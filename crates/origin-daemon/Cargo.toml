@@ -1,0 +1,17 @@
+[package]
+name = "origin-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+origin-ipc = { path = "../origin-ipc" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "sync"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
