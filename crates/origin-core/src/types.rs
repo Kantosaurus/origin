@@ -22,19 +22,14 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MessageId(pub ulid::Ulid);
 
 impl MessageId {
     #[must_use]
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self(ulid::Ulid::new())
-    }
-}
-
-impl Default for MessageId {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -44,12 +39,15 @@ impl core::fmt::Display for MessageId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TurnIndex(pub u32);
 
 impl TurnIndex {
     #[must_use]
-    pub const fn next(self) -> Self {
-        Self(self.0 + 1)
+    pub const fn next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(n) => Some(Self(n)),
+            None => None,
+        }
     }
 }
