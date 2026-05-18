@@ -1,4 +1,4 @@
 edition = "2021"
 max_width = 110
-imports_granularity = "Crate"
-group_imports = "StdExternalCrate"
+# Note: imports_granularity and group_imports are nightly-only;
+# revisit once toolchain moves to nightly or a stable release supports them.

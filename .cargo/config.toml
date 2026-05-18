@@ -1,2 +1,5 @@
+# Workaround for environments where cargo's built-in git client can't handle
+# corporate proxies, custom credential helpers, or SSH agent forwarding.
+# Remove if your environment doesn't need it.
 [net]
 git-fetch-with-cli = true
