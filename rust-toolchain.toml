@@ -1,3 +1,5 @@
 [toolchain]
 channel = "1.83.0"
-components = ["clippy", "rustfmt", "rust-src"]
+components = ["clippy", "rustfmt"]
+# rust-src will be added back when a crate needs it (e.g., for rust-analyzer
+# deep analysis or no_std targets).
