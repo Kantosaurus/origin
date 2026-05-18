@@ -1,0 +1,2 @@
+# Clippy lint configuration.
+# Primary lint configuration lives in [workspace.lints.clippy] in Cargo.toml.
