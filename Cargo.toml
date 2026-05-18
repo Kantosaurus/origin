@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.83"
+license = "Apache-2.0"
+repository = "https://github.com/wooainsley/origin"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"  # overridden in cas/tui/ipc
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+panic = "warn"
