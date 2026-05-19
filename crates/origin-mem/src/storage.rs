@@ -107,12 +107,17 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// Load the stored quantizer, if any.  Returns a freshly deserialised copy each call.
+    /// Load the stored quantizer, if any.  Populates `q_cache` on success so
+    /// subsequent [`Self::save`] calls skip the SQL round-trip.
     ///
     /// # Errors
     /// Propagates SQL or deserialisation errors.
     pub fn load_quantizer(&self) -> Result<Option<Quantizer>, StorageError> {
-        self.deserialise_from_db_opt()
+        let opt = self.deserialise_from_db_opt()?;
+        if let Some(ref q) = opt {
+            *self.q_cache.write() = Some(q.clone());
+        }
+        Ok(opt)
     }
 
     // ── Core CRUD ────────────────────────────────────────────────────────
@@ -150,10 +155,7 @@ impl MemoryStore {
         let now_ms = now_ms();
         let id = Ulid::new();
 
-        // --- Tag bitset ---
-        let tags_bitset = self.sql.with_conn(|conn| resolve_tags(conn, tags))?;
-
-        // --- Persist ---
+        // --- Tag resolution + memory INSERT (single atomic transaction) ---
         // Reinterpret i8 bytes as u8 for BLOB storage; bit pattern is preserved.
         #[allow(clippy::cast_sign_loss)]
         let deltas_blob: Vec<u8> = encoded.deltas.iter().map(|&b| b as u8).collect();
@@ -162,7 +164,9 @@ impl MemoryStore {
         let superseded_by: Option<String> = None;
 
         self.sql.with_conn(|conn| {
-            conn.execute(
+            let tx = conn.unchecked_transaction()?;
+            let tags_bitset = resolve_tags(&tx, tags)?;
+            tx.execute(
                 "INSERT INTO memories \
                  (id, centroid_id, deltas, body_handle, body_preview, tags_bitset, \
                   created_at, last_seen_at, superseded_by, cluster_priority) \
@@ -179,7 +183,7 @@ impl MemoryStore {
                     superseded_by,
                 ],
             )?;
-            Ok(())
+            tx.commit()
         })?;
 
         Ok(id)
@@ -462,38 +466,40 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PartialRow> {
 }
 
 /// Lookup-or-insert each tag name into `mem_tags`; return a 16-byte bitset BLOB.
+///
+/// Uses INSERT OR IGNORE (UPSERT) so concurrent callers racing on the same tag
+/// name all converge to the same `bit_idx`.  Must be called inside an active
+/// transaction so the next-free-slot lookup and the INSERT are race-free.
+///
 /// Tags beyond bit index 127 are silently dropped with a `tracing::warn!`.
 fn resolve_tags(conn: &rusqlite::Connection, tags: &[&str]) -> rusqlite::Result<Vec<u8>> {
     let mut bits = BitArray::<[u8; 16], Lsb0>::new([0u8; 16]);
     for &name in tags {
-        // Try to fetch the existing bit_idx first.
-        let existing: Option<i64> = conn
-            .query_row(
-                "SELECT bit_idx FROM mem_tags WHERE name = ?1",
-                params![name],
-                |r| r.get(0),
-            )
-            .optional()?;
+        // Pick the candidate next-free slot before attempting the INSERT.
+        let max_idx: Option<i64> = conn
+            .query_row("SELECT MAX(bit_idx) FROM mem_tags", [], |r| r.get(0))
+            .optional()?
+            .flatten();
+        let next = max_idx.map_or(0, |m| m + 1);
+        if next > 127 {
+            tracing::warn!(tag = name, "mem_tags: bit_idx exhausted (>127), dropping tag");
+            continue;
+        }
 
-        let bit_idx: i64 = if let Some(idx) = existing {
-            idx
-        } else {
-            // Find the next free slot (lowest bit_idx not yet allocated).
-            let max_idx: Option<i64> = conn
-                .query_row("SELECT MAX(bit_idx) FROM mem_tags", [], |r| r.get(0))
-                .optional()?
-                .flatten();
-            let next = max_idx.map_or(0, |m| m + 1);
-            if next > 127 {
-                tracing::warn!(tag = name, "mem_tags: bit_idx exhausted (>127), dropping tag");
-                continue;
-            }
-            conn.execute(
-                "INSERT INTO mem_tags (bit_idx, name) VALUES (?1, ?2)",
-                params![next, name],
-            )?;
-            next
-        };
+        // INSERT OR IGNORE: if another caller already inserted this name (race),
+        // the existing row wins and the INSERT is silently skipped.
+        conn.execute(
+            "INSERT OR IGNORE INTO mem_tags (bit_idx, name) VALUES (?1, ?2)",
+            params![next, name],
+        )?;
+
+        // Always resolve bit_idx from the authoritative row (handles both the
+        // fresh-insert case and the already-existed case).
+        let bit_idx: i64 = conn.query_row(
+            "SELECT bit_idx FROM mem_tags WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )?;
 
         if bit_idx > 127 {
             tracing::warn!(tag = name, "mem_tags: bit_idx {} > 127, dropping tag", bit_idx);
