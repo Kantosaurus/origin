@@ -44,3 +44,63 @@ pub async fn check(meta: &ToolMeta, args_preview: &str, prompter: &dyn Prompter)
         }
     }
 }
+
+pub mod bloom;
+pub mod rules;
+
+use crate::bloom::BloomPreCheck;
+use crate::rules::Rule;
+
+/// Permission check that consults the bloom + rule list before the tier check.
+///
+/// 1. Build the canonical key `"{meta.name}@{scope}"`.
+/// 2. If `bloom.maybe_contains(key)` is `false`, fall through to the tier check.
+/// 3. Otherwise walk `rules` for an exact match; explicit allow/deny short-circuits.
+/// 4. If no rule matches, fall through to the tier check.
+pub async fn check_with_rules(
+    meta: &ToolMeta,
+    args_preview: &str,
+    prompter: &dyn Prompter,
+    scope: &str,
+    rules: &[Rule],
+    bloom: &BloomPreCheck,
+) -> Decision {
+    let key = format!("{}@{scope}", meta.name);
+    if bloom.maybe_contains(&key) {
+        if let Some(rule) = rules.iter().find(|r| r.key() == key) {
+            return Decision {
+                outcome: if rule.allow { Outcome::Allow } else { Outcome::Deny },
+                reason: format!(
+                    "rule:{}@{scope}:{}",
+                    meta.name,
+                    if rule.allow { "allow" } else { "deny" }
+                ),
+            };
+        }
+    }
+    check(meta, args_preview, prompter).await
+}
+
+use origin_skills::SkillRegistry;
+
+/// Same as [`check`], but also enforces an active [`SkillRegistry`]'s
+/// allowed-tools intersection mask before the tier check.
+///
+/// If any skill is active and `meta.name` is not in the intersection, the
+/// outcome is [`Outcome::Deny`] with `reason = "skill-narrowed"`.
+pub async fn check_with_skills(
+    meta: &ToolMeta,
+    args_preview: &str,
+    prompter: &dyn Prompter,
+    skills: &SkillRegistry,
+) -> Decision {
+    if let Some(mask) = skills.allowed_tools() {
+        if !mask.contains(meta.name) {
+            return Decision {
+                outcome: Outcome::Deny,
+                reason: "skill-narrowed".into(),
+            };
+        }
+    }
+    check(meta, args_preview, prompter).await
+}
