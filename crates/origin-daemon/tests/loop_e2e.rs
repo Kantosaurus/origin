@@ -125,6 +125,7 @@ async fn loop_caps_at_max_turns() {
         streaming_disabled: true,
         proposer: None,
         event_tx: None,
+        injector: None,
     };
     let err = run_loop(&mut session, "loop", &provider, &AlwaysAllow, &opts)
         .await
@@ -176,6 +177,7 @@ async fn tool_result_goes_to_cas_and_block_carries_handle_only() {
         streaming_disabled: true,
         proposer: None,
         event_tx: None,
+        injector: None,
     };
 
     let summary = run_loop(

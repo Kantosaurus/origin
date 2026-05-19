@@ -2,8 +2,11 @@
 //! the binary and for integration tests.
 
 pub mod agent;
+pub mod memory_wiring;
 pub mod protocol;
 pub mod session;
 pub mod session_store;
 pub mod stream_relay;
 pub mod tool_use_parser;
+
+pub use memory_wiring::{MemoryDispatchHandle, MemoryWiring};

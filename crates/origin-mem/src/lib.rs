@@ -17,7 +17,7 @@ pub use consolidator::{ConsolidationError, ConsolidationReport, Consolidator};
 pub use embedder::EmbedderError;
 pub use embedder::{Embedder, EMBED_DIM};
 pub use index::{Candidate, IndexError, MemIndex, MetaRow, SearchOpts};
-pub use injector::{InjectedContext, Injector, InjectorError};
+pub use injector::{memory_id_to_u64, InjectedContext, Injector, InjectorError};
 pub use proposer::{MemoryProposal, Proposer};
 pub use quantizer::{EncodedVector, Quantizer, QuantizerError, NUM_CENTROIDS};
 pub use storage::{EdgeKind, MemoryId, MemoryRecord, MemoryStore, StorageError};

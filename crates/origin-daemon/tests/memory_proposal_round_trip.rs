@@ -96,6 +96,7 @@ async fn memory_proposed_round_trip_via_stub_provider() {
             streaming_disabled: true,
             proposer: Some(Arc::clone(&proposer)),
             event_tx: Some(event_tx.clone()),
+            injector: None,
         };
         let summary = run_loop(&mut session, &prompt.user_text, &provider, &AlwaysAllow, &opts)
             .await
