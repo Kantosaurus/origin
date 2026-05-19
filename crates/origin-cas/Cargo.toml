@@ -16,8 +16,12 @@ undocumented_unsafe_blocks = "deny"
 
 [dependencies]
 blake3 = "1"
+byteorder = "1"
 fastcdc = "3"
+memmap2 = "0.9"
 thiserror = "1"
 
 [dev-dependencies]
 hex = "0.4"
+proptest = { version = "=1.4.0", default-features = false, features = ["std"] }
+tempfile = "3"

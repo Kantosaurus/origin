@@ -7,6 +7,8 @@
 
 mod chunker;
 mod hash;
+mod packfile;
 
 pub use chunker::{chunks, ChunkIter, ChunkRef};
 pub use hash::Hash;
+pub use packfile::{PackBuilder, PackError, PackReader, PackSlice};
