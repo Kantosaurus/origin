@@ -22,10 +22,11 @@ use ulid::Ulid;
 
 use crate::error::SwarmError;
 use crate::lifecycle::Lifecycle;
+use crate::prefix_inherit::PrefixSnapshot;
 use crate::report::CompletionReport;
 use crate::rpc::PlanHandle;
 use crate::spec::WorkerSpec;
-use crate::worker::{default_noop_worker, PrefixSnapshot, WorkerContext, WorkerFn};
+use crate::worker::{default_noop_worker, WorkerContext, WorkerFn};
 
 /// Opaque worker identifier (ULID under the hood).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -83,7 +84,15 @@ pub struct Coordinator {
     workers: Arc<Mutex<HashMap<WorkerId, WorkerState>>>,
     default_worker: WorkerFn,
     last_completion: Arc<Mutex<Option<CompletionReport>>>,
+    /// Parent ledger retained so observers can re-snapshot post-builder if
+    /// the upstream code mutates a clone before spawn. Currently not exposed
+    /// publicly — the cached `parent_snapshot` is what workers actually see.
     parent_ledger: Option<PrefixLedger>,
+    /// Eagerly cached `PrefixSnapshot` computed once at
+    /// [`Coordinator::with_parent_ledger`] time. Cloned cheaply into every
+    /// `WorkerContext::inherited_ledger` on spawn (`Vec<(SectionId, Band)>`
+    /// clone — both `Copy` payloads).
+    parent_snapshot: Option<PrefixSnapshot>,
 }
 
 impl Coordinator {
@@ -100,6 +109,7 @@ impl Coordinator {
             default_worker: default_noop_worker(),
             last_completion: Arc::new(Mutex::new(None)),
             parent_ledger: None,
+            parent_snapshot: None,
         }
     }
 
@@ -109,10 +119,17 @@ impl Coordinator {
         &self.ring_name
     }
 
-    /// Builder-style setter for the parent's `PrefixLedger` — P9.7 will use
-    /// this snapshot to seed worker contexts.
+    /// Builder-style setter for the parent's `PrefixLedger`.
+    ///
+    /// The snapshot of stable bands (`Frozen` + `Sticky`) is computed
+    /// **once, eagerly** here and cached for the lifetime of the
+    /// coordinator. Subsequent `spawn`/`spawn_with` calls clone the cached
+    /// snapshot into each `WorkerContext` rather than re-walking the
+    /// ledger — workers should see a stable inheritance set per coordinator
+    /// (N7.1, P9.7).
     #[must_use]
     pub fn with_parent_ledger(mut self, l: PrefixLedger) -> Self {
+        self.parent_snapshot = Some(Self::take_prefix_snapshot(&l));
         self.parent_ledger = Some(l);
         self
     }
@@ -147,10 +164,7 @@ impl Coordinator {
             budget: spec.budget,
             parent_actor: spec.parent_actor,
             spec: spec.clone(),
-            inherited_ledger: self
-                .parent_ledger
-                .as_ref()
-                .map_or_else(PrefixSnapshot::new, Self::take_prefix_snapshot),
+            inherited_ledger: self.parent_snapshot.clone().unwrap_or_default(),
         };
 
         let report_slot: Arc<Mutex<Option<CompletionReport>>> = Arc::new(Mutex::new(None));
@@ -262,12 +276,13 @@ impl Coordinator {
         self.last_completion.try_lock().ok().and_then(|g| g.clone())
     }
 
-    /// Extract a `PrefixSnapshot` from a parent `PrefixLedger`.
+    /// Extract a `PrefixSnapshot` from a parent `PrefixLedger`, retaining
+    /// only `Frozen` + `Sticky` band entries (N7.1, P9.7).
     ///
-    /// P9.6 returns an empty snapshot — P9.7 will populate it with the
-    /// `Frozen` + `Sticky` band entries from `l`.
+    /// Free-function-style: takes a borrow, returns an owned snapshot.
+    /// Idempotent and side-effect free.
     #[must_use]
-    pub fn take_prefix_snapshot(_l: &PrefixLedger) -> PrefixSnapshot {
-        PrefixSnapshot::new()
+    pub fn take_prefix_snapshot(l: &PrefixLedger) -> PrefixSnapshot {
+        PrefixSnapshot::from_ledger(l)
     }
 }
