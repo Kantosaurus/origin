@@ -28,6 +28,7 @@ unicode-segmentation = "1"
 unicode-width = "0.1"
 lru = "0.12"
 fxhash = "0.2"
+origin-stream = { path = "../origin-stream" }
 
 [dev-dependencies]
 proptest = { version = "=1.4.0", default-features = false, features = ["std"] }

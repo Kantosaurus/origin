@@ -6,6 +6,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 #[allow(clippy::module_name_repetitions)]
+#[derive(Debug)]
 pub struct WidthCache {
     map: LruCache<u64, u8>,
 }
