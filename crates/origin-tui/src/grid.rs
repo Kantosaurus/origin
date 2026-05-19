@@ -1,5 +1,5 @@
 //! Packed 16-byte `Cell` + row-major `Grid` with `resize` / `put` / `get` /
-//! `diff`-friendly raw byte access via `as_bytes` / `as_bytes_mut`.
+//! `diff`-friendly raw byte access via `as_bytes`.
 //!
 //! `Cell` is `#[repr(C)]` so its in-memory layout matches what P4.2's SIMD
 //! diff scans byte-for-byte.
@@ -29,7 +29,7 @@ impl Attr {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub struct Cell {
-    /// Unicode scalar value or 0 for "blank".
+    /// Unicode scalar value; `Cell::BLANK` uses ASCII space.
     pub glyph: u32,
     /// Foreground color, 0x00RRGGBB; 0 means terminal default.
     pub fg: u32,
@@ -110,7 +110,12 @@ impl Grid {
         self.rows
     }
 
-    /// Resize and clear the buffer.
+    /// Resize and **fully clear** the buffer. All previous cell contents are
+    /// lost, even within the surviving region.
+    ///
+    /// # Panics
+    /// Panics if `cols * rows` overflows `usize` (unreachable on any
+    /// terminal size we care about).
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
