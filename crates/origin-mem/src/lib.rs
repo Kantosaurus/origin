@@ -3,6 +3,8 @@
 
 pub mod embedder;
 pub mod index;
+pub mod injector;
+pub mod proposer;
 pub mod quantizer;
 pub mod storage;
 
@@ -13,5 +15,7 @@ pub mod storage;
 pub use embedder::EmbedderError;
 pub use embedder::{Embedder, EMBED_DIM};
 pub use index::{Candidate, IndexError, MemIndex, MetaRow, SearchOpts};
+pub use injector::{InjectedContext, Injector, InjectorError};
+pub use proposer::{MemoryProposal, Proposer};
 pub use quantizer::{EncodedVector, Quantizer, QuantizerError, NUM_CENTROIDS};
 pub use storage::{EdgeKind, MemoryId, MemoryRecord, MemoryStore, StorageError};
