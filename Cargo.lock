@@ -2840,6 +2840,15 @@ name = "origin-mcp"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "eventsource-stream",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "origin-cas",
+ "origin-keyvault",
+ "origin-tools",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -2879,6 +2888,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "growable-bloom-filter",
+ "origin-skills",
  "origin-tools",
  "thiserror 1.0.69",
  "tokio",
@@ -3068,6 +3078,8 @@ name = "origin-skills"
 version = "0.0.1"
 dependencies = [
  "blake3",
+ "origin-cas",
+ "origin-mem",
  "serde",
  "serde_yaml",
  "tempfile",
