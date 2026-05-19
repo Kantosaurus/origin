@@ -1303,9 +1303,13 @@ dependencies = [
 name = "origin-codegraph"
 version = "0.0.1"
 dependencies = [
+ "blake3",
  "criterion",
  "fastcdc",
  "origin-cas",
+ "origin-store",
+ "rkyv",
+ "rusqlite",
  "tempfile",
  "thiserror 1.0.69",
  "tree-sitter",

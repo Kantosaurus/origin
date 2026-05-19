@@ -10,8 +10,12 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+blake3 = "1"
 fastcdc = "3"
 origin-cas = { path = "../origin-cas" }
+origin-store = { path = "../origin-store" }
+rkyv = { version = "0.7", features = ["validation"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 thiserror = "1"
 tree-sitter = "=0.22.6"
 tree-sitter-rust = "=0.21.2"
