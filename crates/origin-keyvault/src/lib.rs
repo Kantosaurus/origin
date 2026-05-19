@@ -8,13 +8,16 @@
 //! through [`Secret<T>`] so the inner value is zeroized on drop and never
 //! appears in `Debug` output.
 //!
-//! Phase 8.1 ships the façade, `Secret<T>`, and the per-OS backends; P8.2
-//! will add OAuth helpers in [`oauth`].
+//! Phase 8.1 shipped the façade, `Secret<T>`, and the per-OS backends.
+//! Phase 8.2 adds the OAuth driver (`Pkce` + `OAuthClient`) re-exported
+//! from [`oauth`].
 
 mod backend;
 mod backend_memory;
 mod oauth;
 mod secret;
+
+pub use crate::oauth::{AuthCodeRequest, ExchangedTokens, OAuthClient, Pkce, RefreshOutcome};
 
 #[cfg(target_os = "linux")]
 mod backend_linux;
