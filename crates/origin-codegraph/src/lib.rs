@@ -2,6 +2,7 @@
 //!
 //! Modules land per-task across P7.1–P7.8; this lib.rs collects them.
 
+pub mod chunker;
 pub mod extract;
 pub mod lang;
 
