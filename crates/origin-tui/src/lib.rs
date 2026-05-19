@@ -8,5 +8,6 @@
 pub mod ansi;
 pub mod damage;
 pub mod grid;
+pub mod scheduler;
 
 pub use grid::{Attr, Cell, Grid, GridError};
