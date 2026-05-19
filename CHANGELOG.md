@@ -4,6 +4,22 @@ All notable changes to `origin` will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely;
 versions correspond to phase milestones from the implementation plan.
 
+## Phase 2 — Streaming + CAS + Ring Buffer (2026-05-19)
+
+- `origin-cas` crate: blake3 Hash, FastCDC chunker, mmap pack files,
+  three-tier (Hot LRU + Warm mmap + Cold zstd) Store, refcount/GC enumerator.
+- `origin-stream` crate: single-producer multi-tail byte ring;
+  rkyv-archived TokenEvent records.
+- Anthropic provider gains native SSE → ring streaming.
+- `Provider::chat_stream` added to trait; default impl wraps `chat`.
+- Daemon: tool outputs land in CAS; `Block::ToolResult` carries 32-byte
+  handle, not inline bytes. `expand_messages_for_wire` re-inflates on the
+  outbound encode hop.
+- CLI: live token streaming infrastructure into TUI; assistant turn buffer;
+  token/cost status bar driven by Usage events.
+- RAM soak: 1000-msg session, ΔRSS < 200 MiB.
+- New SQLite migration V2: `cas_refs(hash, refcount, tier, last_access)`.
+
 ## [phase-1] — 2026-05-19
 
 ### Added
