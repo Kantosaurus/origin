@@ -8,6 +8,7 @@ mod wire;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use origin_core::types::{Block, Message, Role};
+use origin_planner::Plan;
 use origin_provider::{ChatRequest, ChatResponse, Provider, ProviderError, Usage};
 use reqwest::StatusCode;
 use serde_json::json;
@@ -22,6 +23,7 @@ pub struct Anthropic {
     base: String,
     client: reqwest::Client,
     cas: Option<std::sync::Arc<origin_cas::Store>>,
+    plan: Option<Plan>,
 }
 
 impl Anthropic {
@@ -39,7 +41,18 @@ impl Anthropic {
             base: base.trim_end_matches('/').to_string(),
             client: reqwest::Client::new(),
             cas: None,
+            plan: None,
         }
+    }
+
+    /// Construct against an arbitrary endpoint URL with an API key and default
+    /// model (for testing).
+    ///
+    /// The `model` parameter is accepted for symmetry with other test helpers
+    /// but is not stored — the model is taken from `ChatRequest` at call time.
+    #[must_use]
+    pub fn with_endpoint(base: impl AsRef<str>, api_key: impl Into<String>, _model: &str) -> Self {
+        Self::with_base_url(api_key, base.as_ref())
     }
 
     /// Attach a CAS so `ToolResult` blocks carrying a handle are re-inflated
@@ -47,6 +60,14 @@ impl Anthropic {
     #[must_use]
     pub fn with_cas(mut self, cas: std::sync::Arc<origin_cas::Store>) -> Self {
         self.cas = Some(cas);
+        self
+    }
+
+    /// Attach a `Plan` so the encoder emits `cache_control` markers at the
+    /// planned band boundaries.
+    #[must_use]
+    pub fn with_plan(mut self, plan: Plan) -> Self {
+        self.plan = Some(plan);
         self
     }
 }
@@ -59,7 +80,12 @@ impl Provider for Anthropic {
 
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError> {
         let expanded = expand_messages_for_wire(&req.messages, self.cas.as_ref())?;
-        let wire_messages = expanded.iter().map(message_to_wire).collect::<Vec<_>>();
+        let plan = self.plan.as_ref();
+        let wire_messages = expanded
+            .iter()
+            .enumerate()
+            .map(|(idx, m)| message_to_wire(m, plan, idx))
+            .collect::<Vec<_>>();
         let wire_tools = req
             .tools
             .iter()
@@ -123,7 +149,12 @@ impl Provider for Anthropic {
 
     async fn chat_stream(&self, req: ChatRequest, ring: &origin_stream::Ring) -> Result<(), ProviderError> {
         let expanded = expand_messages_for_wire(&req.messages, self.cas.as_ref())?;
-        let wire_messages = expanded.iter().map(message_to_wire).collect::<Vec<_>>();
+        let plan = self.plan.as_ref();
+        let wire_messages = expanded
+            .iter()
+            .enumerate()
+            .map(|(idx, m)| message_to_wire(m, plan, idx))
+            .collect::<Vec<_>>();
         let wire_tools = req
             .tools
             .iter()
@@ -176,25 +207,47 @@ impl Provider for Anthropic {
     }
 }
 
-fn message_to_wire(m: &Message) -> wire::WireMessage<'_> {
+fn message_to_wire<'a>(m: &'a Message, plan: Option<&Plan>, msg_idx: usize) -> wire::WireMessage<'a> {
     let role = match m.role {
         Role::User | Role::Tool | Role::System => "user",
         // Anthropic represents tool results as user messages (Role::Tool).
         // System content goes in the top-level `system` field, not a message (Role::System).
         Role::Assistant => "assistant",
     };
-    let content = m.blocks.iter().filter_map(block_to_wire).collect();
+    let marker_indices: &[usize] = plan.map_or(&[], Plan::marker_indices);
+    let content = m
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(block_idx, b)| {
+            // Emit a cache marker on a block when:
+            // - a plan is present
+            // - this is the first message (msg_idx == 0)
+            // - block_idx is in the plan's marker_indices
+            let cache_control = if plan.is_some() && msg_idx == 0 && marker_indices.contains(&block_idx) {
+                Some(wire::WireCacheControl::ephemeral())
+            } else {
+                None
+            };
+            block_to_wire(b, cache_control)
+        })
+        .collect();
     wire::WireMessage { role, content }
 }
 
-fn block_to_wire(b: &Block) -> Option<wire::WireBlock<'_>> {
+fn block_to_wire(b: &Block, cache_control: Option<wire::WireCacheControl>) -> Option<wire::WireBlock<'_>> {
     match b {
-        Block::Text { text, .. } => Some(wire::WireBlock::Text { text }),
+        Block::Text { text, .. } => Some(wire::WireBlock::Text { text, cache_control }),
         Block::ToolUse {
             id, name, input_json, ..
         } => {
             let input: serde_json::Value = serde_json::from_slice(input_json).unwrap_or_else(|_| json!({}));
-            Some(wire::WireBlock::ToolUse { id, name, input })
+            Some(wire::WireBlock::ToolUse {
+                id,
+                name,
+                input,
+                cache_control,
+            })
         }
         Block::ToolResult {
             tool_use_id, inline, ..
@@ -208,6 +261,7 @@ fn block_to_wire(b: &Block) -> Option<wire::WireBlock<'_>> {
                 tool_use_id,
                 content: content_str,
                 is_error: false,
+                cache_control,
             })
         }
         // Do not re-send thinking blocks; Anthropic ignores them on inbound.

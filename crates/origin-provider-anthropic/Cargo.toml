@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 origin-core = { path = "../origin-core" }
+origin-planner = { path = "../origin-planner" }
 origin-provider = { path = "../origin-provider" }
 origin-stream = { path = "../origin-stream" }
 origin-cas = { path = "../origin-cas" }

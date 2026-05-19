@@ -1378,6 +1378,7 @@ dependencies = [
  "futures-util",
  "origin-cas",
  "origin-core",
+ "origin-planner",
  "origin-provider",
  "origin-stream",
  "pin-utils",
