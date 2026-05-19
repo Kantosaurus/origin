@@ -1113,6 +1113,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "origin-cas",
  "origin-core",
  "origin-ipc",
  "origin-permission",
@@ -1174,6 +1175,7 @@ dependencies = [
  "async-trait",
  "eventsource-stream",
  "futures-util",
+ "origin-cas",
  "origin-core",
  "origin-provider",
  "origin-stream",

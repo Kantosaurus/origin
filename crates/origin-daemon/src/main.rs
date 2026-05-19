@@ -22,7 +22,20 @@ async fn main() -> Result<()> {
 
     let api_key =
         env::var("ANTHROPIC_API_KEY").map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY must be set"))?;
-    let provider = std::sync::Arc::new(Anthropic::new(api_key));
+
+    let cas_root = env::var("ORIGIN_CAS_ROOT").unwrap_or_else(|_| default_cas_root());
+    let cas = std::sync::Arc::new(
+        origin_cas::Store::open(origin_cas::StoreConfig {
+            root: cas_root.clone().into(),
+            hot_capacity: 256,
+            warm_pack_target_bytes: 4 * 1024 * 1024,
+            cold_zstd_level: 3,
+        })
+        .map_err(|e| anyhow::anyhow!("cas open: {e}"))?,
+    );
+    info!(cas_root = %cas_root, "cas store ready");
+
+    let provider = std::sync::Arc::new(Anthropic::new(api_key).with_cas(std::sync::Arc::clone(&cas)));
 
     let db_path = env::var("ORIGIN_DB").unwrap_or_else(|_| default_db_path());
     let session_store = std::sync::Arc::new(SessionStore::open(&db_path)?);
@@ -36,6 +49,7 @@ async fn main() -> Result<()> {
         let mut conn = listener.accept().await?;
         let provider = std::sync::Arc::clone(&provider);
         let session_store = std::sync::Arc::clone(&session_store);
+        let cas = std::sync::Arc::clone(&cas);
         tokio::spawn(async move {
             loop {
                 let Ok(body) = conn.read_frame_body().await else {
@@ -52,12 +66,16 @@ async fn main() -> Result<()> {
                     }
                 };
                 let mut session = Session::new("anthropic", &req.model);
+                let opts = LoopOptions {
+                    max_turns: 25,
+                    cas: Some(std::sync::Arc::clone(&cas)),
+                };
                 match run_loop(
                     &mut session,
                     &req.user_text,
                     provider.as_ref(),
                     &AlwaysAllow,
-                    LoopOptions::default(),
+                    &opts,
                 )
                 .await
                 {
@@ -111,5 +129,11 @@ fn default_path() -> String {
 fn default_db_path() -> String {
     let mut p = std::env::temp_dir();
     p.push("origin.db");
+    p.to_string_lossy().into_owned()
+}
+
+fn default_cas_root() -> String {
+    let mut p = std::env::temp_dir();
+    p.push("origin-cas");
     p.to_string_lossy().into_owned()
 }
