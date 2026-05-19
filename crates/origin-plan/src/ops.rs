@@ -97,6 +97,24 @@ pub struct Reorder {
     pub key: LogootKey,
 }
 
+/// `LeaseStep(step, expires_at_ms)` — request a worker lease on a step (N7.6).
+///
+/// When two `LeaseStep` ops race the same step, the winner is the envelope
+/// with the lexicographically larger `(lamport, actor)` pair: highest lamport
+/// wins, ties broken by larger actor id. Expired leases (those whose
+/// `expires_at_ms <= now_ms`) are filtered out of
+/// [`crate::plan::Plan::lease_holder`] but remain in the underlying fold state
+/// so re-folding the log is deterministic regardless of wall-clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseStep {
+    /// Step being leased.
+    pub step: StepId,
+    /// Wall-clock expiry, in milliseconds since the unix epoch (or any other
+    /// monotonic reference agreed on by producers). Compared against the
+    /// `now_ms` passed to `lease_holder`.
+    pub expires_at_ms: u64,
+}
+
 /// The CRDT op alphabet.
 ///
 /// Each variant is a small, plain payload — wrapping in an [`OpEnvelope`] is
@@ -113,6 +131,8 @@ pub enum Op {
     AddNote(AddNote),
     /// See [`Reorder`].
     Reorder(Reorder),
+    /// See [`LeaseStep`].
+    LeaseStep(LeaseStep),
 }
 
 impl Op {
@@ -128,6 +148,7 @@ impl Op {
             Self::EditContent(_) => 2,
             Self::AddNote(_) => 3,
             Self::Reorder(_) => 4,
+            Self::LeaseStep(_) => 5,
         }
     }
 }
