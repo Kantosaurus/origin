@@ -1,4 +1,8 @@
-//! Live smoke test against Anthropic. Skipped unless ANTHROPIC_API_KEY is set.
+//! Live smoke test against Anthropic. Skipped unless `ANTHROPIC_API_KEY` is set.
+
+use origin_core::types::{Block, Message, Role};
+use origin_provider::{ChatRequest, Provider};
+use origin_provider_anthropic::Anthropic;
 
 #[tokio::test(flavor = "current_thread")]
 async fn live_smoke() {
@@ -6,9 +10,6 @@ async fn live_smoke() {
         eprintln!("ANTHROPIC_API_KEY not set; skipping live_smoke");
         return;
     };
-    use origin_core::types::{Block, Message, Role};
-    use origin_provider::{ChatRequest, Provider};
-    use origin_provider_anthropic::Anthropic;
 
     let provider = Anthropic::new(api_key);
     let req = ChatRequest {
@@ -18,9 +19,8 @@ async fn live_smoke() {
         tools: vec![],
     };
     let resp = provider.chat(req).await.expect("anthropic should answer");
-    let txt = match &resp.assistant.blocks[0] {
-        Block::Text { text, .. } => text.clone(),
-        other => panic!("expected text, got {other:?}"),
+    let Block::Text { text: txt, .. } = &resp.assistant.blocks[0] else {
+        unreachable!("anthropic always returns a Text block first for this prompt");
     };
     assert!(!txt.is_empty(), "anthropic should return non-empty text");
     println!("live_smoke reply: {txt}");
