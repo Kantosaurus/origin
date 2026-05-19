@@ -4,6 +4,10 @@
 //! format. Multi-provider support is achieved by per-provider crates that
 //! `impl Provider for …`.
 
+pub mod ndjson;
+pub mod openai_tools;
+pub mod sse;
+
 use origin_core::types::Message;
 use thiserror::Error;
 
