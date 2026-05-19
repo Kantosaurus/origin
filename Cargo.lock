@@ -1458,6 +1458,7 @@ dependencies = [
  "criterion",
  "hex",
  "origin-cas",
+ "origin-codegraph",
  "origin-core",
  "origin-ipc",
  "origin-permission",

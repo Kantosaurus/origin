@@ -1,5 +1,7 @@
 //! IPC request/response shapes for daemon ↔ client.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -7,6 +9,27 @@ pub struct PromptRequest {
     pub system: String,
     pub model: String,
     pub user_text: String,
+}
+
+/// Request to rebuild the code graph over a set of paths.
+///
+/// Wired into the daemon's IPC `Frame` dispatcher in P10; for P7.8 the shape
+/// exists so the `post-commit` hook script and the agent free function in
+/// `agent.rs` can share a single struct.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RebuildRequest {
+    pub paths: Vec<PathBuf>,
+}
+
+/// Counter reply for a rebuild pass. Mirrors
+/// [`origin_codegraph::rebuild::RebuildReport`] over the wire so the daemon
+/// doesn't have to re-export the codegraph type.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RebuildReply {
+    pub paths_seen: usize,
+    pub nodes_added: usize,
+    pub nodes_updated: usize,
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

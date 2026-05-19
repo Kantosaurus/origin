@@ -1,22 +1,15 @@
-//! `graph_query` — typed code-graph query, returns a CAS handle.
+//! `graph_query` — typed code-graph query, dispatched against the live index.
 
-use origin_codegraph::query::Query;
-use thiserror::Error;
+use origin_codegraph::index::CodeGraphIndex;
+use origin_codegraph::query::{dispatch, Query, QueryError, QueryResult};
 
-#[allow(clippy::module_name_repetitions)] // `GraphQueryError` mirrors `RecallError` precedent
-#[derive(Debug, Error)]
-pub enum GraphQueryError {
-    #[error("not yet wired to the live index")]
-    Unwired,
-}
-
+/// Dispatch a typed [`Query`] against `idx`.
+///
 /// # Errors
-/// Returns [`GraphQueryError::Unwired`] until P7.8 wires the daemon-held
-/// `CodeGraphIndex`; the tool's registration is what P7.7 verifies.
+/// Propagates [`QueryError`] from [`origin_codegraph::query::dispatch`].
 #[allow(clippy::module_name_repetitions)] // `graph_query_tool` follows `recall_tool` precedent
-#[allow(clippy::needless_pass_by_value)] // matches future wired signature
-pub const fn graph_query_tool(_q: Query) -> Result<String, GraphQueryError> {
-    Err(GraphQueryError::Unwired)
+pub fn graph_query_tool(idx: &CodeGraphIndex, q: Query) -> Result<QueryResult, QueryError> {
+    dispatch(idx, q)
 }
 
 crate::origin_tool! {
