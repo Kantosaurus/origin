@@ -5,7 +5,7 @@ use crate::session::Session;
 use crate::tool_use_parser::{ToolUseDelta, ToolUseParser};
 use origin_cas::{Hash, Store};
 use origin_core::types::{Block, Message, Role};
-use origin_mem::Proposer;
+use origin_mem::{Injector, Proposer};
 use origin_permission::{check, prompt::Prompter, Outcome};
 use origin_provider::{ChatRequest, Provider};
 use origin_tools::{registry_iter, SideEffects, ToolMeta};
@@ -42,6 +42,10 @@ pub struct LoopOptions {
     /// [`origin_stream::TokenKind`] — it's a turn-end side product, not a
     /// streaming token.
     pub event_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
+    /// If `Some`, the loop embeds the user prompt and prepends any retrieved
+    /// `<context source="origin-mem">` block to the system prompt of every
+    /// turn's `ChatRequest`. `None` disables prompt-recall injection.
+    pub injector: Option<Arc<Injector>>,
 }
 
 impl Default for LoopOptions {
@@ -53,6 +57,7 @@ impl Default for LoopOptions {
             streaming_disabled: false,
             proposer: None,
             event_tx: None,
+            injector: None,
         }
     }
 }
@@ -177,9 +182,25 @@ pub async fn run_loop(
     // same session avoid redundant tool execution.
     let mut cache = origin_tools::Cache::new();
 
+    // Prompt-recall (P6.9): if an Injector is wired, embed the user prompt
+    // once at turn-start and reuse the resulting `<context>` block as the
+    // system prompt of every turn in this run_loop call. Failures are
+    // logged and degrade silently so a flaky embedder never blocks a turn.
+    let recalled_system =
+        opts.injector
+            .as_ref()
+            .map_or_else(String::new, |injector| match injector.for_prompt(user_text, 5) {
+                Ok(Some(ctx)) => ctx.block,
+                Ok(None) => String::new(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "injector.for_prompt failed; running without recall");
+                    String::new()
+                }
+            });
+
     for turn in 1..=opts.max_turns {
         let req = ChatRequest {
-            system: String::new(),
+            system: recalled_system.clone(),
             messages: session.snapshot(),
             model: session.model.clone(),
             tools: tools_schema.clone(),

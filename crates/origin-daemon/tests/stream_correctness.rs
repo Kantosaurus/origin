@@ -143,6 +143,7 @@ async fn relay_drains_all_events_before_response_frame() {
                 streaming_disabled: false,
                 proposer: None,
                 event_tx: None,
+                injector: None,
             };
             run_loop(&mut session, "hi", &provider, &AlwaysAllow, &opts)
                 .await

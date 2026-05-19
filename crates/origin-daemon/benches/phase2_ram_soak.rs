@@ -76,6 +76,7 @@ fn main() {
         streaming_disabled: true,
         proposer: None,
         event_tx: None,
+        injector: None,
     };
 
     let mut sys = System::new();

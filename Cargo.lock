@@ -1743,6 +1743,7 @@ dependencies = [
  "origin-store",
  "origin-stream",
  "origin-tools",
+ "parking_lot",
  "proptest",
  "rkyv",
  "rusqlite",
@@ -1755,6 +1756,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+ "wiremock",
 ]
 
 [[package]]
