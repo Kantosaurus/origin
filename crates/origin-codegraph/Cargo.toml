@@ -15,6 +15,7 @@ fastcdc = "3"
 lopdf = "0.32"
 origin-cas = { path = "../origin-cas" }
 origin-store = { path = "../origin-store" }
+petgraph = "0.6"
 rkyv = { version = "0.7", features = ["validation"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 thiserror = "1"
@@ -31,4 +32,8 @@ tempfile = "3"
 
 [[bench]]
 name = "incremental"
+harness = false
+
+[[bench]]
+name = "community"
 harness = false
