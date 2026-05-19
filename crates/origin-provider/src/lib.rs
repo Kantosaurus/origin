@@ -58,4 +58,35 @@ pub trait Provider: Send + Sync {
     /// # Errors
     /// Returns `ProviderError` for transport, API, auth, or rate-limit failures.
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError>;
+
+    /// Stream tokens into `ring`. Default impl falls back to `chat` and emits
+    /// one `TextDelta` + `TurnEnd` so providers without native streaming still
+    /// work behind the ring API.
+    ///
+    /// # Errors
+    /// Returns `ProviderError` for transport, API, auth, or rate-limit failures.
+    async fn chat_stream(&self, req: ChatRequest, ring: &origin_stream::Ring) -> Result<(), ProviderError> {
+        let resp = self.chat(req).await?;
+        let text: String = resp
+            .assistant
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                origin_core::types::Block::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        ring.publish(&origin_stream::TokenEvent::new(
+            origin_stream::TokenKind::TextDelta,
+            text.into_bytes(),
+        ))
+        .map_err(|e| ProviderError::Api(e.to_string()))?;
+        ring.publish(&origin_stream::TokenEvent::new(
+            origin_stream::TokenKind::TurnEnd,
+            Vec::new(),
+        ))
+        .map_err(|e| ProviderError::Api(e.to_string()))?;
+        ring.close();
+        Ok(())
+    }
 }

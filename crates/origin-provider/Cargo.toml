@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 origin-core = { path = "../origin-core" }
+origin-stream = { path = "../origin-stream" }
 async-trait = "0.1"
 thiserror = "1"
 

@@ -6,6 +6,7 @@ pub mod streaming;
 mod wire;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use origin_core::types::{Block, Message, Role};
 use origin_provider::{ChatRequest, ChatResponse, Provider, ProviderError, Usage};
 use reqwest::StatusCode;
@@ -107,6 +108,59 @@ impl Provider for Anthropic {
                 Err(ProviderError::Api(format!("status {s}: {body}")))
             }
         }
+    }
+
+    async fn chat_stream(&self, req: ChatRequest, ring: &origin_stream::Ring) -> Result<(), ProviderError> {
+        let wire_messages = req.messages.iter().map(message_to_wire).collect::<Vec<_>>();
+        let wire_tools = req
+            .tools
+            .iter()
+            .map(|t| wire::WireTool {
+                name: &t.name,
+                description: &t.description,
+                input_schema: serde_json::from_str(&t.input_schema_json).unwrap_or_else(|_| json!({})),
+            })
+            .collect::<Vec<_>>();
+
+        let url = format!("{}/v1/messages", self.base);
+        let resp = self
+            .client
+            .post(&url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", API_VERSION)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .json(&serde_json::json!({
+                "model": req.model,
+                "max_tokens": DEFAULT_MAX_TOKENS,
+                "system": if req.system.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(req.system.clone())
+                },
+                "messages": wire_messages,
+                "tools": wire_tools,
+                "stream": true,
+            }))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::Api(format!("status {status}: {text}")));
+        }
+
+        let byte_stream = resp.bytes_stream();
+        let async_read = tokio_util::io::StreamReader::new(
+            byte_stream.map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
+        );
+        crate::streaming::parse_into_ring(async_read, ring)
+            .await
+            .map_err(|e| ProviderError::Api(e.to_string()))?;
+        ring.close();
+        Ok(())
     }
 }
 
