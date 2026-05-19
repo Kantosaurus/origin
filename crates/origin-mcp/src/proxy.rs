@@ -11,6 +11,8 @@ use origin_tools::{DynTool, ToolMeta};
 use serde_json::Value;
 use std::sync::Arc;
 
+// `McpToolProxy` — `Mcp` prefix is the crate's naming convention even though
+// it repeats `proxy`'s parent crate name; kept for symmetry with `McpClient`.
 #[allow(clippy::module_name_repetitions)]
 pub struct McpToolProxy {
     client: Arc<McpClient>,

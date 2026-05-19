@@ -3078,7 +3078,6 @@ name = "origin-skills"
 version = "0.0.1"
 dependencies = [
  "blake3",
- "origin-cas",
  "origin-mem",
  "serde",
  "serde_yaml",

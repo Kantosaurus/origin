@@ -15,11 +15,16 @@ async fn attach_bearer_pulls_from_keyvault() {
     .expect("set");
 
     let transport = Arc::new(HttpTransport::new("http://example.invalid/rpc", None));
+    assert!(transport.current_bearer().is_none(), "no bearer before attach");
+
     attach_bearer(&kv, "mcp-server-x", "default", &transport)
         .await
         .expect("attach");
 
-    // We don't run a server; we just verify the bearer was wired in by
-    // round-tripping the in-memory transport state.
-    transport.set_bearer(Some("tok-abc".into())); // also confirm the setter is idempotent
+    // Assert the bearer was sourced from the vault.
+    assert_eq!(
+        transport.current_bearer().as_deref(),
+        Some("tok-abc"),
+        "attach_bearer must copy the vault-stored token onto the transport"
+    );
 }

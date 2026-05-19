@@ -4,6 +4,9 @@ use async_trait::async_trait;
 use serde_json::Value;
 use thiserror::Error;
 
+// `TransportError` repeats the module name `transport`; kept so callers can
+// write `origin_mcp::TransportError` without disambiguating which module's
+// `Error` they want.
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Error)]
 pub enum TransportError {

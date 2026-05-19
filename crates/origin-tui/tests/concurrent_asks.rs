@@ -28,13 +28,16 @@ async fn two_concurrent_asks_both_deliver_via_queue() {
     let (tx, mut rx) = mpsc::channel::<PanelEvent>(8);
     let prompter = Arc::new(SidePanelPrompter::new(tx));
 
+    // Spawn the first ask, then wait for its event to land in the mpsc queue
+    // before spawning the second. The first event's arrival is a causal proof
+    // that ask #1 took the submit lock, sent its event, released the lock, and
+    // is now parked on its oneshot — so ask #2 will follow with id+1.
     let p1 = prompter.clone();
     let h1 = tokio::spawn(async move { p1.ask(&META_READ, "/etc/hosts").await });
+    let ev1 = rx.recv().await.expect("ev1");
+
     let p2 = prompter.clone();
     let h2 = tokio::spawn(async move { p2.ask(&META_BASH, "ls -la").await });
-
-    // Pull both events out of the queue — they must arrive in submission order.
-    let ev1 = rx.recv().await.expect("ev1");
     let ev2 = rx.recv().await.expect("ev2");
     let (id1, id2) = match (ev1, ev2) {
         (

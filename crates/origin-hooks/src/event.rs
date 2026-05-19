@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Lifecycle event emitted by the daemon for each hook to inspect.
+// `LifecycleEvent` repeats the module name `event`; suppressed so callers can
+// write `origin_hooks::LifecycleEvent` without disambiguating which module.
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

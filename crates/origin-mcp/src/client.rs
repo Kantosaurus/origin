@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
+// `ClientError` repeats the module name `client`; suppressed so callers can
+// write `origin_mcp::ClientError` without a module-disambiguating rename.
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -42,6 +44,9 @@ pub struct ToolCallResult {
     pub content: Value,
 }
 
+// `McpClient` — the `Mcp` prefix repeats the module name `client`, but the
+// `Mcp*` prefix is the convention across this crate (see `McpTool`,
+// `McpToolProxy`) so disambiguates well at use sites.
 #[allow(clippy::module_name_repetitions)]
 pub struct McpClient {
     transport: Arc<dyn Transport>,

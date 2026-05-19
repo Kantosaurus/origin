@@ -11,8 +11,10 @@ use eventsource_stream::Eventsource;
 use futures_util::stream::{Stream, StreamExt};
 use reqwest::Client;
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
+// `HttpTransport` shares the suffix with the `transport_http` module, but the
+// `Http*` prefix is the disambiguating convention across the transports.
 #[allow(clippy::module_name_repetitions)]
 pub struct HttpTransport {
     client: Client,
@@ -39,7 +41,13 @@ impl HttpTransport {
         *self.bearer.lock().expect("bearer mutex poisoned") = token;
     }
 
-    fn current_bearer(&self) -> Option<String> {
+    /// Inspect the currently configured bearer (used by tests + the SSE/POST
+    /// paths). Returns `None` when no token has been attached.
+    ///
+    /// # Panics
+    /// Panics if the bearer mutex has been poisoned by a prior panic.
+    #[must_use]
+    pub fn current_bearer(&self) -> Option<String> {
         #[allow(clippy::expect_used)] // same justification as set_bearer
         self.bearer.lock().expect("bearer mutex poisoned").clone()
     }
@@ -95,8 +103,3 @@ impl Transport for HttpTransport {
     }
 }
 
-// Silence the unused-import warning when neither caller path threads `Arc<HttpTransport>`.
-#[allow(dead_code)]
-fn _arc_check(t: Arc<HttpTransport>) -> Arc<dyn Transport> {
-    t
-}

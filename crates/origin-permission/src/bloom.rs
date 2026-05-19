@@ -1,9 +1,14 @@
-//! 4-KiB growable bloom over the rule set (N9.2).
+//! Small growable bloom over the rule set (N9.2).
 //!
 //! Used as a pre-check before the rule walk: if the bloom says "absent" we
 //! skip the rule walk entirely (≥95% rejection on the test mix). False
 //! positives walk the rules — a few extra hashes — and never affect
 //! correctness.
+//!
+//! Sizing: `GrowableBloom::new(0.01, target_count)` starts in the few-hundred-
+//! bits range and auto-grows as items are inserted. The "4 KiB" descriptor in
+//! the original spec was an upper-bound estimate for ≈1000 rules; small rule
+//! sets stay well under that.
 
 use crate::rules::Rule;
 use growable_bloom_filter::GrowableBloom;
