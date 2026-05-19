@@ -6,12 +6,14 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 mod chunker;
+pub mod dict;
 mod hash;
 mod packfile;
 mod refs;
 mod store;
 
 pub use chunker::{chunks, ChunkIter, ChunkRef};
+pub use dict::{DictError, DictVersion};
 pub use hash::Hash;
 pub use packfile::{PackBuilder, PackError, PackReader, PackSlice};
 pub use refs::{RefError, RefTable};

@@ -60,6 +60,7 @@ struct Inner {
     cold_packs: Vec<PackReader>,
     warm_index: HashMap<Hash, usize>,
     cold_index: HashMap<Hash, usize>,
+    active_dict: Option<(crate::dict::DictVersion, Vec<u8>)>,
 }
 
 /// Three-tier content-addressed store: Hot (LRU) → Warm (mmap) → Cold (zstd).
@@ -94,6 +95,7 @@ impl Store {
                 cold_packs,
                 warm_index,
                 cold_index,
+                active_dict: None,
             }),
         })
     }
@@ -155,8 +157,30 @@ impl Store {
         }
         if let Some(&idx) = inner.cold_index.get(&h) {
             if let Some(slice) = inner.cold_packs[idx].read(h) {
-                let dec = zstd::decode_all(slice.as_ref()).map_err(|e| StoreError::Zstd(e.to_string()))?;
-                return Ok(Some(dec));
+                let dict_bytes: Option<Vec<u8>> = inner.active_dict.as_ref().map(|(_, d)| d.clone());
+                let raw: Vec<u8> = slice.as_ref().to_vec();
+                // Release lock before decompression.
+                drop(inner);
+                let decoded = if let Some(dict) = &dict_bytes {
+                    use std::io::Read;
+                    use zstd::stream::Decoder;
+                    let cursor = std::io::Cursor::new(raw.as_slice());
+                    let dec_result = (|| -> Result<Vec<u8>, std::io::Error> {
+                        let mut d = Decoder::with_dictionary(cursor, dict)?;
+                        let mut buf = Vec::new();
+                        d.read_to_end(&mut buf)?;
+                        Ok(buf)
+                    })();
+                    match dec_result {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            zstd::decode_all(raw.as_slice()).map_err(|e| StoreError::Zstd(e.to_string()))?
+                        }
+                    }
+                } else {
+                    zstd::decode_all(raw.as_slice()).map_err(|e| StoreError::Zstd(e.to_string()))?
+                };
+                return Ok(Some(decoded));
             }
         }
         Ok(None)
@@ -188,17 +212,107 @@ impl Store {
             return Ok(());
         };
 
-        let compressed = zstd::encode_all(&bytes[..], inner.cfg.cold_zstd_level)
-            .map_err(|e| StoreError::Zstd(e.to_string()))?;
+        let cold_level = inner.cfg.cold_zstd_level;
+        let dict_bytes: Option<Vec<u8>> = inner.active_dict.as_ref().map(|(_, d)| d.clone());
         let next_idx = inner.cold_packs.len();
         let path = inner.cfg.root.join("cold").join(format!("c{next_idx:08}.pack"));
+        // Release lock before I/O.
+        drop(inner);
+
+        let compressed = if let Some(dict) = &dict_bytes {
+            use std::io::Write;
+            use zstd::stream::Encoder;
+            let mut enc = Encoder::with_dictionary(Vec::new(), cold_level, dict)
+                .map_err(|e| StoreError::Zstd(e.to_string()))?;
+            enc.write_all(&bytes)
+                .map_err(|e| StoreError::Zstd(e.to_string()))?;
+            enc.finish().map_err(|e| StoreError::Zstd(e.to_string()))?
+        } else {
+            zstd::encode_all(&bytes[..], cold_level).map_err(|e| StoreError::Zstd(e.to_string()))?
+        };
+
         let mut b = PackBuilder::create(&path)?;
         b.append(h, &compressed)?;
         let _ = b.finalize()?;
         let r = PackReader::open(&path)?;
+
+        let mut inner = self.inner.lock();
         inner.cold_index.insert(h, next_idx);
         inner.cold_packs.push(r);
         Ok(())
+    }
+
+    /// Train a dict from up to `n_samples` decoded cold-tier shards and
+    /// persist it under the store root. Subsequent cold writes use this dict.
+    ///
+    /// # Errors
+    /// Propagates `DictError` (wrapped via `StoreError::Zstd`) on training
+    /// failure and `StoreError::Io` on file write failure.
+    pub fn train_dict_from_sample(&self, n_samples: usize) -> Result<crate::dict::DictVersion, StoreError> {
+        let samples = self.collect_samples(n_samples)?;
+        let dict_bytes = crate::dict::train(&samples).map_err(|e| StoreError::Zstd(e.to_string()))?;
+        let v = self.next_dict_version();
+        let root = self.inner.lock().cfg.root.clone();
+        let dict_path = root.join(format!("dict-v{}.zstd", v.0));
+        std::fs::write(&dict_path, &dict_bytes)?;
+        let meta_path = root.join("dict_meta");
+        std::fs::write(meta_path, v.0.to_string())?;
+        self.inner.lock().active_dict = Some((v, dict_bytes));
+        Ok(v)
+    }
+
+    /// Return the currently active dictionary version, if any.
+    #[must_use]
+    pub fn active_dict_version(&self) -> Option<crate::dict::DictVersion> {
+        self.inner.lock().active_dict.as_ref().map(|(v, _)| *v)
+    }
+
+    fn collect_samples(&self, n: usize) -> Result<Vec<Vec<u8>>, StoreError> {
+        // Collect raw byte slices while holding the lock; cold slices are
+        // zstd-compressed (needs_decomp=true), warm slices are raw.
+        // We release the lock before doing the actual decompression I/O.
+        let raw_slices: Vec<(Vec<u8>, bool)> = {
+            let inner = self.inner.lock();
+            let mut slices = Vec::new();
+            // Prefer cold-tier (compressed) samples first.
+            for (h, &pack_idx) in &inner.cold_index {
+                if slices.len() >= n {
+                    break;
+                }
+                if let Some(slice) = inner.cold_packs[pack_idx].read(*h) {
+                    slices.push((slice.as_ref().to_vec(), true));
+                }
+            }
+            // Fall back to warm-tier (uncompressed) samples when cold is sparse.
+            for (h, &pack_idx) in &inner.warm_index {
+                if slices.len() >= n {
+                    break;
+                }
+                if let Some(slice) = inner.warm_packs[pack_idx].read(*h) {
+                    slices.push((slice.as_ref().to_vec(), false));
+                }
+            }
+            // Also include the hot / warm-pending in-memory items.
+            for (_, v) in inner.warm_pending.iter().take(n.saturating_sub(slices.len())) {
+                slices.push((v.clone(), false));
+            }
+            slices
+        };
+        let mut samples = Vec::with_capacity(raw_slices.len());
+        for (raw, needs_decomp) in raw_slices {
+            let dec = if needs_decomp {
+                zstd::decode_all(raw.as_slice()).map_err(|e| StoreError::Zstd(e.to_string()))?
+            } else {
+                raw
+            };
+            samples.push(dec);
+        }
+        Ok(samples)
+    }
+
+    fn next_dict_version(&self) -> crate::dict::DictVersion {
+        let cur = self.inner.lock().active_dict.as_ref().map_or(0, |(v, _)| v.0);
+        crate::dict::DictVersion(cur + 1)
     }
 }
 
