@@ -195,6 +195,10 @@ impl MemIndex {
                     * row.cluster_priority
                     * (1.0 + row.edge_boost);
 
+                if !score.is_finite() {
+                    return None;
+                }
+
                 Some(Candidate {
                     id,
                     raw_sim,
