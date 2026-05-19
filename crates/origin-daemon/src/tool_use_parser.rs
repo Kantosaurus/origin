@@ -85,6 +85,9 @@ impl ToolUseParser {
     pub fn begin_tool_use(&mut self, name: impl Into<String>) {
         self.tool_name = Some(name.into());
         self.state = State::BeforeKey;
+        self.key_buf.clear();
+        self.val_buf.clear();
+        self.nest_depth = 0;
     }
 
     /// Feed the next fragment and collect any completed field events.
@@ -174,11 +177,31 @@ impl ToolUseParser {
                 _ => {} // whitespace or other ignored bytes
             },
             State::InBoolNull => {
+                // If a structural delimiter arrives before the literal matches, bail to
+                // AfterValue and re-process the delimiter so a malformed literal can't
+                // swallow the rest of the object.
+                if b == b'}' || b == b',' {
+                    self.val_buf.clear();
+                    self.state = State::AfterValue;
+                    self.step(b, out);
+                    return;
+                }
                 self.val_buf.push(b);
+                if self.val_buf.len() > 5 {
+                    // Malformed literal — abandon and resync at the next delimiter.
+                    self.val_buf.clear();
+                    self.state = State::AfterValue;
+                    return;
+                }
                 if matches!(self.val_buf.as_slice(), b"true" | b"false" | b"null") {
                     self.emit_field(out);
                 }
             }
+            // FIXME(N10.10): `InNested` tracks `{`/`[`/`}`/`]` as raw bytes without
+            // distinguishing those that appear inside string literals. Adversarial or
+            // unusual provider output could skew `nest_depth` and emit too early/late.
+            // Fine for Read/Glob/Grep (no JSON-in-string values); revisit with the
+            // full fuzz corpus in Phase 14.
             State::InNested => {
                 self.val_buf.push(b);
                 match b {
