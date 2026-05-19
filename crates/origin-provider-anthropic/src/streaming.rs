@@ -121,6 +121,11 @@ where
                 let payload = [id.as_bytes(), b"\0", name.as_bytes()].concat();
                 ring.publish(&TokenEvent::new(TokenKind::ToolUseStart, payload))?;
             }
+            // TODO(P3.4 follow-up): preserve `index` here so the daemon can route
+            // concurrent tool_use deltas correctly. Until then, the agent loop
+            // uses "most-recently-started parser" routing which is correct for
+            // sequential tool_use blocks (the common case) but mis-routes when
+            // Anthropic interleaves concurrent block deltas by index.
             WireEvent::ContentBlockDelta {
                 delta: WireDelta::TextDelta { text },
                 ..

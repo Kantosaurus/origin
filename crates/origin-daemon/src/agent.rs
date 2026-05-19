@@ -8,7 +8,7 @@ use origin_permission::{check, prompt::Prompter, Outcome};
 use origin_provider::{ChatRequest, Provider};
 use origin_tools::{registry_iter, SideEffects, ToolMeta};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::task::JoinHandle;
@@ -373,10 +373,12 @@ fn try_speculative_spawn(
     if !matches!(meta.side_effects, SideEffects::Pure) {
         return false;
     }
-    // Re-parse the accumulated bytes accumulated so far. For single-field pure
-    // tools (Read/Glob/Grep) the first Field event arrives with a complete JSON
-    // value, so `from_slice` succeeds here. Multi-field partial args are
-    // best-effort: if parse fails we skip the spawn.
+    // Try to parse the accumulated bytes as a complete JSON object. For
+    // single-field tools (Read, Glob) this succeeds at the first `Field`
+    // event because the value's closing quote is also the start of the
+    // outer `}`. For multi-field tools (Grep with `pattern` + `root`) the
+    // first attempt may fail because only one field has arrived — we'll
+    // retry on the next Field event when more bytes have accumulated.
     let buf = tool_input_bufs
         .get(tool_use_id)
         .map_or(&[] as &[u8], Vec::as_slice);
@@ -402,9 +404,10 @@ async fn drain_subscriber_into_response(
     let mut parsers: HashMap<String, ToolUseParser> = HashMap::new();
     let mut active_id: Option<String> = None;
     let mut tool_input_bufs: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut tool_input_order: Vec<String> = Vec::new();
     let mut tool_names: HashMap<String, String> = HashMap::new();
     let mut registry = SpeculativeRegistry::default();
-    let mut speculative_spawned: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut speculative_spawned: HashSet<String> = HashSet::new();
 
     while let Some(ev) = sub
         .next()
@@ -422,7 +425,16 @@ async fn drain_subscriber_into_response(
                     parsers.insert(id.to_owned(), parser);
                     tool_names.insert(id.to_owned(), name.to_owned());
                     tool_input_bufs.insert(id.to_owned(), Vec::new());
+                    if !tool_input_order.contains(&id.to_owned()) {
+                        tool_input_order.push(id.to_owned());
+                    }
                     active_id = Some(id.to_owned());
+                } else {
+                    tracing::warn!(
+                        bytes = ev.payload().len(),
+                        "malformed ToolUseStart payload; \
+                         routing for subsequent ToolUseDelta events may be incorrect"
+                    );
                 }
             }
             origin_stream::TokenKind::ToolUseDelta => {
@@ -466,12 +478,15 @@ async fn drain_subscriber_into_response(
             cache_marker: None,
         });
     }
-    for (id, buf) in tool_input_bufs {
-        let name = tool_names.get(&id).cloned().unwrap_or_default();
+    for id in &tool_input_order {
+        let Some(buf) = tool_input_bufs.get(id) else {
+            continue;
+        };
+        let name = tool_names.get(id).cloned().unwrap_or_default();
         blocks.push(Block::ToolUse {
-            id,
+            id: id.clone(),
             name,
-            input_json: buf,
+            input_json: buf.clone(),
             cache_marker: None,
         });
     }
