@@ -18,6 +18,7 @@ thiserror = "1"
 reqwest = { workspace = true }
 eventsource-stream = { workspace = true }
 futures-util = "0.3"
+origin-tools = { path = "../origin-tools" }
 
 [dev-dependencies]
 tempfile = "3"
