@@ -7,6 +7,7 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt as _;
 use origin_cli::input::{reduce, InputAction};
+use origin_cli::plan_panel_wiring::Wiring as PlanPanelWiring;
 use origin_cli::tui::App;
 use origin_daemon::protocol::{ClientMessage, StreamEvent};
 use origin_ipc::frame::{encode, FrameKind};
@@ -98,6 +99,10 @@ async fn run_event_loop(
     path: &str,
     model: &str,
 ) -> Result<()> {
+    // Plan side panel wiring (P9.9). The widget is in-process today; the
+    // daemon-driven `PlanHandle` broadcast subscription lands in P10. See
+    // `plan_panel_wiring.rs` for the TODO marking that integration seam.
+    let _plan_panel = PlanPanelWiring::new();
     let mut input_stream = crossterm::event::EventStream::new();
     while let Some(maybe_ev) = input_stream.next().await {
         if let crossterm::event::Event::Key(ev) = maybe_ev? {

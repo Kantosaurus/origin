@@ -32,6 +32,7 @@ origin-stream = { path = "../origin-stream" }
 origin-tools = { path = "../origin-tools" }
 origin-permission = { path = "../origin-permission" }
 origin-cas = { path = "../origin-cas" }
+origin-plan = { path = "../origin-plan" }
 async-trait = "0.1"
 parking_lot = "0.12"
 blake3 = "1"
