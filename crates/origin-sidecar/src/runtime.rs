@@ -107,7 +107,7 @@ impl Sidecar {
     }
 }
 
-async fn dispatch_stub(provider: &Arc<dyn Provider>, _cas: &Arc<Store>, model: &str, job: SidecarJob) {
+async fn dispatch_stub(provider: &Arc<dyn Provider>, cas: &Arc<Store>, model: &str, job: SidecarJob) {
     // P5.2: Summarize arm calls `summarize::run`; P5.3 replaces the Extract arm.
     match job {
         SidecarJob::Summarize {
@@ -127,7 +127,7 @@ async fn dispatch_stub(provider: &Arc<dyn Provider>, _cas: &Arc<Store>, model: &
             .await;
         }
         SidecarJob::Extract { handle, deliver_to } => {
-            deliver_to.deliver(handle, handle).await;
+            crate::extract::run(cas, handle, deliver_to.as_ref()).await;
         }
     }
 }

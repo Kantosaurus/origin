@@ -7,7 +7,7 @@ use origin_cas::{Hash, Store};
 use origin_core::types::{Block, Message, Role};
 use origin_permission::{check, prompt::Prompter, Outcome};
 use origin_provider::{ChatRequest, Provider};
-use origin_sidecar::{Sidecar, SummaryDeliverer};
+use origin_sidecar::{ExtractDeliverer, Sidecar, SummaryDeliverer};
 use origin_tools::{registry_iter, SideEffects, ToolMeta};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -108,6 +108,21 @@ impl SummaryDeliverer for SessionStoreSummaryDeliverer {
             let _ = store.update_summary(&s, turn_index, &sum);
         })
         .await;
+    }
+}
+
+/// No-op deliverer used when the daemon fires Extract for large tool outputs.
+///
+/// The outline handle's existence in CAS is sufficient for P5.3 scope.
+/// Future phases may surface it via the side panel or Recall.
+#[derive(Debug)]
+pub struct NoopExtractDeliverer;
+
+#[async_trait::async_trait]
+impl ExtractDeliverer for NoopExtractDeliverer {
+    async fn deliver(&self, _source: origin_cas::Hash, _outline: origin_cas::Hash) {
+        // The outline handle's existence in CAS is sufficient for P5.3 scope.
+        // Future phases may surface it via the side panel or Recall.
     }
 }
 
@@ -313,6 +328,16 @@ pub async fn run_loop(
                 let h: Hash = cas
                     .put(&result_bytes)
                     .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
+
+                // Fire Extract job for large tool outputs (P5.3, N2.5.c).
+                if result_bytes.len() >= origin_sidecar::extract::EXTRACT_THRESHOLD_BYTES {
+                    if let Some(sidecar) = &opts.sidecar {
+                        let _ = sidecar.submit(origin_sidecar::SidecarJob::Extract {
+                            handle: h,
+                            deliver_to: Box::new(NoopExtractDeliverer),
+                        });
+                    }
+                }
 
                 // Record into the memoization cache for subsequent turns
                 // within this session. Skip-listed tools and hits are not

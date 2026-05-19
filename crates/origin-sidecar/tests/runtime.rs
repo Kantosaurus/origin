@@ -85,8 +85,10 @@ async fn submit_summarize_drives_delivery() {
 #[tokio::test(flavor = "current_thread")]
 async fn submit_extract_drives_delivery() {
     let counter = Arc::new(AtomicU32::new(0));
-    let sidecar = Sidecar::spawn(Arc::new(StubProvider), store(), SidecarConfig::default());
-    let h = Hash::of(b"placeholder");
+    let cas = store();
+    let body = b"the quick brown fox\n".repeat(1000); // > 16 KB
+    let h = cas.put(&body).expect("put body");
+    let sidecar = Sidecar::spawn(Arc::new(StubProvider), cas.clone(), SidecarConfig::default());
     sidecar
         .submit(SidecarJob::Extract {
             handle: h,
