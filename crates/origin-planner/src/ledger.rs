@@ -73,10 +73,10 @@ impl PrefixLedger {
         self.table.entry(id).or_insert(Stability { score: 0, band });
     }
 
-    /// Record a cache hit. `tokens_read` is informational only at this stage
-    /// (real workloads will weigh by token count once Phase 3 telemetry lands
-    /// in P3.8); kept in the signature so callers don't change once weighting
-    /// is added.
+    /// Record a cache hit. `tokens_read` is informational only at this stage; real workloads
+    /// will weigh by token count once telemetry lands in a future phase
+    /// (no phase tag yet — currently unscheduled). Kept in the signature so callers don't
+    /// change once weighting is added.
     pub fn record_hit(&mut self, id: SectionId, _tokens_read: u32) {
         let entry = self.table.entry(id).or_insert(Stability {
             score: 0,

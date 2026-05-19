@@ -224,7 +224,7 @@ fn message_to_wire<'a>(m: &'a Message, plan: Option<&Plan>, msg_idx: usize) -> w
             // - a plan is present
             // - this is the first message (msg_idx == 0)
             // - block_idx is in the plan's marker_indices
-            // TODO(P3.6): lift the `msg_idx == 0` gate once handle-substitution lands and
+            // TODO(N4.3/Phase 11): lift the `msg_idx == 0` gate once handle-substitution lands and
             // the planner's marker_indices() map to a stable section-to-wire-block index.
             // Also: enumerate over wire-block index (post `block_to_wire` filter) to avoid
             // index skew when assistant messages contain `Block::Thinking` (which is
@@ -311,8 +311,7 @@ fn expand_messages_for_wire(
                     .ok_or_else(|| ProviderError::Api("cas miss for tool result handle".into()))?;
 
                 // Phase 3 stub: any handle in the active turn is treated as Volatile.
-                // The full section-to-block mapping arrives with the live planner
-                // wiring in P3.8.
+                // The full section-to-block mapping arrives with the N4.3 encoder codegen in Phase 11.
                 let band = plan.map_or(origin_planner::Band::Volatile, |_p| {
                     origin_planner::Band::Volatile
                 });
