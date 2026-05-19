@@ -1,8 +1,13 @@
-//! Shared dispatch + per-session memoization (N5.4).
+//! Shared dispatch + per-session memoization (N5.4) and memory-tool support types.
 //!
-//! The agent looks up `(tool_name, normalized_input)` in `Cache` before
-//! actually running the tool. `Bash`, `Edit`, and `Write` are on the deny-list
-//! because their side effects mean a cached result could be stale.
+//! - `Cache` / `NormalizedInput` / `CacheHit`: the agent looks up
+//!   `(tool_name, normalized_input)` in `Cache` before actually running the
+//!   tool. `Bash`, `Edit`, and `Write` are on the deny-list because their
+//!   side effects mean a cached result could be stale. (Phase 3.)
+//! - `MemoryHandle` / `SearchHit` / `MemoryToolError`: the trait the dispatch
+//!   passes into memory-aware tools (`mem_search` / `mem_save` / `mem_forget`).
+//!   The daemon implements `MemoryHandle` by wrapping `origin_mem` types so
+//!   `origin-tools` itself does not depend on `origin-mem`. (Phase 6.)
 
 use blake3::Hash as Blake3Hash;
 use std::collections::HashMap;
@@ -73,4 +78,65 @@ impl Cache {
             },
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 — memory-tool support types
+// ---------------------------------------------------------------------------
+
+/// A semantic-search hit returned by [`MemoryHandle::search`].
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    /// ULID string identifying the memory entry.
+    pub id: String,
+    /// Short text preview of the stored body.
+    pub preview: String,
+    /// Cosine similarity score in [0, 1].
+    pub score: f32,
+    /// Age of the entry in fractional days.
+    pub age_days: f32,
+    /// User-supplied tags attached to the entry.
+    pub tags: Vec<String>,
+}
+
+/// Errors that memory tool operations can surface.
+#[derive(Debug, thiserror::Error)]
+pub enum MemoryToolError {
+    /// The memory subsystem is not reachable (e.g. daemon not running).
+    #[error("memory subsystem unavailable")]
+    Unavailable,
+    /// The supplied id string is not a valid ULID.
+    #[error("invalid id: {0}")]
+    BadId(String),
+    /// A storage-layer failure with a human-readable description.
+    #[error("storage: {0}")]
+    Storage(String),
+}
+
+/// Thin object-safe handle the tool dispatch passes into memory-aware tools.
+///
+/// The daemon will implement this by wrapping `origin_mem`'s `MemoryStore`,
+/// `Embedder`, and `MemIndex`. `origin-tools` itself remains free of that dep.
+pub trait MemoryHandle: Send + Sync + std::fmt::Debug {
+    /// Search top-k entries by semantic similarity to `query`.
+    ///
+    /// When `fresh` is `true`, implementations should bias toward recently saved
+    /// entries when ranking is otherwise tied.
+    ///
+    /// # Errors
+    /// Returns [`MemoryToolError`] on subsystem failure.
+    fn search(&self, query: &str, k: usize, fresh: bool) -> Result<Vec<SearchHit>, MemoryToolError>;
+
+    /// Persist `body` with optional `tags`; returns the new entry's ULID string.
+    ///
+    /// # Errors
+    /// Returns [`MemoryToolError`] on subsystem failure.
+    fn save(&self, body: &str, tags: &[String]) -> Result<String, MemoryToolError>;
+
+    /// Hard-delete the entry identified by the ULID `id`.
+    ///
+    /// # Errors
+    /// Returns [`MemoryToolError::BadId`] if `id` is not a valid ULID or is
+    /// not found, and [`MemoryToolError::Storage`] on I/O failure.
+    fn forget(&self, id: &str) -> Result<(), MemoryToolError>;
 }

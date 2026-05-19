@@ -3,6 +3,7 @@
 //! Persistence (P1.12) wraps this with `SQLite` writes per turn.
 
 use origin_core::types::{Message, MessageId};
+use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct Session {
@@ -10,6 +11,11 @@ pub struct Session {
     pub provider_name: String,
     pub model: String,
     pub messages: Vec<Message>,
+    /// Memory proposals emitted at the end of an assistant turn that the user
+    /// has not yet accepted/rejected/edited. Keyed by `proposal_id`.
+    pub pending_proposals: HashMap<u32, origin_mem::MemoryProposal>,
+    /// Monotonic counter handed to [`origin_mem::Proposer::scan`].
+    pub next_proposal_id: u32,
 }
 
 impl Session {
@@ -20,6 +26,8 @@ impl Session {
             provider_name: provider_name.into(),
             model: model.into(),
             messages: Vec::new(),
+            pending_proposals: HashMap::new(),
+            next_proposal_id: 1,
         }
     }
 

@@ -38,35 +38,43 @@ pub struct PromptReply {
     pub turns: u32,
 }
 
-/// Inbound IPC message from the CLI. Internally tagged on `kind` so the
-/// daemon can dispatch `Prompt` requests vs runtime control messages
-/// (e.g. `/account` switches) over the same `Request` frame.
+/// Inbound IPC message from the CLI.
+///
+/// Internally tagged on `kind` so the daemon can dispatch `Prompt` requests
+/// vs runtime control messages (e.g. `/account` switches, `/mem` memory
+/// decisions) over the same `Request` frame.
+///
+/// P6.7 introduces `MemoryDecision`; P8.9 introduces `SwitchAccount`.
+/// Legacy clients that still send raw [`PromptRequest`] JSON are handled by
+/// a fallback in the daemon main (`from_legacy_prompt_request`).
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientMessage {
-    /// A user prompt to run through the agent loop. Fields mirror
-    /// [`PromptRequest`] flattened into the message so the internally-tagged
-    /// representation stays a single JSON map.
-    Prompt {
-        system: String,
-        model: String,
-        user_text: String,
-    },
+    /// A user prompt to run through the agent loop.
+    Prompt(PromptRequest),
     /// Hot-swap the active provider/account credential without restarting
     /// the daemon.
     SwitchAccount { provider: String, account_id: String },
+    /// User decision on a pending memory proposal surfaced via
+    /// [`StreamEvent::MemoryProposed`].
+    MemoryDecision { proposal_id: u32, action: MemoryAction },
 }
 
 impl ClientMessage {
     /// Convenience constructor for the common `Prompt` variant.
     #[must_use]
-    pub fn prompt(req: PromptRequest) -> Self {
-        Self::Prompt {
-            system: req.system,
-            model: req.model,
-            user_text: req.user_text,
-        }
+    pub const fn prompt(req: PromptRequest) -> Self {
+        Self::Prompt(req)
     }
+}
+
+/// Action the user took on a pending memory proposal.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MemoryAction {
+    Accept,
+    Reject,
+    Edit { body: String, tags: Vec<String> },
 }
 
 /// One in-flight event during a streaming response. Encoded as JSON inside
@@ -96,5 +104,13 @@ pub enum StreamEvent {
     ProviderActive {
         provider: String,
         account_id: String,
+    },
+    /// Surfaced at turn end when the [`origin_mem::Proposer`] extracts a
+    /// memory candidate from the user/assistant exchange. The CLI displays
+    /// these and lets the user `/mem accept|reject|edit <id>` them.
+    MemoryProposed {
+        proposal_id: u32,
+        body: String,
+        suggested_tags: Vec<String>,
     },
 }

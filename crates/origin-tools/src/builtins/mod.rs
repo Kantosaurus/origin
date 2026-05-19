@@ -8,6 +8,7 @@ pub mod graph_query;
 pub mod graph_rebuild;
 pub mod graph_summarize;
 pub mod grep_tool;
+pub mod mem;
 pub mod read;
 pub mod recall;
 pub mod task;

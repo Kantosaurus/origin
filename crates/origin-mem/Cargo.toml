@@ -1,0 +1,41 @@
+[package]
+name = "origin-mem"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# NOTE (deviation from P6.1 spec): the plan called for `load-dynamic` so the
+# ONNX Runtime shared library is resolved at runtime via `libloading`. That
+# requires shipping or pre-installing a system `onnxruntime.{dll,dylib,so}`.
+# For Phase 6.1 we use `download-binaries` instead so `cargo test` is
+# hermetic — ort-sys fetches a vendored ORT binary at build time, no PATH
+# dance, no manual install. Phase 12 (multi-runtime + arenas) can switch
+# back to `load-dynamic` when we own the loader policy ourselves.
+ort         = { version = "2.0.0-rc.4", default-features = false, features = ["ndarray", "download-binaries", "copy-dylibs"] }
+ndarray     = "0.15"
+tokenizers  = { version = "0.20", default-features = false, features = ["onig"] }
+hnsw_rs     = "0.3"
+rand        = "0.8"
+rand_chacha = "0.3"
+rusqlite    = { version = "0.31", features = ["bundled", "blob"] }
+ulid        = { version = "1", features = ["serde"] }
+blake3      = "1"
+thiserror   = "1"
+sha2        = "0.10"
+ureq        = { version = "2", default-features = false, features = ["tls"] }
+bitvec      = "1"
+parking_lot = "0.12"
+regex       = "1"
+tracing     = "0.1"
+origin-cas   = { path = "../origin-cas" }
+origin-store = { path = "../origin-store" }
+
+[dev-dependencies]
+proptest    = "1"
+tempfile    = "3"

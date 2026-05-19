@@ -37,6 +37,7 @@ origin-codegraph        = { path = "../origin-codegraph" }
 origin-stream           = { path = "../origin-stream" }
 origin-keyvault         = { path = "../origin-keyvault" }
 origin-sidecar          = { path = "../origin-sidecar" }
+origin-mem              = { path = "../origin-mem" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "sync"] }
 anyhow = "1"
 tracing = "0.1"
@@ -49,12 +50,14 @@ rkyv        = { version = "0.7", features = ["validation", "bytecheck"] }
 ulid        = "1"
 rusqlite    = { version = "0.31", features = ["bundled"] }
 hex         = "0.4"
+parking_lot = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 sysinfo  = "0.30"
 proptest = { version = "=1.4.0", default-features = false, features = ["std"] }
+wiremock = "0.6"
 
 [lib]
 name = "origin_daemon"
