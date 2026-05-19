@@ -100,6 +100,25 @@ impl Grid {
         }
     }
 
+    /// Construct a grid filled with the given `cell`.
+    ///
+    /// Useful for initialising scratch/shadow grids with a sentinel value
+    /// so that the first damage-diff against them covers every cell.
+    #[must_use]
+    pub fn new_filled(cols: u16, rows: u16, cell: Cell) -> Self {
+        let n = usize::from(cols) * usize::from(rows);
+        Self {
+            cols,
+            rows,
+            cells: vec![cell; n],
+        }
+    }
+
+    /// Fill every cell with `cell` in place (without reallocating).
+    pub fn fill(&mut self, cell: Cell) {
+        self.cells.fill(cell);
+    }
+
     #[must_use]
     pub const fn cols(&self) -> u16 {
         self.cols

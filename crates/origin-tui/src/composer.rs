@@ -5,7 +5,7 @@
 use std::io::Write as _;
 
 use crate::damage::{self, Run};
-use crate::grid::Attr;
+use crate::grid::{Attr, Cell};
 use crate::Grid;
 
 /// Three-pane terminal composer.
@@ -149,24 +149,40 @@ const fn unpack(c: u32) -> (u8, u8, u8) {
 impl Composer {
     /// Create a new `Composer` for a terminal of `cols × rows`.
     ///
-    /// Side panel starts visible; all grids are blank.
+    /// Both live and scratch grids start filled with a NUL-glyph sentinel
+    /// (distinct from `Cell::blank()` whose glyph is `' '`).  This means:
+    ///
+    /// * An immediate `frame()` call on a freshly constructed `Composer`
+    ///   returns empty bytes (live == scratch → no damage).
+    /// * The first `draw()` call clears the live panes to `Cell::blank()`
+    ///   (glyph `' '`), which differs from the NUL-glyph scratch, so the
+    ///   subsequent `frame()` emits **every** live cell — including space
+    ///   characters that would otherwise look identical to blank scratch.
     #[must_use]
     pub fn new(cols: u16, rows: u16) -> Self {
         let side_visible = true;
         let side_cols = compute_side_cols(cols, side_visible);
         let pane_rows = rows.saturating_sub(3);
         let main_cols = cols.saturating_sub(side_cols);
+        // NUL-glyph sentinel: distinct from blank (' ') so the first draw()
+        // that clears to blank triggers a full repaint of every cell.
+        let sentinel = Cell {
+            glyph: 0,
+            fg: 0,
+            bg: 0,
+            attr: 0,
+        };
 
         Self {
             cols,
             rows,
             side_cols,
-            main: Grid::new(main_cols, pane_rows),
-            side: Grid::new(side_cols.max(1), pane_rows),
-            prompt: Grid::new(cols, 3),
-            scratch_main: Grid::new(main_cols, pane_rows),
-            scratch_side: Grid::new(side_cols.max(1), pane_rows),
-            scratch_prompt: Grid::new(cols, 3),
+            main: Grid::new_filled(main_cols, pane_rows, sentinel),
+            side: Grid::new_filled(side_cols.max(1), pane_rows, sentinel),
+            prompt: Grid::new_filled(cols, 3, sentinel),
+            scratch_main: Grid::new_filled(main_cols, pane_rows, sentinel),
+            scratch_side: Grid::new_filled(side_cols.max(1), pane_rows, sentinel),
+            scratch_prompt: Grid::new_filled(cols, 3, sentinel),
             side_visible,
         }
     }

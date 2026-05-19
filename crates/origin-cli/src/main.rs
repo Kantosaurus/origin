@@ -1,18 +1,20 @@
 use std::env;
-use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use futures_util::StreamExt as _;
 use origin_cli::input::{reduce, InputAction};
-use origin_cli::tui::{draw, App};
+use origin_cli::tui::App;
 use origin_daemon::protocol::StreamEvent;
 use origin_ipc::frame::{encode, FrameKind};
 use origin_ipc::transport::Connector;
-use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
+use origin_tui::composer::Composer;
+use origin_tui::scheduler::{Handle, Scheduler};
+use origin_tui::stream_widget::{Rect, StreamWidget};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
@@ -24,10 +26,14 @@ struct PromptRequest<'a> {
 
 #[derive(Deserialize)]
 struct PromptReply {
-    #[allow(dead_code)] // text is reconstructed live from stream deltas; we only need `turns` to finalize.
+    #[allow(dead_code)] // reconstructed live from stream deltas; only `turns` is used.
     assistant_text: String,
     turns: u32,
 }
+
+type SharedApp = Arc<Mutex<App>>;
+type SharedComposer = Arc<Mutex<Composer>>;
+type SharedWidget = Arc<Mutex<StreamWidget>>;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -35,76 +41,133 @@ async fn main() -> Result<()> {
     let model = env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".into());
 
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    execute!(std::io::stdout(), EnterAlternateScreen)?;
 
-    let mut app = App::new("anthropic", model.clone());
-    app.add_line(
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let main_cols = cols.saturating_sub(20);
+    let main_rows = rows.saturating_sub(3);
+
+    let composer: SharedComposer = Arc::new(Mutex::new(Composer::new(cols, rows)));
+    let widget: SharedWidget = Arc::new(Mutex::new(StreamWidget::new(Rect {
+        row: 0,
+        col: 0,
+        cols: main_cols,
+        rows: main_rows,
+    })));
+    let app: SharedApp = Arc::new(Mutex::new(App::new("anthropic", model.clone())));
+    app.lock().add_line(
         "",
         "Connected; type a prompt and press Enter. Ctrl-C / Esc to quit.",
     );
 
-    let result: Result<()> = async {
-        loop {
-            terminal.draw(|f| draw(f, &app))?;
-            if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(ev) = event::read()? {
-                    match reduce(&mut app.input, ev) {
-                        InputAction::Quit => break,
-                        InputAction::Submit(text) => {
-                            app.add_line("you> ", &text);
-                            app.start_assistant_turn();
-                            // Collect deltas + usage synchronously inside call_daemon
-                            // so we don't fight the borrow checker over `&mut app`
-                            // across the `terminal.draw(|f| draw(f, &app))` shared
-                            // borrow. We re-render between deltas inside the closure.
-                            let mut deltas: Vec<String> = Vec::new();
-                            let mut usage_events: Vec<(u32, u32, u32, u32)> = Vec::new();
-                            let reply = call_daemon(
-                                &path,
-                                &model,
-                                &text,
-                                |d| deltas.push(d.to_string()),
-                                |i, o, cr, cw| usage_events.push((i, o, cr, cw)),
-                            )
-                            .await;
-                            for d in &deltas {
-                                app.append_to_current_assistant(d);
-                            }
-                            match reply {
-                                Ok((r, elapsed)) => {
-                                    let mut sum = (0u32, 0u32, 0u32, 0u32);
-                                    for (i, o, cr, cw) in &usage_events {
-                                        sum.0 = sum.0.saturating_add(*i);
-                                        sum.1 = sum.1.saturating_add(*o);
-                                        sum.2 = sum.2.saturating_add(*cr);
-                                        sum.3 = sum.3.saturating_add(*cw);
-                                    }
-                                    app.record_usage(sum.0, sum.1, sum.2, sum.3, elapsed);
-                                    app.finalize_assistant_turn(r.turns);
-                                }
-                                Err(e) => {
-                                    // Drop the in-flight buffer on error; surface the
-                                    // error in scrollback under the standard prefix.
-                                    app.current_assistant = None;
-                                    app.add_line("error> ", &format!("{e}"));
-                                }
-                            }
-                        }
-                        _ => {}
+    let scheduler = Scheduler::new(Duration::from_millis(6));
+    let handle = scheduler.handle();
+    handle.mark_dirty();
+
+    let render_task = {
+        let c2 = composer.clone();
+        let a2 = app.clone();
+        let w2 = widget.clone();
+        tokio::spawn(async move {
+            scheduler
+                .run(move || {
+                    // Draw into composer, then collect frame bytes while lock is held,
+                    // then release locks before writing to stdout.
+                    let bytes = {
+                        let mut c = c2.lock();
+                        let mut w = w2.lock();
+                        a2.lock().draw(&mut c, &mut w);
+                        c.frame()
+                    };
+                    if !bytes.is_empty() {
+                        use std::io::Write as _;
+                        let _ = std::io::stdout().write_all(&bytes);
+                        let _ = std::io::stdout().flush();
                     }
+                })
+                .await;
+        })
+    };
+
+    let result = run_event_loop(app, composer, widget, handle, &path, &model).await;
+
+    render_task.abort();
+    disable_raw_mode()?;
+    execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    result
+}
+
+async fn run_event_loop(
+    app: SharedApp,
+    _composer: SharedComposer,
+    _widget: SharedWidget,
+    handle: Handle,
+    path: &str,
+    model: &str,
+) -> Result<()> {
+    let mut input_stream = crossterm::event::EventStream::new();
+    while let Some(maybe_ev) = input_stream.next().await {
+        if let crossterm::event::Event::Key(ev) = maybe_ev? {
+            let action = {
+                let mut a = app.lock();
+                reduce(&mut a.input, ev)
+            };
+            match action {
+                InputAction::Quit => break,
+                InputAction::Submit(text) => {
+                    handle_submit(&app, &handle, path, model, &text).await;
+                }
+                _ => {
+                    handle.mark_dirty();
                 }
             }
         }
-        Ok(())
     }
+    Ok(())
+}
+
+async fn handle_submit(app: &SharedApp, handle: &Handle, path: &str, model: &str, text: &str) {
+    {
+        let mut a = app.lock();
+        a.add_line("you> ", text);
+        a.start_assistant_turn();
+    }
+    handle.mark_dirty();
+
+    let mut deltas: Vec<String> = Vec::new();
+    let mut usage_events: Vec<(u32, u32, u32, u32)> = Vec::new();
+    let reply = call_daemon(
+        path,
+        model,
+        text,
+        |d| deltas.push(d.to_string()),
+        |i, o, cr, cw| usage_events.push((i, o, cr, cw)),
+    )
     .await;
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    result
+    let mut a = app.lock();
+    for d in &deltas {
+        a.append_to_current_assistant(d);
+    }
+    match reply {
+        Ok((r, elapsed)) => {
+            let mut sum = (0u32, 0u32, 0u32, 0u32);
+            for (i, o, cr, cw) in &usage_events {
+                sum.0 = sum.0.saturating_add(*i);
+                sum.1 = sum.1.saturating_add(*o);
+                sum.2 = sum.2.saturating_add(*cr);
+                sum.3 = sum.3.saturating_add(*cw);
+            }
+            a.record_usage(sum.0, sum.1, sum.2, sum.3, elapsed);
+            a.finalize_assistant_turn(r.turns);
+        }
+        Err(e) => {
+            a.current_assistant = None;
+            a.add_line("error> ", &format!("{e}"));
+        }
+    }
+    drop(a);
+    handle.mark_dirty();
 }
 
 async fn call_daemon(

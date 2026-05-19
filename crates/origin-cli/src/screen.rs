@@ -1,21 +1,7 @@
-//! Screen layout primitives.
+//! Screen layout primitives for the new origin-tui renderer.
+//!
+//! Layout is largely done inside `Composer`; this module just re-exports
+//! the cross-pane `Rect` for consumers and provides any layout helpers
+//! origin-cli still needs.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-
-#[must_use]
-pub fn split_main_input(area: Rect) -> (Rect, Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
-        .split(area);
-    (chunks[0], chunks[1])
-}
-
-#[must_use]
-pub fn split_main_input_status(area: Rect) -> (Rect, Rect, Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3), Constraint::Length(1)])
-        .split(area);
-    (chunks[0], chunks[1], chunks[2])
-}
+pub use origin_tui::stream_widget::Rect;
