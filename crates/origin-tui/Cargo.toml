@@ -24,6 +24,10 @@ undocumented_unsafe_blocks = "deny"
 thiserror = "1"
 wide = "0.7"
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+unicode-segmentation = "1"
+unicode-width = "0.1"
+lru = "0.12"
+fxhash = "0.2"
 
 [dev-dependencies]
 proptest = { version = "=1.4.0", default-features = false, features = ["std"] }
