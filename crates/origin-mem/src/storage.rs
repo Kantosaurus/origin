@@ -301,6 +301,30 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Add `delta` to `cluster_priority`, capping at 2.0.
+    ///
+    /// # Errors
+    /// Propagates SQL errors.
+    pub fn bump_priority(&self, id: MemoryId, delta: f32) -> Result<(), StorageError> {
+        // First fetch current priority, then write capped value atomically.
+        let id_str = id.to_string();
+        self.sql.with_conn(|conn| {
+            let current: f64 = conn.query_row(
+                "SELECT cluster_priority FROM memories WHERE id = ?1",
+                params![id_str],
+                |r| r.get(0),
+            )?;
+            #[allow(clippy::cast_possible_truncation)]
+            let new_priority = ((current as f32) + delta).min(2.0_f32);
+            conn.execute(
+                "UPDATE memories SET cluster_priority = ?1 WHERE id = ?2",
+                params![f64::from(new_priority), id_str],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────
 
     /// Resolve set bits in `bitset` to tag name strings.
