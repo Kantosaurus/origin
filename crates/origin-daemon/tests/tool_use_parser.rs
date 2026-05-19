@@ -44,6 +44,44 @@ fn surfaces_close_event_on_outer_brace() {
     assert!(closed, "expected ToolUseDelta::Closed at outer `}}`");
 }
 
+#[test]
+fn bool_field_followed_by_close_emits_close() {
+    let mut p = ToolUseParser::new();
+    p.begin_tool_use("X");
+    let events = p.feed(b"{\"flag\":true}");
+    // Expect: Field { name: "flag", value: b"true" }, Closed { .. }.
+    let has_field = events.iter().any(|e| {
+        matches!(
+            e,
+            ToolUseDelta::Field { name, value, .. }
+                if name == "flag" && value == b"true"
+        )
+    });
+    let has_close = events.iter().any(|e| matches!(e, ToolUseDelta::Closed { .. }));
+    assert!(has_field, "missing Field event: {events:?}");
+    assert!(has_close, "missing Closed event: {events:?}");
+}
+
+#[test]
+fn malformed_literal_recovers_at_next_delimiter() {
+    let mut p = ToolUseParser::new();
+    p.begin_tool_use("X");
+    // `trueX` is not a valid JSON literal; we should resync at the `,`
+    // and parse the next field correctly.
+    let events = p.feed(b"{\"a\":trueX,\"b\":\"ok\"}");
+    let saw_b = events.iter().any(|e| {
+        matches!(
+            e,
+            ToolUseDelta::Field { name, value, .. }
+                if name == "b" && value == b"ok"
+        )
+    });
+    assert!(
+        saw_b,
+        "parser failed to resync after malformed literal: {events:?}"
+    );
+}
+
 use proptest::prelude::*;
 
 proptest! {
