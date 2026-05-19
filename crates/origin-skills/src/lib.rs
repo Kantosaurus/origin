@@ -4,10 +4,12 @@
 
 pub mod embed;
 pub mod frontmatter;
+pub mod import;
 pub mod loader;
 pub mod registry;
 
 pub use embed::{SkillEmbedError, SkillEmbedder};
 pub use frontmatter::{parse_frontmatter, FrontmatterError, SkillFrontmatter};
+pub use import::{first_run_import, ImportDecision, ImportError, ImportReport};
 pub use loader::{load_skills_dir, LoaderError, Skill, SkillHash};
 pub use registry::SkillRegistry;
