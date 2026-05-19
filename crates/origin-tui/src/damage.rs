@@ -4,8 +4,12 @@
 //! per-cell pass that emits `Run { row, col, len }` tuples for each
 //! contiguous span of changed cells.
 
+use crate::grid::Cell;
 use crate::Grid;
 use wide::u8x32;
+
+const CELL_BYTES: usize = std::mem::size_of::<Cell>();
+const _: () = assert!(CELL_BYTES == 16, "SIMD coarse pass assumes Cell is 16 bytes");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Run {
@@ -28,8 +32,7 @@ pub fn diff(prev: &Grid, next: &Grid) -> Vec<Run> {
     );
     let cols = prev.cols();
     let rows = prev.rows();
-    let cell_bytes = 16usize;
-    let row_bytes = usize::from(cols) * cell_bytes;
+    let row_bytes = usize::from(cols) * CELL_BYTES;
     let prev_b = prev.as_bytes();
     let next_b = next.as_bytes();
 
@@ -58,17 +61,17 @@ pub fn diff(prev: &Grid, next: &Grid) -> Vec<Run> {
             continue;
         }
 
-        let mut col = 0u16;
+        let mut col = u16::try_from(byte_i / CELL_BYTES).unwrap_or(0).min(cols);
         while col < cols {
-            let c_off = usize::from(col) * cell_bytes;
-            if row_prev[c_off..c_off + cell_bytes] == row_next[c_off..c_off + cell_bytes] {
+            let c_off = usize::from(col) * CELL_BYTES;
+            if row_prev[c_off..c_off + CELL_BYTES] == row_next[c_off..c_off + CELL_BYTES] {
                 col += 1;
                 continue;
             }
             let start = col;
             while col < cols {
-                let c_off2 = usize::from(col) * cell_bytes;
-                if row_prev[c_off2..c_off2 + cell_bytes] == row_next[c_off2..c_off2 + cell_bytes] {
+                let c_off2 = usize::from(col) * CELL_BYTES;
+                if row_prev[c_off2..c_off2 + CELL_BYTES] == row_next[c_off2..c_off2 + CELL_BYTES] {
                     break;
                 }
                 col += 1;
@@ -84,7 +87,7 @@ pub fn diff(prev: &Grid, next: &Grid) -> Vec<Run> {
 }
 
 fn chunk32(s: &[u8], i: usize) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&s[i..i + 32]);
-    out
+    s[i..i + 32]
+        .try_into()
+        .expect("slice length is exactly 32 by construction")
 }
