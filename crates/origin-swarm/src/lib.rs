@@ -18,10 +18,12 @@
 //!
 //! ## Where each Phase-9 sub-task plugs in
 //!
-//! - **P9.6 (this crate, today):** protocol scaffold + noop worker that the
+//! - **P9.6 (this crate):** protocol scaffold + noop worker that the
 //!   test fixture in `tests/protocol.rs` exercises.
-//! - **P9.7:** fills in [`worker::PrefixSnapshot`] so the coordinator's
-//!   [`origin_planner::PrefixLedger`] bands seed each worker.
+//! - **P9.7 (this crate):** [`prefix_inherit::PrefixSnapshot`] carries the
+//!   coordinator's `Frozen`+`Sticky` band entries from
+//!   [`origin_planner::PrefixLedger`] into each
+//!   [`worker::WorkerContext::inherited_ledger`].
 //! - **P9.8:** overrides the default worker via
 //!   [`Coordinator::set_default_worker`] with the real agent-loop closure.
 //! - **P9.9:** subscribes the TUI plan panel to [`PlanHandle::subscribe`].
@@ -30,6 +32,7 @@ pub mod coordinator;
 pub mod credit;
 pub mod error;
 pub mod lifecycle;
+pub mod prefix_inherit;
 pub mod report;
 pub mod rpc;
 pub mod spec;
@@ -38,7 +41,8 @@ pub mod worker;
 pub use coordinator::{Coordinator, WorkerHandle, WorkerId};
 pub use error::SwarmError;
 pub use lifecycle::Lifecycle;
+pub use prefix_inherit::PrefixSnapshot;
 pub use report::CompletionReport;
 pub use rpc::PlanHandle;
 pub use spec::{Budget, DecisionRecord, ReportStatus, TaskRef, Usage, WorkerSpec};
-pub use worker::{default_noop_worker, PrefixSnapshot, WorkerContext, WorkerFn};
+pub use worker::{default_noop_worker, WorkerContext, WorkerFn};

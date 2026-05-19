@@ -111,4 +111,13 @@ impl PrefixLedger {
     pub fn suggested_band(&self, id: SectionId) -> Option<Band> {
         self.table.get(&id).map(|s| s.band)
     }
+
+    /// Iterate every `(section_id, band)` currently held by the ledger.
+    ///
+    /// Read-only view consumed by `origin-swarm` (P9.7, N7.1) to snapshot a
+    /// coordinator's stable-band assignments before fanning them out to
+    /// worker `WorkerContext`s. Iteration order is unspecified (`HashMap`).
+    pub fn iter_bands(&self) -> impl Iterator<Item = (SectionId, Band)> + '_ {
+        self.table.iter().map(|(id, s)| (*id, s.band))
+    }
 }
