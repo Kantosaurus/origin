@@ -5,3 +5,11 @@
 pub mod shellpool;
 
 pub use shellpool::{PoolError, ShellPool, ShellSpec};
+
+pub mod dispatch;
+pub mod event;
+
+pub use dispatch::{dispatch_event, DispatchError};
+pub use event::{
+    parse_hook_stdout, HookOverride, HookOverrideInner, HookParseError, LifecycleEvent, ToolPhase,
+};
