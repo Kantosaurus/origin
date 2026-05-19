@@ -309,17 +309,19 @@ impl MemoryStore {
         // First fetch current priority, then write capped value atomically.
         let id_str = id.to_string();
         self.sql.with_conn(|conn| {
-            let current: f64 = conn.query_row(
+            let tx = conn.unchecked_transaction()?;
+            let current: f64 = tx.query_row(
                 "SELECT cluster_priority FROM memories WHERE id = ?1",
                 params![id_str],
                 |r| r.get(0),
             )?;
             #[allow(clippy::cast_possible_truncation)]
             let new_priority = ((current as f32) + delta).min(2.0_f32);
-            conn.execute(
+            tx.execute(
                 "UPDATE memories SET cluster_priority = ?1 WHERE id = ?2",
                 params![f64::from(new_priority), id_str],
             )?;
+            tx.commit()?;
             Ok(())
         })?;
         Ok(())
