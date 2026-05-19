@@ -11,8 +11,10 @@ workspace = true
 
 [dependencies]
 origin-tools = { path = "../origin-tools" }
+origin-skills = { path = "../origin-skills" }
 async-trait = "0.1"
 thiserror = "1"
+growable-bloom-filter = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
