@@ -210,6 +210,20 @@ impl CodeGraphIndex {
         Ok(())
     }
 
+    /// Run a closure against the underlying `SQLite` connection.
+    ///
+    /// Used by the typed query DSL (`crate::query`) to issue ad-hoc reads
+    /// without exposing the store handle.
+    ///
+    /// # Errors
+    /// Propagates `SQLite` errors from the closure.
+    pub fn with_store<R, F>(&self, f: F) -> rusqlite::Result<R>
+    where
+        F: FnOnce(&rusqlite::Connection) -> rusqlite::Result<R>,
+    {
+        self.sql.with_conn(f)
+    }
+
     /// Fetch every outgoing edge from `from`.
     ///
     /// # Errors
