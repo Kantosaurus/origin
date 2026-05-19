@@ -1,14 +1,17 @@
 //! Agent loop: prompt → provider → tool dispatch → repeat → final text.
 
 use crate::session::Session;
+use crate::tool_use_parser::{ToolUseDelta, ToolUseParser};
 use origin_cas::{Hash, Store};
 use origin_core::types::{Block, Message, Role};
 use origin_permission::{check, prompt::Prompter, Outcome};
 use origin_provider::{ChatRequest, Provider};
-use origin_tools::{registry_iter, ToolMeta};
+use origin_tools::{registry_iter, SideEffects, ToolMeta};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::task::JoinHandle;
 
 #[derive(Clone)]
 pub struct LoopOptions {
@@ -84,6 +87,43 @@ pub enum LoopError {
     BadArgs(String),
 }
 
+/// Tracks speculative tasks fired off mid-stream. Keyed by the assistant
+/// `tool_use.id` so the agent can `await` the precomputed handle once the
+/// `tool_use` block closes.
+#[derive(Default)]
+pub(crate) struct SpeculativeRegistry {
+    in_flight: HashMap<String, JoinHandle<Result<Vec<u8>, LoopError>>>,
+}
+
+impl SpeculativeRegistry {
+    fn spawn(&mut self, tool_use_id: String, meta: &'static ToolMeta, args: serde_json::Value) {
+        // Side-effecting tools opt out — N2.2.
+        if !matches!(meta.side_effects, SideEffects::Pure) {
+            return;
+        }
+        let handle = tokio::spawn(async move {
+            let text = dispatch_tool(meta, &args).await?;
+            Ok::<_, LoopError>(text.into_bytes())
+        });
+        self.in_flight.insert(tool_use_id, handle);
+    }
+
+    async fn take(&mut self, tool_use_id: &str) -> Option<Result<Vec<u8>, LoopError>> {
+        let handle = self.in_flight.remove(tool_use_id)?;
+        match handle.await {
+            Ok(r) => Some(r),
+            Err(join_err) => Some(Err(LoopError::ToolFailure(join_err.to_string()))),
+        }
+    }
+}
+
+/// Return value of `run_streaming_turn`: the reconstructed response plus any
+/// speculative handles that were spawned during stream consumption.
+pub(crate) struct StreamingTurn {
+    pub response: origin_provider::ChatResponse,
+    pub speculative: SpeculativeRegistry,
+}
+
 /// Run the agent loop until the assistant emits a turn without any `tool_use`
 /// blocks, or until `max_turns` is reached.
 ///
@@ -114,11 +154,15 @@ pub async fn run_loop(
             model: session.model.clone(),
             tools: tools_schema.clone(),
         };
-        let resp = if opts.streaming_disabled {
-            provider.chat(req).await?
+
+        let (resp, mut speculative) = if opts.streaming_disabled {
+            let r = provider.chat(req).await?;
+            (r, SpeculativeRegistry::default())
         } else {
-            run_streaming_turn(provider, req, opts).await?
+            let st = run_streaming_turn(provider, req, opts).await?;
+            (st.response, st.speculative)
         };
+
         session.push(resp.assistant.clone());
 
         // Gather tool_use blocks (clone owned data because we'll borrow `meta`).
@@ -162,11 +206,20 @@ pub async fn run_loop(
 
             let decision = check(meta, &preview, prompter).await;
             if decision.outcome == Outcome::Deny {
+                // Discard any precomputed speculative result — the tool was denied.
+                let _ = speculative.take(&id).await;
                 return Err(LoopError::Denied(name.clone()));
             }
 
-            let result_text = dispatch_tool(meta, &args).await?;
-            let result_bytes = result_text.into_bytes();
+            // Try the speculative precomputed result first; fall back to
+            // synchronous dispatch if the registry has no entry (e.g., the tool
+            // is side-effecting, streaming was disabled, or the spawn lost).
+            let result_bytes: Vec<u8> = if let Some(pre) = speculative.take(&id).await {
+                pre?
+            } else {
+                dispatch_tool(meta, &args).await?.into_bytes()
+            };
+
             let block = if let Some(cas) = opts.cas.as_ref() {
                 let h: Hash = cas
                     .put(&result_bytes)
@@ -261,22 +314,21 @@ async fn dispatch_tool(meta: &ToolMeta, args: &Value) -> Result<String, LoopErro
     }
 }
 
-/// Drain a per-turn `Ring` `Subscriber` into a synthetic `ChatResponse`. For
-/// Phase 2 we reconstruct only `Block::Text` (concatenating all `TextDelta`s)
-/// plus `Usage`. `ToolUseDelta` and `ThinkingDelta` are intentionally ignored:
-/// reconstructing `Block::ToolUse` requires incremental JSON parsing which
-/// lands in P3.3.
 /// Run one streaming turn. Pre-subscribes BOTH the drain and (optionally) the
 /// relay before publishing — a fresh subscriber starts at the current write
 /// cursor, so subscribing after the producer publishes would miss every record.
 /// The drive future always closes the ring on completion (success OR error) so
 /// the drain and the relay subscriber wake up cleanly even if the provider
 /// fails mid-stream. `Ring::close` is idempotent.
+///
+/// P3.4: also drives `ToolUseParser`s and spawns speculative tasks for pure
+/// tools when the first `Field` event fires. Returns the registry alongside
+/// the synthetic `ChatResponse` so `run_loop` can await precomputed handles.
 async fn run_streaming_turn(
     provider: &dyn Provider,
     req: ChatRequest,
     opts: &LoopOptions,
-) -> Result<origin_provider::ChatResponse, LoopError> {
+) -> Result<StreamingTurn, LoopError> {
     let ring = origin_stream::Ring::with_capacity(256 * 1024);
     let drain_sub = ring.subscribe();
     if let Some(tx) = &opts.relay_tx {
@@ -290,17 +342,69 @@ async fn run_streaming_turn(
         outcome
     };
     let drain = drain_subscriber_into_response(drain_sub);
-    let (drive_res, resp) = tokio::join!(drive, drain);
+    let (drive_res, turn_res) = tokio::join!(drive, drain);
     drive_res?;
-    resp
+    turn_res
+}
+
+/// Decode a `ToolUseStart` payload into `(id, name)`.
+/// Layout: `id` bytes + `\0` + `name` bytes.
+fn decode_tool_use_start(payload: &[u8]) -> Option<(&str, &str)> {
+    let sep = payload.iter().position(|&b| b == 0)?;
+    let id = std::str::from_utf8(&payload[..sep]).ok()?;
+    let name = std::str::from_utf8(&payload[sep + 1..]).ok()?;
+    Some((id, name))
+}
+
+/// Try to speculatively spawn a pure tool when the first `Field` event fires.
+/// Called at most once per `tool_use_id`. Returns `true` if a task was spawned.
+fn try_speculative_spawn(
+    tool_use_id: &str,
+    tool_names: &HashMap<String, String>,
+    tool_input_bufs: &HashMap<String, Vec<u8>>,
+    registry: &mut SpeculativeRegistry,
+) -> bool {
+    let Some(name) = tool_names.get(tool_use_id) else {
+        return false;
+    };
+    let Some(meta) = registry_iter().find(|m| m.name == *name) else {
+        return false;
+    };
+    if !matches!(meta.side_effects, SideEffects::Pure) {
+        return false;
+    }
+    // Re-parse the accumulated bytes accumulated so far. For single-field pure
+    // tools (Read/Glob/Grep) the first Field event arrives with a complete JSON
+    // value, so `from_slice` succeeds here. Multi-field partial args are
+    // best-effort: if parse fails we skip the spawn.
+    let buf = tool_input_bufs
+        .get(tool_use_id)
+        .map_or(&[] as &[u8], Vec::as_slice);
+    if let Ok(args) = serde_json::from_slice::<Value>(buf) {
+        registry.spawn(tool_use_id.to_owned(), meta, args);
+        return true;
+    }
+    false
 }
 
 async fn drain_subscriber_into_response(
     mut sub: origin_stream::Subscriber,
-) -> Result<origin_provider::ChatResponse, LoopError> {
+) -> Result<StreamingTurn, LoopError> {
     let mut text = String::new();
     let mut usage = origin_provider::Usage::default();
     let mut blocks: Vec<Block> = Vec::new();
+
+    // P3.4: per-id incremental JSON parsers for active tool_use blocks.
+    // DONE_WITH_CONCERNS: routing deltas to the "most recent" parser is a
+    // simplification — Anthropic can interleave deltas for concurrent
+    // tool_use blocks by index. Full index-based routing is deferred to a
+    // follow-up that adds an `index` field to the ToolUseDelta payload.
+    let mut parsers: HashMap<String, ToolUseParser> = HashMap::new();
+    let mut active_id: Option<String> = None;
+    let mut tool_input_bufs: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut tool_names: HashMap<String, String> = HashMap::new();
+    let mut registry = SpeculativeRegistry::default();
+    let mut speculative_spawned: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     while let Some(ev) = sub
         .next()
@@ -310,6 +414,33 @@ async fn drain_subscriber_into_response(
         match ev.kind() {
             origin_stream::TokenKind::TextDelta => {
                 text.push_str(&String::from_utf8_lossy(ev.payload()));
+            }
+            origin_stream::TokenKind::ToolUseStart => {
+                if let Some((id, name)) = decode_tool_use_start(ev.payload()) {
+                    let mut parser = ToolUseParser::new();
+                    parser.begin_tool_use(name);
+                    parsers.insert(id.to_owned(), parser);
+                    tool_names.insert(id.to_owned(), name.to_owned());
+                    tool_input_bufs.insert(id.to_owned(), Vec::new());
+                    active_id = Some(id.to_owned());
+                }
+            }
+            origin_stream::TokenKind::ToolUseDelta => {
+                if let Some(id) = &active_id {
+                    if let Some(buf) = tool_input_bufs.get_mut(id) {
+                        buf.extend_from_slice(ev.payload());
+                    }
+                    let id_owned = id.clone();
+                    if let Some(parser) = parsers.get_mut(&id_owned) {
+                        let events = parser.feed(ev.payload());
+                        if !speculative_spawned.contains(&id_owned)
+                            && events.iter().any(|e| matches!(e, ToolUseDelta::Field { .. }))
+                            && try_speculative_spawn(&id_owned, &tool_names, &tool_input_bufs, &mut registry)
+                        {
+                            speculative_spawned.insert(id_owned);
+                        }
+                    }
+                }
             }
             origin_stream::TokenKind::Usage => {
                 let p = ev.payload();
@@ -325,12 +456,22 @@ async fn drain_subscriber_into_response(
                 }
             }
             origin_stream::TokenKind::TurnEnd => break,
-            origin_stream::TokenKind::ToolUseDelta | origin_stream::TokenKind::ThinkingDelta => {}
+            origin_stream::TokenKind::ThinkingDelta => {}
         }
     }
+
     if !text.is_empty() {
         blocks.push(Block::Text {
             text,
+            cache_marker: None,
+        });
+    }
+    for (id, buf) in tool_input_bufs {
+        let name = tool_names.get(&id).cloned().unwrap_or_default();
+        blocks.push(Block::ToolUse {
+            id,
+            name,
+            input_json: buf,
             cache_marker: None,
         });
     }
@@ -338,5 +479,8 @@ async fn drain_subscriber_into_response(
         role: Role::Assistant,
         blocks,
     };
-    Ok(origin_provider::ChatResponse { assistant, usage })
+    Ok(StreamingTurn {
+        response: origin_provider::ChatResponse { assistant, usage },
+        speculative: registry,
+    })
 }
