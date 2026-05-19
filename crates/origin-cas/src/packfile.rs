@@ -167,6 +167,11 @@ impl PackReader {
         Ok(Self { map, index })
     }
 
+    /// Iterate every hash recorded in this pack's index.
+    pub fn hashes(&self) -> impl Iterator<Item = Hash> + '_ {
+        self.index.keys().copied()
+    }
+
     /// Look up a hash and return a slice into the mmap'd region. `None` if
     /// the hash isn't present.
     #[must_use]

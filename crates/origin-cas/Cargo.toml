@@ -18,8 +18,11 @@ undocumented_unsafe_blocks = "deny"
 blake3 = "1"
 byteorder = "1"
 fastcdc = "3"
+lru = "0.12"
 memmap2 = "0.9"
+parking_lot = "0.12"
 thiserror = "1"
+zstd = "0.13"
 
 [dev-dependencies]
 hex = "0.4"
