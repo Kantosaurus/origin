@@ -1,5 +1,6 @@
 //! Tool registry + macros + builtin tools.
 
+pub mod builtins;
 pub mod macros;
 pub mod registry;
 
