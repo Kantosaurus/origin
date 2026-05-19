@@ -36,6 +36,7 @@ origin-cas              = { path = "../origin-cas" }
 origin-codegraph        = { path = "../origin-codegraph" }
 origin-stream           = { path = "../origin-stream" }
 origin-keyvault         = { path = "../origin-keyvault" }
+origin-sidecar          = { path = "../origin-sidecar" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "sync"] }
 anyhow = "1"
 tracing = "0.1"

@@ -74,6 +74,7 @@ fn main() {
         cas: Some(Arc::clone(&store)),
         relay_tx: None,
         streaming_disabled: true,
+        ..LoopOptions::default()
     };
 
     let mut sys = System::new();

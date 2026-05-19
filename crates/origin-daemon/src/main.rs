@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use origin_cas::Store;
-use origin_daemon::agent::{run_loop, LoopOptions};
+use origin_core::types::Role;
+use origin_daemon::agent::{run_loop, LoopOptions, SessionStoreSummaryDeliverer};
 use origin_daemon::protocol::{ClientMessage, PromptReply, PromptRequest, StreamEvent};
 use origin_daemon::provider_factory::{ProviderFactory, ProviderId};
 use origin_daemon::session::Session;
@@ -14,6 +15,8 @@ use origin_ipc::transport::{Listener, SharedConnection};
 use origin_keyvault::{KeyVault, Secret};
 use origin_permission::prompt::AlwaysAllow;
 use origin_provider::Provider;
+use origin_provider_anthropic::Anthropic;
+use origin_sidecar::{Sidecar, SidecarConfig, SidecarJob};
 use origin_stream::Subscriber;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{error, info, warn};
@@ -75,6 +78,17 @@ async fn main() -> Result<()> {
     let session_store = Arc::new(SessionStore::open(&db_path)?);
     info!(db = %db_path, "session store ready");
 
+    let sidecar_provider: Arc<dyn origin_provider::Provider> = Arc::new(
+        Anthropic::new(env::var("ANTHROPIC_API_KEY").unwrap_or_default()).with_cas(Arc::clone(&cas)),
+    );
+    let sidecar_cfg = SidecarConfig {
+        workers: 2,
+        queue_capacity: 256,
+        model: env::var("ORIGIN_SIDECAR_MODEL").unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string()),
+    };
+    let sidecar = Arc::new(Sidecar::spawn(sidecar_provider, Arc::clone(&cas), sidecar_cfg));
+    info!("sidecar ready");
+
     let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
     let listener = Listener::bind(&path).await?;
     info!(path = %path, "origin-daemon listening");
@@ -89,6 +103,7 @@ async fn main() -> Result<()> {
             factory.clone(),
             Arc::clone(&session_store),
             Arc::clone(&cas),
+            Arc::clone(&sidecar),
         );
     }
 }
@@ -99,6 +114,7 @@ fn spawn_handler_task(
     factory: ProviderFactory,
     session_store: Arc<SessionStore>,
     cas: Arc<Store>,
+    sidecar: Arc<Sidecar>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -142,8 +158,9 @@ fn spawn_handler_task(
                     if !handle_request(
                         &conn,
                         provider_snapshot.as_ref(),
-                        session_store.as_ref(),
+                        Arc::clone(&session_store),
                         Arc::clone(&cas),
+                        Arc::clone(&sidecar),
                         req,
                     )
                     .await
@@ -176,8 +193,9 @@ fn spawn_handler_task(
 async fn handle_request(
     conn: &SharedConnection,
     provider: &dyn Provider,
-    session_store: &SessionStore,
+    session_store: Arc<SessionStore>,
     cas: Arc<Store>,
+    sidecar: Arc<Sidecar>,
     req: PromptRequest,
 ) -> bool {
     let mut session = Session::new(provider.name(), &req.model);
@@ -201,6 +219,8 @@ async fn handle_request(
             cas: Some(cas),
             relay_tx: Some(tx_sub.clone()),
             streaming_disabled: false,
+            sidecar: None, // sidecar submit fires in handle_request after persist
+            session_store: None,
         };
         run_loop(&mut session, &req.user_text, provider, &AlwaysAllow, &opts).await
     };
@@ -230,7 +250,11 @@ async fn handle_request(
                     return false;
                 }
             }
-            persist(session_store, &session);
+            // Persist first so the rows exist before the sidecar deliverer
+            // fires update_summary.
+            persist(session_store.as_ref(), &session);
+            // Submit one Summarize job per assistant turn (P5.2, N2.5.a).
+            submit_summarize_jobs(&sidecar, &session_store, &session);
             true
         }
         Err(e) => {
@@ -302,6 +326,28 @@ fn persist(session_store: &SessionStore, session: &Session) {
         if let Err(e) = session_store.persist_message(&session.id.to_string(), turn, m) {
             error!(error = %e, "persist_message failed");
         }
+    }
+}
+
+/// Submit one `SidecarJob::Summarize` for each assistant turn in the session.
+/// Must be called AFTER `persist` so the message rows exist when the deliverer
+/// fires `update_summary`.
+fn submit_summarize_jobs(sidecar: &Sidecar, session_store: &Arc<SessionStore>, session: &Session) {
+    let transcript = session.messages.clone();
+    for (i, m) in session.messages.iter().enumerate() {
+        if m.role != Role::Assistant {
+            continue;
+        }
+        #[allow(clippy::expect_used)]
+        let turn_index = u32::try_from(i).expect("turn fits u32");
+        let session_id = session.id.to_string();
+        let deliverer = SessionStoreSummaryDeliverer(Arc::clone(session_store));
+        let _ = sidecar.submit(SidecarJob::Summarize {
+            session_id,
+            turn_index,
+            transcript: transcript.clone(),
+            deliver_to: Box::new(deliverer),
+        });
     }
 }
 

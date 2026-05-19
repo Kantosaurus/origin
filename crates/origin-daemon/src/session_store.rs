@@ -86,6 +86,27 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Update the `summary` column for an existing message row. No-op if the
+    /// row does not exist. Idempotent.
+    ///
+    /// # Errors
+    /// Propagates sqlite errors.
+    pub fn update_summary(
+        &self,
+        session_id: &str,
+        turn_index: u32,
+        summary: &str,
+    ) -> Result<(), SessionStoreError> {
+        self.inner.with_conn(|c| {
+            c.execute(
+                "UPDATE messages SET summary = ?1 WHERE session_id = ?2 AND turn_index = ?3",
+                rusqlite::params![summary, session_id, turn_index],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     /// Load all messages for a session, ordered by turn.
     ///
     /// # Errors

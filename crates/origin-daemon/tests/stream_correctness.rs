@@ -141,6 +141,7 @@ async fn relay_drains_all_events_before_response_frame() {
                 cas: None,
                 relay_tx: Some(tx_sub.clone()),
                 streaming_disabled: false,
+                ..LoopOptions::default()
             };
             run_loop(&mut session, "hi", &provider, &AlwaysAllow, &opts)
                 .await

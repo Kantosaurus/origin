@@ -107,18 +107,24 @@ impl Sidecar {
     }
 }
 
-async fn dispatch_stub(_provider: &Arc<dyn Provider>, _cas: &Arc<Store>, _model: &str, job: SidecarJob) {
-    // Placeholder dispatch: invokes the deliverer with synthetic data so the
-    // runtime test verifies pool + queue wiring. P5.2 replaces this with calls
-    // to `summarize::run`; P5.3 replaces the Extract arm with `extract::run`.
+async fn dispatch_stub(provider: &Arc<dyn Provider>, _cas: &Arc<Store>, model: &str, job: SidecarJob) {
+    // P5.2: Summarize arm calls `summarize::run`; P5.3 replaces the Extract arm.
     match job {
         SidecarJob::Summarize {
             session_id,
             turn_index,
+            transcript,
             deliver_to,
-            ..
         } => {
-            deliver_to.deliver(&session_id, turn_index, "stub-summary").await;
+            crate::summarize::run(
+                provider,
+                model,
+                &session_id,
+                turn_index,
+                &transcript,
+                deliver_to.as_ref(),
+            )
+            .await;
         }
         SidecarJob::Extract { handle, deliver_to } => {
             deliver_to.deliver(handle, handle).await;
