@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
                             let reply = call_daemon(&path, &model, &text).await;
                             match reply {
                                 Ok(r) => {
-                                    app.add_line(&format!("origin ({} turns)> ", r.turns), &r.assistant_text)
+                                    app.add_line(&format!("origin ({} turns)> ", r.turns), &r.assistant_text);
                                 }
                                 Err(e) => app.add_line("error> ", &format!("{e}")),
                             }
