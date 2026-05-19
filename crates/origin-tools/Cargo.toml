@@ -13,7 +13,10 @@ workspace = true
 origin-core = { path = "../origin-core" }
 origin-cas  = { path = "../origin-cas" }
 origin-codegraph = { path = "../origin-codegraph" }
+origin-plan = { path = "../origin-plan" }
+origin-swarm = { path = "../origin-swarm" }
 blake3 = "1"
+hex = "0.4"
 regex = "1"
 glob = "0.3"
 grep-matcher = "0.1"
@@ -25,7 +28,8 @@ async-trait = "0.1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "fs", "sync"] }
 
 [dev-dependencies]
+origin-store = { path = "../origin-store" }
 tempfile = "3"
