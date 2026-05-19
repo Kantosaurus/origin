@@ -1,0 +1,22 @@
+[package]
+name = "origin-cas"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# CAS uses mmap and atomic cursors in later P2 tasks; override the workspace
+# `unsafe_code = "forbid"` here. Every unsafe block carries a `// SAFETY:` comment.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[dependencies]
+blake3 = "1"
+thiserror = "1"
+
+[dev-dependencies]
+hex = "0.4"
