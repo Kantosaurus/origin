@@ -8,7 +8,9 @@
 mod chunker;
 mod hash;
 mod packfile;
+mod store;
 
 pub use chunker::{chunks, ChunkIter, ChunkRef};
 pub use hash::Hash;
 pub use packfile::{PackBuilder, PackError, PackReader, PackSlice};
+pub use store::{Store, StoreConfig, StoreError};
