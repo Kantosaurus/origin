@@ -19,6 +19,7 @@ reqwest = { workspace = true }
 eventsource-stream = { workspace = true }
 futures-util = "0.3"
 origin-tools = { path = "../origin-tools" }
+origin-cas = { path = "../origin-cas" }
 
 [dev-dependencies]
 tempfile = "3"
