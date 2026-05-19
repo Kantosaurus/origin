@@ -2354,6 +2354,7 @@ dependencies = [
  "origin-provider-ollama",
  "origin-provider-openai",
  "origin-provider-openrouter",
+ "origin-sidecar",
  "origin-store",
  "origin-stream",
  "origin-tools",

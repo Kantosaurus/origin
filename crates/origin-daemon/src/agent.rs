@@ -1,11 +1,13 @@
 //! Agent loop: prompt → provider → tool dispatch → repeat → final text.
 
 use crate::session::Session;
+use crate::session_store::SessionStore;
 use crate::tool_use_parser::{ToolUseDelta, ToolUseParser};
 use origin_cas::{Hash, Store};
 use origin_core::types::{Block, Message, Role};
 use origin_permission::{check, prompt::Prompter, Outcome};
 use origin_provider::{ChatRequest, Provider};
+use origin_sidecar::{Sidecar, SummaryDeliverer};
 use origin_tools::{registry_iter, SideEffects, ToolMeta};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -27,6 +29,10 @@ pub struct LoopOptions {
     /// bypass the streaming drain path. The incremental `tool_use` parser
     /// (P3.3) means production code paths can leave this `false`.
     pub streaming_disabled: bool,
+    /// Optional sidecar handle for eager turn summarization (P5.2).
+    pub sidecar: Option<Arc<Sidecar>>,
+    /// Optional session store for delivering summaries (P5.2).
+    pub session_store: Option<Arc<SessionStore>>,
 }
 
 impl Default for LoopOptions {
@@ -36,6 +42,8 @@ impl Default for LoopOptions {
             cas: None,
             relay_tx: None,
             streaming_disabled: false,
+            sidecar: None,
+            session_store: None,
         }
     }
 }
@@ -63,6 +71,43 @@ impl LoopOptions {
     pub const fn without_streaming(mut self) -> Self {
         self.streaming_disabled = true;
         self
+    }
+
+    /// Attach a sidecar for eager turn summarization (P5.2).
+    #[must_use]
+    pub fn with_sidecar(mut self, sidecar: Arc<Sidecar>) -> Self {
+        self.sidecar = Some(sidecar);
+        self
+    }
+
+    /// Attach a session store so summaries can be written back to `SQLite` (P5.2).
+    #[must_use]
+    pub fn with_session_store(mut self, store: Arc<SessionStore>) -> Self {
+        self.session_store = Some(store);
+        self
+    }
+}
+
+/// Deliverer that writes a summary to the `SQLite` `messages.summary` column via
+/// a blocking `spawn_blocking` task.
+pub struct SessionStoreSummaryDeliverer(pub Arc<SessionStore>);
+
+impl std::fmt::Debug for SessionStoreSummaryDeliverer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionStoreSummaryDeliverer")
+    }
+}
+
+#[async_trait::async_trait]
+impl SummaryDeliverer for SessionStoreSummaryDeliverer {
+    async fn deliver(&self, session_id: &str, turn_index: u32, summary: &str) {
+        let store = self.0.clone();
+        let s = session_id.to_string();
+        let sum = summary.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = store.update_summary(&s, turn_index, &sum);
+        })
+        .await;
     }
 }
 
