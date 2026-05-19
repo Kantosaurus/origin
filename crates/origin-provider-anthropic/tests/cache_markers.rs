@@ -67,4 +67,9 @@ async fn cache_marker_emitted_on_planned_boundary() {
             .is_some_and(|cs| cs.iter().any(|c| c.get("cache_control").is_some()))
     });
     assert!(saw_marker, "expected at least one cache_control marker");
+    let block_zero_has_marker = messages[0]["content"][0].get("cache_control").is_some();
+    assert!(
+        block_zero_has_marker,
+        "marker must land on block 0 (the Frozen→Sticky boundary), got: {messages:?}"
+    );
 }

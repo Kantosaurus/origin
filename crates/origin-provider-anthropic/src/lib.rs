@@ -224,6 +224,12 @@ fn message_to_wire<'a>(m: &'a Message, plan: Option<&Plan>, msg_idx: usize) -> w
             // - a plan is present
             // - this is the first message (msg_idx == 0)
             // - block_idx is in the plan's marker_indices
+            // TODO(P3.6): lift the `msg_idx == 0` gate once handle-substitution lands and
+            // the planner's marker_indices() map to a stable section-to-wire-block index.
+            // Also: enumerate over wire-block index (post `block_to_wire` filter) to avoid
+            // index skew when assistant messages contain `Block::Thinking` (which is
+            // dropped from the wire). At P3.2 only user messages (msg_idx == 0) carry
+            // markers, so the skew is unreachable.
             let cache_control = if plan.is_some() && msg_idx == 0 && marker_indices.contains(&block_idx) {
                 Some(wire::WireCacheControl::ephemeral())
             } else {
