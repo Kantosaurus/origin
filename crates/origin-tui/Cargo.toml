@@ -29,6 +29,10 @@ unicode-width = "0.1"
 lru = "0.12"
 fxhash = "0.2"
 origin-stream = { path = "../origin-stream" }
+origin-tools = { path = "../origin-tools" }
+origin-permission = { path = "../origin-permission" }
+async-trait = "0.1"
+parking_lot = "0.12"
 
 [dev-dependencies]
 proptest = { version = "=1.4.0", default-features = false, features = ["std"] }
