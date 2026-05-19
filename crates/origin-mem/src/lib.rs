@@ -4,6 +4,7 @@
 pub mod embedder;
 pub mod index;
 pub mod quantizer;
+pub mod storage;
 
 // `EmbedderError` repeats the module name; we re-export it under the canonical
 // name to keep the public surface stable across the rest of Phase 6, even
@@ -13,3 +14,4 @@ pub use embedder::EmbedderError;
 pub use embedder::{Embedder, EMBED_DIM};
 pub use index::{Candidate, IndexError, MemIndex, MetaRow, SearchOpts};
 pub use quantizer::{EncodedVector, Quantizer, QuantizerError, NUM_CENTROIDS};
+pub use storage::{EdgeKind, MemoryId, MemoryRecord, MemoryStore, StorageError};

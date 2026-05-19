@@ -29,6 +29,9 @@ blake3      = "1"
 thiserror   = "1"
 sha2        = "0.10"
 ureq        = { version = "2", default-features = false, features = ["tls"] }
+bitvec      = "1"
+parking_lot = "0.12"
+tracing     = "0.1"
 origin-cas   = { path = "../origin-cas" }
 origin-store = { path = "../origin-store" }
 
