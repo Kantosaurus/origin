@@ -4,6 +4,56 @@ All notable changes to `origin` will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely;
 versions correspond to phase milestones from the implementation plan.
 
+## Phase 3 — CachePlanner + Speculative Dispatch + Recall (2026-05-19)
+
+- New `origin-planner` crate: `Band` enum (Frozen/Sticky/Sliding/Volatile),
+  `PrefixLedger` stability scoring with promote/demote thresholds,
+  `CachePlanner::plan` four-band sort + boundary marker indices,
+  `WireDecision::for_block` inline-vs-reference rule.
+- `origin-provider-anthropic` emits `cache_control: ephemeral` at planned
+  band boundaries; consults `WireDecision` to inline small handles or
+  emit `<result handle:XXXXXXXX — N bytes>` references for large ones.
+- New `origin-daemon::tool_use_parser` — SAX-style incremental JSON parser
+  yielding `Field` events before the streaming `tool_use` block closes.
+- Speculative dispatch: agent forks pure-tool tasks on the parser's first
+  complete field; side-effecting tools (`Bash`, `Edit`, `Write`, MCP
+  writes) stay sequential. New `TokenKind::ToolUseStart` event surfaces
+  the assistant's tool_use block-start to the agent loop.
+- New `Recall` builtin: inflates a CAS handle with optional Lines /
+  Match / OutlineOnly region selector. Threaded `Option<Arc<Store>>`
+  through the dispatch path.
+- Session-scope memoization: `(tool_name, raw_input_bytes)` → blake3
+  hash → CAS handle; cached results annotated `(cached from turn N)`.
+  `Bash`/`Edit`/`Write` opt out via `MEMOIZATION_SKIPLIST`.
+- `phase3_cache_warm_ratio` checkpoint test: 20-turn synthetic workload,
+  warm pass asserts `cache_read_input_tokens > 0.5 × input_tokens`.
+
+### Known limitations (deferred)
+
+- Section→wire-block index for `cache_control` marker placement is a
+  stub (always Volatile); full plumbing lands with N4.3 encoder codegen
+  in Phase 11.
+- Multi-tool-use concurrent block delta routing uses "most-recent
+  parser" instead of Anthropic's `index` field; sequential tool_use
+  works correctly. Full index routing lands with concurrent-tool
+  support in Phase 7.
+- `OutlineOnly` region selector returns a placeholder; the sidecar
+  coroutine that emits structure summaries lands in Phase 6.
+- Tool-input normalization is byte-equivalent only; canonical-form
+  normalization (path canon, regex parse-equivalence) lands with
+  N10.4 in Phase 10.
+- `cargo fuzz` target for `tool_use_parser` is stubbed; full corpus +
+  CI fuzz cycle lands with N10.10 in Phase 14.
+
+### Test coverage at phase exit
+
+- All previous tests still passing.
+- New: 8 `origin-planner` tests (3 ledger + 2 planner + 3 decision).
+- New: 6 `origin-daemon` tests (3 + 1 prop tool_use_parser, 1
+  speculative_e2e, 1 memoization_e2e, 1 phase3_cache_warm_ratio).
+- New: 3 `origin-tools` recall tests + 3 memoization tests.
+- New: 1 Anthropic `cache_markers` test + 1 `handle_substitution` test.
+
 ## Phase 2 — Streaming + CAS + Ring Buffer (2026-05-19)
 
 - `origin-cas` crate: blake3 Hash, FastCDC chunker, mmap pack files,
