@@ -19,7 +19,7 @@ use core::cmp::Ordering;
 use crate::lamport::ActorId;
 
 /// One step inside a [`LogootKey`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PathComponent {
     /// Digit on this level. Higher digit → later in the list.
     pub digit: u32,
@@ -54,7 +54,7 @@ impl Ord for PathComponent {
 ///
 /// Lexicographic order over the path components defines the list position.
 /// Components are 1-indexed conceptually but represented as a plain `Vec`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct LogootKey {
     path: Vec<PathComponent>,
 }

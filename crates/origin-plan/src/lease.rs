@@ -18,7 +18,7 @@ use crate::lamport::{ActorId, Lamport};
 ///
 /// Stored inside [`crate::plan::Plan`]; the [`crate::ops::LeaseStep`] op is
 /// what produces it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LeaseRecord {
     /// Lamport of the winning lease op.
     pub lamport: Lamport,

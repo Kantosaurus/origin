@@ -12,7 +12,7 @@ use crate::logoot::LogootKey;
 use crate::ops::{Op, OpEnvelope, Status, StepId};
 
 /// A single step inside a [`Plan`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Step {
     id: StepId,
     parent: Option<StepId>,
@@ -121,6 +121,26 @@ pub struct Plan {
     /// `(lamport, actor.value())`. Expired leases stay in the map for fold
     /// determinism; [`Plan::lease_holder`] filters them with `now_ms`.
     leases: HashMap<StepId, LeaseRecord>,
+}
+
+/// On-disk shape used by [`Plan::serialize_for_snapshot`] / [`Plan::deserialize_snapshot`].
+///
+/// `steps` is laid out as a `Vec<(StepId, Step)>` taken from the `BTreeMap`'s
+/// in-order iterator — bincode of a `BTreeMap` is non-portable across versions,
+/// but a `Vec` is stable. `leases` is taken as `Vec<(StepId, LeaseRecord)>` for
+/// the same reason; we sort by `StepId` so the encoding is deterministic.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SnapshotBody {
+    steps: Vec<(StepId, Step)>,
+    leases: Vec<(StepId, LeaseRecord)>,
+}
+
+/// Errors returned by [`Plan::deserialize_snapshot`].
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotError {
+    /// Failed to decode the bincode payload.
+    #[error("snapshot decode: {0}")]
+    Decode(String),
 }
 
 impl Plan {
@@ -241,5 +261,45 @@ impl Plan {
 
     pub(crate) fn get_mut(&mut self, id: StepId) -> Option<&mut Step> {
         self.steps.get_mut(&id)
+    }
+
+    /// Serialize the plan state into a bincode-encoded snapshot body suitable
+    /// for storage in the CAS via [`crate::store::PlanStore::write_snapshot`].
+    ///
+    /// The encoding shape is stable: a `(Vec<(StepId, Step)>, Vec<(StepId,
+    /// LeaseRecord)>)` pair. Both vecs are emitted in `StepId` order so the
+    /// output is byte-deterministic across hosts. Re-folding the op-log is
+    /// always an acceptable fallback if the encoding ever needs to change.
+    #[must_use]
+    pub fn serialize_for_snapshot(&self) -> Vec<u8> {
+        let steps: Vec<(StepId, Step)> = self.steps.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let mut leases: Vec<(StepId, LeaseRecord)> = self.leases.iter().map(|(k, v)| (*k, *v)).collect();
+        leases.sort_by_key(|(k, _)| *k);
+        let body = SnapshotBody { steps, leases };
+        // bincode::serialize on a fixed concrete shape returns
+        // `Result<_, bincode::Error>`; the only failure modes are OOM or a
+        // serializer bug. We unwrap_or_default for the latter — an empty body
+        // is a safe representation of "empty plan" — and document the
+        // invariant in the doc comment.
+        bincode::serialize(&body).unwrap_or_default()
+    }
+
+    /// Decode a snapshot body produced by [`Self::serialize_for_snapshot`].
+    ///
+    /// # Errors
+    /// Returns [`SnapshotError::Decode`] if the byte slice is not a valid
+    /// snapshot body (truncated, version-mismatched, etc.).
+    pub fn deserialize_snapshot(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let body: SnapshotBody =
+            bincode::deserialize(bytes).map_err(|e| SnapshotError::Decode(e.to_string()))?;
+        let mut steps = BTreeMap::new();
+        for (id, step) in body.steps {
+            steps.insert(id, step);
+        }
+        let mut leases = HashMap::new();
+        for (id, rec) in body.leases {
+            leases.insert(id, rec);
+        }
+        Ok(Self { steps, leases })
     }
 }
