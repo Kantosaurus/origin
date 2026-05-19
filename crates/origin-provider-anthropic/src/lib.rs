@@ -2,6 +2,7 @@
 //!
 //! Streaming support arrives in Phase 2 (origin spec N4.4).
 
+pub mod streaming;
 mod wire;
 
 use async_trait::async_trait;

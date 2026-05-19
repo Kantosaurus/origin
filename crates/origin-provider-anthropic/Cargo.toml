@@ -12,11 +12,17 @@ workspace = true
 [dependencies]
 origin-core = { path = "../origin-core" }
 origin-provider = { path = "../origin-provider" }
+origin-stream = { path = "../origin-stream" }
 async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+eventsource-stream = "0.2"
+futures-util = "0.3"
+pin-utils = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
+tokio = { version = "1", default-features = false }
+tokio-util = { version = "0.7", features = ["io"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
