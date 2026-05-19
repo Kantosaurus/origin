@@ -136,6 +136,7 @@ pub(crate) struct StreamingTurn {
 /// # Errors
 /// Returns `LoopError` for provider failures, permission denial, unknown tools,
 /// tool execution failures, malformed tool inputs, or hitting `max_turns`.
+#[allow(clippy::too_many_lines)] // turn loop + memoization path; extraction would require extra allocations
 pub async fn run_loop(
     session: &mut Session,
     user_text: &str,
@@ -152,6 +153,11 @@ pub async fn run_loop(
             input_schema_json: m.input_schema.to_string(),
         })
         .collect::<Vec<_>>();
+
+    // Per-session memoization cache (N5.4). Lives for the lifetime of this
+    // run_loop call so identical (tool_name, input_bytes) pairs within the
+    // same session avoid redundant tool execution.
+    let mut cache = origin_tools::Cache::new();
 
     for turn in 1..=opts.max_turns {
         let req = ChatRequest {
@@ -210,28 +216,65 @@ pub async fn run_loop(
                 serde_json::from_slice(&input_bytes).map_err(|e| LoopError::BadArgs(e.to_string()))?;
             let preview = args.to_string();
 
+            // Compute the memoization key using the RAW input bytes (not
+            // re-serialized args) so the key is stable across turns.
+            let key = origin_tools::NormalizedInput::hash(meta.name, &input_bytes);
+            let cache_hit = if cache.is_skipped(meta.name) {
+                None
+            } else {
+                cache.lookup(&key).copied()
+            };
+
+            // Permission check fires first — denied tools never use cached results.
             let decision = check(meta, &preview, prompter).await;
             if decision.outcome == Outcome::Deny {
-                // Discard any precomputed speculative result — the tool was denied.
+                // Drain any speculative slot to keep the registry clean.
                 let _ = speculative.take(&id).await;
                 return Err(LoopError::Denied(name.clone()));
             }
 
-            // Try the speculative precomputed result first; fall back to
-            // synchronous dispatch if the registry has no entry (e.g., the tool
-            // is side-effecting, streaming was disabled, or the spawn lost).
-            let result_bytes: Vec<u8> = if let Some(pre) = speculative.take(&id).await {
-                pre?
+            let result_bytes: Vec<u8> = if let Some(hit) = cache_hit {
+                // Serve the cached body annotated with the originating turn.
+                let store = opts.cas.as_ref().ok_or_else(|| {
+                    LoopError::ToolFailure("memoization requires CAS to be configured".into())
+                })?;
+                let body = store
+                    .get(origin_cas::Hash::from_bytes(hit.handle))
+                    .map_err(|e| LoopError::ToolFailure(e.to_string()))?
+                    .ok_or_else(|| LoopError::ToolFailure("cas miss on cached handle".into()))?;
+                let annotated = format!(
+                    "{}\n\n(cached from turn {})",
+                    String::from_utf8_lossy(&body),
+                    hit.from_turn,
+                );
+                // Drain any matching speculative slot so the task doesn't stay
+                // detached — its result will be discarded in favour of the cache.
+                let _ = speculative.take(&id).await;
+                annotated.into_bytes()
             } else {
-                dispatch_tool(meta, &args, opts.cas.as_deref())
-                    .await?
-                    .into_bytes()
+                // Try speculative precomputed result first; fall back to fresh
+                // synchronous dispatch if the registry has no entry.
+                if let Some(pre) = speculative.take(&id).await {
+                    pre?
+                } else {
+                    dispatch_tool(meta, &args, opts.cas.as_deref())
+                        .await?
+                        .into_bytes()
+                }
             };
 
             let block = if let Some(cas) = opts.cas.as_ref() {
                 let h: Hash = cas
                     .put(&result_bytes)
                     .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
+
+                // Record into the memoization cache for subsequent turns
+                // within this session. Skip-listed tools and hits are not
+                // re-recorded (a hit means the entry is already present).
+                if !cache.is_skipped(meta.name) && cache_hit.is_none() {
+                    cache.record(key, *h.as_bytes(), turn);
+                }
+
                 Block::ToolResult {
                     tool_use_id: id,
                     handle: Some(*h.as_bytes()),
