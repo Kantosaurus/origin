@@ -14,6 +14,8 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = { workspace = true }
 thiserror = "1"
 blake3 = "1"
+origin-mem = { path = "../origin-mem" }
+origin-cas = { path = "../origin-cas" }
 
 [dev-dependencies]
 tempfile = "3"
