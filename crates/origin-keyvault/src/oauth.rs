@@ -12,6 +12,7 @@ use base64::Engine as _;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::{Error, KeyVault, Secret};
 
@@ -62,6 +63,7 @@ impl Default for Pkce {
 
 /// Inputs for an RFC 6749 §4.1.3 authorization-code token exchange.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AuthCodeRequest {
     /// The `code` returned by the authorization server on the redirect.
     pub code: String,
@@ -71,9 +73,27 @@ pub struct AuthCodeRequest {
     pub redirect_uri: String,
 }
 
+impl AuthCodeRequest {
+    /// Build a new auth-code exchange request. Use this rather than a struct
+    /// literal so future fields can be added without a breaking change.
+    #[must_use]
+    pub fn new(
+        code: impl Into<String>,
+        code_verifier: impl Into<String>,
+        redirect_uri: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            code_verifier: code_verifier.into(),
+            redirect_uri: redirect_uri.into(),
+        }
+    }
+}
+
 /// Result of a successful `/token` exchange, exposed to the caller. The
 /// refresh token is *not* returned — it stays inside the vault.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct ExchangedTokens {
     /// Bearer access token. Use immediately, do not log.
     pub access: Secret<String>,
@@ -83,6 +103,7 @@ pub struct ExchangedTokens {
 
 /// Outcome of [`OAuthClient::refresh`] / [`OAuthClient::refresh_if_due`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum RefreshOutcome {
     /// Tokens were rotated; freshly minted access token is returned.
     Rotated {
@@ -99,10 +120,14 @@ pub enum RefreshOutcome {
 
 /// On-disk shape persisted in the vault. Kept private — callers reach
 /// tokens through [`OAuthClient::exchange`] / [`OAuthClient::refresh`].
-#[derive(Debug, Serialize, Deserialize)]
+///
+/// `Zeroize` + `ZeroizeOnDrop` wipe the access and refresh token bytes
+/// (both `String`) when the in-memory copy is dropped, so the secrets do
+/// not linger on the heap after a refresh.
+#[derive(Debug, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct StoredTokens {
     access: String,
-    refresh: String,
+    refresh: Option<String>,
     expires_at: u64,
 }
 
@@ -165,9 +190,17 @@ impl OAuthClient {
         ];
         let resp = self.post_form(&form).await?;
         let expires_at = now_epoch_secs().saturating_add(resp.expires_in);
-        let refresh = resp.refresh_token.unwrap_or_default();
-        self.persist(vault, account, &resp.access_token, &refresh, expires_at)
-            .await?;
+        // Only persist a refresh token if the provider actually issued one;
+        // storing `""` would make a later refresh POST `refresh_token=` and
+        // mask the real failure mode behind a 400 from the IdP.
+        self.persist(
+            vault,
+            account,
+            &resp.access_token,
+            resp.refresh_token.as_deref(),
+            expires_at,
+        )
+        .await?;
         Ok(ExchangedTokens {
             access: Secret::new(resp.access_token),
             expires_at,
@@ -178,20 +211,26 @@ impl OAuthClient {
     ///
     /// # Errors
     /// Returns [`Error::NotFound`] if no tokens are stored, [`Error::Serde`]
-    /// on JSON parse failure, [`Error::Backend`] on HTTP failure.
+    /// on JSON parse failure, [`Error::Backend`] on HTTP failure, and
+    /// [`Error::Backend`] with `"no refresh_token available …"` if the
+    /// initial exchange never received a refresh token.
     pub async fn refresh(&self, vault: &KeyVault, account: &str) -> Result<RefreshOutcome, Error> {
         let stored = self.load(vault, account).await?;
+        let refresh_token = stored
+            .refresh
+            .as_deref()
+            .ok_or_else(|| Error::Backend("no refresh_token available for account".to_owned()))?;
         let form = [
             ("grant_type", "refresh_token"),
-            ("refresh_token", stored.refresh.as_str()),
+            ("refresh_token", refresh_token),
             ("client_id", self.client_id.as_str()),
         ];
         let resp = self.post_form(&form).await?;
         let expires_at = now_epoch_secs().saturating_add(resp.expires_in);
         // Some providers (e.g. Google with non-offline scopes) omit a new
         // refresh token on rotation; reuse the previous one in that case.
-        let refresh = resp.refresh_token.unwrap_or(stored.refresh);
-        self.persist(vault, account, &resp.access_token, &refresh, expires_at)
+        let refresh = resp.refresh_token.as_deref().or(Some(refresh_token));
+        self.persist(vault, account, &resp.access_token, refresh, expires_at)
             .await?;
         Ok(RefreshOutcome::Rotated {
             access: Secret::new(resp.access_token),
@@ -246,12 +285,12 @@ impl OAuthClient {
         vault: &KeyVault,
         account: &str,
         access: &str,
-        refresh: &str,
+        refresh: Option<&str>,
         expires_at: u64,
     ) -> Result<(), Error> {
         let stored = StoredTokens {
             access: access.to_owned(),
-            refresh: refresh.to_owned(),
+            refresh: refresh.map(str::to_owned),
             expires_at,
         };
         let json = serde_json::to_string(&stored).map_err(|e| Error::Serde(format!("encode: {e}")))?;
