@@ -302,6 +302,28 @@ pub async fn run_loop(
     Err(LoopError::MaxTurns(opts.max_turns))
 }
 
+/// Rebuild entry-point invoked by the future IPC handler / git hook.
+///
+/// P7.8 ships the free function; P10 wires it into the daemon's `Frame`
+/// dispatcher alongside [`crate::protocol::RebuildRequest`]. The function
+/// itself is a thin shim over [`origin_codegraph::rebuild::rebuild_paths`].
+///
+/// # Errors
+/// Propagates [`origin_codegraph::rebuild::RebuildError`] for fatal CAS /
+/// `SQLite` failures; per-file errors are aggregated into the returned report.
+// `req` is taken by value to match the future IPC handler shape — once P10
+// deserializes a `RebuildRequest` off the wire it will move the value into
+// this function. Taking by reference now would force a copy at the boundary.
+#[allow(clippy::needless_pass_by_value)]
+pub fn rebuild_codegraph(
+    idx: &mut origin_codegraph::index::CodeGraphIndex,
+    req: crate::protocol::RebuildRequest,
+    lang: origin_codegraph::Language,
+) -> Result<origin_codegraph::rebuild::RebuildReport, origin_codegraph::rebuild::RebuildError> {
+    tracing::info!(paths = req.paths.len(), "rebuild_codegraph: dispatching");
+    origin_codegraph::rebuild::rebuild_paths(idx, &req.paths, lang)
+}
+
 async fn dispatch_tool(meta: &ToolMeta, args: &Value, cas: Option<&Store>) -> Result<String, LoopError> {
     match meta.name {
         "Read" => {

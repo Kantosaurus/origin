@@ -1,24 +1,20 @@
 //! `graph_path` — shortest-path query between two code entities.
 
-use thiserror::Error;
+use origin_codegraph::index::{CodeGraphIndex, EntityId};
+use origin_codegraph::query::{dispatch, Query, QueryError, QueryResult};
 
-#[allow(clippy::module_name_repetitions)] // `GraphPathError` follows `RecallError` precedent
-#[derive(Debug, Error)]
-pub enum GraphPathError {
-    #[error("not yet wired to the live index")]
-    Unwired,
-}
-
+/// Find a shortest path of length ≤ `max_hops` from `from` to `to`.
+///
 /// # Errors
-/// Returns [`GraphPathError::Unwired`] until P7.8 wires the daemon-held
-/// `CodeGraphIndex`; the tool's registration is what P7.7 verifies.
+/// Propagates [`QueryError`] from [`origin_codegraph::query::dispatch`].
 #[allow(clippy::module_name_repetitions)] // `graph_path_tool` follows `recall_tool` precedent
-pub const fn graph_path_tool(
-    _from: [u8; 32],
-    _to: [u8; 32],
-    _max_hops: usize,
-) -> Result<String, GraphPathError> {
-    Err(GraphPathError::Unwired)
+pub fn graph_path_tool(
+    idx: &CodeGraphIndex,
+    from: EntityId,
+    to: EntityId,
+    max_hops: usize,
+) -> Result<QueryResult, QueryError> {
+    dispatch(idx, Query::Path { from, to, max_hops })
 }
 
 crate::origin_tool! {
