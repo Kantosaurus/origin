@@ -80,3 +80,27 @@ pub async fn check_with_rules(
     }
     check(meta, args_preview, prompter).await
 }
+
+use origin_skills::SkillRegistry;
+
+/// Same as [`check`], but also enforces an active [`SkillRegistry`]'s
+/// allowed-tools intersection mask before the tier check.
+///
+/// If any skill is active and `meta.name` is not in the intersection, the
+/// outcome is [`Outcome::Deny`] with `reason = "skill-narrowed"`.
+pub async fn check_with_skills(
+    meta: &ToolMeta,
+    args_preview: &str,
+    prompter: &dyn Prompter,
+    skills: &SkillRegistry,
+) -> Decision {
+    if let Some(mask) = skills.allowed_tools() {
+        if !mask.contains(meta.name) {
+            return Decision {
+                outcome: Outcome::Deny,
+                reason: "skill-narrowed".into(),
+            };
+        }
+    }
+    check(meta, args_preview, prompter).await
+}
