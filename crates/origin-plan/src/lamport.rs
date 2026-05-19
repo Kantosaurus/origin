@@ -8,7 +8,7 @@
 use core::cmp::Ordering;
 
 /// Stable identifier for a producer of plan ops (coordinator or worker).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ActorId(u64);
 
 impl ActorId {
@@ -26,7 +26,7 @@ impl ActorId {
 }
 
 /// Logical Lamport timestamp. Monotonic per actor; comparable globally.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Lamport(u64);
 
 impl Lamport {
@@ -65,7 +65,7 @@ impl Lamport {
 ///
 /// Used as the sort key in [`crate::fold::fold`] so that any permutation of
 /// the input log produces an identical sorted sequence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct OpKey {
     /// Lamport timestamp of the op.
     pub lamport: Lamport,

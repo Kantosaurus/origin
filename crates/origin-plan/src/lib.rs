@@ -35,10 +35,14 @@ pub mod lease;
 pub mod logoot;
 pub mod ops;
 pub mod plan;
+pub mod snapshot;
+pub mod store;
 
 pub use fold::fold;
 pub use lamport::{ActorId, Lamport, OpKey};
 pub use lease::{LeaseOutcome, LeaseRecord};
 pub use logoot::{LogootKey, PathComponent};
 pub use ops::{AddNote, AddStep, EditContent, LeaseStep, MarkStep, Op, OpEnvelope, Reorder, Status, StepId};
-pub use plan::{Plan, Step};
+pub use plan::{Plan, SnapshotError, Step};
+pub use snapshot::Snapshot;
+pub use store::{PlanStore, PlanStoreError};

@@ -62,6 +62,13 @@ pub fn fold<I: IntoIterator<Item = OpEnvelope>>(envs: I) -> Plan {
                 let candidate = LeaseRecord::new(env.lamport, env.actor, lease.expires_at_ms);
                 plan.apply_lease(lease.step, candidate);
             }
+            Op::Snapshot(_) => {
+                // Snapshots are a persistence-layer fast-forward marker
+                // (P9.3, N7.7). Folding one does not change `Plan` state:
+                // snapshot restoration goes through
+                // `PlanStore::load_latest_snapshot`, which deserializes the
+                // CAS-stored body directly and bypasses the fold.
+            }
         }
     }
 

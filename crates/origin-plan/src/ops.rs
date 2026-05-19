@@ -7,6 +7,7 @@
 
 use crate::lamport::{ActorId, Lamport, OpKey};
 use crate::logoot::LogootKey;
+use crate::snapshot::Snapshot;
 
 /// Stable identifier for a step in the plan tree.
 ///
@@ -14,7 +15,7 @@ use crate::logoot::LogootKey;
 /// any other globally-unique payload chosen by the producer. The CRDT only
 /// requires that distinct logical steps choose distinct ids — collisions are a
 /// caller bug, not a fold-time failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct StepId(u128);
 
 impl StepId {
@@ -32,7 +33,7 @@ impl StepId {
 }
 
 /// Lifecycle status of a step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Status {
     /// Step exists but no worker has picked it up.
     Pending,
@@ -46,7 +47,7 @@ pub enum Status {
 
 /// `AddStep(parent, id, body, key)` — insert a step into the plan tree at
 /// position `key` under `parent` (root if `None`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AddStep {
     /// Globally-unique id chosen by the producer.
     pub id: StepId,
@@ -60,7 +61,7 @@ pub struct AddStep {
 
 /// `MarkStep(id, status)` — set a step's status. Last-writer-wins on
 /// `(lamport, actor)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MarkStep {
     /// Step being marked.
     pub id: StepId,
@@ -69,7 +70,7 @@ pub struct MarkStep {
 }
 
 /// `EditContent(id, body)` — last-writer-wins replace of a step body.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EditContent {
     /// Step being edited.
     pub id: StepId,
@@ -79,7 +80,7 @@ pub struct EditContent {
 
 /// `AddNote(id, body)` — append a note to a step. Notes form an ordered list
 /// driven by `(lamport, actor)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AddNote {
     /// Step the note is attached to.
     pub id: StepId,
@@ -89,7 +90,7 @@ pub struct AddNote {
 
 /// `Reorder(id, key)` — move a step to a new Logoot position. Last-writer-wins
 /// on `(lamport, actor)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Reorder {
     /// Step being reordered.
     pub id: StepId,
@@ -105,7 +106,7 @@ pub struct Reorder {
 /// `expires_at_ms <= now_ms`) are filtered out of
 /// [`crate::plan::Plan::lease_holder`] but remain in the underlying fold state
 /// so re-folding the log is deterministic regardless of wall-clock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LeaseStep {
     /// Step being leased.
     pub step: StepId,
@@ -119,7 +120,7 @@ pub struct LeaseStep {
 ///
 /// Each variant is a small, plain payload — wrapping in an [`OpEnvelope`] is
 /// what attaches the Lamport/actor metadata used by the fold.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Op {
     /// See [`AddStep`].
     AddStep(AddStep),
@@ -133,6 +134,11 @@ pub enum Op {
     Reorder(Reorder),
     /// See [`LeaseStep`].
     LeaseStep(LeaseStep),
+    /// See [`Snapshot`] — a persistence-layer fast-forward marker (P9.3,
+    /// N7.7). Folding a `Snapshot` op is a no-op: snapshots restore state by
+    /// loading the CAS-stored body directly via
+    /// [`crate::store::PlanStore::load_latest_snapshot`], bypassing the fold.
+    Snapshot(Snapshot),
 }
 
 impl Op {
@@ -149,12 +155,29 @@ impl Op {
             Self::AddNote(_) => 3,
             Self::Reorder(_) => 4,
             Self::LeaseStep(_) => 5,
+            Self::Snapshot(_) => 6,
+        }
+    }
+
+    /// Short stable tag stored in the V4 `plan_ops.op_kind` column.
+    /// Used only as a human/diagnostic label; the canonical type info is in
+    /// `body` (bincode-encoded `OpEnvelope`).
+    #[must_use]
+    pub const fn kind_tag(&self) -> &'static str {
+        match self {
+            Self::AddStep(_) => "AddStep",
+            Self::MarkStep(_) => "MarkStep",
+            Self::EditContent(_) => "EditContent",
+            Self::AddNote(_) => "AddNote",
+            Self::Reorder(_) => "Reorder",
+            Self::LeaseStep(_) => "LeaseStep",
+            Self::Snapshot(_) => "Snapshot",
         }
     }
 }
 
 /// One entry in the op log: producer + clock + payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OpEnvelope {
     /// Producing actor.
     pub actor: ActorId,
