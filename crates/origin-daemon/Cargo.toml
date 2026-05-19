@@ -9,11 +9,22 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["openai", "gemini", "ollama"]
+openai = ["dep:origin-provider-openai"]
+gemini = ["dep:origin-provider-gemini"]
+ollama = ["dep:origin-provider-ollama"]
+openrouter = ["dep:origin-provider-openrouter"]
+
 [dependencies]
 origin-ipc              = { path = "../origin-ipc" }
 origin-core             = { path = "../origin-core" }
 origin-provider         = { path = "../origin-provider" }
 origin-provider-anthropic = { path = "../origin-provider-anthropic" }
+origin-provider-openai     = { path = "../origin-provider-openai",     optional = true }
+origin-provider-gemini     = { path = "../origin-provider-gemini",     optional = true }
+origin-provider-ollama     = { path = "../origin-provider-ollama",     optional = true }
+origin-provider-openrouter = { path = "../origin-provider-openrouter", optional = true }
 origin-tools            = { path = "../origin-tools" }
 origin-permission       = { path = "../origin-permission" }
 origin-store            = { path = "../origin-store" }

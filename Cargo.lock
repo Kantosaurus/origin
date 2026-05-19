@@ -2106,6 +2106,10 @@ dependencies = [
  "origin-permission",
  "origin-provider",
  "origin-provider-anthropic",
+ "origin-provider-gemini",
+ "origin-provider-ollama",
+ "origin-provider-openai",
+ "origin-provider-openrouter",
  "origin-store",
  "origin-stream",
  "origin-tools",
@@ -2264,6 +2268,21 @@ dependencies = [
  "origin-provider",
  "origin-stream",
  "pin-utils",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
+name = "origin-provider-openrouter"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "origin-core",
+ "origin-provider",
+ "origin-stream",
  "reqwest",
  "serde",
  "serde_json",
