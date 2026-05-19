@@ -60,31 +60,14 @@ impl Provider for OpenAi {
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
-        match resp.status() {
-            StatusCode::OK => {
-                let wire: wire::WireResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| ProviderError::Api(format!("decode: {e}")))?;
-                Ok(decode_response(wire))
-            }
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(ProviderError::Auth),
-            StatusCode::TOO_MANY_REQUESTS => {
-                let retry = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .unwrap_or(1);
-                Err(ProviderError::RateLimit {
-                    retry_after_secs: retry,
-                })
-            }
-            s => {
-                let body = resp.text().await.unwrap_or_default();
-                Err(ProviderError::Api(format!("status {s}: {body}")))
-            }
+        if resp.status() == StatusCode::OK {
+            let wire: wire::WireResponse = resp
+                .json()
+                .await
+                .map_err(|e| ProviderError::Api(format!("decode: {e}")))?;
+            return Ok(decode_response(wire));
         }
+        Err(status_error(resp).await)
     }
 
     async fn chat_stream(&self, req: ChatRequest, ring: &origin_stream::Ring) -> Result<(), ProviderError> {
@@ -102,14 +85,41 @@ impl Provider for OpenAi {
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api(format!("status {status}: {text}")));
+            let err = status_error(resp).await;
+            ring.close();
+            return Err(err);
         }
 
-        streaming::parse_into_ring(resp, ring).await?;
+        let result = streaming::parse_into_ring(resp, ring).await;
         ring.close();
-        Ok(())
+        result
+    }
+}
+
+/// Map a non-2xx `reqwest::Response` to the canonical `ProviderError` variant.
+///
+/// - 401 / 403 → `ProviderError::Auth`
+/// - 429 → `ProviderError::RateLimit` (parses `retry-after` header, defaults to 1)
+/// - other → `ProviderError::Api(format!("status {s}: {body}"))`
+async fn status_error(resp: reqwest::Response) -> ProviderError {
+    let status = resp.status();
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderError::Auth,
+        StatusCode::TOO_MANY_REQUESTS => {
+            let retry = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(1);
+            ProviderError::RateLimit {
+                retry_after_secs: retry,
+            }
+        }
+        s => {
+            let body = resp.text().await.unwrap_or_default();
+            ProviderError::Api(format!("status {s}: {body}"))
+        }
     }
 }
 

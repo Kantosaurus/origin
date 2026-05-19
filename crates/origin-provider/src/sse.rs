@@ -18,9 +18,7 @@ use futures_util::{Stream, StreamExt};
 /// Each yielded item is `Err(ProviderError::Api)` if the SSE parser encounters
 /// a malformed frame.
 pub fn from_reqwest(resp: reqwest::Response) -> impl Stream<Item = Result<Event, ProviderError>> + Send {
-    let byte_stream = resp
-        .bytes_stream()
-        .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+    let byte_stream = resp.bytes_stream().map(|r| r.map_err(std::io::Error::other));
     let async_read = tokio_util::io::StreamReader::new(byte_stream);
     tokio_util::io::ReaderStream::new(async_read)
         .eventsource()
