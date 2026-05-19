@@ -10,3 +10,4 @@ pub mod graph_summarize;
 pub mod grep_tool;
 pub mod read;
 pub mod recall;
+pub mod task;
