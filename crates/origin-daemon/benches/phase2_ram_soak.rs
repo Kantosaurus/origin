@@ -74,6 +74,8 @@ fn main() {
         cas: Some(Arc::clone(&store)),
         relay_tx: None,
         streaming_disabled: true,
+        proposer: None,
+        event_tx: None,
     };
 
     let mut sys = System::new();

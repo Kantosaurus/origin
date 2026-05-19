@@ -1736,6 +1736,7 @@ dependencies = [
  "origin-cas",
  "origin-core",
  "origin-ipc",
+ "origin-mem",
  "origin-permission",
  "origin-provider",
  "origin-provider-anthropic",

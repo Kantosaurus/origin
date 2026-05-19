@@ -123,6 +123,8 @@ async fn loop_caps_at_max_turns() {
         cas: None,
         relay_tx: None,
         streaming_disabled: true,
+        proposer: None,
+        event_tx: None,
     };
     let err = run_loop(&mut session, "loop", &provider, &AlwaysAllow, &opts)
         .await
@@ -172,6 +174,8 @@ async fn tool_result_goes_to_cas_and_block_carries_handle_only() {
         cas: Some(Arc::clone(&store)),
         relay_tx: None,
         streaming_disabled: true,
+        proposer: None,
+        event_tx: None,
     };
 
     let summary = run_loop(
