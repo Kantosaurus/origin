@@ -8,6 +8,16 @@ use crate::damage::{self, Run};
 use crate::grid::{Attr, Cell};
 use crate::Grid;
 
+/// NUL-glyph sentinel cell used to initialize scratch grids.
+/// Distinct from `Cell::blank()` (glyph `' '`) so the first frame after
+/// construction or resize triggers a full repaint.
+const SCRATCH_SENTINEL: Cell = Cell {
+    glyph: 0,
+    fg: 0,
+    bg: 0,
+    attr: 0,
+};
+
 /// Three-pane terminal composer.
 ///
 /// Manages a main pane, a (optionally hidden) side panel, and a prompt bar,
@@ -164,25 +174,17 @@ impl Composer {
         let side_cols = compute_side_cols(cols, side_visible);
         let pane_rows = rows.saturating_sub(3);
         let main_cols = cols.saturating_sub(side_cols);
-        // NUL-glyph sentinel: distinct from blank (' ') so the first draw()
-        // that clears to blank triggers a full repaint of every cell.
-        let sentinel = Cell {
-            glyph: 0,
-            fg: 0,
-            bg: 0,
-            attr: 0,
-        };
 
         Self {
             cols,
             rows,
             side_cols,
-            main: Grid::new_filled(main_cols, pane_rows, sentinel),
-            side: Grid::new_filled(side_cols.max(1), pane_rows, sentinel),
-            prompt: Grid::new_filled(cols, 3, sentinel),
-            scratch_main: Grid::new_filled(main_cols, pane_rows, sentinel),
-            scratch_side: Grid::new_filled(side_cols.max(1), pane_rows, sentinel),
-            scratch_prompt: Grid::new_filled(cols, 3, sentinel),
+            main: Grid::new_filled(main_cols, pane_rows, SCRATCH_SENTINEL),
+            side: Grid::new_filled(side_cols.max(1), pane_rows, SCRATCH_SENTINEL),
+            prompt: Grid::new_filled(cols, 3, SCRATCH_SENTINEL),
+            scratch_main: Grid::new_filled(main_cols, pane_rows, SCRATCH_SENTINEL),
+            scratch_side: Grid::new_filled(side_cols.max(1), pane_rows, SCRATCH_SENTINEL),
+            scratch_prompt: Grid::new_filled(cols, 3, SCRATCH_SENTINEL),
             side_visible,
         }
     }
@@ -205,9 +207,11 @@ impl Composer {
         self.prompt = resize_clipped(&self.prompt, cols, 3);
 
         // Scratch grids also resize (clear) so the next diff is a full repaint.
-        self.scratch_main = Grid::new(main_cols, pane_rows);
-        self.scratch_side = Grid::new(side_cols.max(1), pane_rows);
-        self.scratch_prompt = Grid::new(cols, 3);
+        // Use SCRATCH_SENTINEL to match the initialization in `new()`, ensuring
+        // that the scratch grid stays distinct from the live grid post-draw.
+        self.scratch_main = Grid::new_filled(main_cols, pane_rows, SCRATCH_SENTINEL);
+        self.scratch_side = Grid::new_filled(side_cols.max(1), pane_rows, SCRATCH_SENTINEL);
+        self.scratch_prompt = Grid::new_filled(cols, 3, SCRATCH_SENTINEL);
     }
 
     /// Mutable reference to the main pane grid.
