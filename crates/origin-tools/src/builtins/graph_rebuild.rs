@@ -2,23 +2,23 @@
 
 use std::path::PathBuf;
 
-use thiserror::Error;
+use origin_codegraph::index::CodeGraphIndex;
+use origin_codegraph::rebuild::{rebuild_paths, RebuildError, RebuildReport};
+use origin_codegraph::Language;
 
-#[allow(clippy::module_name_repetitions)] // `GraphRebuildError` follows `RecallError` precedent
-#[derive(Debug, Error)]
-pub enum GraphRebuildError {
-    #[error("not yet wired to the live index")]
-    Unwired,
-}
-
+/// Re-extract nodes for each path and upsert them into `idx`.
+///
 /// # Errors
-/// Returns [`GraphRebuildError::Unwired`] until P7.8 wires the daemon-held
-/// `CodeGraphIndex` rebuild pipeline; the tool's registration is what P7.7
-/// verifies.
+/// Propagates [`RebuildError`] for fatal CAS / `SQLite` failures; per-file
+/// diagnostics are aggregated into the returned report.
 #[allow(clippy::module_name_repetitions)] // `graph_rebuild_tool` follows `recall_tool` precedent
 #[allow(clippy::needless_pass_by_value)] // matches future wired signature
-pub fn graph_rebuild_tool(_paths: Vec<PathBuf>) -> Result<String, GraphRebuildError> {
-    Err(GraphRebuildError::Unwired)
+pub fn graph_rebuild_tool(
+    idx: &mut CodeGraphIndex,
+    paths: Vec<PathBuf>,
+    lang: Language,
+) -> Result<RebuildReport, RebuildError> {
+    rebuild_paths(idx, &paths, lang)
 }
 
 crate::origin_tool! {
