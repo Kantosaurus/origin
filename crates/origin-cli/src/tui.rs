@@ -5,7 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::screen::split_main_input;
+use crate::screen::split_main_input_status;
+use crate::status::{render_line, UsageSnapshot};
 
 #[derive(Debug)]
 pub struct App {
@@ -15,15 +16,17 @@ pub struct App {
     /// stream relay appends `TextDelta`s here, and `finalize_assistant_turn`
     /// commits the buffer to scrollback as a single line.
     pub current_assistant: Option<String>,
+    pub usage: UsageSnapshot,
 }
 
 impl App {
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new(provider: &'static str, model: impl Into<String>) -> Self {
         Self {
             scrollback: Vec::new(),
             input: String::new(),
             current_assistant: None,
+            usage: UsageSnapshot::new(provider, model),
         }
     }
 
@@ -50,16 +53,29 @@ impl App {
             self.scrollback.push(format!("origin ({turns} turns)> {text}"));
         }
     }
-}
 
-impl Default for App {
-    fn default() -> Self {
-        Self::new()
+    /// Accumulate one batch of token usage + wallclock elapsed into the
+    /// running status snapshot. Called once per `Submit` cycle after
+    /// `call_daemon` returns.
+    pub fn record_usage(
+        &mut self,
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_read: u32,
+        cache_write: u32,
+        elapsed: std::time::Duration,
+    ) {
+        self.usage.input_tokens = self.usage.input_tokens.saturating_add(input_tokens);
+        self.usage.output_tokens = self.usage.output_tokens.saturating_add(output_tokens);
+        self.usage.cache_read_input_tokens = self.usage.cache_read_input_tokens.saturating_add(cache_read);
+        self.usage.cache_creation_input_tokens =
+            self.usage.cache_creation_input_tokens.saturating_add(cache_write);
+        self.usage.elapsed += elapsed;
     }
 }
 
 pub fn draw(f: &mut Frame<'_>, app: &App) {
-    let (main, prompt) = split_main_input(f.area());
+    let (main, prompt, status) = split_main_input_status(f.area());
 
     let mut lines: Vec<Line> = app
         .scrollback
@@ -80,4 +96,8 @@ pub fn draw(f: &mut Frame<'_>, app: &App) {
     ]))
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(input, prompt);
+
+    let s = render_line(&app.usage);
+    let status_p = Paragraph::new(Line::from(Span::raw(s)));
+    f.render_widget(status_p, status);
 }

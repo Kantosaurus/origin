@@ -2,7 +2,7 @@ use origin_cli::tui::App;
 
 #[test]
 fn assistant_turn_lifecycle() {
-    let mut app = App::new();
+    let mut app = App::new("anthropic", "claude-opus-4-7");
     app.start_assistant_turn();
     app.append_to_current_assistant("Hel");
     app.append_to_current_assistant("lo");
