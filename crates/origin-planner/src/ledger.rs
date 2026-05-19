@@ -1,7 +1,6 @@
-//! `PrefixLedger` — per-section stability scoring.
-// The public types intentionally repeat the module name for clarity at the
-// crate root (`origin_planner::PrefixLedger`, `origin_planner::LedgerError`).
 #![allow(clippy::module_name_repetitions)]
+
+//! `PrefixLedger` — per-section stability scoring.
 //!
 //! Each `(section_id, band)` carries a running `Stability` score updated by
 //! `record_hit` (positive) and `record_miss` (negative). When the score crosses
@@ -45,7 +44,10 @@ pub struct Stability {
     pub band: Band,
 }
 
-/// Errors returned by [`PrefixLedger`].
+/// Errors surfaced by `PrefixLedger` queries.
+///
+/// Defined in P3.1; first returned by `CachePlanner::plan` in P3.2 when the
+/// planner asks the ledger about a section it never saw seeded.
 #[derive(Debug, Error)]
 pub enum LedgerError {
     /// Caller asked for a section the ledger never saw.

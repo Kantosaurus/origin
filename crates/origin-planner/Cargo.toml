@@ -10,8 +10,6 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-origin-core = { path = "../origin-core" }
-origin-cas  = { path = "../origin-cas" }
 thiserror = "1"
 
 [dev-dependencies]
