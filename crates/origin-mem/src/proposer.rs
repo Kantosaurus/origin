@@ -119,7 +119,10 @@ impl Proposer {
     /// the per-line per-pattern extraction loop.
     #[must_use]
     pub fn scan(&self, user: &str, assistant: &str, next_id: &mut u32) -> Vec<MemoryProposal> {
-        let mut out = Vec::new();
+        let mut out: Vec<MemoryProposal> = Vec::new();
+        // Dedup by body so e.g. "remember: i prefer X" doesn't fire two near-identical
+        // proposals (one from the remember pattern, one from the preference pattern).
+        let mut seen_bodies: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Fast-path: skip per-line work if no user-side pattern fires at all.
         if self.user_set.is_match(user) {
@@ -129,7 +132,13 @@ impl Proposer {
                 }
                 for line in user.lines() {
                     if let Some(proposal) = self.extract(idx, def, line, next_id) {
-                        out.push(proposal);
+                        if seen_bodies.insert(proposal.body.clone()) {
+                            out.push(proposal);
+                        } else {
+                            // Roll back the id we burned on the duplicate so the
+                            // counter stays packed.
+                            *next_id -= 1;
+                        }
                     }
                 }
             }
@@ -143,7 +152,11 @@ impl Proposer {
                 }
                 for line in assistant.lines() {
                     if let Some(proposal) = self.extract(idx, def, line, next_id) {
-                        out.push(proposal);
+                        if seen_bodies.insert(proposal.body.clone()) {
+                            out.push(proposal);
+                        } else {
+                            *next_id -= 1;
+                        }
                     }
                 }
             }
