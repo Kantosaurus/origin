@@ -5,6 +5,7 @@
 //! an identical [`Plan`] — because the very first step is to sort envelopes by
 //! `(lamport, actor)`. After that the apply loop is straight-line.
 
+use crate::lease::LeaseRecord;
 use crate::ops::{Op, OpEnvelope};
 use crate::plan::{Plan, Step};
 
@@ -52,6 +53,14 @@ pub fn fold<I: IntoIterator<Item = OpEnvelope>>(envs: I) -> Plan {
                 if let Some(s) = plan.get_mut(re.id) {
                     s.apply_reorder(re.key, op_key);
                 }
+            }
+            Op::LeaseStep(lease) => {
+                // Lease records are infallible: races are resolved by
+                // `(lamport, actor)` lex order via `LeaseRecord::supersedes`.
+                // Lease ops for unknown steps are dropped (mirrors the rest
+                // of the alphabet).
+                let candidate = LeaseRecord::new(env.lamport, env.actor, lease.expires_at_ms);
+                plan.apply_lease(lease.step, candidate);
             }
         }
     }
