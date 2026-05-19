@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use origin_cas::Store;
 use origin_daemon::agent::{run_loop, LoopOptions};
-use origin_daemon::protocol::{PromptReply, PromptRequest};
+use origin_daemon::protocol::{ClientMessage, MemoryAction, PromptReply, PromptRequest};
 use origin_daemon::session::Session;
 use origin_daemon::session_store::SessionStore;
 use origin_daemon::stream_relay::relay_to_connection;
@@ -79,31 +79,81 @@ fn spawn_handler_task(
                     Err(_) => break,
                 }
             };
-            let req: PromptRequest = match serde_json::from_slice(&body) {
-                Ok(r) => r,
-                Err(e) => {
-                    error!(error = %e, "bad prompt request");
-                    let _ = conn
-                        .lock()
-                        .await
-                        .write_frame(FrameKind::ErrorFrame, format!("bad request: {e}").as_bytes())
-                        .await;
-                    continue;
+            // Try the new ClientMessage envelope first, then fall back to the
+            // legacy raw `PromptRequest` shape (back-compat for clients that
+            // pre-date P6.7).
+            let msg: ClientMessage = if let Ok(m) = serde_json::from_slice::<ClientMessage>(&body) {
+                m
+            } else {
+                #[allow(deprecated)]
+                let res = from_legacy_prompt_request(&body);
+                match res {
+                    Ok(m) => m,
+                    Err(e) => {
+                        error!(error = %e, "bad client message");
+                        let _ = conn
+                            .lock()
+                            .await
+                            .write_frame(FrameKind::ErrorFrame, format!("bad request: {e}").as_bytes())
+                            .await;
+                        continue;
+                    }
                 }
             };
-            if !handle_request(
-                &conn,
-                provider.as_ref(),
-                session_store.as_ref(),
-                Arc::clone(&cas),
-                req,
-            )
-            .await
-            {
-                break;
+
+            match msg {
+                ClientMessage::Prompt(req) => {
+                    if !handle_request(
+                        &conn,
+                        provider.as_ref(),
+                        session_store.as_ref(),
+                        Arc::clone(&cas),
+                        req,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+                ClientMessage::MemoryDecision { proposal_id, action } => {
+                    // TODO(P6.9): wire MemoryHandle here so Accept/Edit
+                    // actually persist into origin-mem. For P6.7 we just log
+                    // and acknowledge the decision.
+                    handle_memory_decision_stub(&conn, proposal_id, &action).await;
+                }
             }
         }
     });
+}
+
+/// Back-compat shim: legacy clients send raw `PromptRequest` JSON without a
+/// `kind` discriminator. Wrap such bodies into `ClientMessage::Prompt`.
+#[deprecated(note = "send ClientMessage::Prompt explicitly; legacy fallback for pre-P6.7 clients")]
+fn from_legacy_prompt_request(body: &[u8]) -> Result<ClientMessage, serde_json::Error> {
+    serde_json::from_slice::<PromptRequest>(body).map(ClientMessage::Prompt)
+}
+
+/// Per-connection acknowledgement for a [`ClientMessage::MemoryDecision`].
+/// The P6.7 implementation is intentionally a stub — the daemon owns no
+/// `MemoryHandle` yet, so the decision is logged and acknowledged with a
+/// `Response` frame so the client can unblock its `send_decision` call.
+async fn handle_memory_decision_stub(
+    conn: &origin_ipc::transport::SharedConnection,
+    proposal_id: u32,
+    action: &MemoryAction,
+) {
+    let kind = match action {
+        MemoryAction::Accept => "accept",
+        MemoryAction::Reject => "reject",
+        MemoryAction::Edit { .. } => "edit",
+    };
+    info!(proposal_id, action = %kind, "memory decision (stub)");
+    let body = format!("{{\"ok\":true,\"proposal_id\":{proposal_id},\"action\":\"{kind}\"}}");
+    let _ = conn
+        .lock()
+        .await
+        .write_frame(FrameKind::Response, body.as_bytes())
+        .await;
 }
 
 /// Run one request to completion. Returns `false` if the response write
@@ -146,6 +196,8 @@ async fn handle_request(
             cas: Some(cas),
             relay_tx: Some(tx_sub.clone()),
             streaming_disabled: false,
+            proposer: None,
+            event_tx: None,
         };
         run_loop(&mut session, &req.user_text, provider, &AlwaysAllow, &opts).await
     };

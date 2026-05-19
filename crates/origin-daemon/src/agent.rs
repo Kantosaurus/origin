@@ -1,9 +1,11 @@
 //! Agent loop: prompt → provider → tool dispatch → repeat → final text.
 
+use crate::protocol::StreamEvent;
 use crate::session::Session;
 use crate::tool_use_parser::{ToolUseDelta, ToolUseParser};
 use origin_cas::{Hash, Store};
 use origin_core::types::{Block, Message, Role};
+use origin_mem::Proposer;
 use origin_permission::{check, prompt::Prompter, Outcome};
 use origin_provider::{ChatRequest, Provider};
 use origin_tools::{registry_iter, SideEffects, ToolMeta};
@@ -27,6 +29,19 @@ pub struct LoopOptions {
     /// bypass the streaming drain path. The incremental `tool_use` parser
     /// (P3.3) means production code paths can leave this `false`.
     pub streaming_disabled: bool,
+    /// If `Some`, the Proposer runs at turn end and pushes proposals into
+    /// `session.pending_proposals` and emits one [`StreamEvent::MemoryProposed`]
+    /// per proposal through `event_tx` (or skips the emit if no sender is
+    /// configured). `None` disables the feature (the existing dogfood path).
+    pub proposer: Option<Arc<Proposer>>,
+    /// Side-band channel for non-streaming [`StreamEvent`]s (currently only
+    /// [`StreamEvent::MemoryProposed`]). The daemon main forwards these as
+    /// `Event` frames after `run_loop` returns and before writing `Response`.
+    /// We use a direct event channel here (not the per-turn rkyv `Ring`)
+    /// because [`StreamEvent::MemoryProposed`] doesn't map to any
+    /// [`origin_stream::TokenKind`] — it's a turn-end side product, not a
+    /// streaming token.
+    pub event_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
 }
 
 impl Default for LoopOptions {
@@ -36,6 +51,8 @@ impl Default for LoopOptions {
             cas: None,
             relay_tx: None,
             streaming_disabled: false,
+            proposer: None,
+            event_tx: None,
         }
     }
 }
@@ -201,6 +218,26 @@ pub async fn run_loop(
                     _ => None,
                 })
                 .collect::<String>();
+
+            // P6.7: optional proposer pass at turn end. Each proposal is
+            // stashed on the Session and surfaced as a side-band StreamEvent
+            // for the CLI to render.
+            if let Some(proposer) = &opts.proposer {
+                let proposals = proposer.scan(user_text, &text, &mut session.next_proposal_id);
+                for p in proposals {
+                    if let Some(tx) = &opts.event_tx {
+                        let _ = tx
+                            .send(StreamEvent::MemoryProposed {
+                                proposal_id: p.proposal_id,
+                                body: p.body.clone(),
+                                suggested_tags: p.suggested_tags.clone(),
+                            })
+                            .await;
+                    }
+                    session.pending_proposals.insert(p.proposal_id, p);
+                }
+            }
+
             return Ok(LoopSummary {
                 assistant_text: text,
                 turns: turn,

@@ -19,6 +19,7 @@ origin-permission       = { path = "../origin-permission" }
 origin-store            = { path = "../origin-store" }
 origin-cas              = { path = "../origin-cas" }
 origin-stream           = { path = "../origin-stream" }
+origin-mem              = { path = "../origin-mem" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "sync"] }
 anyhow = "1"
 tracing = "0.1"

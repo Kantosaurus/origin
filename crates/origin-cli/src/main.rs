@@ -6,11 +6,11 @@ use anyhow::Result;
 use crossterm::event::{self, Event};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
-use origin_cli::input::{reduce, InputAction};
+use origin_cli::input::{parse_mem_command, reduce, InputAction};
 use origin_cli::tui::{draw, App};
 use origin_daemon::protocol::StreamEvent;
 use origin_ipc::frame::{encode, FrameKind};
-use origin_ipc::transport::Connector;
+use origin_ipc::transport::{Connection, Connector};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,16 @@ async fn main() -> Result<()> {
                     match reduce(&mut app.input, ev) {
                         InputAction::Quit => break,
                         InputAction::Submit(text) => {
+                            // /mem accept|reject|edit <N> is handled here so
+                            // we never start an assistant turn for it.
+                            if let Some(decision) = parse_mem_command(&text) {
+                                app.add_line("you> ", &text);
+                                match send_decision(&path, &decision).await {
+                                    Ok(()) => app.add_line("ok> ", "decision sent"),
+                                    Err(e) => app.add_line("error> ", &format!("{e}")),
+                                }
+                                continue;
+                            }
                             app.add_line("you> ", &text);
                             app.start_assistant_turn();
                             // Collect deltas + usage synchronously inside call_daemon
@@ -62,12 +72,14 @@ async fn main() -> Result<()> {
                             // borrow. We re-render between deltas inside the closure.
                             let mut deltas: Vec<String> = Vec::new();
                             let mut usage_events: Vec<(u32, u32, u32, u32)> = Vec::new();
+                            let mut proposals: Vec<(u32, String, Vec<String>)> = Vec::new();
                             let reply = call_daemon(
                                 &path,
                                 &model,
                                 &text,
                                 |d| deltas.push(d.to_string()),
                                 |i, o, cr, cw| usage_events.push((i, o, cr, cw)),
+                                |id, body, tags| proposals.push((id, body, tags)),
                             )
                             .await;
                             for d in &deltas {
@@ -84,6 +96,17 @@ async fn main() -> Result<()> {
                                     }
                                     app.record_usage(sum.0, sum.1, sum.2, sum.3, elapsed);
                                     app.finalize_assistant_turn(r.turns);
+                                    // Render each memory proposal as a status line.
+                                    for (id, body, tags) in &proposals {
+                                        let truncated: String = body.chars().take(60).collect();
+                                        let tag_str = tags.join(", ");
+                                        app.add_line(
+                                            "mem> ",
+                                            &format!(
+                                                "[#{id}] \"{truncated}\" (tags: {tag_str}) — /mem accept {id}, /mem reject {id}, /mem edit {id} <body>"
+                                            ),
+                                        );
+                                    }
                                 }
                                 Err(e) => {
                                     // Drop the in-flight buffer on error; surface the
@@ -113,6 +136,7 @@ async fn call_daemon(
     user_text: &str,
     mut on_delta: impl FnMut(&str) + Send,
     mut on_usage: impl FnMut(u32, u32, u32, u32) + Send,
+    mut on_proposal: impl FnMut(u32, String, Vec<String>) + Send,
 ) -> Result<(PromptReply, Duration)> {
     let start = std::time::Instant::now();
     let mut client = Connector::connect(path).await?;
@@ -142,6 +166,11 @@ async fn call_daemon(
                     cache_read_input_tokens,
                     cache_creation_input_tokens,
                 ),
+                StreamEvent::MemoryProposed {
+                    proposal_id,
+                    body: pbody,
+                    suggested_tags,
+                } => on_proposal(proposal_id, pbody, suggested_tags),
                 _ => {}
             }
             continue;
@@ -149,6 +178,21 @@ async fn call_daemon(
         let reply: PromptReply = serde_json::from_slice(&body)?;
         return Ok((reply, start.elapsed()));
     }
+}
+
+/// Send a `ClientMessage::MemoryDecision` to the daemon and wait for the
+/// acknowledgement frame. Opens a one-shot connection — the decision is
+/// fire-and-forget for the user, but we still drain the ack so the daemon's
+/// write buffer is unblocked.
+async fn send_decision(path: &str, decision: &origin_daemon::protocol::ClientMessage) -> Result<()> {
+    let mut client: Connection = Connector::connect(path).await?;
+    let body = serde_json::to_vec(decision)?;
+    let frame = encode(1, FrameKind::Request, &body);
+    client.write_raw(&frame).await?;
+    // Best-effort drain a single frame so the daemon's reply isn't orphaned.
+    // Errors here are non-fatal — the decision has already been sent.
+    let _ = client.read_frame_body().await;
+    Ok(())
 }
 
 fn default_path() -> String {
