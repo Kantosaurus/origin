@@ -11,6 +11,22 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Anthropic API cache-control marker. The only supported type is `"ephemeral"`.
+#[derive(Serialize, Clone, Copy)]
+pub struct WireCacheControl {
+    /// Must be `"ephemeral"` per the Anthropic Messages API spec.
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+}
+
+impl WireCacheControl {
+    /// Construct the ephemeral cache-control marker.
+    #[must_use]
+    pub const fn ephemeral() -> Self {
+        Self { kind: "ephemeral" }
+    }
+}
+
 #[derive(Serialize)]
 pub struct WireRequest<'a> {
     pub model: &'a str,
@@ -33,16 +49,22 @@ pub struct WireMessage<'a> {
 pub enum WireBlock<'a> {
     Text {
         text: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<WireCacheControl>,
     },
     ToolUse {
         id: &'a str,
         name: &'a str,
         input: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<WireCacheControl>,
     },
     ToolResult {
         tool_use_id: &'a str,
         content: &'a str,
         is_error: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<WireCacheControl>,
     },
 }
 
