@@ -842,6 +842,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-permission"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "origin-tools",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "origin-provider"
 version = "0.0.1"
 dependencies = [
