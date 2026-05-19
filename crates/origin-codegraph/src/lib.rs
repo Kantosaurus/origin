@@ -7,6 +7,7 @@ pub mod community;
 pub mod extract;
 pub mod index;
 pub mod lang;
+pub mod query;
 pub mod record;
 pub mod sidecar;
 
