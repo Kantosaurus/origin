@@ -22,10 +22,22 @@ pub enum StreamingError {
 }
 
 #[derive(Deserialize)]
+struct WireContentBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireEvent {
     MessageStart {},
-    ContentBlockStart {},
+    ContentBlockStart {
+        content_block: WireContentBlock,
+    },
     ContentBlockDelta {
         #[allow(dead_code)]
         index: u32,
@@ -101,6 +113,14 @@ where
         let parsed: WireEvent =
             serde_json::from_str(&raw).map_err(|e| StreamingError::Sse(format!("json: {e}; raw={raw}")))?;
         match parsed {
+            WireEvent::ContentBlockStart {
+                content_block: WireContentBlock { kind, id, name },
+            } if kind == "tool_use" => {
+                // Payload layout: id bytes + '\0' + name bytes (both UTF-8).
+                // `id` is always ASCII (`toolu_…`) and cannot contain '\0'.
+                let payload = [id.as_bytes(), b"\0", name.as_bytes()].concat();
+                ring.publish(&TokenEvent::new(TokenKind::ToolUseStart, payload))?;
+            }
             WireEvent::ContentBlockDelta {
                 delta: WireDelta::TextDelta { text },
                 ..

@@ -20,6 +20,10 @@ pub enum TokenKind {
     TurnEnd = 3,
     /// Provider sent usage stats after `message_stop`.
     Usage = 4,
+    /// `tool_use` block started. Payload layout: `id` bytes, then a null byte
+    /// (`\0`), then `name` bytes — both UTF-8, no further framing needed since
+    /// `id` is always an ASCII `toolu_…` token that cannot contain `\0`.
+    ToolUseStart = 5,
 }
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

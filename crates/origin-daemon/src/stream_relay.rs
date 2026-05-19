@@ -55,6 +55,9 @@ pub async fn relay_to_connection(mut sub: Subscriber, conn: SharedConnection) ->
                 }
             }
             TokenKind::TurnEnd => StreamEvent::TurnEnd,
+            // ToolUseStart is consumed by the agent loop's speculative-dispatch
+            // path; the CLI relay doesn't expose it as a StreamEvent (yet).
+            TokenKind::ToolUseStart => continue,
         };
         let body = serde_json::to_vec(&sev)?;
         conn.lock().await.write_frame(FrameKind::Event, &body).await?;
