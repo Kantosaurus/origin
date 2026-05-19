@@ -8,6 +8,7 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use origin_cli::input::{reduce, InputAction};
 use origin_cli::tui::{draw, App};
+use origin_daemon::protocol::StreamEvent;
 use origin_ipc::frame::{encode, FrameKind};
 use origin_ipc::transport::Connector;
 use ratatui::backend::CrosstermBackend;
@@ -23,6 +24,7 @@ struct PromptRequest<'a> {
 
 #[derive(Deserialize)]
 struct PromptReply {
+    #[allow(dead_code)] // text is reconstructed live from stream deltas; we only need `turns` to finalize.
     assistant_text: String,
     turns: u32,
 }
@@ -53,12 +55,25 @@ async fn main() -> Result<()> {
                         InputAction::Quit => break,
                         InputAction::Submit(text) => {
                             app.add_line("you> ", &text);
-                            let reply = call_daemon(&path, &model, &text).await;
+                            app.start_assistant_turn();
+                            // Collect deltas synchronously inside call_daemon so we
+                            // don't fight the borrow checker over `&mut app` across
+                            // the `terminal.draw(|f| draw(f, &app))` shared borrow.
+                            // We re-render between deltas inside the closure.
+                            let mut deltas: Vec<String> = Vec::new();
+                            let reply =
+                                call_daemon(&path, &model, &text, |d| deltas.push(d.to_string())).await;
+                            for d in &deltas {
+                                app.append_to_current_assistant(d);
+                            }
                             match reply {
-                                Ok(r) => {
-                                    app.add_line(&format!("origin ({} turns)> ", r.turns), &r.assistant_text);
+                                Ok(r) => app.finalize_assistant_turn(r.turns),
+                                Err(e) => {
+                                    // Drop the in-flight buffer on error; surface the
+                                    // error in scrollback under the standard prefix.
+                                    app.current_assistant = None;
+                                    app.add_line("error> ", &format!("{e}"));
                                 }
-                                Err(e) => app.add_line("error> ", &format!("{e}")),
                             }
                         }
                         _ => {}
@@ -75,7 +90,12 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn call_daemon(path: &str, model: &str, user_text: &str) -> Result<PromptReply> {
+async fn call_daemon(
+    path: &str,
+    model: &str,
+    user_text: &str,
+    mut on_delta: impl FnMut(&str) + Send,
+) -> Result<PromptReply> {
     let mut client = Connector::connect(path).await?;
     let body = serde_json::to_vec(&PromptRequest {
         system: "",
@@ -84,9 +104,20 @@ async fn call_daemon(path: &str, model: &str, user_text: &str) -> Result<PromptR
     })?;
     let frame = encode(1, FrameKind::Request, &body);
     client.write_raw(&frame).await?;
-    let resp = client.read_frame_body().await?;
-    let reply: PromptReply = serde_json::from_slice(&resp)?;
-    Ok(reply)
+
+    loop {
+        let body = client.read_frame_body().await?;
+        // Try to decode as a StreamEvent first; if that fails, treat as the
+        // terminal `PromptReply` Response frame.
+        if let Ok(ev) = serde_json::from_slice::<StreamEvent>(&body) {
+            if let StreamEvent::TextDelta { text } = &ev {
+                on_delta(text);
+            }
+            continue;
+        }
+        let reply: PromptReply = serde_json::from_slice(&body)?;
+        return Ok(reply);
+    }
 }
 
 fn default_path() -> String {

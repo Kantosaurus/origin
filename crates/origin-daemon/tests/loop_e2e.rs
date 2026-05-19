@@ -87,7 +87,7 @@ async fn loop_dispatches_tool_and_continues() {
         "please read the file",
         &provider,
         &AlwaysAllow,
-        &LoopOptions::default(),
+        &LoopOptions::default().without_streaming(),
     )
     .await
     .expect("loop ok");
@@ -121,6 +121,8 @@ async fn loop_caps_at_max_turns() {
     let opts = LoopOptions {
         max_turns: 3,
         cas: None,
+        relay_tx: None,
+        streaming_disabled: true,
     };
     let err = run_loop(&mut session, "loop", &provider, &AlwaysAllow, &opts)
         .await
@@ -168,6 +170,8 @@ async fn tool_result_goes_to_cas_and_block_carries_handle_only() {
     let opts = LoopOptions {
         max_turns: 5,
         cas: Some(Arc::clone(&store)),
+        relay_tx: None,
+        streaming_disabled: true,
     };
 
     let summary = run_loop(

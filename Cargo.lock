@@ -1090,6 +1090,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "crossterm",
+ "origin-daemon",
  "origin-ipc",
  "ratatui",
  "serde",
@@ -1120,6 +1121,7 @@ dependencies = [
  "origin-provider",
  "origin-provider-anthropic",
  "origin-store",
+ "origin-stream",
  "origin-tools",
  "rkyv",
  "rusqlite",

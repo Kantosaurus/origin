@@ -19,6 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 origin-ipc = { path = "../origin-ipc" }
+origin-daemon = { path = "../origin-daemon" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 anyhow = "1"
 ratatui = { version = "0.28", default-features = false, features = ["crossterm"] }

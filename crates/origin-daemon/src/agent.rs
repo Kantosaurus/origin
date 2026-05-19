@@ -14,6 +14,15 @@ use thiserror::Error;
 pub struct LoopOptions {
     pub max_turns: u32,
     pub cas: Option<Arc<Store>>,
+    /// Optional channel used by the daemon to publish each request's
+    /// `Subscriber` to a per-connection relay task. The relay forwards token
+    /// events to the CLI as `Event` frames. We send a pre-subscribed
+    /// `Subscriber` (not the `Ring`) so the relay never races the producer.
+    pub relay_tx: Option<tokio::sync::mpsc::Sender<origin_stream::Subscriber>>,
+    /// When `true`, the loop falls back to `provider.chat()` instead of
+    /// `provider.chat_stream()`. Required for `tool_use` turns until
+    /// incremental `tool_use` JSON parsing lands (P3.3).
+    pub streaming_disabled: bool,
 }
 
 impl Default for LoopOptions {
@@ -21,6 +30,8 @@ impl Default for LoopOptions {
         Self {
             max_turns: 25,
             cas: None,
+            relay_tx: None,
+            streaming_disabled: false,
         }
     }
 }
@@ -30,6 +41,23 @@ impl LoopOptions {
     #[must_use]
     pub fn with_cas(mut self, store: Arc<Store>) -> Self {
         self.cas = Some(store);
+        self
+    }
+
+    /// Attach a relay channel so each per-request `Subscriber` is published to
+    /// the connection's relay task.
+    #[must_use]
+    pub fn with_relay(mut self, tx: tokio::sync::mpsc::Sender<origin_stream::Subscriber>) -> Self {
+        self.relay_tx = Some(tx);
+        self
+    }
+
+    /// Disable streaming for this loop — fall back to `provider.chat()`. Use
+    /// for `tool_use`-heavy scripted tests until Phase 3 lands incremental
+    /// `tool_use` JSON parsing.
+    #[must_use]
+    pub const fn without_streaming(mut self) -> Self {
+        self.streaming_disabled = true;
         self
     }
 }
@@ -86,7 +114,28 @@ pub async fn run_loop(
             model: session.model.clone(),
             tools: tools_schema.clone(),
         };
-        let resp = provider.chat(req).await?;
+        let resp = if opts.streaming_disabled {
+            provider.chat(req).await?
+        } else {
+            let ring = origin_stream::Ring::with_capacity(256 * 1024);
+            // Subscribe BEFORE the provider publishes — a fresh subscriber
+            // starts at the current write cursor, so subscribing after the
+            // publishes would miss every record. Same reasoning applies to
+            // the relay's subscriber.
+            let drain_sub = ring.subscribe();
+            if let Some(tx) = &opts.relay_tx {
+                let relay_sub = ring.subscribe();
+                let _ = tx.send(relay_sub).await;
+            }
+            // Drive the provider and the drain concurrently. The provider
+            // publishes; the drain consumes; once the provider returns and the
+            // ring closes, the drain finishes too.
+            let drive = provider.chat_stream(req, &ring);
+            let drain = drain_subscriber_into_response(drain_sub);
+            let (drive_res, resp) = tokio::join!(drive, drain);
+            drive_res?;
+            resp?
+        };
         session.push(resp.assistant.clone());
 
         // Gather tool_use blocks (clone owned data because we'll borrow `meta`).
@@ -227,4 +276,55 @@ async fn dispatch_tool(meta: &ToolMeta, args: &Value) -> Result<String, LoopErro
         }
         other => Err(LoopError::UnknownTool(other.into())),
     }
+}
+
+/// Drain a per-turn `Ring` `Subscriber` into a synthetic `ChatResponse`. For
+/// Phase 2 we reconstruct only `Block::Text` (concatenating all `TextDelta`s)
+/// plus `Usage`. `ToolUseDelta` and `ThinkingDelta` are intentionally ignored:
+/// reconstructing `Block::ToolUse` requires incremental JSON parsing which
+/// lands in P3.3.
+async fn drain_subscriber_into_response(
+    mut sub: origin_stream::Subscriber,
+) -> Result<origin_provider::ChatResponse, LoopError> {
+    let mut text = String::new();
+    let mut usage = origin_provider::Usage::default();
+    let mut blocks: Vec<Block> = Vec::new();
+
+    while let Some(ev) = sub
+        .next()
+        .await
+        .map_err(|e| LoopError::ToolFailure(e.to_string()))?
+    {
+        match ev.kind() {
+            origin_stream::TokenKind::TextDelta => {
+                text.push_str(&String::from_utf8_lossy(ev.payload()));
+            }
+            origin_stream::TokenKind::Usage => {
+                let p = ev.payload();
+                if p.len() == 16 {
+                    usage = origin_provider::Usage {
+                        input_tokens: u32::from_be_bytes(p[0..4].try_into().expect("4 bytes")),
+                        output_tokens: u32::from_be_bytes(p[4..8].try_into().expect("4 bytes")),
+                        cache_read_input_tokens: u32::from_be_bytes(p[8..12].try_into().expect("4 bytes")),
+                        cache_creation_input_tokens: u32::from_be_bytes(
+                            p[12..16].try_into().expect("4 bytes"),
+                        ),
+                    };
+                }
+            }
+            origin_stream::TokenKind::TurnEnd => break,
+            origin_stream::TokenKind::ToolUseDelta | origin_stream::TokenKind::ThinkingDelta => {}
+        }
+    }
+    if !text.is_empty() {
+        blocks.push(Block::Text {
+            text,
+            cache_marker: None,
+        });
+    }
+    let assistant = Message {
+        role: Role::Assistant,
+        blocks,
+    };
+    Ok(origin_provider::ChatResponse { assistant, usage })
 }
