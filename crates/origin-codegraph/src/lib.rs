@@ -7,6 +7,7 @@ pub mod extract;
 pub mod index;
 pub mod lang;
 pub mod record;
+pub mod sidecar;
 
 pub use extract::{CodeEdge, CodeNode, EdgeKind, NodeKind};
 pub use index::{CodeGraphIndex, EdgeRow, EntityId, IndexError, NodeRow};
