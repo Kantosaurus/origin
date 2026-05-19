@@ -1,21 +1,36 @@
 //! Agent loop: prompt → provider → tool dispatch → repeat → final text.
 
 use crate::session::Session;
+use origin_cas::{Hash, Store};
 use origin_core::types::{Block, Message, Role};
 use origin_permission::{check, prompt::Prompter, Outcome};
 use origin_provider::{ChatRequest, Provider};
 use origin_tools::{registry_iter, ToolMeta};
 use serde_json::Value;
+use std::sync::Arc;
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 pub struct LoopOptions {
     pub max_turns: u32,
+    pub cas: Option<Arc<Store>>,
 }
 
 impl Default for LoopOptions {
     fn default() -> Self {
-        Self { max_turns: 25 }
+        Self {
+            max_turns: 25,
+            cas: None,
+        }
+    }
+}
+
+impl LoopOptions {
+    /// Attach a CAS so tool outputs are stored by handle instead of inline.
+    #[must_use]
+    pub fn with_cas(mut self, store: Arc<Store>) -> Self {
+        self.cas = Some(store);
+        self
     }
 }
 
@@ -52,7 +67,7 @@ pub async fn run_loop(
     user_text: &str,
     provider: &dyn Provider,
     prompter: &dyn Prompter,
-    opts: LoopOptions,
+    opts: &LoopOptions,
 ) -> Result<LoopSummary, LoopError> {
     session.push(Message::new(Role::User).with_block(Block::text(user_text)));
 
@@ -119,12 +134,26 @@ pub async fn run_loop(
             }
 
             let result_text = dispatch_tool(meta, &args).await?;
-            tool_results.push(Block::ToolResult {
-                tool_use_id: id,
-                handle: None,
-                inline: Some(result_text.into_bytes()),
-                cache_marker: None,
-            });
+            let result_bytes = result_text.into_bytes();
+            let block = if let Some(cas) = opts.cas.as_ref() {
+                let h: Hash = cas
+                    .put(&result_bytes)
+                    .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
+                Block::ToolResult {
+                    tool_use_id: id,
+                    handle: Some(*h.as_bytes()),
+                    inline: None,
+                    cache_marker: None,
+                }
+            } else {
+                Block::ToolResult {
+                    tool_use_id: id,
+                    handle: None,
+                    inline: Some(result_bytes),
+                    cache_marker: None,
+                }
+            };
+            tool_results.push(block);
         }
 
         // Append tool results as a single Role::Tool message (provider crates

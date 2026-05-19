@@ -21,6 +21,7 @@ pub struct Anthropic {
     api_key: String,
     base: String,
     client: reqwest::Client,
+    cas: Option<std::sync::Arc<origin_cas::Store>>,
 }
 
 impl Anthropic {
@@ -37,7 +38,16 @@ impl Anthropic {
             api_key: api_key.into(),
             base: base.trim_end_matches('/').to_string(),
             client: reqwest::Client::new(),
+            cas: None,
         }
+    }
+
+    /// Attach a CAS so `ToolResult` blocks carrying a handle are re-inflated
+    /// from CAS bytes when serializing to the wire.
+    #[must_use]
+    pub fn with_cas(mut self, cas: std::sync::Arc<origin_cas::Store>) -> Self {
+        self.cas = Some(cas);
+        self
     }
 }
 
@@ -48,7 +58,8 @@ impl Provider for Anthropic {
     }
 
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError> {
-        let wire_messages = req.messages.iter().map(message_to_wire).collect::<Vec<_>>();
+        let expanded = expand_messages_for_wire(&req.messages, self.cas.as_ref())?;
+        let wire_messages = expanded.iter().map(message_to_wire).collect::<Vec<_>>();
         let wire_tools = req
             .tools
             .iter()
@@ -111,7 +122,8 @@ impl Provider for Anthropic {
     }
 
     async fn chat_stream(&self, req: ChatRequest, ring: &origin_stream::Ring) -> Result<(), ProviderError> {
-        let wire_messages = req.messages.iter().map(message_to_wire).collect::<Vec<_>>();
+        let expanded = expand_messages_for_wire(&req.messages, self.cas.as_ref())?;
+        let wire_messages = expanded.iter().map(message_to_wire).collect::<Vec<_>>();
         let wire_tools = req
             .tools
             .iter()
@@ -201,6 +213,51 @@ fn block_to_wire(b: &Block) -> Option<wire::WireBlock<'_>> {
         // Do not re-send thinking blocks; Anthropic ignores them on inbound.
         Block::Thinking { .. } => None,
     }
+}
+
+/// Re-inflate any `ToolResult` blocks that carry a CAS `handle` (but no
+/// inline bytes) by fetching the payload from the attached store.
+///
+/// Blocks with inline bytes (or unrelated kinds) are passed through unchanged.
+///
+/// # Errors
+/// Returns `ProviderError::Api` if a handle is encountered without a CAS, or
+/// if the CAS lookup fails or misses.
+fn expand_messages_for_wire(
+    messages: &[Message],
+    cas: Option<&std::sync::Arc<origin_cas::Store>>,
+) -> Result<Vec<Message>, ProviderError> {
+    let mut out = Vec::with_capacity(messages.len());
+    for m in messages {
+        let mut blocks = Vec::with_capacity(m.blocks.len());
+        for b in &m.blocks {
+            if let Block::ToolResult {
+                tool_use_id,
+                handle: Some(h),
+                inline: None,
+                cache_marker,
+            } = b
+            {
+                let store = cas.ok_or_else(|| {
+                    ProviderError::Api("ToolResult handle present but no CAS configured".into())
+                })?;
+                let bytes = store
+                    .get(origin_cas::Hash::from_bytes(*h))
+                    .map_err(|e| ProviderError::Api(format!("cas get: {e}")))?
+                    .ok_or_else(|| ProviderError::Api("cas miss for tool result handle".into()))?;
+                blocks.push(Block::ToolResult {
+                    tool_use_id: tool_use_id.clone(),
+                    handle: None,
+                    inline: Some(bytes),
+                    cache_marker: *cache_marker,
+                });
+            } else {
+                blocks.push(b.clone());
+            }
+        }
+        out.push(Message { role: m.role, blocks });
+    }
+    Ok(out)
 }
 
 fn decode_response(wire: wire::WireResponse) -> ChatResponse {
