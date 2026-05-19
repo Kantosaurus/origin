@@ -5,3 +5,4 @@ pub mod agent;
 pub mod protocol;
 pub mod session;
 pub mod session_store;
+pub mod stream_relay;

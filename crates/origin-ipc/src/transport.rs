@@ -1,10 +1,19 @@
 use std::io;
+use std::sync::Arc;
 
 use interprocess::local_socket::{
     tokio::{prelude::*, Listener as IpcListener, Stream as IpcStream},
     GenericFilePath, ListenerOptions,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
+
+/// Shared, mutex-protected `Connection` handle.
+///
+/// Use when multiple writers (e.g., a stream relay plus the main request
+/// handler) must serialize access to the underlying transport. Cloning is
+/// cheap (`Arc` clone).
+pub type SharedConnection = Arc<Mutex<Connection>>;
 
 use crate::frame::{encode, FrameKind, HEADER_LEN};
 
