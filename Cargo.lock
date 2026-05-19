@@ -1351,6 +1351,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-planner"
+version = "0.0.1"
+dependencies = [
+ "origin-cas",
+ "origin-core",
+ "proptest",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "origin-provider"
 version = "0.0.1"
 dependencies = [

@@ -1,0 +1,18 @@
+[package]
+name = "origin-planner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+origin-core = { path = "../origin-core" }
+origin-cas  = { path = "../origin-cas" }
+thiserror = "1"
+
+[dev-dependencies]
+proptest = { version = "=1.4.0", default-features = false, features = ["std"] }
