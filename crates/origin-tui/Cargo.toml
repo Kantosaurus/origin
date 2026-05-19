@@ -23,10 +23,12 @@ undocumented_unsafe_blocks = "deny"
 [dependencies]
 thiserror = "1"
 wide = "0.7"
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
 
 [dev-dependencies]
 proptest = { version = "=1.4.0", default-features = false, features = ["std"] }
 criterion = "0.5"
+tokio = { version = "1", features = ["macros", "rt", "test-util", "time"] }
 
 [[bench]]
 name = "damage_diff"
