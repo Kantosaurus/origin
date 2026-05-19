@@ -4,18 +4,22 @@ use std::sync::Arc;
 use anyhow::Result;
 use origin_cas::Store;
 use origin_daemon::agent::{run_loop, LoopOptions};
-use origin_daemon::protocol::{PromptReply, PromptRequest};
+use origin_daemon::protocol::{ClientMessage, PromptReply, PromptRequest, StreamEvent};
+use origin_daemon::provider_factory::{ProviderFactory, ProviderId};
 use origin_daemon::session::Session;
 use origin_daemon::session_store::SessionStore;
 use origin_daemon::stream_relay::relay_to_connection;
 use origin_ipc::frame::FrameKind;
 use origin_ipc::transport::{Listener, SharedConnection};
+use origin_keyvault::{KeyVault, Secret};
 use origin_permission::prompt::AlwaysAllow;
 use origin_provider::Provider;
-use origin_provider_anthropic::Anthropic;
 use origin_stream::Subscriber;
-use tokio::sync::{mpsc, Mutex};
-use tracing::{error, info};
+use tokio::sync::{mpsc, Mutex, RwLock};
+use tracing::{error, info, warn};
+
+/// Convenience alias for the runtime-swappable active provider handle.
+type ActiveProvider = Arc<RwLock<Arc<dyn Provider>>>;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -25,9 +29,6 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-
-    let api_key =
-        env::var("ANTHROPIC_API_KEY").map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY must be set"))?;
 
     let cas_root = env::var("ORIGIN_CAS_ROOT").unwrap_or_else(|_| default_cas_root());
     let cas = Arc::new(
@@ -41,7 +42,34 @@ async fn main() -> Result<()> {
     );
     info!(cas_root = %cas_root, "cas store ready");
 
-    let provider: Arc<dyn Provider> = Arc::new(Anthropic::new(api_key).with_cas(Arc::clone(&cas)));
+    let vault = KeyVault::detect().map_err(|e| anyhow::anyhow!("keyvault detect: {e}"))?;
+
+    // Back-compat: legacy installs only set `ANTHROPIC_API_KEY`. Mirror it
+    // into the vault at ("anthropic", "default") so `ProviderFactory::build`
+    // finds it. Best-effort — a vault failure must not abort daemon startup.
+    if let Ok(api_key) = env::var("ANTHROPIC_API_KEY") {
+        if let Err(e) = vault.set("anthropic", "default", Secret::new(api_key)).await {
+            warn!(error = %e, "could not mirror ANTHROPIC_API_KEY into vault");
+        }
+    }
+
+    let factory = ProviderFactory::new(vault.clone()).with_cas(Arc::clone(&cas));
+
+    let initial_provider_str = env::var("ORIGIN_PROVIDER").unwrap_or_else(|_| "anthropic".into());
+    let initial_provider_id = ProviderId::parse(&initial_provider_str)
+        .ok_or_else(|| anyhow::anyhow!("ORIGIN_PROVIDER `{initial_provider_str}` is not a known provider"))?;
+    let initial_account = env::var("ORIGIN_ACCOUNT").unwrap_or_else(|_| "default".into());
+
+    let initial_provider: Arc<dyn Provider> = factory
+        .build(initial_provider_id, &initial_account)
+        .await
+        .map_err(|e| anyhow::anyhow!("initial provider build: {e}"))?;
+    info!(
+        provider = initial_provider_id.as_str(),
+        account = %initial_account,
+        "initial provider ready"
+    );
+    let active: ActiveProvider = Arc::new(RwLock::new(initial_provider));
 
     let db_path = env::var("ORIGIN_DB").unwrap_or_else(|_| default_db_path());
     let session_store = Arc::new(SessionStore::open(&db_path)?);
@@ -57,7 +85,8 @@ async fn main() -> Result<()> {
 
         spawn_handler_task(
             shared_conn,
-            Arc::clone(&provider),
+            Arc::clone(&active),
+            factory.clone(),
             Arc::clone(&session_store),
             Arc::clone(&cas),
         );
@@ -66,7 +95,8 @@ async fn main() -> Result<()> {
 
 fn spawn_handler_task(
     conn: SharedConnection,
-    provider: Arc<dyn Provider>,
+    active: ActiveProvider,
+    factory: ProviderFactory,
     session_store: Arc<SessionStore>,
     cas: Arc<Store>,
 ) {
@@ -79,10 +109,10 @@ fn spawn_handler_task(
                     Err(_) => break,
                 }
             };
-            let req: PromptRequest = match serde_json::from_slice(&body) {
+            let msg: ClientMessage = match serde_json::from_slice(&body) {
                 Ok(r) => r,
                 Err(e) => {
-                    error!(error = %e, "bad prompt request");
+                    error!(error = %e, "bad client message");
                     let _ = conn
                         .lock()
                         .await
@@ -91,16 +121,41 @@ fn spawn_handler_task(
                     continue;
                 }
             };
-            if !handle_request(
-                &conn,
-                provider.as_ref(),
-                session_store.as_ref(),
-                Arc::clone(&cas),
-                req,
-            )
-            .await
-            {
-                break;
+            match msg {
+                ClientMessage::Prompt {
+                    system,
+                    model,
+                    user_text,
+                } => {
+                    let req = PromptRequest {
+                        system,
+                        model,
+                        user_text,
+                    };
+                    // Snapshot the current provider for this request so a
+                    // mid-flight `/account` switch on a different connection
+                    // does not yank the provider out from under us.
+                    let provider_snapshot: Arc<dyn Provider> = {
+                        let g = active.read().await;
+                        Arc::clone(&*g)
+                    };
+                    if !handle_request(
+                        &conn,
+                        provider_snapshot.as_ref(),
+                        session_store.as_ref(),
+                        Arc::clone(&cas),
+                        req,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+                ClientMessage::SwitchAccount { provider, account_id } => {
+                    if !handle_switch(&conn, &active, &factory, &provider, &account_id).await {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -125,7 +180,7 @@ async fn handle_request(
     cas: Arc<Store>,
     req: PromptRequest,
 ) -> bool {
-    let mut session = Session::new("anthropic", &req.model);
+    let mut session = Session::new(provider.name(), &req.model);
     let (tx_sub, mut rx_sub) = mpsc::channel::<Subscriber>(1);
     let conn_for_relay = Arc::clone(conn);
     let relay_handle: tokio::task::JoinHandle<()> = tokio::spawn(async move {
@@ -187,6 +242,53 @@ async fn handle_request(
             true
         }
     }
+}
+
+/// Handle a `ClientMessage::SwitchAccount`. Builds the new provider via the
+/// factory, swaps the `RwLock`-guarded handle, and emits a
+/// `StreamEvent::ProviderActive` event frame on success. Returns `false`
+/// only if the IPC write itself fails (connection is dead).
+async fn handle_switch(
+    conn: &SharedConnection,
+    active: &ActiveProvider,
+    factory: &ProviderFactory,
+    provider_str: &str,
+    account: &str,
+) -> bool {
+    let Some(id) = ProviderId::parse(provider_str) else {
+        return write_error(conn, &format!("unknown provider: {provider_str}")).await;
+    };
+
+    let new_provider = match factory.build(id, account).await {
+        Ok(p) => p,
+        Err(e) => return write_error(conn, &format!("switch_account: {e}")).await,
+    };
+
+    {
+        let mut g = active.write().await;
+        *g = new_provider;
+    }
+
+    let ev = StreamEvent::ProviderActive {
+        provider: id.as_str().to_string(),
+        account_id: account.to_string(),
+    };
+    // StreamEvent::ProviderActive is always serializable (plain strings).
+    #[allow(clippy::expect_used)]
+    let bytes = serde_json::to_vec(&ev).expect("StreamEvent::ProviderActive is always serializable");
+    conn.lock()
+        .await
+        .write_frame(FrameKind::Event, &bytes)
+        .await
+        .is_ok()
+}
+
+async fn write_error(conn: &SharedConnection, msg: &str) -> bool {
+    conn.lock()
+        .await
+        .write_frame(FrameKind::ErrorFrame, msg.as_bytes())
+        .await
+        .is_ok()
 }
 
 fn persist(session_store: &SessionStore, session: &Session) {

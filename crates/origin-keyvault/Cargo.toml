@@ -1,0 +1,54 @@
+[package]
+name = "origin-keyvault"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Override workspace `unsafe_code = "forbid"` — the Windows backend needs
+# raw FFI pointers for `CredWriteW`/`CredReadW`/`CredDeleteW`. Every
+# `unsafe { ... }` block in this crate must carry a `// SAFETY:` comment.
+# Cargo forbids combining `[lints] workspace = true` with per-section
+# overrides, so we inline the workspace clippy lints here too.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+panic = "warn"
+undocumented_unsafe_blocks = "deny"
+
+[dependencies]
+thiserror = "1"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+parking_lot = "0.12"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+rand = "0.8"
+sha2 = "0.10"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "4", features = ["rt-tokio-crypto-rust"] }
+age = "0.10"
+dirs = "5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
+wiremock = "0.6"
+sha2 = "0.10"
+base64 = "0.22"
+serde_json = "1"

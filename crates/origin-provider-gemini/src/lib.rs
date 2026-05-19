@@ -1,0 +1,169 @@
+//! Gemini provider (non-streaming + SSE streaming).
+//!
+//! Implements `origin_provider::Provider` against Google's Generative Language
+//! REST API: `POST {base}/v1beta/models/{model}:generateContent?key={api_key}`
+//! for non-streaming and `:streamGenerateContent?key={key}&alt=sse` for SSE.
+//! Streaming reuses the shared `origin_provider::sse` pump.
+
+pub mod streaming;
+mod wire;
+
+use async_trait::async_trait;
+use origin_core::types::{Block, Message, Role};
+use origin_provider::{ChatRequest, ChatResponse, Provider, ProviderError, Usage};
+use reqwest::StatusCode;
+
+const DEFAULT_BASE: &str = "https://generativelanguage.googleapis.com";
+
+/// Gemini provider backed by `generateContent` / `streamGenerateContent`.
+///
+/// The API key is embedded as a `?key=` query parameter, not a header. The
+/// struct deliberately does not derive `Debug` so the key cannot be logged.
+pub struct Gemini {
+    api_key: String,
+    base: String,
+    client: reqwest::Client,
+}
+
+impl Gemini {
+    /// Construct with the default base URL.
+    #[must_use]
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self::with_base_url(api_key, DEFAULT_BASE)
+    }
+
+    /// Construct against an arbitrary base URL (for testing and gateways).
+    #[must_use]
+    pub fn with_base_url(api_key: impl Into<String>, base: &str) -> Self {
+        Self {
+            api_key: api_key.into(),
+            base: base.trim_end_matches('/').to_string(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    fn url(&self, model: &str, action: &str, extra_query: &str) -> String {
+        // `extra_query` is either "" or "&alt=sse".
+        format!(
+            "{}/v1beta/models/{}:{}?key={}{}",
+            self.base, model, action, self.api_key, extra_query
+        )
+    }
+}
+
+#[async_trait]
+impl Provider for Gemini {
+    fn name(&self) -> &'static str {
+        "gemini"
+    }
+
+    async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError> {
+        let body = wire::encode_request(&req);
+        let url = self.url(&req.model, "generateContent", "");
+        let resp = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        if resp.status() == StatusCode::OK {
+            let wire: wire::WireResponse = resp
+                .json()
+                .await
+                .map_err(|e| ProviderError::Api(format!("decode: {e}")))?;
+            return Ok(decode_response(wire));
+        }
+        Err(status_error(resp).await)
+    }
+
+    async fn chat_stream(&self, req: ChatRequest, ring: &origin_stream::Ring) -> Result<(), ProviderError> {
+        let body = wire::encode_request(&req);
+        let url = self.url(&req.model, "streamGenerateContent", "&alt=sse");
+        let resp = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let err = status_error(resp).await;
+            ring.close();
+            return Err(err);
+        }
+
+        let result = streaming::parse_into_ring(resp, ring).await;
+        ring.close();
+        result
+    }
+}
+
+/// Map a non-2xx `reqwest::Response` to the canonical `ProviderError` variant.
+///
+/// - 401 / 403 → `ProviderError::Auth`
+/// - 429 → `ProviderError::RateLimit` (parses `retry-after` header, defaults to 1)
+/// - other → `ProviderError::Api(format!("status {s}: {body}"))`
+async fn status_error(resp: reqwest::Response) -> ProviderError {
+    let status = resp.status();
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderError::Auth,
+        StatusCode::TOO_MANY_REQUESTS => {
+            let retry = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(1);
+            ProviderError::RateLimit {
+                retry_after_secs: retry,
+            }
+        }
+        s => {
+            let body = resp.text().await.unwrap_or_default();
+            ProviderError::Api(format!("status {s}: {body}"))
+        }
+    }
+}
+
+fn decode_response(wire: wire::WireResponse) -> ChatResponse {
+    let mut blocks: Vec<Block> = Vec::new();
+    if let Some(candidate) = wire.candidates.into_iter().next() {
+        for part in candidate.content.parts {
+            if let Some(text) = part.text {
+                if !text.is_empty() {
+                    blocks.push(Block::Text {
+                        text,
+                        cache_marker: None,
+                    });
+                }
+            }
+            if let Some(fc) = part.function_call {
+                let input_json = serde_json::to_vec(&fc.args).unwrap_or_default();
+                blocks.push(Block::ToolUse {
+                    id: format!("call_{}", fc.name),
+                    name: fc.name,
+                    input_json,
+                    cache_marker: None,
+                });
+            }
+        }
+    }
+
+    let assistant = Message {
+        role: Role::Assistant,
+        blocks,
+    };
+    let usage = Usage {
+        input_tokens: wire.usage_metadata.prompt_token_count,
+        output_tokens: wire.usage_metadata.candidates_token_count,
+        cache_read_input_tokens: wire.usage_metadata.cached_content_token_count,
+        cache_creation_input_tokens: 0,
+    };
+    ChatResponse { assistant, usage }
+}

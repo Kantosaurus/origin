@@ -8,21 +8,14 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScree
 use futures_util::StreamExt as _;
 use origin_cli::input::{reduce, InputAction};
 use origin_cli::tui::App;
-use origin_daemon::protocol::StreamEvent;
+use origin_daemon::protocol::{ClientMessage, StreamEvent};
 use origin_ipc::frame::{encode, FrameKind};
-use origin_ipc::transport::Connector;
+use origin_ipc::transport::{Connection, Connector};
 use origin_tui::composer::Composer;
 use origin_tui::scheduler::{Handle, Scheduler};
 use origin_tui::stream_widget::{Rect, StreamWidget};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
-
-#[derive(Serialize)]
-struct PromptRequest<'a> {
-    system: &'a str,
-    model: &'a str,
-    user_text: &'a str,
-}
+use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct PromptReply {
@@ -127,6 +120,29 @@ async fn run_event_loop(
 }
 
 async fn handle_submit(app: &SharedApp, handle: &Handle, path: &str, model: &str, text: &str) {
+    if let Some(rest) = slash_account_args(text) {
+        {
+            let mut a = app.lock();
+            a.add_line("you> ", text);
+        }
+        handle.mark_dirty();
+        match parse_account_command(rest) {
+            Ok((provider, account_id)) => match switch_account(path, &provider, &account_id).await {
+                Ok((p, a)) => {
+                    app.lock()
+                        .add_line("system> ", &format!("provider active: {p}/{a}"));
+                }
+                Err(e) => {
+                    app.lock().add_line("error> ", &format!("{e}"));
+                }
+            },
+            Err(e) => {
+                app.lock().add_line("error> ", e);
+            }
+        }
+        handle.mark_dirty();
+        return;
+    }
     {
         let mut a = app.lock();
         a.add_line("you> ", text);
@@ -179,11 +195,12 @@ async fn call_daemon(
 ) -> Result<(PromptReply, Duration)> {
     let start = std::time::Instant::now();
     let mut client = Connector::connect(path).await?;
-    let body = serde_json::to_vec(&PromptRequest {
-        system: "",
-        model,
-        user_text,
-    })?;
+    let msg = ClientMessage::Prompt {
+        system: String::new(),
+        model: model.to_string(),
+        user_text: user_text.to_string(),
+    };
+    let body = serde_json::to_vec(&msg)?;
     let frame = encode(1, FrameKind::Request, &body);
     client.write_raw(&frame).await?;
 
@@ -211,6 +228,57 @@ async fn call_daemon(
         }
         let reply: PromptReply = serde_json::from_slice(&body)?;
         return Ok((reply, start.elapsed()));
+    }
+}
+
+/// Returns `Some(rest)` when `line` is a `/account` command (with or
+/// without arguments), where `rest` is the trimmed argument tail.
+fn slash_account_args(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix("/account")?;
+    // Require a word boundary so `/accountfoo` is not matched.
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        Some(rest.trim())
+    } else {
+        None
+    }
+}
+
+/// Parses `/account <provider> [<account>]` into a `(provider, account_id)`
+/// tuple. Defaults `account_id` to `"default"` when omitted. Returns
+/// `Err` with a user-facing message on bad input.
+fn parse_account_command(rest: &str) -> Result<(String, String), &'static str> {
+    let mut parts = rest.split_whitespace();
+    let provider = parts.next().ok_or("usage: /account <provider> [<account>]")?;
+    let account = parts.next().unwrap_or("default");
+    if parts.next().is_some() {
+        return Err("usage: /account <provider> [<account>]");
+    }
+    Ok((provider.to_string(), account.to_string()))
+}
+
+/// Sends `ClientMessage::SwitchAccount` over a one-shot connection and
+/// awaits the matching `StreamEvent::ProviderActive` confirmation.
+async fn switch_account(path: &str, provider: &str, account_id: &str) -> Result<(String, String)> {
+    let mut client: Connection = Connector::connect(path).await?;
+    let msg = ClientMessage::SwitchAccount {
+        provider: provider.to_string(),
+        account_id: account_id.to_string(),
+    };
+    let body = serde_json::to_vec(&msg)?;
+    let frame = encode(1, FrameKind::Request, &body);
+    client.write_raw(&frame).await?;
+
+    let body = client.read_frame_body().await?;
+    match serde_json::from_slice::<StreamEvent>(&body) {
+        Ok(StreamEvent::ProviderActive { provider, account_id }) => Ok((provider, account_id)),
+        Ok(other) => Err(anyhow::anyhow!("unexpected event: {other:?}")),
+        Err(_) => {
+            // Likely an ErrorFrame surfaced through `read_frame_body`; the
+            // bytes are typically a UTF-8 message from the daemon.
+            let text = String::from_utf8_lossy(&body).into_owned();
+            Err(anyhow::anyhow!("switch failed: {text}"))
+        }
     }
 }
 
