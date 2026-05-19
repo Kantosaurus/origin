@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 origin-core = { path = "../origin-core" }
 origin-cas  = { path = "../origin-cas" }
+origin-codegraph = { path = "../origin-codegraph" }
 blake3 = "1"
 regex = "1"
 glob = "0.3"
