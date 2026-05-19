@@ -16,6 +16,7 @@ lopdf = "0.32"
 origin-cas = { path = "../origin-cas" }
 origin-store = { path = "../origin-store" }
 petgraph = "0.6"
+regex = "1"
 rkyv = { version = "0.7", features = ["validation"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 thiserror = "1"
