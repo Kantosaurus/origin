@@ -2,6 +2,7 @@
 //! the binary and for integration tests.
 
 pub mod agent;
+pub mod compactor;
 pub mod protocol;
 pub mod provider_factory;
 pub mod session;
