@@ -1,6 +1,12 @@
+pub mod ask;
 pub mod bash;
 pub mod edit;
 pub mod glob_tool;
+pub mod graph_explain;
+pub mod graph_path;
+pub mod graph_query;
+pub mod graph_rebuild;
+pub mod graph_summarize;
 pub mod grep_tool;
 pub mod read;
 pub mod recall;
