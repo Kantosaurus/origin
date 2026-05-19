@@ -3,9 +3,11 @@
 //! Phase 3 deliverables: `Band`, `PrefixLedger`, `CachePlanner`, `WireDecision`.
 
 pub mod band;
+pub mod decision;
 pub mod ledger;
 pub mod planner;
 
 pub use band::Band;
+pub use decision::{WireDecision, INLINE_BYTE_BUDGET};
 pub use ledger::{LedgerError, PrefixLedger, SectionId, Stability};
 pub use planner::{CachePlanner, Plan, Section};

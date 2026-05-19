@@ -79,7 +79,7 @@ impl Provider for Anthropic {
     }
 
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError> {
-        let expanded = expand_messages_for_wire(&req.messages, self.cas.as_ref())?;
+        let expanded = expand_messages_for_wire(&req.messages, self.cas.as_ref(), self.plan.as_ref())?;
         let plan = self.plan.as_ref();
         let wire_messages = expanded
             .iter()
@@ -148,7 +148,7 @@ impl Provider for Anthropic {
     }
 
     async fn chat_stream(&self, req: ChatRequest, ring: &origin_stream::Ring) -> Result<(), ProviderError> {
-        let expanded = expand_messages_for_wire(&req.messages, self.cas.as_ref())?;
+        let expanded = expand_messages_for_wire(&req.messages, self.cas.as_ref(), self.plan.as_ref())?;
         let plan = self.plan.as_ref();
         let wire_messages = expanded
             .iter()
@@ -278,6 +278,9 @@ fn block_to_wire(b: &Block, cache_control: Option<wire::WireCacheControl>) -> Op
 /// Re-inflate any `ToolResult` blocks that carry a CAS `handle` (but no
 /// inline bytes) by fetching the payload from the attached store.
 ///
+/// When a `plan` is provided, consults `WireDecision` to decide whether to
+/// inline the bytes or emit a short `<result handle:… — N bytes>` reference.
+///
 /// Blocks with inline bytes (or unrelated kinds) are passed through unchanged.
 ///
 /// # Errors
@@ -286,6 +289,7 @@ fn block_to_wire(b: &Block, cache_control: Option<wire::WireCacheControl>) -> Op
 fn expand_messages_for_wire(
     messages: &[Message],
     cas: Option<&std::sync::Arc<origin_cas::Store>>,
+    plan: Option<&origin_planner::Plan>,
 ) -> Result<Vec<Message>, ProviderError> {
     let mut out = Vec::with_capacity(messages.len());
     for m in messages {
@@ -305,12 +309,34 @@ fn expand_messages_for_wire(
                     .get(origin_cas::Hash::from_bytes(*h))
                     .map_err(|e| ProviderError::Api(format!("cas get: {e}")))?
                     .ok_or_else(|| ProviderError::Api("cas miss for tool result handle".into()))?;
-                blocks.push(Block::ToolResult {
-                    tool_use_id: tool_use_id.clone(),
-                    handle: None,
-                    inline: Some(bytes),
-                    cache_marker: *cache_marker,
+
+                // Phase 3 stub: any handle in the active turn is treated as Volatile.
+                // The full section-to-block mapping arrives with the live planner
+                // wiring in P3.8.
+                let band = plan.map_or(origin_planner::Band::Volatile, |_p| {
+                    origin_planner::Band::Volatile
                 });
+
+                match origin_planner::WireDecision::for_block(band, bytes.len()) {
+                    origin_planner::WireDecision::Inline => {
+                        blocks.push(Block::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            handle: None,
+                            inline: Some(bytes),
+                            cache_marker: *cache_marker,
+                        });
+                    }
+                    origin_planner::WireDecision::Reference => {
+                        let preview =
+                            format!("<result handle:{} \u{2014} {} bytes>", short_hex(h), bytes.len());
+                        blocks.push(Block::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            handle: None,
+                            inline: Some(preview.into_bytes()),
+                            cache_marker: *cache_marker,
+                        });
+                    }
+                }
             } else {
                 blocks.push(b.clone());
             }
@@ -318,6 +344,14 @@ fn expand_messages_for_wire(
         out.push(Message { role: m.role, blocks });
     }
     Ok(out)
+}
+
+fn short_hex(h: &[u8; 32]) -> String {
+    origin_cas::Hash::from_bytes(*h)
+        .to_string()
+        .chars()
+        .take(8)
+        .collect()
 }
 
 fn decode_response(wire: wire::WireResponse) -> ChatResponse {
