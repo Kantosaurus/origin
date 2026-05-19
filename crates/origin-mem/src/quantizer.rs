@@ -54,7 +54,7 @@ pub enum QuantizerError {
 }
 
 /// Int8 product quantizer: 256 centroids + a global delta scale.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Quantizer {
     centroids: Box<[[f32; EMBED_DIM]; NUM_CENTROIDS]>,
     /// Global i8 scale: `real_delta = i8_delta * scale`.
