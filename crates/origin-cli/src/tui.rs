@@ -1,11 +1,11 @@
-//! Ratatui baseline TUI: scrollback + prompt input + live assistant buffer.
+//! Composer-driven TUI app state and draw routine.
 
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::Frame;
+use std::time::Duration;
 
-use crate::screen::split_main_input_status;
+use origin_tui::composer::Composer;
+use origin_tui::grid::{Cell, Grid};
+use origin_tui::stream_widget::StreamWidget;
+
 use crate::status::{render_line, UsageSnapshot};
 
 #[derive(Debug)]
@@ -63,7 +63,7 @@ impl App {
         output_tokens: u32,
         cache_read: u32,
         cache_write: u32,
-        elapsed: std::time::Duration,
+        elapsed: Duration,
     ) {
         self.usage.input_tokens = self.usage.input_tokens.saturating_add(input_tokens);
         self.usage.output_tokens = self.usage.output_tokens.saturating_add(output_tokens);
@@ -72,32 +72,67 @@ impl App {
             self.usage.cache_creation_input_tokens.saturating_add(cache_write);
         self.usage.elapsed += elapsed;
     }
+
+    /// Render the current app state into the composer's grids.
+    ///
+    /// `widget` is threaded through for future per-delta streaming use;
+    /// this method does direct cell writes for simplicity.
+    pub fn draw(&self, composer: &mut Composer, widget: &mut StreamWidget) {
+        let _ = widget; // future: live-delta cursor mgmt
+                        // Main pane
+        {
+            let main = composer.main_grid();
+            let cols = main.cols();
+            let rows = main.rows();
+            // Clear
+            for r in 0..rows {
+                for c in 0..cols {
+                    main.put(r, c, Cell::blank());
+                }
+            }
+            let mut row: u16 = 0;
+            for line in &self.scrollback {
+                if row >= rows {
+                    break;
+                }
+                write_str(main, row, 0, line, cols);
+                row = row.saturating_add(1);
+            }
+            if let Some(buf) = self.current_assistant.as_ref() {
+                if row < rows {
+                    write_str(main, row, 0, buf, cols);
+                }
+            }
+        }
+        // Prompt bar
+        {
+            let prompt = composer.prompt_grid();
+            let pcols = prompt.cols();
+            let prows = prompt.rows();
+            for r in 0..prows {
+                for c in 0..pcols {
+                    prompt.put(r, c, Cell::blank());
+                }
+            }
+            let status_line = render_line(&self.usage);
+            write_str(prompt, 0, 0, &status_line, pcols);
+            // Input echo on next row, prefixed "> "
+            let mut input_line = String::from("> ");
+            input_line.push_str(&self.input);
+            if prows >= 2 {
+                write_str(prompt, 1, 0, &input_line, pcols);
+            }
+        }
+    }
 }
 
-pub fn draw(f: &mut Frame<'_>, app: &App) {
-    let (main, prompt, status) = split_main_input_status(f.area());
-
-    let mut lines: Vec<Line> = app
-        .scrollback
-        .iter()
-        .map(|s| Line::from(Span::raw(s.clone())))
-        .collect();
-    if let Some(buf) = app.current_assistant.as_ref() {
-        lines.push(Line::from(Span::raw(format!("origin> {buf}"))));
+fn write_str(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16) {
+    let mut c = col;
+    for ch in s.chars() {
+        if c >= max_cols {
+            break;
+        }
+        grid.put(row, c, Cell::glyph(ch));
+        c = c.saturating_add(1);
     }
-    let scroll = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title("origin"));
-    f.render_widget(scroll, main);
-
-    let input = Paragraph::new(Line::from(vec![
-        Span::raw("> "),
-        Span::styled(app.input.clone(), Style::default().add_modifier(Modifier::BOLD)),
-    ]))
-    .block(Block::default().borders(Borders::ALL));
-    f.render_widget(input, prompt);
-
-    let s = render_line(&app.usage);
-    let status_p = Paragraph::new(Line::from(Span::raw(s)));
-    f.render_widget(status_p, status);
 }
