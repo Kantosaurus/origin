@@ -28,6 +28,8 @@ pub enum HandoffError {
 ///
 /// # Errors
 /// Returns [`HandoffError`] on serialization or CAS write failure.
+// `cas_handoff_if_large` repeats the module name `cas_handoff`; the
+// `_if_large` suffix is the meaningful disambiguator at the call site.
 #[allow(clippy::module_name_repetitions)]
 pub fn cas_handoff_if_large(
     store: &Arc<Store>,

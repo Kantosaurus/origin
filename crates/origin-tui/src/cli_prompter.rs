@@ -39,6 +39,9 @@ impl SidePanelPrompter {
         Self {
             tx,
             pending: Mutex::new(HashMap::new()),
+            // Start ids at 1 so a "valid id" is distinguishable from `0` in
+            // logs / test fixtures; the value is just a counter, the only
+            // semantic constraint is "strictly increasing".
             submit_lock: AsyncMutex::new(1),
         }
     }

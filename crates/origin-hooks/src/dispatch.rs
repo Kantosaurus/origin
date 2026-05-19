@@ -5,6 +5,8 @@ use crate::event::{parse_hook_stdout, HookOverride, HookParseError, LifecycleEve
 use crate::shellpool::{PoolError, ShellPool};
 use thiserror::Error;
 
+// `DispatchError` repeats the module name `dispatch`; suppressed so external
+// callers can write `origin_hooks::DispatchError` without a redundant rename.
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Error)]
 pub enum DispatchError {
@@ -24,6 +26,8 @@ pub enum DispatchError {
 ///
 /// # Errors
 /// Forwards [`DispatchError`].
+// `dispatch_event` repeats the module name `dispatch`; kept for API clarity at
+// the use-site (`origin_hooks::dispatch_event`).
 #[allow(clippy::module_name_repetitions)]
 pub async fn dispatch_event(pool: &ShellPool, event: &LifecycleEvent) -> Result<HookOverride, DispatchError> {
     let mut line = serde_json::to_string(event)?;
