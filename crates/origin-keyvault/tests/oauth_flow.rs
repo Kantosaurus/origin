@@ -6,6 +6,28 @@ use std::time::Duration;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// Read the persisted OAuth blob back out of the vault and pull
+/// `(access, refresh)` out of it. The wire shape is internal to
+/// `origin-keyvault`, but the JSON keys are stable contract for the test.
+async fn read_stored(vault: &KeyVault, provider: &str, account: &str) -> (String, Option<String>) {
+    let secret = vault
+        .get(provider, &format!("{account}/oauth"))
+        .await
+        .expect("vault must contain persisted OAuth tokens");
+    let v: serde_json::Value =
+        serde_json::from_str(secret.expose()).expect("persisted OAuth blob must be valid JSON");
+    let access = v
+        .get("access")
+        .and_then(serde_json::Value::as_str)
+        .expect("persisted blob must have `access`")
+        .to_owned();
+    let refresh = v
+        .get("refresh")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    (access, refresh)
+}
+
 #[tokio::test]
 async fn exchange_then_refresh_rotates_tokens() {
     let server = MockServer::start().await;
@@ -13,6 +35,10 @@ async fn exchange_then_refresh_rotates_tokens() {
     Mock::given(method("POST"))
         .and(path("/token"))
         .and(body_string_contains("grant_type=authorization_code"))
+        .and(body_string_contains("code=auth-code"))
+        .and(body_string_contains("code_verifier=verifier"))
+        .and(body_string_contains("redirect_uri=https"))
+        .and(body_string_contains("client_id=client-id"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "access_token": "access-1",
             "refresh_token": "refresh-1",
@@ -25,6 +51,8 @@ async fn exchange_then_refresh_rotates_tokens() {
     Mock::given(method("POST"))
         .and(path("/token"))
         .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains("refresh_token=refresh-1"))
+        .and(body_string_contains("client_id=client-id"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "access_token": "access-2",
             "refresh_token": "refresh-2",
@@ -41,15 +69,16 @@ async fn exchange_then_refresh_rotates_tokens() {
         .exchange(
             &vault,
             "default",
-            AuthCodeRequest {
-                code: "auth-code".into(),
-                code_verifier: "verifier".into(),
-                redirect_uri: "https://example.invalid/callback".into(),
-            },
+            AuthCodeRequest::new("auth-code", "verifier", "https://example.invalid/callback"),
         )
         .await
         .expect("exchange should succeed");
     assert_eq!(exchanged.access.expose(), "access-1");
+
+    // Vault must hold exactly what the mock returned after `exchange`.
+    let (stored_access, stored_refresh) = read_stored(&vault, "github", "default").await;
+    assert_eq!(stored_access, "access-1");
+    assert_eq!(stored_refresh.as_deref(), Some("refresh-1"));
 
     let outcome = client
         .refresh(&vault, "default")
@@ -59,6 +88,11 @@ async fn exchange_then_refresh_rotates_tokens() {
         unreachable!("expected Rotated, got NotDue");
     };
     assert_eq!(access.expose(), "access-2");
+
+    // Vault must hold the rotated tokens after `refresh`.
+    let (stored_access, stored_refresh) = read_stored(&vault, "github", "default").await;
+    assert_eq!(stored_access, "access-2");
+    assert_eq!(stored_refresh.as_deref(), Some("refresh-2"));
 }
 
 #[tokio::test]
@@ -84,11 +118,7 @@ async fn refresh_if_due_skips_when_not_due() {
         .exchange(
             &vault,
             "default",
-            AuthCodeRequest {
-                code: "auth-code".into(),
-                code_verifier: "verifier".into(),
-                redirect_uri: "https://example.invalid/callback".into(),
-            },
+            AuthCodeRequest::new("auth-code", "verifier", "https://example.invalid/callback"),
         )
         .await
         .expect("exchange should succeed");
