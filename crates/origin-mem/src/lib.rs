@@ -2,6 +2,7 @@
 //! + HNSW + temporal-decay re-rank, with bodies in CAS and edges in `SQLite`.
 
 pub mod embedder;
+pub mod index;
 pub mod quantizer;
 
 // `EmbedderError` repeats the module name; we re-export it under the canonical
@@ -10,4 +11,5 @@ pub mod quantizer;
 #[allow(clippy::module_name_repetitions)]
 pub use embedder::EmbedderError;
 pub use embedder::{Embedder, EMBED_DIM};
+pub use index::{Candidate, IndexError, MemIndex, MetaRow, SearchOpts};
 pub use quantizer::{EncodedVector, Quantizer, QuantizerError, NUM_CENTROIDS};
