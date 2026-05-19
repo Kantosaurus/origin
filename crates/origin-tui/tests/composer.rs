@@ -25,12 +25,19 @@ fn toggling_side_panel_keeps_main_unchanged() {
     let mut c = Composer::new(40, 10);
     c.resize(40, 10, true);
     c.main_grid().put(2, 5, Cell::glyph('X'));
-    let _ = c.frame();
+    // Read BEFORE calling frame() — frame() swaps the live grid with the
+    // scratch, which would zero out our writes from the live grid's perspective.
     let cell_before = c.main_grid().get(2, 5);
+    assert_eq!(
+        cell_before,
+        Cell::glyph('X'),
+        "sanity: write was visible pre-resize"
+    );
     c.resize(40, 10, false);
     let cell_after = c.main_grid().get(2, 5);
     assert_eq!(
-        cell_before, cell_after,
-        "main contents must not be rewrapped on side toggle"
+        cell_after,
+        Cell::glyph('X'),
+        "main contents must survive side-panel toggle"
     );
 }
