@@ -2253,6 +2253,7 @@ dependencies = [
  "origin-provider-anthropic",
  "origin-provider-bedrock",
  "origin-provider-gemini",
+ "origin-provider-github",
  "origin-provider-ollama",
  "origin-provider-openai",
  "origin-provider-openrouter",
@@ -2398,6 +2399,22 @@ dependencies = [
  "origin-provider",
  "origin-stream",
  "pin-utils",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
+name = "origin-provider-github"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "origin-core",
+ "origin-keyvault",
+ "origin-provider",
+ "origin-stream",
  "reqwest",
  "serde",
  "serde_json",

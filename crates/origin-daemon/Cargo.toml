@@ -16,6 +16,7 @@ gemini = ["dep:origin-provider-gemini"]
 ollama = ["dep:origin-provider-ollama"]
 openrouter = ["dep:origin-provider-openrouter"]
 bedrock = ["dep:origin-provider-bedrock"]
+github-models = ["dep:origin-provider-github"]
 
 [dependencies]
 origin-ipc              = { path = "../origin-ipc" }
@@ -27,6 +28,7 @@ origin-provider-gemini     = { path = "../origin-provider-gemini",     optional 
 origin-provider-ollama     = { path = "../origin-provider-ollama",     optional = true }
 origin-provider-openrouter = { path = "../origin-provider-openrouter", optional = true }
 origin-provider-bedrock    = { path = "../origin-provider-bedrock",    optional = true }
+origin-provider-github     = { path = "../origin-provider-github",     optional = true }
 origin-tools            = { path = "../origin-tools" }
 origin-permission       = { path = "../origin-permission" }
 origin-store            = { path = "../origin-store" }
