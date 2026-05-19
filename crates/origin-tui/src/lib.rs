@@ -5,6 +5,7 @@
 //! LRU (`WidthCache`), streaming text widget (`StreamWidget`), and a side
 //! panel as a separate render target (`Composer`).
 
+pub mod ansi;
 pub mod damage;
 pub mod grid;
 
