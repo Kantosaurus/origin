@@ -2221,6 +2221,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-provider-gemini"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "origin-core",
+ "origin-provider",
+ "origin-stream",
+ "pin-utils",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
 name = "origin-provider-openai"
 version = "0.0.1"
 dependencies = [
