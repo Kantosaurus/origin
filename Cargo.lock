@@ -683,6 +683,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fxhash"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c31b6d751ae2c7f11320402d34e41349dd1016f8d5d45e48c4312bc8625af50c"
+dependencies = [
+ "byteorder",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1449,9 +1458,13 @@ name = "origin-tui"
 version = "0.0.1"
 dependencies = [
  "criterion",
+ "fxhash",
+ "lru",
  "proptest",
  "thiserror 1.0.69",
  "tokio",
+ "unicode-segmentation",
+ "unicode-width",
  "wide",
 ]
 

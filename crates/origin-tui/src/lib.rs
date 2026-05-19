@@ -9,7 +9,9 @@ pub mod ansi;
 pub mod damage;
 pub mod grid;
 pub mod scheduler;
+pub mod width;
 
 pub use damage::Run;
 pub use grid::{Attr, Cell, Grid, GridError};
 pub use scheduler::{Handle, Scheduler};
+pub use width::WidthCache;
