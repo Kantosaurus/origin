@@ -30,6 +30,7 @@ thiserror   = "1"
 rkyv        = { version = "0.7", features = ["validation", "bytecheck"] }
 ulid        = "1"
 rusqlite    = { version = "0.31", features = ["bundled"] }
+hex         = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
