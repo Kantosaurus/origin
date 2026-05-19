@@ -1313,6 +1313,7 @@ dependencies = [
  "origin-store",
  "origin-stream",
  "origin-tools",
+ "proptest",
  "rkyv",
  "rusqlite",
  "serde",

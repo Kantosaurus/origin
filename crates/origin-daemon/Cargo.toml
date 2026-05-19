@@ -35,6 +35,7 @@ rusqlite    = { version = "0.31", features = ["bundled"] }
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 sysinfo  = "0.30"
+proptest = { version = "=1.4.0", default-features = false, features = ["std"] }
 
 [lib]
 name = "origin_daemon"
