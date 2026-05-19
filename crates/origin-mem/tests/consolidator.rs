@@ -27,7 +27,27 @@ fn near_duplicates_get_supersede_proposal() {
         .expect("cas"),
     );
     let store = Arc::new(MemoryStore::new(Arc::clone(&sql), Arc::clone(&cas)));
-    let q = Quantizer::fit(&vec![unit_vec(0.0); 1024], 9).expect("fit");
+    // Build a degenerate but valid quantizer directly from its binary format,
+    // bypassing the k-means fit (which is O(k²·n·d) and slow in debug builds).
+    // Format: [u32 magic=0xC0FFEE42][u32 version=1][f32 scale=1.0]
+    //         [NUM_CENTROIDS * EMBED_DIM × f32 centroids]
+    // All centroids are set to unit_vec(0.0); encode/decode round-trips correctly.
+    let q = {
+        let magic: u32 = 0xC0FF_EE42;
+        let version: u32 = 1;
+        let scale: f32 = 1.0;
+        let centroid = unit_vec(0.0);
+        let mut buf = Vec::with_capacity(12 + origin_mem::quantizer::NUM_CENTROIDS * EMBED_DIM * 4);
+        buf.extend_from_slice(&magic.to_le_bytes());
+        buf.extend_from_slice(&version.to_le_bytes());
+        buf.extend_from_slice(&scale.to_le_bytes());
+        for _ in 0..origin_mem::quantizer::NUM_CENTROIDS {
+            for v in &centroid {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        Quantizer::from_bytes(&buf).expect("build degenerate quantizer")
+    };
     store.install_quantizer(&q).expect("install");
     let id_a = store
         .save("user is a rust engineer", &unit_vec(0.0), &[])
