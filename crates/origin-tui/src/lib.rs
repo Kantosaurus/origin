@@ -14,6 +14,7 @@ pub mod layout_cache;
 pub mod panel;
 pub mod scheduler;
 pub mod stream_widget;
+pub mod widgets;
 pub mod width;
 
 pub use cli_prompter::SidePanelPrompter;

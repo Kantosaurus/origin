@@ -2,6 +2,7 @@
 //! binary and for unit tests.
 
 pub mod input;
+pub mod plan_panel_wiring;
 pub mod screen;
 pub mod status;
 pub mod tui;
