@@ -41,7 +41,7 @@ rkyv = { version = "0.7", features = ["validation", "bytecheck"] }
 [dev-dependencies]
 proptest = { version = "=1.4.0", default-features = false, features = ["std"] }
 criterion = "0.5"
-tokio = { version = "1", features = ["macros", "rt", "test-util", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "test-util", "time"] }
 tempfile = "3"
 
 [[bench]]
