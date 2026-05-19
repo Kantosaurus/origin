@@ -2623,6 +2623,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-smr"
+version = "0.0.1"
+dependencies = [
+ "bytecheck",
+ "crossbeam-utils",
+ "nix",
+ "rkyv",
+ "thiserror 1.0.69",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "origin-store"
 version = "0.0.1"
 dependencies = [
