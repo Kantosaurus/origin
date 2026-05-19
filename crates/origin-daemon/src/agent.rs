@@ -1,10 +1,12 @@
 //! Agent loop: prompt → provider → tool dispatch → repeat → final text.
 
+use crate::protocol::StreamEvent;
 use crate::session::Session;
 use crate::session_store::SessionStore;
 use crate::tool_use_parser::{ToolUseDelta, ToolUseParser};
 use origin_cas::{Hash, Store};
 use origin_core::types::{Block, Message, Role};
+use origin_mem::{Injector, Proposer};
 use origin_permission::{check, prompt::Prompter, Outcome};
 use origin_provider::{ChatRequest, Provider};
 use origin_sidecar::{ExtractDeliverer, Sidecar, SummaryDeliverer};
@@ -33,6 +35,23 @@ pub struct LoopOptions {
     pub sidecar: Option<Arc<Sidecar>>,
     /// Optional session store for delivering summaries (P5.2).
     pub session_store: Option<Arc<SessionStore>>,
+    /// If `Some`, the Proposer runs at turn end and pushes proposals into
+    /// `session.pending_proposals` and emits one [`StreamEvent::MemoryProposed`]
+    /// per proposal through `event_tx` (or skips the emit if no sender is
+    /// configured). `None` disables the feature (the existing dogfood path).
+    pub proposer: Option<Arc<Proposer>>,
+    /// Side-band channel for non-streaming [`StreamEvent`]s (currently only
+    /// [`StreamEvent::MemoryProposed`]). The daemon main forwards these as
+    /// `Event` frames after `run_loop` returns and before writing `Response`.
+    /// We use a direct event channel here (not the per-turn rkyv `Ring`)
+    /// because [`StreamEvent::MemoryProposed`] doesn't map to any
+    /// [`origin_stream::TokenKind`] — it's a turn-end side product, not a
+    /// streaming token.
+    pub event_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
+    /// If `Some`, the loop embeds the user prompt and prepends any retrieved
+    /// `<context source="origin-mem">` block to the system prompt of every
+    /// turn's `ChatRequest`. `None` disables prompt-recall injection.
+    pub injector: Option<Arc<Injector>>,
 }
 
 impl Default for LoopOptions {
@@ -44,6 +63,9 @@ impl Default for LoopOptions {
             streaming_disabled: false,
             sidecar: None,
             session_store: None,
+            proposer: None,
+            event_tx: None,
+            injector: None,
         }
     }
 }
@@ -220,9 +242,25 @@ pub async fn run_loop(
     // same session avoid redundant tool execution.
     let mut cache = origin_tools::Cache::new();
 
+    // Prompt-recall (P6.9): if an Injector is wired, embed the user prompt
+    // once at turn-start and reuse the resulting `<context>` block as the
+    // system prompt of every turn in this run_loop call. Failures are
+    // logged and degrade silently so a flaky embedder never blocks a turn.
+    let recalled_system =
+        opts.injector
+            .as_ref()
+            .map_or_else(String::new, |injector| match injector.for_prompt(user_text, 5) {
+                Ok(Some(ctx)) => ctx.block,
+                Ok(None) => String::new(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "injector.for_prompt failed; running without recall");
+                    String::new()
+                }
+            });
+
     for turn in 1..=opts.max_turns {
         let req = ChatRequest {
-            system: String::new(),
+            system: recalled_system.clone(),
             messages: session.snapshot(),
             model: session.model.clone(),
             tools: tools_schema.clone(),
@@ -261,6 +299,26 @@ pub async fn run_loop(
                     _ => None,
                 })
                 .collect::<String>();
+
+            // P6.7: optional proposer pass at turn end. Each proposal is
+            // stashed on the Session and surfaced as a side-band StreamEvent
+            // for the CLI to render.
+            if let Some(proposer) = &opts.proposer {
+                let proposals = proposer.scan(user_text, &text, &mut session.next_proposal_id);
+                for p in proposals {
+                    if let Some(tx) = &opts.event_tx {
+                        let _ = tx
+                            .send(StreamEvent::MemoryProposed {
+                                proposal_id: p.proposal_id,
+                                body: p.body.clone(),
+                                suggested_tags: p.suggested_tags.clone(),
+                            })
+                            .await;
+                    }
+                    session.pending_proposals.insert(p.proposal_id, p);
+                }
+            }
+
             return Ok(LoopSummary {
                 assistant_text: text,
                 turns: turn,
