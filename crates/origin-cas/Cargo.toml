@@ -16,6 +16,7 @@ undocumented_unsafe_blocks = "deny"
 
 [dependencies]
 blake3 = "1"
+fastcdc = "3"
 thiserror = "1"
 
 [dev-dependencies]

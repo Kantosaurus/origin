@@ -5,6 +5,8 @@
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+mod chunker;
 mod hash;
 
+pub use chunker::{chunks, ChunkIter, ChunkRef};
 pub use hash::Hash;
