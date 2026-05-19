@@ -67,3 +67,7 @@ path = "src/main.rs"
 [[bench]]
 name = "phase2_ram_soak"
 harness = false
+
+[[bench]]
+name = "long_session"
+harness = false
