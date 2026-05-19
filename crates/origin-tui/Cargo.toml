@@ -31,13 +31,17 @@ fxhash = "0.2"
 origin-stream = { path = "../origin-stream" }
 origin-tools = { path = "../origin-tools" }
 origin-permission = { path = "../origin-permission" }
+origin-cas = { path = "../origin-cas" }
 async-trait = "0.1"
 parking_lot = "0.12"
+blake3 = "1"
+rkyv = { version = "0.7", features = ["validation", "bytecheck"] }
 
 [dev-dependencies]
 proptest = { version = "=1.4.0", default-features = false, features = ["std"] }
 criterion = "0.5"
 tokio = { version = "1", features = ["macros", "rt", "test-util", "time"] }
+tempfile = "3"
 
 [[bench]]
 name = "damage_diff"

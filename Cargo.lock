@@ -1457,10 +1457,19 @@ dependencies = [
 name = "origin-tui"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
+ "blake3",
  "criterion",
  "fxhash",
  "lru",
+ "origin-cas",
+ "origin-permission",
+ "origin-stream",
+ "origin-tools",
+ "parking_lot",
  "proptest",
+ "rkyv",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "unicode-segmentation",
