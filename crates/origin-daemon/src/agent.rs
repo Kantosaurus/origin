@@ -23,8 +23,9 @@ pub struct LoopOptions {
     /// `Subscriber` (not the `Ring`) so the relay never races the producer.
     pub relay_tx: Option<tokio::sync::mpsc::Sender<origin_stream::Subscriber>>,
     /// When `true`, the loop falls back to `provider.chat()` instead of
-    /// `provider.chat_stream()`. Required for `tool_use` turns until
-    /// incremental `tool_use` JSON parsing lands (P3.3).
+    /// `provider.chat_stream()`. Used by scripted/deterministic tests to
+    /// bypass the streaming drain path. The incremental `tool_use` parser
+    /// (P3.3) means production code paths can leave this `false`.
     pub streaming_disabled: bool,
 }
 
