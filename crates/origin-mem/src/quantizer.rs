@@ -189,11 +189,17 @@ impl Quantizer {
         }
         let magic = u32::from_le_bytes(bytes[0..4].try_into().expect("slice is 4 bytes"));
         if magic != MAGIC {
-            return Err(QuantizerError::TooFewSamples { got: 0, min: 1 });
+            return Err(QuantizerError::TooFewSamples {
+                got: magic as usize,
+                min: MAGIC as usize,
+            });
         }
         let version = u32::from_le_bytes(bytes[4..8].try_into().expect("slice is 4 bytes"));
         if version != VERSION {
-            return Err(QuantizerError::TooFewSamples { got: 0, min: 1 });
+            return Err(QuantizerError::TooFewSamples {
+                got: version as usize,
+                min: VERSION as usize,
+            });
         }
         let scale = f32::from_le_bytes(bytes[8..12].try_into().expect("slice is 4 bytes"));
         let mut centroids = Box::new([[0_f32; EMBED_DIM]; NUM_CENTROIDS]);
@@ -256,7 +262,7 @@ fn lloyd(
     mut centroids: Box<[[f32; EMBED_DIM]; NUM_CENTROIDS]>,
     training: &[[f32; EMBED_DIM]],
 ) -> Result<Box<[[f32; EMBED_DIM]; NUM_CENTROIDS]>, QuantizerError> {
-    for iter in 0..MAX_ITERS {
+    for _iter in 0..MAX_ITERS {
         let assignments: Vec<usize> = training.iter().map(|v| nearest_centroid(&centroids, v)).collect();
 
         let mut sums = vec![[0_f32; EMBED_DIM]; NUM_CENTROIDS];
@@ -290,11 +296,8 @@ fn lloyd(
         if total_movement < CONVERGE_THRESHOLD {
             return Ok(centroids);
         }
-        if iter == MAX_ITERS - 1 {
-            return Err(QuantizerError::NoConverge { iters: MAX_ITERS });
-        }
     }
-    Ok(centroids)
+    Err(QuantizerError::NoConverge { iters: MAX_ITERS })
 }
 
 /// Return the index of the centroid nearest to `v` (by squared L2 distance).
