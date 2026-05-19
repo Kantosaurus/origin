@@ -1,0 +1,27 @@
+[package]
+name = "origin-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Override workspace `unsafe_code = "forbid"` — P4.2 needs `wide::u8x32`
+# intrinsic dispatch. Each unsafe block must carry a SAFETY: comment.
+# Cargo forbids combining `[lints] workspace = true` with per-section
+# overrides, so we inline the workspace clippy lints here too.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+panic = "warn"
+undocumented_unsafe_blocks = "deny"
+
+[dependencies]
+thiserror = "1"
+
+[dev-dependencies]
+proptest = { version = "=1.4.0", default-features = false, features = ["std"] }
