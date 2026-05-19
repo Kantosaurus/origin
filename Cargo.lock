@@ -2672,6 +2672,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-swarm"
+version = "0.0.1"
+dependencies = [
+ "bincode",
+ "origin-cas",
+ "origin-core",
+ "origin-plan",
+ "origin-planner",
+ "origin-smr",
+ "origin-store",
+ "serde",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
 name = "origin-tools"
 version = "0.0.1"
 dependencies = [
