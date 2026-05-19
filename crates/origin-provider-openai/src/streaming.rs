@@ -75,6 +75,9 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
         };
 
         for choice in chunk.choices {
+            // TODO(P8.x): track `index` field on streaming tool_calls to support concurrent
+            // tool-call demux. Currently consumers cannot disambiguate which tool a
+            // ToolUseDelta belongs to when OpenAI interleaves multiple tool calls.
             // tool_use_start: a tool-call delta arriving with a fresh id+name.
             if let Some(tcs) = &choice.delta.tool_calls {
                 for tc in tcs {
@@ -101,6 +104,9 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
                 }
             }
             if choice.finish_reason.is_some() {
+                // TODO(P8.x): set `stream_options.include_usage = true` in the request body and
+                // parse the final `usage` SSE frame to publish a `TokenKind::Usage` event with
+                // token counts. OpenAI omits usage from streaming responses by default.
                 ring.publish(&TokenEvent::new(TokenKind::TurnEnd, Vec::new()))
                     .map_err(|e| ProviderError::Api(e.to_string()))?;
             }
