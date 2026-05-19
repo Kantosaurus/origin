@@ -82,3 +82,38 @@ fn supersede_drops_loser() {
         "10 should be dropped as superseded"
     );
 }
+
+#[test]
+fn cluster_priority_and_edge_boost_affect_rank() {
+    let mut idx = MemIndex::new();
+    let a = unit_vec(0.0);
+    let b = unit_vec(0.05);
+    idx.insert(100, &a).expect("ins");
+    idx.insert(101, &b).expect("ins");
+    // Both same age; 101 has higher cluster_priority + edge_boost, expect 101 first.
+    let meta: HashMap<u64, MetaRow> = HashMap::from([
+        (
+            100_u64,
+            MetaRow {
+                age_days: 1.0,
+                cluster_priority: 1.0,
+                edge_boost: 0.0,
+                superseded_by: None,
+            },
+        ),
+        (
+            101_u64,
+            MetaRow {
+                age_days: 1.0,
+                cluster_priority: 1.5,
+                edge_boost: 0.3,
+                superseded_by: None,
+            },
+        ),
+    ]);
+    let out = idx
+        .search(&a, &SearchOpts::default(), |id| meta.get(&id).copied())
+        .expect("search");
+    assert_eq!(out[0].id, 101, "boosted candidate should rank first");
+    assert!(out[0].score > out[1].score);
+}
