@@ -4,6 +4,7 @@ use anyhow::Result;
 use origin_daemon::agent::{run_loop, LoopOptions};
 use origin_daemon::protocol::{PromptReply, PromptRequest};
 use origin_daemon::session::Session;
+use origin_daemon::session_store::SessionStore;
 use origin_ipc::frame::FrameKind;
 use origin_ipc::transport::Listener;
 use origin_permission::prompt::AlwaysAllow;
@@ -23,6 +24,10 @@ async fn main() -> Result<()> {
         env::var("ANTHROPIC_API_KEY").map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY must be set"))?;
     let provider = std::sync::Arc::new(Anthropic::new(api_key));
 
+    let db_path = env::var("ORIGIN_DB").unwrap_or_else(|_| default_db_path());
+    let session_store = std::sync::Arc::new(SessionStore::open(&db_path)?);
+    info!(db = %db_path, "session store ready");
+
     let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
     let listener = Listener::bind(&path).await?;
     info!(path = %path, "origin-daemon listening");
@@ -30,6 +35,7 @@ async fn main() -> Result<()> {
     loop {
         let mut conn = listener.accept().await?;
         let provider = std::sync::Arc::clone(&provider);
+        let session_store = std::sync::Arc::clone(&session_store);
         tokio::spawn(async move {
             loop {
                 let Ok(body) = conn.read_frame_body().await else {
@@ -67,6 +73,18 @@ async fn main() -> Result<()> {
                             error!(error = %e, "write reply");
                             break;
                         }
+                        // Persist session metadata and all messages.
+                        if let Err(e) = session_store.persist_session(&session) {
+                            error!(error = %e, "persist_session failed");
+                        }
+                        for (i, m) in session.messages.iter().enumerate() {
+                            #[allow(clippy::expect_used)]
+                            // Turn count in a session cannot exceed u32::MAX in practice.
+                            let turn = u32::try_from(i).expect("turn fits u32");
+                            if let Err(e) = session_store.persist_message(&session.id.to_string(), turn, m) {
+                                error!(error = %e, "persist_message failed");
+                            }
+                        }
                     }
                     Err(e) => {
                         let _ = conn
@@ -88,4 +106,10 @@ fn default_path() -> String {
     {
         r"\\.\pipe\origin".to_string()
     }
+}
+
+fn default_db_path() -> String {
+    let mut p = std::env::temp_dir();
+    p.push("origin.db");
+    p.to_string_lossy().into_owned()
 }
