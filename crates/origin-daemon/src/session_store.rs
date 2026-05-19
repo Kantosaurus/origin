@@ -117,6 +117,33 @@ impl SessionStore {
     }
 }
 
+impl SessionStore {
+    /// Return `(turn_index, summary)` for every persisted message of
+    /// `session_id`, ordered ascending by `turn_index`.
+    ///
+    /// # Errors
+    /// Propagates sqlite errors on read failure.
+    pub fn load_summaries(&self, session_id: &str) -> Result<Vec<(u32, Option<String>)>, SessionStoreError> {
+        let rows = self.inner.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT turn_index, summary FROM messages \
+                 WHERE session_id = ?1 ORDER BY turn_index ASC",
+            )?;
+            let iter = stmt.query_map([session_id], |r| {
+                let t: i64 = r.get(0)?;
+                let s: Option<String> = r.get(1)?;
+                Ok((u32::try_from(t).unwrap_or(u32::MAX), s))
+            })?;
+            let mut out = Vec::new();
+            for r in iter {
+                out.push(r?);
+            }
+            Ok(out)
+        })?;
+        Ok(rows)
+    }
+}
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
