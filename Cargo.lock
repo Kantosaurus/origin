@@ -1051,6 +1051,7 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "proptest",
+ "rusqlite",
  "tempfile",
  "thiserror 1.0.69",
  "zstd",

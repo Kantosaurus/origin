@@ -55,6 +55,35 @@ fn explicit_demote_to_cold_still_readable() {
     assert_eq!(v.as_slice(), b"please-compress-me");
 }
 
+#[test]
+fn flush_threshold_persists_across_reopen() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let cfg_small = StoreConfig {
+        root: root.clone(),
+        hot_capacity: 2,
+        warm_pack_target_bytes: 64,
+        cold_zstd_level: 3,
+    };
+
+    let mut early_hash: Option<Hash> = None;
+    {
+        let store = Store::open(cfg_small.clone()).expect("open");
+        for i in 0..12u32 {
+            let payload = format!("payload-{i:02}");
+            let h = store.put(payload.as_bytes()).expect("put");
+            if i == 0 {
+                early_hash = Some(h);
+            }
+        }
+    }
+
+    let store2 = Store::open(cfg_small).expect("reopen");
+    let h0 = early_hash.expect("early hash captured");
+    let v = store2.get(h0).expect("get").expect("present after reopen");
+    assert_eq!(v.as_slice(), b"payload-00");
+}
+
 proptest::proptest! {
     #[test]
     fn random_read_write_evict_preserves_content(items in proptest::collection::vec(proptest::collection::vec(proptest::num::u8::ANY, 0..512), 1..50)) {
