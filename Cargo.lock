@@ -477,6 +477,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-provider"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "origin-core",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "origin-store"
 version = "0.0.1"
 dependencies = [
