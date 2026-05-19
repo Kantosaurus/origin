@@ -96,13 +96,19 @@ pub(crate) struct SpeculativeRegistry {
 }
 
 impl SpeculativeRegistry {
-    fn spawn(&mut self, tool_use_id: String, meta: &'static ToolMeta, args: serde_json::Value) {
+    fn spawn(
+        &mut self,
+        tool_use_id: String,
+        meta: &'static ToolMeta,
+        args: serde_json::Value,
+        cas: Option<Arc<Store>>,
+    ) {
         // Side-effecting tools opt out — N2.2.
         if !matches!(meta.side_effects, SideEffects::Pure) {
             return;
         }
         let handle = tokio::spawn(async move {
-            let text = dispatch_tool(meta, &args).await?;
+            let text = dispatch_tool(meta, &args, cas.as_deref()).await?;
             Ok::<_, LoopError>(text.into_bytes())
         });
         self.in_flight.insert(tool_use_id, handle);
@@ -217,7 +223,9 @@ pub async fn run_loop(
             let result_bytes: Vec<u8> = if let Some(pre) = speculative.take(&id).await {
                 pre?
             } else {
-                dispatch_tool(meta, &args).await?.into_bytes()
+                dispatch_tool(meta, &args, opts.cas.as_deref())
+                    .await?
+                    .into_bytes()
             };
 
             let block = if let Some(cas) = opts.cas.as_ref() {
@@ -250,7 +258,7 @@ pub async fn run_loop(
     Err(LoopError::MaxTurns(opts.max_turns))
 }
 
-async fn dispatch_tool(meta: &ToolMeta, args: &Value) -> Result<String, LoopError> {
+async fn dispatch_tool(meta: &ToolMeta, args: &Value, cas: Option<&Store>) -> Result<String, LoopError> {
     match meta.name {
         "Read" => {
             let path = args
@@ -310,7 +318,54 @@ async fn dispatch_tool(meta: &ToolMeta, args: &Value) -> Result<String, LoopErro
                 out.exit_code, out.stdout, out.stderr
             ))
         }
+        "Recall" => {
+            let store =
+                cas.ok_or_else(|| LoopError::ToolFailure("Recall requires CAS to be configured".into()))?;
+            let handle_hex = args
+                .get("handle")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| LoopError::BadArgs("Recall: missing `handle`".into()))?;
+            let handle: [u8; 32] = {
+                let mut buf = [0u8; 32];
+                hex::decode_to_slice(handle_hex, &mut buf)
+                    .map_err(|e| LoopError::BadArgs(format!("Recall: bad hex: {e}")))?;
+                buf
+            };
+            let region = args.get("region").map(parse_region).transpose()?;
+            origin_tools::builtins::recall::recall_tool(store, handle, region)
+                .map_err(|e| LoopError::ToolFailure(e.to_string()))
+        }
         other => Err(LoopError::UnknownTool(other.into())),
+    }
+}
+
+fn parse_region(v: &Value) -> Result<origin_tools::builtins::recall::Region, LoopError> {
+    if let Some(lines) = v.get("lines").and_then(Value::as_array) {
+        // Region indices are bounded by file sizes and will never exceed usize::MAX
+        // on any supported target. Casting u64 -> usize is intentional here.
+        #[allow(clippy::cast_possible_truncation)]
+        let start = lines
+            .first()
+            .and_then(Value::as_u64)
+            .ok_or_else(|| LoopError::BadArgs("Recall.region.lines requires [start, end]".into()))?
+            as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let end = lines
+            .get(1)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| LoopError::BadArgs("Recall.region.lines requires [start, end]".into()))?
+            as usize;
+        Ok(origin_tools::builtins::recall::Region::Lines { start, end })
+    } else if let Some(m) = v.get("match").and_then(Value::as_str) {
+        Ok(origin_tools::builtins::recall::Region::Match {
+            pattern: m.to_string(),
+        })
+    } else if v.get("outline_only").and_then(Value::as_bool) == Some(true) {
+        Ok(origin_tools::builtins::recall::Region::OutlineOnly)
+    } else {
+        Err(LoopError::BadArgs(
+            "Recall.region: expected lines/match/outline_only".into(),
+        ))
     }
 }
 
@@ -341,7 +396,7 @@ async fn run_streaming_turn(
         ring_for_drive.close();
         outcome
     };
-    let drain = drain_subscriber_into_response(drain_sub);
+    let drain = drain_subscriber_into_response(drain_sub, opts.cas.clone());
     let (drive_res, turn_res) = tokio::join!(drive, drain);
     drive_res?;
     turn_res
@@ -363,6 +418,7 @@ fn try_speculative_spawn(
     tool_names: &HashMap<String, String>,
     tool_input_bufs: &HashMap<String, Vec<u8>>,
     registry: &mut SpeculativeRegistry,
+    cas: Option<Arc<Store>>,
 ) -> bool {
     let Some(name) = tool_names.get(tool_use_id) else {
         return false;
@@ -383,14 +439,16 @@ fn try_speculative_spawn(
         .get(tool_use_id)
         .map_or(&[] as &[u8], Vec::as_slice);
     if let Ok(args) = serde_json::from_slice::<Value>(buf) {
-        registry.spawn(tool_use_id.to_owned(), meta, args);
+        registry.spawn(tool_use_id.to_owned(), meta, args, cas);
         return true;
     }
     false
 }
 
+#[allow(clippy::too_many_lines)] // streaming state-machine; extracting sub-functions would require extra allocation
 async fn drain_subscriber_into_response(
     mut sub: origin_stream::Subscriber,
+    cas: Option<Arc<Store>>,
 ) -> Result<StreamingTurn, LoopError> {
     let mut text = String::new();
     let mut usage = origin_provider::Usage::default();
@@ -447,7 +505,13 @@ async fn drain_subscriber_into_response(
                         let events = parser.feed(ev.payload());
                         if !speculative_spawned.contains(&id_owned)
                             && events.iter().any(|e| matches!(e, ToolUseDelta::Field { .. }))
-                            && try_speculative_spawn(&id_owned, &tool_names, &tool_input_bufs, &mut registry)
+                            && try_speculative_spawn(
+                                &id_owned,
+                                &tool_names,
+                                &tool_input_bufs,
+                                &mut registry,
+                                cas.clone(),
+                            )
                         {
                             speculative_spawned.insert(id_owned);
                         }
