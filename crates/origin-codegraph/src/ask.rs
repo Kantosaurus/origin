@@ -28,6 +28,29 @@ pub struct MemHit {
     pub body: String,
 }
 
+/// Result of an `ask` dispatch: which backend was chosen plus any memory hits.
+///
+/// Code-side hits will fold in here in Phase 6 when free-text → typed-Query
+/// translation lands; for P7.8 we carry only the classifier decision and the
+/// memory hits returned by the supplied [`MemRouter`].
+// `AskResult` is the plan-mandated public name; the `Ask` prefix matches the
+// surrounding `Route`/`MemHit`/`MemRouter` API and disambiguates against
+// `std::result::Result` at call sites.
+#[allow(clippy::module_name_repetitions)]
+#[derive(Debug, Clone)]
+pub struct AskResult {
+    pub route: Route,
+    pub mem_hits: Vec<MemHit>,
+}
+
+impl AskResult {
+    /// Construct a result from its parts.
+    #[must_use]
+    pub const fn new(route: Route, mem_hits: Vec<MemHit>) -> Self {
+        Self { route, mem_hits }
+    }
+}
+
 /// Pluggable memory search backend. Phase 7 ships only [`NullMemRouter`];
 /// Phase 6's sleep-time memory implements this trait against its own store.
 pub trait MemRouter: Send + Sync {

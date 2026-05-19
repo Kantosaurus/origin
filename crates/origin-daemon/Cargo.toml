@@ -18,6 +18,7 @@ origin-tools            = { path = "../origin-tools" }
 origin-permission       = { path = "../origin-permission" }
 origin-store            = { path = "../origin-store" }
 origin-cas              = { path = "../origin-cas" }
+origin-codegraph        = { path = "../origin-codegraph" }
 origin-stream           = { path = "../origin-stream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "sync"] }
 anyhow = "1"

@@ -1,20 +1,21 @@
-//! `graph_summarize` — summarize a community or node neighborhood.
+//! `graph_summarize` — placeholder until Phase 5's sidecar lands.
+//!
+//! P7.8 returns [`QueryResult::Empty`] so the tool's registration is observable
+//! and the daemon doesn't have to special-case the call site.
 
-use thiserror::Error;
+use origin_codegraph::index::CodeGraphIndex;
+use origin_codegraph::query::QueryResult;
 
-#[allow(clippy::module_name_repetitions)] // `GraphSummarizeError` follows `RecallError` precedent
-#[derive(Debug, Error)]
-pub enum GraphSummarizeError {
-    #[error("not yet wired to the live index")]
-    Unwired,
-}
-
-/// # Errors
-/// Returns [`GraphSummarizeError::Unwired`] until P7.8 wires the daemon-held
-/// `CodeGraphIndex`; the tool's registration is what P7.7 verifies.
+/// Placeholder — Phase 5's sidecar wires the real summarizer.
+///
+/// `_idx` is intentionally unused at P7.8; it stays in the signature so future
+/// wiring doesn't require a breaking API change. `_target` is the community
+/// id or node hex passed in by the agent.
+#[must_use]
 #[allow(clippy::module_name_repetitions)] // `graph_summarize_tool` follows `recall_tool` precedent
-pub fn graph_summarize_tool(_target: String) -> Result<String, GraphSummarizeError> {
-    Err(GraphSummarizeError::Unwired)
+#[allow(clippy::needless_pass_by_value)] // matches future wired signature once the summarizer lands
+pub fn graph_summarize_tool(_idx: &CodeGraphIndex, _target: String) -> QueryResult {
+    QueryResult::Empty
 }
 
 crate::origin_tool! {

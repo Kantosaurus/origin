@@ -1,22 +1,16 @@
 //! `graph_explain` — run a typed query, route the result through the sidecar.
 
 use origin_codegraph::query::Query;
-use thiserror::Error;
 
-#[allow(clippy::module_name_repetitions)] // `GraphExplainError` follows `RecallError` precedent
-#[derive(Debug, Error)]
-pub enum GraphExplainError {
-    #[error("not yet wired to the live index")]
-    Unwired,
-}
-
-/// # Errors
-/// Returns [`GraphExplainError::Unwired`] until P7.8 wires the daemon-held
-/// `CodeGraphIndex` and sidecar; the tool's registration is what P7.7 verifies.
+// TODO(p5): swap NoopSidecar for `origin_sidecar::Sidecar` once Phase 5 lands.
+/// Placeholder explanation. Phase 5's sidecar pipes typed-query results
+/// through a tight NL template; until then we surface a stable sentinel string
+/// so the tool's registration is observable end-to-end.
+#[must_use]
 #[allow(clippy::module_name_repetitions)] // `graph_explain_tool` follows `recall_tool` precedent
 #[allow(clippy::needless_pass_by_value)] // matches future wired signature
-pub const fn graph_explain_tool(_q: Query) -> Result<String, GraphExplainError> {
-    Err(GraphExplainError::Unwired)
+pub fn graph_explain_tool(_q: Query) -> String {
+    "<explanation pending Phase 5 sidecar>".to_owned()
 }
 
 crate::origin_tool! {
