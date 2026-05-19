@@ -117,24 +117,7 @@ pub async fn run_loop(
         let resp = if opts.streaming_disabled {
             provider.chat(req).await?
         } else {
-            let ring = origin_stream::Ring::with_capacity(256 * 1024);
-            // Subscribe BEFORE the provider publishes — a fresh subscriber
-            // starts at the current write cursor, so subscribing after the
-            // publishes would miss every record. Same reasoning applies to
-            // the relay's subscriber.
-            let drain_sub = ring.subscribe();
-            if let Some(tx) = &opts.relay_tx {
-                let relay_sub = ring.subscribe();
-                let _ = tx.send(relay_sub).await;
-            }
-            // Drive the provider and the drain concurrently. The provider
-            // publishes; the drain consumes; once the provider returns and the
-            // ring closes, the drain finishes too.
-            let drive = provider.chat_stream(req, &ring);
-            let drain = drain_subscriber_into_response(drain_sub);
-            let (drive_res, resp) = tokio::join!(drive, drain);
-            drive_res?;
-            resp?
+            run_streaming_turn(provider, req, opts).await?
         };
         session.push(resp.assistant.clone());
 
@@ -283,6 +266,35 @@ async fn dispatch_tool(meta: &ToolMeta, args: &Value) -> Result<String, LoopErro
 /// plus `Usage`. `ToolUseDelta` and `ThinkingDelta` are intentionally ignored:
 /// reconstructing `Block::ToolUse` requires incremental JSON parsing which
 /// lands in P3.3.
+/// Run one streaming turn. Pre-subscribes BOTH the drain and (optionally) the
+/// relay before publishing — a fresh subscriber starts at the current write
+/// cursor, so subscribing after the producer publishes would miss every record.
+/// The drive future always closes the ring on completion (success OR error) so
+/// the drain and the relay subscriber wake up cleanly even if the provider
+/// fails mid-stream. `Ring::close` is idempotent.
+async fn run_streaming_turn(
+    provider: &dyn Provider,
+    req: ChatRequest,
+    opts: &LoopOptions,
+) -> Result<origin_provider::ChatResponse, LoopError> {
+    let ring = origin_stream::Ring::with_capacity(256 * 1024);
+    let drain_sub = ring.subscribe();
+    if let Some(tx) = &opts.relay_tx {
+        let relay_sub = ring.subscribe();
+        let _ = tx.send(relay_sub).await;
+    }
+    let ring_for_drive = ring.clone();
+    let drive = async move {
+        let outcome = provider.chat_stream(req, &ring_for_drive).await;
+        ring_for_drive.close();
+        outcome
+    };
+    let drain = drain_subscriber_into_response(drain_sub);
+    let (drive_res, resp) = tokio::join!(drive, drain);
+    drive_res?;
+    resp
+}
+
 async fn drain_subscriber_into_response(
     mut sub: origin_stream::Subscriber,
 ) -> Result<origin_provider::ChatResponse, LoopError> {

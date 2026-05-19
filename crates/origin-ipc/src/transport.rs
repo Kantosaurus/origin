@@ -78,6 +78,19 @@ impl Connection {
     /// Returns an error if the connection closes mid-frame or the length field
     /// is malformed.
     pub async fn read_frame_body(&mut self) -> io::Result<Vec<u8>> {
+        let (_kind, body) = self.read_frame().await?;
+        Ok(body)
+    }
+
+    /// Read the next frame, returning its `FrameKind` and body bytes. Used by
+    /// callers that need to distinguish `Event` from `Response` frames (e.g.,
+    /// the CLI's streaming response loop and the daemon's ordering tests).
+    ///
+    /// # Errors
+    /// Returns an error if the connection closes mid-frame, the magic bytes
+    /// don't match, the length field is malformed, or the kind byte is
+    /// unknown.
+    pub async fn read_frame(&mut self) -> io::Result<(FrameKind, Vec<u8>)> {
         let mut header = [0_u8; HEADER_LEN];
         self.inner.read_exact(&mut header).await?;
         // header layout (must match crate::frame::encode):
@@ -85,10 +98,22 @@ impl Connection {
         //   [4]     kind
         //   [5..13] request_id
         //   [13..17] body length (big-endian u32)
+        let kind = match header[4] {
+            1 => FrameKind::Request,
+            2 => FrameKind::Response,
+            3 => FrameKind::Event,
+            4 => FrameKind::ErrorFrame,
+            x => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown frame kind: {x}"),
+                ))
+            }
+        };
         let len = u32::from_be_bytes([header[13], header[14], header[15], header[16]]) as usize;
         let mut body = vec![0_u8; len];
         self.inner.read_exact(&mut body).await?;
-        Ok(body)
+        Ok((kind, body))
     }
 
     /// Write a frame with `kind` and `body`. `request_id` is zero — the

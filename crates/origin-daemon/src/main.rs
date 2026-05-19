@@ -7,6 +7,7 @@ use origin_daemon::agent::{run_loop, LoopOptions};
 use origin_daemon::protocol::{PromptReply, PromptRequest};
 use origin_daemon::session::Session;
 use origin_daemon::session_store::SessionStore;
+use origin_daemon::stream_relay::relay_to_connection;
 use origin_ipc::frame::FrameKind;
 use origin_ipc::transport::{Listener, SharedConnection};
 use origin_permission::prompt::AlwaysAllow;
@@ -53,12 +54,9 @@ async fn main() -> Result<()> {
     loop {
         let conn = listener.accept().await?;
         let shared_conn: SharedConnection = Arc::new(Mutex::new(conn));
-        let (tx_sub, rx_sub) = mpsc::channel::<Subscriber>(1);
 
-        spawn_relay_task(Arc::clone(&shared_conn), rx_sub);
         spawn_handler_task(
             shared_conn,
-            tx_sub,
             Arc::clone(&provider),
             Arc::clone(&session_store),
             Arc::clone(&cas),
@@ -66,20 +64,8 @@ async fn main() -> Result<()> {
     }
 }
 
-fn spawn_relay_task(conn: SharedConnection, mut rx_sub: mpsc::Receiver<Subscriber>) {
-    tokio::spawn(async move {
-        while let Some(sub) = rx_sub.recv().await {
-            if let Err(e) = origin_daemon::stream_relay::relay_to_connection(sub, Arc::clone(&conn)).await {
-                error!(error = %e, "relay terminated");
-                break;
-            }
-        }
-    });
-}
-
 fn spawn_handler_task(
     conn: SharedConnection,
-    tx_sub: mpsc::Sender<Subscriber>,
     provider: Arc<dyn Provider>,
     session_store: Arc<SessionStore>,
     cas: Arc<Store>,
@@ -107,7 +93,6 @@ fn spawn_handler_task(
             };
             if !handle_request(
                 &conn,
-                &tx_sub,
                 provider.as_ref(),
                 session_store.as_ref(),
                 Arc::clone(&cas),
@@ -123,22 +108,58 @@ fn spawn_handler_task(
 
 /// Run one request to completion. Returns `false` if the response write
 /// failed (the connection is dead and the handler task should exit).
+///
+/// Bug-2 guard: the relay (Event frames) and the handler (Response frame) both
+/// write to the same `SharedConnection`. If the handler grabs the conn mutex
+/// and writes `Response` while the relay still has buffered events to flush,
+/// the CLI sees `Response` first and exits, dropping later events. We fix this
+/// by spawning a *per-request* relay task here, capturing its `JoinHandle`, and
+/// awaiting it AFTER `run_loop` returns (the per-turn rings are closed by then)
+/// and BEFORE writing the `Response`. Dropping `tx_sub` after `run_loop` closes
+/// the per-request `Subscriber` channel, which terminates the relay's outer
+/// loop deterministically.
 async fn handle_request(
     conn: &SharedConnection,
-    tx_sub: &mpsc::Sender<Subscriber>,
     provider: &dyn Provider,
     session_store: &SessionStore,
     cas: Arc<Store>,
     req: PromptRequest,
 ) -> bool {
     let mut session = Session::new("anthropic", &req.model);
-    let opts = LoopOptions {
-        max_turns: 25,
-        cas: Some(cas),
-        relay_tx: Some(tx_sub.clone()),
-        streaming_disabled: false,
+    let (tx_sub, mut rx_sub) = mpsc::channel::<Subscriber>(1);
+    let conn_for_relay = Arc::clone(conn);
+    let relay_handle: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+        while let Some(sub) = rx_sub.recv().await {
+            if let Err(e) = relay_to_connection(sub, Arc::clone(&conn_for_relay)).await {
+                error!(error = %e, "relay terminated");
+                break;
+            }
+        }
+    });
+
+    // Scope `opts` so its `relay_tx` Sender clone is dropped on this line —
+    // otherwise the channel has TWO senders (one in `tx_sub`, one in `opts`)
+    // and `rx_sub.recv()` never returns None, so the relay task hangs forever.
+    let loop_result = {
+        let opts = LoopOptions {
+            max_turns: 25,
+            cas: Some(cas),
+            relay_tx: Some(tx_sub.clone()),
+            streaming_disabled: false,
+        };
+        run_loop(&mut session, &req.user_text, provider, &AlwaysAllow, &opts).await
     };
-    match run_loop(&mut session, &req.user_text, provider, &AlwaysAllow, &opts).await {
+    // Close the per-request Subscriber channel so the relay task exits its
+    // outer loop once it finishes flushing the last ring.
+    drop(tx_sub);
+    // Wait for the relay to flush every Event frame for this request before we
+    // write the Response. Errors here are non-fatal (already logged inside the
+    // relay task); we just need to know it finished.
+    if let Err(e) = relay_handle.await {
+        error!(error = %e, "relay join");
+    }
+
+    match loop_result {
         Ok(summary) => {
             let reply = PromptReply {
                 assistant_text: summary.assistant_text,
