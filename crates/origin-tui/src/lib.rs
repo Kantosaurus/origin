@@ -5,6 +5,8 @@
 //! LRU (`WidthCache`), streaming text widget (`StreamWidget`), and a side
 //! panel as a separate render target (`Composer`).
 
+pub mod damage;
 pub mod grid;
 
+pub use damage::Run;
 pub use grid::{Attr, Cell, Grid, GridError};
