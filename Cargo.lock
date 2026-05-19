@@ -821,10 +821,20 @@ name = "origin-daemon"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "origin-core",
  "origin-ipc",
+ "origin-permission",
+ "origin-provider",
+ "origin-provider-anthropic",
+ "origin-tools",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ulid",
 ]
 
 [[package]]
