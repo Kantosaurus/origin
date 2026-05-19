@@ -1,0 +1,23 @@
+[package]
+name = "origin-stream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints.rust]
+unsafe_code = "allow"   # raw cursor atomics
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[dependencies]
+bytes = "1"
+rkyv = { version = "0.7", features = ["validation", "bytecheck"] }
+tokio = { version = "1", features = ["sync"] }
+thiserror = "1"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "time", "sync"] }
