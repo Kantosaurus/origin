@@ -10,9 +10,17 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 origin-daemon = { path = ".." }
+origin-ipc = { path = "../../origin-ipc" }
 
 [[bin]]
 name = "tool_use_parser"
 path = "fuzz_targets/tool_use_parser.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "ipc_frame"
+path = "fuzz_targets/ipc_frame.rs"
+test = false
+doc = false
+bench = false
