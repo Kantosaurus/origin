@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bundle;
+pub mod cas_tap;
 pub mod clock;
 pub mod ipc_tap;
 pub mod provider_tap;
