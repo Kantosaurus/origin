@@ -94,12 +94,19 @@ impl Transport for HttpTransport {
             .send()
             .await
             .map_err(|e| TransportError::Other(e.to_string()))?;
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| TransportError::Other(e.to_string()))?;
-        let v: Value = serde_json::from_slice(&bytes)?;
+        // 1. Pre-check Content-Length if the server advertised one.
+        if let Some(len) = resp.content_length() {
+            crate::limits::enforce_cap(usize::try_from(len).unwrap_or(usize::MAX))?;
+        }
+        // 2. Streaming guard: chunk-counted body reader.
+        let mut body: Vec<u8> = Vec::with_capacity(4096);
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| TransportError::Other(e.to_string()))?;
+            body.extend_from_slice(&chunk);
+            crate::limits::enforce_cap(body.len())?;
+        }
+        let v: Value = serde_json::from_slice(&body)?;
         Ok(v)
     }
 }
-

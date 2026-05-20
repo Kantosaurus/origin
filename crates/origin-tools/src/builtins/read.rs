@@ -24,4 +24,5 @@ crate::origin_tool! {
         },
         "required": ["path"]
     }"#,
+    sandbox: ::origin_sandbox::SandboxProfile::ReadFs,
 }

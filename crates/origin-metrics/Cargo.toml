@@ -1,0 +1,27 @@
+[package]
+name = "origin-metrics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+otel = ["dep:opentelemetry", "dep:opentelemetry-otlp"]
+
+[dependencies]
+prometheus = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+
+[dev-dependencies]
+
+[[bench]]
+name = "encode"
+harness = false
