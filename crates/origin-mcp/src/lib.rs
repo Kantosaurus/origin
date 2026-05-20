@@ -7,6 +7,7 @@ pub mod jsonrpc;
 pub mod limits;
 pub mod oauth;
 pub mod proxy;
+pub mod schema;
 pub mod transport;
 pub mod transport_http;
 pub mod transport_stdio;
@@ -16,6 +17,7 @@ pub use client::{ClientError, ListToolsResult, McpClient, McpTool, ToolCallResul
 pub use jsonrpc::{JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse};
 pub use oauth::{attach_bearer, OAuthBridgeError};
 pub use proxy::McpToolProxy;
+pub use schema::{SchemaCache, ValidationError};
 pub use transport::{Transport, TransportError};
 pub use transport_http::HttpTransport;
 pub use transport_stdio::StdioTransport;
