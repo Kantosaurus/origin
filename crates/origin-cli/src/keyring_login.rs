@@ -16,6 +16,11 @@ use std::io::{self, BufRead as _, Write as _};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Entry point called from `main.rs` when `keyring login` is dispatched.
+///
+/// # Errors
+/// Returns an error if the provider is not in the catalog, is not an OAuth
+/// provider, the keyvault cannot be detected, the OAuth flow fails, or
+/// token persistence fails.
 pub async fn run(provider_id: &str, account: &str) -> Result<()> {
     let cat = Catalog::builtin();
     let entry = cat
@@ -69,7 +74,7 @@ async fn run_device_flow(
     let client = reqwest::Client::new();
 
     // POST to device/code endpoint
-    let scopes: Vec<&str> = spec.scopes.iter().map(|s| s.as_ref()).collect();
+    let scopes: Vec<&str> = spec.scopes.iter().map(AsRef::as_ref).collect();
     let scope_str = scopes.join(" ");
 
     let resp = client
@@ -132,7 +137,15 @@ async fn run_device_flow(
         if let Some(access) = tok.access_token {
             let expires_in = tok.expires_in.unwrap_or(3600);
             let expires_at = now_epoch_secs().saturating_add(expires_in);
-            persist_tokens(vault, provider_id, account, &access, tok.refresh_token.as_deref(), expires_at).await?;
+            persist_tokens(
+                vault,
+                provider_id,
+                account,
+                &access,
+                tok.refresh_token.as_deref(),
+                expires_at,
+            )
+            .await?;
             println!("Stored OAuth tokens for {provider_id}:{account}");
             return Ok(());
         }
@@ -154,12 +167,16 @@ async fn run_auth_code_flow(
     // Generate a random state parameter (16 random bytes, hex-encoded).
     let state: String = {
         use rand::RngCore as _;
+        use std::fmt::Write as _;
         let mut buf = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut buf);
-        buf.iter().map(|b| format!("{b:02x}")).collect()
+        buf.iter().fold(String::with_capacity(32), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
     };
 
-    let scopes: Vec<&str> = spec.scopes.iter().map(|s| s.as_ref()).collect();
+    let scopes: Vec<&str> = spec.scopes.iter().map(AsRef::as_ref).collect();
     let scope_str = scopes.join(" ");
 
     let authorize_url = format!(
@@ -263,7 +280,7 @@ async fn receive_code_via_listener(port: u16) -> Result<String> {
         .nth(1)
         .ok_or_else(|| anyhow!("malformed HTTP request line"))?;
 
-    let query = path.splitn(2, '?').nth(1).unwrap_or("");
+    let query = path.split_once('?').map_or("", |x| x.1);
     for pair in query.split('&') {
         if let Some(value) = pair.strip_prefix("code=") {
             return Ok(urlencoding::decode(value)
@@ -283,11 +300,7 @@ async fn exchange_and_persist(
     pkce: &Pkce,
     code: &str,
 ) -> Result<()> {
-    let oauth = OAuthClient::new(
-        provider_id,
-        spec.token_url.as_ref(),
-        spec.client_id.as_ref(),
-    );
+    let oauth = OAuthClient::new(provider_id, spec.token_url.as_ref(), spec.client_id.as_ref());
     let req = AuthCodeRequest::new(code, pkce.verifier(), spec.redirect_uri.as_ref());
     oauth
         .exchange(vault, account, req)
@@ -317,18 +330,17 @@ async fn persist_tokens(
     refresh: Option<&str>,
     expires_at: u64,
 ) -> Result<()> {
-    let blob = if let Some(r) = refresh {
-        serde_json::json!({
+    let blob = refresh.map_or_else(
+        || serde_json::json!({
+            "access": access,
+            "expires_at": expires_at,
+        }),
+        |r| serde_json::json!({
             "access": access,
             "refresh": r,
             "expires_at": expires_at,
-        })
-    } else {
-        serde_json::json!({
-            "access": access,
-            "expires_at": expires_at,
-        })
-    };
+        }),
+    );
     let json = serde_json::to_string(&blob).map_err(|e| anyhow!("serialize tokens: {e}"))?;
     vault
         .set(provider, &format!("{account}/oauth"), Secret::new(json))
