@@ -7,9 +7,11 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod layer;
+pub mod query;
 pub mod ring;
 pub mod schema;
 
 pub use layer::{init, Layer, LayerGuard};
+pub use query::{QueryArgs, QueryError, QueryRow};
 pub use ring::{Ring, RingError};
 pub use schema::{span_schema, SpanRow};
