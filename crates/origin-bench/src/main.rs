@@ -38,7 +38,18 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::List => println!("(task list will be populated in P14.C.3)"),
-        Cmd::RunOrigin { tasks: _ } => println!("(origin runner lands in P14.C.4)"),
+        Cmd::RunOrigin { tasks } => {
+            let task_list = origin_bench::task_set::load(&tasks)?;
+            let bin = std::env::var("ORIGIN_BIN").map_or_else(
+                |_| std::path::PathBuf::from("target/debug/origin"),
+                std::path::PathBuf::from,
+            );
+            let mut out = Vec::new();
+            for t in &task_list {
+                out.push(origin_bench::runner_origin::run_one(&bin, t)?);
+            }
+            println!("{}", origin_bench::report::render_json(&out));
+        }
         Cmd::RunSubprocess {
             name,
             bin: _,
