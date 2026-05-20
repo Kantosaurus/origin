@@ -1,0 +1,7 @@
+//! Migrate sessions/skills/memories from other harnesses into `origin`.
+//! See spec §11 Phase 14 — "Migration tools".
+
+#![forbid(unsafe_code)]
+
+pub mod sink;
+pub mod source;
