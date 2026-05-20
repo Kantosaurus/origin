@@ -15,8 +15,18 @@ impl BulkGate {
     }
 
     pub async fn wait_until_idle(&self) {
-        while critical_in_flight() > 0 {
-            self.0.notified().await;
+        // Construct the `Notified` future BEFORE the in-flight check so we are
+        // already registered as a waiter when the producer side calls
+        // `notify_waiters()`. Otherwise a notification fired between the check
+        // and `.await` would be lost (Notify only buffers a single permit, and
+        // `notify_waiters` does not buffer at all).
+        loop {
+            let notified = self.0.notified();
+            tokio::pin!(notified);
+            if critical_in_flight() == 0 {
+                return;
+            }
+            notified.as_mut().await;
         }
     }
 
