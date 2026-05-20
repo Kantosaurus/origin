@@ -122,7 +122,7 @@ impl MemoryHandle for MemoryDispatchHandle {
                 .filter(|r| r.body_preview.to_lowercase().contains(&q_lower))
                 .map(|r| {
                     #[allow(clippy::cast_precision_loss)]
-                    let age_days = ((now_ms - r.created_at_ms).max(0) as f32) / 86_400_000.0;
+                    let age_days = ((now_ms - r.created_at_ms).max(0) as f32) / origin_mem::MS_PER_DAY;
                     SearchHit {
                         id: r.id.to_string(),
                         preview: r.body_preview,
@@ -169,7 +169,7 @@ impl MemoryHandle for MemoryDispatchHandle {
                 .search(&q_arr, &opts, |id| {
                     let r = by_u64.get(&id)?;
                     #[allow(clippy::cast_precision_loss)]
-                    let age_days = ((now_ms - r.created_at_ms).max(0) as f32) / 86_400_000.0;
+                    let age_days = ((now_ms - r.created_at_ms).max(0) as f32) / origin_mem::MS_PER_DAY;
                     Some(origin_mem::MetaRow {
                         age_days,
                         cluster_priority: r.cluster_priority,

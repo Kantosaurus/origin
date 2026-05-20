@@ -99,6 +99,7 @@ async fn memory_proposed_round_trip_via_stub_provider() {
             injector: None,
             sidecar: None,
             session_store: None,
+            proposal_registry: None,
         };
         let summary = run_loop(&mut session, &prompt.user_text, &provider, &AlwaysAllow, &opts)
             .await

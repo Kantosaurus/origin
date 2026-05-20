@@ -1,5 +1,6 @@
 use std::env;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,14 +9,17 @@ use origin_cas::Store;
 use origin_core::types::Role;
 use origin_daemon::agent::{run_loop, LoopOptions, SessionStoreSummaryDeliverer};
 use origin_daemon::auth::BearerStore;
+use origin_daemon::config::bearer_ttl_secs;
 use origin_daemon::memory_wiring::MemoryWiring;
 use origin_daemon::pairing::{Pairing, RedeemResult};
+use origin_daemon::plan_bus::PlanBus;
+use origin_daemon::proposal_registry::ProposalRegistry;
 use origin_daemon::protocol::{ClientMessage, MemoryAction, PromptReply, PromptRequest, StreamEvent};
 use origin_daemon::provider_factory::{ProviderFactory, ProviderId};
 use origin_daemon::runtime_launch::{self, ShutdownSignal};
 use origin_daemon::session::Session;
 use origin_daemon::session_store::SessionStore;
-use origin_daemon::shutdown::CooperativeShutdown;
+use origin_daemon::shutdown::{CooperativeShutdown, ShutdownPhase};
 use origin_daemon::stream_relay::relay_to_connection;
 use origin_ipc::frame::FrameKind;
 use origin_ipc::transport::{Listener, SharedConnection};
@@ -23,6 +27,7 @@ use origin_keyvault::{KeyVault, Secret};
 use origin_mem::{Embedder, MemIndex};
 use origin_metrics::Metrics;
 use origin_permission::prompt::AlwaysAllow;
+use origin_provider::catalog::Catalog;
 use origin_provider::Provider;
 use origin_provider_anthropic::Anthropic;
 use origin_runtime::{spawn_in, TaskClass};
@@ -35,6 +40,23 @@ use tracing::{error, info, warn};
 
 /// Convenience alias for the runtime-swappable active provider handle.
 type ActiveProvider = Arc<RwLock<Arc<dyn Provider>>>;
+
+/// Snapshot of subsystem handles the cooperative shutdown driver binds to.
+///
+/// `main` constructs one [`Arc<Mutex<DaemonState>>`] up front and hands it to
+/// both `daemon_setup` (which populates the fields as each subsystem comes
+/// up) and the control-core signal-handler task (which reads them when a
+/// shutdown signal fires). Fields are `Option` because the daemon may be
+/// shutting down mid-boot, before every subsystem is wired.
+#[derive(Default)]
+struct DaemonState {
+    sidecar: Option<Arc<Sidecar>>,
+    cas: Option<Arc<Store>>,
+    session_store: Option<Arc<SessionStore>>,
+    /// Set to `true` by the `StopAcceptingIpc` phase. The accept loop polls
+    /// this between accepts so new connections stop being served.
+    accept_disabled: Option<Arc<AtomicBool>>,
+}
 
 /// Hand-rolled entrypoint — replaces `#[tokio::main]` with the P12.8
 /// two-runtime split. The control core runs on a dedicated `origin-ctrl`
@@ -55,6 +77,7 @@ fn main() -> Result<()> {
         origin_trace::init(&trace_dir).map_err(|e| anyhow::anyhow!("origin-trace init: {e}"))?;
 
     let signal = ShutdownSignal::new();
+    let state: Arc<std::sync::Mutex<DaemonState>> = Arc::new(std::sync::Mutex::new(DaemonState::default()));
 
     // Spawn the two-runtime launcher on its own OS thread. It blocks until
     // `signal.trigger()` is called, then tears down both runtimes.
@@ -72,12 +95,13 @@ fn main() -> Result<()> {
     // handle's `block_on` from a blocking task so the daemon's main accept
     // loop runs on the worker runtime, not the control core.
     let signal_for_setup = signal.clone();
+    let state_for_setup = Arc::clone(&state);
     worker_handle.spawn_blocking(move || {
         let h = signal_for_setup
             .worker_handle()
             .raw()
             .expect("worker handle populated");
-        if let Err(e) = h.block_on(daemon_setup()) {
+        if let Err(e) = h.block_on(daemon_setup(state_for_setup)) {
             error!(error = %e, "daemon_setup terminated with error");
             signal_for_setup.trigger();
         }
@@ -108,12 +132,13 @@ fn main() -> Result<()> {
     .map_err(|e| anyhow::anyhow!("ctrlc set_handler: {e}"))?;
 
     let signal_for_shutdown = signal.clone();
+    let state_for_shutdown = Arc::clone(&state);
     signal.control_handle().spawn_on_control(async move {
         if sig_rx.recv().await.is_none() {
             // Channel closed without a signal — nothing to do.
             return;
         }
-        let mut driver = CooperativeShutdown::for_production();
+        let mut driver = build_shutdown_driver(&state_for_shutdown);
         match driver.run().await {
             Ok(report) => info!(?report, "cooperative shutdown complete"),
             Err(e) => warn!(error = %e, "cooperative shutdown driver returned error"),
@@ -151,8 +176,77 @@ fn wait_for_worker_handle(signal: &ShutdownSignal) -> Result<tokio::runtime::Han
 // P12 + P13 merge — both phases added new IPC verbs (`PairStart`/`PairRedeem`
 // from P13; `ResumeRequest` from P12) and supporting wiring to this single
 // entrypoint. Breaking it apart is P14 polish (see plan).
-#[allow(clippy::cognitive_complexity)]
-async fn daemon_setup() -> Result<()> {
+/// Assemble a [`CooperativeShutdown`] driver whose per-phase callbacks
+/// run against whichever subsystems `daemon_setup` has populated in
+/// `state`. Subsystems wired here today:
+///
+/// - **`StopAcceptingIpc`** flips an `AtomicBool` polled by the accept loop.
+/// - **`PersistSidecarQueue`** drains in-flight `SidecarJob`s by dropping the
+///   queue's sender and awaiting workers (`Sidecar::shutdown`).
+/// - **`FlushCasWriteBuffer`** writes pending warm-pack bytes to disk.
+/// - **`CheckpointSqlite`** runs `PRAGMA wal_checkpoint(TRUNCATE)`.
+///
+/// Phases without an installed subsystem fall back to the
+/// `yield_now`-only no-op the driver uses for tests.
+fn build_shutdown_driver(state: &Arc<std::sync::Mutex<DaemonState>>) -> CooperativeShutdown {
+    let snapshot = {
+        let g = state.lock().expect("daemon state mutex");
+        DaemonStateSnapshot {
+            sidecar: g.sidecar.clone(),
+            cas: g.cas.clone(),
+            session_store: g.session_store.clone(),
+            accept_disabled: g.accept_disabled.clone(),
+        }
+    };
+    let mut driver = CooperativeShutdown::for_production();
+    if let Some(flag) = snapshot.accept_disabled.clone() {
+        driver = driver.on(ShutdownPhase::StopAcceptingIpc, move || async move {
+            flag.store(true, Ordering::Release);
+            info!("shutdown: stopped accepting new IPC connections");
+        });
+    }
+    if let Some(sidecar) = snapshot.sidecar.clone() {
+        driver = driver.on(ShutdownPhase::PersistSidecarQueue, move || async move {
+            sidecar.shutdown().await;
+            info!("shutdown: sidecar queue drained");
+        });
+    }
+    if let Some(cas) = snapshot.cas.clone() {
+        driver = driver.on(ShutdownPhase::FlushCasWriteBuffer, move || async move {
+            if let Err(e) = cas.flush_warm_pending() {
+                warn!(error = %e, "shutdown: cas flush_warm_pending failed");
+            } else {
+                info!("shutdown: cas warm-pending bytes flushed");
+            }
+        });
+    }
+    if let Some(store) = snapshot.session_store {
+        driver = driver.on(ShutdownPhase::CheckpointSqlite, move || async move {
+            if let Err(e) = store.checkpoint() {
+                warn!(error = %e, "shutdown: sqlite checkpoint failed");
+            } else {
+                info!("shutdown: sqlite WAL checkpointed");
+            }
+        });
+    }
+    driver
+}
+
+/// Plain (non-Mutex) snapshot of [`DaemonState`] used inside the closures
+/// captured by [`build_shutdown_driver`]. Keeping a value-typed clone here
+/// lets the move closures own only the handles they need.
+struct DaemonStateSnapshot {
+    sidecar: Option<Arc<Sidecar>>,
+    cas: Option<Arc<Store>>,
+    session_store: Option<Arc<SessionStore>>,
+    accept_disabled: Option<Arc<AtomicBool>>,
+}
+
+// `daemon_setup` deliberately wires every subsystem in one place — splitting
+// it out is a P14 polish item already noted above. Allow the line count
+// linter to ignore this wiring function.
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     let cas_root = env::var("ORIGIN_CAS_ROOT").unwrap_or_else(|_| default_cas_root());
     let cas = Arc::new(
         origin_cas::Store::open(origin_cas::StoreConfig {
@@ -172,6 +266,13 @@ async fn daemon_setup() -> Result<()> {
     // pair_start / pair_redeem calls share one state machine.
     let pairing = Arc::new(Pairing::new());
     let bearer_store = Arc::new(BearerStore::new());
+    // Daemon-wide pending-proposal registry — lets `MemoryDecision::Accept`
+    // resolve a proposal recorded by an earlier prompt-turn handler.
+    let proposal_registry = Arc::new(ProposalRegistry::new());
+    // Daemon-wide plan-op broadcast bus. IPC clients subscribe via
+    // `ClientMessage::SubscribePlan`; swarm coordinators publish via
+    // `bus.publish(envelope)` when their PlanHandle::apply succeeds.
+    let plan_bus = PlanBus::new();
 
     // Back-compat: legacy installs only set `ANTHROPIC_API_KEY`. Mirror it
     // into the vault at ("anthropic", "default") so `ProviderFactory::build`
@@ -182,15 +283,27 @@ async fn daemon_setup() -> Result<()> {
         }
     }
 
-    let factory = ProviderFactory::new(vault.clone()).with_cas(Arc::clone(&cas));
+    let mut catalog = Catalog::builtin();
+    let cfg_path = dirs::home_dir().map(|h| h.join(".origin").join("providers.toml"));
+    if let Some(p) = cfg_path {
+        match origin_provider::custom::load(&p) {
+            Ok(custom) => {
+                if let Err(e) = catalog.merge_custom(custom) {
+                    tracing::warn!(target: "origin::provider", error = %e, "custom providers merge failed");
+                }
+            }
+            Err(e) => tracing::warn!(target: "origin::provider", error = %e, "failed to load providers.toml"),
+        }
+    }
+    let factory = ProviderFactory::new(vault.clone(), catalog).with_cas(Arc::clone(&cas));
 
     let initial_provider_str = env::var("ORIGIN_PROVIDER").unwrap_or_else(|_| "anthropic".into());
-    let initial_provider_id = ProviderId::parse(&initial_provider_str)
+    let initial_provider_id = ProviderId::parse(&initial_provider_str, factory.catalog())
         .ok_or_else(|| anyhow::anyhow!("ORIGIN_PROVIDER `{initial_provider_str}` is not a known provider"))?;
     let initial_account = env::var("ORIGIN_ACCOUNT").unwrap_or_else(|_| "default".into());
 
     let initial_provider: Arc<dyn Provider> = factory
-        .build(initial_provider_id, &initial_account)
+        .build(&initial_provider_id, &initial_account)
         .await
         .map_err(|e| anyhow::anyhow!("initial provider build: {e}"))?;
     info!(
@@ -241,7 +354,23 @@ async fn daemon_setup() -> Result<()> {
     let listener = Listener::bind(&path).await?;
     info!(path = %path, "origin-daemon listening");
 
+    // Populate the shared `DaemonState` so the cooperative shutdown driver
+    // can bind real per-phase callbacks. We do this AFTER each subsystem is
+    // up so an early shutdown signal doesn't grab half-initialized handles.
+    let accept_disabled = Arc::new(AtomicBool::new(false));
+    {
+        let mut g = state.lock().expect("daemon state mutex");
+        g.sidecar = Some(Arc::clone(&sidecar));
+        g.cas = Some(Arc::clone(&cas));
+        g.session_store = Some(Arc::clone(&session_store));
+        g.accept_disabled = Some(Arc::clone(&accept_disabled));
+    }
+
     loop {
+        if accept_disabled.load(Ordering::Acquire) {
+            info!("origin-daemon: accept loop stopping after StopAcceptingIpc");
+            break Ok(());
+        }
         let conn = listener.accept().await?;
         let shared_conn: SharedConnection = Arc::new(Mutex::new(conn));
 
@@ -257,6 +386,8 @@ async fn daemon_setup() -> Result<()> {
             Arc::clone(&bearer_store),
             vault.clone(),
             Arc::clone(&metrics),
+            Arc::clone(&proposal_registry),
+            plan_bus.clone(),
         );
     }
 }
@@ -348,6 +479,8 @@ fn spawn_handler_task(
     bearer_store: Arc<BearerStore>,
     vault: KeyVault,
     metrics: Arc<Metrics>,
+    proposal_registry: Arc<ProposalRegistry>,
+    plan_bus: PlanBus,
 ) {
     spawn_in(TaskClass::Critical, async move {
         loop {
@@ -396,6 +529,7 @@ fn spawn_handler_task(
                         Arc::clone(&cas),
                         Arc::clone(&sidecar),
                         memory.as_ref(),
+                        Arc::clone(&proposal_registry),
                         req,
                     )
                     .await
@@ -409,7 +543,14 @@ fn spawn_handler_task(
                     }
                 }
                 ClientMessage::MemoryDecision { proposal_id, action } => {
-                    handle_memory_decision(&conn, memory.as_ref(), proposal_id, &action).await;
+                    handle_memory_decision(
+                        &conn,
+                        memory.as_ref(),
+                        proposal_registry.as_ref(),
+                        proposal_id,
+                        &action,
+                    )
+                    .await;
                 }
                 ClientMessage::PairStart { ttl_secs } => {
                     let session = pairing.start(Duration::from_secs(u64::from(ttl_secs)));
@@ -439,7 +580,7 @@ fn spawn_handler_task(
                             StreamEvent::PairIssued {
                                 bearer,
                                 device_id,
-                                ttl_secs: 86_400,
+                                ttl_secs: bearer_ttl_secs(),
                             }
                         }
                         Err(e) => StreamEvent::PairError {
@@ -452,6 +593,9 @@ fn spawn_handler_task(
                 }
                 ClientMessage::ResumeRequest { token } => {
                     handle_resume_request(&conn, Arc::clone(&session_store), token).await;
+                }
+                ClientMessage::SubscribePlan => {
+                    spawn_plan_relay(plan_bus.subscribe(), Arc::clone(&conn));
                 }
                 admin @ (ClientMessage::ListSessions
                 | ClientMessage::RemoveSession { .. }
@@ -471,23 +615,42 @@ fn spawn_handler_task(
 
 /// Handle a [`ClientMessage::ResumeRequest`] from the supervisor.
 ///
-/// P12 ships the wire shape + an immediate ack: we log the request, persist
-/// the token so the daemon can later inspect it, and respond with a
-/// [`ServerMessage::ResumeAck`] inside a `Response` frame. Full hydrate-from-
-/// CAS plumbing (re-loading the message log up to `token.last_turn` and
-/// re-spawning `pending_tool_calls` under `TaskClass::Critical`) is a P14
-/// polish item per the plan's Step 5 note.
+/// We persist the supervisor's resume token, then load the persisted message
+/// log up to `token.last_turn` so the next `Prompt` against this session
+/// reads a hydrated transcript. The acknowledgement carries the actual
+/// `restored_to_turn` the daemon hydrated (capped by what's on disk), not
+/// just the token's claim. Pending-tool-call re-spawn under
+/// `TaskClass::Critical` still requires the in-flight per-tool state the
+/// supervisor doesn't checkpoint today — that lands when the supervisor
+/// extends `ResumeToken::pending_tool_calls`.
 async fn handle_resume_request(
     conn: &SharedConnection,
     session_store: Arc<SessionStore>,
     token: origin_resume_token::ResumeToken,
 ) {
     let session_id = token.session_id.clone();
-    let restored_to_turn = token.last_turn;
     if let Err(e) = session_store.save_resume_token(&token) {
         warn!(error = %e, session = %session_id, "resume: could not persist token");
     }
-    info!(session = %session_id, last_turn = restored_to_turn, "resume: ack");
+    let messages = match session_store.load_messages(&session_id) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(error = %e, session = %session_id, "resume: load_messages failed");
+            Vec::new()
+        }
+    };
+    // Cap the reported turn by what is actually on disk so the supervisor
+    // does not believe we hydrated beyond the persisted log.
+    #[allow(clippy::cast_possible_truncation)]
+    let on_disk_high_watermark = u32::try_from(messages.len()).unwrap_or(u32::MAX);
+    let restored_to_turn = token.last_turn.min(on_disk_high_watermark.saturating_sub(1));
+    info!(
+        session = %session_id,
+        last_turn = token.last_turn,
+        messages = messages.len(),
+        restored_to_turn,
+        "resume: ack"
+    );
     let ack = origin_daemon::protocol::ServerMessage::ResumeAck {
         session_id,
         restored_to_turn,
@@ -518,6 +681,7 @@ fn from_legacy_prompt_request(body: &[u8]) -> Result<ClientMessage, serde_json::
 async fn handle_memory_decision(
     conn: &origin_ipc::transport::SharedConnection,
     memory: Option<&MemoryWiring>,
+    proposal_registry: &ProposalRegistry,
     proposal_id: u32,
     action: &MemoryAction,
 ) {
@@ -527,27 +691,29 @@ async fn handle_memory_decision(
         MemoryAction::Edit { .. } => "edit",
     };
 
-    // Persist on Accept/Edit if we have wiring AND the body is supplied. The
-    // body isn't in the Accept variant (it lives in session.pending_proposals
-    // keyed by proposal_id) — for the wiremock-driven E2E test we trigger the
-    // save via the Edit variant which carries the body inline.
+    // Resolve the `(body, tags)` to persist. `Edit` carries them inline;
+    // `Accept` looks them up in the daemon-wide `ProposalRegistry`; `Reject`
+    // drops the registry entry without persisting.
     let mut persisted_id: Option<String> = None;
-    if let Some(m) = memory {
-        match action {
-            MemoryAction::Edit { body, tags } => {
-                let handle = m.handle();
-                match origin_tools::dispatch::MemoryHandle::save(handle.as_ref(), body, tags) {
-                    Ok(id) => persisted_id = Some(id),
-                    Err(e) => warn!(error = %e, "memory decision save failed"),
-                }
-            }
-            MemoryAction::Accept | MemoryAction::Reject => {
-                // Accept-without-body needs the session-keyed pending proposal,
-                // which the per-connection scope doesn't currently hold; the
-                // P6.7 round-trip test covers the wire shape, and the P6.9
-                // E2E uses Edit { body, tags } to drive deterministic saves.
-            }
+    let to_persist: Option<(String, Vec<String>)> = match action {
+        MemoryAction::Edit { body, tags } => Some((body.clone(), tags.clone())),
+        MemoryAction::Accept => proposal_registry.take(proposal_id).map(|p| (p.body, p.tags)),
+        MemoryAction::Reject => {
+            proposal_registry.drop(proposal_id);
+            None
         }
+    };
+    if let (Some((body, tags)), Some(m)) = (to_persist.as_ref(), memory) {
+        let handle = m.handle();
+        match origin_tools::dispatch::MemoryHandle::save(handle.as_ref(), body, tags) {
+            Ok(id) => persisted_id = Some(id),
+            Err(e) => warn!(error = %e, "memory decision save failed"),
+        }
+    }
+    // `Edit` overrides any registry entry — drop the stale one so it doesn't
+    // get re-accepted later. `Accept` already removed it via `take`.
+    if matches!(action, MemoryAction::Edit { .. }) {
+        proposal_registry.drop(proposal_id);
     }
 
     info!(proposal_id, action = %kind, persisted = persisted_id.is_some(),
@@ -575,6 +741,9 @@ async fn handle_memory_decision(
 /// and BEFORE writing the `Response`. Dropping `tx_sub` after `run_loop` closes
 /// the per-request `Subscriber` channel, which terminates the relay's outer
 /// loop deterministically.
+// `handle_request` threads each subsystem handle a `Prompt` may touch in one
+// signature. Bundling them into a struct is a P14 polish item.
+#[allow(clippy::too_many_arguments)]
 async fn handle_request(
     conn: &SharedConnection,
     provider: &dyn Provider,
@@ -582,6 +751,7 @@ async fn handle_request(
     cas: Arc<Store>,
     sidecar: Arc<Sidecar>,
     memory: Option<&MemoryWiring>,
+    proposal_registry: Arc<ProposalRegistry>,
     req: PromptRequest,
 ) -> bool {
     let mut session = Session::new(provider.name(), &req.model);
@@ -636,6 +806,7 @@ async fn handle_request(
             proposer: memory.map(|m| Arc::clone(&m.proposer)),
             event_tx: Some(event_tx.clone()),
             injector: memory.and_then(|m| m.injector.clone()),
+            proposal_registry: Some(Arc::clone(&proposal_registry)),
         };
         run_loop(&mut session, &req.user_text, provider, &AlwaysAllow, &opts).await
     };
@@ -696,11 +867,11 @@ async fn handle_switch(
     provider_str: &str,
     account: &str,
 ) -> bool {
-    let Some(id) = ProviderId::parse(provider_str) else {
+    let Some(id) = ProviderId::parse(provider_str, factory.catalog()) else {
         return write_error(conn, &format!("unknown provider: {provider_str}")).await;
     };
 
-    let new_provider = match factory.build(id, account).await {
+    let new_provider = match factory.build(&id, account).await {
         Ok(p) => p,
         Err(e) => return write_error(conn, &format!("switch_account: {e}")).await,
     };
@@ -766,11 +937,7 @@ async fn handle_admin(
                 message: e.to_string(),
             },
         },
-        ClientMessage::ResumeSession { session_id: _ } => {
-            // Resume semantics deferred (P14); acknowledge so the
-            // clap-level routing on the client side completes.
-            StreamEvent::AdminOk
-        }
+        ClientMessage::ResumeSession { session_id } => resume_session_event(session_store, &session_id),
         ClientMessage::GetUsage => StreamEvent::UsageReport {
             rows: build_usage_rows(&metrics.snapshot()),
         },
@@ -803,7 +970,8 @@ async fn handle_admin(
         | ClientMessage::MemoryDecision { .. }
         | ClientMessage::PairStart { .. }
         | ClientMessage::PairRedeem { .. }
-        | ClientMessage::ResumeRequest { .. } => return true,
+        | ClientMessage::ResumeRequest { .. }
+        | ClientMessage::SubscribePlan => return true,
     };
     write_event(conn, &ev).await.is_ok()
 }
@@ -850,6 +1018,73 @@ fn build_usage_rows(snap: &origin_metrics::Snapshot) -> Vec<origin_daemon::proto
             },
         )
         .collect()
+}
+
+/// Forward every plan op the bus broadcasts to `conn` as a
+/// [`StreamEvent::PlanOp`] frame. The task exits when the bus channel is
+/// closed (all senders dropped — never under normal operation) or when the
+/// connection's write fails (peer disconnected). Lagged subscribers log a
+/// warning and resume on the next op; clients should re-snapshot.
+fn spawn_plan_relay(
+    mut rx: tokio::sync::broadcast::Receiver<origin_plan::OpEnvelope>,
+    conn: SharedConnection,
+) {
+    spawn_in(TaskClass::Realtime, async move {
+        loop {
+            match rx.recv().await {
+                Ok(envelope) => {
+                    let ev = StreamEvent::PlanOp { envelope };
+                    if write_event(&conn, &ev).await.is_err() {
+                        // Peer closed; the per-connection loop will exit too.
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(lagged = n, "plan relay: subscriber fell behind");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+/// Build the [`StreamEvent`] reply for a [`ClientMessage::ResumeSession`].
+///
+/// The handler is intentionally read-only: it counts persisted message rows,
+/// surfaces any supervisor-written [`ResumeToken`], and reports the high-water
+/// turn so the client can decide whether to continue the session. The actual
+/// in-memory `Session` re-spawn (re-running pending tool calls, attaching the
+/// active provider, …) still belongs in the `Prompt` handler — `ResumeSession`
+/// describes the persisted state without touching the live agent loop.
+fn resume_session_event(session_store: &SessionStore, session_id: &str) -> StreamEvent {
+    let messages = match session_store.load_messages(session_id) {
+        Ok(m) => m,
+        Err(e) => {
+            return StreamEvent::AdminError {
+                message: format!("load_messages({session_id}): {e}"),
+            };
+        }
+    };
+    if messages.is_empty() {
+        return StreamEvent::AdminError {
+            message: format!("unknown session: {session_id}"),
+        };
+    }
+    let token = session_store.load_resume_token(session_id).unwrap_or(None);
+    let had_resume_token = token.is_some();
+    // Saturate at u32::MAX — a session with >4 G messages is not feasible.
+    #[allow(clippy::cast_possible_truncation)]
+    let messages_loaded = u32::try_from(messages.len()).unwrap_or(u32::MAX);
+    let restored_to_turn = token
+        .as_ref()
+        .map_or_else(|| messages_loaded.saturating_sub(1), |t| t.last_turn);
+    StreamEvent::SessionResumed {
+        session_id: session_id.to_string(),
+        messages_loaded,
+        restored_to_turn,
+        had_resume_token,
+    }
 }
 
 /// Serialize `ev` and write it as a single `Event` frame. Mirrors the

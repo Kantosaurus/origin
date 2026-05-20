@@ -4,8 +4,11 @@
 pub mod agent;
 pub mod auth;
 pub mod compactor;
+pub mod config;
 pub mod memory_wiring;
 pub mod pairing;
+pub mod plan_bus;
+pub mod proposal_registry;
 pub mod protocol;
 pub mod provider_factory;
 pub mod runtime_launch;
