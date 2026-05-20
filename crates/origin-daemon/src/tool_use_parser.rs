@@ -43,6 +43,18 @@ enum State {
     Closed,
 }
 
+/// Sub-state of [`State::InNested`] tracking whether the cursor is currently
+/// inside a JSON string literal so that `{`/`}`/`[`/`]` bytes appearing inside
+/// strings are not miscounted toward bracket depth (N10.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NestedState {
+    /// Not inside a string literal — brace/bracket bytes affect depth.
+    Outside,
+    /// Inside a `"…"` string literal. `escape` is set after a `\` byte so the
+    /// following byte is consumed verbatim (and not interpreted as `"`).
+    InString { escape: bool },
+}
+
 /// Incremental SAX-style JSON parser for a single `tool_use` input object.
 ///
 /// Call [`begin_tool_use`](Self::begin_tool_use) when a `tool_use` block
@@ -59,6 +71,8 @@ pub struct ToolUseParser {
     val_buf: Vec<u8>,
     /// Bracket depth while inside a nested value. Reaches 0 → value done.
     nest_depth: u32,
+    /// String-tracking sub-state for [`State::InNested`] (N10.10).
+    nest_string: NestedState,
 }
 
 impl Default for ToolUseParser {
@@ -77,6 +91,7 @@ impl ToolUseParser {
             key_buf: Vec::new(),
             val_buf: Vec::new(),
             nest_depth: 0,
+            nest_string: NestedState::Outside,
         }
     }
 
@@ -88,6 +103,7 @@ impl ToolUseParser {
         self.key_buf.clear();
         self.val_buf.clear();
         self.nest_depth = 0;
+        self.nest_string = NestedState::Outside;
     }
 
     /// Feed the next fragment and collect any completed field events.
@@ -141,6 +157,7 @@ impl ToolUseParser {
                     b'{' | b'[' => {
                         self.val_buf.push(b);
                         self.nest_depth = 1;
+                        self.nest_string = NestedState::Outside;
                         self.state = State::InNested;
                     }
                     b't' | b'f' | b'n' => {
@@ -197,22 +214,34 @@ impl ToolUseParser {
                     self.emit_field(out);
                 }
             }
-            // FIXME(N10.10): `InNested` tracks `{`/`[`/`}`/`]` as raw bytes without
-            // distinguishing those that appear inside string literals. Adversarial or
-            // unusual provider output could skew `nest_depth` and emit too early/late.
-            // Fine for Read/Glob/Grep (no JSON-in-string values); revisit with the
-            // full fuzz corpus in Phase 14.
+            // `InNested` tracks `{`/`[`/`}`/`]` as bracket depth, but only when
+            // the cursor is *outside* a JSON string literal. Inside a string
+            // those bytes are payload and must not skew `nest_depth`. `\` toggles
+            // a single-byte escape so the following `"` is treated as data (N10.10).
             State::InNested => {
                 self.val_buf.push(b);
-                match b {
-                    b'{' | b'[' => self.nest_depth = self.nest_depth.saturating_add(1),
-                    b'}' | b']' => {
-                        self.nest_depth = self.nest_depth.saturating_sub(1);
-                        if self.nest_depth == 0 {
-                            self.emit_field(out);
+                match self.nest_string {
+                    NestedState::Outside => match b {
+                        b'"' => self.nest_string = NestedState::InString { escape: false },
+                        b'{' | b'[' => self.nest_depth = self.nest_depth.saturating_add(1),
+                        b'}' | b']' => {
+                            self.nest_depth = self.nest_depth.saturating_sub(1);
+                            if self.nest_depth == 0 {
+                                self.emit_field(out);
+                            }
                         }
+                        _ => {}
+                    },
+                    NestedState::InString { escape: true } => {
+                        // Previous byte was `\`; consume this one verbatim and
+                        // clear the escape flag regardless of what it is.
+                        self.nest_string = NestedState::InString { escape: false };
                     }
-                    _ => {}
+                    NestedState::InString { escape: false } => match b {
+                        b'\\' => self.nest_string = NestedState::InString { escape: true },
+                        b'"' => self.nest_string = NestedState::Outside,
+                        _ => {}
+                    },
                 }
             }
             State::AfterValue => match b {
@@ -239,5 +268,64 @@ impl ToolUseParser {
         let tool_name = self.tool_name.clone().unwrap_or_else(|| "<unknown>".into());
         out.push(ToolUseDelta::Closed { tool_name });
         self.state = State::Closed;
+    }
+}
+
+/// Aggregated outcome of a test-only parser run: the raw bytes fed to the
+/// parser (verbatim, useful for round-trip assertions) and whether the outer
+/// object's closing `}` was observed.
+#[derive(Debug, Clone, Default)]
+pub struct CompletedToolUse {
+    /// The exact byte stream fed into the parser, reassembled into a `String`.
+    pub input_json: String,
+    /// `true` once a [`ToolUseDelta::Closed`] event has been emitted, signalling
+    /// the outer `}` arrived and depth tracking balanced out.
+    pub complete: bool,
+}
+
+/// Test-only handle wrapping a [`ToolUseParser`] that captures fed bytes and
+/// surfaces completion as a single `CompletedToolUse` view.
+///
+/// Intended for unit tests that want to assert on the raw input round-trip
+/// and on whether the parser correctly tracked nested-brace depth (especially
+/// when those braces appear inside JSON string literals — N10.10).
+pub struct ParserHandle {
+    inner: ToolUseParser,
+    input: Vec<u8>,
+    complete: bool,
+}
+
+impl ParserHandle {
+    /// Feed a chunk of bytes into the underlying parser, recording them for
+    /// later inspection via [`Self::finish`].
+    pub fn feed(&mut self, chunk: &[u8]) {
+        self.input.extend_from_slice(chunk);
+        for delta in self.inner.feed(chunk) {
+            if matches!(delta, ToolUseDelta::Closed { .. }) {
+                self.complete = true;
+            }
+        }
+    }
+
+    /// Consume the handle and return the aggregated outcome.
+    #[must_use]
+    pub fn finish(self) -> CompletedToolUse {
+        CompletedToolUse {
+            input_json: String::from_utf8_lossy(&self.input).into_owned(),
+            complete: self.complete,
+        }
+    }
+}
+
+/// Build a fresh [`ParserHandle`] pre-armed with a `tool_use` start so tests
+/// can immediately call `.feed(...)`.
+#[must_use]
+pub fn feed_for_test() -> ParserHandle {
+    let mut inner = ToolUseParser::new();
+    inner.begin_tool_use("test");
+    ParserHandle {
+        inner,
+        input: Vec::new(),
+        complete: false,
     }
 }
