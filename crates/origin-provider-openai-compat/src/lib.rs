@@ -1,4 +1,4 @@
-//! Generic OpenAI Chat-Completions wire client.
+//! Generic `OpenAI` Chat-Completions wire client.
 //!
 //! Parameterised over base URL, chat path, auth header, and extra headers so
 //! it can serve every OpenAI-shape provider in the catalog from a single

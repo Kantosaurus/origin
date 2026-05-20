@@ -71,7 +71,7 @@ impl TokenSource for StaticHeader {
     }
 }
 
-/// "No auth" source for local providers (Ollama, vLLM, SGLang).
+/// "No auth" source for local providers (Ollama, vLLM, `SGLang`).
 #[derive(Debug, Clone)]
 pub struct NoAuth;
 
