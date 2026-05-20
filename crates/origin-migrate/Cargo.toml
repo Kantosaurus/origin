@@ -1,0 +1,26 @@
+[package]
+name = "origin-migrate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+origin-core   = { path = "../origin-core" }
+origin-store  = { path = "../origin-store" }
+origin-skills = { path = "../origin-skills" }
+origin-mem    = { path = "../origin-mem" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+walkdir.workspace = true
+globset.workspace = true
+rusqlite = { version = "0.31", features = ["bundled"] }
+blake3 = "1"
+
+[dev-dependencies]
+tempfile = "3"
