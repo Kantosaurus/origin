@@ -27,12 +27,29 @@ pub enum PanelEvent {
     },
     /// A permission decision has been made.
     PermissionDecided { id: u64, outcome: PermissionOutcome },
+    /// User pressed `?` — toggle the metrics view.
+    ShowMetrics,
+}
+
+/// Active sub-view of the side panel.
+///
+/// The permission queue (default) renders [`PanelEvent::PermissionAsk`]
+/// rows. The metrics view replaces the queue display until dismissed.
+#[allow(clippy::module_name_repetitions)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PanelState {
+    /// Permission ask queue (default).
+    #[default]
+    PermissionQueue,
+    /// `?metrics` panel.
+    Metrics,
 }
 
 /// Side panel event queue with keyboard-driven permission handling.
 #[derive(Debug, Default)]
 pub struct Panel {
     items: VecDeque<PanelEvent>,
+    state: PanelState,
 }
 
 impl Panel {
@@ -43,16 +60,41 @@ impl Panel {
     }
 
     /// Append an event to the queue.
+    ///
+    /// [`PanelEvent::ShowMetrics`] is a control event: instead of being
+    /// enqueued for rendering, it toggles the panel into [`PanelState::Metrics`]
+    /// mode without disturbing the pending permission asks.
     pub fn push(&mut self, ev: PanelEvent) {
+        if matches!(ev, PanelEvent::ShowMetrics) {
+            self.state = match self.state {
+                PanelState::PermissionQueue => PanelState::Metrics,
+                PanelState::Metrics => PanelState::PermissionQueue,
+            };
+            return;
+        }
         self.items.push_back(ev);
+    }
+
+    /// Current sub-view.
+    #[must_use]
+    pub const fn state(&self) -> PanelState {
+        self.state
     }
 
     /// If the front of the queue is a `PermissionAsk`, interpret key `k` as a
     /// permission decision and pop the event, returning the `PermissionOutcome`.
     ///
     /// `'y'`/`'Y'` → `Allow`, `'n'`/`'N'` → `Deny`, `'e'`/`'E'` → `Edit`.
+    /// `'?'` toggles the metrics panel and returns `None`.
     /// Any other key returns `None` without consuming the event.
     pub fn handle_key(&mut self, k: char) -> Option<PermissionOutcome> {
+        if k == '?' {
+            self.state = match self.state {
+                PanelState::PermissionQueue => PanelState::Metrics,
+                PanelState::Metrics => PanelState::PermissionQueue,
+            };
+            return None;
+        }
         let outcome = match k {
             'y' | 'Y' => PermissionOutcome::Allow,
             'n' | 'N' => PermissionOutcome::Deny,
@@ -95,6 +137,9 @@ impl Panel {
                     };
                     format!("Done: {id} {outcome_str}")
                 }
+                // `ShowMetrics` is a control event handled by `push`; it never
+                // sits in the queue. Skip if it somehow appears.
+                PanelEvent::ShowMetrics => continue,
             };
             for (col_idx, ch) in label.chars().enumerate() {
                 let col = u16::try_from(col_idx).unwrap_or(u16::MAX);

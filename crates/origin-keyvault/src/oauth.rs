@@ -134,7 +134,11 @@ struct StoredTokens {
 /// Raw `/token` response. Some providers omit `refresh_token` on refresh
 /// (no rotation); we fall back to the previously stored refresh token in
 /// that case.
-#[derive(Debug, Deserialize)]
+///
+/// No `Debug` derive: `access_token` / `refresh_token` are bearer
+/// credentials; the `xtask lint-secrets` (P11.14) gate enforces this rule
+/// for any `#[derive(Debug)]` struct with a secret-looking field.
+#[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
     #[serde(default)]

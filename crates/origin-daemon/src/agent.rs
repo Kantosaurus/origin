@@ -220,6 +220,11 @@ pub(crate) struct StreamingTurn {
 /// Returns `LoopError` for provider failures, permission denial, unknown tools,
 /// tool execution failures, malformed tool inputs, or hitting `max_turns`.
 #[allow(clippy::too_many_lines)] // turn loop + memoization path; extraction would require extra allocations
+#[tracing::instrument(
+    level = "info",
+    skip(session, user_text, provider, prompter, opts),
+    fields(kind = "turn", provider = provider.name())
+)]
 pub async fn run_loop(
     session: &mut Session,
     user_text: &str,
@@ -452,6 +457,11 @@ pub fn rebuild_codegraph(
     origin_codegraph::rebuild::rebuild_paths(idx, &req.paths, lang)
 }
 
+#[tracing::instrument(
+    level = "info",
+    skip(args, cas),
+    fields(kind = "tool", tool = meta.name)
+)]
 async fn dispatch_tool(meta: &ToolMeta, args: &Value, cas: Option<&Store>) -> Result<String, LoopError> {
     match meta.name {
         "Read" => {
@@ -573,6 +583,11 @@ fn parse_region(v: &Value) -> Result<origin_tools::builtins::recall::Region, Loo
 /// P3.4: also drives `ToolUseParser`s and spawns speculative tasks for pure
 /// tools when the first `Field` event fires. Returns the registry alongside
 /// the synthetic `ChatResponse` so `run_loop` can await precomputed handles.
+#[tracing::instrument(
+    level = "info",
+    skip(provider, req, opts),
+    fields(kind = "provider", provider = provider.name())
+)]
 async fn run_streaming_turn(
     provider: &dyn Provider,
     req: ChatRequest,

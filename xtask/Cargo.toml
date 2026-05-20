@@ -1,0 +1,17 @@
+[package]
+name = "xtask"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+syn = { version = "2", features = ["full", "visit"] }
+walkdir = "2"
+regex = "1"
+thiserror = "1"
+proc-macro2 = "1"
+quote = "1"

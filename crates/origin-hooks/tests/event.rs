@@ -1,19 +1,26 @@
 #![allow(clippy::panic)]
 
 use origin_hooks::{parse_hook_stdout, HookOverride, LifecycleEvent, ToolPhase};
+use origin_sandbox::SandboxProfile;
 
 #[test]
 fn lifecycle_event_round_trips_json() {
     let ev = LifecycleEvent::PreTool {
         tool: "Bash".into(),
         args_preview: "ls -la".into(),
+        sandbox_ordinal: SandboxProfile::Shell.ordinal(),
     };
     let json = serde_json::to_string(&ev).expect("ser");
     let back: LifecycleEvent = serde_json::from_str(&json).expect("de");
     match back {
-        LifecycleEvent::PreTool { tool, args_preview } => {
+        LifecycleEvent::PreTool {
+            tool,
+            args_preview,
+            sandbox_ordinal,
+        } => {
             assert_eq!(tool, "Bash");
             assert_eq!(args_preview, "ls -la");
+            assert_eq!(sandbox_ordinal, SandboxProfile::Shell.ordinal());
         }
         _ => panic!("wrong variant"),
     }
@@ -27,10 +34,12 @@ fn every_event_kind_serializes() {
         LifecycleEvent::PreTool {
             tool: "Read".into(),
             args_preview: "/x".into(),
+            sandbox_ordinal: SandboxProfile::ReadFs.ordinal(),
         },
         LifecycleEvent::PostTool {
             tool: "Read".into(),
             phase: ToolPhase::Ok,
+            sandbox_ordinal: SandboxProfile::ReadFs.ordinal(),
         },
         LifecycleEvent::PreCommit {
             branch: "phase-10".into(),

@@ -3,11 +3,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use clap::{Parser, Subcommand};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt as _;
 use origin_cli::input::{parse_mem_command, reduce, InputAction};
 use origin_cli::plan_panel_wiring::Wiring as PlanPanelWiring;
+use origin_cli::trace_cmd::TraceQuery;
 use origin_cli::tui::App;
 use origin_daemon::protocol::{ClientMessage, PromptRequest, StreamEvent};
 use origin_ipc::frame::{encode, FrameKind};
@@ -17,6 +19,29 @@ use origin_tui::scheduler::{Handle, Scheduler};
 use origin_tui::stream_widget::{Rect, StreamWidget};
 use parking_lot::Mutex;
 use serde::Deserialize;
+
+#[derive(Parser)]
+#[command(name = "origin", version, about = "origin agentic coding harness")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Query the trace ring (P11.11). Without any flags, prints the most
+    /// recent 100 spans across every kind.
+    Trace {
+        #[command(subcommand)]
+        sub: TraceSub,
+    },
+}
+
+#[derive(Subcommand)]
+enum TraceSub {
+    /// Print spans matching the given filters.
+    Query(TraceQuery),
+}
 
 #[derive(Deserialize)]
 struct PromptReply {
@@ -31,6 +56,16 @@ type SharedWidget = Arc<Mutex<StreamWidget>>;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    // Dispatch a subcommand if one was given, otherwise fall through to the
+    // TUI entry path (preserves the existing env-driven invocation).
+    let cli = Cli::parse();
+    if let Some(Cmd::Trace {
+        sub: TraceSub::Query(q),
+    }) = cli.cmd
+    {
+        return origin_cli::trace_cmd::invoke(q).map_err(|e| anyhow::anyhow!("{e}"));
+    }
+
     let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
     let model = env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".into());
 

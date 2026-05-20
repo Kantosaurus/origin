@@ -5,6 +5,7 @@
 
 use crate::cas_handoff::{cas_envelope, cas_handoff_if_large, HandoffOutcome};
 use crate::client::{ClientError, McpClient};
+use crate::schema::SchemaCache;
 use async_trait::async_trait;
 use origin_cas::Store as CasStore;
 use origin_tools::{DynTool, ToolMeta};
@@ -22,6 +23,11 @@ pub struct McpToolProxy {
     remote_name: String,
     cas: Option<Arc<CasStore>>,
     cas_threshold: usize,
+    /// Per-server schema cache (P11.8). When set, [`invoke`] validates
+    /// `args` against the registered schema for `remote_name` before
+    /// calling the MCP server. Defaults to `None` so existing call-sites
+    /// remain pass-through.
+    schemas: Option<Arc<SchemaCache>>,
 }
 
 impl std::fmt::Debug for McpToolProxy {
@@ -43,6 +49,7 @@ impl McpToolProxy {
             remote_name,
             cas: None,
             cas_threshold: 16 * 1024,
+            schemas: None,
         }
     }
 
@@ -51,6 +58,15 @@ impl McpToolProxy {
     pub fn with_cas(mut self, store: Arc<CasStore>, threshold: usize) -> Self {
         self.cas = Some(store);
         self.cas_threshold = threshold;
+        self
+    }
+
+    /// Attach a schema cache shared with the [`McpClient`]'s
+    /// `tools/list` refresh. When set, [`invoke`] validates args against
+    /// the registered schema before sending the JSON-RPC call.
+    #[must_use]
+    pub fn with_schemas(mut self, schemas: Arc<SchemaCache>) -> Self {
+        self.schemas = Some(schemas);
         self
     }
 }
@@ -62,6 +78,11 @@ impl DynTool for McpToolProxy {
     }
 
     async fn invoke(&self, args: Value) -> Result<Value, String> {
+        if let Some(cache) = &self.schemas {
+            if let Err(e) = cache.validate(&self.remote_name, &args) {
+                return Err(format!("mcp schema: {e}"));
+            }
+        }
         let result = match self.client.call_tool(&self.remote_name, args).await {
             Ok(r) => r,
             Err(ClientError::Rpc(e)) => return Err(format!("mcp rpc: {e}")),
