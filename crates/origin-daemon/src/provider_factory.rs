@@ -9,79 +9,36 @@
 //! Phase 8.9 wires this factory into the daemon so the CLI's `/account`
 //! command can hot-swap providers without restarting.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use origin_keyvault::{Error as VaultError, KeyVault};
 use origin_provider::Provider;
-use origin_provider_anthropic::Anthropic;
-#[cfg(feature = "bedrock")]
-use origin_provider_bedrock::Bedrock;
-#[cfg(feature = "gemini")]
-use origin_provider_gemini::Gemini;
-#[cfg(feature = "github-models")]
-use origin_provider_github::GitHubModels;
-#[cfg(feature = "ollama")]
-use origin_provider_ollama::Ollama;
-#[cfg(feature = "openai")]
-use origin_provider_openai::OpenAi;
-#[cfg(feature = "openrouter")]
-use origin_provider_openrouter::OpenRouter;
+use origin_provider::catalog::Catalog;
 use thiserror::Error;
 
-/// Identifier for every provider the daemon knows how to build.
-///
-/// Mirrors the on-wire `provider` string used by
-/// [`crate::protocol::ClientMessage::SwitchAccount`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderId {
-    Anthropic,
-    OpenAi,
-    Gemini,
-    Ollama,
-    #[cfg(feature = "openrouter")]
-    OpenRouter,
-    #[cfg(feature = "bedrock")]
-    Bedrock,
-    #[cfg(feature = "github-models")]
-    GitHubModels,
-}
+/// Stable id of a provider in the merged catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProviderId(pub Cow<'static, str>);
 
 impl ProviderId {
-    /// Parses a lowercase provider identifier (matches [`Self::as_str`]).
-    /// Accepts a handful of common aliases (`"openai"`, `"open-ai"`, …).
     #[must_use]
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "anthropic" => Some(Self::Anthropic),
-            "openai" | "open-ai" | "open_ai" => Some(Self::OpenAi),
-            "gemini" | "google" => Some(Self::Gemini),
-            "ollama" => Some(Self::Ollama),
-            #[cfg(feature = "openrouter")]
-            "openrouter" | "open-router" => Some(Self::OpenRouter),
-            #[cfg(feature = "bedrock")]
-            "bedrock" | "aws-bedrock" => Some(Self::Bedrock),
-            #[cfg(feature = "github-models")]
-            "github" | "github-models" => Some(Self::GitHubModels),
-            _ => None,
-        }
+    pub fn parse(s: &str, catalog: &Catalog) -> Option<Self> {
+        let normalised = s.to_ascii_lowercase();
+        // Common aliases: "open-ai" → "openai", "aws-bedrock" → "bedrock"
+        let canonical = match normalised.as_str() {
+            "open-ai" | "open_ai" => "openai",
+            "aws-bedrock" => "bedrock",
+            "gemini" => "google",
+            "github" | "github-models" => "github-copilot",
+            "open-router" => "openrouter",
+            other => other,
+        };
+        catalog.lookup(canonical).map(|e| Self(e.id.clone()))
     }
 
-    /// Stable lowercase string form. Round-trips through [`Self::parse`].
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Anthropic => "anthropic",
-            Self::OpenAi => "openai",
-            Self::Gemini => "gemini",
-            Self::Ollama => "ollama",
-            #[cfg(feature = "openrouter")]
-            Self::OpenRouter => "openrouter",
-            #[cfg(feature = "bedrock")]
-            Self::Bedrock => "bedrock",
-            #[cfg(feature = "github-models")]
-            Self::GitHubModels => "github-models",
-        }
-    }
+    pub fn as_str(&self) -> &str { &self.0 }
 }
 
 /// Errors surfaced by [`ProviderFactory::build`].
@@ -148,11 +105,13 @@ impl BedrockCreds {
     }
 }
 
-/// Builds providers on demand from a backing [`KeyVault`].
+use origin_provider_openai_compat::TokenSource;
+
 #[derive(Clone)]
 pub struct ProviderFactory {
     vault: KeyVault,
     cas: Option<Arc<origin_cas::Store>>,
+    catalog: Catalog,
 }
 
 impl core::fmt::Debug for ProviderFactory {
@@ -160,117 +119,178 @@ impl core::fmt::Debug for ProviderFactory {
         f.debug_struct("ProviderFactory")
             .field("vault", &self.vault)
             .field("cas", &self.cas.as_ref().map(|_| "<cas>"))
+            .field("catalog_entries", &self.catalog.entries().len())
             .finish()
     }
 }
 
 impl ProviderFactory {
-    /// Wraps an existing vault. The factory clones the handle (cheap —
-    /// `KeyVault` is itself `Arc`-backed) for every `build` call so the
-    /// caller can keep the original vault for direct lookups.
     #[must_use]
-    pub const fn new(vault: KeyVault) -> Self {
-        Self { vault, cas: None }
+    pub fn new(vault: KeyVault, catalog: Catalog) -> Self {
+        Self { vault, cas: None, catalog }
     }
 
-    /// Attaches a CAS handle so providers that re-inflate `ToolResult`
-    /// blocks from CAS bytes (currently only Anthropic) pick it up. The
-    /// factory ignores the CAS for every other provider so this is safe
-    /// to call unconditionally from the daemon bootstrap.
     #[must_use]
     pub fn with_cas(mut self, cas: Arc<origin_cas::Store>) -> Self {
         self.cas = Some(cas);
         self
     }
 
-    /// Construct the provider matching `id` using the credential stored
-    /// under (`id.as_str()`, `account`).
-    ///
-    /// # Errors
-    /// Returns [`FactoryError::MissingCredential`] when the vault has no
-    /// entry for the (provider, account) pair, [`FactoryError::Vault`] for
-    /// other backend failures, and [`FactoryError::CredentialParse`] when
-    /// a structured blob (Bedrock) cannot be decoded.
-    pub async fn build(&self, id: ProviderId, account: &str) -> Result<Arc<dyn Provider>, FactoryError> {
-        match id {
-            ProviderId::Anthropic => {
-                let secret = self
-                    .vault
-                    .get("anthropic", account)
-                    .await
-                    .map_err(|e| FactoryError::from_vault(e, "anthropic", account))?;
-                let mut provider = Anthropic::new(secret.expose().clone());
-                if let Some(cas) = self.cas.clone() {
-                    provider = provider.with_cas(cas);
+    #[must_use]
+    pub fn catalog(&self) -> &Catalog { &self.catalog }
+
+    pub async fn build(&self, id: &ProviderId, account: &str) -> Result<Arc<dyn Provider>, FactoryError> {
+        let entry = self.catalog.lookup(id.as_str())
+            .ok_or_else(|| FactoryError::UnknownProvider(id.as_str().to_string()))?
+            .clone();
+        let token = self.resolve_auth(&entry, account).await?;
+        self.build_for_wire(&entry, token, account).await
+    }
+
+    async fn resolve_auth(&self, entry: &origin_provider::catalog::ProviderEntry, account: &str) -> Result<Arc<dyn TokenSource>, FactoryError> {
+        use origin_provider::catalog::AuthScheme;
+        use origin_provider_openai_compat::{NoAuth, StaticBearer, StaticHeader};
+        match &entry.auth {
+            AuthScheme::None => Ok(NoAuth::new()),
+            AuthScheme::ApiKey { header, prefix } => {
+                let secret = self.vault.get(entry.id.as_ref(), account).await
+                    .map_err(|e| FactoryError::from_vault(e, entry.id.as_ref(), account))?;
+                if header.eq_ignore_ascii_case("Authorization") && prefix.as_ref() == "Bearer " {
+                    Ok(StaticBearer::new(secret.expose().clone()))
+                } else {
+                    Ok(StaticHeader::new(header.to_string(), prefix.to_string(), secret.expose().clone()))
                 }
-                Ok(Arc::new(provider))
             }
-            #[cfg(feature = "openai")]
-            ProviderId::OpenAi => {
-                let secret = self
-                    .vault
-                    .get("openai", account)
-                    .await
-                    .map_err(|e| FactoryError::from_vault(e, "openai", account))?;
-                Ok(Arc::new(OpenAi::new(secret.expose().clone())))
+            AuthScheme::OAuth(_) => {
+                use origin_keyvault::OAuthClient;
+                use std::time::Duration;
+                if let AuthScheme::OAuth(spec) = &entry.auth {
+                    let client = OAuthClient::new(entry.id.to_string(), spec.token_url.to_string(), spec.client_id.to_string());
+                    match client.refresh_if_due(&self.vault, account, Duration::from_secs(60)).await {
+                        Ok(origin_keyvault::RefreshOutcome::Rotated { access }) => {
+                            Ok(StaticBearer::new(access.expose().to_string()))
+                        }
+                        Ok(origin_keyvault::RefreshOutcome::NotDue { .. }) | Ok(_) => {
+                            let secret = self.vault.get(entry.id.as_ref(), &format!("{account}/oauth")).await
+                                .map_err(|e| FactoryError::from_vault(e, entry.id.as_ref(), account))?;
+                            let stored: serde_json::Value = serde_json::from_str(secret.expose())
+                                .map_err(|e| FactoryError::CredentialParse(e.to_string()))?;
+                            let access = stored.get("access").and_then(|v| v.as_str())
+                                .ok_or_else(|| FactoryError::CredentialParse("oauth blob missing 'access'".into()))?;
+                            Ok(StaticBearer::new(access.to_string()))
+                        }
+                        Err(e) => Err(FactoryError::Vault(e.to_string())),
+                    }
+                } else { unreachable!() }
             }
-            #[cfg(not(feature = "openai"))]
-            ProviderId::OpenAi => Err(FactoryError::UnknownProvider("openai".into())),
+            AuthScheme::SigV4 { .. } => {
+                // SigV4 is handled inside the Bedrock builder — return NoAuth as a placeholder.
+                Ok(origin_provider_openai_compat::NoAuth::new())
+            }
+            AuthScheme::Custom => Ok(origin_provider_openai_compat::NoAuth::new()),
+        }
+    }
+
+    async fn build_for_wire(
+        &self,
+        entry: &origin_provider::catalog::ProviderEntry,
+        token: Arc<dyn TokenSource>,
+        account: &str,
+    ) -> Result<Arc<dyn Provider>, FactoryError> {
+        use origin_provider::catalog::WireFormat;
+        use origin_provider_openai_compat::{OpenAiCompat, OpenAiCompatConfig};
+        // Leak the id to obtain a &'static str for Provider::name(). One leak per
+        // provider construction is acceptable for a daemon's lifetime; the
+        // alternative (changing the trait signature) is a much bigger refactor.
+        #[allow(clippy::box_collection)]
+        let name: &'static str = Box::leak(entry.id.to_string().into_boxed_str());
+        match entry.wire {
+            WireFormat::OpenAIChat => {
+                let cfg = OpenAiCompatConfig {
+                    name,
+                    base_url: render_base_url(entry.base_url.as_ref(), &self.vault, entry.id.as_ref(), account).await?,
+                    chat_path: entry.chat_path.to_string(),
+                    auth: token,
+                    extra_headers: openai_extra_headers(entry.id.as_ref()),
+                };
+                Ok(Arc::new(OpenAiCompat::new(cfg)))
+            }
+            WireFormat::Anthropic => {
+                let secret = self.vault.get(entry.id.as_ref(), account).await
+                    .map_err(|e| FactoryError::from_vault(e, entry.id.as_ref(), account))?;
+                let mut p = origin_provider_anthropic::Anthropic::new(secret.expose().clone());
+                if let Some(cas) = self.cas.clone() { p = p.with_cas(cas); }
+                Ok(Arc::new(p))
+            }
             #[cfg(feature = "gemini")]
-            ProviderId::Gemini => {
-                let secret = self
-                    .vault
-                    .get("gemini", account)
-                    .await
-                    .map_err(|e| FactoryError::from_vault(e, "gemini", account))?;
-                Ok(Arc::new(Gemini::new(secret.expose().clone())))
+            WireFormat::Gemini => {
+                let secret = self.vault.get(entry.id.as_ref(), account).await
+                    .map_err(|e| FactoryError::from_vault(e, entry.id.as_ref(), account))?;
+                Ok(Arc::new(origin_provider_gemini::Gemini::new(secret.expose().clone())))
             }
             #[cfg(not(feature = "gemini"))]
-            ProviderId::Gemini => Err(FactoryError::UnknownProvider("gemini".into())),
-            #[cfg(feature = "ollama")]
-            ProviderId::Ollama => {
-                // Ollama has no credential; the account selector is reserved
-                // for a future base-url override.
-                let _ = account;
-                Ok(Arc::new(Ollama::new()))
-            }
-            #[cfg(not(feature = "ollama"))]
-            ProviderId::Ollama => Err(FactoryError::UnknownProvider("ollama".into())),
-            #[cfg(feature = "openrouter")]
-            ProviderId::OpenRouter => {
-                let secret = self
-                    .vault
-                    .get("openrouter", account)
-                    .await
-                    .map_err(|e| FactoryError::from_vault(e, "openrouter", account))?;
-                Ok(Arc::new(OpenRouter::new(secret.expose().clone())))
-            }
+            WireFormat::Gemini => Err(FactoryError::UnknownProvider("gemini".into())),
             #[cfg(feature = "bedrock")]
-            ProviderId::Bedrock => {
-                let secret = self
-                    .vault
-                    .get("bedrock", account)
-                    .await
-                    .map_err(|e| FactoryError::from_vault(e, "bedrock", account))?;
+            WireFormat::Bedrock => {
+                let secret = self.vault.get(entry.id.as_ref(), account).await
+                    .map_err(|e| FactoryError::from_vault(e, entry.id.as_ref(), account))?;
                 let creds: BedrockCreds = serde_json::from_str(secret.expose())
                     .map_err(|e| FactoryError::CredentialParse(e.to_string()))?;
-                let endpoint = creds.endpoint();
-                let model_id = creds.model_id();
-                Ok(Arc::new(Bedrock::new(
-                    endpoint,
+                Ok(Arc::new(origin_provider_bedrock::Bedrock::new(
+                    creds.endpoint(),
                     creds.region.clone(),
-                    model_id,
+                    creds.model_id(),
                     creds.access.clone(),
                     creds.secret,
                 )))
             }
-            #[cfg(feature = "github-models")]
-            ProviderId::GitHubModels => {
-                // GitHub Models reads its OAuth token from the vault on every
-                // request; we only need to hand it the vault handle + account.
-                Ok(Arc::new(GitHubModels::new(self.vault.clone(), account)))
+            #[cfg(not(feature = "bedrock"))]
+            WireFormat::Bedrock => Err(FactoryError::UnknownProvider("bedrock".into())),
+            #[cfg(feature = "ollama")]
+            WireFormat::Ollama => {
+                let _ = account;
+                Ok(Arc::new(origin_provider_ollama::Ollama::new()))
             }
+            #[cfg(not(feature = "ollama"))]
+            WireFormat::Ollama => Err(FactoryError::UnknownProvider("ollama".into())),
+            #[cfg(feature = "github-models")]
+            WireFormat::GitHubCopilot => {
+                Ok(Arc::new(origin_provider_github::GitHubModels::new(self.vault.clone(), account)))
+            }
+            #[cfg(not(feature = "github-models"))]
+            WireFormat::GitHubCopilot => Err(FactoryError::UnknownProvider("github-copilot".into())),
         }
+    }
+}
+
+async fn render_base_url(
+    template: &str,
+    vault: &KeyVault,
+    provider: &str,
+    account: &str,
+) -> Result<String, FactoryError> {
+    if !template.contains('{') { return Ok(template.to_string()); }
+    let extras_key = format!("{account}/extras");
+    let extras = vault.get(provider, &extras_key).await
+        .map_err(|e| FactoryError::from_vault(e, provider, &extras_key))?;
+    let json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(extras.expose())
+        .map_err(|e| FactoryError::CredentialParse(e.to_string()))?;
+    let mut out = template.to_string();
+    for (k, v) in json {
+        if let Some(s) = v.as_str() {
+            out = out.replace(&format!("{{{k}}}"), s);
+        }
+    }
+    Ok(out)
+}
+
+fn openai_extra_headers(id: &str) -> Vec<(String, String)> {
+    match id {
+        "openrouter" => vec![
+            ("HTTP-Referer".to_string(), "https://origin.local".to_string()),
+            ("X-Title".to_string(), "origin".to_string()),
+        ],
+        _ => Vec::new(),
     }
 }
 
@@ -280,20 +300,18 @@ mod tests {
 
     #[test]
     fn parse_round_trip_known_ids() {
-        for id in [
-            ProviderId::Anthropic,
-            ProviderId::OpenAi,
-            ProviderId::Gemini,
-            ProviderId::Ollama,
-        ] {
-            assert_eq!(ProviderId::parse(id.as_str()), Some(id));
+        let cat = Catalog::builtin();
+        for id in ["anthropic", "openai", "google", "ollama"] {
+            let parsed = ProviderId::parse(id, &cat).expect(id);
+            assert_eq!(parsed.as_str(), id);
         }
     }
 
     #[test]
     fn parse_aliases() {
-        assert_eq!(ProviderId::parse("open-ai"), Some(ProviderId::OpenAi));
-        assert_eq!(ProviderId::parse("google"), Some(ProviderId::Gemini));
-        assert!(ProviderId::parse("totally-not-a-provider").is_none());
+        let cat = Catalog::builtin();
+        assert_eq!(ProviderId::parse("open-ai", &cat).unwrap().as_str(), "openai");
+        assert_eq!(ProviderId::parse("gemini", &cat).unwrap().as_str(), "google");
+        assert!(ProviderId::parse("totally-not-a-provider", &cat).is_none());
     }
 }
