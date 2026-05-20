@@ -96,6 +96,8 @@ fn scan(root: &Path) -> Result<(), String> {
         if is_crate_subdir(&normalized, "tests")
             || is_crate_subdir(&normalized, "benches")
             || normalized.contains("/target/")
+            || normalized.contains("/.claude/")
+            || normalized.contains("/.git/")
             || normalized.ends_with("build.rs")
         {
             continue;
