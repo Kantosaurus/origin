@@ -85,7 +85,14 @@ fn client_message_prompt_round_trips() {
         ClientMessage::SwitchAccount { .. }
         | ClientMessage::MemoryDecision { .. }
         | ClientMessage::PairStart { .. }
-        | ClientMessage::PairRedeem { .. } => unreachable!("expected Prompt variant"),
+        | ClientMessage::PairRedeem { .. }
+        | ClientMessage::ListSessions
+        | ClientMessage::RemoveSession { .. }
+        | ClientMessage::ResumeSession { .. }
+        | ClientMessage::GetUsage
+        | ClientMessage::KeyringAdd { .. }
+        | ClientMessage::KeyringList { .. }
+        | ClientMessage::KeyringRemove { .. } => unreachable!("expected Prompt variant"),
     }
 }
 
@@ -108,7 +115,14 @@ fn client_message_switch_account_round_trips() {
         ClientMessage::Prompt(_)
         | ClientMessage::MemoryDecision { .. }
         | ClientMessage::PairStart { .. }
-        | ClientMessage::PairRedeem { .. } => unreachable!("expected SwitchAccount variant"),
+        | ClientMessage::PairRedeem { .. }
+        | ClientMessage::ListSessions
+        | ClientMessage::RemoveSession { .. }
+        | ClientMessage::ResumeSession { .. }
+        | ClientMessage::GetUsage
+        | ClientMessage::KeyringAdd { .. }
+        | ClientMessage::KeyringList { .. }
+        | ClientMessage::KeyringRemove { .. } => unreachable!("expected SwitchAccount variant"),
     }
 }
 

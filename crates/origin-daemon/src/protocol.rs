@@ -67,6 +67,35 @@ pub enum ClientMessage {
     /// [`StreamEvent::PairIssued`]; failures use
     /// [`StreamEvent::PairError`].
     PairRedeem { code: String, device_id: String },
+    /// P13.4.2: enumerate persisted sessions. The daemon replies with a
+    /// single [`StreamEvent::SessionsListed`] carrying a row per session.
+    ListSessions,
+    /// P13.4.2: delete a session (and all of its message rows) by id. The
+    /// daemon replies with [`StreamEvent::AdminOk`] on success or
+    /// [`StreamEvent::AdminError`] on failure.
+    RemoveSession { session_id: String },
+    /// P13.4.2: resume a previously persisted session. Currently a
+    /// clap-level routing placeholder; the daemon acknowledges with
+    /// [`StreamEvent::AdminOk`] and full resume semantics land in P14.
+    ResumeSession { session_id: String },
+    /// P13.4.2: ask the daemon for a per-provider/per-model token usage
+    /// snapshot. The daemon replies with [`StreamEvent::UsageReport`].
+    GetUsage,
+    /// P13.4.2: store (or overwrite) a provider secret in the keyvault.
+    /// The daemon replies with [`StreamEvent::AdminOk`] or
+    /// [`StreamEvent::AdminError`].
+    KeyringAdd {
+        provider: String,
+        account: String,
+        secret: String,
+    },
+    /// P13.4.2: list every account known to the keyvault for `provider`.
+    /// The daemon replies with [`StreamEvent::KeyringAccounts`].
+    KeyringList { provider: String },
+    /// P13.4.2: delete a provider/account secret from the keyvault. The
+    /// daemon replies with [`StreamEvent::AdminOk`] or
+    /// [`StreamEvent::AdminError`].
+    KeyringRemove { provider: String, account: String },
 }
 
 impl ClientMessage {
@@ -142,4 +171,47 @@ pub enum StreamEvent {
     PairError {
         message: String,
     },
+    /// P13.4.2: response to [`ClientMessage::ListSessions`]. Carries one
+    /// wire-shape summary per persisted session, newest-first.
+    SessionsListed { summaries: Vec<SessionSummaryWire> },
+    /// P13.4.2: response to [`ClientMessage::GetUsage`]. Carries one row
+    /// per (provider, model) tuple seen in the running metrics registry.
+    UsageReport { rows: Vec<UsageRow> },
+    /// P13.4.2: response to [`ClientMessage::KeyringList`]. Carries the
+    /// list of accounts the keyvault knows for `provider`.
+    KeyringAccounts {
+        provider: String,
+        accounts: Vec<String>,
+    },
+    /// P13.4.2: positive acknowledgement for admin mutations that have no
+    /// payload of their own (`RemoveSession`, `KeyringAdd`, …).
+    AdminOk,
+    /// P13.4.2: negative acknowledgement carrying a human-readable error
+    /// message. Used as the failure side of the admin mutation handlers.
+    AdminError { message: String },
+}
+
+/// Wire-shape projection of `SessionStore::SessionSummary`.
+///
+/// Kept as a distinct type so the daemon can change its in-process row
+/// shape (extra derived columns, debug fields, …) without breaking IPC
+/// compatibility.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionSummaryWire {
+    pub id: String,
+    pub created_at: i64,
+    pub title: Option<String>,
+    pub model: String,
+    pub message_count: u32,
+}
+
+/// One row of the `StreamEvent::UsageReport`. Derived from the metrics
+/// registry's `origin_tokens_in_total{provider,model}` /
+/// `origin_tokens_out_total{provider,model}` counter families.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UsageRow {
+    pub provider: String,
+    pub model: String,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
 }
