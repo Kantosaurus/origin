@@ -61,3 +61,41 @@ async fn json_lines_stream_matches_golden() {
         "missing turn_end: {stdout}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_url_routes_through_quic() {
+    use origin_ipc::quic::QuicListener;
+    use origin_ipc::tls::generate_self_signed;
+
+    let bundle = generate_self_signed("origin-daemon").expect("cert");
+    let listener = QuicListener::bind("127.0.0.1:0".parse().expect("addr"), bundle.clone())
+        .await
+        .expect("bind quic");
+    let addr = listener.local_addr();
+    let dir = TempDir::new().expect("tempdir");
+    let ca_path = dir.path().join("ca.der");
+    std::fs::write(&ca_path, &bundle.ca_der).expect("write ca");
+
+    let server = tokio::spawn(async move {
+        let mut conn = listener.accept().await.expect("accept");
+        let _req = conn.read_frame().await.expect("read req");
+        let ev = origin_daemon::protocol::StreamEvent::TextDelta { text: "remote-ok".into() };
+        let body = serde_json::to_vec(&ev).expect("ser ev");
+        conn.write_frame(origin_ipc::frame::FrameKind::Event, &body).await.expect("write ev");
+        let reply = origin_daemon::protocol::PromptReply { assistant_text: "remote-ok".into(), turns: 1 };
+        let body = serde_json::to_vec(&reply).expect("ser reply");
+        conn.write_frame(origin_ipc::frame::FrameKind::Response, &body).await.expect("write reply");
+    });
+
+    let cmd = env!("CARGO_BIN_EXE_origin");
+    let url = format!("origin://{addr}#deadbeef");
+    let output = tokio::process::Command::new(cmd)
+        .env("ORIGIN_REMOTE_CA_DER_FILE", &ca_path)
+        .args(["run", "--remote", &url, "--json", "hi"])
+        .output()
+        .await
+        .expect("run binary");
+    server.await.expect("server task");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("remote-ok"), "stdout: {stdout}");
+}
