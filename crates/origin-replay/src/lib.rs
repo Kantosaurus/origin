@@ -6,5 +6,6 @@
 
 pub mod bundle;
 pub mod clock;
+pub mod provider_tap;
 pub mod recorder;
 pub mod rng;
