@@ -38,6 +38,10 @@ origin-stream           = { path = "../origin-stream" }
 origin-keyvault         = { path = "../origin-keyvault" }
 origin-sidecar          = { path = "../origin-sidecar" }
 origin-mem              = { path = "../origin-mem" }
+origin-metrics          = { path = "../origin-metrics" }
+hyper                   = { workspace = true }
+hyper-util              = { version = "0.1", features = ["tokio"] }
+http-body-util          = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "sync"] }
 anyhow = "1"
 tracing = "0.1"

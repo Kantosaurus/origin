@@ -22,7 +22,7 @@ pub use composer::Composer;
 pub use damage::Run;
 pub use grid::{Attr, Cell, Grid, GridError};
 pub use layout_cache::{LayoutCache, LayoutCacheError, LayoutSpan};
-pub use panel::{Panel, PanelEvent, PermissionOutcome};
+pub use panel::{Panel, PanelEvent, PanelState, PermissionOutcome};
 pub use scheduler::{Handle, Scheduler};
 pub use stream_widget::{Rect, StreamWidget};
 pub use width::WidthCache;
