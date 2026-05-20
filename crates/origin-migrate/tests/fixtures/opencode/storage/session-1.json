@@ -1,0 +1,9 @@
+{
+  "id": "ses_abc",
+  "title": "First session",
+  "createdAt": 1700000000000,
+  "messages": [
+    {"role": "user", "parts": [{"type": "text", "text": "ping"}]},
+    {"role": "assistant", "parts": [{"type": "text", "text": "pong"}]}
+  ]
+}
