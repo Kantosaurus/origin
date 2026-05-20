@@ -17,12 +17,8 @@ fn update_summary_writes_column() {
             cache_marker: None,
         }],
     };
-    store
-        .persist_message(&s.id, 0, &m)
-        .expect("persist message");
-    store
-        .update_summary(&s.id, 0, "first-summary")
-        .expect("update");
+    store.persist_message(&s.id, 0, &m).expect("persist message");
+    store.update_summary(&s.id, 0, "first-summary").expect("update");
     drop(store);
     let conn = rusqlite::Connection::open(&db).expect("re-open");
     let got: String = conn

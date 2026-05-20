@@ -22,16 +22,25 @@ async fn json_lines_stream_matches_golden() {
         let _req = conn.read_frame_body().await.expect("read req");
 
         for ev in [
-            StreamEvent::TextDelta { text: "hello ".into() },
+            StreamEvent::TextDelta {
+                text: "hello ".into(),
+            },
             StreamEvent::TextDelta { text: "world".into() },
             StreamEvent::TurnEnd,
         ] {
             let body = serde_json::to_vec(&ev).expect("ser ev");
-            conn.write_raw(&encode(1, FrameKind::Event, &body)).await.expect("write ev");
+            conn.write_raw(&encode(1, FrameKind::Event, &body))
+                .await
+                .expect("write ev");
         }
-        let reply = PromptReply { assistant_text: "hello world".into(), turns: 1 };
+        let reply = PromptReply {
+            assistant_text: "hello world".into(),
+            turns: 1,
+        };
         let body = serde_json::to_vec(&reply).expect("ser reply");
-        conn.write_raw(&encode(1, FrameKind::Response, &body)).await.expect("write reply");
+        conn.write_raw(&encode(1, FrameKind::Response, &body))
+            .await
+            .expect("write reply");
         let _ = listen_sock;
     });
 
@@ -44,16 +53,24 @@ async fn json_lines_stream_matches_golden() {
         .expect("run binary");
     server.await.expect("server task");
 
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
 
     assert!(
-        lines.iter().any(|l| l.contains("\"kind\":\"text_delta\"") && l.contains("hello ")),
+        lines
+            .iter()
+            .any(|l| l.contains("\"kind\":\"text_delta\"") && l.contains("hello ")),
         "missing first delta: {stdout}"
     );
     assert!(
-        lines.iter().any(|l| l.contains("\"kind\":\"text_delta\"") && l.contains("world")),
+        lines
+            .iter()
+            .any(|l| l.contains("\"kind\":\"text_delta\"") && l.contains("world")),
         "missing second delta: {stdout}"
     );
     assert!(
@@ -79,12 +96,21 @@ async fn remote_url_routes_through_quic() {
     let server = tokio::spawn(async move {
         let mut conn = listener.accept().await.expect("accept");
         let _req = conn.read_frame().await.expect("read req");
-        let ev = origin_daemon::protocol::StreamEvent::TextDelta { text: "remote-ok".into() };
+        let ev = origin_daemon::protocol::StreamEvent::TextDelta {
+            text: "remote-ok".into(),
+        };
         let body = serde_json::to_vec(&ev).expect("ser ev");
-        conn.write_frame(origin_ipc::frame::FrameKind::Event, &body).await.expect("write ev");
-        let reply = origin_daemon::protocol::PromptReply { assistant_text: "remote-ok".into(), turns: 1 };
+        conn.write_frame(origin_ipc::frame::FrameKind::Event, &body)
+            .await
+            .expect("write ev");
+        let reply = origin_daemon::protocol::PromptReply {
+            assistant_text: "remote-ok".into(),
+            turns: 1,
+        };
         let body = serde_json::to_vec(&reply).expect("ser reply");
-        conn.write_frame(origin_ipc::frame::FrameKind::Response, &body).await.expect("write reply");
+        conn.write_frame(origin_ipc::frame::FrameKind::Response, &body)
+            .await
+            .expect("write reply");
     });
 
     let cmd = env!("CARGO_BIN_EXE_origin");

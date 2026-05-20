@@ -349,15 +349,7 @@ fn spawn_handler_task(
                 | ClientMessage::KeyringAdd { .. }
                 | ClientMessage::KeyringList { .. }
                 | ClientMessage::KeyringRemove { .. }) => {
-                    if !handle_admin(
-                        &conn,
-                        &session_store,
-                        &vault,
-                        metrics.as_ref(),
-                        admin,
-                    )
-                    .await
-                    {
+                    if !handle_admin(&conn, &session_store, &vault, metrics.as_ref(), admin).await {
                         break;
                     }
                 }
@@ -642,28 +634,28 @@ async fn handle_admin(
         ClientMessage::GetUsage => StreamEvent::UsageReport {
             rows: build_usage_rows(&metrics.snapshot()),
         },
-        ClientMessage::KeyringAdd { provider, account, secret } => {
-            match vault.set(&provider, &account, Secret::new(secret)).await {
-                Ok(()) => StreamEvent::AdminOk,
-                Err(e) => StreamEvent::AdminError {
-                    message: e.to_string(),
-                },
-            }
-        }
+        ClientMessage::KeyringAdd {
+            provider,
+            account,
+            secret,
+        } => match vault.set(&provider, &account, Secret::new(secret)).await {
+            Ok(()) => StreamEvent::AdminOk,
+            Err(e) => StreamEvent::AdminError {
+                message: e.to_string(),
+            },
+        },
         ClientMessage::KeyringList { provider } => match vault.list(&provider).await {
             Ok(accounts) => StreamEvent::KeyringAccounts { provider, accounts },
             Err(e) => StreamEvent::AdminError {
                 message: e.to_string(),
             },
         },
-        ClientMessage::KeyringRemove { provider, account } => {
-            match vault.delete(&provider, &account).await {
-                Ok(()) => StreamEvent::AdminOk,
-                Err(e) => StreamEvent::AdminError {
-                    message: e.to_string(),
-                },
-            }
-        }
+        ClientMessage::KeyringRemove { provider, account } => match vault.delete(&provider, &account).await {
+            Ok(()) => StreamEvent::AdminOk,
+            Err(e) => StreamEvent::AdminError {
+                message: e.to_string(),
+            },
+        },
         // The caller restricts inputs via `admin @ (...)` so other variants
         // never reach this function.
         ClientMessage::Prompt(_)
@@ -708,12 +700,14 @@ fn build_usage_rows(snap: &origin_metrics::Snapshot) -> Vec<origin_daemon::proto
         }
     }
     acc.into_iter()
-        .map(|((provider, model), (tokens_in, tokens_out))| origin_daemon::protocol::UsageRow {
-            provider,
-            model,
-            tokens_in,
-            tokens_out,
-        })
+        .map(
+            |((provider, model), (tokens_in, tokens_out))| origin_daemon::protocol::UsageRow {
+                provider,
+                model,
+                tokens_in,
+                tokens_out,
+            },
+        )
         .collect()
 }
 
