@@ -8,6 +8,27 @@ pub mod ndjson;
 pub mod openai_tools;
 pub mod sse;
 
+#[cfg(feature = "recorder")]
+pub mod recorder_hook {
+    //! Global `ProviderTap` registered by the daemon at startup. Concrete
+    //! provider impls call `tap()` and feed frames through it without
+    //! changing their public APIs.
+
+    use origin_replay::provider_tap::ProviderTap;
+    use std::sync::Arc;
+
+    static TAP: parking_lot::RwLock<Option<Arc<ProviderTap>>> = parking_lot::RwLock::new(None);
+
+    pub fn register_tap(tap: Arc<ProviderTap>) {
+        *TAP.write() = Some(tap);
+    }
+
+    #[must_use]
+    pub fn tap() -> Option<Arc<ProviderTap>> {
+        TAP.read().clone()
+    }
+}
+
 use origin_core::types::Message;
 use thiserror::Error;
 
