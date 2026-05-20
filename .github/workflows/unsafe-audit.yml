@@ -1,0 +1,41 @@
+name: Unsafe audit
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+jobs:
+  geiger:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.83.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-geiger
+        run: cargo install cargo-geiger --locked
+      - name: Run cargo-geiger
+        run: |
+          cargo geiger --workspace --output-format Json > geiger.json
+      - name: Assert unsafe only in cas/tui/ipc
+        run: |
+          python - <<'PY'
+          import json, sys
+          data = json.load(open('geiger.json'))
+          allowed = {'origin-cas', 'origin-tui', 'origin-ipc'}
+          fail = []
+          for pkg in data['packages']:
+              name = pkg['package']['id']['name']
+              unsafe = pkg['unsafety']['used']
+              total = (unsafe['functions']['unsafe_']
+                       + unsafe['exprs']['unsafe_']
+                       + unsafe['item_impls']['unsafe_']
+                       + unsafe['item_traits']['unsafe_']
+                       + unsafe['methods']['unsafe_'])
+              if total > 0 and name not in allowed and name.startswith('origin-'):
+                  fail.append((name, total))
+          if fail:
+              for n, t in fail:
+                  print(f"FAIL: {n} has {t} unsafe items", file=sys.stderr)
+              sys.exit(1)
+          PY
