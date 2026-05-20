@@ -1,0 +1,17 @@
+[book]
+title = "origin"
+authors = ["Ainsley Woo"]
+description = "Performance-first agentic coding harness"
+language = "en"
+multilingual = false
+src = "src"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/wooainsley/origin"
+edit-url-template = "https://github.com/wooainsley/origin/edit/dev/docs/site/{path}"
+
+[output.html.fold]
+enable = true
+level = 1
