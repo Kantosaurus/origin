@@ -39,4 +39,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 caps = "0.5"
 seccompiler = "0.4"
 landlock = "0.4"
-
+# P12 additions
+tikv-jemallocator = { version = "0.6", default-features = false, features = ["background_threads"] }
+tikv-jemalloc-ctl = { version = "0.6", default-features = false }
+tokio-uring = "0.5"
+nix = { version = "0.29", default-features = false, features = ["signal", "process"] }
