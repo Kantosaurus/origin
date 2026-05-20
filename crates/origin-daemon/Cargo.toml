@@ -10,19 +10,23 @@ repository.workspace = true
 workspace = true
 
 [features]
-default = ["openai", "gemini", "ollama"]
-openai = ["dep:origin-provider-openai"]
+default = ["openai", "gemini", "ollama", "openrouter", "openai-compat", "oauth-providers", "custom-providers"]
+openai = ["dep:origin-provider-openai", "openai-compat"]
+openai-compat = []
 gemini = ["dep:origin-provider-gemini"]
 ollama = ["dep:origin-provider-ollama"]
-openrouter = ["dep:origin-provider-openrouter"]
+openrouter = ["dep:origin-provider-openrouter", "openai-compat"]
 bedrock = ["dep:origin-provider-bedrock"]
 github-models = ["dep:origin-provider-github"]
+oauth-providers = []
+custom-providers = []
 
 [dependencies]
 origin-ipc              = { path = "../origin-ipc" }
 origin-core             = { path = "../origin-core" }
 origin-provider         = { path = "../origin-provider" }
 origin-provider-anthropic = { path = "../origin-provider-anthropic" }
+origin-provider-openai-compat = { path = "../origin-provider-openai-compat" }
 origin-provider-openai     = { path = "../origin-provider-openai",     optional = true }
 origin-provider-gemini     = { path = "../origin-provider-gemini",     optional = true }
 origin-provider-ollama     = { path = "../origin-provider-ollama",     optional = true }
@@ -43,6 +47,7 @@ origin-metrics          = { path = "../origin-metrics" }
 origin-runtime          = { path = "../origin-runtime" }
 origin-alloc            = { path = "../origin-alloc" }
 origin-resume-token     = { path = "../origin-resume-token" }
+origin-plan             = { path = "../origin-plan" }
 ctrlc                   = "3"
 dirs                    = "5"
 hyper                   = { workspace = true }
