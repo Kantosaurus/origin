@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use origin_planner::PrefixLedger;
+use origin_runtime::{spawn_in, TaskClass};
 use tokio::sync::{watch, Mutex};
 use ulid::Ulid;
 
@@ -182,7 +183,7 @@ impl Coordinator {
         let last = Arc::clone(&self.last_completion);
         let lc_tx_for_spawn = lc_tx.clone();
         let per_worker_slot = Arc::clone(&report_slot);
-        tokio::spawn(async move {
+        spawn_in(TaskClass::Critical, async move {
             // We immediately publish `Running` so spawn callers can rely on
             // observing it (the test only awaits `Done` / `Failed`, but
             // future P9.8 paths need the transition to be observable).

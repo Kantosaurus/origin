@@ -1,8 +1,9 @@
 //! SQLite-backed session persistence (inline blobs for P1; CAS handles arrive in P2).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use origin_core::types::{Message, Role};
+use origin_resume_token::ResumeToken;
 use origin_store::{Store, StoreError};
 use thiserror::Error;
 
@@ -21,6 +22,9 @@ pub enum SessionStoreError {
 
 pub struct SessionStore {
     inner: Store,
+    /// Directory the `SQLite` database lives in. Used to derive the
+    /// `resume/` subdirectory where P12.12 persists `ResumeToken`s.
+    db_dir: PathBuf,
 }
 
 /// Lightweight projection of a `sessions` row used by admin/list operations.
@@ -39,9 +43,44 @@ impl SessionStore {
     /// # Errors
     /// Propagates `StoreError` for open/migration failures.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SessionStoreError> {
+        let p = path.as_ref();
+        let db_dir = p.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         Ok(Self {
-            inner: Store::open(path)?,
+            inner: Store::open(p)?,
+            db_dir,
         })
+    }
+
+    /// Directory under which P12.12 persists per-session resume tokens.
+    /// Created on demand by [`Self::save_resume_token`].
+    #[must_use]
+    pub fn resume_dir(&self) -> PathBuf {
+        self.db_dir.join("resume")
+    }
+
+    /// Persist `token` to `<db_dir>/resume/<session_id>.json`. Idempotent.
+    ///
+    /// # Errors
+    /// Propagates I/O and serialization errors from
+    /// [`ResumeToken::save`].
+    pub fn save_resume_token(&self, token: &ResumeToken) -> std::io::Result<()> {
+        token.save(&self.resume_dir())
+    }
+
+    /// Load the resume token for `session_id` if one was previously
+    /// checkpointed. Returns `Ok(None)` when no token exists.
+    ///
+    /// # Errors
+    /// Propagates I/O and serde decode errors.
+    pub fn load_resume_token(&self, session_id: &str) -> std::io::Result<Option<ResumeToken>> {
+        let path = self.resume_dir().join(format!("{session_id}.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(path)?;
+        let token: ResumeToken = serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Some(token))
     }
 
     /// Insert (or replace) a session metadata row.

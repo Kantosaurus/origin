@@ -12,8 +12,10 @@ use origin_daemon::memory_wiring::MemoryWiring;
 use origin_daemon::pairing::{Pairing, RedeemResult};
 use origin_daemon::protocol::{ClientMessage, MemoryAction, PromptReply, PromptRequest, StreamEvent};
 use origin_daemon::provider_factory::{ProviderFactory, ProviderId};
+use origin_daemon::runtime_launch::{self, ShutdownSignal};
 use origin_daemon::session::Session;
 use origin_daemon::session_store::SessionStore;
+use origin_daemon::shutdown::CooperativeShutdown;
 use origin_daemon::stream_relay::relay_to_connection;
 use origin_ipc::frame::FrameKind;
 use origin_ipc::transport::{Listener, SharedConnection};
@@ -23,6 +25,7 @@ use origin_metrics::Metrics;
 use origin_permission::prompt::AlwaysAllow;
 use origin_provider::Provider;
 use origin_provider_anthropic::Anthropic;
+use origin_runtime::{spawn_in, TaskClass};
 use origin_sidecar::{Sidecar, SidecarConfig, SidecarJob};
 use origin_store::Store as SqlStore;
 use origin_stream::Subscriber;
@@ -33,11 +36,17 @@ use tracing::{error, info, warn};
 /// Convenience alias for the runtime-swappable active provider handle.
 type ActiveProvider = Arc<RwLock<Arc<dyn Provider>>>;
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
+/// Hand-rolled entrypoint — replaces `#[tokio::main]` with the P12.8
+/// two-runtime split. The control core runs on a dedicated `origin-ctrl`
+/// OS thread; the worker pool gets `physical_cores - 1` workers. The
+/// existing async pipeline (`daemon_setup`) runs on the worker pool via
+/// `spawn_on_worker` + `Handle::block_on`. SIGINT/SIGTERM trigger the
+/// shutdown signal; the full phased shutdown lands in P12.11.
+fn main() -> Result<()> {
     // Install the parquet-backed tracing layer. The guard holds the drain
     // thread alive for the lifetime of `main`; on shutdown it flushes any
-    // buffered spans before exiting.
+    // buffered spans before exiting. We keep this on the OS main thread so
+    // its Drop runs after both runtimes have torn down.
     let trace_dir = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("origin")
@@ -45,6 +54,99 @@ async fn main() -> Result<()> {
     let _trace_guard =
         origin_trace::init(&trace_dir).map_err(|e| anyhow::anyhow!("origin-trace init: {e}"))?;
 
+    let signal = ShutdownSignal::new();
+
+    // Spawn the two-runtime launcher on its own OS thread. It blocks until
+    // `signal.trigger()` is called, then tears down both runtimes.
+    let signal_for_launcher = signal.clone();
+    let launcher_join = std::thread::Builder::new()
+        .name("origin-launcher".to_string())
+        .spawn(move || runtime_launch::start(signal_for_launcher))
+        .map_err(|e| anyhow::anyhow!("launcher thread spawn: {e}"))?;
+
+    // Wait for the worker handle to be populated. `start()` sets it before
+    // spawning the control thread, but we run concurrently — poll briefly.
+    let worker_handle = wait_for_worker_handle(&signal)?;
+
+    // Hand the existing async setup to the worker pool. We use the worker
+    // handle's `block_on` from a blocking task so the daemon's main accept
+    // loop runs on the worker runtime, not the control core.
+    let signal_for_setup = signal.clone();
+    worker_handle.spawn_blocking(move || {
+        let h = signal_for_setup
+            .worker_handle()
+            .raw()
+            .expect("worker handle populated");
+        if let Err(e) = h.block_on(daemon_setup()) {
+            error!(error = %e, "daemon_setup terminated with error");
+            signal_for_setup.trigger();
+        }
+    });
+
+    // P12.11: SIGINT/SIGTERM/Ctrl+C wakes a tokio watcher that drives the
+    // CooperativeShutdown phases on the control core, then triggers the
+    // shutdown signal so the launcher returns. The current
+    // `CooperativeShutdown::for_production` is a stub equivalent to
+    // `for_test(no_op_channel, 30s_budget)` — full per-phase wiring (IPC
+    // listener stop, sidecar queue persist, CAS flush, SQLite checkpoint,
+    // etc.) is a P14 polish item.
+    //
+    // We still use `ctrlc` as the cross-platform signal entry — its handler
+    // runs on its own thread, posts to a `mpsc` channel, and a control-core
+    // task drives the phased shutdown from there. This avoids tying
+    // `tokio::signal::ctrl_c` to the OS main thread (which is not a tokio
+    // runtime) while still landing the phase driver on the control core.
+    let (sig_tx, mut sig_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let signal_for_handler = signal.clone();
+    ctrlc::set_handler(move || {
+        // Best-effort; if the receiver is dropped the launcher is already on
+        // its way out, so we fall back to a direct trigger.
+        if sig_tx.send(()).is_err() {
+            signal_for_handler.trigger();
+        }
+    })
+    .map_err(|e| anyhow::anyhow!("ctrlc set_handler: {e}"))?;
+
+    let signal_for_shutdown = signal.clone();
+    signal.control_handle().spawn_on_control(async move {
+        if sig_rx.recv().await.is_none() {
+            // Channel closed without a signal — nothing to do.
+            return;
+        }
+        let mut driver = CooperativeShutdown::for_production();
+        match driver.run().await {
+            Ok(report) => info!(?report, "cooperative shutdown complete"),
+            Err(e) => warn!(error = %e, "cooperative shutdown driver returned error"),
+        }
+        signal_for_shutdown.trigger();
+    });
+
+    // Block on the launcher; it returns when `signal.trigger()` fires.
+    launcher_join
+        .join()
+        .map_err(|_| anyhow::anyhow!("launcher thread panicked"))?;
+    Ok(())
+}
+
+/// Poll the worker handle until `start()` populates it. The launcher sets
+/// the handle synchronously inside `start()` before the control thread
+/// spawns, so this typically resolves in microseconds.
+fn wait_for_worker_handle(signal: &ShutdownSignal) -> Result<tokio::runtime::Handle> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(h) = signal.worker_handle().raw() {
+            return Ok(h);
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow::anyhow!("worker handle never came up"));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The pre-P12.8 daemon body, lifted verbatim (modulo `_trace_guard` which
+/// now lives in `main`). Runs to completion on the worker pool.
+async fn daemon_setup() -> Result<()> {
     let cas_root = env::var("ORIGIN_CAS_ROOT").unwrap_or_else(|_| default_cas_root());
     let cas = Arc::new(
         origin_cas::Store::open(origin_cas::StoreConfig {
@@ -161,7 +263,7 @@ fn spawn_idle_consolidator(memory: Option<&MemoryWiring>) {
         return;
     };
     let c = Arc::clone(consolidator);
-    tokio::spawn(async move {
+    spawn_in(TaskClass::Background, async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         interval.tick().await; // skip the immediate first tick
         loop {
@@ -241,7 +343,7 @@ fn spawn_handler_task(
     vault: KeyVault,
     metrics: Arc<Metrics>,
 ) {
-    tokio::spawn(async move {
+    spawn_in(TaskClass::Critical, async move {
         loop {
             let body = {
                 let mut g = conn.lock().await;
@@ -342,6 +444,9 @@ fn spawn_handler_task(
                         break;
                     }
                 }
+                ClientMessage::ResumeRequest { token } => {
+                    handle_resume_request(&conn, Arc::clone(&session_store), token).await;
+                }
                 admin @ (ClientMessage::ListSessions
                 | ClientMessage::RemoveSession { .. }
                 | ClientMessage::ResumeSession { .. }
@@ -356,6 +461,35 @@ fn spawn_handler_task(
             }
         }
     });
+}
+
+/// Handle a [`ClientMessage::ResumeRequest`] from the supervisor.
+///
+/// P12 ships the wire shape + an immediate ack: we log the request, persist
+/// the token so the daemon can later inspect it, and respond with a
+/// [`ServerMessage::ResumeAck`] inside a `Response` frame. Full hydrate-from-
+/// CAS plumbing (re-loading the message log up to `token.last_turn` and
+/// re-spawning `pending_tool_calls` under `TaskClass::Critical`) is a P14
+/// polish item per the plan's Step 5 note.
+async fn handle_resume_request(
+    conn: &SharedConnection,
+    session_store: Arc<SessionStore>,
+    token: origin_resume_token::ResumeToken,
+) {
+    let session_id = token.session_id.clone();
+    let restored_to_turn = token.last_turn;
+    if let Err(e) = session_store.save_resume_token(&token) {
+        warn!(error = %e, session = %session_id, "resume: could not persist token");
+    }
+    info!(session = %session_id, last_turn = restored_to_turn, "resume: ack");
+    let ack = origin_daemon::protocol::ServerMessage::ResumeAck {
+        session_id,
+        restored_to_turn,
+    };
+    // ServerMessage::ResumeAck is always serializable (plain strings + u32).
+    #[allow(clippy::expect_used)]
+    let bytes = serde_json::to_vec(&ack).expect("ServerMessage::ResumeAck serializable");
+    let _ = conn.lock().await.write_frame(FrameKind::Response, &bytes).await;
 }
 
 /// Back-compat shim: legacy clients send raw `PromptRequest` JSON without a
@@ -447,7 +581,7 @@ async fn handle_request(
     let mut session = Session::new(provider.name(), &req.model);
     let (tx_sub, mut rx_sub) = mpsc::channel::<Subscriber>(1);
     let conn_for_relay = Arc::clone(conn);
-    let relay_handle: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+    let relay_handle: tokio::task::JoinHandle<()> = spawn_in(TaskClass::Realtime, async move {
         while let Some(sub) = rx_sub.recv().await {
             if let Err(e) = relay_to_connection(sub, Arc::clone(&conn_for_relay)).await {
                 error!(error = %e, "relay terminated");
@@ -459,7 +593,7 @@ async fn handle_request(
     // Side-band StreamEvent channel: MemoryProposed events flow through here.
     let (event_tx, mut event_rx) = mpsc::channel::<StreamEvent>(16);
     let conn_for_event_relay = Arc::clone(conn);
-    let event_relay_handle: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+    let event_relay_handle: tokio::task::JoinHandle<()> = spawn_in(TaskClass::Realtime, async move {
         while let Some(ev) = event_rx.recv().await {
             let body = match serde_json::to_vec(&ev) {
                 Ok(b) => b,
@@ -662,7 +796,8 @@ async fn handle_admin(
         | ClientMessage::SwitchAccount { .. }
         | ClientMessage::MemoryDecision { .. }
         | ClientMessage::PairStart { .. }
-        | ClientMessage::PairRedeem { .. } => return true,
+        | ClientMessage::PairRedeem { .. }
+        | ClientMessage::ResumeRequest { .. } => return true,
     };
     write_event(conn, &ev).await.is_ok()
 }
@@ -803,7 +938,7 @@ fn parse_metrics_bind() -> Option<String> {
 /// served as a single `Full<Bytes>` frame so the handler is allocation-only
 /// per request. Bind failure is logged but does not abort the daemon.
 fn spawn_metrics_endpoint(metrics: Metrics, addr: String) {
-    tokio::spawn(async move {
+    spawn_in(TaskClass::Realtime, async move {
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {
@@ -821,7 +956,7 @@ fn spawn_metrics_endpoint(metrics: Metrics, addr: String) {
                 }
             };
             let metrics = metrics.clone();
-            tokio::spawn(async move {
+            spawn_in(TaskClass::Realtime, async move {
                 let io = hyper_util::rt::TokioIo::new(stream);
                 let svc = hyper::service::service_fn(move |_req: hyper::Request<hyper::body::Incoming>| {
                     let body = metrics.encode_text().unwrap_or_default();
