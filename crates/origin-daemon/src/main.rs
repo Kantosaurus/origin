@@ -7,7 +7,9 @@ use anyhow::Result;
 use origin_cas::Store;
 use origin_core::types::Role;
 use origin_daemon::agent::{run_loop, LoopOptions, SessionStoreSummaryDeliverer};
+use origin_daemon::auth::BearerStore;
 use origin_daemon::memory_wiring::MemoryWiring;
+use origin_daemon::pairing::{Pairing, RedeemResult};
 use origin_daemon::protocol::{ClientMessage, MemoryAction, PromptReply, PromptRequest, StreamEvent};
 use origin_daemon::provider_factory::{ProviderFactory, ProviderId};
 use origin_daemon::session::Session;
@@ -56,6 +58,12 @@ async fn main() -> Result<()> {
     info!(cas_root = %cas_root, "cas store ready");
 
     let vault = KeyVault::detect().map_err(|e| anyhow::anyhow!("keyvault detect: {e}"))?;
+
+    // P13.2: pairing + bearer-token state lives in-process. Both handles
+    // are cloned (Arc) into each per-connection future so concurrent
+    // pair_start / pair_redeem calls share one state machine.
+    let pairing = Arc::new(Pairing::new());
+    let bearer_store = Arc::new(BearerStore::new());
 
     // Back-compat: legacy installs only set `ANTHROPIC_API_KEY`. Mirror it
     // into the vault at ("anthropic", "default") so `ProviderFactory::build`
@@ -136,6 +144,9 @@ async fn main() -> Result<()> {
             Arc::clone(&cas),
             Arc::clone(&sidecar),
             memory.clone(),
+            Arc::clone(&pairing),
+            Arc::clone(&bearer_store),
+            vault.clone(),
         );
     }
 }
@@ -214,6 +225,7 @@ fn try_load_embedder() -> Option<Arc<Embedder>> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_handler_task(
     conn: SharedConnection,
     active: ActiveProvider,
@@ -222,6 +234,9 @@ fn spawn_handler_task(
     cas: Arc<Store>,
     sidecar: Arc<Sidecar>,
     memory: Option<MemoryWiring>,
+    pairing: Arc<Pairing>,
+    bearer_store: Arc<BearerStore>,
+    vault: KeyVault,
 ) {
     tokio::spawn(async move {
         loop {
@@ -285,10 +300,44 @@ fn spawn_handler_task(
                 ClientMessage::MemoryDecision { proposal_id, action } => {
                     handle_memory_decision(&conn, memory.as_ref(), proposal_id, &action).await;
                 }
-                // P13.2.2: variants are wired in P13.2.3 once the
-                // Pairing/BearerStore handles thread through this future.
-                ClientMessage::PairStart { .. } | ClientMessage::PairRedeem { .. } => {
-                    let _ = write_error(&conn, "pair: not yet wired").await;
+                ClientMessage::PairStart { ttl_secs } => {
+                    let session = pairing.start(Duration::from_secs(u64::from(ttl_secs)));
+                    let ev = StreamEvent::PairCode {
+                        code: session.code,
+                        expires_in_secs: ttl_secs,
+                    };
+                    if write_event(&conn, &ev).await.is_err() {
+                        break;
+                    }
+                }
+                ClientMessage::PairRedeem { code, device_id } => {
+                    let ev = match pairing.redeem(&code, &device_id) {
+                        Ok(RedeemResult::Issued { bearer, device_id }) => {
+                            bearer_store.insert(bearer.clone(), device_id.clone());
+                            // Best-effort vault mirror so bearers survive a
+                            // daemon restart. A failure here is non-fatal —
+                            // the in-memory BearerStore still authorizes
+                            // until the daemon exits.
+                            if let Err(e) = vault
+                                .set("origin-remote", &device_id, Secret::new(bearer.clone()))
+                                .await
+                            {
+                                warn!(error = %e, device = %device_id,
+                                      "pair: keyvault mirror failed");
+                            }
+                            StreamEvent::PairIssued {
+                                bearer,
+                                device_id,
+                                ttl_secs: 86_400,
+                            }
+                        }
+                        Err(e) => StreamEvent::PairError {
+                            message: e.to_string(),
+                        },
+                    };
+                    if write_event(&conn, &ev).await.is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -527,6 +576,16 @@ async fn write_error(conn: &SharedConnection, msg: &str) -> bool {
         .write_frame(FrameKind::ErrorFrame, msg.as_bytes())
         .await
         .is_ok()
+}
+
+/// Serialize `ev` and write it as a single `Event` frame. Mirrors the
+/// pattern used by `handle_switch` for `StreamEvent::ProviderActive`,
+/// but kept as a small helper because P13.2 emits three different
+/// `StreamEvent` variants from the pair handler.
+async fn write_event(conn: &SharedConnection, ev: &StreamEvent) -> Result<()> {
+    let body = serde_json::to_vec(ev)?;
+    conn.lock().await.write_frame(FrameKind::Event, &body).await?;
+    Ok(())
 }
 
 fn persist(session_store: &SessionStore, session: &Session) {
