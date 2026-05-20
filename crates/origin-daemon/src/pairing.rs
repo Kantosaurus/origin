@@ -28,9 +28,14 @@ pub struct PairingSession {
 }
 
 /// A bearer token minted on successful redeem.
+//
+// The bearer string itself is the `HashMap<String, BearerToken>` key in
+// `Inner::issued` — we do not duplicate it as a struct field, both to
+// keep the per-token footprint minimal and to avoid leaking the bearer
+// through any future `Debug`/`tracing` of this struct. The P11.14
+// secret-redaction lint enforces this discipline.
 #[derive(Debug, Clone)]
 pub struct BearerToken {
-    pub token: String,
     pub device_id: String,
     pub issued_at: Instant,
 }
@@ -100,7 +105,6 @@ impl Pairing {
             inner.issued.insert(
                 bearer.clone(),
                 BearerToken {
-                    token: bearer.clone(),
                     device_id: device_id.to_string(),
                     issued_at: Instant::now(),
                 },
