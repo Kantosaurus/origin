@@ -57,12 +57,49 @@ enum Cmd {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Daemon usage snapshot (tokens in/out per provider/model).
+    Usage,
+    /// Manage persisted sessions.
+    Sessions {
+        #[command(subcommand)]
+        sub: SessionsSub,
+    },
+    /// Manage stored provider credentials.
+    Keyring {
+        #[command(subcommand)]
+        sub: KeyringSub,
+    },
 }
 
 #[derive(Subcommand)]
 enum TraceSub {
     /// Print spans matching the given filters.
     Query(TraceQuery),
+}
+
+#[derive(Subcommand)]
+enum SessionsSub {
+    /// List recent sessions (most-recent first).
+    Ls,
+    /// Resume a session by id (currently a no-op acknowledgement).
+    Resume { session_id: String },
+    /// Delete a session and all its messages.
+    Rm { session_id: String },
+}
+
+#[derive(Subcommand)]
+enum KeyringSub {
+    /// Add or overwrite a provider secret.
+    Add {
+        provider: String,
+        account: String,
+        /// The secret value; read from stdin if `-`.
+        secret: String,
+    },
+    /// List accounts for a provider.
+    List { provider: String },
+    /// Remove a provider account secret.
+    Remove { provider: String, account: String },
 }
 
 #[derive(Subcommand)]
@@ -115,6 +152,9 @@ async fn main() -> Result<()> {
         Some(Cmd::Run { text, json, remote, bearer, model }) => {
             return origin_cli::headless::run(text, json, remote, bearer, model).await;
         }
+        Some(Cmd::Usage) => return origin_cli::admin::usage().await,
+        Some(Cmd::Sessions { sub }) => return origin_cli::admin::sessions(sub_to_action(sub)).await,
+        Some(Cmd::Keyring { sub }) => return origin_cli::admin::keyring(sub_to_action_kr(sub)).await,
         None => {}
     }
 
@@ -421,6 +461,26 @@ async fn send_decision(path: &str, decision: &ClientMessage) -> Result<()> {
     // Errors here are non-fatal — the decision has already been sent.
     let _ = client.read_frame_body().await;
     Ok(())
+}
+
+fn sub_to_action(sub: SessionsSub) -> origin_cli::admin::SessionsAction {
+    match sub {
+        SessionsSub::Ls => origin_cli::admin::SessionsAction::Ls,
+        SessionsSub::Resume { session_id } => origin_cli::admin::SessionsAction::Resume(session_id),
+        SessionsSub::Rm { session_id } => origin_cli::admin::SessionsAction::Rm(session_id),
+    }
+}
+
+fn sub_to_action_kr(sub: KeyringSub) -> origin_cli::admin::KeyringAction {
+    match sub {
+        KeyringSub::Add { provider, account, secret } => {
+            origin_cli::admin::KeyringAction::Add { provider, account, secret }
+        }
+        KeyringSub::List { provider } => origin_cli::admin::KeyringAction::List { provider },
+        KeyringSub::Remove { provider, account } => {
+            origin_cli::admin::KeyringAction::Remove { provider, account }
+        }
+    }
 }
 
 /// `origin pair start [--ttl-secs N]`. Sends a `PairStart` to the
