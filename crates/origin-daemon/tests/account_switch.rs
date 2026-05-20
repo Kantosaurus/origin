@@ -92,7 +92,8 @@ fn client_message_prompt_round_trips() {
         | ClientMessage::GetUsage
         | ClientMessage::KeyringAdd { .. }
         | ClientMessage::KeyringList { .. }
-        | ClientMessage::KeyringRemove { .. } => unreachable!("expected Prompt variant"),
+        | ClientMessage::KeyringRemove { .. }
+        | ClientMessage::ResumeRequest { .. } => unreachable!("expected Prompt variant"),
     }
 }
 
@@ -122,7 +123,8 @@ fn client_message_switch_account_round_trips() {
         | ClientMessage::GetUsage
         | ClientMessage::KeyringAdd { .. }
         | ClientMessage::KeyringList { .. }
-        | ClientMessage::KeyringRemove { .. } => unreachable!("expected SwitchAccount variant"),
+        | ClientMessage::KeyringRemove { .. }
+        | ClientMessage::ResumeRequest { .. } => unreachable!("expected SwitchAccount variant"),
     }
 }
 

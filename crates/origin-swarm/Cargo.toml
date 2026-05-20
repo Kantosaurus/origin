@@ -16,6 +16,7 @@ origin-smr = { path = "../origin-smr" }
 origin-cas = { path = "../origin-cas" }
 origin-store = { path = "../origin-store" }
 origin-planner = { path = "../origin-planner" }
+origin-runtime = { path = "../origin-runtime" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }

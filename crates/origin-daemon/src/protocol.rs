@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use origin_resume_token::ResumeToken;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -96,6 +97,13 @@ pub enum ClientMessage {
     /// daemon replies with [`StreamEvent::AdminOk`] or
     /// [`StreamEvent::AdminError`].
     KeyringRemove { provider: String, account: String },
+    /// Supervisor → daemon. Sent by `origin-supervisor` on restart for
+    /// each previously-checkpointed open session. The daemon looks up
+    /// the session, hydrates the transcript from CAS up to
+    /// `token.last_turn`, and re-spawns any `pending_tool_calls` under
+    /// `TaskClass::Critical`. The full hydrate-from-CAS wiring is a P14
+    /// polish item; P12 ships the wire shape + an immediate ack handler.
+    ResumeRequest { token: ResumeToken },
 }
 
 impl ClientMessage {
@@ -220,4 +228,21 @@ pub struct UsageRow {
     pub model: String,
     pub tokens_in: u64,
     pub tokens_out: u64,
+}
+
+/// Outbound responses the daemon sends back to a client (or the supervisor).
+///
+/// Today the only variant is `ResumeAck`, sent in response to a
+/// [`ClientMessage::ResumeRequest`]. We keep the enum tagged so future
+/// non-event responses can be added without rev-locking the wire format.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ServerMessage {
+    /// Acknowledgement that the daemon accepted the resume token and
+    /// hydrated the session up to `restored_to_turn`. P12 ships the wire
+    /// shape; full hydrate-from-CAS plumbing is a P14 polish item.
+    ResumeAck {
+        session_id: String,
+        restored_to_turn: u32,
+    },
 }

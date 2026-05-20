@@ -14,6 +14,7 @@ use origin_cli::tui::App;
 use origin_daemon::protocol::{ClientMessage, PromptRequest, StreamEvent};
 use origin_ipc::frame::{encode, FrameKind};
 use origin_ipc::transport::{Connection, Connector};
+use origin_runtime::{spawn_in, TaskClass};
 use origin_tui::composer::Composer;
 use origin_tui::scheduler::{Handle, Scheduler};
 use origin_tui::stream_widget::{Rect, StreamWidget};
@@ -195,7 +196,7 @@ async fn main() -> Result<()> {
         let c2 = composer.clone();
         let a2 = app.clone();
         let w2 = widget.clone();
-        tokio::spawn(async move {
+        spawn_in(TaskClass::Realtime, async move {
             scheduler
                 .run(move || {
                     // Draw into composer, then collect frame bytes while lock is held,
