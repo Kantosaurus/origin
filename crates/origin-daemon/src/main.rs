@@ -285,6 +285,11 @@ fn spawn_handler_task(
                 ClientMessage::MemoryDecision { proposal_id, action } => {
                     handle_memory_decision(&conn, memory.as_ref(), proposal_id, &action).await;
                 }
+                // P13.2.2: variants are wired in P13.2.3 once the
+                // Pairing/BearerStore handles thread through this future.
+                ClientMessage::PairStart { .. } | ClientMessage::PairRedeem { .. } => {
+                    let _ = write_error(&conn, "pair: not yet wired").await;
+                }
             }
         }
     });
