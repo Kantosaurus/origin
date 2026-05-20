@@ -39,8 +39,8 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("origin")
         .join("trace");
-    let _trace_guard = origin_trace::init(&trace_dir)
-        .map_err(|e| anyhow::anyhow!("origin-trace init: {e}"))?;
+    let _trace_guard =
+        origin_trace::init(&trace_dir).map_err(|e| anyhow::anyhow!("origin-trace init: {e}"))?;
 
     let cas_root = env::var("ORIGIN_CAS_ROOT").unwrap_or_else(|_| default_cas_root());
     let cas = Arc::new(
