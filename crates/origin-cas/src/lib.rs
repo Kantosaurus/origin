@@ -9,12 +9,14 @@ mod chunker;
 pub mod dict;
 mod hash;
 mod packfile;
+#[cfg(all(target_os = "linux", feature = "uring"))]
+pub mod packfile_uring;
 mod refs;
 mod store;
 
 pub use chunker::{chunks, ChunkIter, ChunkRef};
 pub use dict::{DictError, DictVersion};
 pub use hash::Hash;
-pub use packfile::{PackBuilder, PackError, PackReader, PackSlice};
+pub use packfile::{IndexEntry, PackBuilder, PackError, PackReader, PackSlice};
 pub use refs::{RefError, RefTable};
 pub use store::{Store, StoreConfig, StoreError};

@@ -109,6 +109,20 @@ impl PackBuilder {
 pub struct PackReader {
     map: Mmap,
     index: HashMap<Hash, (u64, u32)>,
+    path: PathBuf,
+}
+
+/// Minimal index entry: payload offset (after the in-file hash+len header) and
+/// payload length in bytes. Used by alternate I/O backends (e.g. `tokio-uring`)
+/// to issue a single `read_at` for the payload bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexEntry {
+    /// Byte offset of the payload bytes (i.e. **past** the embedded
+    /// `[hash:32][len:u32]` entry header), measured from the start of the
+    /// pack file.
+    pub offset: u64,
+    /// Length of the payload, in bytes.
+    pub len: u32,
 }
 
 impl PackReader {
@@ -118,6 +132,7 @@ impl PackReader {
     /// Returns `PackError::BadMagic` / `UnsupportedVersion` / `Truncated` for
     /// malformed inputs; otherwise propagates I/O errors.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, PackError> {
+        let path_buf = path.as_ref().to_path_buf();
         let mut file = File::open(path.as_ref())?;
         let len = file.metadata()?.len();
         if len < 4 + 2 + 2 + 8 + 8 + 4 {
@@ -164,7 +179,11 @@ impl PackReader {
             index.insert(Hash::from_bytes(h), (off, len));
         }
 
-        Ok(Self { map, index })
+        Ok(Self {
+            map,
+            index,
+            path: path_buf,
+        })
     }
 
     /// Iterate every hash recorded in this pack's index.
@@ -183,6 +202,26 @@ impl PackReader {
             return None;
         }
         Some(PackSlice(&self.map[start..end]))
+    }
+
+    /// Path the pack was opened from. Used by alternate I/O backends
+    /// (e.g. `tokio-uring`) that need to re-open the file as an async handle.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Look up the on-disk location of `hash`'s payload bytes. Returns the
+    /// payload offset (skipping the embedded `[hash:32][len:u32]` entry header)
+    /// and the payload length. `None` if the hash isn't in this pack.
+    #[must_use]
+    pub fn find(&self, hash: &Hash) -> Option<IndexEntry> {
+        let (off, len) = self.index.get(hash).copied()?;
+        let payload_offset = off.checked_add(32 + 4)?;
+        Some(IndexEntry {
+            offset: payload_offset,
+            len,
+        })
     }
 }
 

@@ -29,3 +29,10 @@ zstd = "0.13"
 hex = "0.4"
 proptest = { version = "=1.4.0", default-features = false, features = ["std"] }
 tempfile = "3"
+
+[features]
+default = []
+uring = ["dep:tokio-uring"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring = { workspace = true, optional = true }
