@@ -9,6 +9,7 @@ pub mod provider_factory;
 pub mod runtime_launch;
 pub mod session;
 pub mod session_store;
+pub mod shutdown;
 pub mod stream_relay;
 pub mod tool_use_parser;
 
