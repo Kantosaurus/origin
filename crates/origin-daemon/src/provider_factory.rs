@@ -13,8 +13,8 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use origin_keyvault::{Error as VaultError, KeyVault};
-use origin_provider::Provider;
 use origin_provider::catalog::Catalog;
+use origin_provider::Provider;
 use thiserror::Error;
 
 /// Stable id of a provider in the merged catalog.
@@ -38,7 +38,9 @@ impl ProviderId {
     }
 
     #[must_use]
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Errors surfaced by [`ProviderFactory::build`].
@@ -126,8 +128,12 @@ impl core::fmt::Debug for ProviderFactory {
 
 impl ProviderFactory {
     #[must_use]
-    pub fn new(vault: KeyVault, catalog: Catalog) -> Self {
-        Self { vault, cas: None, catalog }
+    pub const fn new(vault: KeyVault, catalog: Catalog) -> Self {
+        Self {
+            vault,
+            cas: None,
+            catalog,
+        }
     }
 
     #[must_use]
@@ -137,51 +143,87 @@ impl ProviderFactory {
     }
 
     #[must_use]
-    pub fn catalog(&self) -> &Catalog { &self.catalog }
+    pub const fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
 
+    /// Build an [`Arc<dyn Provider>`] for the given catalog id + account.
+    ///
+    /// # Errors
+    /// Returns [`FactoryError::UnknownProvider`] if `id` is not in the merged
+    /// catalog, [`FactoryError::MissingCredential`] if the vault has no entry
+    /// for `(provider, account)`, [`FactoryError::CredentialParse`] for
+    /// malformed credential blobs, or [`FactoryError::Vault`] for any other
+    /// keyvault backend failure.
     pub async fn build(&self, id: &ProviderId, account: &str) -> Result<Arc<dyn Provider>, FactoryError> {
-        let entry = self.catalog.lookup(id.as_str())
+        let entry = self
+            .catalog
+            .lookup(id.as_str())
             .ok_or_else(|| FactoryError::UnknownProvider(id.as_str().to_string()))?
             .clone();
         let token = self.resolve_auth(&entry, account).await?;
         self.build_for_wire(&entry, token, account).await
     }
 
-    async fn resolve_auth(&self, entry: &origin_provider::catalog::ProviderEntry, account: &str) -> Result<Arc<dyn TokenSource>, FactoryError> {
+    async fn resolve_auth(
+        &self,
+        entry: &origin_provider::catalog::ProviderEntry,
+        account: &str,
+    ) -> Result<Arc<dyn TokenSource>, FactoryError> {
         use origin_provider::catalog::AuthScheme;
         use origin_provider_openai_compat::{NoAuth, StaticBearer, StaticHeader};
         match &entry.auth {
             AuthScheme::None => Ok(NoAuth::new()),
             AuthScheme::ApiKey { header, prefix } => {
-                let secret = self.vault.get(entry.id.as_ref(), account).await
+                let secret = self
+                    .vault
+                    .get(entry.id.as_ref(), account)
+                    .await
                     .map_err(|e| FactoryError::from_vault(e, entry.id.as_ref(), account))?;
                 if header.eq_ignore_ascii_case("Authorization") && prefix.as_ref() == "Bearer " {
                     Ok(StaticBearer::new(secret.expose().clone()))
                 } else {
-                    Ok(StaticHeader::new(header.to_string(), prefix.to_string(), secret.expose().clone()))
+                    Ok(StaticHeader::new(
+                        header.to_string(),
+                        prefix.to_string(),
+                        secret.expose().clone(),
+                    ))
                 }
             }
             AuthScheme::OAuth(_) => {
                 use origin_keyvault::OAuthClient;
                 use std::time::Duration;
                 if let AuthScheme::OAuth(spec) = &entry.auth {
-                    let client = OAuthClient::new(entry.id.to_string(), spec.token_url.to_string(), spec.client_id.to_string());
-                    match client.refresh_if_due(&self.vault, account, Duration::from_secs(60)).await {
+                    let client = OAuthClient::new(
+                        entry.id.to_string(),
+                        spec.token_url.to_string(),
+                        spec.client_id.to_string(),
+                    );
+                    match client
+                        .refresh_if_due(&self.vault, account, Duration::from_secs(60))
+                        .await
+                    {
                         Ok(origin_keyvault::RefreshOutcome::Rotated { access }) => {
                             Ok(StaticBearer::new(access.expose().to_string()))
                         }
-                        Ok(origin_keyvault::RefreshOutcome::NotDue { .. }) | Ok(_) => {
-                            let secret = self.vault.get(entry.id.as_ref(), &format!("{account}/oauth")).await
+                        Ok(origin_keyvault::RefreshOutcome::NotDue { .. } | _) => {
+                            let secret = self
+                                .vault
+                                .get(entry.id.as_ref(), &format!("{account}/oauth"))
+                                .await
                                 .map_err(|e| FactoryError::from_vault(e, entry.id.as_ref(), account))?;
                             let stored: serde_json::Value = serde_json::from_str(secret.expose())
                                 .map_err(|e| FactoryError::CredentialParse(e.to_string()))?;
-                            let access = stored.get("access").and_then(|v| v.as_str())
-                                .ok_or_else(|| FactoryError::CredentialParse("oauth blob missing 'access'".into()))?;
+                            let access = stored.get("access").and_then(|v| v.as_str()).ok_or_else(|| {
+                                FactoryError::CredentialParse("oauth blob missing 'access'".into())
+                            })?;
                             Ok(StaticBearer::new(access.to_string()))
                         }
                         Err(e) => Err(FactoryError::Vault(e.to_string())),
                     }
-                } else { unreachable!() }
+                } else {
+                    unreachable!()
+                }
             }
             AuthScheme::SigV4 { .. } => {
                 // SigV4 is handled inside the Bedrock builder — return NoAuth as a placeholder.
@@ -191,6 +233,9 @@ impl ProviderFactory {
         }
     }
 
+    // `build_for_wire` dispatches across every supported wire format in one
+    // place. Splitting per-wire helpers is a multi-provider polish item.
+    #[allow(clippy::too_many_lines)]
     async fn build_for_wire(
         &self,
         entry: &origin_provider::catalog::ProviderEntry,
@@ -208,7 +253,13 @@ impl ProviderFactory {
             WireFormat::OpenAIChat => {
                 let cfg = OpenAiCompatConfig {
                     name,
-                    base_url: render_base_url(entry.base_url.as_ref(), &self.vault, entry.id.as_ref(), account).await?,
+                    base_url: render_base_url(
+                        entry.base_url.as_ref(),
+                        &self.vault,
+                        entry.id.as_ref(),
+                        account,
+                    )
+                    .await?,
                     chat_path: entry.chat_path.to_string(),
                     auth: token,
                     extra_headers: openai_extra_headers(entry.id.as_ref()),
@@ -220,23 +271,30 @@ impl ProviderFactory {
                 let base = entry.base_url.as_ref();
                 let mut p = match &entry.auth {
                     AuthScheme::ApiKey { .. } => {
-                        let secret = self.vault.get(entry.id.as_ref(), account).await
+                        let secret = self
+                            .vault
+                            .get(entry.id.as_ref(), account)
+                            .await
                             .map_err(|e| FactoryError::from_vault(e, entry.id.as_ref(), account))?;
-                        origin_provider_anthropic::Anthropic::new(secret.expose().clone())
-                            .with_base(base)
+                        origin_provider_anthropic::Anthropic::new(secret.expose().clone()).with_base(base)
                     }
                     AuthScheme::OAuth(_) => {
-                        let (_, bearer) = token.header().await
+                        let (_, bearer) = token
+                            .header()
+                            .await
                             .map_err(|_| FactoryError::Vault("oauth token".into()))?;
                         let raw = bearer.strip_prefix("Bearer ").unwrap_or(&bearer).to_string();
-                        origin_provider_anthropic::Anthropic::with_oauth_bearer(raw)
-                            .with_base(base)
+                        origin_provider_anthropic::Anthropic::with_oauth_bearer(raw).with_base(base)
                     }
-                    _ => return Err(FactoryError::CredentialParse(
-                        "anthropic wire requires ApiKey or OAuth".into(),
-                    )),
+                    _ => {
+                        return Err(FactoryError::CredentialParse(
+                            "anthropic wire requires ApiKey or OAuth".into(),
+                        ))
+                    }
                 };
-                if let Some(cas) = self.cas.clone() { p = p.with_cas(cas); }
+                if let Some(cas) = self.cas.clone() {
+                    p = p.with_cas(cas);
+                }
                 Ok(Arc::new(p))
             }
             #[cfg(feature = "gemini")]
@@ -244,19 +302,26 @@ impl ProviderFactory {
                 use origin_provider::catalog::AuthScheme;
                 let p = match &entry.auth {
                     AuthScheme::ApiKey { .. } => {
-                        let secret = self.vault.get(entry.id.as_ref(), account).await
+                        let secret = self
+                            .vault
+                            .get(entry.id.as_ref(), account)
+                            .await
                             .map_err(|e| FactoryError::from_vault(e, entry.id.as_ref(), account))?;
                         origin_provider_gemini::Gemini::new(secret.expose().clone())
                     }
                     AuthScheme::OAuth(_) => {
-                        let (_, bearer) = token.header().await
+                        let (_, bearer) = token
+                            .header()
+                            .await
                             .map_err(|_| FactoryError::Vault("oauth token".into()))?;
                         let raw = bearer.strip_prefix("Bearer ").unwrap_or(&bearer).to_string();
                         origin_provider_gemini::Gemini::with_oauth_bearer(raw)
                     }
-                    _ => return Err(FactoryError::CredentialParse(
-                        "gemini wire requires ApiKey or OAuth".into(),
-                    )),
+                    _ => {
+                        return Err(FactoryError::CredentialParse(
+                            "gemini wire requires ApiKey or OAuth".into(),
+                        ))
+                    }
                 };
                 Ok(Arc::new(p))
             }
@@ -264,7 +329,10 @@ impl ProviderFactory {
             WireFormat::Gemini => Err(FactoryError::UnknownProvider("gemini".into())),
             #[cfg(feature = "bedrock")]
             WireFormat::Bedrock => {
-                let secret = self.vault.get(entry.id.as_ref(), account).await
+                let secret = self
+                    .vault
+                    .get(entry.id.as_ref(), account)
+                    .await
                     .map_err(|e| FactoryError::from_vault(e, entry.id.as_ref(), account))?;
                 let creds: BedrockCreds = serde_json::from_str(secret.expose())
                     .map_err(|e| FactoryError::CredentialParse(e.to_string()))?;
@@ -286,9 +354,10 @@ impl ProviderFactory {
             #[cfg(not(feature = "ollama"))]
             WireFormat::Ollama => Err(FactoryError::UnknownProvider("ollama".into())),
             #[cfg(feature = "github-models")]
-            WireFormat::GitHubCopilot => {
-                Ok(Arc::new(origin_provider_github::GitHubModels::new(self.vault.clone(), account)))
-            }
+            WireFormat::GitHubCopilot => Ok(Arc::new(origin_provider_github::GitHubModels::new(
+                self.vault.clone(),
+                account,
+            ))),
             #[cfg(not(feature = "github-models"))]
             WireFormat::GitHubCopilot => Err(FactoryError::UnknownProvider("github-copilot".into())),
         }
@@ -301,12 +370,16 @@ async fn render_base_url(
     provider: &str,
     account: &str,
 ) -> Result<String, FactoryError> {
-    if !template.contains('{') { return Ok(template.to_string()); }
+    if !template.contains('{') {
+        return Ok(template.to_string());
+    }
     let extras_key = format!("{account}/extras");
-    let extras = vault.get(provider, &extras_key).await
+    let extras = vault
+        .get(provider, &extras_key)
+        .await
         .map_err(|e| FactoryError::from_vault(e, provider, &extras_key))?;
-    let json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(extras.expose())
-        .map_err(|e| FactoryError::CredentialParse(e.to_string()))?;
+    let json: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(extras.expose()).map_err(|e| FactoryError::CredentialParse(e.to_string()))?;
     let mut out = template.to_string();
     for (k, v) in json {
         if let Some(s) = v.as_str() {
@@ -342,8 +415,16 @@ mod tests {
     #[test]
     fn parse_aliases() {
         let cat = Catalog::builtin();
-        assert_eq!(ProviderId::parse("open-ai", &cat).unwrap().as_str(), "openai");
-        assert_eq!(ProviderId::parse("gemini", &cat).unwrap().as_str(), "google");
+        assert_eq!(
+            ProviderId::parse("open-ai", &cat)
+                .expect("open-ai alias")
+                .as_str(),
+            "openai"
+        );
+        assert_eq!(
+            ProviderId::parse("gemini", &cat).expect("gemini alias").as_str(),
+            "google"
+        );
         assert!(ProviderId::parse("totally-not-a-provider", &cat).is_none());
     }
 }
