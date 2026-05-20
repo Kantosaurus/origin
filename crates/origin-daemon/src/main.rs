@@ -10,6 +10,7 @@ use origin_daemon::agent::{run_loop, LoopOptions, SessionStoreSummaryDeliverer};
 use origin_daemon::memory_wiring::MemoryWiring;
 use origin_daemon::protocol::{ClientMessage, MemoryAction, PromptReply, PromptRequest, StreamEvent};
 use origin_daemon::provider_factory::{ProviderFactory, ProviderId};
+use origin_daemon::runtime_launch::{self, ShutdownSignal};
 use origin_daemon::session::Session;
 use origin_daemon::session_store::SessionStore;
 use origin_daemon::stream_relay::relay_to_connection;
@@ -21,6 +22,7 @@ use origin_metrics::Metrics;
 use origin_permission::prompt::AlwaysAllow;
 use origin_provider::Provider;
 use origin_provider_anthropic::Anthropic;
+use origin_runtime::{spawn_in, TaskClass};
 use origin_sidecar::{Sidecar, SidecarConfig, SidecarJob};
 use origin_store::Store as SqlStore;
 use origin_stream::Subscriber;
@@ -31,11 +33,17 @@ use tracing::{error, info, warn};
 /// Convenience alias for the runtime-swappable active provider handle.
 type ActiveProvider = Arc<RwLock<Arc<dyn Provider>>>;
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
+/// Hand-rolled entrypoint — replaces `#[tokio::main]` with the P12.8
+/// two-runtime split. The control core runs on a dedicated `origin-ctrl`
+/// OS thread; the worker pool gets `physical_cores - 1` workers. The
+/// existing async pipeline (`daemon_setup`) runs on the worker pool via
+/// `spawn_on_worker` + `Handle::block_on`. SIGINT/SIGTERM trigger the
+/// shutdown signal; the full phased shutdown lands in P12.11.
+fn main() -> Result<()> {
     // Install the parquet-backed tracing layer. The guard holds the drain
     // thread alive for the lifetime of `main`; on shutdown it flushes any
-    // buffered spans before exiting.
+    // buffered spans before exiting. We keep this on the OS main thread so
+    // its Drop runs after both runtimes have torn down.
     let trace_dir = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("origin")
@@ -43,6 +51,67 @@ async fn main() -> Result<()> {
     let _trace_guard =
         origin_trace::init(&trace_dir).map_err(|e| anyhow::anyhow!("origin-trace init: {e}"))?;
 
+    let signal = ShutdownSignal::new();
+
+    // Spawn the two-runtime launcher on its own OS thread. It blocks until
+    // `signal.trigger()` is called, then tears down both runtimes.
+    let signal_for_launcher = signal.clone();
+    let launcher_join = std::thread::Builder::new()
+        .name("origin-launcher".to_string())
+        .spawn(move || runtime_launch::start(signal_for_launcher))
+        .map_err(|e| anyhow::anyhow!("launcher thread spawn: {e}"))?;
+
+    // Wait for the worker handle to be populated. `start()` sets it before
+    // spawning the control thread, but we run concurrently — poll briefly.
+    let worker_handle = wait_for_worker_handle(&signal)?;
+
+    // Hand the existing async setup to the worker pool. We use the worker
+    // handle's `block_on` from a blocking task so the daemon's main accept
+    // loop runs on the worker runtime, not the control core.
+    let signal_for_setup = signal.clone();
+    worker_handle.spawn_blocking(move || {
+        let h = signal_for_setup
+            .worker_handle()
+            .raw()
+            .expect("worker handle populated");
+        if let Err(e) = h.block_on(daemon_setup()) {
+            error!(error = %e, "daemon_setup terminated with error");
+            signal_for_setup.trigger();
+        }
+    });
+
+    // Wire SIGINT (and on Unix, SIGTERM via ctrlc's handler) to the shutdown
+    // signal. P12.11 replaces this with the full phased shutdown.
+    let signal_for_handler = signal;
+    ctrlc::set_handler(move || signal_for_handler.trigger())
+        .map_err(|e| anyhow::anyhow!("ctrlc set_handler: {e}"))?;
+
+    // Block on the launcher; it returns when `signal.trigger()` fires.
+    launcher_join
+        .join()
+        .map_err(|_| anyhow::anyhow!("launcher thread panicked"))?;
+    Ok(())
+}
+
+/// Poll the worker handle until `start()` populates it. The launcher sets
+/// the handle synchronously inside `start()` before the control thread
+/// spawns, so this typically resolves in microseconds.
+fn wait_for_worker_handle(signal: &ShutdownSignal) -> Result<tokio::runtime::Handle> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(h) = signal.worker_handle().raw() {
+            return Ok(h);
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow::anyhow!("worker handle never came up"));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The pre-P12.8 daemon body, lifted verbatim (modulo `_trace_guard` which
+/// now lives in `main`). Runs to completion on the worker pool.
+async fn daemon_setup() -> Result<()> {
     let cas_root = env::var("ORIGIN_CAS_ROOT").unwrap_or_else(|_| default_cas_root());
     let cas = Arc::new(
         origin_cas::Store::open(origin_cas::StoreConfig {
@@ -148,7 +217,7 @@ fn spawn_idle_consolidator(memory: Option<&MemoryWiring>) {
         return;
     };
     let c = Arc::clone(consolidator);
-    tokio::spawn(async move {
+    spawn_in(TaskClass::Background, async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         interval.tick().await; // skip the immediate first tick
         loop {
@@ -223,7 +292,7 @@ fn spawn_handler_task(
     sidecar: Arc<Sidecar>,
     memory: Option<MemoryWiring>,
 ) {
-    tokio::spawn(async move {
+    spawn_in(TaskClass::Critical, async move {
         loop {
             let body = {
                 let mut g = conn.lock().await;
@@ -379,7 +448,7 @@ async fn handle_request(
     let mut session = Session::new(provider.name(), &req.model);
     let (tx_sub, mut rx_sub) = mpsc::channel::<Subscriber>(1);
     let conn_for_relay = Arc::clone(conn);
-    let relay_handle: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+    let relay_handle: tokio::task::JoinHandle<()> = spawn_in(TaskClass::Realtime, async move {
         while let Some(sub) = rx_sub.recv().await {
             if let Err(e) = relay_to_connection(sub, Arc::clone(&conn_for_relay)).await {
                 error!(error = %e, "relay terminated");
@@ -391,7 +460,7 @@ async fn handle_request(
     // Side-band StreamEvent channel: MemoryProposed events flow through here.
     let (event_tx, mut event_rx) = mpsc::channel::<StreamEvent>(16);
     let conn_for_event_relay = Arc::clone(conn);
-    let event_relay_handle: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+    let event_relay_handle: tokio::task::JoinHandle<()> = spawn_in(TaskClass::Realtime, async move {
         while let Some(ev) = event_rx.recv().await {
             let body = match serde_json::to_vec(&ev) {
                 Ok(b) => b,
@@ -606,7 +675,7 @@ fn parse_metrics_bind() -> Option<String> {
 /// served as a single `Full<Bytes>` frame so the handler is allocation-only
 /// per request. Bind failure is logged but does not abort the daemon.
 fn spawn_metrics_endpoint(metrics: Metrics, addr: String) {
-    tokio::spawn(async move {
+    spawn_in(TaskClass::Realtime, async move {
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {
@@ -624,7 +693,7 @@ fn spawn_metrics_endpoint(metrics: Metrics, addr: String) {
                 }
             };
             let metrics = metrics.clone();
-            tokio::spawn(async move {
+            spawn_in(TaskClass::Realtime, async move {
                 let io = hyper_util::rt::TokioIo::new(stream);
                 let svc = hyper::service::service_fn(move |_req: hyper::Request<hyper::body::Incoming>| {
                     let body = metrics.encode_text().unwrap_or_default();
