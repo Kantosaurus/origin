@@ -1,6 +1,6 @@
 use origin_permission::{check_with_skills, prompt::AlwaysAllow, Outcome};
 use origin_skills::SkillRegistry;
-use origin_tools::{SideEffects, Tier, ToolMeta, Urgency};
+use origin_tools::{SandboxProfile, SideEffects, Tier, ToolMeta, Urgency};
 
 const READ_META: ToolMeta = ToolMeta {
     name: "Read",
@@ -9,6 +9,7 @@ const READ_META: ToolMeta = ToolMeta {
     urgency: Urgency::Low,
     side_effects: SideEffects::Pure,
     input_schema: "{}",
+    sandbox_profile: SandboxProfile::ReadFs,
 };
 
 const EDIT_META: ToolMeta = ToolMeta {
@@ -18,6 +19,7 @@ const EDIT_META: ToolMeta = ToolMeta {
     urgency: Urgency::Medium,
     side_effects: SideEffects::Mutating,
     input_schema: "{}",
+    sandbox_profile: SandboxProfile::WriteCwd,
 };
 
 #[tokio::test]

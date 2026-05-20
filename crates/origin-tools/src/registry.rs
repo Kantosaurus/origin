@@ -4,6 +4,7 @@
 //! `registry_iter` walks all registered tools at runtime.
 
 use crate::{SideEffects, Tier, Urgency};
+use origin_sandbox::SandboxProfile;
 
 #[derive(Debug)]
 pub struct ToolMeta {
@@ -13,6 +14,11 @@ pub struct ToolMeta {
     pub urgency: Urgency,
     pub side_effects: SideEffects,
     pub input_schema: &'static str,
+    /// Per-tool sandbox profile applied to child processes this tool spawns.
+    /// Defaults to [`SandboxProfile::Inherit`] (no extra confinement); tools
+    /// that exec untrusted binaries override this to `Shell`, `WriteCwd`,
+    /// etc. via the optional `sandbox: …` arm of [`crate::origin_tool!`].
+    pub sandbox_profile: SandboxProfile,
 }
 
 inventory::collect!(ToolMeta);

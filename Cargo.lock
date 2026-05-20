@@ -3188,6 +3188,7 @@ dependencies = [
  "origin-codegraph",
  "origin-core",
  "origin-plan",
+ "origin-sandbox",
  "origin-store",
  "origin-swarm",
  "regex",
