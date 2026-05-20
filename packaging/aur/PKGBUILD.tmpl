@@ -1,0 +1,19 @@
+# Maintainer: Ainsley Woo <wooainsley@gmail.com>
+pkgname=origin-bin
+pkgver={{VERSION}}
+pkgrel=1
+pkgdesc="Performance-first agentic coding harness"
+arch=('x86_64' 'aarch64')
+url="https://github.com/wooainsley/origin"
+license=('Apache')
+provides=('origin')
+conflicts=('origin')
+source_x86_64=("$url/releases/download/v$pkgver/origin-x86_64-unknown-linux-musl")
+source_aarch64=("$url/releases/download/v$pkgver/origin-aarch64-unknown-linux-musl")
+sha256sums_x86_64=('{{SHA256_LINUX_X64}}')
+sha256sums_aarch64=('{{SHA256_LINUX_ARM}}')
+
+package() {
+  install -Dm755 "$srcdir/origin-${CARCH/x86_64/x86_64-unknown-linux-musl}" \
+                 "$pkgdir/usr/bin/origin"
+}
