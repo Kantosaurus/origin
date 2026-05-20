@@ -5,8 +5,8 @@
 //! implementation.
 
 pub mod streaming;
-pub mod wire;
 mod token_source;
+pub mod wire;
 
 pub use token_source::{NoAuth, StaticBearer, StaticHeader, TokenSource};
 
@@ -34,18 +34,31 @@ pub struct OpenAiCompat {
 impl OpenAiCompat {
     #[must_use]
     pub fn new(cfg: OpenAiCompatConfig) -> Self {
-        Self { cfg, client: reqwest::Client::new() }
+        Self {
+            cfg,
+            client: reqwest::Client::new(),
+        }
     }
 }
 
 #[async_trait]
 impl Provider for OpenAiCompat {
-    fn name(&self) -> &'static str { self.cfg.name }
+    fn name(&self) -> &'static str {
+        self.cfg.name
+    }
 
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError> {
         let body = wire::encode_request(&req, false);
-        let url = format!("{}{}", self.cfg.base_url.trim_end_matches('/'), self.cfg.chat_path);
-        let mut builder = self.client.post(&url).header("content-type", "application/json").json(&body);
+        let url = format!(
+            "{}{}",
+            self.cfg.base_url.trim_end_matches('/'),
+            self.cfg.chat_path
+        );
+        let mut builder = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json")
+            .json(&body);
         let (hdr, val) = self.cfg.auth.header().await.map_err(|_| ProviderError::Auth)?;
         if !hdr.is_empty() {
             builder = builder.header(hdr, val);
@@ -53,9 +66,15 @@ impl Provider for OpenAiCompat {
         for (h, v) in &self.cfg.extra_headers {
             builder = builder.header(h, v);
         }
-        let resp = builder.send().await.map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
         if resp.status() == StatusCode::OK {
-            let wire: wire::WireResponse = resp.json().await.map_err(|e| ProviderError::Api(format!("decode: {e}")))?;
+            let wire: wire::WireResponse = resp
+                .json()
+                .await
+                .map_err(|e| ProviderError::Api(format!("decode: {e}")))?;
             return Ok(decode_response(wire));
         }
         Err(status_error(resp).await)
@@ -63,8 +82,14 @@ impl Provider for OpenAiCompat {
 
     async fn chat_stream(&self, req: ChatRequest, ring: &origin_stream::Ring) -> Result<(), ProviderError> {
         let body = wire::encode_request(&req, true);
-        let url = format!("{}{}", self.cfg.base_url.trim_end_matches('/'), self.cfg.chat_path);
-        let mut builder = self.client.post(&url)
+        let url = format!(
+            "{}{}",
+            self.cfg.base_url.trim_end_matches('/'),
+            self.cfg.chat_path
+        );
+        let mut builder = self
+            .client
+            .post(&url)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
             .json(&body);
@@ -75,7 +100,10 @@ impl Provider for OpenAiCompat {
         for (h, v) in &self.cfg.extra_headers {
             builder = builder.header(h, v);
         }
-        let resp = builder.send().await.map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
         if !resp.status().is_success() {
             let err = status_error(resp).await;
             ring.close();
@@ -92,8 +120,15 @@ async fn status_error(resp: reqwest::Response) -> ProviderError {
     match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderError::Auth,
         StatusCode::TOO_MANY_REQUESTS => {
-            let retry = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
-            ProviderError::RateLimit { retry_after_secs: retry }
+            let retry = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(1);
+            ProviderError::RateLimit {
+                retry_after_secs: retry,
+            }
         }
         s => {
             let body = resp.text().await.unwrap_or_default();
@@ -107,7 +142,10 @@ fn decode_response(wire: wire::WireResponse) -> ChatResponse {
     if let Some(choice) = wire.choices.into_iter().next() {
         if let Some(text) = choice.message.content {
             if !text.is_empty() {
-                blocks.push(Block::Text { text, cache_marker: None });
+                blocks.push(Block::Text {
+                    text,
+                    cache_marker: None,
+                });
             }
         }
         if let Some(tool_calls) = choice.message.tool_calls {
@@ -117,7 +155,10 @@ fn decode_response(wire: wire::WireResponse) -> ChatResponse {
         }
     }
     ChatResponse {
-        assistant: Message { role: Role::Assistant, blocks },
+        assistant: Message {
+            role: Role::Assistant,
+            blocks,
+        },
         usage: Usage {
             input_tokens: wire.usage.prompt_tokens,
             output_tokens: wire.usage.completion_tokens,

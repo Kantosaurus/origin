@@ -90,9 +90,7 @@ impl Gemini {
     fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth {
             AuthKind::ApiKey(_) => builder,
-            AuthKind::OAuthBearer(token) => {
-                builder.header("Authorization", format!("Bearer {token}"))
-            }
+            AuthKind::OAuthBearer(token) => builder.header("Authorization", format!("Bearer {token}")),
         }
     }
 }

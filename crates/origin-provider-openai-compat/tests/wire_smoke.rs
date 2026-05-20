@@ -33,16 +33,27 @@ async fn happy_path_chat() {
 
     let req = ChatRequest {
         system: String::new(),
-        messages: vec![Message { role: Role::User, blocks: vec![Block::Text { text: "hi".into(), cache_marker: None }] }],
+        messages: vec![Message {
+            role: Role::User,
+            blocks: vec![Block::Text {
+                text: "hi".into(),
+                cache_marker: None,
+            }],
+        }],
         model: "test-model".to_string(),
         tools: vec![],
     };
 
     let resp = provider.chat(req).await.unwrap();
-    let text: String = resp.assistant.blocks.iter().filter_map(|b| match b {
-        Block::Text { text, .. } => Some(text.clone()),
-        _ => None,
-    }).collect();
+    let text: String = resp
+        .assistant
+        .blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
     assert_eq!(text, "hello world");
     assert_eq!(resp.usage.input_tokens, 5);
     assert_eq!(resp.usage.output_tokens, 2);

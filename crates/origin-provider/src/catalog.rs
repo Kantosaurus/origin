@@ -15,9 +15,14 @@ pub enum WireFormat {
 #[derive(Debug, Clone)]
 pub enum AuthScheme {
     None,
-    ApiKey { header: Cow<'static, str>, prefix: Cow<'static, str> },
+    ApiKey {
+        header: Cow<'static, str>,
+        prefix: Cow<'static, str>,
+    },
     OAuth(OAuthSpec),
-    SigV4 { service: Cow<'static, str> },
+    SigV4 {
+        service: Cow<'static, str>,
+    },
     Custom,
 }
 
@@ -85,7 +90,9 @@ pub struct Catalog {
 impl Catalog {
     #[must_use]
     pub fn builtin() -> Self {
-        Self { entries: builtin_catalog() }
+        Self {
+            entries: builtin_catalog(),
+        }
     }
 
     /// Merges user-defined entries into the catalog.

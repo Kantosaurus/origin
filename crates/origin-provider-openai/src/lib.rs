@@ -31,13 +31,22 @@ impl OpenAi {
 
 #[async_trait::async_trait]
 impl origin_provider::Provider for OpenAi {
-    fn name(&self) -> &'static str { self.0.name() }
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
 
-    async fn chat(&self, req: origin_provider::ChatRequest) -> Result<origin_provider::ChatResponse, origin_provider::ProviderError> {
+    async fn chat(
+        &self,
+        req: origin_provider::ChatRequest,
+    ) -> Result<origin_provider::ChatResponse, origin_provider::ProviderError> {
         self.0.chat(req).await
     }
 
-    async fn chat_stream(&self, req: origin_provider::ChatRequest, ring: &origin_stream::Ring) -> Result<(), origin_provider::ProviderError> {
+    async fn chat_stream(
+        &self,
+        req: origin_provider::ChatRequest,
+        ring: &origin_stream::Ring,
+    ) -> Result<(), origin_provider::ProviderError> {
         self.0.chat_stream(req, ring).await
     }
 }

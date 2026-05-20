@@ -89,7 +89,11 @@ pub fn load(path: &Path) -> Result<Vec<ProviderEntry>, CustomLoadError> {
             base_url: Cow::Owned(entry.base_url),
             chat_path: Cow::Owned(entry.chat_path),
             default_model: Cow::Owned(entry.default_model),
-            capabilities: Capabilities { streaming: true, tools: true, ..Default::default() },
+            capabilities: Capabilities {
+                streaming: true,
+                tools: true,
+                ..Default::default()
+            },
         });
     }
     Ok(out)

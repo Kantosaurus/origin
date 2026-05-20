@@ -6,7 +6,11 @@ use origin_tools::builtins::graph_explain::graph_explain_tool;
 fn explains_path_query() {
     let from = EntityId([0xab; 32]);
     let to = EntityId([0xcd; 32]);
-    let q = Query::Path { from, to, max_hops: 5 };
+    let q = Query::Path {
+        from,
+        to,
+        max_hops: 5,
+    };
     let out = graph_explain_tool(&q);
     assert_eq!(out, "shortest path from abababab to cdcdcdcd within 5 hops");
 }
@@ -34,7 +38,9 @@ fn explains_god_nodes_query() {
 
 #[test]
 fn explains_recent_changes_query() {
-    let q = Query::RecentChanges { since_ms: 1_700_000_000_000 };
+    let q = Query::RecentChanges {
+        since_ms: 1_700_000_000_000,
+    };
     let out = graph_explain_tool(&q);
     assert_eq!(out, "nodes changed since unix-ms 1700000000000");
 }
