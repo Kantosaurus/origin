@@ -205,6 +205,33 @@ impl Store {
         Ok(None)
     }
 
+    /// Flush any pending warm-tier bytes to disk as a fresh warm pack. No-op
+    /// if `warm_pending` is empty. Useful at shutdown so unflushed bytes
+    /// survive a daemon restart instead of being dropped from RAM only.
+    ///
+    /// # Errors
+    /// Propagates I/O errors from the pack write.
+    pub fn flush_warm_pending(&self) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock();
+        if inner.warm_pending.is_empty() {
+            return Ok(());
+        }
+        let next_idx = inner.warm_packs.len();
+        let path = inner.cfg.root.join("warm").join(format!("w{next_idx:08}.pack"));
+        let pending = std::mem::take(&mut inner.warm_pending);
+        // Release the lock while doing the (possibly uring-backed) write.
+        drop(inner);
+        write_pack(&path, &pending)?;
+        let r = PackReader::open(&path)?;
+        let mut inner = self.inner.lock();
+        for (ph, _) in &pending {
+            inner.warm_index.insert(*ph, next_idx);
+        }
+        inner.warm_packs.push(r);
+        inner.warm_bytes = 0;
+        Ok(())
+    }
+
     /// Force `h` to migrate Hot/Warm-pending/Warm → Cold (zstd-compressed pack).
     /// No-op if `h` is already cold or unknown.
     ///

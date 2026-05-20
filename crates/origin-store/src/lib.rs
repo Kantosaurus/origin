@@ -106,4 +106,17 @@ impl Store {
             Ok(())
         })
     }
+
+    /// Run `PRAGMA wal_checkpoint(TRUNCATE)` so the WAL is folded back into
+    /// the main database file and truncated. Safe to run on a quiesced
+    /// store; concurrent writers will be queued by the connection mutex.
+    ///
+    /// # Errors
+    /// Propagates rusqlite errors from the PRAGMA.
+    pub fn wal_checkpoint_truncate(&self) -> rusqlite::Result<()> {
+        self.with_conn(|c| {
+            c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            Ok(())
+        })
+    }
 }
