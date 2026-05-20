@@ -5,7 +5,7 @@
 
 use futures_util::StreamExt;
 use origin_provider::sse;
-use origin_provider::ProviderError;
+use origin_provider::{ProviderError, Usage};
 use origin_stream::{Ring, TokenEvent, TokenKind};
 use serde::Deserialize;
 
@@ -13,6 +13,8 @@ use serde::Deserialize;
 struct WireStreamChunk {
     #[serde(default)]
     choices: Vec<WireStreamChoice>,
+    #[serde(default)]
+    usage: Option<WireStreamUsage>,
 }
 
 #[derive(Deserialize)]
@@ -33,10 +35,23 @@ struct WireStreamDelta {
 
 #[derive(Deserialize)]
 struct WireStreamToolCallDelta {
+    /// Position of this tool call within the assistant's response. Required
+    /// to demux concurrent tool calls — `id` and `name` arrive only on the
+    /// first fragment per index, while later fragments only carry `arguments`.
+    #[serde(default)]
+    index: Option<u32>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
     function: Option<WireStreamToolFnDelta>,
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+struct WireStreamUsage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -74,11 +89,18 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
             Err(e) => return Err(ProviderError::Api(format!("sse json: {e}; raw={raw}"))),
         };
 
+        // OpenAI emits `usage` on a trailing frame (with empty `choices`) when
+        // the request set `stream_options.include_usage=true`. Forward the
+        // counts whenever they appear so consumers can record real usage.
+        if let Some(u) = chunk.usage {
+            ring.publish(&TokenEvent::new(TokenKind::Usage, encode_usage(u)))
+                .map_err(|e| ProviderError::Api(e.to_string()))?;
+        }
+
         for choice in chunk.choices {
-            // TODO(P8.x): track `index` field on streaming tool_calls to support concurrent
-            // tool-call demux. Currently consumers cannot disambiguate which tool a
-            // ToolUseDelta belongs to when OpenAI interleaves multiple tool calls.
-            // tool_use_start: a tool-call delta arriving with a fresh id+name.
+            // `index` on each tool_call lets future routing demux concurrent
+            // tool calls. The current ring payload format is unchanged; the
+            // index is preserved on the wire-level struct for downstream use.
             if let Some(tcs) = &choice.delta.tool_calls {
                 for tc in tcs {
                     if let (Some(id), Some(func)) = (tc.id.as_ref(), tc.function.as_ref()) {
@@ -104,15 +126,62 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
                 }
             }
             if choice.finish_reason.is_some() {
-                // TODO(P8.x): set `stream_options.include_usage = true` in the request body and
-                // parse the final `usage` SSE frame to publish a `TokenKind::Usage` event with
-                // token counts. OpenAI omits usage from streaming responses by default.
                 ring.publish(&TokenEvent::new(TokenKind::TurnEnd, Vec::new()))
                     .map_err(|e| ProviderError::Api(e.to_string()))?;
             }
         }
     }
     Ok(())
+}
+
+fn encode_usage(u: WireStreamUsage) -> Vec<u8> {
+    // 4 × u32 BE. Order: input, output, cache_read, cache_creation. OpenAI
+    // does not report cache token counts on Chat Completions streams.
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(&u.prompt_tokens.to_be_bytes());
+    out.extend_from_slice(&u.completion_tokens.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out
+}
+
+/// Test-only view of a parsed `OpenAI` SSE frame.
+///
+/// Exposes the `index` field on the first observed `tool_call` delta and any
+/// `usage` counts on the trailing frame (only present when
+/// `stream_options.include_usage=true`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TestFrame {
+    pub index: Option<u32>,
+    pub usage: Option<Usage>,
+}
+
+/// Parse a single SSE `data: …` line into a `TestFrame`. Returns `None` for
+/// non-data lines, blank payloads, `[DONE]`, or invalid JSON.
+#[must_use]
+pub fn parse_chunk_for_test(line: &[u8]) -> Option<TestFrame> {
+    let text = std::str::from_utf8(line).ok()?;
+    let payload = text
+        .trim_start()
+        .strip_prefix("data:")
+        .map_or(text.trim(), str::trim_start)
+        .trim();
+    if payload.is_empty() || payload == "[DONE]" {
+        return None;
+    }
+    let chunk: WireStreamChunk = serde_json::from_str(payload).ok()?;
+    let index = chunk
+        .choices
+        .iter()
+        .find_map(|c| c.delta.tool_calls.as_ref())
+        .and_then(|tcs| tcs.iter().find_map(|tc| tc.index));
+    let usage = chunk.usage.map(|u| Usage {
+        input_tokens: u.prompt_tokens,
+        output_tokens: u.completion_tokens,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    });
+    Some(TestFrame { index, usage })
 }
 
 /// Panic-free synchronous SSE wire-chunk decoder for fuzz targets.
