@@ -36,3 +36,8 @@ uring = ["dep:tokio-uring"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-uring = { workspace = true, optional = true }
+
+[[bench]]
+name = "uring_throughput"
+harness = false
+required-features = ["uring"]

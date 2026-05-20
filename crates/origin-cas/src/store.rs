@@ -342,13 +342,33 @@ fn flush_warm(inner: &mut Inner) -> Result<(), StoreError> {
     }
     let next_idx = inner.warm_packs.len();
     let path = inner.cfg.root.join("warm").join(format!("w{next_idx:08}.pack"));
-    let mut b = PackBuilder::create(&path)?;
     let pending = std::mem::take(&mut inner.warm_pending);
-    for (h, bytes) in pending {
-        b.append(h, &bytes)?;
-        inner.warm_index.insert(h, next_idx);
+
+    // On Linux with the `uring` cargo feature, route the pack flush through
+    // the io_uring writer. Everywhere else, fall back to the std BufWriter
+    // path that `PackBuilder` already implements.
+    #[cfg(all(target_os = "linux", feature = "uring"))]
+    {
+        let path_for_writer = path.clone();
+        let pending_for_writer = pending.clone();
+        let res: Result<(), crate::packfile::PackError> = tokio_uring::start(async move {
+            crate::packfile_uring::write_payloads_uring(&path_for_writer, &pending_for_writer).await
+        });
+        res?;
+        for (h, _) in &pending {
+            inner.warm_index.insert(*h, next_idx);
+        }
     }
-    let _ = b.finalize()?;
+    #[cfg(not(all(target_os = "linux", feature = "uring")))]
+    {
+        let mut b = PackBuilder::create(&path)?;
+        for (h, bytes) in &pending {
+            b.append(*h, bytes)?;
+            inner.warm_index.insert(*h, next_idx);
+        }
+        let _ = b.finalize()?;
+    }
+
     let r = PackReader::open(&path)?;
     inner.warm_packs.push(r);
     inner.warm_bytes = 0;
