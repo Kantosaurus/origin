@@ -1,156 +1,39 @@
-//! `OpenAI` Chat Completions provider (non-streaming + SSE streaming).
-//!
-//! Implements the canonical `origin_provider::Provider` trait against
-//! `POST /v1/chat/completions` with bearer-token auth. Streaming reuses the
-//! shared `origin_provider::sse` pump; non-streaming tool calls are mapped
-//! through the shared `origin_provider::openai_tools` module.
+//! `OpenAI` provider — thin wrapper around `origin-provider-openai-compat`.
 
-pub mod streaming;
-mod wire;
-
-use async_trait::async_trait;
-use origin_core::types::{Block, Message, Role};
-use origin_provider::openai_tools::tool_call_to_block;
-use origin_provider::{ChatRequest, ChatResponse, Provider, ProviderError, Usage};
-use reqwest::StatusCode;
+use origin_provider_openai_compat::{OpenAiCompat, OpenAiCompatConfig, StaticBearer};
 
 const DEFAULT_BASE: &str = "https://api.openai.com";
 
-/// `OpenAI` provider backed by Chat Completions with bearer-token auth.
-pub struct OpenAi {
-    api_key: String,
-    base: String,
-    client: reqwest::Client,
-}
+pub struct OpenAi(OpenAiCompat);
 
 impl OpenAi {
-    /// Construct with the default base URL (`https://api.openai.com`).
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_base_url(api_key, DEFAULT_BASE)
     }
 
-    /// Construct against an arbitrary base URL (for testing and gateways).
     #[must_use]
     pub fn with_base_url(api_key: impl Into<String>, base: &str) -> Self {
-        Self {
-            api_key: api_key.into(),
-            base: base.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
-        }
+        let cfg = OpenAiCompatConfig {
+            name: "openai",
+            base_url: base.trim_end_matches('/').to_string(),
+            chat_path: "/v1/chat/completions".to_string(),
+            auth: StaticBearer::new(api_key.into()),
+            extra_headers: Vec::new(),
+        };
+        Self(OpenAiCompat::new(cfg))
     }
 }
 
-#[async_trait]
-impl Provider for OpenAi {
-    fn name(&self) -> &'static str {
-        "openai"
+#[async_trait::async_trait]
+impl origin_provider::Provider for OpenAi {
+    fn name(&self) -> &'static str { self.0.name() }
+
+    async fn chat(&self, req: origin_provider::ChatRequest) -> Result<origin_provider::ChatResponse, origin_provider::ProviderError> {
+        self.0.chat(req).await
     }
 
-    async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError> {
-        let body = wire::encode_request(&req, false);
-        let url = format!("{}/v1/chat/completions", self.base);
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-
-        if resp.status() == StatusCode::OK {
-            let wire: wire::WireResponse = resp
-                .json()
-                .await
-                .map_err(|e| ProviderError::Api(format!("decode: {e}")))?;
-            return Ok(decode_response(wire));
-        }
-        Err(status_error(resp).await)
+    async fn chat_stream(&self, req: origin_provider::ChatRequest, ring: &origin_stream::Ring) -> Result<(), origin_provider::ProviderError> {
+        self.0.chat_stream(req, ring).await
     }
-
-    async fn chat_stream(&self, req: ChatRequest, ring: &origin_stream::Ring) -> Result<(), ProviderError> {
-        let body = wire::encode_request(&req, true);
-        let url = format!("{}/v1/chat/completions", self.base);
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            let err = status_error(resp).await;
-            ring.close();
-            return Err(err);
-        }
-
-        let result = streaming::parse_into_ring(resp, ring).await;
-        ring.close();
-        result
-    }
-}
-
-/// Map a non-2xx `reqwest::Response` to the canonical `ProviderError` variant.
-///
-/// - 401 / 403 → `ProviderError::Auth`
-/// - 429 → `ProviderError::RateLimit` (parses `retry-after` header, defaults to 1)
-/// - other → `ProviderError::Api(format!("status {s}: {body}"))`
-async fn status_error(resp: reqwest::Response) -> ProviderError {
-    let status = resp.status();
-    match status {
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderError::Auth,
-        StatusCode::TOO_MANY_REQUESTS => {
-            let retry = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(1);
-            ProviderError::RateLimit {
-                retry_after_secs: retry,
-            }
-        }
-        s => {
-            let body = resp.text().await.unwrap_or_default();
-            ProviderError::Api(format!("status {s}: {body}"))
-        }
-    }
-}
-
-fn decode_response(wire: wire::WireResponse) -> ChatResponse {
-    let mut blocks: Vec<Block> = Vec::new();
-    let first = wire.choices.into_iter().next();
-    if let Some(choice) = first {
-        if let Some(text) = choice.message.content {
-            if !text.is_empty() {
-                blocks.push(Block::Text {
-                    text,
-                    cache_marker: None,
-                });
-            }
-        }
-        if let Some(tool_calls) = choice.message.tool_calls {
-            for tc in &tool_calls {
-                blocks.push(tool_call_to_block(tc));
-            }
-        }
-    }
-
-    let assistant = Message {
-        role: Role::Assistant,
-        blocks,
-    };
-    let usage = Usage {
-        input_tokens: wire.usage.prompt_tokens,
-        output_tokens: wire.usage.completion_tokens,
-        cache_read_input_tokens: 0,
-        cache_creation_input_tokens: 0,
-    };
-    ChatResponse { assistant, usage }
 }
