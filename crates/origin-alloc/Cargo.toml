@@ -21,7 +21,7 @@ panic = "warn"
 
 [features]
 default = []
-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "dep:libc"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "dep:libc"]
 
 [dependencies]
 thiserror = "1"
@@ -29,6 +29,7 @@ tracing = { workspace = true }
 
 tikv-jemallocator = { workspace = true, optional = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
+tikv-jemalloc-sys = { version = "0.6", optional = true }
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
