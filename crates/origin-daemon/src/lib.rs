@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod compactor;
 pub mod memory_wiring;
+pub mod pairing;
 pub mod protocol;
 pub mod provider_factory;
 pub mod session;

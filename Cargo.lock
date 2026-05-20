@@ -3469,6 +3469,7 @@ dependencies = [
  "origin-trace",
  "parking_lot",
  "proptest",
+ "rand 0.8.6",
  "rkyv",
  "rusqlite",
  "serde",
