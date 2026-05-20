@@ -15,8 +15,7 @@ use crate::{Embedder, EMBED_DIM};
 /// Minimum re-ranked score for a candidate to be included in the injected block.
 const MIN_SCORE: f32 = 0.2;
 
-/// Milliseconds in a day, used when converting `created_at_ms` to fractional days.
-const MS_PER_DAY: f32 = 86_400_000.0;
+use crate::MS_PER_DAY;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 

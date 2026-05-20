@@ -61,6 +61,19 @@ pub enum Cmd {
     },
     /// Import a session/skill set from another harness (P14.B.7).
     Import(crate::import::ImportArgs),
+    /// List and describe known providers from the builtin catalog.
+    Providers {
+        #[command(subcommand)]
+        sub: ProvidersSub,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ProvidersSub {
+    /// List every catalog entry (id, display name, wire, auth, capabilities).
+    Ls,
+    /// Print one provider's full config.
+    Describe { id: String },
 }
 
 #[derive(Subcommand)]
@@ -92,6 +105,15 @@ pub enum KeyringSub {
     List { provider: String },
     /// Remove a provider account secret.
     Remove { provider: String, account: String },
+    /// Launch the OAuth flow for an OAuth provider and persist the tokens.
+    Login {
+        /// Catalog id of an OAuth-backed provider, e.g. "github-copilot" or
+        /// "anthropic-oauth".
+        provider: String,
+        /// Account name to store the tokens under. Defaults to "default".
+        #[arg(default_value = "default")]
+        account: String,
+    },
 }
 
 #[derive(Subcommand)]
