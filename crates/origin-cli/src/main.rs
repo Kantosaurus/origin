@@ -35,12 +35,36 @@ enum Cmd {
         #[command(subcommand)]
         sub: TraceSub,
     },
+    /// Start or redeem a pairing session for remote QUIC clients (P13.2).
+    Pair {
+        #[command(subcommand)]
+        sub: PairSub,
+    },
 }
 
 #[derive(Subcommand)]
 enum TraceSub {
     /// Print spans matching the given filters.
     Query(TraceQuery),
+}
+
+#[derive(Subcommand)]
+enum PairSub {
+    /// Daemon-side: show a 6-digit pairing code.
+    Start {
+        #[arg(long, default_value_t = 60)]
+        ttl_secs: u32,
+    },
+    /// Client-side: redeem a code against a remote daemon.
+    Redeem {
+        /// Remote URL: `origin://host:port#fingerprint`.
+        url: String,
+        /// The 6-digit code shown on the daemon host.
+        code: String,
+        /// Stable device identifier (defaults to hostname).
+        #[arg(long)]
+        device_id: Option<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -59,11 +83,19 @@ async fn main() -> Result<()> {
     // Dispatch a subcommand if one was given, otherwise fall through to the
     // TUI entry path (preserves the existing env-driven invocation).
     let cli = Cli::parse();
-    if let Some(Cmd::Trace {
-        sub: TraceSub::Query(q),
-    }) = cli.cmd
-    {
-        return origin_cli::trace_cmd::invoke(q).map_err(|e| anyhow::anyhow!("{e}"));
+    match cli.cmd {
+        Some(Cmd::Trace {
+            sub: TraceSub::Query(q),
+        }) => {
+            return origin_cli::trace_cmd::invoke(q).map_err(|e| anyhow::anyhow!("{e}"));
+        }
+        Some(Cmd::Pair { sub }) => {
+            return match sub {
+                PairSub::Start { ttl_secs } => pair_start(ttl_secs).await,
+                PairSub::Redeem { url, code, device_id } => pair_redeem(&url, &code, device_id).await,
+            };
+        }
+        None => {}
     }
 
     let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
@@ -369,6 +401,67 @@ async fn send_decision(path: &str, decision: &ClientMessage) -> Result<()> {
     // Errors here are non-fatal — the decision has already been sent.
     let _ = client.read_frame_body().await;
     Ok(())
+}
+
+/// `origin pair start [--ttl-secs N]`. Sends a `PairStart` to the
+/// local daemon and prints the 6-digit code it returns.
+async fn pair_start(ttl_secs: u32) -> Result<()> {
+    let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
+    let mut c = Connector::connect(&path).await?;
+    let msg = ClientMessage::PairStart { ttl_secs };
+    let body = serde_json::to_vec(&msg)?;
+    c.write_raw(&encode(1, FrameKind::Request, &body)).await?;
+    let resp = c.read_frame_body().await?;
+    let ev: StreamEvent = serde_json::from_slice(&resp)?;
+    match ev {
+        StreamEvent::PairCode {
+            code,
+            expires_in_secs,
+        } => {
+            println!("pairing code: {code} (valid {expires_in_secs}s)");
+            Ok(())
+        }
+        other => Err(anyhow::anyhow!("unexpected: {other:?}")),
+    }
+}
+
+/// `origin pair redeem <origin-url> <code> [--device-id DEV]`. Dials
+/// the remote daemon over QUIC, redeems the code, and prints the
+/// minted bearer.
+async fn pair_redeem(url: &str, code: &str, device_id: Option<String>) -> Result<()> {
+    let device = device_id.unwrap_or_else(|| {
+        hostname::get()
+            .ok()
+            .and_then(|n| n.into_string().ok())
+            .unwrap_or_else(|| "unknown".into())
+    });
+    let parsed = origin_cli::admin_url::parse_origin_url(url)?;
+    let ca = parsed.fingerprint_to_ca_placeholder();
+    let mut c = origin_ipc::quic::QuicConnector::connect(parsed.addr, "origin-daemon", &ca)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let msg = ClientMessage::PairRedeem {
+        code: code.into(),
+        device_id: device.clone(),
+    };
+    let body = serde_json::to_vec(&msg)?;
+    c.write_raw(&encode(1, FrameKind::Request, &body))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (_kind, resp) = c.read_frame().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ev: StreamEvent = serde_json::from_slice(&resp)?;
+    match ev {
+        StreamEvent::PairIssued {
+            bearer,
+            device_id,
+            ttl_secs,
+        } => {
+            println!("paired device={device_id} ttl={ttl_secs}s");
+            println!("token: {bearer}");
+            Ok(())
+        }
+        other => Err(anyhow::anyhow!("pair failed: {other:?}")),
+    }
 }
 
 fn default_path() -> String {
