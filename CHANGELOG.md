@@ -4,6 +4,33 @@ All notable changes to `origin` will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely;
 versions correspond to phase milestones from the implementation plan.
 
+## 1.0.0 — 2026-06-17
+
+### Added
+- **Replay infrastructure** (`origin-replay`): `.origin-replay` bundle format (zstd-tar with manifest), `Recorder` trait with `Null`/`File` backends, `Frame` enum covering provider/IPC/CAS/clock/RNG events, virtual clock, seeded SplitMix64 RNG, opt-in `recorder` feature on `origin-provider`, `origin-ipc`, `origin-cas` via static `recorder_hook` registries.
+- **Fuzz CI** (`.github/workflows/fuzz.yml`): nightly 5-target × 5-min cargo-fuzz matrix covering `ipc_frame` validator, `fastcdc_boundary` chunker, `anthropic_stream` + `openai_stream` SSE parsers, `streaming_json` rkyv decoder.
+- **Migration** (`origin-migrate`, `origin import`): adapters for Claude Code (jsonl + SKILL.md), jcode (rusqlite reader), opencode (storage/*.json); idempotent content-hash dedupe via new `Store::{contains,insert}_migrated_{session,skill}` + V6 SQLite migration; `--dry-run` / `--apply` / `--json` modes.
+- **Benchmarks** (`origin-bench`): 8-task fixed set, origin + generic subprocess runners, Markdown + JSON reports.
+- **Docs site** (`docs/site/`): 11-chapter mdBook (intro/quickstart/architecture/configuration/providers/skills/hooks/mcp/migration/sdk/troubleshooting); `origin --tutorial` 7-step guided tour; clap_mangen manpages via `xtask manpages`.
+- **Release engineering** (`.github/workflows/release.yml`): 6-target matrix build (musl x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64/aarch64) with cosign keyless signing + SLSA build-provenance attestation; packaging templates for Homebrew (`packaging/homebrew/origin.rb.tmpl`), winget, AUR, cargo-binstall metadata; `xtask release` stamps `{{VERSION}}` + `{{SHA256_*}}` placeholders.
+
+### Gates
+- Perf gate workflow asserts read-only task `wall_ms` worst ≤ 80 ms.
+- Unsafe-audit workflow asserts `unsafe` only in `origin-cas`, `origin-tui`, `origin-ipc`.
+- Security review signoff doc (`docs/security/p14-security-review.md`) for sandbox + KeyVault.
+- Three migration paths validated by `crates/origin-migrate/tests/three_paths.rs`.
+
+### Spec criteria
+1. Deterministic replay + fuzz suite green: ✅ (`origin-replay`, `.github/workflows/fuzz.yml`).
+2. Perf gates: ✅ (`.github/workflows/perf-gate.yml`).
+3. Zero-unsafe in surface crates: ✅ (`.github/workflows/unsafe-audit.yml`).
+4. Sandbox + KeyVault review: ⏳ (signoff doc landed; reviewer signature pending).
+5. Three migration paths validated: ✅ (`tests/three_paths.rs`).
+
+### Known follow-ups (out of GA scope)
+- A.9–A.11 fuzz targets compile only under nightly Rust due to `anndists`/`ort-sys` transitive deps requiring `edition2024`; the GA build uses Rust 1.83 (MSRV) and the fuzz crate is excluded from the workspace. CI workflow runs against nightly.
+- Apply-mode of `origin import` (vs dry-run) currently returns the same content-hash summary; persistent write through `apply_with_store` requires a CLI Store handle to be threaded — slated for a 1.0.x patch.
+
 ## Phase 13 — QUIC Remote IPC + Headless Polish (2026-05-20)
 
 - New `origin-ipc::quic` transport: `QuicListener` / `QuicConnector` /
