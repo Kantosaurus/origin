@@ -18,17 +18,17 @@ fn update_summary_writes_column() {
         }],
     };
     store
-        .persist_message(&s.id.to_string(), 0, &m)
+        .persist_message(&s.id, 0, &m)
         .expect("persist message");
     store
-        .update_summary(&s.id.to_string(), 0, "first-summary")
+        .update_summary(&s.id, 0, "first-summary")
         .expect("update");
     drop(store);
     let conn = rusqlite::Connection::open(&db).expect("re-open");
     let got: String = conn
         .query_row(
             "SELECT summary FROM messages WHERE session_id = ?1 AND turn_index = ?2",
-            rusqlite::params![s.id.to_string(), 0],
+            rusqlite::params![&s.id, 0],
             |r| r.get(0),
         )
         .expect("query");

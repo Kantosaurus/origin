@@ -37,7 +37,7 @@ fn pair_round_trip_then_validate() {
     let evs = dispatch(&pairing, &store, ClientMessage::PairStart { ttl_secs: 60 });
     let code = match &evs[0] {
         StreamEvent::PairCode { code, .. } => code.clone(),
-        _ => panic!("expected PairCode"),
+        other => unreachable!("expected PairCode, got {other:?}"),
     };
     let evs = dispatch(
         &pairing,
@@ -49,7 +49,7 @@ fn pair_round_trip_then_validate() {
     );
     let bearer = match &evs[0] {
         StreamEvent::PairIssued { bearer, .. } => bearer.clone(),
-        other => panic!("expected PairIssued, got {other:?}"),
+        other => unreachable!("expected PairIssued, got {other:?}"),
     };
     assert_eq!(store.validate(&bearer).as_deref(), Some("laptop"));
     assert!(store.validate("orb_nope").is_none());
