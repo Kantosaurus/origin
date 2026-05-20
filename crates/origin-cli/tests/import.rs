@@ -8,6 +8,7 @@ fn dry_run_against_claude_code_fixture_summarizes() {
         from: PathBuf::from("../origin-migrate/tests/fixtures/claude-code"),
         apply: false,
         json: true,
+        db: None,
     };
     let report = run_import(&args).expect("run import");
     assert_eq!(report.sessions_inserted, 1);

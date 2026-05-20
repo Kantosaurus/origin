@@ -92,6 +92,22 @@ pub async fn sessions(action: SessionsAction) -> Result<()> {
             println!("ok");
             Ok(())
         }
+        StreamEvent::SessionResumed {
+            session_id,
+            messages_loaded,
+            restored_to_turn,
+            had_resume_token,
+        } => {
+            let suffix = if had_resume_token {
+                " (resume token present)"
+            } else {
+                ""
+            };
+            println!(
+                "resumed {session_id}: {messages_loaded} messages, last turn {restored_to_turn}{suffix}"
+            );
+            Ok(())
+        }
         StreamEvent::AdminError { message } => Err(anyhow::anyhow!("{message}")),
         other => Err(anyhow::anyhow!("unexpected: {other:?}")),
     }

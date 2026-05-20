@@ -32,6 +32,9 @@ type SharedApp = Arc<Mutex<App>>;
 type SharedComposer = Arc<Mutex<Composer>>;
 type SharedWidget = Arc<Mutex<StreamWidget>>;
 
+// CLI subcommand dispatch is intentionally inlined here; splitting it into
+// per-subcommand entry helpers is a follow-up polish item.
+#[allow(clippy::too_many_lines)]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     // Dispatch a subcommand if one was given, otherwise fall through to the
@@ -209,21 +212,22 @@ async fn run_event_loop(
 /// daemon closes the connection.
 fn spawn_plan_subscription(path: String, wiring: Arc<Mutex<PlanPanelWiring>>, render: Handle) {
     spawn_in(TaskClass::Realtime, async move {
-        let mut client = match Connector::connect(&path).await {
-            Ok(c) => c,
-            Err(_) => return,
+        let Ok(mut client) = Connector::connect(&path).await else {
+            return;
         };
-        let body = match serde_json::to_vec(&ClientMessage::SubscribePlan) {
-            Ok(b) => b,
-            Err(_) => return,
+        let Ok(body) = serde_json::to_vec(&ClientMessage::SubscribePlan) else {
+            return;
         };
-        if client.write_raw(&encode(1, FrameKind::Request, &body)).await.is_err() {
+        if client
+            .write_raw(&encode(1, FrameKind::Request, &body))
+            .await
+            .is_err()
+        {
             return;
         }
         loop {
-            let frame = match client.read_frame_body().await {
-                Ok(b) => b,
-                Err(_) => break,
+            let Ok(frame) = client.read_frame_body().await else {
+                break;
             };
             let ev: StreamEvent = match serde_json::from_slice(&frame) {
                 Ok(v) => v,

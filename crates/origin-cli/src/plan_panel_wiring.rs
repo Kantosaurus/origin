@@ -1,32 +1,19 @@
-//! Plan side-panel wiring for the cli (P9.9).
+//! Plan side-panel wiring for the cli.
 //!
-//! Phase 9 introduced the `origin-plan` CRDT, the `origin-swarm` coordinator,
-//! and the `origin-tui::widgets::plan_panel::PlanPanel` widget. The intended
-//! end-to-end shape for the cli is:
+//! Wire shape (P9.9 → P10):
 //!
-//! 1. The daemon owns a `PlanHandle` (op-log + broadcast sender).
-//! 2. The cli, on connect, subscribes to `PlanHandle::watch()` and receives a
-//!    `tokio::sync::broadcast::Receiver<OpEnvelope>`.
-//! 3. Each received op flows through [`PlanPanel::apply_op`]; the panel
-//!    re-folds the log; the cli re-renders.
+//! 1. The daemon hosts a process-wide
+//!    [`PlanBus`](origin_daemon::plan_bus::PlanBus); swarm coordinators
+//!    publish each successful `PlanHandle::apply` op to it.
+//! 2. The cli sends [`ClientMessage::SubscribePlan`] over the IPC socket;
+//!    the daemon spawns a relay task that forwards every envelope as a
+//!    [`StreamEvent::PlanOp`] frame.
+//! 3. The cli's IPC loop deserialises the frame and calls
+//!    [`Wiring::ingest`]; the panel re-folds the log; the cli re-renders.
 //!
-//! The cross-process plumbing for step 1+2 (broadcast over the existing
-//! `origin-ipc` framing) is out of scope for P9.9 — the daemon does not yet
-//! expose a `PlanHandle` over IPC. P9.9's hard test gate is the widget unit
-//! tests in `crates/origin-tui/tests/plan_panel.rs`.
-//!
-//! This module pins the in-process shape so a future phase has a single
-//! wiring seam to plug daemon-side broadcast into. [`Wiring::new`] gives us a
-//! ready-to-render panel; [`Wiring::ingest`] is the call site that will be
-//! driven by the broadcast receiver loop. The cli renderer can then call
-//! `wiring.panel().render()` and write the resulting [`PlanLine`]s into a
-//! `Grid` column the same way `Panel::render` does.
-//!
-//! TODO(p10): replace [`Wiring::ingest`]'s manual feed with a
-//! `tokio::sync::broadcast::Receiver<OpEnvelope>` subscription point. The
-//! daemon already broadcasts `StreamEvent`s; extending the protocol to carry
-//! a `PlanOp` frame and threading `PlanHandle::subscribe()` through
-//! `origin-daemon` is the remaining work.
+//! [`Wiring::ingest`] is the single seam the cli's IPC loop drives. The
+//! widget unit tests in `crates/origin-tui/tests/plan_panel.rs` cover the
+//! fold semantics; [`tests`] below covers the in-process feed path.
 
 use origin_plan::OpEnvelope;
 use origin_tui::widgets::plan_panel::{PlanLine, PlanPanel};
@@ -34,8 +21,7 @@ use origin_tui::widgets::plan_panel::{PlanLine, PlanPanel};
 /// In-process wiring for the plan side panel.
 ///
 /// Wraps [`PlanPanel`] so the cli has a single seam to feed plan ops into.
-/// When daemon-side broadcast lands, the `ingest` call site becomes the
-/// receiver-loop branch.
+/// The daemon-driven [`StreamEvent::PlanOp`] receive loop calls [`Self::ingest`].
 #[derive(Debug, Default)]
 pub struct Wiring {
     panel: PlanPanel,
@@ -48,10 +34,8 @@ impl Wiring {
         Self::default()
     }
 
-    /// Apply a plan op to the underlying panel.
-    ///
-    /// The daemon-driven broadcast loop will call this from its
-    /// `tokio::select!` branch when P10 wires it up.
+    /// Apply a plan op to the underlying panel. Called by the cli's IPC
+    /// receive loop for every [`StreamEvent::PlanOp`] frame.
     pub fn ingest(&mut self, op: OpEnvelope) {
         self.panel.apply_op(op);
     }
