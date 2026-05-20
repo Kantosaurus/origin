@@ -7051,6 +7051,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
+ "serde_json",
  "syn 2.0.117",
  "tempfile",
  "thiserror 1.0.69",
