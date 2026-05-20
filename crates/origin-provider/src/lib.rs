@@ -4,6 +4,7 @@
 //! format. Multi-provider support is achieved by per-provider crates that
 //! `impl Provider for …`.
 
+pub mod catalog;
 pub mod ndjson;
 pub mod openai_tools;
 pub mod sse;
