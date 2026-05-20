@@ -7,6 +7,7 @@
 pub mod catalog;
 mod catalog_rows;
 pub use catalog_rows::builtin_catalog;
+pub mod custom;
 pub mod ndjson;
 pub mod openai_tools;
 pub mod sse;
