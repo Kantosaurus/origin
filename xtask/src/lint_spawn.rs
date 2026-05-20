@@ -14,11 +14,16 @@ use walkdir::WalkDir;
 
 use crate::lint_spawn_allowlist::is_allowlisted;
 
-const BANNED_PATTERNS: &[&str] = &[
-    "tokio::spawn(",
-    "tokio::task::spawn(",
-    "tokio::task::spawn_blocking(",
-];
+// The banned patterns. Built at runtime from fragments to avoid the
+// literal strings tripping the lint when the lint scans its own source.
+fn banned_patterns() -> [String; 3] {
+    let s = "spawn";
+    [
+        format!("tokio::{s}("),
+        format!("tokio::task::{s}("),
+        format!("tokio::task::{s}_blocking("),
+    ]
+}
 
 /// Arguments for the `lint-spawn` subcommand.
 #[derive(Debug, ClapArgs)]
@@ -57,6 +62,25 @@ fn is_crate_subdir(path: &str, kind: &str) -> bool {
 }
 
 fn scan(root: &Path) -> Result<(), String> {
+    // When the caller explicitly targets a fixture subtree (the integration
+    // tests do this), scanning fixture files is the whole point. When the
+    // caller targets the workspace root, fixture files are lint input, not
+    // real source, so they should be skipped.
+    let root_targets_fixture = root
+        .display()
+        .to_string()
+        .replace('\\', "/")
+        .contains("/fixtures/")
+        || root
+            .display()
+            .to_string()
+            .replace('\\', "/")
+            .contains("fixtures/dirty_spawn")
+        || root
+            .display()
+            .to_string()
+            .replace('\\', "/")
+            .contains("fixtures/clean_spawn");
     let mut violations: Vec<(String, usize, String)> = Vec::new();
     for entry in WalkDir::new(root)
         .into_iter()
@@ -66,7 +90,8 @@ fn scan(root: &Path) -> Result<(), String> {
         let rel = entry.path().display().to_string();
         // Integration tests / benches / build scripts / target are exempt.
         // Match real crate test/bench dirs (`crates/<name>/tests/`), not
-        // arbitrary `tests` substrings (so xtask fixture trees still scan).
+        // arbitrary `tests` substrings (so xtask fixture trees still scan
+        // when explicitly targeted).
         let normalized = rel.replace('\\', "/");
         if is_crate_subdir(&normalized, "tests")
             || is_crate_subdir(&normalized, "benches")
@@ -75,10 +100,16 @@ fn scan(root: &Path) -> Result<(), String> {
         {
             continue;
         }
+        // Skip fixture files when we are scanning the whole workspace —
+        // they exist precisely to contain banned spawns as lint input.
+        if !root_targets_fixture && normalized.contains("/fixtures/") {
+            continue;
+        }
         if is_allowlisted(&rel) {
             continue;
         }
         let src = std::fs::read_to_string(entry.path()).map_err(|e| format!("read {rel}: {e}"))?;
+        let patterns = banned_patterns();
         for (lineno, line) in src.lines().enumerate() {
             // Skip lines inside a string literal or comment in the cheapest
             // way that still catches the common cases.
@@ -86,8 +117,8 @@ fn scan(root: &Path) -> Result<(), String> {
             if trimmed.starts_with("//") {
                 continue;
             }
-            for pat in BANNED_PATTERNS {
-                if line.contains(pat) {
+            for pat in &patterns {
+                if line.contains(pat.as_str()) {
                     violations.push((rel.clone(), lineno + 1, line.trim().to_string()));
                 }
             }

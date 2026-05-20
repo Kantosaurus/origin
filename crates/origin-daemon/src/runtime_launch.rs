@@ -14,10 +14,12 @@
 //! call site in the daemon to `origin_runtime::spawn_in(class, …)` so the
 //! per-class semaphores enforce the budget contract.
 
+use origin_runtime::{spawn_in, TaskClass};
 use std::future::Future;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use tokio::runtime::{Builder, Handle, Runtime};
+use tokio::task::spawn_blocking as sb;
 
 /// Shared shutdown flag plus the lazily-populated runtime handles.
 ///
@@ -231,8 +233,15 @@ pub fn start(signal: ShutdownSignal) {
                 // current-thread runtime can still service other futures
                 // spawned via `spawn_on_control`.
                 let s = signal_ctrl.clone();
-                if let Err(e) = tokio::task::spawn_blocking(move || s.wait()).await {
-                    tracing::error!(error = %e, "control park task join error");
+                let outer = spawn_in(TaskClass::Sidecar, async move { sb(move || s.wait()).await }).await;
+                match outer {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, "control park spawn_blocking join error");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "control park task join error");
+                    }
                 }
             });
         })

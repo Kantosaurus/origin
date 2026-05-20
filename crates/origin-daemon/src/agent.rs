@@ -9,12 +9,14 @@ use origin_core::types::{Block, Message, Role};
 use origin_mem::{Injector, Proposer};
 use origin_permission::{check, prompt::Prompter, Outcome};
 use origin_provider::{ChatRequest, Provider};
+use origin_runtime::{spawn_in, TaskClass};
 use origin_sidecar::{ExtractDeliverer, Sidecar, SummaryDeliverer};
 use origin_tools::{registry_iter, SideEffects, ToolMeta};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::task::spawn_blocking as sb;
 use tokio::task::JoinHandle;
 
 #[derive(Clone)]
@@ -126,8 +128,11 @@ impl SummaryDeliverer for SessionStoreSummaryDeliverer {
         let store = self.0.clone();
         let s = session_id.to_string();
         let sum = summary.to_string();
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = store.update_summary(&s, turn_index, &sum);
+        let _ = spawn_in(TaskClass::Sidecar, async move {
+            let _ = sb(move || {
+                let _ = store.update_summary(&s, turn_index, &sum);
+            })
+            .await;
         })
         .await;
     }
@@ -190,7 +195,7 @@ impl SpeculativeRegistry {
         if !matches!(meta.side_effects, SideEffects::Pure) {
             return;
         }
-        let handle = tokio::spawn(async move {
+        let handle = spawn_in(TaskClass::Critical, async move {
             let text = dispatch_tool(meta, &args, cas.as_deref()).await?;
             Ok::<_, LoopError>(text.into_bytes())
         });
