@@ -50,4 +50,60 @@ impl Store {
         let conn = self.conn.lock().expect("store mutex poisoned");
         f(&conn)
     }
+
+    /// True iff a migrated session with this content-key was already inserted.
+    ///
+    /// # Errors
+    /// Propagates rusqlite errors from the query.
+    pub fn contains_migrated_session(&self, key: &str) -> rusqlite::Result<bool> {
+        self.with_conn(|c| {
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM migrated_sessions WHERE key = ?",
+                [key],
+                |r| r.get(0),
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    /// Insert a migrated session keyed by `key` with JSON `body`.
+    ///
+    /// # Errors
+    /// Propagates rusqlite errors (including UNIQUE violations) from the insert.
+    pub fn insert_migrated_session(&self, key: &str, body_json: &str) -> rusqlite::Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO migrated_sessions(key, body) VALUES(?, ?)",
+                rusqlite::params![key, body_json],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// True iff a migrated skill with this content-key was already inserted.
+    ///
+    /// # Errors
+    /// Propagates rusqlite errors from the query.
+    pub fn contains_migrated_skill(&self, key: &str) -> rusqlite::Result<bool> {
+        self.with_conn(|c| {
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM migrated_skills WHERE key = ?", [key], |r| {
+                r.get(0)
+            })?;
+            Ok(n > 0)
+        })
+    }
+
+    /// Insert a migrated skill keyed by `key` with JSON `body`.
+    ///
+    /// # Errors
+    /// Propagates rusqlite errors (including UNIQUE violations) from the insert.
+    pub fn insert_migrated_skill(&self, key: &str, body_json: &str) -> rusqlite::Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO migrated_skills(key, body) VALUES(?, ?)",
+                rusqlite::params![key, body_json],
+            )?;
+            Ok(())
+        })
+    }
 }
