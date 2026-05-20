@@ -1,0 +1,4 @@
+{"type":"user","content":"hello"}
+{"type":"assistant","content":"hi there"}
+{"type":"user","content":"can you read foo.rs?"}
+{"type":"assistant","content":"sure"}
