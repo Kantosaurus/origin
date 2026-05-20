@@ -1,0 +1,40 @@
+name: Fuzz
+on:
+  schedule:
+    - cron: '0 6 * * *'   # nightly at 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - ipc_frame
+          - fastcdc_boundary
+          - anthropic_stream
+          - openai_stream
+          - streaming_json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: crates/origin-daemon/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+      - name: Run fuzz target (5 min)
+        working-directory: crates/origin-daemon/fuzz
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300 -timeout=15
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: crates/origin-daemon/fuzz/artifacts/${{ matrix.target }}
