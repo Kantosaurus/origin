@@ -19,6 +19,16 @@ pub struct WireRequest<'a> {
     pub tools: Vec<WireTool<'a>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub stream: bool,
+    /// Only emitted when `stream=true`. Asks the server to include a final
+    /// `usage` SSE frame with token counts (otherwise omitted).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<WireStreamOptions>,
+}
+
+/// `stream_options` block on the streaming request body.
+#[derive(Serialize)]
+pub struct WireStreamOptions {
+    pub include_usage: bool,
 }
 
 /// One message in the `OpenAI` request.
@@ -130,6 +140,11 @@ pub fn encode_request(req: &ChatRequest, stream: bool) -> WireRequest<'_> {
         messages,
         tools,
         stream,
+        stream_options: if stream {
+            Some(WireStreamOptions { include_usage: true })
+        } else {
+            None
+        },
     }
 }
 

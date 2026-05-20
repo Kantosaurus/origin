@@ -7,7 +7,7 @@
 
 use futures_util::StreamExt;
 use origin_provider::sse;
-use origin_provider::ProviderError;
+use origin_provider::{ProviderError, Usage};
 use origin_stream::{Ring, TokenEvent, TokenKind};
 use serde::Deserialize;
 use serde_json::Value;
@@ -16,6 +16,19 @@ use serde_json::Value;
 struct WireStreamChunk {
     #[serde(default)]
     candidates: Vec<WireStreamCandidate>,
+    #[serde(rename = "usageMetadata", default)]
+    usage_metadata: Option<WireUsageMetadata>,
+}
+
+#[allow(clippy::struct_field_names)]
+#[derive(Deserialize, Default, Clone, Copy)]
+struct WireUsageMetadata {
+    #[serde(rename = "promptTokenCount", default)]
+    prompt_token_count: u32,
+    #[serde(rename = "candidatesTokenCount", default)]
+    candidates_token_count: u32,
+    #[serde(rename = "cachedContentTokenCount", default)]
+    cached_content_token_count: u32,
 }
 
 #[derive(Deserialize)]
@@ -60,10 +73,6 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
     let stream = sse::from_reqwest(resp);
     pin_utils::pin_mut!(stream);
 
-    // TODO(P8.x): Gemini reports `usageMetadata` only on the final SSE frame
-    // (and sometimes omits it entirely). Parse the final-frame `usageMetadata`
-    // and publish a `TokenKind::Usage` event with token counts — mirrors the
-    // OpenAI streaming TODO.
     while let Some(item) = stream.next().await {
         let ev = item?;
         let raw = ev.data;
@@ -76,6 +85,11 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
             Err(e) => return Err(ProviderError::Api(format!("sse json: {e}; raw={raw}"))),
         };
 
+        // Gemini reports `usageMetadata` on the final SSE frame (and sometimes
+        // on intermediate frames too). Publish a `Usage` token event whenever
+        // present so consumers can record real token counts for streaming.
+        let usage_meta = chunk.usage_metadata;
+        let mut finished = false;
         for cand in chunk.candidates {
             for part in cand.content.parts {
                 if let Some(text) = part.text {
@@ -100,11 +114,60 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
                 }
             }
             if cand.finish_reason.is_some() {
-                ring.publish(&TokenEvent::new(TokenKind::TurnEnd, Vec::new()))
-                    .map_err(|e| ProviderError::Api(e.to_string()))?;
-                return Ok(());
+                finished = true;
             }
+        }
+        if let Some(um) = usage_meta {
+            ring.publish(&TokenEvent::new(TokenKind::Usage, encode_usage_meta(um)))
+                .map_err(|e| ProviderError::Api(e.to_string()))?;
+        }
+        if finished {
+            ring.publish(&TokenEvent::new(TokenKind::TurnEnd, Vec::new()))
+                .map_err(|e| ProviderError::Api(e.to_string()))?;
+            return Ok(());
         }
     }
     Ok(())
+}
+
+fn encode_usage_meta(u: WireUsageMetadata) -> Vec<u8> {
+    // 4 × u32 BE. Order: input, output, cache_read, cache_creation.
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(&u.prompt_token_count.to_be_bytes());
+    out.extend_from_slice(&u.candidates_token_count.to_be_bytes());
+    out.extend_from_slice(&u.cached_content_token_count.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out
+}
+
+/// Test-only view of a parsed Gemini SSE frame, exposing the optional
+/// `usageMetadata` token counts. Returned by `parse_chunk_for_test`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TestFrame {
+    pub usage: Option<Usage>,
+    pub finished: bool,
+}
+
+/// Parse a single SSE `data: …` line into a `TestFrame`. Returns `None` for
+/// non-data lines, blank payloads, or invalid JSON.
+#[must_use]
+pub fn parse_chunk_for_test(line: &[u8]) -> Option<TestFrame> {
+    let text = std::str::from_utf8(line).ok()?;
+    let payload = text
+        .trim_start()
+        .strip_prefix("data:")
+        .map_or(text.trim(), str::trim_start)
+        .trim();
+    if payload.is_empty() {
+        return None;
+    }
+    let chunk: WireStreamChunk = serde_json::from_str(payload).ok()?;
+    let finished = chunk.candidates.iter().any(|c| c.finish_reason.is_some());
+    let usage = chunk.usage_metadata.map(|u| Usage {
+        input_tokens: u.prompt_token_count,
+        output_tokens: u.candidates_token_count,
+        cache_read_input_tokens: u.cached_content_token_count,
+        cache_creation_input_tokens: 0,
+    });
+    Some(TestFrame { usage, finished })
 }
