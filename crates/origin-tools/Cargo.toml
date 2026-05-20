@@ -14,6 +14,7 @@ origin-core = { path = "../origin-core" }
 origin-cas  = { path = "../origin-cas" }
 origin-codegraph = { path = "../origin-codegraph" }
 origin-plan = { path = "../origin-plan" }
+origin-sandbox = { path = "../origin-sandbox" }
 origin-swarm = { path = "../origin-swarm" }
 blake3 = "1"
 hex = "0.4"

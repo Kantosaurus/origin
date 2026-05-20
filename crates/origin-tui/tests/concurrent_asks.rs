@@ -1,5 +1,5 @@
 use origin_permission::prompt::Prompter;
-use origin_tools::{SideEffects, Tier, ToolMeta, Urgency};
+use origin_tools::{SandboxProfile, SideEffects, Tier, ToolMeta, Urgency};
 use origin_tui::{PanelEvent, PermissionOutcome, SidePanelPrompter};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -11,6 +11,7 @@ const META_READ: ToolMeta = ToolMeta {
     urgency: Urgency::Low,
     side_effects: SideEffects::Pure,
     input_schema: "{}",
+    sandbox_profile: SandboxProfile::ReadFs,
 };
 
 const META_BASH: ToolMeta = ToolMeta {
@@ -20,6 +21,7 @@ const META_BASH: ToolMeta = ToolMeta {
     urgency: Urgency::High,
     side_effects: SideEffects::Mutating,
     input_schema: "{}",
+    sandbox_profile: SandboxProfile::Shell,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
