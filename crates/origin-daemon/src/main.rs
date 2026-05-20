@@ -119,13 +119,14 @@ async fn main() -> Result<()> {
 
     // P11.12: optional bounded-cardinality Prometheus `/metrics` endpoint.
     // Bind address comes from `--metrics-bind <addr>` CLI flag, or, when
-    // absent, the `ORIGIN_METRICS_BIND` env var. The handle is intentionally
-    // dropped after spawning — per-call instrumentation that needs to mutate
-    // the registry will land in a follow-up cluster once provider/tool call
-    // sites grow a `Metrics` field.
+    // absent, the `ORIGIN_METRICS_BIND` env var.
+    //
+    // P13.4.2: we now keep a daemon-wide `Arc<Metrics>` handle regardless of
+    // whether the HTTP endpoint is bound, so the admin IPC `GetUsage`
+    // handler can read the same registry the `/metrics` exporter does.
+    let metrics = Arc::new(Metrics::new());
     if let Some(bind) = parse_metrics_bind() {
-        let metrics_handle = Metrics::new();
-        spawn_metrics_endpoint(metrics_handle, bind);
+        spawn_metrics_endpoint((*metrics).clone(), bind);
     }
 
     let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
@@ -147,6 +148,7 @@ async fn main() -> Result<()> {
             Arc::clone(&pairing),
             Arc::clone(&bearer_store),
             vault.clone(),
+            Arc::clone(&metrics),
         );
     }
 }
@@ -225,7 +227,7 @@ fn try_load_embedder() -> Option<Arc<Embedder>> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn spawn_handler_task(
     conn: SharedConnection,
     active: ActiveProvider,
@@ -237,6 +239,7 @@ fn spawn_handler_task(
     pairing: Arc<Pairing>,
     bearer_store: Arc<BearerStore>,
     vault: KeyVault,
+    metrics: Arc<Metrics>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -336,6 +339,25 @@ fn spawn_handler_task(
                         },
                     };
                     if write_event(&conn, &ev).await.is_err() {
+                        break;
+                    }
+                }
+                admin @ (ClientMessage::ListSessions
+                | ClientMessage::RemoveSession { .. }
+                | ClientMessage::ResumeSession { .. }
+                | ClientMessage::GetUsage
+                | ClientMessage::KeyringAdd { .. }
+                | ClientMessage::KeyringList { .. }
+                | ClientMessage::KeyringRemove { .. }) => {
+                    if !handle_admin(
+                        &conn,
+                        &session_store,
+                        &vault,
+                        metrics.as_ref(),
+                        admin,
+                    )
+                    .await
+                    {
                         break;
                     }
                 }
@@ -576,6 +598,123 @@ async fn write_error(conn: &SharedConnection, msg: &str) -> bool {
         .write_frame(FrameKind::ErrorFrame, msg.as_bytes())
         .await
         .is_ok()
+}
+
+/// Dispatch the P13.4.2 admin `ClientMessage` variants. Returns `false`
+/// only if the IPC write fails (the per-connection handler then exits).
+///
+/// Variants other than `ListSessions / RemoveSession / ResumeSession /
+/// GetUsage / KeyringAdd / KeyringList / KeyringRemove` are unreachable
+/// because the caller restricts the input via an `@`-bound pattern.
+async fn handle_admin(
+    conn: &SharedConnection,
+    session_store: &SessionStore,
+    vault: &KeyVault,
+    metrics: &Metrics,
+    msg: ClientMessage,
+) -> bool {
+    let ev = match msg {
+        ClientMessage::ListSessions => {
+            let summaries = session_store.list_summaries().unwrap_or_default();
+            let wire: Vec<_> = summaries
+                .into_iter()
+                .map(|s| origin_daemon::protocol::SessionSummaryWire {
+                    id: s.id,
+                    created_at: s.created_at,
+                    title: s.title,
+                    model: s.model,
+                    message_count: s.message_count,
+                })
+                .collect();
+            StreamEvent::SessionsListed { summaries: wire }
+        }
+        ClientMessage::RemoveSession { session_id } => match session_store.delete(&session_id) {
+            Ok(()) => StreamEvent::AdminOk,
+            Err(e) => StreamEvent::AdminError {
+                message: e.to_string(),
+            },
+        },
+        ClientMessage::ResumeSession { session_id: _ } => {
+            // Resume semantics deferred (P14); acknowledge so the
+            // clap-level routing on the client side completes.
+            StreamEvent::AdminOk
+        }
+        ClientMessage::GetUsage => StreamEvent::UsageReport {
+            rows: build_usage_rows(&metrics.snapshot()),
+        },
+        ClientMessage::KeyringAdd { provider, account, secret } => {
+            match vault.set(&provider, &account, Secret::new(secret)).await {
+                Ok(()) => StreamEvent::AdminOk,
+                Err(e) => StreamEvent::AdminError {
+                    message: e.to_string(),
+                },
+            }
+        }
+        ClientMessage::KeyringList { provider } => match vault.list(&provider).await {
+            Ok(accounts) => StreamEvent::KeyringAccounts { provider, accounts },
+            Err(e) => StreamEvent::AdminError {
+                message: e.to_string(),
+            },
+        },
+        ClientMessage::KeyringRemove { provider, account } => {
+            match vault.delete(&provider, &account).await {
+                Ok(()) => StreamEvent::AdminOk,
+                Err(e) => StreamEvent::AdminError {
+                    message: e.to_string(),
+                },
+            }
+        }
+        // The caller restricts inputs via `admin @ (...)` so other variants
+        // never reach this function.
+        ClientMessage::Prompt(_)
+        | ClientMessage::SwitchAccount { .. }
+        | ClientMessage::MemoryDecision { .. }
+        | ClientMessage::PairStart { .. }
+        | ClientMessage::PairRedeem { .. } => return true,
+    };
+    write_event(conn, &ev).await.is_ok()
+}
+
+/// Fold a `Metrics::snapshot()` into one `UsageRow` per (provider, model)
+/// tuple. `origin_tokens_in_total{provider,model}` rows fill the
+/// `tokens_in` column; `origin_tokens_out_total{provider,model}` rows
+/// fill the `tokens_out` column. Other families are ignored.
+fn build_usage_rows(snap: &origin_metrics::Snapshot) -> Vec<origin_daemon::protocol::UsageRow> {
+    use std::collections::BTreeMap;
+    let mut acc: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
+    for r in snap.iter() {
+        let is_in = r.name == "origin_tokens_in_total";
+        let is_out = r.name == "origin_tokens_out_total";
+        if !(is_in || is_out) {
+            continue;
+        }
+        let mut provider = String::new();
+        let mut model = String::new();
+        for (k, v) in &r.labels {
+            match k.as_str() {
+                "provider" => provider.clone_from(v),
+                "model" => model.clone_from(v),
+                _ => {}
+            }
+        }
+        // Saturating cast — counter values are non-negative.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let val = r.value as u64;
+        let entry = acc.entry((provider, model)).or_insert((0, 0));
+        if is_in {
+            entry.0 = entry.0.saturating_add(val);
+        } else {
+            entry.1 = entry.1.saturating_add(val);
+        }
+    }
+    acc.into_iter()
+        .map(|((provider, model), (tokens_in, tokens_out))| origin_daemon::protocol::UsageRow {
+            provider,
+            model,
+            tokens_in,
+            tokens_out,
+        })
+        .collect()
 }
 
 /// Serialize `ev` and write it as a single `Event` frame. Mirrors the
