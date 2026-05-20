@@ -146,6 +146,12 @@ fn wait_for_worker_handle(signal: &ShutdownSignal) -> Result<tokio::runtime::Han
 
 /// The pre-P12.8 daemon body, lifted verbatim (modulo `_trace_guard` which
 /// now lives in `main`). Runs to completion on the worker pool.
+//
+// Cognitive complexity exceeds the workspace's nursery threshold after the
+// P12 + P13 merge — both phases added new IPC verbs (`PairStart`/`PairRedeem`
+// from P13; `ResumeRequest` from P12) and supporting wiring to this single
+// entrypoint. Breaking it apart is P14 polish (see plan).
+#[allow(clippy::cognitive_complexity)]
 async fn daemon_setup() -> Result<()> {
     let cas_root = env::var("ORIGIN_CAS_ROOT").unwrap_or_else(|_| default_cas_root());
     let cas = Arc::new(
