@@ -117,8 +117,12 @@ impl FactoryError {
 /// (`"bedrock"`, `account`). The minimum fields are `access`, `secret`,
 /// and `region`; `endpoint` and `model_id` fall back to sensible defaults
 /// when omitted so a P8.9 vault entry only needs the three core fields.
+// No `Debug` derive — `secret` and `access` are credential material; a
+// stray `{:?}` print would leak them. The `xtask lint-secrets` (P11.14)
+// CI gate enforces this rule for any `#[derive(Debug)]` struct with a
+// secret-looking field.
 #[cfg(feature = "bedrock")]
-#[derive(Debug, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 struct BedrockCreds {
     access: String,
     secret: String,

@@ -3449,6 +3449,7 @@ dependencies = [
  "age",
  "async-trait",
  "base64 0.22.1",
+ "chrono",
  "dirs",
  "parking_lot",
  "rand 0.8.6",
@@ -6540,6 +6541,19 @@ checksum = "ec1cdab258fb55c0da61328dc52c8764709b249011b2cad0454c72f0bf10a1f6"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "xtask"
+version = "0.0.1"
+dependencies = [
+ "clap",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "syn 2.0.117",
+ "thiserror 1.0.69",
+ "walkdir",
 ]
 
 [[package]]
