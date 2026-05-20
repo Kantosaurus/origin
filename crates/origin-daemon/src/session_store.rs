@@ -23,6 +23,16 @@ pub struct SessionStore {
     inner: Store,
 }
 
+/// Lightweight projection of a `sessions` row used by admin/list operations.
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub id: String,
+    pub created_at: i64,
+    pub title: Option<String>,
+    pub model: String,
+    pub message_count: u32,
+}
+
 impl SessionStore {
     /// Open or create the `SQLite` database at `path` and run migrations.
     ///
@@ -162,6 +172,53 @@ impl SessionStore {
             Ok(out)
         })?;
         Ok(rows)
+    }
+
+    /// Return one [`SessionSummary`] per row in the `sessions` table, ordered
+    /// newest-first by `created_at`. The `message_count` column is computed by
+    /// a correlated subquery against `messages`.
+    ///
+    /// # Errors
+    /// Propagates sqlite errors on read failure.
+    pub fn list_summaries(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
+        let rows = self.inner.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT s.id, s.created_at, s.title, s.model, \
+                        (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) \
+                 FROM sessions s \
+                 ORDER BY s.created_at DESC",
+            )?;
+            let iter = stmt.query_map([], |r| {
+                let count: i64 = r.get(4)?;
+                Ok(SessionSummary {
+                    id: r.get(0)?,
+                    created_at: r.get(1)?,
+                    title: r.get(2)?,
+                    model: r.get(3)?,
+                    message_count: u32::try_from(count).unwrap_or(u32::MAX),
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in iter {
+                out.push(r?);
+            }
+            Ok(out)
+        })?;
+        Ok(rows)
+    }
+
+    /// Delete a session row and all of its associated message rows. Idempotent:
+    /// removing a non-existent session is a no-op.
+    ///
+    /// # Errors
+    /// Propagates sqlite errors on write failure.
+    pub fn delete(&self, session_id: &str) -> Result<(), SessionStoreError> {
+        self.inner.with_conn(|c| {
+            c.execute("DELETE FROM messages WHERE session_id = ?1", [session_id])?;
+            c.execute("DELETE FROM sessions WHERE id = ?1", [session_id])?;
+            Ok(())
+        })?;
+        Ok(())
     }
 }
 
