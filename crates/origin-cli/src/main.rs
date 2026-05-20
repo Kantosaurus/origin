@@ -40,6 +40,23 @@ enum Cmd {
         #[command(subcommand)]
         sub: PairSub,
     },
+    /// One-shot prompt: connect to the daemon, send `text`, drain to completion, exit.
+    Run {
+        /// The user prompt.
+        text: String,
+        /// Emit JSON-Lines stream of every IPC event.
+        #[arg(long)]
+        json: bool,
+        /// Remote daemon URL (`origin://host:port#fingerprint`).
+        #[arg(long)]
+        remote: Option<String>,
+        /// Optional bearer token for remote auth.
+        #[arg(long)]
+        bearer: Option<String>,
+        /// Model override.
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -94,6 +111,9 @@ async fn main() -> Result<()> {
                 PairSub::Start { ttl_secs } => pair_start(ttl_secs).await,
                 PairSub::Redeem { url, code, device_id } => pair_redeem(&url, &code, device_id).await,
             };
+        }
+        Some(Cmd::Run { text, json, remote, bearer, model }) => {
+            return origin_cli::headless::run(text, json, remote, bearer, model).await;
         }
         None => {}
     }
