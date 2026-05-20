@@ -82,9 +82,10 @@ fn client_message_prompt_round_trips() {
             assert_eq!(req.model, "claude-opus-4-7");
             assert_eq!(req.user_text, "hello");
         }
-        ClientMessage::SwitchAccount { .. } | ClientMessage::MemoryDecision { .. } => {
-            panic!("expected Prompt variant")
-        }
+        ClientMessage::SwitchAccount { .. }
+        | ClientMessage::MemoryDecision { .. }
+        | ClientMessage::PairStart { .. }
+        | ClientMessage::PairRedeem { .. } => unreachable!("expected Prompt variant"),
     }
 }
 
@@ -104,9 +105,10 @@ fn client_message_switch_account_round_trips() {
             assert_eq!(provider, "openai");
             assert_eq!(account_id, "work");
         }
-        ClientMessage::Prompt(_) | ClientMessage::MemoryDecision { .. } => {
-            panic!("expected SwitchAccount variant")
-        }
+        ClientMessage::Prompt(_)
+        | ClientMessage::MemoryDecision { .. }
+        | ClientMessage::PairStart { .. }
+        | ClientMessage::PairRedeem { .. } => unreachable!("expected SwitchAccount variant"),
     }
 }
 
