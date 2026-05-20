@@ -1,0 +1,9 @@
+{
+  "id": "06-mcp-readonly",
+  "prompt": "Use the filesystem MCP server to list files in `crates/origin-core/src`.",
+  "expected_tools_min": ["mcp:filesystem:list"],
+  "expected_tool_calls_max": 4,
+  "max_turn_latency_ms": 5000,
+  "max_input_tokens": 4000,
+  "max_output_tokens": 1000
+}

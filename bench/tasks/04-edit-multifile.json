@@ -1,0 +1,9 @@
+{
+  "id": "04-edit-multifile",
+  "prompt": "Update the version in `Cargo.toml` and the corresponding `CHANGELOG.md` entry.",
+  "expected_tools_min": ["Read", "MultiEdit"],
+  "expected_tool_calls_max": 4,
+  "max_turn_latency_ms": 5000,
+  "max_input_tokens": 4000,
+  "max_output_tokens": 1000
+}

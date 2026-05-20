@@ -1,0 +1,9 @@
+{
+  "id": "08-swarm-refactor",
+  "prompt": "Split the existing `Foo` module into `foo_a` and `foo_b`, in parallel via swarm.",
+  "expected_tools_min": ["Task"],
+  "expected_tool_calls_max": 4,
+  "max_turn_latency_ms": 5000,
+  "max_input_tokens": 4000,
+  "max_output_tokens": 1000
+}

@@ -1,0 +1,9 @@
+{
+  "id": "01-read-and-summarize",
+  "prompt": "Read README.md and summarize in 2 sentences.",
+  "expected_tools_min": ["Read"],
+  "expected_tool_calls_max": 4,
+  "max_turn_latency_ms": 5000,
+  "max_input_tokens": 4000,
+  "max_output_tokens": 1000
+}

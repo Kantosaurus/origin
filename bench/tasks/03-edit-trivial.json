@@ -1,0 +1,9 @@
+{
+  "id": "03-edit-trivial",
+  "prompt": "In `src/foo.rs`, rename `compute` to `compute_value` everywhere it's used.",
+  "expected_tools_min": ["Read", "Edit"],
+  "expected_tool_calls_max": 4,
+  "max_turn_latency_ms": 5000,
+  "max_input_tokens": 4000,
+  "max_output_tokens": 1000
+}
