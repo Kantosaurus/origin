@@ -73,3 +73,81 @@ mod tests {
         assert_eq!(e.wire, WireFormat::OpenAIChat);
     }
 }
+
+use crate::builtin_catalog;
+
+/// Merged (builtin + custom) catalog handle.
+#[derive(Debug, Clone)]
+pub struct Catalog {
+    entries: Vec<ProviderEntry>,
+}
+
+impl Catalog {
+    #[must_use]
+    pub fn builtin() -> Self {
+        Self { entries: builtin_catalog() }
+    }
+
+    /// Merges user-defined entries into the catalog.
+    ///
+    /// # Errors
+    /// Returns [`CatalogError::IdCollision`] if any custom entry id matches an
+    /// existing builtin entry id.
+    pub fn merge_custom(&mut self, custom: Vec<ProviderEntry>) -> Result<(), CatalogError> {
+        for entry in custom {
+            if self.entries.iter().any(|e| e.id == entry.id) {
+                return Err(CatalogError::IdCollision(entry.id.to_string()));
+            }
+            self.entries.push(entry);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn lookup(&self, id: &str) -> Option<&ProviderEntry> {
+        self.entries.iter().find(|e| e.id == id)
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[ProviderEntry] {
+        &self.entries
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[allow(clippy::module_name_repetitions)]
+pub enum CatalogError {
+    #[error("user-defined provider id collides with builtin: {0}")]
+    IdCollision(String),
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn lookup_finds_builtin() {
+        let cat = Catalog::builtin();
+        assert!(cat.lookup("openai").is_some());
+        assert!(cat.lookup("deepseek").is_some());
+        assert!(cat.lookup("nonexistent").is_none());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn collision_rejected() {
+        let mut cat = Catalog::builtin();
+        let dup = ProviderEntry {
+            id: "openai".into(),
+            display_name: "Fake".into(),
+            wire: WireFormat::OpenAIChat,
+            auth: AuthScheme::None,
+            base_url: "https://x".into(),
+            chat_path: "/x".into(),
+            default_model: "x".into(),
+            capabilities: Capabilities::default(),
+        };
+        assert!(cat.merge_custom(vec![dup]).is_err());
+    }
+}
