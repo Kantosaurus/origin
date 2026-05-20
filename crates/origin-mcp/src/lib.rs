@@ -4,6 +4,7 @@
 pub mod cas_handoff;
 pub mod client;
 pub mod jsonrpc;
+pub mod limits;
 pub mod oauth;
 pub mod proxy;
 pub mod transport;

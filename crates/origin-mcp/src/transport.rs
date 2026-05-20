@@ -14,6 +14,8 @@ pub enum TransportError {
     Io(#[from] std::io::Error),
     #[error("serde: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("response too large: {observed} bytes > {cap} cap")]
+    TooLarge { observed: usize, cap: usize },
     #[error("transport: {0}")]
     Other(String),
 }
