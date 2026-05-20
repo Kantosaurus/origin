@@ -1,0 +1,32 @@
+name: Perf gate
+on:
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.83.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --release -p origin-cli -p origin-daemon
+      - name: Cold-start benchmark
+        run: cargo run --release -p origin-bench -- run-origin --tasks bench/tasks > result.json
+      - name: Assert perf gates
+        run: |
+          python - <<'PY'
+          import json, sys
+          rs = json.load(open('result.json'))
+          # Aggregate gates from spec §11 GA acceptance:
+          #  - cold-start to first prompt < 50ms (proxy: bench wall_ms_p99 on read-only task < 80ms)
+          #  - cache hit rate ≥ 70% — measured by token planner, surfaced in trace; not asserted here
+          read_only = [r for r in rs if r['task_id'].startswith(('01-','02-'))]
+          worst = max(r['wall_ms'] for r in read_only)
+          if worst > 80:
+              print(f"FAIL: read-only wall_ms worst = {worst}ms > 80ms", file=sys.stderr)
+              sys.exit(1)
+          print(f"OK: read-only wall_ms worst = {worst}ms")
+          PY
