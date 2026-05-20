@@ -15,12 +15,21 @@ use reqwest::StatusCode;
 
 const DEFAULT_BASE: &str = "https://generativelanguage.googleapis.com";
 
+/// Controls which auth mechanism is used for Gemini requests.
+enum AuthKind {
+    /// `?key=<api_key>` query parameter — the standard Gemini API key path.
+    ApiKey(String),
+    /// `Authorization: Bearer <token>` header — used when a refreshed OAuth
+    /// token is presented (e.g. Gemini CLI OAuth flow).
+    OAuthBearer(String),
+}
+
 /// Gemini provider backed by `generateContent` / `streamGenerateContent`.
 ///
 /// The API key is embedded as a `?key=` query parameter, not a header. The
 /// struct deliberately does not derive `Debug` so the key cannot be logged.
 pub struct Gemini {
-    api_key: String,
+    auth: AuthKind,
     base: String,
     client: reqwest::Client,
 }
@@ -36,18 +45,55 @@ impl Gemini {
     #[must_use]
     pub fn with_base_url(api_key: impl Into<String>, base: &str) -> Self {
         Self {
-            api_key: api_key.into(),
+            auth: AuthKind::ApiKey(api_key.into()),
             base: base.trim_end_matches('/').to_string(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Construct using a refreshed OAuth bearer token instead of an API key.
+    ///
+    /// Sends `Authorization: Bearer <token>` and omits the `?key=` query
+    /// parameter from the URL.
+    #[must_use]
+    pub fn with_oauth_bearer(token: impl Into<String>) -> Self {
+        Self {
+            auth: AuthKind::OAuthBearer(token.into()),
+            base: DEFAULT_BASE.to_string(),
             client: reqwest::Client::new(),
         }
     }
 
     fn url(&self, model: &str, action: &str, extra_query: &str) -> String {
         // `extra_query` is either "" or "&alt=sse".
-        format!(
-            "{}/v1beta/models/{}:{}?key={}{}",
-            self.base, model, action, self.api_key, extra_query
-        )
+        match &self.auth {
+            AuthKind::ApiKey(key) => format!(
+                "{}/v1beta/models/{}:{}?key={}{}",
+                self.base, model, action, key, extra_query
+            ),
+            AuthKind::OAuthBearer(_) => {
+                // For OAuth, the key goes in the Authorization header instead.
+                // extra_query may start with "&" — replace it with "?" when it
+                // is the first query param.
+                let qs = extra_query.trim_start_matches('&');
+                if qs.is_empty() {
+                    format!("{}/v1beta/models/{}:{}", self.base, model, action)
+                } else {
+                    format!("{}/v1beta/models/{}:{}?{}", self.base, model, action, qs)
+                }
+            }
+        }
+    }
+
+    /// Apply the appropriate auth header to a request builder (no-op for `ApiKey`,
+    /// which uses the `?key=` query parameter instead).
+    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth {
+            AuthKind::ApiKey(_) => builder,
+            AuthKind::OAuthBearer(token) => {
+                builder.header("Authorization", format!("Bearer {token}"))
+            }
+        }
     }
 }
 
@@ -61,8 +107,7 @@ impl Provider for Gemini {
         let body = wire::encode_request(&req);
         let url = self.url(&req.model, "generateContent", "");
         let resp = self
-            .client
-            .post(&url)
+            .apply_auth(self.client.post(&url))
             .header("content-type", "application/json")
             .json(&body)
             .send()
@@ -83,8 +128,7 @@ impl Provider for Gemini {
         let body = wire::encode_request(&req);
         let url = self.url(&req.model, "streamGenerateContent", "&alt=sse");
         let resp = self
-            .client
-            .post(&url)
+            .apply_auth(self.client.post(&url))
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
             .json(&body)
