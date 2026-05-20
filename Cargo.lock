@@ -2810,6 +2810,7 @@ name = "origin-hooks"
 version = "0.0.1"
 dependencies = [
  "criterion",
+ "origin-sandbox",
  "serde",
  "serde_json",
  "tempfile",

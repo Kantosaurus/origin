@@ -13,12 +13,32 @@ use thiserror::Error;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LifecycleEvent {
-    PrePrompt { text: String },
-    PostPrompt { text: String },
-    PreTool { tool: String, args_preview: String },
-    PostTool { tool: String, phase: ToolPhase },
-    PreCommit { branch: String },
-    PostCommit { sha: String },
+    PrePrompt {
+        text: String,
+    },
+    PostPrompt {
+        text: String,
+    },
+    PreTool {
+        tool: String,
+        args_preview: String,
+        /// Sandbox profile ordinal the daemon will enforce when this tool
+        /// spawns child processes — see [`origin_sandbox::SandboxProfile`].
+        /// Hook scripts can short-circuit on this value without round-tripping
+        /// back to the permission engine (P11.6).
+        sandbox_ordinal: origin_sandbox::ProfileOrdinal,
+    },
+    PostTool {
+        tool: String,
+        phase: ToolPhase,
+        sandbox_ordinal: origin_sandbox::ProfileOrdinal,
+    },
+    PreCommit {
+        branch: String,
+    },
+    PostCommit {
+        sha: String,
+    },
     SessionStart,
     SessionEnd,
 }
