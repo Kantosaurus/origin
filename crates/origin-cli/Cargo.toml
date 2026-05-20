@@ -39,6 +39,8 @@ url = "2"
 [dev-dependencies]
 criterion = "0.5"
 origin-stream = { path = "../origin-stream" }
+tempfile = "3"
+ulid = "1"
 
 [[bench]]
 name = "keystroke_to_pixel"
