@@ -10,3 +10,4 @@ pub mod screen;
 pub mod status;
 pub mod trace_cmd;
 pub mod tui;
+pub mod tutorial;

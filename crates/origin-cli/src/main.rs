@@ -24,6 +24,9 @@ use serde::Deserialize;
 #[derive(Parser)]
 #[command(name = "origin", version, about = "origin agentic coding harness")]
 struct Cli {
+    /// Run the 7-step interactive guided tour (P14.D.3).
+    #[arg(long)]
+    tutorial: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -138,6 +141,12 @@ async fn main() -> Result<()> {
     // Dispatch a subcommand if one was given, otherwise fall through to the
     // TUI entry path (preserves the existing env-driven invocation).
     let cli = Cli::parse();
+    if cli.tutorial {
+        let stdin = std::io::stdin();
+        let stdout = std::io::stdout();
+        origin_cli::tutorial::run(stdin.lock(), stdout.lock())?;
+        return Ok(());
+    }
     match cli.cmd {
         Some(Cmd::Trace {
             sub: TraceSub::Query(q),
