@@ -59,6 +59,8 @@ pub enum Cmd {
         #[command(subcommand)]
         sub: KeyringSub,
     },
+    /// Import a session/skill set from another harness (P14.B.7).
+    Import(crate::import::ImportArgs),
 }
 
 #[derive(Subcommand)]
