@@ -104,6 +104,42 @@ impl Ring {
     }
 }
 
+/// Panic-free length-prefixed rkyv-archived `TokenEvent` decoder for fuzz
+/// targets.
+///
+/// Walks the input as a sequence of `u32` BE length-prefixed records and
+/// validates each via `check_archived_root::<TokenEvent>`. This is the
+/// same decode path used by ring subscribers and MUST NOT panic on
+/// arbitrary input.
+///
+/// # Errors
+/// Returns `RingError::Decode` on the first malformed record (truncated
+/// length prefix, length exceeding remaining bytes, or rkyv validation
+/// failure). Returns `Ok(())` on an empty input or a clean walk.
+pub fn parse(bytes: &[u8]) -> Result<(), RingError> {
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if cursor.checked_add(4).map_or(true, |end| end > bytes.len()) {
+            return Err(RingError::Decode("len prefix truncated".into()));
+        }
+        let len_bytes: [u8; 4] = bytes[cursor..cursor + 4]
+            .try_into()
+            .map_err(|_| RingError::Decode("len prefix".into()))?;
+        let len = u32::from_be_bytes(len_bytes) as usize;
+        let start = cursor + 4;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| RingError::Decode("len overflow".into()))?;
+        if end > bytes.len() {
+            return Err(RingError::Decode("record truncated".into()));
+        }
+        let slice = &bytes[start..end];
+        check_archived_root::<TokenEvent>(slice).map_err(|e| RingError::Decode(format!("{e:?}")))?;
+        cursor = end;
+    }
+    Ok(())
+}
+
 /// One tail. Each subscriber tracks its own read position.
 pub struct Subscriber {
     ring: Ring,

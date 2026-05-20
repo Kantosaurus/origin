@@ -164,6 +164,55 @@ where
     Ok(())
 }
 
+/// Panic-free synchronous SSE wire-event decoder for fuzz targets.
+///
+/// Splits the input on SSE event boundaries (blank lines), strips a
+/// leading `data:` prefix on each chunk, and feeds each payload through
+/// the same `WireEvent` JSON decoder used by the live streaming path.
+/// Any decode failure is reported via `ParseError`; this function MUST
+/// NOT panic on arbitrary input.
+///
+/// # Errors
+/// `ParseError::Empty` if the input contains no candidate JSON payloads.
+/// `ParseError::Invalid` if a candidate payload fails to deserialize.
+pub fn parse(bytes: &[u8]) -> Result<(), ParseError> {
+    // Best-effort UTF-8 lift; reject up-front rather than panic on slicing.
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Err(ParseError::Invalid);
+    };
+    let mut saw_any = false;
+    for chunk in text.split("\n\n") {
+        let mut payload = String::new();
+        for line in chunk.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("data:") {
+                payload.push_str(rest.trim_start());
+            }
+        }
+        if payload.is_empty() {
+            continue;
+        }
+        saw_any = true;
+        if serde_json::from_str::<WireEvent>(&payload).is_err() {
+            return Err(ParseError::Invalid);
+        }
+    }
+    if saw_any {
+        Ok(())
+    } else {
+        Err(ParseError::Empty)
+    }
+}
+
+/// Reasons `parse` may reject input.
+#[derive(Debug, Error)]
+pub enum ParseError {
+    #[error("no SSE payloads found")]
+    Empty,
+    #[error("invalid wire event")]
+    Invalid,
+}
+
 fn encode_usage(u: &WireUsage) -> Vec<u8> {
     // 4 × u32 BE. Order: input, output, cache_read, cache_creation.
     let mut out = Vec::with_capacity(16);

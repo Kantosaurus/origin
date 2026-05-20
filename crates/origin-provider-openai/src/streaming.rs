@@ -114,3 +114,66 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
     }
     Ok(())
 }
+
+/// Panic-free synchronous SSE wire-chunk decoder for fuzz targets.
+///
+/// Splits the input on SSE event boundaries (blank lines), strips a
+/// leading `data:` prefix on each chunk, and feeds each payload through
+/// the same `WireStreamChunk` JSON decoder used by the live streaming
+/// path. The `[DONE]` sentinel is recognized and skipped. This function
+/// MUST NOT panic on arbitrary input.
+///
+/// # Errors
+/// `ParseError::Empty` if the input contains no candidate JSON payloads.
+/// `ParseError::Invalid` if a candidate payload fails to deserialize.
+pub fn parse(bytes: &[u8]) -> Result<(), ParseError> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Err(ParseError::Invalid);
+    };
+    let mut saw_any = false;
+    for chunk in text.split("\n\n") {
+        let mut payload = String::new();
+        for line in chunk.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("data:") {
+                payload.push_str(rest.trim_start());
+            }
+        }
+        if payload.is_empty() {
+            continue;
+        }
+        if payload.trim() == "[DONE]" {
+            saw_any = true;
+            continue;
+        }
+        saw_any = true;
+        if serde_json::from_str::<WireStreamChunk>(&payload).is_err() {
+            return Err(ParseError::Invalid);
+        }
+    }
+    if saw_any {
+        Ok(())
+    } else {
+        Err(ParseError::Empty)
+    }
+}
+
+/// Reasons `parse` may reject input.
+#[derive(Debug)]
+pub enum ParseError {
+    /// No `data:` payloads were found in the byte stream.
+    Empty,
+    /// A `data:` payload failed to deserialize as a wire chunk.
+    Invalid,
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("no SSE payloads found"),
+            Self::Invalid => f.write_str("invalid wire chunk"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
