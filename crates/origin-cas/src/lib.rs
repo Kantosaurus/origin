@@ -5,7 +5,7 @@
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-mod chunker;
+pub mod chunker;
 pub mod dict;
 mod hash;
 mod packfile;

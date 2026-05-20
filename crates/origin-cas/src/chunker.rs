@@ -47,3 +47,19 @@ impl Iterator for ChunkIter<'_> {
         })
     }
 }
+
+/// Panic-free chunking wrapper: returns the chunk byte ranges as
+/// `(offset, length)` pairs covering the input contiguously without gaps
+/// or overlaps. Used by fuzz targets — any panic in the FastCDC
+/// implementation would be a soundness bug we want surfaced.
+///
+/// Empty input returns an empty `Vec`.
+#[must_use]
+pub fn chunk(bytes: &[u8]) -> Vec<(usize, usize)> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    fastcdc::v2020::FastCDC::new(bytes, MIN_SIZE, AVG_SIZE, MAX_SIZE)
+        .map(|c| (c.offset, c.length))
+        .collect()
+}

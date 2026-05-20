@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+origin-cas = { path = "../../origin-cas" }
 origin-daemon = { path = ".." }
 origin-ipc = { path = "../../origin-ipc" }
 
@@ -21,6 +22,13 @@ doc = false
 [[bin]]
 name = "ipc_frame"
 path = "fuzz_targets/ipc_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fastcdc_boundary"
+path = "fuzz_targets/fastcdc_boundary.rs"
 test = false
 doc = false
 bench = false
