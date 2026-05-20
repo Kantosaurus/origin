@@ -6,10 +6,10 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+pub mod layer;
 pub mod ring;
 pub mod schema;
 
+pub use layer::{init, Layer, LayerGuard};
 pub use ring::{Ring, RingError};
 pub use schema::{span_schema, SpanRow};
-
-// Layer + query land in P11.10 / P11.11.
