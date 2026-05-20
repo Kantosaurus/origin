@@ -32,10 +32,13 @@ tempfile = "3"
 
 [features]
 default = []
-uring = ["dep:tokio-uring"]
+uring = ["dep:tokio-uring", "dep:origin-runtime"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-uring = { workspace = true, optional = true }
+# Used by the uring-write hop to attach a `TaskClass::Background` permit
+# to the `spawn_blocking` that hosts `tokio_uring::start`.
+origin-runtime = { path = "../origin-runtime", optional = true }
 
 [[bench]]
 name = "uring_throughput"

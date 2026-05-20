@@ -374,17 +374,28 @@ fn write_pack(path: &std::path::Path, pending: &[(Hash, Vec<u8>)]) -> Result<(),
         // is the contract `tokio_uring::start` requires.
         let path_for_writer = path.to_path_buf();
         let pending_for_writer = pending.to_vec();
+        // The uring write hops off the Tokio worker pool onto a dedicated OS
+        // thread (`tokio_uring::start` panics if called from a Tokio worker).
+        // Classify the wrapper as `Background` so the per-class semaphore
+        // enforces the budget contract from P12.3.
         let res: Result<(), crate::packfile::PackError> = tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();
             handle.block_on(async move {
-                tokio::task::spawn_blocking(move || {
-                    tokio_uring::start(async move {
-                        crate::packfile_uring::write_payloads_uring(&path_for_writer, &pending_for_writer)
-                            .await
+                origin_runtime::spawn_in(origin_runtime::TaskClass::Background, async move {
+                    // Inner `spawn_blocking` is the actual off-worker hop;
+                    // `spawn_in` only attaches the class permit + budget.
+                    use tokio::task::spawn_blocking as sb;
+                    sb(move || {
+                        tokio_uring::start(async move {
+                            crate::packfile_uring::write_payloads_uring(&path_for_writer, &pending_for_writer)
+                                .await
+                        })
                     })
+                    .await
+                    .expect("uring write blocking task panicked")
                 })
                 .await
-                .expect("uring write blocking task panicked")
+                .expect("uring outer spawn_in join failed")
             })
         });
         res?;

@@ -20,6 +20,7 @@ path = "src/main.rs"
 [dependencies]
 origin-ipc = { path = "../origin-ipc" }
 origin-daemon = { path = "../origin-daemon" }
+origin-runtime = { path = "../origin-runtime" }
 origin-tui = { path = "../origin-tui" }
 origin-plan = { path = "../origin-plan" }
 origin-trace = { path = "../origin-trace" }
