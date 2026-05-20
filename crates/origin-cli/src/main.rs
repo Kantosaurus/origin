@@ -7,7 +7,7 @@ use clap::Parser;
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt as _;
-use origin_cli::cli_def::{Cli, Cmd, KeyringSub, PairSub, SessionsSub, TraceSub};
+use origin_cli::cli_def::{Cli, Cmd, KeyringSub, PairSub, ProvidersSub, SessionsSub, TraceSub};
 use origin_cli::input::{parse_mem_command, reduce, InputAction};
 use origin_cli::plan_panel_wiring::Wiring as PlanPanelWiring;
 use origin_cli::tui::App;
@@ -66,7 +66,27 @@ async fn main() -> Result<()> {
         }
         Some(Cmd::Usage) => return origin_cli::admin::usage().await,
         Some(Cmd::Sessions { sub }) => return origin_cli::admin::sessions(sub_to_action(sub)).await,
-        Some(Cmd::Keyring { sub }) => return origin_cli::admin::keyring(sub_to_action_kr(sub)).await,
+        Some(Cmd::Keyring { sub }) => {
+            // Login drives an interactive OAuth flow and must be handled
+            // before converting to KeyringAction (which doesn't have a Login
+            // variant — Login bypasses the daemon IPC path entirely).
+            if let KeyringSub::Login { provider, account } = sub {
+                return origin_cli::keyring_login::run(&provider, &account).await;
+            }
+            return origin_cli::admin::keyring(sub_to_action_kr(sub)).await;
+        }
+        Some(Cmd::Providers { sub }) => {
+            return match sub {
+                ProvidersSub::Ls => {
+                    origin_cli::providers::ls();
+                    Ok(())
+                }
+                ProvidersSub::Describe { id } => {
+                    origin_cli::providers::describe(&id);
+                    Ok(())
+                }
+            };
+        }
         Some(Cmd::Import(a)) => {
             let r = origin_cli::import::run_import(&a).map_err(anyhow::Error::from)?;
             if a.json {
@@ -156,10 +176,12 @@ async fn run_event_loop(
     path: &str,
     model: &str,
 ) -> Result<()> {
-    // Plan side panel wiring (P9.9). The widget is in-process today; the
-    // daemon-driven `PlanHandle` broadcast subscription lands in P10. See
-    // `plan_panel_wiring.rs` for the TODO marking that integration seam.
-    let _plan_panel = PlanPanelWiring::new();
+    // Plan side panel: subscribe to the daemon's PlanBus over IPC. Each
+    // received envelope feeds `PlanPanelWiring::ingest`. The subscribe
+    // runs on a dedicated long-lived connection so it survives the
+    // one-shot prompt/admin connections each request opens.
+    let plan_panel = Arc::new(Mutex::new(PlanPanelWiring::new()));
+    spawn_plan_subscription(path.to_string(), Arc::clone(&plan_panel), handle.clone());
     let mut input_stream = crossterm::event::EventStream::new();
     while let Some(maybe_ev) = input_stream.next().await {
         if let crossterm::event::Event::Key(ev) = maybe_ev? {
@@ -179,6 +201,40 @@ async fn run_event_loop(
         }
     }
     Ok(())
+}
+
+/// Open a dedicated long-lived IPC connection, send
+/// [`ClientMessage::SubscribePlan`], and feed every received
+/// [`StreamEvent::PlanOp`] into `wiring.ingest`. The task exits when the
+/// daemon closes the connection.
+fn spawn_plan_subscription(path: String, wiring: Arc<Mutex<PlanPanelWiring>>, render: Handle) {
+    spawn_in(TaskClass::Realtime, async move {
+        let mut client = match Connector::connect(&path).await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let body = match serde_json::to_vec(&ClientMessage::SubscribePlan) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        if client.write_raw(&encode(1, FrameKind::Request, &body)).await.is_err() {
+            return;
+        }
+        loop {
+            let frame = match client.read_frame_body().await {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            let ev: StreamEvent = match serde_json::from_slice(&frame) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let StreamEvent::PlanOp { envelope } = ev {
+                wiring.lock().ingest(envelope);
+                render.mark_dirty();
+            }
+        }
+    });
 }
 
 async fn handle_submit(app: &SharedApp, handle: &Handle, path: &str, model: &str, text: &str) {
@@ -416,6 +472,9 @@ fn sub_to_action_kr(sub: KeyringSub) -> origin_cli::admin::KeyringAction {
         KeyringSub::Remove { provider, account } => {
             origin_cli::admin::KeyringAction::Remove { provider, account }
         }
+        // Login is handled before this function is reached; see the Keyring
+        // dispatch arm in main(). This arm is unreachable at runtime.
+        KeyringSub::Login { .. } => unreachable!("Login is handled before sub_to_action_kr"),
     }
 }
 

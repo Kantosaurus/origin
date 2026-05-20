@@ -119,7 +119,7 @@ impl Consolidator {
                 // Precision loss acceptable: age in days is bounded and the
                 // f32 range is sufficient for the decay formula.
                 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-                let age_days = (age_ms as f64 / 86_400_000.0) as f32;
+                let age_days = (age_ms as f64 / f64::from(crate::MS_PER_DAY)) as f32;
                 Some(MetaRow {
                     age_days,
                     cluster_priority: r.cluster_priority,

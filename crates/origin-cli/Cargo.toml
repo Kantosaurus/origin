@@ -25,6 +25,7 @@ origin-tui = { path = "../origin-tui" }
 origin-plan = { path = "../origin-plan" }
 origin-trace = { path = "../origin-trace" }
 origin-migrate = { path = "../origin-migrate" }
+origin-store = { path = "../origin-store" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
 anyhow = "1"
 crossterm = { version = "0.28", features = ["event-stream"] }
@@ -38,6 +39,11 @@ dirs = "5"
 hostname = "0.4"
 url = "2"
 thiserror = "1"
+origin-provider = { path = "../origin-provider" }
+origin-keyvault = { path = "../origin-keyvault" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rand = "0.8"
+urlencoding = "2"
 
 [dev-dependencies]
 criterion = "0.5"
