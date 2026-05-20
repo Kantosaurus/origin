@@ -58,8 +58,25 @@ fn main() -> anyhow::Result<()> {
             }
             println!("{}", origin_bench::report::render_json(&out));
         }
-        Cmd::Report { results: _, out } => {
-            std::fs::write(out, "# Bench report\n_pending implementation._\n")?;
+        Cmd::Report { results, out } => {
+            let mut all: Vec<origin_bench::metrics::TaskResult> = Vec::new();
+            if results.is_file() {
+                let body = std::fs::read(&results)?;
+                let one: Vec<origin_bench::metrics::TaskResult> = serde_json::from_slice(&body)?;
+                all.extend(one);
+            } else if results.is_dir() {
+                for entry in walkdir::WalkDir::new(&results)
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "json"))
+                {
+                    let body = std::fs::read(entry.path())?;
+                    let one: Vec<origin_bench::metrics::TaskResult> = serde_json::from_slice(&body)?;
+                    all.extend(one);
+                }
+            }
+            let md = origin_bench::report::render_markdown(&all);
+            std::fs::write(&out, md)?;
         }
     }
     Ok(())
