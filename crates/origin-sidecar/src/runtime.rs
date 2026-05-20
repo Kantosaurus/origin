@@ -44,10 +44,13 @@ impl Default for SidecarConfig {
 }
 
 pub struct Sidecar {
-    tx: mpsc::Sender<SidecarJob>,
+    /// Wrapped in `Mutex<Option<...>>` so the shutdown phase can drop the
+    /// sender without taking `Sidecar` by value; once `None`, subsequent
+    /// `submit` calls return [`SidecarError::Shutdown`].
+    tx: std::sync::Mutex<Option<mpsc::Sender<SidecarJob>>>,
     /// Kept alive so the channel stays open even when `workers == 0`.
     _rx: Arc<Mutex<mpsc::Receiver<SidecarJob>>>,
-    workers: Vec<JoinHandle<()>>,
+    workers: std::sync::Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Sidecar {
@@ -83,7 +86,11 @@ impl Sidecar {
                 }
             }));
         }
-        Self { tx, _rx: rx, workers }
+        Self {
+            tx: std::sync::Mutex::new(Some(tx)),
+            _rx: rx,
+            workers: std::sync::Mutex::new(workers),
+        }
     }
 
     /// Submit a job to the queue.
@@ -91,17 +98,39 @@ impl Sidecar {
     /// # Errors
     /// Returns `QueueFull` if the bounded mpsc has no slot. `Shutdown` if the
     /// receiver half has been dropped.
+    ///
+    /// # Panics
+    /// Panics if the internal sender mutex is poisoned (a prior caller
+    /// panicked while holding it).
+    #[allow(clippy::expect_used)]
     pub fn submit(&self, job: SidecarJob) -> Result<(), SidecarError> {
-        self.tx.try_send(job).map_err(|e| match e {
+        // Clone the sender out of the mutex so we don't hold the lock across
+        // the (potentially blocking) `try_send`.
+        let tx = {
+            let g = self.tx.lock().expect("sidecar tx mutex");
+            g.as_ref().ok_or(SidecarError::Shutdown)?.clone()
+        };
+        tx.try_send(job).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => SidecarError::QueueFull,
             mpsc::error::TrySendError::Closed(_) => SidecarError::Shutdown,
         })
     }
 
-    /// Shut down all worker tasks gracefully.
-    pub async fn shutdown(self) {
-        drop(self.tx);
-        for h in self.workers {
+    /// Shut down all worker tasks gracefully. Safe to call concurrently with
+    /// in-flight `submit`s — those that race will see [`SidecarError::Shutdown`]
+    /// once the sender slot is taken. Subsequent calls are no-ops.
+    ///
+    /// # Panics
+    /// Panics if either the internal sender or workers mutex is poisoned.
+    #[allow(clippy::expect_used)]
+    pub async fn shutdown(&self) {
+        // Drop the sender so workers see the channel close.
+        let _ = self.tx.lock().expect("sidecar tx mutex").take();
+        let handles: Vec<JoinHandle<()>> = {
+            let mut g = self.workers.lock().expect("sidecar workers mutex");
+            std::mem::take(&mut *g)
+        };
+        for h in handles {
             let _ = h.await;
         }
     }
