@@ -17,6 +17,20 @@ pub(crate) use jemalloc_backend as backend;
 pub use arena_id::ArenaId;
 pub use scope::ArenaScope;
 
+/// Re-export of the jemalloc allocator type so binaries that link this crate
+/// (with the `jemalloc` feature) can opt in as the global allocator:
+///
+/// ```ignore
+/// #[global_allocator]
+/// static GLOBAL: origin_alloc::JemallocAllocator = origin_alloc::JemallocAllocator;
+/// ```
+///
+/// The library itself does NOT install a `#[global_allocator]` — that is the
+/// binary's choice. Per-arena MALLCTL calls still function regardless because
+/// `tikv-jemalloc-sys` links the jemalloc symbols in unconditionally.
+#[cfg(feature = "jemalloc")]
+pub use tikv_jemallocator::Jemalloc as JemallocAllocator;
+
 use thiserror::Error;
 
 /// Per-arena resident / allocated byte snapshot.

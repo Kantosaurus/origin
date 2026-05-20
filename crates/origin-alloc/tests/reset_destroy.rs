@@ -1,8 +1,18 @@
 //! jemalloc-only — reset releases resident bytes; destroy invalidates the arena.
 //!
 //! These tests touch global jemalloc state, so they run on a single thread.
+//!
+//! The library crate no longer installs a `#[global_allocator]`; for these
+//! tests to observe `allocated_bytes` moving in response to `Vec` allocations,
+//! the test binary itself installs jemalloc as the global allocator. The
+//! `reset` contract (must not error) still holds even on a non-jemalloc-global
+//! host because the per-arena MALLCTL surface is independent of the global
+//! allocator choice.
 
 #![cfg(feature = "jemalloc")]
+
+#[global_allocator]
+static GLOBAL: origin_alloc::JemallocAllocator = origin_alloc::JemallocAllocator;
 
 use origin_alloc::{destroy, reset, stats_snapshot, with_arena, ArenaId};
 use serial_test::serial;

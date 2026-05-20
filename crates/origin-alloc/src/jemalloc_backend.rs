@@ -1,12 +1,16 @@
 //! jemalloc backend — one MALLCTL arena per `ArenaId`. Created lazily on first
 //! use; reset / destroy operate on the backing jemalloc arena.
+//!
+//! Note: this crate intentionally does NOT install a `#[global_allocator]`.
+//! Binaries that want jemalloc to be the global allocator must opt in by
+//! declaring their own `#[global_allocator]` using the re-exported
+//! [`crate::JemallocAllocator`] type. The per-arena MALLCTL calls below
+//! continue to work even when jemalloc is not the global allocator — the
+//! `tikv-jemalloc-sys` dependency links in the jemalloc symbols regardless.
 
 use crate::arena_id::ArenaId;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// Per-`ArenaId` jemalloc arena index (`arenas.create` result). Allocated lazily.
 static ARENAS: OnceLock<Mutex<[Option<u32>; ArenaId::COUNT]>> = OnceLock::new();
@@ -44,17 +48,16 @@ fn ensure_arena(id: ArenaId) -> u32 {
     new_idx
 }
 
-pub fn bind_thread_arena(id: ArenaId) -> Option<usize> {
+pub fn bind_thread_arena(id: ArenaId) -> Option<u32> {
     let prev = THREAD_ARENA.with(std::cell::Cell::get);
     let new = ensure_arena(id);
     set_thread_arena_raw(new);
     THREAD_ARENA.with(|c| c.set(Some(new)));
-    prev.map(|v| v as usize)
+    prev
 }
 
-pub fn restore_thread_arena(prev: Option<usize>) {
-    let v: Option<u32> = prev.map(|n| u32::try_from(n).expect("arena idx fits u32"));
-    if let Some(idx) = v {
+pub fn restore_thread_arena(prev: Option<u32>) {
+    if let Some(idx) = prev {
         set_thread_arena_raw(idx);
         THREAD_ARENA.with(|c| c.set(Some(idx)));
     } else {
@@ -132,15 +135,18 @@ pub fn snapshot() -> Result<[ArenaStat; ArenaId::COUNT], super::AllocError> {
     let epoch = c"epoch";
     let mut ep: u64 = 1;
     let mut len: libc::size_t = std::mem::size_of::<u64>();
-    // SAFETY: jemalloc FFI.
+    // SAFETY: jemalloc FFI; `mallctl` is the documented control surface. We
+    // bind and assert the return code so a stats-refresh failure surfaces
+    // immediately rather than silently returning stale counters.
     unsafe {
-        tikv_jemalloc_sys::mallctl(
+        let ret = tikv_jemalloc_sys::mallctl(
             epoch.as_ptr().cast(),
             std::ptr::from_mut::<u64>(&mut ep).cast(),
             std::ptr::from_mut::<libc::size_t>(&mut len),
             std::ptr::from_mut::<u64>(&mut ep).cast(),
             std::mem::size_of::<u64>(),
         );
+        assert_eq!(ret, 0, "jemalloc epoch failed: {ret}");
     }
     let mut out = [ArenaStat::default(); ArenaId::COUNT];
     let guard = arenas().lock().expect("arenas lock poisoned");

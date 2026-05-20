@@ -9,8 +9,9 @@ use crate::arena_id::ArenaId;
 pub struct ArenaScope {
     id: ArenaId,
     // Restoration of the prior thread-arena binding is the backend's job; this
-    // field is private and lives only for `Drop`.
-    pub(crate) prev_index: Option<usize>,
+    // field is private and lives only for `Drop`. Stored as `Option<u32>` to
+    // match the jemalloc backend's native arena index type.
+    pub(crate) prev_index: Option<u32>,
 }
 
 impl ArenaScope {
@@ -20,7 +21,7 @@ impl ArenaScope {
         self.id
     }
 
-    pub(crate) const fn new(id: ArenaId, prev_index: Option<usize>) -> Self {
+    pub(crate) const fn new(id: ArenaId, prev_index: Option<u32>) -> Self {
         Self { id, prev_index }
     }
 }

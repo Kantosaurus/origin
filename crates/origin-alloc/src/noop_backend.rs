@@ -6,20 +6,26 @@ use crate::arena_id::ArenaId;
 use std::cell::Cell;
 
 thread_local! {
-    static CURRENT: Cell<Option<usize>> = const { Cell::new(None) };
+    // Mirror the jemalloc backend's `Option<u32>` shape so the public
+    // signature is identical across backends. The no-op stores the
+    // `ArenaId::backend_index()` as a u32 for routing tests.
+    static CURRENT: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
-pub fn bind_thread_arena(id: ArenaId) -> Option<usize> {
-    CURRENT.with(|c| c.replace(Some(id.backend_index())))
+pub fn bind_thread_arena(id: ArenaId) -> Option<u32> {
+    // `backend_index()` returns a small enum-derived index (< ArenaId::COUNT),
+    // so the cast is always lossless.
+    let idx = u32::try_from(id.backend_index()).unwrap_or(u32::MAX);
+    CURRENT.with(|c| c.replace(Some(idx)))
 }
 
-pub fn restore_thread_arena(prev: Option<usize>) {
+pub fn restore_thread_arena(prev: Option<u32>) {
     CURRENT.with(|c| c.set(prev));
 }
 
 #[must_use]
 #[allow(dead_code)]
-pub fn current_thread_arena() -> Option<usize> {
+pub fn current_thread_arena() -> Option<u32> {
     CURRENT.with(Cell::get)
 }
 
