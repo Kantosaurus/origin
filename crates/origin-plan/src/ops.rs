@@ -15,7 +15,7 @@ use crate::snapshot::Snapshot;
 /// any other globally-unique payload chosen by the producer. The CRDT only
 /// requires that distinct logical steps choose distinct ids — collisions are a
 /// caller bug, not a fold-time failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StepId(u128);
 
 impl StepId {
@@ -29,6 +29,27 @@ impl StepId {
     #[must_use]
     pub const fn value(self) -> u128 {
         self.0
+    }
+}
+
+// Serialize `StepId` as a 32-char lowercase hex string. `serde_json` does
+// not support `u128` deserialization without the `arbitrary_precision`
+// feature, which we deliberately don't pull in. Strings round-trip cleanly
+// over every backend the daemon uses (IPC `serde_json` frames + persisted
+// log files).
+impl serde::Serialize for StepId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let hex = format!("{:032x}", self.0);
+        s.serialize_str(&hex)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for StepId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = <std::borrow::Cow<'_, str>>::deserialize(d)?;
+        u128::from_str_radix(&s, 16)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
     }
 }
 
