@@ -12,6 +12,9 @@ libfuzzer-sys = "0.4"
 origin-cas = { path = "../../origin-cas" }
 origin-daemon = { path = ".." }
 origin-ipc = { path = "../../origin-ipc" }
+origin-provider-anthropic = { path = "../../origin-provider-anthropic" }
+origin-provider-openai = { path = "../../origin-provider-openai" }
+origin-stream = { path = "../../origin-stream" }
 
 [[bin]]
 name = "tool_use_parser"
@@ -29,6 +32,27 @@ bench = false
 [[bin]]
 name = "fastcdc_boundary"
 path = "fuzz_targets/fastcdc_boundary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "anthropic_stream"
+path = "fuzz_targets/anthropic_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "openai_stream"
+path = "fuzz_targets/openai_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "streaming_json"
+path = "fuzz_targets/streaming_json.rs"
 test = false
 doc = false
 bench = false
