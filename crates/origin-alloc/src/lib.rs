@@ -19,6 +19,13 @@ pub use scope::ArenaScope;
 
 use thiserror::Error;
 
+/// Per-arena resident / allocated byte snapshot.
+#[cfg(feature = "jemalloc")]
+pub use crate::jemalloc_backend::ArenaStat;
+/// Per-arena resident / allocated byte snapshot (no-op backend — all zeros).
+#[cfg(not(feature = "jemalloc"))]
+pub use crate::noop_backend::ArenaStat;
+
 #[derive(Debug, Error)]
 pub enum AllocError {
     #[error("backend rejected arena bind for `{0:?}`: {1}")]
@@ -32,13 +39,44 @@ pub enum AllocError {
 ///
 /// # Errors
 /// Returns [`AllocError::Bind`] if the backend rejects the bind (jemalloc only).
-pub fn with_arena<R>(
-    id: ArenaId,
-    f: impl FnOnce(&ArenaScope) -> R,
-) -> Result<R, AllocError> {
+pub fn with_arena<R>(id: ArenaId, f: impl FnOnce(&ArenaScope) -> R) -> Result<R, AllocError> {
     let prev = backend::bind_thread_arena(id);
     let scope = ArenaScope::new(id, prev);
     let out = f(&scope);
     drop(scope); // Drop restores `prev`.
     Ok(out)
+}
+
+/// Snapshot of resident bytes per arena. No-op backend returns all zeros.
+///
+/// # Errors
+/// Returns [`AllocError::Unavailable`] on the no-op backend (currently never —
+/// the no-op snapshot always succeeds and returns zeros).
+pub fn stats_snapshot() -> Result<[backend::ArenaStat; ArenaId::COUNT], AllocError> {
+    backend::snapshot()
+}
+
+/// `arena.<i>.reset` — drop physical pages without invalidating the arena.
+///
+/// # Errors
+/// Returns [`AllocError::Bind`] if the underlying `mallctl` fails;
+/// [`AllocError::Unavailable`] on the no-op backend.
+// jemalloc backend's `reset_arena` is non-const (FFI); keep this non-const for
+// API parity across backends.
+#[allow(clippy::missing_const_for_fn)]
+pub fn reset(id: ArenaId) -> Result<(), AllocError> {
+    backend::reset_arena(id)
+}
+
+/// `arena.<i>.destroy` — fully invalidate the arena. Subsequent `with_arena`
+/// for the same id allocates a fresh jemalloc arena.
+///
+/// # Errors
+/// Returns [`AllocError::Bind`] if the underlying `mallctl` fails;
+/// [`AllocError::Unavailable`] on the no-op backend.
+// jemalloc backend's `destroy_arena` is non-const (FFI); keep this non-const
+// for API parity across backends.
+#[allow(clippy::missing_const_for_fn)]
+pub fn destroy(id: ArenaId) -> Result<(), AllocError> {
+    backend::destroy_arena(id)
 }
