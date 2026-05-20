@@ -7,7 +7,9 @@ use anyhow::Result;
 use origin_cas::Store;
 use origin_core::types::Role;
 use origin_daemon::agent::{run_loop, LoopOptions, SessionStoreSummaryDeliverer};
+use origin_daemon::auth::BearerStore;
 use origin_daemon::memory_wiring::MemoryWiring;
+use origin_daemon::pairing::{Pairing, RedeemResult};
 use origin_daemon::protocol::{ClientMessage, MemoryAction, PromptReply, PromptRequest, StreamEvent};
 use origin_daemon::provider_factory::{ProviderFactory, ProviderId};
 use origin_daemon::session::Session;
@@ -56,6 +58,12 @@ async fn main() -> Result<()> {
     info!(cas_root = %cas_root, "cas store ready");
 
     let vault = KeyVault::detect().map_err(|e| anyhow::anyhow!("keyvault detect: {e}"))?;
+
+    // P13.2: pairing + bearer-token state lives in-process. Both handles
+    // are cloned (Arc) into each per-connection future so concurrent
+    // pair_start / pair_redeem calls share one state machine.
+    let pairing = Arc::new(Pairing::new());
+    let bearer_store = Arc::new(BearerStore::new());
 
     // Back-compat: legacy installs only set `ANTHROPIC_API_KEY`. Mirror it
     // into the vault at ("anthropic", "default") so `ProviderFactory::build`
@@ -111,13 +119,14 @@ async fn main() -> Result<()> {
 
     // P11.12: optional bounded-cardinality Prometheus `/metrics` endpoint.
     // Bind address comes from `--metrics-bind <addr>` CLI flag, or, when
-    // absent, the `ORIGIN_METRICS_BIND` env var. The handle is intentionally
-    // dropped after spawning — per-call instrumentation that needs to mutate
-    // the registry will land in a follow-up cluster once provider/tool call
-    // sites grow a `Metrics` field.
+    // absent, the `ORIGIN_METRICS_BIND` env var.
+    //
+    // P13.4.2: we now keep a daemon-wide `Arc<Metrics>` handle regardless of
+    // whether the HTTP endpoint is bound, so the admin IPC `GetUsage`
+    // handler can read the same registry the `/metrics` exporter does.
+    let metrics = Arc::new(Metrics::new());
     if let Some(bind) = parse_metrics_bind() {
-        let metrics_handle = Metrics::new();
-        spawn_metrics_endpoint(metrics_handle, bind);
+        spawn_metrics_endpoint((*metrics).clone(), bind);
     }
 
     let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
@@ -136,6 +145,10 @@ async fn main() -> Result<()> {
             Arc::clone(&cas),
             Arc::clone(&sidecar),
             memory.clone(),
+            Arc::clone(&pairing),
+            Arc::clone(&bearer_store),
+            vault.clone(),
+            Arc::clone(&metrics),
         );
     }
 }
@@ -214,6 +227,7 @@ fn try_load_embedder() -> Option<Arc<Embedder>> {
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn spawn_handler_task(
     conn: SharedConnection,
     active: ActiveProvider,
@@ -222,6 +236,10 @@ fn spawn_handler_task(
     cas: Arc<Store>,
     sidecar: Arc<Sidecar>,
     memory: Option<MemoryWiring>,
+    pairing: Arc<Pairing>,
+    bearer_store: Arc<BearerStore>,
+    vault: KeyVault,
+    metrics: Arc<Metrics>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -284,6 +302,56 @@ fn spawn_handler_task(
                 }
                 ClientMessage::MemoryDecision { proposal_id, action } => {
                     handle_memory_decision(&conn, memory.as_ref(), proposal_id, &action).await;
+                }
+                ClientMessage::PairStart { ttl_secs } => {
+                    let session = pairing.start(Duration::from_secs(u64::from(ttl_secs)));
+                    let ev = StreamEvent::PairCode {
+                        code: session.code,
+                        expires_in_secs: ttl_secs,
+                    };
+                    if write_event(&conn, &ev).await.is_err() {
+                        break;
+                    }
+                }
+                ClientMessage::PairRedeem { code, device_id } => {
+                    let ev = match pairing.redeem(&code, &device_id) {
+                        Ok(RedeemResult::Issued { bearer, device_id }) => {
+                            bearer_store.insert(bearer.clone(), device_id.clone());
+                            // Best-effort vault mirror so bearers survive a
+                            // daemon restart. A failure here is non-fatal —
+                            // the in-memory BearerStore still authorizes
+                            // until the daemon exits.
+                            if let Err(e) = vault
+                                .set("origin-remote", &device_id, Secret::new(bearer.clone()))
+                                .await
+                            {
+                                warn!(error = %e, device = %device_id,
+                                      "pair: keyvault mirror failed");
+                            }
+                            StreamEvent::PairIssued {
+                                bearer,
+                                device_id,
+                                ttl_secs: 86_400,
+                            }
+                        }
+                        Err(e) => StreamEvent::PairError {
+                            message: e.to_string(),
+                        },
+                    };
+                    if write_event(&conn, &ev).await.is_err() {
+                        break;
+                    }
+                }
+                admin @ (ClientMessage::ListSessions
+                | ClientMessage::RemoveSession { .. }
+                | ClientMessage::ResumeSession { .. }
+                | ClientMessage::GetUsage
+                | ClientMessage::KeyringAdd { .. }
+                | ClientMessage::KeyringList { .. }
+                | ClientMessage::KeyringRemove { .. }) => {
+                    if !handle_admin(&conn, &session_store, &vault, metrics.as_ref(), admin).await {
+                        break;
+                    }
                 }
             }
         }
@@ -522,6 +590,135 @@ async fn write_error(conn: &SharedConnection, msg: &str) -> bool {
         .write_frame(FrameKind::ErrorFrame, msg.as_bytes())
         .await
         .is_ok()
+}
+
+/// Dispatch the P13.4.2 admin `ClientMessage` variants. Returns `false`
+/// only if the IPC write fails (the per-connection handler then exits).
+///
+/// Variants other than `ListSessions / RemoveSession / ResumeSession /
+/// GetUsage / KeyringAdd / KeyringList / KeyringRemove` are unreachable
+/// because the caller restricts the input via an `@`-bound pattern.
+async fn handle_admin(
+    conn: &SharedConnection,
+    session_store: &SessionStore,
+    vault: &KeyVault,
+    metrics: &Metrics,
+    msg: ClientMessage,
+) -> bool {
+    let ev = match msg {
+        ClientMessage::ListSessions => {
+            let summaries = session_store.list_summaries().unwrap_or_default();
+            let wire: Vec<_> = summaries
+                .into_iter()
+                .map(|s| origin_daemon::protocol::SessionSummaryWire {
+                    id: s.id,
+                    created_at: s.created_at,
+                    title: s.title,
+                    model: s.model,
+                    message_count: s.message_count,
+                })
+                .collect();
+            StreamEvent::SessionsListed { summaries: wire }
+        }
+        ClientMessage::RemoveSession { session_id } => match session_store.delete(&session_id) {
+            Ok(()) => StreamEvent::AdminOk,
+            Err(e) => StreamEvent::AdminError {
+                message: e.to_string(),
+            },
+        },
+        ClientMessage::ResumeSession { session_id: _ } => {
+            // Resume semantics deferred (P14); acknowledge so the
+            // clap-level routing on the client side completes.
+            StreamEvent::AdminOk
+        }
+        ClientMessage::GetUsage => StreamEvent::UsageReport {
+            rows: build_usage_rows(&metrics.snapshot()),
+        },
+        ClientMessage::KeyringAdd {
+            provider,
+            account,
+            secret,
+        } => match vault.set(&provider, &account, Secret::new(secret)).await {
+            Ok(()) => StreamEvent::AdminOk,
+            Err(e) => StreamEvent::AdminError {
+                message: e.to_string(),
+            },
+        },
+        ClientMessage::KeyringList { provider } => match vault.list(&provider).await {
+            Ok(accounts) => StreamEvent::KeyringAccounts { provider, accounts },
+            Err(e) => StreamEvent::AdminError {
+                message: e.to_string(),
+            },
+        },
+        ClientMessage::KeyringRemove { provider, account } => match vault.delete(&provider, &account).await {
+            Ok(()) => StreamEvent::AdminOk,
+            Err(e) => StreamEvent::AdminError {
+                message: e.to_string(),
+            },
+        },
+        // The caller restricts inputs via `admin @ (...)` so other variants
+        // never reach this function.
+        ClientMessage::Prompt(_)
+        | ClientMessage::SwitchAccount { .. }
+        | ClientMessage::MemoryDecision { .. }
+        | ClientMessage::PairStart { .. }
+        | ClientMessage::PairRedeem { .. } => return true,
+    };
+    write_event(conn, &ev).await.is_ok()
+}
+
+/// Fold a `Metrics::snapshot()` into one `UsageRow` per (provider, model)
+/// tuple. `origin_tokens_in_total{provider,model}` rows fill the
+/// `tokens_in` column; `origin_tokens_out_total{provider,model}` rows
+/// fill the `tokens_out` column. Other families are ignored.
+fn build_usage_rows(snap: &origin_metrics::Snapshot) -> Vec<origin_daemon::protocol::UsageRow> {
+    use std::collections::BTreeMap;
+    let mut acc: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
+    for r in snap.iter() {
+        let is_in = r.name == "origin_tokens_in_total";
+        let is_out = r.name == "origin_tokens_out_total";
+        if !(is_in || is_out) {
+            continue;
+        }
+        let mut provider = String::new();
+        let mut model = String::new();
+        for (k, v) in &r.labels {
+            match k.as_str() {
+                "provider" => provider.clone_from(v),
+                "model" => model.clone_from(v),
+                _ => {}
+            }
+        }
+        // Saturating cast — counter values are non-negative.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let val = r.value as u64;
+        let entry = acc.entry((provider, model)).or_insert((0, 0));
+        if is_in {
+            entry.0 = entry.0.saturating_add(val);
+        } else {
+            entry.1 = entry.1.saturating_add(val);
+        }
+    }
+    acc.into_iter()
+        .map(
+            |((provider, model), (tokens_in, tokens_out))| origin_daemon::protocol::UsageRow {
+                provider,
+                model,
+                tokens_in,
+                tokens_out,
+            },
+        )
+        .collect()
+}
+
+/// Serialize `ev` and write it as a single `Event` frame. Mirrors the
+/// pattern used by `handle_switch` for `StreamEvent::ProviderActive`,
+/// but kept as a small helper because P13.2 emits three different
+/// `StreamEvent` variants from the pair handler.
+async fn write_event(conn: &SharedConnection, ev: &StreamEvent) -> Result<()> {
+    let body = serde_json::to_vec(ev)?;
+    conn.lock().await.write_frame(FrameKind::Event, &body).await?;
+    Ok(())
 }
 
 fn persist(session_store: &SessionStore, session: &Session) {

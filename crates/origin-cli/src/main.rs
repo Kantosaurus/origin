@@ -35,12 +35,90 @@ enum Cmd {
         #[command(subcommand)]
         sub: TraceSub,
     },
+    /// Start or redeem a pairing session for remote QUIC clients (P13.2).
+    Pair {
+        #[command(subcommand)]
+        sub: PairSub,
+    },
+    /// One-shot prompt: connect to the daemon, send `text`, drain to completion, exit.
+    Run {
+        /// The user prompt.
+        text: String,
+        /// Emit JSON-Lines stream of every IPC event.
+        #[arg(long)]
+        json: bool,
+        /// Remote daemon URL (`origin://host:port#fingerprint`).
+        #[arg(long)]
+        remote: Option<String>,
+        /// Optional bearer token for remote auth.
+        #[arg(long)]
+        bearer: Option<String>,
+        /// Model override.
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Daemon usage snapshot (tokens in/out per provider/model).
+    Usage,
+    /// Manage persisted sessions.
+    Sessions {
+        #[command(subcommand)]
+        sub: SessionsSub,
+    },
+    /// Manage stored provider credentials.
+    Keyring {
+        #[command(subcommand)]
+        sub: KeyringSub,
+    },
 }
 
 #[derive(Subcommand)]
 enum TraceSub {
     /// Print spans matching the given filters.
     Query(TraceQuery),
+}
+
+#[derive(Subcommand)]
+enum SessionsSub {
+    /// List recent sessions (most-recent first).
+    Ls,
+    /// Resume a session by id (currently a no-op acknowledgement).
+    Resume { session_id: String },
+    /// Delete a session and all its messages.
+    Rm { session_id: String },
+}
+
+#[derive(Subcommand)]
+enum KeyringSub {
+    /// Add or overwrite a provider secret.
+    Add {
+        provider: String,
+        account: String,
+        /// The secret value; read from stdin if `-`.
+        secret: String,
+    },
+    /// List accounts for a provider.
+    List { provider: String },
+    /// Remove a provider account secret.
+    Remove { provider: String, account: String },
+}
+
+#[derive(Subcommand)]
+enum PairSub {
+    /// Daemon-side: show a 6-digit pairing code.
+    Start {
+        #[arg(long, default_value_t = 60)]
+        ttl_secs: u32,
+    },
+    /// Client-side: redeem a code against a remote daemon.
+    Redeem {
+        /// Remote URL: `origin://host:port#fingerprint`.
+        url: String,
+        /// The 6-digit code shown on the daemon host.
+        code: String,
+        /// Stable device identifier (defaults to hostname).
+        #[arg(long)]
+        device_id: Option<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -59,11 +137,31 @@ async fn main() -> Result<()> {
     // Dispatch a subcommand if one was given, otherwise fall through to the
     // TUI entry path (preserves the existing env-driven invocation).
     let cli = Cli::parse();
-    if let Some(Cmd::Trace {
-        sub: TraceSub::Query(q),
-    }) = cli.cmd
-    {
-        return origin_cli::trace_cmd::invoke(q).map_err(|e| anyhow::anyhow!("{e}"));
+    match cli.cmd {
+        Some(Cmd::Trace {
+            sub: TraceSub::Query(q),
+        }) => {
+            return origin_cli::trace_cmd::invoke(q).map_err(|e| anyhow::anyhow!("{e}"));
+        }
+        Some(Cmd::Pair { sub }) => {
+            return match sub {
+                PairSub::Start { ttl_secs } => pair_start(ttl_secs).await,
+                PairSub::Redeem { url, code, device_id } => pair_redeem(&url, &code, device_id).await,
+            };
+        }
+        Some(Cmd::Run {
+            text,
+            json,
+            remote,
+            bearer,
+            model,
+        }) => {
+            return origin_cli::headless::run(text, json, remote, bearer, model).await;
+        }
+        Some(Cmd::Usage) => return origin_cli::admin::usage().await,
+        Some(Cmd::Sessions { sub }) => return origin_cli::admin::sessions(sub_to_action(sub)).await,
+        Some(Cmd::Keyring { sub }) => return origin_cli::admin::keyring(sub_to_action_kr(sub)).await,
+        None => {}
     }
 
     let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
@@ -369,6 +467,93 @@ async fn send_decision(path: &str, decision: &ClientMessage) -> Result<()> {
     // Errors here are non-fatal — the decision has already been sent.
     let _ = client.read_frame_body().await;
     Ok(())
+}
+
+fn sub_to_action(sub: SessionsSub) -> origin_cli::admin::SessionsAction {
+    match sub {
+        SessionsSub::Ls => origin_cli::admin::SessionsAction::Ls,
+        SessionsSub::Resume { session_id } => origin_cli::admin::SessionsAction::Resume(session_id),
+        SessionsSub::Rm { session_id } => origin_cli::admin::SessionsAction::Rm(session_id),
+    }
+}
+
+fn sub_to_action_kr(sub: KeyringSub) -> origin_cli::admin::KeyringAction {
+    match sub {
+        KeyringSub::Add {
+            provider,
+            account,
+            secret,
+        } => origin_cli::admin::KeyringAction::Add {
+            provider,
+            account,
+            secret,
+        },
+        KeyringSub::List { provider } => origin_cli::admin::KeyringAction::List { provider },
+        KeyringSub::Remove { provider, account } => {
+            origin_cli::admin::KeyringAction::Remove { provider, account }
+        }
+    }
+}
+
+/// `origin pair start [--ttl-secs N]`. Sends a `PairStart` to the
+/// local daemon and prints the 6-digit code it returns.
+async fn pair_start(ttl_secs: u32) -> Result<()> {
+    let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
+    let mut c = Connector::connect(&path).await?;
+    let msg = ClientMessage::PairStart { ttl_secs };
+    let body = serde_json::to_vec(&msg)?;
+    c.write_raw(&encode(1, FrameKind::Request, &body)).await?;
+    let resp = c.read_frame_body().await?;
+    let ev: StreamEvent = serde_json::from_slice(&resp)?;
+    match ev {
+        StreamEvent::PairCode {
+            code,
+            expires_in_secs,
+        } => {
+            println!("pairing code: {code} (valid {expires_in_secs}s)");
+            Ok(())
+        }
+        other => Err(anyhow::anyhow!("unexpected: {other:?}")),
+    }
+}
+
+/// `origin pair redeem <origin-url> <code> [--device-id DEV]`. Dials
+/// the remote daemon over QUIC, redeems the code, and prints the
+/// minted bearer.
+async fn pair_redeem(url: &str, code: &str, device_id: Option<String>) -> Result<()> {
+    let device = device_id.unwrap_or_else(|| {
+        hostname::get()
+            .ok()
+            .and_then(|n| n.into_string().ok())
+            .unwrap_or_else(|| "unknown".into())
+    });
+    let parsed = origin_cli::admin_url::parse_origin_url(url)?;
+    let ca = parsed.fingerprint_to_ca_placeholder();
+    let mut c = origin_ipc::quic::QuicConnector::connect(parsed.addr, "origin-daemon", &ca)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let msg = ClientMessage::PairRedeem {
+        code: code.into(),
+        device_id: device.clone(),
+    };
+    let body = serde_json::to_vec(&msg)?;
+    c.write_raw(&encode(1, FrameKind::Request, &body))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (_kind, resp) = c.read_frame().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ev: StreamEvent = serde_json::from_slice(&resp)?;
+    match ev {
+        StreamEvent::PairIssued {
+            bearer,
+            device_id,
+            ttl_secs,
+        } => {
+            println!("paired device={device_id} ttl={ttl_secs}s");
+            println!("token: {bearer}");
+            Ok(())
+        }
+        other => Err(anyhow::anyhow!("pair failed: {other:?}")),
+    }
 }
 
 fn default_path() -> String {

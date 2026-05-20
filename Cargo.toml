@@ -39,4 +39,17 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 caps = "0.5"
 seccompiler = "0.4"
 landlock = "0.4"
+# P13 QUIC + mutual-TLS remote IPC transport
+quinn          = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring", "log"] }
+rustls         = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rcgen          = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+x509-parser    = "0.16"
+sha2           = "0.10"
+hex            = "0.4"
+# P12 additions
+tikv-jemallocator = { version = "0.6", default-features = false, features = ["background_threads"] }
+tikv-jemalloc-ctl = { version = "0.6", default-features = false }
+tokio-uring = "0.5"
+nix = { version = "0.29", default-features = false, features = ["signal", "process"] }
 

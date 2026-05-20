@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct Session {
-    pub id: MessageId,
+    pub id: String,
     pub provider_name: String,
     pub model: String,
     pub messages: Vec<Message>,
@@ -22,9 +22,25 @@ impl Session {
     #[must_use]
     pub fn new(provider_name: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            id: MessageId::new(),
+            id: MessageId::new().to_string(),
             provider_name: provider_name.into(),
             model: model.into(),
+            messages: Vec::new(),
+            pending_proposals: HashMap::new(),
+            next_proposal_id: 1,
+        }
+    }
+
+    /// Construct a session with a caller-supplied id. Used by admin/restore
+    /// paths that need to materialize a known session id (e.g. when loading
+    /// from `SessionStore` or in tests). Mirrors [`Session::new`] otherwise,
+    /// leaving `provider_name` empty.
+    #[must_use]
+    pub fn new_with_id(id: String, model: String) -> Self {
+        Self {
+            id,
+            provider_name: String::new(),
+            model,
             messages: Vec::new(),
             pending_proposals: HashMap::new(),
             next_proposal_id: 1,

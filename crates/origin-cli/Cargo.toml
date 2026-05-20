@@ -33,10 +33,14 @@ futures-util = "0.3"
 parking_lot = "0.12"
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
+hostname = "0.4"
+url = "2"
 
 [dev-dependencies]
 criterion = "0.5"
 origin-stream = { path = "../origin-stream" }
+tempfile = "3"
+ulid = "1"
 
 [[bench]]
 name = "keystroke_to_pixel"
