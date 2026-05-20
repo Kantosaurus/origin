@@ -1,5 +1,9 @@
 //! `OpenAI` provider — thin wrapper around `origin-provider-openai-compat`.
 
+/// Re-export of the shared OpenAI-shape SSE parser. Exposed so consumers
+/// (and tests) can address it as `origin_provider_openai::streaming::…`.
+pub use origin_provider_openai_compat::streaming;
+
 use origin_provider_openai_compat::{OpenAiCompat, OpenAiCompatConfig, StaticBearer};
 
 const DEFAULT_BASE: &str = "https://api.openai.com";
