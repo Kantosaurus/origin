@@ -9,11 +9,17 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[lib]
+name = "origin_supervisor"
+path = "src/lib.rs"
+
 [[bin]]
 name = "origin-supervisor"
 path = "src/main.rs"
 
 [dependencies]
+origin-resume-token = { path = "../origin-resume-token" }
+origin-ipc = { path = "../origin-ipc" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "time"] }
