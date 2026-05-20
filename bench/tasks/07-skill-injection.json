@@ -1,0 +1,9 @@
+{
+  "id": "07-skill-injection",
+  "prompt": "Use the `refactor-rust-module` skill to clean up `src/foo.rs`.",
+  "expected_tools_min": [],
+  "expected_tool_calls_max": 4,
+  "max_turn_latency_ms": 5000,
+  "max_input_tokens": 4000,
+  "max_output_tokens": 1000
+}

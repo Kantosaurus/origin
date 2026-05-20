@@ -1,10 +1,3 @@
-#[allow(dead_code)]
-mod metrics;
-#[allow(dead_code)]
-mod report;
-#[allow(dead_code)]
-mod task_set;
-
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]

@@ -1,0 +1,9 @@
+{
+  "id": "02-grep-and-explain",
+  "prompt": "Find every `unsafe` block in this repo and explain why each is needed.",
+  "expected_tools_min": ["Grep", "Read"],
+  "expected_tool_calls_max": 4,
+  "max_turn_latency_ms": 5000,
+  "max_input_tokens": 4000,
+  "max_output_tokens": 1000
+}

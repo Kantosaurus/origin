@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "tasks": [
+    "01-read-and-summarize.json",
+    "02-grep-and-explain.json",
+    "03-edit-trivial.json",
+    "04-edit-multifile.json",
+    "05-bash-build.json",
+    "06-mcp-readonly.json",
+    "07-skill-injection.json",
+    "08-swarm-refactor.json"
+  ]
+}
