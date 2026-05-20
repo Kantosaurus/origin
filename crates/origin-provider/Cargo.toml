@@ -29,3 +29,4 @@ recorder = ["dep:origin-replay"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+url = "2"
