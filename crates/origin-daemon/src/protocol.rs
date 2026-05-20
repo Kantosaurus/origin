@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use origin_plan::OpEnvelope;
 use origin_resume_token::ResumeToken;
 use serde::{Deserialize, Serialize};
 
@@ -75,9 +76,12 @@ pub enum ClientMessage {
     /// daemon replies with [`StreamEvent::AdminOk`] on success or
     /// [`StreamEvent::AdminError`] on failure.
     RemoveSession { session_id: String },
-    /// P13.4.2: resume a previously persisted session. Currently a
-    /// clap-level routing placeholder; the daemon acknowledges with
-    /// [`StreamEvent::AdminOk`] and full resume semantics land in P14.
+    /// P13.4.2: resume a previously persisted session. The daemon
+    /// counts the persisted message rows for `session_id`, reads any
+    /// checkpointed [`ResumeToken`] from the `resume/` directory, and
+    /// replies with [`StreamEvent::SessionResumed`] describing the
+    /// hydratable state. Returns [`StreamEvent::AdminError`] if the
+    /// session does not exist.
     ResumeSession { session_id: String },
     /// P13.4.2: ask the daemon for a per-provider/per-model token usage
     /// snapshot. The daemon replies with [`StreamEvent::UsageReport`].
@@ -104,6 +108,11 @@ pub enum ClientMessage {
     /// `TaskClass::Critical`. The full hydrate-from-CAS wiring is a P14
     /// polish item; P12 ships the wire shape + an immediate ack handler.
     ResumeRequest { token: ResumeToken },
+    /// Subscribe this connection to the daemon-wide plan-op broadcast.
+    /// Every subsequent [`OpEnvelope`] published to the bus is forwarded as
+    /// a [`StreamEvent::PlanOp`] event frame. The subscription terminates
+    /// when the connection closes.
+    SubscribePlan,
 }
 
 impl ClientMessage {
@@ -198,6 +207,24 @@ pub enum StreamEvent {
     /// P13.4.2: positive acknowledgement for admin mutations that have no
     /// payload of their own (`RemoveSession`, `KeyringAdd`, …).
     AdminOk,
+    /// One plan op envelope forwarded to a [`ClientMessage::SubscribePlan`]
+    /// subscriber. The CLI feeds these into its `plan_panel_wiring::ingest`
+    /// call site to drive the side-panel render.
+    PlanOp {
+        envelope: OpEnvelope,
+    },
+    /// Response to [`ClientMessage::ResumeSession`]. `messages_loaded` is
+    /// the count of persisted message rows that would be re-hydrated;
+    /// `restored_to_turn` is the `last_turn` of the checkpointed
+    /// [`ResumeToken`] when one exists, otherwise `messages_loaded - 1`
+    /// (or `0` for empty sessions). `had_resume_token` flags whether the
+    /// supervisor previously checkpointed the session.
+    SessionResumed {
+        session_id: String,
+        messages_loaded: u32,
+        restored_to_turn: u32,
+        had_resume_token: bool,
+    },
     /// P13.4.2: negative acknowledgement carrying a human-readable error
     /// message. Used as the failure side of the admin mutation handlers.
     AdminError {

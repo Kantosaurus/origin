@@ -6,6 +6,7 @@
 use origin_daemon::protocol::{ClientMessage, PromptRequest, StreamEvent};
 use origin_daemon::provider_factory::{ProviderFactory, ProviderId};
 use origin_keyvault::{KeyVault, Secret};
+use origin_provider::catalog::Catalog;
 
 #[tokio::test]
 async fn factory_builds_anthropic_from_vault() {
@@ -19,11 +20,9 @@ async fn factory_builds_anthropic_from_vault() {
         .await
         .expect("vault set openai");
 
-    let factory = ProviderFactory::new(vault);
-    let provider = factory
-        .build(ProviderId::Anthropic, "default")
-        .await
-        .expect("build anthropic");
+    let factory = ProviderFactory::new(vault, Catalog::builtin());
+    let id = ProviderId::parse("anthropic", factory.catalog()).expect("anthropic id");
+    let provider = factory.build(&id, "default").await.expect("build anthropic");
     assert_eq!(provider.name(), "anthropic");
 }
 
@@ -39,19 +38,18 @@ async fn factory_builds_openai_from_vault() {
         .await
         .expect("vault set openai");
 
-    let factory = ProviderFactory::new(vault);
-    let provider = factory
-        .build(ProviderId::OpenAi, "default")
-        .await
-        .expect("build openai");
+    let factory = ProviderFactory::new(vault, Catalog::builtin());
+    let id = ProviderId::parse("openai", factory.catalog()).expect("openai id");
+    let provider = factory.build(&id, "default").await.expect("build openai");
     assert_eq!(provider.name(), "openai");
 }
 
 #[tokio::test]
 async fn factory_missing_credential_surfaces_error() {
     let vault = KeyVault::in_memory();
-    let factory = ProviderFactory::new(vault);
-    let result = factory.build(ProviderId::Anthropic, "default").await;
+    let factory = ProviderFactory::new(vault, Catalog::builtin());
+    let id = ProviderId::parse("anthropic", factory.catalog()).expect("anthropic id");
+    let result = factory.build(&id, "default").await;
     let err = match result {
         Ok(_) => panic!("expected MissingCredential, got Ok"),
         Err(e) => e,
@@ -93,7 +91,8 @@ fn client_message_prompt_round_trips() {
         | ClientMessage::KeyringAdd { .. }
         | ClientMessage::KeyringList { .. }
         | ClientMessage::KeyringRemove { .. }
-        | ClientMessage::ResumeRequest { .. } => unreachable!("expected Prompt variant"),
+        | ClientMessage::ResumeRequest { .. }
+        | ClientMessage::SubscribePlan => unreachable!("expected Prompt variant"),
     }
 }
 
@@ -124,7 +123,8 @@ fn client_message_switch_account_round_trips() {
         | ClientMessage::KeyringAdd { .. }
         | ClientMessage::KeyringList { .. }
         | ClientMessage::KeyringRemove { .. }
-        | ClientMessage::ResumeRequest { .. } => unreachable!("expected SwitchAccount variant"),
+        | ClientMessage::ResumeRequest { .. }
+        | ClientMessage::SubscribePlan => unreachable!("expected SwitchAccount variant"),
     }
 }
 
@@ -150,8 +150,16 @@ fn stream_event_provider_active_round_trips() {
 
 #[test]
 fn provider_id_parse_and_as_str_round_trip() {
-    for s in ["anthropic", "openai", "gemini", "ollama"] {
-        let id = ProviderId::parse(s).expect("known id");
-        assert_eq!(id.as_str(), s);
+    let catalog = Catalog::builtin();
+    // (input alias, canonical catalog id)
+    for (input, canonical) in [
+        ("anthropic", "anthropic"),
+        ("openai", "openai"),
+        // `gemini` is the legacy alias; the catalog id is `google`.
+        ("gemini", "google"),
+        ("ollama", "ollama"),
+    ] {
+        let id = ProviderId::parse(input, &catalog).expect("known id");
+        assert_eq!(id.as_str(), canonical);
     }
 }

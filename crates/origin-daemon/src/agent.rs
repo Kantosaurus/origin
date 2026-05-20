@@ -1,5 +1,6 @@
 //! Agent loop: prompt → provider → tool dispatch → repeat → final text.
 
+use crate::proposal_registry::ProposalRegistry;
 use crate::protocol::StreamEvent;
 use crate::session::Session;
 use crate::session_store::SessionStore;
@@ -54,6 +55,12 @@ pub struct LoopOptions {
     /// `<context source="origin-mem">` block to the system prompt of every
     /// turn's `ChatRequest`. `None` disables prompt-recall injection.
     pub injector: Option<Arc<Injector>>,
+    /// Daemon-wide pending-proposal registry. When wired together with
+    /// `proposer` + `event_tx`, each emitted [`StreamEvent::MemoryProposed`]
+    /// also records its `(body, tags)` here so a later
+    /// [`ClientMessage::MemoryDecision::Accept`](crate::protocol::ClientMessage::MemoryDecision)
+    /// on a different connection can still persist the proposal.
+    pub proposal_registry: Option<Arc<ProposalRegistry>>,
 }
 
 impl Default for LoopOptions {
@@ -68,6 +75,7 @@ impl Default for LoopOptions {
             proposer: None,
             event_tx: None,
             injector: None,
+            proposal_registry: None,
         }
     }
 }
@@ -310,12 +318,28 @@ pub async fn run_loop(
                 })
                 .collect::<String>();
 
-            // P6.7: optional proposer pass at turn end. Each proposal is
-            // stashed on the Session and surfaced as a side-band StreamEvent
-            // for the CLI to render.
+            // P6.7: optional proposer pass at turn end. Proposals are surfaced
+            // as side-band StreamEvents for the CLI to render AND recorded in
+            // the daemon-wide [`ProposalRegistry`] so a later `MemoryDecision`
+            // on a different connection can still resolve the body/tags.
+            // The session's local `next_proposal_id` is initialized from the
+            // registry's counter so per-prompt scans share the global id-space
+            // (no collisions across sessions or concurrent prompt requests).
             if let Some(proposer) = &opts.proposer {
-                let proposals = proposer.scan(user_text, &text, &mut session.next_proposal_id);
+                let mut local_id = opts
+                    .proposal_registry
+                    .as_ref()
+                    .map_or(session.next_proposal_id, |r| r.current_id());
+                let proposals = proposer.scan(user_text, &text, &mut local_id);
+                if let Some(registry) = &opts.proposal_registry {
+                    registry.advance_to(local_id);
+                } else {
+                    session.next_proposal_id = local_id;
+                }
                 for p in proposals {
+                    if let Some(registry) = &opts.proposal_registry {
+                        registry.record(p.proposal_id, p.body.clone(), p.suggested_tags.clone());
+                    }
                     if let Some(tx) = &opts.event_tx {
                         let _ = tx
                             .send(StreamEvent::MemoryProposed {

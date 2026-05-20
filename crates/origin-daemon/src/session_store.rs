@@ -246,6 +246,17 @@ impl SessionStore {
         Ok(rows)
     }
 
+    /// Fold the WAL back into the main DB file. Wraps
+    /// [`origin_store::Store::wal_checkpoint_truncate`] so callers don't
+    /// need to depend on `origin-store` directly.
+    ///
+    /// # Errors
+    /// Propagates the underlying sqlite error.
+    pub fn checkpoint(&self) -> Result<(), SessionStoreError> {
+        self.inner.wal_checkpoint_truncate()?;
+        Ok(())
+    }
+
     /// Delete a session row and all of its associated message rows. Idempotent:
     /// removing a non-existent session is a no-op.
     ///
