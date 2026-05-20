@@ -17,6 +17,7 @@ use origin_ipc::frame::FrameKind;
 use origin_ipc::transport::{Listener, SharedConnection};
 use origin_keyvault::{KeyVault, Secret};
 use origin_mem::{Embedder, MemIndex};
+use origin_metrics::Metrics;
 use origin_permission::prompt::AlwaysAllow;
 use origin_provider::Provider;
 use origin_provider_anthropic::Anthropic;
@@ -104,6 +105,17 @@ async fn main() -> Result<()> {
     }
 
     spawn_idle_consolidator(memory.as_ref());
+
+    // P11.12: optional bounded-cardinality Prometheus `/metrics` endpoint.
+    // Bind address comes from `--metrics-bind <addr>` CLI flag, or, when
+    // absent, the `ORIGIN_METRICS_BIND` env var. The handle is intentionally
+    // dropped after spawning — per-call instrumentation that needs to mutate
+    // the registry will land in a follow-up cluster once provider/tool call
+    // sites grow a `Metrics` field.
+    if let Some(bind) = parse_metrics_bind() {
+        let metrics_handle = Metrics::new();
+        spawn_metrics_endpoint(metrics_handle, bind);
+    }
 
     let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
     let listener = Listener::bind(&path).await?;
@@ -566,4 +578,66 @@ fn default_cas_root() -> String {
     let mut p = std::env::temp_dir();
     p.push("origin-cas");
     p.to_string_lossy().into_owned()
+}
+
+/// Parse the optional `--metrics-bind <addr>` CLI flag, falling back to the
+/// `ORIGIN_METRICS_BIND` env var.
+///
+/// We hand-roll the parser to avoid pulling in `clap` for a single flag.
+fn parse_metrics_bind() -> Option<String> {
+    let mut args = env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--metrics-bind" {
+            return args.next();
+        }
+        if let Some(rest) = a.strip_prefix("--metrics-bind=") {
+            return Some(rest.to_string());
+        }
+    }
+    env::var("ORIGIN_METRICS_BIND").ok()
+}
+
+/// Spawn a `hyper` 1.x `/metrics` server bound to `addr`.
+///
+/// Any request returns the current Prometheus text exposition; the body is
+/// served as a single `Full<Bytes>` frame so the handler is allocation-only
+/// per request. Bind failure is logged but does not abort the daemon.
+fn spawn_metrics_endpoint(metrics: Metrics, addr: String) {
+    tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(error = %e, addr = %addr, "metrics: bind failed");
+                return;
+            }
+        };
+        info!(addr = %addr, "metrics: /metrics endpoint listening");
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(error = %e, "metrics: accept failed");
+                    continue;
+                }
+            };
+            let metrics = metrics.clone();
+            tokio::spawn(async move {
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let svc = hyper::service::service_fn(move |_req: hyper::Request<hyper::body::Incoming>| {
+                    let body = metrics.encode_text().unwrap_or_default();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Full::new(
+                            hyper::body::Bytes::from(body),
+                        )))
+                    }
+                });
+                if let Err(e) = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, svc)
+                    .await
+                {
+                    warn!(error = %e, "metrics: serve_connection error");
+                }
+            });
+        }
+    });
 }
