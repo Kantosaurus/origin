@@ -13,6 +13,7 @@ use origin_daemon::provider_factory::{ProviderFactory, ProviderId};
 use origin_daemon::runtime_launch::{self, ShutdownSignal};
 use origin_daemon::session::Session;
 use origin_daemon::session_store::SessionStore;
+use origin_daemon::shutdown::CooperativeShutdown;
 use origin_daemon::stream_relay::relay_to_connection;
 use origin_ipc::frame::FrameKind;
 use origin_ipc::transport::{Listener, SharedConnection};
@@ -80,11 +81,43 @@ fn main() -> Result<()> {
         }
     });
 
-    // Wire SIGINT (and on Unix, SIGTERM via ctrlc's handler) to the shutdown
-    // signal. P12.11 replaces this with the full phased shutdown.
-    let signal_for_handler = signal;
-    ctrlc::set_handler(move || signal_for_handler.trigger())
-        .map_err(|e| anyhow::anyhow!("ctrlc set_handler: {e}"))?;
+    // P12.11: SIGINT/SIGTERM/Ctrl+C wakes a tokio watcher that drives the
+    // CooperativeShutdown phases on the control core, then triggers the
+    // shutdown signal so the launcher returns. The current
+    // `CooperativeShutdown::for_production` is a stub equivalent to
+    // `for_test(no_op_channel, 30s_budget)` — full per-phase wiring (IPC
+    // listener stop, sidecar queue persist, CAS flush, SQLite checkpoint,
+    // etc.) is a P14 polish item.
+    //
+    // We still use `ctrlc` as the cross-platform signal entry — its handler
+    // runs on its own thread, posts to a `mpsc` channel, and a control-core
+    // task drives the phased shutdown from there. This avoids tying
+    // `tokio::signal::ctrl_c` to the OS main thread (which is not a tokio
+    // runtime) while still landing the phase driver on the control core.
+    let (sig_tx, mut sig_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let signal_for_handler = signal.clone();
+    ctrlc::set_handler(move || {
+        // Best-effort; if the receiver is dropped the launcher is already on
+        // its way out, so we fall back to a direct trigger.
+        if sig_tx.send(()).is_err() {
+            signal_for_handler.trigger();
+        }
+    })
+    .map_err(|e| anyhow::anyhow!("ctrlc set_handler: {e}"))?;
+
+    let signal_for_shutdown = signal.clone();
+    signal.control_handle().spawn_on_control(async move {
+        if sig_rx.recv().await.is_none() {
+            // Channel closed without a signal — nothing to do.
+            return;
+        }
+        let mut driver = CooperativeShutdown::for_production();
+        match driver.run().await {
+            Ok(report) => info!(?report, "cooperative shutdown complete"),
+            Err(e) => warn!(error = %e, "cooperative shutdown driver returned error"),
+        }
+        signal_for_shutdown.trigger();
+    });
 
     // Block on the launcher; it returns when `signal.trigger()` fires.
     launcher_join
