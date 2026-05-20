@@ -3498,6 +3498,7 @@ dependencies = [
  "hex",
  "lru",
  "memmap2",
+ "origin-replay",
  "origin-runtime",
  "parking_lot",
  "proptest",

@@ -20,3 +20,20 @@ pub use hash::Hash;
 pub use packfile::{IndexEntry, PackBuilder, PackError, PackReader, PackSlice};
 pub use refs::{RefError, RefTable};
 pub use store::{Store, StoreConfig, StoreError};
+
+#[cfg(feature = "recorder")]
+pub mod recorder_hook {
+    use origin_replay::cas_tap::CasTap;
+    use std::sync::Arc;
+
+    static TAP: parking_lot::RwLock<Option<Arc<CasTap>>> = parking_lot::RwLock::new(None);
+
+    pub fn register_tap(tap: Arc<CasTap>) {
+        *TAP.write() = Some(tap);
+    }
+
+    #[must_use]
+    pub fn tap() -> Option<Arc<CasTap>> {
+        TAP.read().clone()
+    }
+}
