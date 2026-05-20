@@ -5,6 +5,7 @@ pub mod admin;
 pub mod admin_url;
 pub mod cli_def;
 pub mod headless;
+pub mod import;
 pub mod input;
 pub mod plan_panel_wiring;
 pub mod screen;

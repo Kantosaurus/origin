@@ -67,6 +67,24 @@ async fn main() -> Result<()> {
         Some(Cmd::Usage) => return origin_cli::admin::usage().await,
         Some(Cmd::Sessions { sub }) => return origin_cli::admin::sessions(sub_to_action(sub)).await,
         Some(Cmd::Keyring { sub }) => return origin_cli::admin::keyring(sub_to_action_kr(sub)).await,
+        Some(Cmd::Import(a)) => {
+            let r = origin_cli::import::run_import(&a).map_err(anyhow::Error::from)?;
+            if a.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "sessions_inserted": r.sessions_inserted,
+                        "skills_inserted": r.skills_inserted,
+                    })
+                );
+            } else {
+                println!(
+                    "Imported {} sessions, {} skills.",
+                    r.sessions_inserted, r.skills_inserted
+                );
+            }
+            return Ok(());
+        }
         None => {}
     }
 
