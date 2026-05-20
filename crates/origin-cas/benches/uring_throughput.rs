@@ -46,9 +46,9 @@ fn read_bench() -> f64 {
             let _ = read_at_uring(&reader, h).await.expect("read");
         }
         let elapsed = start.elapsed().as_secs_f64();
-        *throughput.lock().unwrap() = (total as f64) / (1024.0 * 1024.0) / elapsed;
+        *throughput.lock().expect("throughput lock") = (total as f64) / (1024.0 * 1024.0) / elapsed;
     });
-    let g = *throughput.lock().unwrap();
+    let g = *throughput.lock().expect("throughput lock");
     g
 }
 

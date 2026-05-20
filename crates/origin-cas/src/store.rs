@@ -117,7 +117,7 @@ impl Store {
             return Ok(h);
         }
 
-        if let Some((evicted_hash, evicted_bytes)) = inner.hot.push(h, bytes.to_vec()) {
+        let need_flush = if let Some((evicted_hash, evicted_bytes)) = inner.hot.push(h, bytes.to_vec()) {
             // `push` returns `Some((k, v))` for the entry pushed out by capacity.
             // It can also return the same key we just inserted if the cache was
             // full and the new key replaced something — in either case, route
@@ -128,10 +128,29 @@ impl Store {
                 let len = u64::try_from(evicted_bytes.len()).unwrap_or(u64::MAX);
                 inner.warm_bytes = inner.warm_bytes.saturating_add(len);
                 inner.warm_pending.push((evicted_hash, evicted_bytes));
-                if inner.warm_bytes >= inner.cfg.warm_pack_target_bytes {
-                    flush_warm(&mut inner)?;
-                }
+                inner.warm_bytes >= inner.cfg.warm_pack_target_bytes
+            } else {
+                false
             }
+        } else {
+            false
+        };
+        if need_flush {
+            // Pull pack path + payloads out under the lock, then RELEASE the
+            // parking_lot guard before invoking the (possibly uring-backed)
+            // writer. We re-acquire the lock to record the new pack reader.
+            let next_idx = inner.warm_packs.len();
+            let path = inner.cfg.root.join("warm").join(format!("w{next_idx:08}.pack"));
+            let pending = std::mem::take(&mut inner.warm_pending);
+            drop(inner);
+            write_pack(&path, &pending)?;
+            let r = PackReader::open(&path)?;
+            let mut inner = self.inner.lock();
+            for (ph, _) in &pending {
+                inner.warm_index.insert(*ph, next_idx);
+            }
+            inner.warm_packs.push(r);
+            inner.warm_bytes = 0;
         }
         Ok(h)
     }
@@ -336,41 +355,47 @@ fn scan_dir(dir: &std::path::Path) -> Result<(Vec<PackReader>, HashMap<Hash, usi
     Ok((packs, index))
 }
 
-fn flush_warm(inner: &mut Inner) -> Result<(), StoreError> {
-    if inner.warm_pending.is_empty() {
-        return Ok(());
-    }
-    let next_idx = inner.warm_packs.len();
-    let path = inner.cfg.root.join("warm").join(format!("w{next_idx:08}.pack"));
-    let pending = std::mem::take(&mut inner.warm_pending);
-
+/// Write `pending` payloads to a pack file at `path`. Must be called with **no
+/// `Store::Inner` lock held**: on Linux with the `uring` feature this enters a
+/// blocking thread that hosts its own `tokio_uring` runtime, and holding a
+/// `parking_lot` guard across that hop would (a) deadlock against any other
+/// reader and (b) interact badly with the surrounding Tokio runtime that
+/// owns the caller.
+fn write_pack(path: &std::path::Path, pending: &[(Hash, Vec<u8>)]) -> Result<(), StoreError> {
     // On Linux with the `uring` cargo feature, route the pack flush through
     // the io_uring writer. Everywhere else, fall back to the std BufWriter
     // path that `PackBuilder` already implements.
     #[cfg(all(target_os = "linux", feature = "uring"))]
     {
-        let path_for_writer = path.clone();
-        let pending_for_writer = pending.clone();
-        let res: Result<(), crate::packfile::PackError> = tokio_uring::start(async move {
-            crate::packfile_uring::write_payloads_uring(&path_for_writer, &pending_for_writer).await
+        // `tokio_uring::start` panics if invoked from inside an existing Tokio
+        // runtime worker, and `Store::put` is called from Tokio workers in the
+        // daemon. We use `block_in_place` + `spawn_blocking` to land the uring
+        // entry on a dedicated OS thread that is *not* a Tokio worker — which
+        // is the contract `tokio_uring::start` requires.
+        let path_for_writer = path.to_path_buf();
+        let pending_for_writer = pending.to_vec();
+        let res: Result<(), crate::packfile::PackError> = tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            handle.block_on(async move {
+                tokio::task::spawn_blocking(move || {
+                    tokio_uring::start(async move {
+                        crate::packfile_uring::write_payloads_uring(&path_for_writer, &pending_for_writer)
+                            .await
+                    })
+                })
+                .await
+                .expect("uring write blocking task panicked")
+            })
         });
         res?;
-        for (h, _) in &pending {
-            inner.warm_index.insert(*h, next_idx);
-        }
     }
     #[cfg(not(all(target_os = "linux", feature = "uring")))]
     {
-        let mut b = PackBuilder::create(&path)?;
-        for (h, bytes) in &pending {
+        let mut b = PackBuilder::create(path)?;
+        for (h, bytes) in pending {
             b.append(*h, bytes)?;
-            inner.warm_index.insert(*h, next_idx);
         }
         let _ = b.finalize()?;
     }
-
-    let r = PackReader::open(&path)?;
-    inner.warm_packs.push(r);
-    inner.warm_bytes = 0;
     Ok(())
 }
