@@ -46,3 +46,14 @@ ulid = "1"
 [[bench]]
 name = "keystroke_to_pixel"
 harness = false
+
+[package.metadata.binstall]
+pkg-url    = "{ repo }/releases/download/v{ version }/origin-{ target }{ binary-ext }"
+pkg-fmt    = "bin"
+bin-dir    = "."
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "bin"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "bin"

@@ -11,6 +11,7 @@ mod lint_secrets;
 mod lint_spawn;
 mod lint_spawn_allowlist;
 mod manpages;
+mod release;
 
 #[derive(Parser)]
 #[command(name = "xtask")]
@@ -32,6 +33,15 @@ enum Cmd {
         #[arg(long, default_value = "target/manpages")]
         out: std::path::PathBuf,
     },
+    /// Stamp packaging templates with version + per-target SHA256s.
+    Release {
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        manifest: std::path::PathBuf,
+        #[arg(long, default_value = "target/release-packaging")]
+        out: std::path::PathBuf,
+    },
 }
 
 fn main() {
@@ -43,6 +53,17 @@ fn main() {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("manpages: {e}");
+                1
+            }
+        },
+        Cmd::Release {
+            version,
+            manifest,
+            out,
+        } => match release::stamp(&version, &manifest, &out) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("release: {e}");
                 1
             }
         },
