@@ -6,6 +6,7 @@ pub mod compactor;
 pub mod memory_wiring;
 pub mod protocol;
 pub mod provider_factory;
+pub mod runtime_launch;
 pub mod session;
 pub mod session_store;
 pub mod stream_relay;
