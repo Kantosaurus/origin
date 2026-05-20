@@ -52,3 +52,10 @@ rcgen          = { version = "0.13", default-features = false, features = ["pem"
 x509-parser    = "0.16"
 sha2           = "0.10"
 hex            = "0.4"
+# P14 additions
+tar          = "0.4"
+zstd         = { version = "0.13", default-features = false }
+globset      = "0.4"
+walkdir      = "2"
+rusqlite     = { version = "0.32", default-features = false, features = ["bundled"] }
+clap_mangen  = "0.2"
