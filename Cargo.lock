@@ -3646,6 +3646,8 @@ dependencies = [
  "hex",
  "interprocess",
  "origin-core",
+ "origin-replay",
+ "parking_lot",
  "proptest",
  "quinn",
  "rcgen",

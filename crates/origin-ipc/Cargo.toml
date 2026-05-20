@@ -11,8 +11,10 @@ workspace = true
 
 [dependencies]
 origin-core = { path = "../origin-core" }
+origin-replay = { path = "../origin-replay", optional = true }
 rkyv = { version = "0.7", features = ["validation", "bytecheck"] }
 bytes = "1"
+parking_lot = "0.12"
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
 interprocess = { version = "2", features = ["tokio"] }
@@ -23,6 +25,9 @@ rcgen.workspace          = true
 x509-parser.workspace    = true
 sha2.workspace           = true
 hex.workspace            = true
+
+[features]
+recorder = ["dep:origin-replay"]
 
 [dev-dependencies]
 proptest = { version = "=1.4.0", default-features = false, features = ["std"] }
