@@ -9,9 +9,15 @@ workspace = true
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+clap_mangen.workspace = true
+origin-cli = { path = "../crates/origin-cli" }
+anyhow = "1"
 syn = { version = "2", features = ["full", "visit"] }
 walkdir = "2"
 regex = "1"
 thiserror = "1"
 proc-macro2 = "1"
 quote = "1"
+
+[dev-dependencies]
+tempfile = "3"
