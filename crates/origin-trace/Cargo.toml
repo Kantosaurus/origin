@@ -21,3 +21,8 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[[bench]]
+name = "write"
+path = "benches/write.rs"
+harness = false
