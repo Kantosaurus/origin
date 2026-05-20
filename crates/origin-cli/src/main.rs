@@ -3,13 +3,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt as _;
+use origin_cli::cli_def::{Cli, Cmd, KeyringSub, PairSub, SessionsSub, TraceSub};
 use origin_cli::input::{parse_mem_command, reduce, InputAction};
 use origin_cli::plan_panel_wiring::Wiring as PlanPanelWiring;
-use origin_cli::trace_cmd::TraceQuery;
 use origin_cli::tui::App;
 use origin_daemon::protocol::{ClientMessage, PromptRequest, StreamEvent};
 use origin_ipc::frame::{encode, FrameKind};
@@ -20,110 +20,6 @@ use origin_tui::scheduler::{Handle, Scheduler};
 use origin_tui::stream_widget::{Rect, StreamWidget};
 use parking_lot::Mutex;
 use serde::Deserialize;
-
-#[derive(Parser)]
-#[command(name = "origin", version, about = "origin agentic coding harness")]
-struct Cli {
-    /// Run the 7-step interactive guided tour (P14.D.3).
-    #[arg(long)]
-    tutorial: bool,
-    #[command(subcommand)]
-    cmd: Option<Cmd>,
-}
-
-#[derive(Subcommand)]
-enum Cmd {
-    /// Query the trace ring (P11.11). Without any flags, prints the most
-    /// recent 100 spans across every kind.
-    Trace {
-        #[command(subcommand)]
-        sub: TraceSub,
-    },
-    /// Start or redeem a pairing session for remote QUIC clients (P13.2).
-    Pair {
-        #[command(subcommand)]
-        sub: PairSub,
-    },
-    /// One-shot prompt: connect to the daemon, send `text`, drain to completion, exit.
-    Run {
-        /// The user prompt.
-        text: String,
-        /// Emit JSON-Lines stream of every IPC event.
-        #[arg(long)]
-        json: bool,
-        /// Remote daemon URL (`origin://host:port#fingerprint`).
-        #[arg(long)]
-        remote: Option<String>,
-        /// Optional bearer token for remote auth.
-        #[arg(long)]
-        bearer: Option<String>,
-        /// Model override.
-        #[arg(long)]
-        model: Option<String>,
-    },
-    /// Daemon usage snapshot (tokens in/out per provider/model).
-    Usage,
-    /// Manage persisted sessions.
-    Sessions {
-        #[command(subcommand)]
-        sub: SessionsSub,
-    },
-    /// Manage stored provider credentials.
-    Keyring {
-        #[command(subcommand)]
-        sub: KeyringSub,
-    },
-}
-
-#[derive(Subcommand)]
-enum TraceSub {
-    /// Print spans matching the given filters.
-    Query(TraceQuery),
-}
-
-#[derive(Subcommand)]
-enum SessionsSub {
-    /// List recent sessions (most-recent first).
-    Ls,
-    /// Resume a session by id (currently a no-op acknowledgement).
-    Resume { session_id: String },
-    /// Delete a session and all its messages.
-    Rm { session_id: String },
-}
-
-#[derive(Subcommand)]
-enum KeyringSub {
-    /// Add or overwrite a provider secret.
-    Add {
-        provider: String,
-        account: String,
-        /// The secret value; read from stdin if `-`.
-        secret: String,
-    },
-    /// List accounts for a provider.
-    List { provider: String },
-    /// Remove a provider account secret.
-    Remove { provider: String, account: String },
-}
-
-#[derive(Subcommand)]
-enum PairSub {
-    /// Daemon-side: show a 6-digit pairing code.
-    Start {
-        #[arg(long, default_value_t = 60)]
-        ttl_secs: u32,
-    },
-    /// Client-side: redeem a code against a remote daemon.
-    Redeem {
-        /// Remote URL: `origin://host:port#fingerprint`.
-        url: String,
-        /// The 6-digit code shown on the daemon host.
-        code: String,
-        /// Stable device identifier (defaults to hostname).
-        #[arg(long)]
-        device_id: Option<String>,
-    },
-}
 
 #[derive(Deserialize)]
 struct PromptReply {

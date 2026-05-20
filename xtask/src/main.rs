@@ -1,14 +1,16 @@
 //! `xtask` — workspace developer-tools binary.
 //!
 //! Hosts the `lint-secrets` subcommand (enforces the `Secret<T>` redaction
-//! convention) and the `lint-spawn` subcommand (bans raw `tokio::spawn`
-//! outside `origin-runtime::spawn_in`).
+//! convention), the `lint-spawn` subcommand (bans raw `tokio::spawn`
+//! outside `origin-runtime::spawn_in`), and `manpages` which renders
+//! `clap_mangen` output for the `origin` CLI (P14.D.4).
 
 use clap::{Parser, Subcommand};
 
 mod lint_secrets;
 mod lint_spawn;
 mod lint_spawn_allowlist;
+mod manpages;
 
 #[derive(Parser)]
 #[command(name = "xtask")]
@@ -24,6 +26,12 @@ enum Cmd {
     LintSecrets(lint_secrets::Args),
     /// Scan Rust source for raw `tokio::spawn` outside the allowlist.
     LintSpawn(lint_spawn::Args),
+    /// Render manpages for `origin` and every subcommand into `--out`.
+    Manpages {
+        /// Output directory. Created if missing.
+        #[arg(long, default_value = "target/manpages")]
+        out: std::path::PathBuf,
+    },
 }
 
 fn main() {
@@ -31,6 +39,13 @@ fn main() {
     let code = match cli.cmd {
         Cmd::LintSecrets(a) => lint_secrets::run(a),
         Cmd::LintSpawn(a) => lint_spawn::run(a),
+        Cmd::Manpages { out } => match manpages::generate(&out) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("manpages: {e}");
+                1
+            }
+        },
     };
     std::process::exit(code);
 }
