@@ -1,0 +1,19 @@
+[package]
+name = "origin-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+parking_lot = "0.12"
+tracing = { workspace = true }
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "test-util"] }
