@@ -1,0 +1,97 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    name: build / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.83.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross (linux only)
+        if: contains(matrix.target, 'linux')
+        run: cargo install cross --locked
+      - name: Build
+        shell: bash
+        env:
+          CARGO_PROFILE_RELEASE_LTO: fat
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+          CARGO_PROFILE_RELEASE_PANIC: abort
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: z
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: |
+          if [[ "${{ matrix.target }}" == *linux* ]]; then
+            cross build -p origin-cli --release --target ${{ matrix.target }}
+          else
+            cargo build -p origin-cli --release --target ${{ matrix.target }}
+          fi
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          ext=""
+          if [[ "${{ matrix.target }}" == *windows* ]]; then ext=".exe"; fi
+          cp "target/${{ matrix.target }}/release/origin$ext" "dist/origin-${{ matrix.target }}$ext"
+      - name: Cosign keyless sign
+        uses: sigstore/cosign-installer@v3
+      - name: Sign
+        shell: bash
+        env:
+          COSIGN_YES: "true"
+        run: |
+          for f in dist/*; do
+            cosign sign-blob --bundle "$f.sig" "$f"
+          done
+      - name: SLSA provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: "dist/*"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten
+        run: |
+          mkdir -p out
+          find dist -type f -exec mv {} out/ \;
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') }}
