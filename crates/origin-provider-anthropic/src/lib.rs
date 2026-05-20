@@ -17,9 +17,18 @@ const DEFAULT_BASE: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
+/// Controls which auth header is sent with each request.
+enum AuthKind {
+    /// `x-api-key: <key>` — the standard Anthropic API key path.
+    ApiKey(String),
+    /// `Authorization: Bearer <token>` — used when a refreshed OAuth token is
+    /// presented instead of a static API key.
+    OAuthBearer(String),
+}
+
 /// Anthropic provider backed by the Messages API with API key authentication.
 pub struct Anthropic {
-    api_key: String,
+    auth: AuthKind,
     base: String,
     client: reqwest::Client,
     cas: Option<std::sync::Arc<origin_cas::Store>>,
@@ -37,7 +46,7 @@ impl Anthropic {
     #[must_use]
     pub fn with_base_url(api_key: impl Into<String>, base: &str) -> Self {
         Self {
-            api_key: api_key.into(),
+            auth: AuthKind::ApiKey(api_key.into()),
             base: base.trim_end_matches('/').to_string(),
             client: reqwest::Client::new(),
             cas: None,
@@ -55,6 +64,27 @@ impl Anthropic {
         Self::with_base_url(api_key, base.as_ref())
     }
 
+    /// Construct using a refreshed OAuth bearer token instead of an API key.
+    ///
+    /// Sends `Authorization: Bearer <token>` rather than `x-api-key: <key>`.
+    #[must_use]
+    pub fn with_oauth_bearer(token: impl Into<String>) -> Self {
+        Self {
+            auth: AuthKind::OAuthBearer(token.into()),
+            base: DEFAULT_BASE.to_string(),
+            client: reqwest::Client::new(),
+            cas: None,
+            plan: None,
+        }
+    }
+
+    /// Override the base URL (builder-pattern; useful for testing or proxies).
+    #[must_use]
+    pub fn with_base(mut self, base: &str) -> Self {
+        self.base = base.trim_end_matches('/').to_string();
+        self
+    }
+
     /// Attach a CAS so `ToolResult` blocks carrying a handle are re-inflated
     /// from CAS bytes when serializing to the wire.
     #[must_use]
@@ -69,6 +99,16 @@ impl Anthropic {
     pub fn with_plan(mut self, plan: Plan) -> Self {
         self.plan = Some(plan);
         self
+    }
+
+    /// Apply the appropriate auth header to a request builder.
+    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth {
+            AuthKind::ApiKey(key) => builder.header("x-api-key", key),
+            AuthKind::OAuthBearer(token) => {
+                builder.header("Authorization", format!("Bearer {token}"))
+            }
+        }
     }
 }
 
@@ -110,9 +150,7 @@ impl Provider for Anthropic {
 
         let url = format!("{}/v1/messages", self.base);
         let resp = self
-            .client
-            .post(&url)
-            .header("x-api-key", &self.api_key)
+            .apply_auth(self.client.post(&url))
             .header("anthropic-version", API_VERSION)
             .header("content-type", "application/json")
             .json(&body)
@@ -167,9 +205,7 @@ impl Provider for Anthropic {
 
         let url = format!("{}/v1/messages", self.base);
         let resp = self
-            .client
-            .post(&url)
-            .header("x-api-key", &self.api_key)
+            .apply_auth(self.client.post(&url))
             .header("anthropic-version", API_VERSION)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
