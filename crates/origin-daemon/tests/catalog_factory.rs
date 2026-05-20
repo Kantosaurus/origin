@@ -1,4 +1,4 @@
-//! End-to-end: catalog row → ProviderFactory → wiremock → real chat response.
+//! End-to-end: catalog row → `ProviderFactory` → wiremock → real chat response.
 
 #![allow(clippy::unwrap_used)]
 
@@ -42,23 +42,40 @@ async fn deepseek_row_builds_and_chats() {
     catalog.merge_custom(vec![entry]).unwrap();
 
     let vault = KeyVault::in_memory();
-    vault.set("test-deepseek", "default", Secret::new("sk-test".to_string())).await.unwrap();
+    vault
+        .set("test-deepseek", "default", Secret::new("sk-test".to_string()))
+        .await
+        .unwrap();
 
     let factory = ProviderFactory::new(vault, catalog);
     let id = ProviderId::parse("test-deepseek", factory.catalog()).unwrap();
     let provider = factory.build(&id, "default").await.unwrap();
 
-    let resp = provider.chat(ChatRequest {
-        system: String::new(),
-        messages: vec![Message { role: Role::User, blocks: vec![Block::Text { text: "hi".into(), cache_marker: None }] }],
-        model: "deepseek-chat".to_string(),
-        tools: vec![],
-    }).await.unwrap();
+    let resp = provider
+        .chat(ChatRequest {
+            system: String::new(),
+            messages: vec![Message {
+                role: Role::User,
+                blocks: vec![Block::Text {
+                    text: "hi".into(),
+                    cache_marker: None,
+                }],
+            }],
+            model: "deepseek-chat".to_string(),
+            tools: vec![],
+        })
+        .await
+        .unwrap();
 
-    let text: String = resp.assistant.blocks.iter().filter_map(|b| match b {
-        Block::Text { text, .. } => Some(text.clone()),
-        _ => None,
-    }).collect();
+    let text: String = resp
+        .assistant
+        .blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
     assert_eq!(text, "hi from deepseek");
 }
 
@@ -105,16 +122,10 @@ async fn anthropic_oauth_row_uses_bearer_header() {
         .unwrap()
         .as_secs()
         + 3600;
-    let oauth_blob = format!(
-        r#"{{"access":"anthro-oauth-tok","refresh":null,"expires_at":{expires_at}}}"#
-    );
+    let oauth_blob = format!(r#"{{"access":"anthro-oauth-tok","refresh":null,"expires_at":{expires_at}}}"#);
     let vault = KeyVault::in_memory();
     vault
-        .set(
-            "test-anthropic-oauth",
-            "default/oauth",
-            Secret::new(oauth_blob),
-        )
+        .set("test-anthropic-oauth", "default/oauth", Secret::new(oauth_blob))
         .await
         .unwrap();
 
@@ -192,9 +203,7 @@ async fn openai_codex_oauth_row_uses_bearer() {
         .unwrap()
         .as_secs()
         + 3600;
-    let oauth_blob = format!(
-        r#"{{"access":"oauth-tok","refresh":null,"expires_at":{expires_at}}}"#
-    );
+    let oauth_blob = format!(r#"{{"access":"oauth-tok","refresh":null,"expires_at":{expires_at}}}"#);
     let vault = KeyVault::in_memory();
     vault
         .set("test-codex", "default/oauth", Secret::new(oauth_blob))
