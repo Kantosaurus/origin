@@ -105,9 +105,7 @@ impl Anthropic {
     fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth {
             AuthKind::ApiKey(key) => builder.header("x-api-key", key),
-            AuthKind::OAuthBearer(token) => {
-                builder.header("Authorization", format!("Bearer {token}"))
-            }
+            AuthKind::OAuthBearer(token) => builder.header("Authorization", format!("Bearer {token}")),
         }
     }
 }

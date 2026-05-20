@@ -331,15 +331,19 @@ async fn persist_tokens(
     expires_at: u64,
 ) -> Result<()> {
     let blob = refresh.map_or_else(
-        || serde_json::json!({
-            "access": access,
-            "expires_at": expires_at,
-        }),
-        |r| serde_json::json!({
-            "access": access,
-            "refresh": r,
-            "expires_at": expires_at,
-        }),
+        || {
+            serde_json::json!({
+                "access": access,
+                "expires_at": expires_at,
+            })
+        },
+        |r| {
+            serde_json::json!({
+                "access": access,
+                "refresh": r,
+                "expires_at": expires_at,
+            })
+        },
     );
     let json = serde_json::to_string(&blob).map_err(|e| anyhow!("serialize tokens: {e}"))?;
     vault

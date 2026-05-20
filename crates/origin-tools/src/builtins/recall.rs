@@ -79,12 +79,10 @@ fn outline_only(body: &str) -> String {
     // Compiled lazily-but-once via `std::sync::OnceLock` would be ideal; for a
     // single function call we just build them locally — `regex::Regex::new`
     // is cheap relative to the I/O that produced `body`.
-    let rust_sig = regex::Regex::new(r"\b(?:fn|struct|enum|trait|impl)\s+[A-Za-z_]")
-        .expect("static regex compiles");
-    let py_sig = regex::Regex::new(r"^\s*(?:def|class)\s+[A-Za-z_]")
-        .expect("static regex compiles");
-    let js_fn = regex::Regex::new(r"\bfunction\s+[A-Za-z_$]")
-        .expect("static regex compiles");
+    let rust_sig =
+        regex::Regex::new(r"\b(?:fn|struct|enum|trait|impl)\s+[A-Za-z_]").expect("static regex compiles");
+    let py_sig = regex::Regex::new(r"^\s*(?:def|class)\s+[A-Za-z_]").expect("static regex compiles");
+    let js_fn = regex::Regex::new(r"\bfunction\s+[A-Za-z_$]").expect("static regex compiles");
     let js_export = regex::Regex::new(r"\bexport\s+(?:function|class|const|let|interface|type|enum)\b")
         .expect("static regex compiles");
 

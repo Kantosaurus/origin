@@ -57,7 +57,11 @@ pub struct StaticHeader {
 impl StaticHeader {
     #[must_use]
     pub fn new(header: impl Into<String>, prefix: impl Into<String>, key: impl Into<String>) -> Arc<Self> {
-        Arc::new(Self { header: header.into(), prefix: prefix.into(), key: key.into() })
+        Arc::new(Self {
+            header: header.into(),
+            prefix: prefix.into(),
+            key: key.into(),
+        })
     }
 }
 
@@ -77,11 +81,15 @@ pub struct NoAuth;
 
 impl NoAuth {
     #[must_use]
-    pub fn new() -> Arc<Self> { Arc::new(Self) }
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self)
+    }
 }
 
 impl Default for NoAuth {
-    fn default() -> Self { Self }
+    fn default() -> Self {
+        Self
+    }
 }
 
 #[async_trait]
