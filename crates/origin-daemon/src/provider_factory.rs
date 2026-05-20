@@ -216,17 +216,49 @@ impl ProviderFactory {
                 Ok(Arc::new(OpenAiCompat::new(cfg)))
             }
             WireFormat::Anthropic => {
-                let secret = self.vault.get(entry.id.as_ref(), account).await
-                    .map_err(|e| FactoryError::from_vault(e, entry.id.as_ref(), account))?;
-                let mut p = origin_provider_anthropic::Anthropic::new(secret.expose().clone());
+                use origin_provider::catalog::AuthScheme;
+                let base = entry.base_url.as_ref();
+                let mut p = match &entry.auth {
+                    AuthScheme::ApiKey { .. } => {
+                        let secret = self.vault.get(entry.id.as_ref(), account).await
+                            .map_err(|e| FactoryError::from_vault(e, entry.id.as_ref(), account))?;
+                        origin_provider_anthropic::Anthropic::new(secret.expose().clone())
+                            .with_base(base)
+                    }
+                    AuthScheme::OAuth(_) => {
+                        let (_, bearer) = token.header().await
+                            .map_err(|_| FactoryError::Vault("oauth token".into()))?;
+                        let raw = bearer.strip_prefix("Bearer ").unwrap_or(&bearer).to_string();
+                        origin_provider_anthropic::Anthropic::with_oauth_bearer(raw)
+                            .with_base(base)
+                    }
+                    _ => return Err(FactoryError::CredentialParse(
+                        "anthropic wire requires ApiKey or OAuth".into(),
+                    )),
+                };
                 if let Some(cas) = self.cas.clone() { p = p.with_cas(cas); }
                 Ok(Arc::new(p))
             }
             #[cfg(feature = "gemini")]
             WireFormat::Gemini => {
-                let secret = self.vault.get(entry.id.as_ref(), account).await
-                    .map_err(|e| FactoryError::from_vault(e, entry.id.as_ref(), account))?;
-                Ok(Arc::new(origin_provider_gemini::Gemini::new(secret.expose().clone())))
+                use origin_provider::catalog::AuthScheme;
+                let p = match &entry.auth {
+                    AuthScheme::ApiKey { .. } => {
+                        let secret = self.vault.get(entry.id.as_ref(), account).await
+                            .map_err(|e| FactoryError::from_vault(e, entry.id.as_ref(), account))?;
+                        origin_provider_gemini::Gemini::new(secret.expose().clone())
+                    }
+                    AuthScheme::OAuth(_) => {
+                        let (_, bearer) = token.header().await
+                            .map_err(|_| FactoryError::Vault("oauth token".into()))?;
+                        let raw = bearer.strip_prefix("Bearer ").unwrap_or(&bearer).to_string();
+                        origin_provider_gemini::Gemini::with_oauth_bearer(raw)
+                    }
+                    _ => return Err(FactoryError::CredentialParse(
+                        "gemini wire requires ApiKey or OAuth".into(),
+                    )),
+                };
+                Ok(Arc::new(p))
             }
             #[cfg(not(feature = "gemini"))]
             WireFormat::Gemini => Err(FactoryError::UnknownProvider("gemini".into())),
