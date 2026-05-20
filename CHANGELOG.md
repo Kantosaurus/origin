@@ -4,6 +4,56 @@ All notable changes to `origin` will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely;
 versions correspond to phase milestones from the implementation plan.
 
+## Phase 13 — QUIC Remote IPC + Headless Polish (2026-05-20)
+
+- New `origin-ipc::quic` transport: `QuicListener` / `QuicConnector` /
+  `QuicConnection` over `quinn` + `rustls`. Identical wire framing to the
+  local-socket transport so daemon dispatch is transport-agnostic. The
+  `QuicConnection::Drop` impl detaches the underlying `quinn::Connection`
+  onto a tokio task that awaits `Connection::closed()` so in-flight
+  stream writes flush before teardown.
+- New `origin-ipc::tls`: self-signed Ed25519 cert generation + SHA-256
+  fingerprint helper. Peers pin by fingerprint; no PKI.
+- New `origin-daemon::pairing`: 6-digit single-use pairing codes with
+  TTL, bearer-token minting (`orb_` prefix, 24-byte random suffix),
+  in-memory `BearerStore`, KeyVault persistence under
+  `("origin-remote", <device>)`.
+- Daemon IPC additions: `PairStart`, `PairRedeem`, `ListSessions`,
+  `ResumeSession`, `RemoveSession`, `GetUsage`, `KeyringAdd`,
+  `KeyringList`, `KeyringRemove` plus matching `StreamEvent`s
+  (`PairCode`, `PairIssued`, `PairError`, `SessionsListed`,
+  `UsageReport`, `KeyringAccounts`, `AdminOk`, `AdminError`).
+- Daemon session_store: `list_summaries()` (id, created_at, title,
+  model, message_count) and `delete(session_id)`. `Session.id` is now a
+  `String` (was `MessageId`) to accept admin-supplied ids.
+- New CLI subcommands:
+  - `origin pair {start,redeem}` — pair a remote client; redeem opens a
+    QUIC connection and prints the issued bearer.
+  - `origin run [--json] [--remote <url>] [--bearer <t>] [--model <m>]
+    <text>` — headless one-shot prompt. `--json` emits JSON-Lines per
+    IPC event; default mode prints `text_delta` payloads concatenated.
+    `--remote origin://host:port#fingerprint` routes through QUIC
+    (CA loaded via `ORIGIN_REMOTE_CA_DER_FILE`).
+  - `origin usage` — per-provider/per-model token totals from the
+    metrics snapshot.
+  - `origin sessions {ls,resume,rm}` — list/resume/remove persisted
+    sessions.
+  - `origin keyring {add,list,remove}` — manage KeyVault credentials;
+    `add` reads the secret from stdin when the value is `-`.
+- Workspace deps pinned: `quinn = "0.11"`, `rustls = "0.23"`,
+  `rcgen = "0.13"`, `rustls-pemfile = "2"`, `x509-parser = "0.16"`,
+  `sha2 = "0.10"`, `hex = "0.4"`. `origin-daemon` gains `rand = "0.8"`;
+  `origin-cli` gains `hostname = "0.4"` + `url = "2"`.
+
+### Test coverage at phase exit
+- `origin-ipc`: 2 tls tests, 1 quic_smoke, 1 quic_concurrent.
+- `origin-daemon`: 4 pairing_unit, 4 protocol_pair, 2 pairing_e2e,
+  3 admin_ipc, 2 session_store_list, plus regressions exercised in
+  the existing `account_switch` suite (extended for new variants).
+- `origin-cli`: 1 run_help, 2 headless_stream, 3 pair_cli (incl. 2
+  admin_url parsing tests), 3 admin_cli (--help surfaces),
+  1 admin_e2e (fake daemon → sessions ls).
+
 ## Phase 3 — CachePlanner + Speculative Dispatch + Recall (2026-05-19)
 
 - New `origin-planner` crate: `Band` enum (Frozen/Sticky/Sliding/Volatile),
