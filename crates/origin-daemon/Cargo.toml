@@ -42,6 +42,7 @@ origin-trace            = { path = "../origin-trace" }
 origin-metrics          = { path = "../origin-metrics" }
 origin-runtime          = { path = "../origin-runtime" }
 origin-alloc            = { path = "../origin-alloc" }
+origin-resume-token     = { path = "../origin-resume-token" }
 ctrlc                   = "3"
 dirs                    = "5"
 hyper                   = { workspace = true }

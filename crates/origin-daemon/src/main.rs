@@ -387,9 +387,41 @@ fn spawn_handler_task(
                 ClientMessage::MemoryDecision { proposal_id, action } => {
                     handle_memory_decision(&conn, memory.as_ref(), proposal_id, &action).await;
                 }
+                ClientMessage::ResumeRequest { token } => {
+                    handle_resume_request(&conn, Arc::clone(&session_store), token).await;
+                }
             }
         }
     });
+}
+
+/// Handle a [`ClientMessage::ResumeRequest`] from the supervisor.
+///
+/// P12 ships the wire shape + an immediate ack: we log the request, persist
+/// the token so the daemon can later inspect it, and respond with a
+/// [`ServerMessage::ResumeAck`] inside a `Response` frame. Full hydrate-from-
+/// CAS plumbing (re-loading the message log up to `token.last_turn` and
+/// re-spawning `pending_tool_calls` under `TaskClass::Critical`) is a P14
+/// polish item per the plan's Step 5 note.
+async fn handle_resume_request(
+    conn: &SharedConnection,
+    session_store: Arc<SessionStore>,
+    token: origin_resume_token::ResumeToken,
+) {
+    let session_id = token.session_id.clone();
+    let restored_to_turn = token.last_turn;
+    if let Err(e) = session_store.save_resume_token(&token) {
+        warn!(error = %e, session = %session_id, "resume: could not persist token");
+    }
+    info!(session = %session_id, last_turn = restored_to_turn, "resume: ack");
+    let ack = origin_daemon::protocol::ServerMessage::ResumeAck {
+        session_id,
+        restored_to_turn,
+    };
+    // ServerMessage::ResumeAck is always serializable (plain strings + u32).
+    #[allow(clippy::expect_used)]
+    let bytes = serde_json::to_vec(&ack).expect("ServerMessage::ResumeAck serializable");
+    let _ = conn.lock().await.write_frame(FrameKind::Response, &bytes).await;
 }
 
 /// Back-compat shim: legacy clients send raw `PromptRequest` JSON without a

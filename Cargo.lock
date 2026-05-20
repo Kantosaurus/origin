@@ -3490,6 +3490,7 @@ dependencies = [
  "origin-provider-ollama",
  "origin-provider-openai",
  "origin-provider-openrouter",
+ "origin-resume-token",
  "origin-runtime",
  "origin-sidecar",
  "origin-store",
@@ -3799,6 +3800,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-resume-token"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "origin-runtime"
 version = "0.0.1"
 dependencies = [
@@ -3892,6 +3903,8 @@ dependencies = [
  "anyhow",
  "clap",
  "nix 0.29.0",
+ "origin-ipc",
+ "origin-resume-token",
  "serde",
  "serde_json",
  "tempfile",
