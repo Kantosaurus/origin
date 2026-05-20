@@ -58,6 +58,15 @@ pub enum ClientMessage {
     /// User decision on a pending memory proposal surfaced via
     /// [`StreamEvent::MemoryProposed`].
     MemoryDecision { proposal_id: u32, action: MemoryAction },
+    /// P13.2: ask the daemon to start a pairing session and emit a
+    /// 6-digit code. The daemon replies with
+    /// [`StreamEvent::PairCode`].
+    PairStart { ttl_secs: u32 },
+    /// P13.2: redeem a code previously surfaced by `PairStart`, binding
+    /// it to `device_id`. On success the daemon replies with
+    /// [`StreamEvent::PairIssued`]; failures use
+    /// [`StreamEvent::PairError`].
+    PairRedeem { code: String, device_id: String },
 }
 
 impl ClientMessage {
@@ -112,5 +121,25 @@ pub enum StreamEvent {
         proposal_id: u32,
         body: String,
         suggested_tags: Vec<String>,
+    },
+    /// P13.2: response to a [`ClientMessage::PairStart`]. Surfaces the
+    /// 6-digit code the daemon operator must read aloud / paste to the
+    /// remote client.
+    PairCode {
+        code: String,
+        expires_in_secs: u32,
+    },
+    /// P13.2: response to a successful
+    /// [`ClientMessage::PairRedeem`]. Carries the freshly minted bearer
+    /// token and the bound device id.
+    PairIssued {
+        bearer: String,
+        device_id: String,
+        ttl_secs: u32,
+    },
+    /// P13.2: response to a failed [`ClientMessage::PairRedeem`]. The
+    /// `message` is the human-readable rendering of `PairingError`.
+    PairError {
+        message: String,
     },
 }
