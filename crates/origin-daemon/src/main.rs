@@ -32,12 +32,15 @@ type ActiveProvider = Arc<RwLock<Arc<dyn Provider>>>;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Install the parquet-backed tracing layer. The guard holds the drain
+    // thread alive for the lifetime of `main`; on shutdown it flushes any
+    // buffered spans before exiting.
+    let trace_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("origin")
+        .join("trace");
+    let _trace_guard =
+        origin_trace::init(&trace_dir).map_err(|e| anyhow::anyhow!("origin-trace init: {e}"))?;
 
     let cas_root = env::var("ORIGIN_CAS_ROOT").unwrap_or_else(|_| default_cas_root());
     let cas = Arc::new(
