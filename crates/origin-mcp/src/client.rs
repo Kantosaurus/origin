@@ -19,6 +19,8 @@ pub enum ClientError {
     Rpc(#[from] JsonRpcError),
     #[error("decode: {0}")]
     Decode(#[from] serde_json::Error),
+    #[error("schema mismatch: {0}")]
+    SchemaMismatch(String),
 }
 
 #[derive(Debug, Clone, Deserialize)]

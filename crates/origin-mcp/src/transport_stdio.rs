@@ -57,12 +57,29 @@ impl Transport for StdioTransport {
         inner.stdin.write_all(request_json.as_bytes()).await?;
         inner.stdin.write_all(b"\n").await?;
         inner.stdin.flush().await?;
-        let mut line = String::new();
-        let n = inner.stdout.read_line(&mut line).await?;
+        // Byte-counted reader: accumulate bytes until newline, but check the
+        // 16 MiB cap on every chunk so a runaway server can't OOM us before
+        // JSON parse.
+        let mut buf: Vec<u8> = Vec::with_capacity(4096);
+        let mut total = 0usize;
+        loop {
+            let pre = buf.len();
+            let n = inner.stdout.read_until(b'\n', &mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            total += n;
+            crate::limits::enforce_cap(total)?;
+            // `read_until` appends; if last byte is newline we're done.
+            if buf.last() == Some(&b'\n') {
+                let _ = pre;
+                break;
+            }
+        }
         drop(inner);
-        if n == 0 {
+        if total == 0 {
             return Err(TransportError::Other("eof".into()));
         }
-        Ok(serde_json::from_str(&line)?)
+        Ok(serde_json::from_slice(&buf)?)
     }
 }
