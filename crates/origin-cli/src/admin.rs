@@ -106,14 +106,20 @@ pub async fn sessions(action: SessionsAction) -> Result<()> {
 /// closes, or the event shape doesn't match.
 pub async fn keyring(action: KeyringAction) -> Result<()> {
     let msg = match action {
-        KeyringAction::Add { provider, account, secret } => {
+        KeyringAction::Add {
+            provider,
+            account,
+            secret,
+        } => {
             let secret = read_secret(secret)?;
-            ClientMessage::KeyringAdd { provider, account, secret }
+            ClientMessage::KeyringAdd {
+                provider,
+                account,
+                secret,
+            }
         }
         KeyringAction::List { provider } => ClientMessage::KeyringList { provider },
-        KeyringAction::Remove { provider, account } => {
-            ClientMessage::KeyringRemove { provider, account }
-        }
+        KeyringAction::Remove { provider, account } => ClientMessage::KeyringRemove { provider, account },
     };
     let ev = round_trip(msg).await?;
     match ev {

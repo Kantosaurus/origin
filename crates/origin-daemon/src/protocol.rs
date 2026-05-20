@@ -173,10 +173,14 @@ pub enum StreamEvent {
     },
     /// P13.4.2: response to [`ClientMessage::ListSessions`]. Carries one
     /// wire-shape summary per persisted session, newest-first.
-    SessionsListed { summaries: Vec<SessionSummaryWire> },
+    SessionsListed {
+        summaries: Vec<SessionSummaryWire>,
+    },
     /// P13.4.2: response to [`ClientMessage::GetUsage`]. Carries one row
     /// per (provider, model) tuple seen in the running metrics registry.
-    UsageReport { rows: Vec<UsageRow> },
+    UsageReport {
+        rows: Vec<UsageRow>,
+    },
     /// P13.4.2: response to [`ClientMessage::KeyringList`]. Carries the
     /// list of accounts the keyvault knows for `provider`.
     KeyringAccounts {
@@ -188,7 +192,9 @@ pub enum StreamEvent {
     AdminOk,
     /// P13.4.2: negative acknowledgement carrying a human-readable error
     /// message. Used as the failure side of the admin mutation handlers.
-    AdminError { message: String },
+    AdminError {
+        message: String,
+    },
 }
 
 /// Wire-shape projection of `SessionStore::SessionSummary`.

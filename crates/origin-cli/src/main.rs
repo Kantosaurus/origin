@@ -149,7 +149,13 @@ async fn main() -> Result<()> {
                 PairSub::Redeem { url, code, device_id } => pair_redeem(&url, &code, device_id).await,
             };
         }
-        Some(Cmd::Run { text, json, remote, bearer, model }) => {
+        Some(Cmd::Run {
+            text,
+            json,
+            remote,
+            bearer,
+            model,
+        }) => {
             return origin_cli::headless::run(text, json, remote, bearer, model).await;
         }
         Some(Cmd::Usage) => return origin_cli::admin::usage().await,
@@ -473,9 +479,15 @@ fn sub_to_action(sub: SessionsSub) -> origin_cli::admin::SessionsAction {
 
 fn sub_to_action_kr(sub: KeyringSub) -> origin_cli::admin::KeyringAction {
     match sub {
-        KeyringSub::Add { provider, account, secret } => {
-            origin_cli::admin::KeyringAction::Add { provider, account, secret }
-        }
+        KeyringSub::Add {
+            provider,
+            account,
+            secret,
+        } => origin_cli::admin::KeyringAction::Add {
+            provider,
+            account,
+            secret,
+        },
         KeyringSub::List { provider } => origin_cli::admin::KeyringAction::List { provider },
         KeyringSub::Remove { provider, account } => {
             origin_cli::admin::KeyringAction::Remove { provider, account }

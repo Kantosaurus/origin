@@ -54,9 +54,8 @@ pub async fn run(
     // mints the bearer but the wire format is still TBD.
     let _ = bearer;
 
-    let model = model.unwrap_or_else(|| {
-        std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".into())
-    });
+    let model =
+        model.unwrap_or_else(|| std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".into()));
 
     let mut conn = match remote {
         None => {
