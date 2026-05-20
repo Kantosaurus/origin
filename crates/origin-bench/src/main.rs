@@ -50,12 +50,13 @@ fn main() -> anyhow::Result<()> {
             }
             println!("{}", origin_bench::report::render_json(&out));
         }
-        Cmd::RunSubprocess {
-            name,
-            bin: _,
-            tasks: _,
-        } => {
-            println!("(subprocess runner for {name} lands in P14.C.5)");
+        Cmd::RunSubprocess { name, bin, tasks } => {
+            let task_list = origin_bench::task_set::load(&tasks)?;
+            let mut out = Vec::new();
+            for t in &task_list {
+                out.push(origin_bench::runner_subprocess::run_one(&name, &bin, &[], t)?);
+            }
+            println!("{}", origin_bench::report::render_json(&out));
         }
         Cmd::Report { results: _, out } => {
             std::fs::write(out, "# Bench report\n_pending implementation._\n")?;
