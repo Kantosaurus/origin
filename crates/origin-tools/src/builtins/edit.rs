@@ -38,4 +38,5 @@ crate::origin_tool! {
         },
         "required": ["path", "old_string", "new_string"]
     }"#,
+    sandbox: ::origin_sandbox::SandboxProfile::WriteCwd,
 }

@@ -1,6 +1,6 @@
 use origin_permission::prompt::{AlwaysAllow, AlwaysDeny};
 use origin_permission::{check, Outcome};
-use origin_tools::{SideEffects, Tier, ToolMeta, Urgency};
+use origin_tools::{SandboxProfile, SideEffects, Tier, ToolMeta, Urgency};
 
 const fn meta(name: &'static str, tier: Tier) -> ToolMeta {
     ToolMeta {
@@ -10,6 +10,7 @@ const fn meta(name: &'static str, tier: Tier) -> ToolMeta {
         urgency: Urgency::Low,
         side_effects: SideEffects::Pure,
         input_schema: "{}",
+        sandbox_profile: SandboxProfile::Inherit,
     }
 }
 

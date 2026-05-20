@@ -1,5 +1,5 @@
 use origin_mcp::{McpClient, McpToolProxy, Transport, TransportError};
-use origin_tools::{DynTool, SideEffects, Tier, ToolMeta, Urgency};
+use origin_tools::{DynTool, SandboxProfile, SideEffects, Tier, ToolMeta, Urgency};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -31,6 +31,7 @@ async fn mcp_proxy_invocation_runs_through_dyntool() {
             urgency: Urgency::Low,
             side_effects: SideEffects::Pure,
             input_schema: "{\"type\":\"object\"}",
+            sandbox_profile: SandboxProfile::Inherit,
         },
         "echo".to_string(),
     );

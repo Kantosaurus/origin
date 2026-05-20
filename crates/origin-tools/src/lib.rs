@@ -6,6 +6,9 @@ pub mod macros;
 pub mod registry;
 
 pub use dispatch::{Cache, CacheHit, NormalizedInput, MEMOIZATION_SKIPLIST};
+// Re-export so downstream tests + callers can construct `ToolMeta` literals
+// without taking a direct dep on `origin-sandbox` (P11.5).
+pub use origin_sandbox::{ProfileOrdinal, SandboxProfile};
 pub use registry::{registry_iter, ToolMeta};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
