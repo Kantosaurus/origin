@@ -9,6 +9,7 @@ use origin_cas::Store;
 use origin_core::types::Role;
 use origin_daemon::agent::{run_loop, LoopOptions, SessionStoreSummaryDeliverer};
 use origin_skills::SkillRegistry;
+use origin_swarm::Coordinator;
 use origin_daemon::auth::BearerStore;
 use origin_daemon::config::bearer_ttl_secs;
 use origin_daemon::memory_wiring::MemoryWiring;
@@ -338,6 +339,34 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
         warn!("memory subsystem disabled (store init failed)");
     }
 
+    // Swarm coordinator (P9.6). We open a dedicated SqlStore for the plan op-log
+    // so the plan tables are isolated from the session-store connection.
+    // `PlanStore::open` is currently infallible (returns `Ok(Self)` always) so
+    // we unwrap rather than abort startup on a construction error.
+    let coordinator: Arc<Coordinator> = {
+        let plan_sql = match origin_store::Store::open(&db_path) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                warn!(error = %e, "swarm: plan SqlStore open failed; Task tool disabled");
+                // Fall through with a dummy coordinator constructed from an in-memory store.
+                // We use a tempfile path that will be cleaned up on exit.
+                let tmp_db = std::env::temp_dir().join("origin-plan-fallback.db");
+                Arc::new(
+                    origin_store::Store::open(&tmp_db)
+                        .map_err(|e2| anyhow::anyhow!("plan fallback store open: {e2}"))?,
+                )
+            }
+        };
+        let plan = Arc::new(tokio::sync::Mutex::new(origin_plan::Plan::new()));
+        let plan_store = Arc::new(
+            origin_plan::PlanStore::open(plan_sql, Arc::clone(&cas))
+                .map_err(|e| anyhow::anyhow!("plan store open: {e}"))?,
+        );
+        let plan_handle = origin_swarm::PlanHandle::new(plan, plan_store);
+        Arc::new(Coordinator::new(plan_handle, "origin-daemon"))
+    };
+    info!("swarm coordinator ready");
+
     let skill_catalog: Arc<SkillCatalog> = {
         let home = std::env::var_os("ORIGIN_HOME")
             .map(std::path::PathBuf::from)
@@ -404,6 +433,7 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
             Arc::clone(&proposal_registry),
             plan_bus.clone(),
             Arc::clone(&skill_catalog),
+            Arc::clone(&coordinator),
         );
     }
 }
@@ -498,6 +528,7 @@ fn spawn_handler_task(
     proposal_registry: Arc<ProposalRegistry>,
     plan_bus: PlanBus,
     skill_catalog: Arc<SkillCatalog>,
+    coordinator: Arc<Coordinator>,
 ) {
     spawn_in(TaskClass::Critical, async move {
         // Per-connection skill activation state. Each ActivateSkill mutates
@@ -557,6 +588,7 @@ fn spawn_handler_task(
                         Arc::clone(&proposal_registry),
                         Arc::clone(&skill_catalog),
                         Arc::clone(&active_skills),
+                        Arc::clone(&coordinator),
                         req,
                     )
                     .await
@@ -879,6 +911,7 @@ async fn handle_request(
     proposal_registry: Arc<ProposalRegistry>,
     skill_catalog: Arc<SkillCatalog>,
     active_skills: Arc<tokio::sync::Mutex<SkillRegistry>>,
+    coordinator: Arc<Coordinator>,
     req: PromptRequest,
 ) -> bool {
     let mut session = Session::new(provider.name(), &req.model);
@@ -952,6 +985,7 @@ async fn handle_request(
                 }
             },
             skill_catalog: Some(Arc::clone(&skill_catalog)),
+            coordinator: Some(Arc::clone(&coordinator)),
         };
         run_loop(&mut session, &req.user_text, provider, &AlwaysAllow, &opts).await
     };

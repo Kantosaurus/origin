@@ -3633,6 +3633,7 @@ dependencies = [
  "origin-skills",
  "origin-store",
  "origin-stream",
+ "origin-swarm",
  "origin-tools",
  "origin-trace",
  "parking_lot",
