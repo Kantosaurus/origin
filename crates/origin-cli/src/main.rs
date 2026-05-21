@@ -233,6 +233,31 @@ async fn run_event_loop(
     let mut input_stream = crossterm::event::EventStream::new();
     while let Some(maybe_ev) = input_stream.next().await {
         if let crossterm::event::Event::Key(ev) = maybe_ev? {
+            // Tab fires the autocomplete pass before the buffer reducer
+            // sees the keypress; only fall through to `reduce` when Tab
+            // didn't recognize the buffer shape.
+            if matches!(ev.code, crossterm::event::KeyCode::Tab) {
+                let result = {
+                    let mut a = app.lock();
+                    let sources = origin_cli::autocomplete::load_sources();
+                    origin_cli::autocomplete::complete(&mut a.input, &sources)
+                };
+                match result {
+                    origin_cli::autocomplete::CompletionResult::NoMatch => {}
+                    origin_cli::autocomplete::CompletionResult::UniqueCompletion => {
+                        handle.mark_dirty();
+                    }
+                    origin_cli::autocomplete::CompletionResult::MultipleCandidates {
+                        candidates,
+                    } => {
+                        let line = format!("candidates: {}", candidates.join(", "));
+                        app.lock().add_line("tab> ", &line);
+                        handle.mark_dirty();
+                    }
+                }
+                continue;
+            }
+
             let action = {
                 let mut a = app.lock();
                 reduce(&mut a.input, ev)
