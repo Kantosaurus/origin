@@ -12,6 +12,16 @@ fn unit_vec(seed: f32) -> [f32; EMBED_DIM] {
 #[test]
 fn decay_demotes_old_match() {
     let mut idx = MemIndex::new();
+    // hnsw_rs uses `StdRng::from_os_rng()` for layer assignment; a 2-point
+    // graph occasionally fails to return both points. Pad with metadata-less
+    // ids so HNSW has a denser graph and the `lookup` closure filters the
+    // padding out before re-ranking.
+    // Padding angles start far from the targets (which use angles 0.0 / 0.05)
+    // so they cannot displace the targets in the cosine-similarity shortlist.
+    for i in 0_u8..50 {
+        let angle = f32::from(i).mul_add(0.13, 1.0);
+        idx.insert(200 + u64::from(i), &unit_vec(angle)).expect("pad");
+    }
     let fresh = unit_vec(0.0);
     let stale = unit_vec(0.05);
     idx.insert(1, &fresh).expect("ins");
@@ -50,6 +60,14 @@ fn decay_demotes_old_match() {
 #[test]
 fn supersede_drops_loser() {
     let mut idx = MemIndex::new();
+    // See `cluster_priority_and_edge_boost_affect_rank` for why padding is
+    // required: hnsw_rs is non-deterministic on tiny graphs.
+    // Padding angles start far from the targets (which use angles 0.0 / 0.05)
+    // so they cannot displace the targets in the cosine-similarity shortlist.
+    for i in 0_u8..50 {
+        let angle = f32::from(i).mul_add(0.13, 1.0);
+        idx.insert(200 + u64::from(i), &unit_vec(angle)).expect("pad");
+    }
     idx.insert(10, &unit_vec(0.0)).expect("ins");
     idx.insert(11, &unit_vec(0.0)).expect("ins");
     let meta: HashMap<u64, MetaRow> = HashMap::from([
@@ -86,6 +104,17 @@ fn supersede_drops_loser() {
 #[test]
 fn cluster_priority_and_edge_boost_affect_rank() {
     let mut idx = MemIndex::new();
+    // hnsw_rs uses `StdRng::from_os_rng()` for layer assignment, so a
+    // 2-point graph occasionally fails to surface both points during search.
+    // Seed the index with ids that have no metadata: HNSW returns them, the
+    // `lookup` closure drops them, and we end up testing the re-rank logic
+    // against a graph that's reliably populated.
+    // Padding angles start far from the targets (which use angles 0.0 / 0.05)
+    // so they cannot displace the targets in the cosine-similarity shortlist.
+    for i in 0_u8..50 {
+        let angle = f32::from(i).mul_add(0.13, 1.0);
+        idx.insert(200 + u64::from(i), &unit_vec(angle)).expect("pad");
+    }
     let a = unit_vec(0.0);
     let b = unit_vec(0.05);
     idx.insert(100, &a).expect("ins");
@@ -114,6 +143,7 @@ fn cluster_priority_and_edge_boost_affect_rank() {
     let out = idx
         .search(&a, &SearchOpts::default(), |id| meta.get(&id).copied())
         .expect("search");
+    assert_eq!(out.len(), 2, "both target candidates must reach re-rank");
     assert_eq!(out[0].id, 101, "boosted candidate should rank first");
     assert!(out[0].score > out[1].score);
 }
