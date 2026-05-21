@@ -160,6 +160,15 @@ async fn main() -> Result<()> {
         "Connected; type a prompt and press Enter. Ctrl-C / Esc to quit.",
     );
 
+    // First-run discovery: if `origin init`'s welcome flow queued a pending
+    // prompt, fire it as the user's first turn and remove the file so it
+    // never auto-fires twice. Errors are non-fatal — the user can always
+    // type a prompt manually.
+    let pending_prompt = match origin_cli::first_run_prompt::path() {
+        Ok(p) => origin_cli::first_run_prompt::drain(&p).ok().flatten(),
+        Err(_) => None,
+    };
+
     let scheduler = Scheduler::new(Duration::from_millis(6));
     let handle = scheduler.handle();
     handle.mark_dirty();
@@ -188,6 +197,14 @@ async fn main() -> Result<()> {
                 .await;
         })
     };
+
+    // Auto-fire the pending discovery prompt now that the TUI is wired up.
+    if let Some(text) = pending_prompt {
+        app.lock()
+            .add_line("system> ", "Running queued first-run discovery prompt\u{2026}");
+        handle.mark_dirty();
+        handle_submit(&app, &handle, &path, &model, &text).await;
+    }
 
     let result = run_event_loop(app, composer, widget, handle, &path, &model).await;
 

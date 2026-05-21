@@ -48,6 +48,7 @@ rand = "0.8"
 urlencoding = "2"
 toml = "0.8"
 async-trait = "0.1"
+tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.5"

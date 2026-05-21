@@ -91,6 +91,27 @@ pub fn run_with<R: BufRead, W: Write>(
         )?;
     }
     screen_workflows(&mut r, &mut w, workflows_path)?;
+
+    // Seed a first-run discovery prompt so the agent can find skills in
+    // non-standard locations on its first chat. `origin-cli` can't drive
+    // the LLM during init (daemon isn't running), so we queue the work
+    // here and let `main.rs` auto-fire it on next TUI start.
+    let pending = workflows_path
+        .parent()
+        .map(|p| p.join("pending-prompt.txt"));
+    if let Some(p) = pending {
+        if let Err(e) = crate::first_run_prompt::seed_to(&p) {
+            writeln!(&mut w, "warning: could not seed first-run prompt: {e}")?;
+        } else {
+            writeln!(
+                &mut w,
+                "\nQueued a first-chat discovery prompt at {}.\n\
+                 The agent will run it the next time you launch origin.",
+                p.display()
+            )?;
+        }
+    }
+
     writeln!(&mut w, "\nSetup complete. `origin --help` lists every subcommand.")?;
     Ok(())
 }
