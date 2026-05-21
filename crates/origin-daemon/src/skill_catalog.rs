@@ -1,0 +1,124 @@
+//! In-process catalog of skills the daemon loaded from `~/.origin/skills/`.
+//!
+//! The daemon loads the catalog once at startup and holds it in an `Arc`
+//! shared across every connection. Activation state — which subset of
+//! these skills is *currently in the stack* — lives separately, per
+//! connection (see the per-connection `SkillRegistry` in `main.rs`).
+//!
+//! A load failure does not abort the daemon; we surface it as an empty
+//! catalog + a `tracing::warn!`, so a corrupt or absent skills dir doesn't
+//! deny service. Re-loading at runtime is a P-future polish item.
+
+use origin_skills::{load_skills_dir, LoaderError, Skill};
+use std::path::Path;
+use std::sync::Arc;
+
+/// Read-only catalog of every `SKILL.md` under `root` at the time of
+/// construction. Lookup is by skill name (the `name:` frontmatter field).
+#[derive(Debug, Default)]
+pub struct SkillCatalog {
+    skills: Vec<Skill>,
+}
+
+impl SkillCatalog {
+    /// Load every skill under `root`. Returns an empty catalog if `root`
+    /// does not exist; surfaces I/O or frontmatter errors via `Err`.
+    pub fn load_from(root: &Path) -> Result<Self, LoaderError> {
+        if !root.exists() {
+            return Ok(Self::default());
+        }
+        let skills = load_skills_dir(root)?;
+        Ok(Self { skills })
+    }
+
+    /// Best-effort variant for the daemon boot path: any error degrades
+    /// to an empty catalog with a warning, so a malformed skill can't
+    /// keep the daemon from coming up.
+    #[must_use]
+    pub fn load_or_empty(root: &Path) -> Arc<Self> {
+        match Self::load_from(root) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %root.display(), "skill catalog load failed; running with empty catalog");
+                Arc::new(Self::default())
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.skills.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.skills.is_empty()
+    }
+
+    /// Find a skill by its frontmatter `name`. `None` when not present.
+    #[must_use]
+    pub fn find(&self, name: &str) -> Option<&Skill> {
+        self.skills.iter().find(|s| s.front.name == name)
+    }
+
+    /// Iterate every skill in catalog order (filesystem walk order, as
+    /// returned by `load_skills_dir`).
+    pub fn iter(&self) -> impl Iterator<Item = &Skill> {
+        self.skills.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_skill(dir: &Path, name: &str, allowed: &[&str]) {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).expect("mkdir");
+        let allowed = allowed.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", ");
+        let body = format!(
+            "---\nname: {name}\ndescription: test skill\nallowed-tools: [{allowed}]\n---\nbody\n"
+        );
+        std::fs::write(skill_dir.join("SKILL.md"), body).expect("write");
+    }
+
+    #[test]
+    fn load_empty_when_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cat = SkillCatalog::load_from(&dir.path().join("nope")).expect("ok");
+        assert!(cat.is_empty());
+    }
+
+    #[test]
+    fn load_two_skills() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_skill(dir.path(), "foo", &["Read"]);
+        write_skill(dir.path(), "bar", &["Glob", "Grep"]);
+        let cat = SkillCatalog::load_from(dir.path()).expect("ok");
+        assert_eq!(cat.len(), 2);
+        assert!(cat.find("foo").is_some());
+        assert!(cat.find("bar").is_some());
+        assert!(cat.find("missing").is_none());
+    }
+
+    #[test]
+    fn load_or_empty_degrades_on_corrupt_frontmatter() {
+        // Contract: `load_skills_dir` is fail-fast. A SINGLE corrupt SKILL.md
+        // causes `load_or_empty` to surface every skill in the directory as
+        // empty — including valid ones alongside the bad file. This is the
+        // intended degradation: we'd rather show no skills than half a catalog
+        // with no signal about the broken file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A valid skill that would normally load fine.
+        write_skill(dir.path(), "good", &["Read"]);
+        // A sibling skill with no frontmatter — this poisons the entire load.
+        let skill_dir = dir.path().join("broken");
+        std::fs::create_dir_all(&skill_dir).expect("mkdir");
+        std::fs::write(skill_dir.join("SKILL.md"), "no frontmatter here").expect("write");
+        let cat = SkillCatalog::load_or_empty(dir.path());
+        assert!(
+            cat.is_empty(),
+            "corrupt frontmatter must drop the entire catalog, including the valid sibling"
+        );
+    }
+}
