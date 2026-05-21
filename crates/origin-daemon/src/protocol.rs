@@ -254,11 +254,14 @@ pub enum StreamEvent {
     /// requested skill is not in the daemon's catalog.
     SkillError { message: String },
     /// Ack for a successful [`ClientMessage::ActivateWorkflow`]. `steps` is
-    /// the ordered list of skill names that were activated; the CLI renders
-    /// them so the user can see the chain that just took effect.
+    /// the ordered list of skill names that were activated; `skipped` lists
+    /// any steps whose skills weren't found in the catalog. Both are surfaced
+    /// in a single frame so the CLI renders the full outcome with one read.
     WorkflowActive {
         name: String,
         steps: Vec<String>,
+        #[serde(default)]
+        skipped: Vec<String>,
     },
     /// P13.4.2: negative acknowledgement carrying a human-readable error
     /// message. Used as the failure side of the admin mutation handlers.

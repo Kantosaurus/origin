@@ -314,7 +314,9 @@ pub async fn run_loop(
                     .as_ref()
                     .map(|reg| reg.iter_active().map(|s| s.name.clone()).collect())
                     .unwrap_or_default();
-                let mut out = String::from("Available skills (invoke via `/skill <name>`):\n");
+                let mut out = String::from(
+                    "Available skills (activate via `/<name>`, deactivate via `/-<name>`):\n",
+                );
                 for s in cat.iter() {
                     let marker = if active_names.contains(&s.front.name) {
                         "*"
