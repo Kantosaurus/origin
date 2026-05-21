@@ -15,6 +15,7 @@ use origin_sidecar::{ExtractDeliverer, Sidecar, SummaryDeliverer};
 use origin_skills::SkillRegistry;
 use crate::skill_catalog::SkillCatalog;
 use origin_tools::{registry_iter, SideEffects, ToolMeta};
+use origin_tools::dispatch::MemoryHandle;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -81,6 +82,11 @@ pub struct LoopOptions {
     /// activation state lives in `skills` above; this is the catalog of
     /// all loadable skills, separate from "currently active".
     pub skill_catalog: Option<Arc<SkillCatalog>>,
+    /// Optional memory-subsystem handle. When `Some`, `mem_search`,
+    /// `mem_save`, and `mem_forget` dispatch to the live `MemoryStore` /
+    /// HNSW index. When `None`, those tools return
+    /// `ToolFailure("memory subsystem not configured")`.
+    pub memory_handle: Option<Arc<dyn MemoryHandle>>,
 }
 
 impl Default for LoopOptions {
@@ -100,6 +106,7 @@ impl Default for LoopOptions {
             proposal_registry: None,
             skills: None,
             skill_catalog: None,
+            memory_handle: None,
         }
     }
 }
@@ -236,8 +243,12 @@ impl SpeculativeRegistry {
             return;
         }
         let handle = spawn_in(TaskClass::Critical, async move {
-            // Speculative tasks are pure and don't require graph/mem handles.
-            let text = dispatch_tool(meta, &args, cas.as_deref(), None, None).await?;
+            // Speculative tasks pass `None` for graph/mem/memory-handle:
+            // those subsystem-dependent tools (graph_*, ask, mem_*) are routed
+            // through the main dispatch path where the real handles are
+            // available. Speculation here only benefits the handle-free tools
+            // (Read/Glob/Grep/Edit/Bash/Recall/graph_explain).
+            let text = dispatch_tool(meta, &args, cas.as_deref(), None, None, None).await?;
             Ok::<_, LoopError>(text.into_bytes())
         });
         self.in_flight.insert(tool_use_id, handle);
@@ -501,6 +512,7 @@ pub async fn run_loop(
                         opts.cas.as_deref(),
                         opts.code_graph.as_ref(),
                         opts.mem_router.as_ref().map(Arc::as_ref),
+                        opts.memory_handle.as_deref(),
                     )
                     .await?
                     .into_bytes()
@@ -579,7 +591,7 @@ pub fn rebuild_codegraph(
 
 #[tracing::instrument(
     level = "info",
-    skip(args, cas, code_graph, mem_router),
+    skip(args, cas, code_graph, mem_router, memory),
     fields(kind = "tool", tool = meta.name)
 )]
 async fn dispatch_tool(
@@ -588,6 +600,7 @@ async fn dispatch_tool(
     cas: Option<&Store>,
     code_graph: Option<&Arc<tokio::sync::Mutex<origin_codegraph::index::CodeGraphIndex>>>,
     mem_router: Option<&dyn origin_codegraph::ask::MemRouter>,
+    memory: Option<&dyn MemoryHandle>,
 ) -> Result<String, LoopError> {
     match meta.name {
         "Read" => {
@@ -859,21 +872,45 @@ async fn dispatch_tool(
             Ok(origin_tools::builtins::graph_explain::graph_explain_tool(&q))
         }
         // ── Memory tools ──
-        // `mem_search` / `mem_save` / `mem_forget` need a `&dyn MemoryHandle`.
-        // The trait lives in `origin_tools::dispatch::MemoryHandle`; a concrete
-        // adapter wrapping `MemoryWiring` (store + embedder + index) is the
-        // follow-up. Until then: clear ToolFailure, not UnknownTool.
-        "mem_search" => Err(LoopError::ToolFailure(
-            "mem_search: memory subsystem not yet wired into dispatch. Thread a \
-             MemoryHandle adapter (wrapping MemoryWiring) through LoopOptions."
-                .into(),
-        )),
-        "mem_save" => Err(LoopError::ToolFailure(
-            "mem_save: memory subsystem not yet wired (see mem_search notes).".into(),
-        )),
-        "mem_forget" => Err(LoopError::ToolFailure(
-            "mem_forget: memory subsystem not yet wired (see mem_search notes).".into(),
-        )),
+        // `mem_search` / `mem_save` / `mem_forget` require a `&dyn MemoryHandle`
+        // threaded through `LoopOptions::memory_handle`. When the handle is
+        // `Some`, they delegate to the typed execute functions in
+        // `origin_tools::builtins::mem`. When `None`, they return a clear
+        // `ToolFailure` (never `UnknownTool`) so the model knows the subsystem
+        // exists but is not currently configured.
+        "mem_search" => {
+            let Some(handle) = memory else {
+                return Err(LoopError::ToolFailure(
+                    "mem_search: memory subsystem not configured".into(),
+                ));
+            };
+            let input = args.to_string();
+            origin_tools::builtins::mem::mem_search_execute(handle, &input)
+                .await
+                .map_err(|e| LoopError::ToolFailure(e.to_string()))
+        }
+        "mem_save" => {
+            let Some(handle) = memory else {
+                return Err(LoopError::ToolFailure(
+                    "mem_save: memory subsystem not configured".into(),
+                ));
+            };
+            let input = args.to_string();
+            origin_tools::builtins::mem::mem_save_execute(handle, &input)
+                .await
+                .map_err(|e| LoopError::ToolFailure(e.to_string()))
+        }
+        "mem_forget" => {
+            let Some(handle) = memory else {
+                return Err(LoopError::ToolFailure(
+                    "mem_forget: memory subsystem not configured".into(),
+                ));
+            };
+            let input = args.to_string();
+            origin_tools::builtins::mem::mem_forget_execute(handle, &input)
+                .await
+                .map_err(|e| LoopError::ToolFailure(e.to_string()))
+        }
         // ── ask ──
         "ask" => {
             let idx_arc = code_graph.ok_or_else(|| {
@@ -1199,7 +1236,9 @@ async fn drain_subscriber_into_response(
 #[cfg(test)]
 mod dispatch_table_tests {
     use super::*;
+    use origin_tools::dispatch::{MemoryHandle, MemoryToolError, SearchHit};
     use origin_tools::registry_iter;
+    use std::sync::Mutex;
 
     /// Build a fresh in-memory-ish `CodeGraphIndex` backed by a tempdir for CAS
     /// and an in-memory (`:memory:`) `SQLite` database. Returns the index wrapped
@@ -1234,7 +1273,7 @@ mod dispatch_table_tests {
         let empty = serde_json::Value::Object(serde_json::Map::new());
         let mut unrecognized: Vec<String> = Vec::new();
         for meta in registry_iter() {
-            let result = dispatch_tool(meta, &empty, None, None, None).await;
+            let result = dispatch_tool(meta, &empty, None, None, None, None).await;
             if let Err(LoopError::UnknownTool(name)) = &result {
                 unrecognized.push(name.clone());
             }
@@ -1254,19 +1293,19 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_explain")
             .expect("graph_explain registered");
         let args = serde_json::json!({"kind": "communities"});
-        let out = dispatch_tool(meta, &args, None, None, None).await.expect("communities dispatch");
+        let out = dispatch_tool(meta, &args, None, None, None, None).await.expect("communities dispatch");
         assert_eq!(out, "all detected communities");
 
         let args = serde_json::json!({
             "kind": "recent_changes",
             "args": {"since_ms": 1_700_000_000_000_i64}
         });
-        let out = dispatch_tool(meta, &args, None, None, None).await.expect("recent_changes dispatch");
+        let out = dispatch_tool(meta, &args, None, None, None, None).await.expect("recent_changes dispatch");
         assert!(out.contains("1700000000000"), "got: {out}");
 
         // Unknown kind surfaces as BadArgs, not ToolFailure or UnknownTool.
         let args = serde_json::json!({"kind": "bogus"});
-        let err = dispatch_tool(meta, &args, None, None, None).await.expect_err("bogus must fail");
+        let err = dispatch_tool(meta, &args, None, None, None, None).await.expect_err("bogus must fail");
         assert!(matches!(err, LoopError::BadArgs(_)));
     }
 
@@ -1275,23 +1314,20 @@ mod dispatch_table_tests {
     /// reversion to the silent-fall-through.
     #[tokio::test]
     async fn stub_arms_return_toolfailure_not_unknowntool() {
-        let names = [
-            "graph_query",
-            "graph_path",
-            "graph_summarize",
-            "graph_rebuild",
-            "mem_search",
-            "mem_save",
-            "mem_forget",
-            "ask",
-            "Task",
-        ];
+        // After Subsystems A (graph_* + ask), B (mem_*) merged, only `Task`
+        // remains a stub. The behavior contract is unchanged: missing
+        // subsystem → ToolFailure with subsystem-naming message.
+        // mem_* / graph_* / ask still surface a `ToolFailure` when their
+        // handle is None (covered in their dedicated tests below); calling
+        // them here with all-None would test the same path, so we keep this
+        // suite narrow to the remaining literal stubs.
+        let names = ["Task"];
         let args = serde_json::Value::Object(serde_json::Map::new());
         for name in names {
             let meta = registry_iter()
                 .find(|m| m.name == name)
                 .unwrap_or_else(|| panic!("{name} not registered"));
-            let err = dispatch_tool(meta, &args, None, None, None).await.expect_err(name);
+            let err = dispatch_tool(meta, &args, None, None, None, None).await.expect_err(name);
             match err {
                 LoopError::ToolFailure(msg) => {
                     assert!(
@@ -1305,6 +1341,8 @@ mod dispatch_table_tests {
         }
     }
 
+    // ── Subsystem A tests: graph_* + ask (with CodeGraphIndex) ────────────────
+
     /// Dispatch `graph_query` with `kind=communities` against an empty index.
     /// Communities is always `QueryResult::Empty` at P7.8, so the result JSON
     /// must be `"{}"`.
@@ -1315,7 +1353,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_query")
             .expect("graph_query registered");
         let args = serde_json::json!({"kind": "communities"});
-        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None)
+        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None)
             .await
             .expect("graph_query dispatch");
         // QueryResult::Empty serializes as "{}".
@@ -1339,6 +1377,7 @@ mod dispatch_table_tests {
             None,
             Some(&code_graph),
             Some(&null_router as &dyn origin_codegraph::ask::MemRouter),
+            None,
         )
         .await
         .expect("ask dispatch");
@@ -1356,7 +1395,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_rebuild")
             .expect("graph_rebuild registered");
         let args = serde_json::json!({"paths": []});
-        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None)
+        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None)
             .await
             .expect("graph_rebuild dispatch");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
@@ -1364,5 +1403,130 @@ mod dispatch_table_tests {
         assert_eq!(paths_seen, 0, "expected 0 paths_seen, got: {out}");
         let errors = parsed["errors"].as_array().expect("errors field");
         assert!(errors.is_empty(), "expected no errors, got: {out}");
+    }
+
+    // ── Subsystem B tests: mem_* (with MemoryHandle) ──────────────────────────
+
+    /// A minimal in-memory `MemoryHandle` implementation for testing.
+    /// Uses a `Mutex<Vec<_>>` so it is `Send + Sync` and requires no external deps.
+    #[derive(Debug)]
+    struct StubMemoryHandle {
+        entries: Mutex<Vec<(String, String, Vec<String>)>>, // (id, body, tags)
+    }
+
+    impl StubMemoryHandle {
+        fn new() -> Self {
+            Self {
+                entries: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl MemoryHandle for StubMemoryHandle {
+        fn search(&self, query: &str, k: usize, _fresh: bool) -> Result<Vec<SearchHit>, MemoryToolError> {
+            let entries = self.entries.lock().expect("lock");
+            let q_lower = query.to_lowercase();
+            let hits: Vec<SearchHit> = entries
+                .iter()
+                .filter(|(_, body, _)| body.to_lowercase().contains(&q_lower))
+                .take(k)
+                .map(|(id, body, tags)| SearchHit {
+                    id: id.clone(),
+                    preview: body.chars().take(128).collect(),
+                    score: 1.0,
+                    age_days: 0.0,
+                    tags: tags.clone(),
+                })
+                .collect();
+            Ok(hits)
+        }
+
+        fn save(&self, body: &str, tags: &[String]) -> Result<String, MemoryToolError> {
+            let id = format!("stub-{}", ulid::Ulid::new());
+            self.entries
+                .lock()
+                .expect("lock")
+                .push((id.clone(), body.to_string(), tags.to_vec()));
+            Ok(id)
+        }
+
+        fn forget(&self, id: &str) -> Result<(), MemoryToolError> {
+            let mut entries = self.entries.lock().expect("lock");
+            let before = entries.len();
+            entries.retain(|(eid, _, _)| eid != id);
+            if entries.len() < before {
+                Ok(())
+            } else {
+                Err(MemoryToolError::BadId(id.to_string()))
+            }
+        }
+    }
+
+    /// `mem_search` with `memory_handle = None` must return `ToolFailure` containing
+    /// "subsystem" — preserving the no-handle behavior.
+    #[tokio::test]
+    async fn mem_search_without_handle_returns_toolfailure() {
+        let meta = registry_iter()
+            .find(|m| m.name == "mem_search")
+            .expect("mem_search registered");
+        let args = serde_json::json!({"query": "anything"});
+        let err = dispatch_tool(meta, &args, None, None, None, None)
+            .await
+            .expect_err("must fail without handle");
+        match err {
+            LoopError::ToolFailure(msg) => {
+                assert!(
+                    msg.contains("subsystem"),
+                    "ToolFailure must mention subsystem; got `{msg}`"
+                );
+            }
+            other => panic!("expected ToolFailure, got {other:?}"),
+        }
+    }
+
+    /// Wire a `StubMemoryHandle` through dispatch, save a memory via `mem_save`,
+    /// then confirm `mem_search` returns the saved item.
+    #[tokio::test]
+    async fn mem_save_round_trips_via_handle() {
+        let handle = StubMemoryHandle::new();
+
+        let save_meta = registry_iter()
+            .find(|m| m.name == "mem_save")
+            .expect("mem_save registered");
+        let save_args = serde_json::json!({
+            "body": "the quick brown fox",
+            "tags": ["test", "roundtrip"]
+        });
+        let save_out = dispatch_tool(save_meta, &save_args, None, None, None, Some(&handle))
+            .await
+            .expect("mem_save must succeed");
+        let save_json: serde_json::Value =
+            serde_json::from_str(&save_out).expect("mem_save output must be valid JSON");
+        assert!(
+            save_json.get("id").and_then(|v| v.as_str()).is_some(),
+            "mem_save must return {{\"id\":\"...\"}}; got `{save_out}`"
+        );
+
+        let search_meta = registry_iter()
+            .find(|m| m.name == "mem_search")
+            .expect("mem_search registered");
+        let search_args = serde_json::json!({"query": "quick brown", "k": 5});
+        let search_out = dispatch_tool(search_meta, &search_args, None, None, None, Some(&handle))
+            .await
+            .expect("mem_search must succeed");
+        let hits: serde_json::Value =
+            serde_json::from_str(&search_out).expect("mem_search output must be valid JSON");
+        let arr = hits.as_array().expect("mem_search must return an array");
+        assert!(
+            !arr.is_empty(),
+            "mem_search must find the saved entry; got empty array"
+        );
+        let first = &arr[0];
+        assert!(
+            first["preview"]
+                .as_str()
+                .map_or(false, |p| p.contains("quick brown")),
+            "hit preview must contain the saved body; got {first}"
+        );
     }
 }

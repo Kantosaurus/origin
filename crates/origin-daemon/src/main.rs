@@ -8,6 +8,7 @@ use anyhow::Result;
 use origin_cas::Store;
 use origin_core::types::Role;
 use origin_daemon::agent::{run_loop, LoopOptions, SessionStoreSummaryDeliverer};
+use origin_tools::dispatch::MemoryHandle as MemoryHandleTrait;
 use origin_skills::SkillRegistry;
 use origin_daemon::auth::BearerStore;
 use origin_daemon::config::bearer_ttl_secs;
@@ -557,6 +558,10 @@ fn spawn_handler_task(
     code_graph: Arc<tokio::sync::Mutex<CodeGraphIndex>>,
     mem_router: Arc<dyn origin_codegraph::ask::MemRouter>,
 ) {
+    // Build a type-erased memory handle once per connection so `handle_request`
+    // doesn't need to know about `MemoryWiring` internals.
+    let memory_handle: Option<Arc<dyn MemoryHandleTrait>> =
+        memory.as_ref().map(|m| m.handle() as Arc<dyn MemoryHandleTrait>);
     spawn_in(TaskClass::Critical, async move {
         // Per-connection skill activation state. Each ActivateSkill mutates
         // this registry; each Prompt reads its `allowed_tools` mask and passes
@@ -612,6 +617,7 @@ fn spawn_handler_task(
                         Arc::clone(&cas),
                         Arc::clone(&sidecar),
                         memory.as_ref(),
+                        memory_handle.clone(),
                         Arc::clone(&proposal_registry),
                         Arc::clone(&skill_catalog),
                         Arc::clone(&active_skills),
@@ -936,6 +942,7 @@ async fn handle_request(
     cas: Arc<Store>,
     sidecar: Arc<Sidecar>,
     memory: Option<&MemoryWiring>,
+    memory_handle: Option<Arc<dyn MemoryHandleTrait>>,
     proposal_registry: Arc<ProposalRegistry>,
     skill_catalog: Arc<SkillCatalog>,
     active_skills: Arc<tokio::sync::Mutex<SkillRegistry>>,
@@ -1016,6 +1023,7 @@ async fn handle_request(
                 }
             },
             skill_catalog: Some(Arc::clone(&skill_catalog)),
+            memory_handle: memory_handle.clone(),
         };
         run_loop(&mut session, &req.user_text, provider, &AlwaysAllow, &opts).await
     };
