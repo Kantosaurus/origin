@@ -59,3 +59,13 @@ globset      = "0.4"
 walkdir      = "2"
 rusqlite     = { version = "0.32", default-features = false, features = ["bundled"] }
 clap_mangen  = "0.2"
+
+# Limit debuginfo to keep PDB under the Windows 4 GB limit (LNK1318).
+# The origin-cli binary links the daemon, every provider, and every tool —
+# full debuginfo blows the PDB past the linker's hard cap on Windows.
+# line-tables-only keeps backtrace line numbers but drops type info.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
