@@ -26,6 +26,13 @@ use tokio::task::JoinHandle;
 pub struct LoopOptions {
     pub max_turns: u32,
     pub cas: Option<Arc<Store>>,
+    /// Optional code-graph index. Wrapped in `Arc<Mutex<...>>` because
+    /// `graph_rebuild` mutates the index. `None` disables all `graph_*` and
+    /// `ask` tools (they return a clear `ToolFailure` rather than `UnknownTool`).
+    pub code_graph: Option<Arc<tokio::sync::Mutex<origin_codegraph::index::CodeGraphIndex>>>,
+    /// Optional memory router for the `ask` tool. `None` disables the memory
+    /// side of ask routing (code side still works if `code_graph` is `Some`).
+    pub mem_router: Option<Arc<dyn origin_codegraph::ask::MemRouter>>,
     /// Optional channel used by the daemon to publish each request's
     /// `Subscriber` to a per-connection relay task. The relay forwards token
     /// events to the CLI as `Event` frames. We send a pre-subscribed
@@ -81,6 +88,8 @@ impl Default for LoopOptions {
         Self {
             max_turns: 25,
             cas: None,
+            code_graph: None,
+            mem_router: None,
             relay_tx: None,
             streaming_disabled: false,
             sidecar: None,
@@ -227,7 +236,8 @@ impl SpeculativeRegistry {
             return;
         }
         let handle = spawn_in(TaskClass::Critical, async move {
-            let text = dispatch_tool(meta, &args, cas.as_deref()).await?;
+            // Speculative tasks are pure and don't require graph/mem handles.
+            let text = dispatch_tool(meta, &args, cas.as_deref(), None, None).await?;
             Ok::<_, LoopError>(text.into_bytes())
         });
         self.in_flight.insert(tool_use_id, handle);
@@ -485,9 +495,15 @@ pub async fn run_loop(
                 if let Some(pre) = speculative.take(&id).await {
                     pre?
                 } else {
-                    dispatch_tool(meta, &args, opts.cas.as_deref())
-                        .await?
-                        .into_bytes()
+                    dispatch_tool(
+                        meta,
+                        &args,
+                        opts.cas.as_deref(),
+                        opts.code_graph.as_ref(),
+                        opts.mem_router.as_ref().map(Arc::as_ref),
+                    )
+                    .await?
+                    .into_bytes()
                 }
             };
 
@@ -563,10 +579,16 @@ pub fn rebuild_codegraph(
 
 #[tracing::instrument(
     level = "info",
-    skip(args, cas),
+    skip(args, cas, code_graph, mem_router),
     fields(kind = "tool", tool = meta.name)
 )]
-async fn dispatch_tool(meta: &ToolMeta, args: &Value, cas: Option<&Store>) -> Result<String, LoopError> {
+async fn dispatch_tool(
+    meta: &ToolMeta,
+    args: &Value,
+    cas: Option<&Store>,
+    code_graph: Option<&Arc<tokio::sync::Mutex<origin_codegraph::index::CodeGraphIndex>>>,
+    mem_router: Option<&dyn origin_codegraph::ask::MemRouter>,
+) -> Result<String, LoopError> {
     match meta.name {
         "Read" => {
             let path = args
@@ -644,28 +666,147 @@ async fn dispatch_tool(meta: &ToolMeta, args: &Value, cas: Option<&Store>) -> Re
                 .map_err(|e| LoopError::ToolFailure(e.to_string()))
         }
         // ── Code-graph tools ──
-        // These four require an `Arc<origin_codegraph::index::CodeGraphIndex>`
-        // threaded through `LoopOptions`. The daemon currently constructs
-        // neither the index nor the SQL pool side it needs, so dispatch returns
-        // a clear `ToolFailure` rather than `UnknownTool` — the tool IS in the
-        // catalog the model receives, the subsystem behind it just isn't wired.
-        "graph_query" => Err(LoopError::ToolFailure(
-            "graph_query: code-graph subsystem not yet wired. Thread a CodeGraphIndex \
-             through LoopOptions and extend dispatch_tool to consume it."
-                .into(),
-        )),
-        "graph_path" => Err(LoopError::ToolFailure(
-            "graph_path: code-graph subsystem not yet wired (see graph_query notes).".into(),
-        )),
-        "graph_summarize" => Err(LoopError::ToolFailure(
-            "graph_summarize: code-graph subsystem not yet wired (see graph_query notes).".into(),
-        )),
-        "graph_rebuild" => Err(LoopError::ToolFailure(
-            "graph_rebuild: code-graph subsystem not yet wired. The free function \
-             `agent::rebuild_codegraph` exists but no IPC verb or background hook \
-             routes to it; this dispatch arm activates once both are present."
-                .into(),
-        )),
+        "graph_query" => {
+            use origin_codegraph::index::EntityId;
+            use origin_codegraph::query::Query;
+            let idx_arc = code_graph.ok_or_else(|| {
+                LoopError::ToolFailure(
+                    "graph_query: code-graph subsystem not yet wired (CodeGraphIndex not in LoopOptions)."
+                        .into(),
+                )
+            })?;
+            let kind = args
+                .get("kind")
+                .and_then(Value::as_str)
+                .ok_or_else(|| LoopError::BadArgs("graph_query: missing `kind`".into()))?;
+            let q_args = args.get("args").cloned().unwrap_or(Value::Null);
+            let parse_id = |v: &Value, field: &str| -> Result<EntityId, LoopError> {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| LoopError::BadArgs(format!("graph_query.{field}: not a string")))?;
+                let mut buf = [0u8; 32];
+                hex::decode_to_slice(s, &mut buf)
+                    .map_err(|e| LoopError::BadArgs(format!("graph_query.{field}: bad hex: {e}")))?;
+                Ok(EntityId(buf))
+            };
+            let q = match kind {
+                "path" => Query::Path {
+                    from: parse_id(&q_args["from"], "args.from")?,
+                    to: parse_id(&q_args["to"], "args.to")?,
+                    max_hops: usize::try_from(q_args["max_hops"].as_u64().unwrap_or(8))
+                        .unwrap_or(usize::MAX),
+                },
+                "neighbors" => Query::Neighbors {
+                    node: parse_id(&q_args["node"], "args.node")?,
+                    depth: usize::try_from(q_args["depth"].as_u64().unwrap_or(1))
+                        .unwrap_or(usize::MAX),
+                },
+                "communities" => Query::Communities,
+                "god_nodes" => Query::GodNodes {
+                    top_per_partition: usize::try_from(
+                        q_args["top_per_partition"].as_u64().unwrap_or(3),
+                    )
+                    .unwrap_or(usize::MAX),
+                },
+                "recent_changes" => Query::RecentChanges {
+                    since_ms: q_args["since_ms"].as_i64().unwrap_or(0),
+                },
+                other => {
+                    return Err(LoopError::BadArgs(format!(
+                        "graph_query: unknown kind `{other}`"
+                    )))
+                }
+            };
+            let idx = idx_arc.lock().await;
+            let result = origin_tools::builtins::graph_query::graph_query_tool(&idx, q)
+                .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
+            Ok(serialize_query_result(&result))
+        }
+        "graph_path" => {
+            use origin_codegraph::index::EntityId;
+            let idx_arc = code_graph.ok_or_else(|| {
+                LoopError::ToolFailure(
+                    "graph_path: code-graph subsystem not yet wired (CodeGraphIndex not in LoopOptions)."
+                        .into(),
+                )
+            })?;
+            let parse_hex_id = |field: &str| -> Result<EntityId, LoopError> {
+                let s = args
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| LoopError::BadArgs(format!("graph_path: missing `{field}`")))?;
+                let mut buf = [0u8; 32];
+                hex::decode_to_slice(s, &mut buf)
+                    .map_err(|e| LoopError::BadArgs(format!("graph_path.{field}: bad hex: {e}")))?;
+                Ok(EntityId(buf))
+            };
+            let from = parse_hex_id("from")?;
+            let to = parse_hex_id("to")?;
+            let max_hops = usize::try_from(
+                args.get("max_hops").and_then(Value::as_u64).unwrap_or(8),
+            )
+            .unwrap_or(usize::MAX);
+            let idx = idx_arc.lock().await;
+            let result =
+                origin_tools::builtins::graph_path::graph_path_tool(&idx, from, to, max_hops)
+                    .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
+            Ok(serialize_query_result(&result))
+        }
+        "graph_summarize" => {
+            let idx_arc = code_graph.ok_or_else(|| {
+                LoopError::ToolFailure(
+                    "graph_summarize: code-graph subsystem not yet wired (CodeGraphIndex not in LoopOptions)."
+                        .into(),
+                )
+            })?;
+            // `community_id` (int) or `node` (hex) is the target string.
+            let target = if let Some(cid) = args.get("community_id").and_then(Value::as_i64) {
+                cid.to_string()
+            } else if let Some(node) = args.get("node").and_then(Value::as_str) {
+                node.to_string()
+            } else {
+                String::new()
+            };
+            let idx = idx_arc.lock().await;
+            // graph_summarize_tool always returns QueryResult::Empty at P7.8.
+            let _result = origin_tools::builtins::graph_summarize::graph_summarize_tool(&idx, target);
+            Ok("{}".to_string())
+        }
+        "graph_rebuild" => {
+            use std::path::PathBuf;
+            let idx_arc = code_graph.ok_or_else(|| {
+                LoopError::ToolFailure(
+                    "graph_rebuild: code-graph subsystem not yet wired (CodeGraphIndex not in LoopOptions)."
+                        .into(),
+                )
+            })?;
+            let paths: Vec<PathBuf> = args
+                .get("paths")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(PathBuf::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Lock, mutate, then release before returning — don't hold across any await.
+            let report = {
+                let mut idx = idx_arc.lock().await;
+                origin_tools::builtins::graph_rebuild::graph_rebuild_tool(
+                    &mut idx,
+                    paths,
+                    origin_codegraph::Language::Rust,
+                )
+                .map_err(|e| LoopError::ToolFailure(e.to_string()))?
+            };
+            Ok(serde_json::json!({
+                "paths_seen": report.paths_seen,
+                "nodes_added": report.nodes_added,
+                "nodes_updated": report.nodes_updated,
+                "errors": report.errors,
+            })
+            .to_string())
+        }
         // `graph_explain` has zero infrastructure dependency — it just classifies
         // a typed `Query` into a deterministic English gloss. Wired here as a
         // real call so the model gets a working tool, not a stub error.
@@ -734,14 +875,45 @@ async fn dispatch_tool(meta: &ToolMeta, args: &Value, cas: Option<&Store>) -> Re
             "mem_forget: memory subsystem not yet wired (see mem_search notes).".into(),
         )),
         // ── ask ──
-        // Needs both a CodeGraphIndex (for code routing) and a MemRouter.
-        // `NullMemRouter` is available as a stub but the full router needs
-        // wiring against the daemon's mem index.
-        "ask" => Err(LoopError::ToolFailure(
-            "ask: free-text router not yet wired. Needs CodeGraphIndex + MemRouter \
-             threaded through LoopOptions."
-                .into(),
-        )),
+        "ask" => {
+            let idx_arc = code_graph.ok_or_else(|| {
+                LoopError::ToolFailure(
+                    "ask: code-graph subsystem not yet wired (CodeGraphIndex not in LoopOptions)."
+                        .into(),
+                )
+            })?;
+            let query = args
+                .get("query")
+                .and_then(Value::as_str)
+                .ok_or_else(|| LoopError::BadArgs("ask: missing `query`".into()))?;
+            // Use provided MemRouter or fall back to the NullMemRouter.
+            let null_router = origin_codegraph::ask::NullMemRouter;
+            let router: &dyn origin_codegraph::ask::MemRouter =
+                mem_router.unwrap_or(&null_router);
+            let idx = idx_arc.lock().await;
+            let result = origin_tools::builtins::ask::ask_tool(&idx, router, query);
+            let route_str = match result.route {
+                origin_codegraph::ask::Route::Code => "code",
+                origin_codegraph::ask::Route::Mem => "mem",
+                origin_codegraph::ask::Route::Both => "both",
+            };
+            let mem_hits: Vec<serde_json::Value> = result
+                .mem_hits
+                .iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "id": h.id,
+                        "score": h.score,
+                        "body": h.body,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({
+                "route": route_str,
+                "mem_hits": mem_hits,
+            })
+            .to_string())
+        }
         // ── Task ──
         // Needs an `origin_swarm::Coordinator` constructed against a PlanHandle.
         // The daemon has a PlanBus but no Coordinator instance yet.
@@ -752,6 +924,46 @@ async fn dispatch_tool(meta: &ToolMeta, args: &Value, cas: Option<&Store>) -> Re
         )),
         other => Err(LoopError::UnknownTool(other.into())),
     }
+}
+
+/// Serialize a [`origin_codegraph::query::QueryResult`] as a JSON string.
+///
+/// `NodeRow` handles (`signature_handle`, `body_handle`) are rendered as
+/// lowercase hex so they are round-trippable through the CAS layer.
+fn serialize_query_result(r: &origin_codegraph::query::QueryResult) -> String {
+    use origin_codegraph::query::QueryResult;
+    match r {
+        QueryResult::Empty => "{}".to_string(),
+        QueryResult::Nodes(nodes) => {
+            let arr: Vec<serde_json::Value> = nodes.iter().map(node_row_to_json).collect();
+            serde_json::json!({ "nodes": arr }).to_string()
+        }
+        QueryResult::Path(nodes) => {
+            let arr: Vec<serde_json::Value> = nodes.iter().map(node_row_to_json).collect();
+            serde_json::json!({ "path": arr }).to_string()
+        }
+        QueryResult::Partitions(parts) => {
+            let arr: Vec<serde_json::Value> = parts
+                .iter()
+                .map(|part| {
+                    let rows: Vec<serde_json::Value> = part.iter().map(node_row_to_json).collect();
+                    serde_json::Value::Array(rows)
+                })
+                .collect();
+            serde_json::json!({ "partitions": arr }).to_string()
+        }
+    }
+}
+
+fn node_row_to_json(row: &origin_codegraph::index::NodeRow) -> serde_json::Value {
+    serde_json::json!({
+        "entity_id": hex::encode(row.entity_id.as_bytes()),
+        "kind": row.kind,
+        "name": row.name,
+        "file_path": row.file_path,
+        "signature_handle": hex::encode(row.signature_handle),
+        "body_handle": hex::encode(row.body_handle),
+    })
 }
 
 fn parse_region(v: &Value) -> Result<origin_tools::builtins::recall::Region, LoopError> {
@@ -989,6 +1201,29 @@ mod dispatch_table_tests {
     use super::*;
     use origin_tools::registry_iter;
 
+    /// Build a fresh in-memory-ish `CodeGraphIndex` backed by a tempdir for CAS
+    /// and an in-memory (`:memory:`) `SQLite` database. Returns the index wrapped
+    /// in `Arc<tokio::sync::Mutex<...>>` as required by `LoopOptions`.
+    fn make_empty_code_graph() -> (
+        Arc<tokio::sync::Mutex<origin_codegraph::index::CodeGraphIndex>>,
+        tempfile::TempDir,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cas_root = tmp.path().join("cas");
+        let cas = origin_cas::Store::open(origin_cas::StoreConfig {
+            root: cas_root,
+            hot_capacity: 64,
+            warm_pack_target_bytes: 1 << 20,
+            cold_zstd_level: 3,
+        })
+        .expect("open cas");
+        // Use the temp db path rather than :memory: so migrations run via refinery.
+        let db_path = tmp.path().join("origin.db");
+        let sql = origin_store::Store::open(&db_path).expect("open sqlite");
+        let idx = origin_codegraph::index::CodeGraphIndex::new(cas, sql);
+        (Arc::new(tokio::sync::Mutex::new(idx)), tmp)
+    }
+
     /// Every tool advertised to the model via `tools_schema = registry_iter().map(...)`
     /// MUST be recognized by `dispatch_tool`. An `UnknownTool` error means the
     /// model received a tool name it can pick, then got told "I don't know that
@@ -999,7 +1234,7 @@ mod dispatch_table_tests {
         let empty = serde_json::Value::Object(serde_json::Map::new());
         let mut unrecognized: Vec<String> = Vec::new();
         for meta in registry_iter() {
-            let result = dispatch_tool(meta, &empty, None).await;
+            let result = dispatch_tool(meta, &empty, None, None, None).await;
             if let Err(LoopError::UnknownTool(name)) = &result {
                 unrecognized.push(name.clone());
             }
@@ -1019,19 +1254,19 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_explain")
             .expect("graph_explain registered");
         let args = serde_json::json!({"kind": "communities"});
-        let out = dispatch_tool(meta, &args, None).await.expect("communities dispatch");
+        let out = dispatch_tool(meta, &args, None, None, None).await.expect("communities dispatch");
         assert_eq!(out, "all detected communities");
 
         let args = serde_json::json!({
             "kind": "recent_changes",
             "args": {"since_ms": 1_700_000_000_000_i64}
         });
-        let out = dispatch_tool(meta, &args, None).await.expect("recent_changes dispatch");
+        let out = dispatch_tool(meta, &args, None, None, None).await.expect("recent_changes dispatch");
         assert!(out.contains("1700000000000"), "got: {out}");
 
         // Unknown kind surfaces as BadArgs, not ToolFailure or UnknownTool.
         let args = serde_json::json!({"kind": "bogus"});
-        let err = dispatch_tool(meta, &args, None).await.expect_err("bogus must fail");
+        let err = dispatch_tool(meta, &args, None, None, None).await.expect_err("bogus must fail");
         assert!(matches!(err, LoopError::BadArgs(_)));
     }
 
@@ -1056,7 +1291,7 @@ mod dispatch_table_tests {
             let meta = registry_iter()
                 .find(|m| m.name == name)
                 .unwrap_or_else(|| panic!("{name} not registered"));
-            let err = dispatch_tool(meta, &args, None).await.expect_err(name);
+            let err = dispatch_tool(meta, &args, None, None, None).await.expect_err(name);
             match err {
                 LoopError::ToolFailure(msg) => {
                     assert!(
@@ -1068,5 +1303,66 @@ mod dispatch_table_tests {
                 other => panic!("{name}: unexpected error variant {other:?}"),
             }
         }
+    }
+
+    /// Dispatch `graph_query` with `kind=communities` against an empty index.
+    /// Communities is always `QueryResult::Empty` at P7.8, so the result JSON
+    /// must be `"{}"`.
+    #[tokio::test]
+    async fn graph_query_runs_against_empty_index_returns_empty_result() {
+        let (code_graph, _tmp) = make_empty_code_graph();
+        let meta = registry_iter()
+            .find(|m| m.name == "graph_query")
+            .expect("graph_query registered");
+        let args = serde_json::json!({"kind": "communities"});
+        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None)
+            .await
+            .expect("graph_query dispatch");
+        // QueryResult::Empty serializes as "{}".
+        assert_eq!(out, "{}", "expected empty JSON, got: {out}");
+    }
+
+    /// Dispatch `ask` with a code-flavored query against an empty index +
+    /// `NullMemRouter`. The classifier routes "what calls foo" to `Route::Code`
+    /// so `result.route` must serialize as `"code"`.
+    #[tokio::test]
+    async fn ask_classifies_pure_code_query() {
+        let (code_graph, _tmp) = make_empty_code_graph();
+        let meta = registry_iter()
+            .find(|m| m.name == "ask")
+            .expect("ask registered");
+        let args = serde_json::json!({"query": "what calls foo"});
+        let null_router = origin_codegraph::ask::NullMemRouter;
+        let out = dispatch_tool(
+            meta,
+            &args,
+            None,
+            Some(&code_graph),
+            Some(&null_router as &dyn origin_codegraph::ask::MemRouter),
+        )
+        .await
+        .expect("ask dispatch");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        let route = parsed["route"].as_str().expect("route field");
+        assert_eq!(route, "code", "expected route=code, got: {out}");
+    }
+
+    /// Dispatch `graph_rebuild` with an empty paths array. The report must show
+    /// `paths_seen = 0` and no errors.
+    #[tokio::test]
+    async fn graph_rebuild_with_empty_paths_returns_zero_report() {
+        let (code_graph, _tmp) = make_empty_code_graph();
+        let meta = registry_iter()
+            .find(|m| m.name == "graph_rebuild")
+            .expect("graph_rebuild registered");
+        let args = serde_json::json!({"paths": []});
+        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None)
+            .await
+            .expect("graph_rebuild dispatch");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        let paths_seen = parsed["paths_seen"].as_u64().expect("paths_seen field");
+        assert_eq!(paths_seen, 0, "expected 0 paths_seen, got: {out}");
+        let errors = parsed["errors"].as_array().expect("errors field");
+        assert!(errors.is_empty(), "expected no errors, got: {out}");
     }
 }

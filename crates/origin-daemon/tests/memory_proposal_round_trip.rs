@@ -92,6 +92,8 @@ async fn memory_proposed_round_trip_via_stub_provider() {
         let opts = LoopOptions {
             max_turns: 5,
             cas: None,
+            code_graph: None,
+            mem_router: None,
             relay_tx: None,
             streaming_disabled: true,
             proposer: Some(Arc::clone(&proposer)),

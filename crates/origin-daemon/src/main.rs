@@ -34,6 +34,8 @@ use origin_provider::Provider;
 use origin_provider_anthropic::Anthropic;
 use origin_runtime::{spawn_in, TaskClass};
 use origin_sidecar::{Sidecar, SidecarConfig, SidecarJob};
+use origin_codegraph::ask::NullMemRouter;
+use origin_codegraph::index::CodeGraphIndex;
 use origin_store::Store as SqlStore;
 use origin_stream::Subscriber;
 use parking_lot::RwLock as PlRwLock;
@@ -319,6 +321,58 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     let session_store = Arc::new(SessionStore::open(&db_path)?);
     info!(db = %db_path, "session store ready");
 
+    // Code-graph subsystem (P7.8 Subsystem A). Opens its own CAS root and
+    // SQL connection so the index never contends with the session store or
+    // memory subsystem. Graceful-degrade: log a warning and leave the
+    // optional `None` if either store fails to open.
+    let codegraph_cas_root = format!("{cas_root}/codegraph");
+    let code_graph: Arc<tokio::sync::Mutex<CodeGraphIndex>> = {
+        let cg_cas = origin_cas::Store::open(origin_cas::StoreConfig {
+            root: codegraph_cas_root.clone().into(),
+            hot_capacity: 128,
+            warm_pack_target_bytes: 4 * 1024 * 1024,
+            cold_zstd_level: 3,
+        });
+        let cg_sql = SqlStore::open(&db_path);
+        match (cg_cas, cg_sql) {
+            (Ok(cas_store), Ok(sql_store)) => {
+                info!("code-graph index ready");
+                Arc::new(tokio::sync::Mutex::new(CodeGraphIndex::new(cas_store, sql_store)))
+            }
+            (Err(e), _) => {
+                warn!(error = %e, "code-graph: CAS open failed; graph tools disabled");
+                // Build an empty fallback so the Arc type is satisfied.
+                // The stores will be opened in a fallback temp dir.
+                let tmp = std::env::temp_dir().join("origin-cg-fallback");
+                let _ = std::fs::create_dir_all(&tmp);
+                let fallback_cas = origin_cas::Store::open(origin_cas::StoreConfig {
+                    root: tmp.clone(),
+                    hot_capacity: 8,
+                    warm_pack_target_bytes: 1 << 20,
+                    cold_zstd_level: 1,
+                })
+                .expect("fallback codegraph cas");
+                let fallback_sql = SqlStore::open(&db_path).expect("fallback codegraph sql");
+                Arc::new(tokio::sync::Mutex::new(CodeGraphIndex::new(fallback_cas, fallback_sql)))
+            }
+            (_, Err(e)) => {
+                warn!(error = %e, "code-graph: SQL open failed; graph tools disabled");
+                let tmp = std::env::temp_dir().join("origin-cg-fallback");
+                let _ = std::fs::create_dir_all(&tmp);
+                let fallback_cas = origin_cas::Store::open(origin_cas::StoreConfig {
+                    root: tmp,
+                    hot_capacity: 8,
+                    warm_pack_target_bytes: 1 << 20,
+                    cold_zstd_level: 1,
+                })
+                .expect("fallback codegraph cas");
+                let fallback_sql = SqlStore::open(&db_path).expect("fallback codegraph sql");
+                Arc::new(tokio::sync::Mutex::new(CodeGraphIndex::new(fallback_cas, fallback_sql)))
+            }
+        }
+    };
+    let mem_router: Arc<dyn origin_codegraph::ask::MemRouter> = Arc::new(NullMemRouter);
+
     let sidecar_provider: Arc<dyn origin_provider::Provider> = Arc::new(
         Anthropic::new(env::var("ANTHROPIC_API_KEY").unwrap_or_default()).with_cas(Arc::clone(&cas)),
     );
@@ -404,6 +458,8 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
             Arc::clone(&proposal_registry),
             plan_bus.clone(),
             Arc::clone(&skill_catalog),
+            Arc::clone(&code_graph),
+            Arc::clone(&mem_router),
         );
     }
 }
@@ -498,6 +554,8 @@ fn spawn_handler_task(
     proposal_registry: Arc<ProposalRegistry>,
     plan_bus: PlanBus,
     skill_catalog: Arc<SkillCatalog>,
+    code_graph: Arc<tokio::sync::Mutex<CodeGraphIndex>>,
+    mem_router: Arc<dyn origin_codegraph::ask::MemRouter>,
 ) {
     spawn_in(TaskClass::Critical, async move {
         // Per-connection skill activation state. Each ActivateSkill mutates
@@ -557,6 +615,8 @@ fn spawn_handler_task(
                         Arc::clone(&proposal_registry),
                         Arc::clone(&skill_catalog),
                         Arc::clone(&active_skills),
+                        Arc::clone(&code_graph),
+                        Arc::clone(&mem_router),
                         req,
                     )
                     .await
@@ -879,6 +939,8 @@ async fn handle_request(
     proposal_registry: Arc<ProposalRegistry>,
     skill_catalog: Arc<SkillCatalog>,
     active_skills: Arc<tokio::sync::Mutex<SkillRegistry>>,
+    code_graph: Arc<tokio::sync::Mutex<CodeGraphIndex>>,
+    mem_router: Arc<dyn origin_codegraph::ask::MemRouter>,
     req: PromptRequest,
 ) -> bool {
     let mut session = Session::new(provider.name(), &req.model);
@@ -926,6 +988,8 @@ async fn handle_request(
         let opts = LoopOptions {
             max_turns: 25,
             cas: Some(cas),
+            code_graph: Some(Arc::clone(&code_graph)),
+            mem_router: Some(Arc::clone(&mem_router)),
             relay_tx: Some(tx_sub.clone()),
             streaming_disabled: false,
             sidecar: None, // sidecar submit fires in handle_request after persist
