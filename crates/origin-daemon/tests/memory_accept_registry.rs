@@ -81,6 +81,8 @@ async fn accept_persists_via_proposal_registry() {
     let opts = LoopOptions {
         max_turns: 5,
         cas: Some(Arc::clone(&cas)),
+        code_graph: None,
+        mem_router: None,
         relay_tx: None,
         streaming_disabled: true,
         proposer: Some(Arc::clone(&proposer)),
