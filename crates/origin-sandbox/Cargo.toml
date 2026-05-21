@@ -30,9 +30,19 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 tracing = { workspace = true }
 
+# The Linux-only optional crates (`landlock`, `seccompiler`, `caps`) FFI into
+# kernel headers that only exist in `libc` when `target_os = "linux"`. Gating
+# them under `[target.'cfg(target_os = "linux")'.dependencies]` lets
+# `--all-features` resolve cleanly on every host: enabling `linux` on Windows
+# is a no-op because Cargo never instantiates the optional deps off-target,
+# and `lib.rs` already cfg-gates `backend_linux` behind the same predicate.
+[target.'cfg(target_os = "linux")'.dependencies]
 landlock = { workspace = true, optional = true }
 seccompiler = { workspace = true, optional = true }
 caps = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
 libc = { version = "0.2", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
