@@ -17,5 +17,6 @@ pub mod session_store;
 pub mod shutdown;
 pub mod stream_relay;
 pub mod tool_use_parser;
+pub mod skill_catalog;
 
 pub use memory_wiring::{MemoryDispatchHandle, MemoryWiring};
