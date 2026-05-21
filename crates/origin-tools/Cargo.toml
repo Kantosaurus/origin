@@ -16,6 +16,7 @@ origin-codegraph = { path = "../origin-codegraph" }
 origin-plan = { path = "../origin-plan" }
 origin-sandbox = { path = "../origin-sandbox" }
 origin-swarm = { path = "../origin-swarm" }
+origin-browser = { path = "../origin-browser" }
 blake3 = "1"
 hex = "0.4"
 regex = "1"
