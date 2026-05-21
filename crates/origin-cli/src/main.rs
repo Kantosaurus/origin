@@ -577,14 +577,19 @@ async fn send_skill_command(path: &str, msg: &ClientMessage) -> Result<String> {
         }
         StreamEvent::SkillError { message } => Err(anyhow::anyhow!("{message}")),
         StreamEvent::AdminOk => Ok("skill deactivated".to_string()),
-        StreamEvent::WorkflowActive { name, steps } => {
-            if steps.is_empty() {
-                Ok(format!("workflow `{name}` activated (no steps resolved)"))
+        StreamEvent::WorkflowActive { name, steps, skipped } => {
+            let main = if steps.is_empty() {
+                format!("workflow `{name}` activated (no steps resolved)")
             } else {
-                Ok(format!(
+                format!(
                     "workflow `{name}` activated; skills: {}",
                     steps.join(" → ")
-                ))
+                )
+            };
+            if skipped.is_empty() {
+                Ok(main)
+            } else {
+                Ok(format!("{main}  (skipped: {})", skipped.join(", ")))
             }
         }
         other => Err(anyhow::anyhow!("unexpected reply: {other:?}")),

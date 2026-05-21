@@ -87,13 +87,15 @@ fn workflow_active_event_round_trips_as_json() {
     let ev = StreamEvent::WorkflowActive {
         name: "frontend-design".into(),
         steps: vec!["frontend-design:frontend-design".into(), "impeccable".into()],
+        skipped: vec!["ghost-skill".into()],
     };
     let body = serde_json::to_vec(&ev).expect("encode");
     let decoded: StreamEvent = serde_json::from_slice(&body).expect("decode");
     match decoded {
-        StreamEvent::WorkflowActive { name, steps } => {
+        StreamEvent::WorkflowActive { name, steps, skipped } => {
             assert_eq!(name, "frontend-design");
             assert_eq!(steps.len(), 2);
+            assert_eq!(skipped, vec!["ghost-skill"]);
         }
         other => panic!("expected WorkflowActive, got {other:?}"),
     }

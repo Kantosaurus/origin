@@ -8,7 +8,7 @@ use anyhow::Result;
 use origin_cas::Store;
 use origin_core::types::Role;
 use origin_daemon::agent::{run_loop, LoopOptions, SessionStoreSummaryDeliverer};
-use origin_skills::{load_skills_dir, SkillRegistry};
+use origin_skills::SkillRegistry;
 use origin_daemon::auth::BearerStore;
 use origin_daemon::config::bearer_ttl_secs;
 use origin_daemon::memory_wiring::MemoryWiring;
@@ -508,25 +508,6 @@ fn spawn_handler_task(
         let active_skills: Arc<tokio::sync::Mutex<SkillRegistry>> =
             Arc::new(tokio::sync::Mutex::new(SkillRegistry::new()));
 
-        // Task-2 scaffold: Task 1's SkillCatalog merge replaces this.
-        // Load on-disk skills once per connection so ActivateSkill can look up
-        // skill frontmatter without referencing the (not-yet-existing)
-        // daemon-wide SkillCatalog from Task 1. Loaded eagerly here (rather
-        // than lazily inside the loop) so it doesn't straddle an await point,
-        // which would require Sync.
-        let skill_load_cache: Vec<origin_skills::Skill> = {
-            let home = std::env::var_os("ORIGIN_HOME")
-                .map(std::path::PathBuf::from)
-                .or_else(dirs::home_dir)
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let skills_path = home.join(".origin").join("skills");
-            if skills_path.exists() {
-                load_skills_dir(&skills_path).unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        };
-
         loop {
             let body = {
                 let mut g = conn.lock().await;
@@ -641,12 +622,11 @@ fn spawn_handler_task(
                     handle_resume_request(&conn, Arc::clone(&session_store), token).await;
                 }
                 ClientMessage::ActivateSkill { name } => {
-                    // Task-2 scaffold: Task 1's SkillCatalog merge replaces this.
-                    // Look up the skill in the per-connection cache loaded at
-                    // connection start; Task 1 will replace this with
-                    // Arc::clone(&skill_catalog).find(&name).
+                    // Look up the skill in the daemon-wide catalog loaded at
+                    // startup. The catalog is the single source of truth shared
+                    // with the system-prompt injection (see agent.rs::run_loop).
                     let conn_clone = Arc::clone(&conn);
-                    if let Some(skill) = skill_load_cache.iter().find(|s| s.front.name == name) {
+                    if let Some(skill) = skill_catalog.find(&name) {
                         let front = skill.front.clone();
                         let allowed_tools: Vec<String> = {
                             let mut guard = active_skills.lock().await;
@@ -719,30 +699,22 @@ fn spawn_handler_task(
                         continue;
                     };
                     let mut activated: Vec<String> = Vec::new();
+                    let mut skipped: Vec<String> = Vec::new();
                     for step in &wf.steps {
-                        if let Some(skill) = skill_load_cache.iter().find(|s| s.front.name == step.skill) {
+                        if let Some(skill) = skill_catalog.find(&step.skill) {
                             active_skills.lock().await.activate(skill.front.clone());
                             activated.push(step.skill.clone());
                         } else {
-                            // Surface the missing skill but keep going — a partial chain is still useful.
-                            let ev = StreamEvent::SkillError {
-                                message: format!(
-                                    "workflow {name} step {} missing from catalog: {}",
-                                    activated.len() + 1,
-                                    step.skill
-                                ),
-                            };
-                            let body = serde_json::to_vec(&ev).unwrap_or_default();
-                            let _ = conn_clone
-                                .lock()
-                                .await
-                                .write_frame(FrameKind::Event, &body)
-                                .await;
+                            // Partial chain still useful — collect the misses
+                            // and surface them in the single ack frame so the
+                            // CLI doesn't need a multi-frame read loop.
+                            skipped.push(step.skill.clone());
                         }
                     }
                     let ev = StreamEvent::WorkflowActive {
                         name: name.clone(),
                         steps: activated,
+                        skipped,
                     };
                     let body = serde_json::to_vec(&ev).unwrap_or_default();
                     let _ = conn_clone.lock().await.write_frame(FrameKind::Event, &body).await;
