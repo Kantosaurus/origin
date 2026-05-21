@@ -20,6 +20,7 @@ use origin_daemon::runtime_launch::{self, ShutdownSignal};
 use origin_daemon::session::Session;
 use origin_daemon::session_store::SessionStore;
 use origin_daemon::shutdown::{CooperativeShutdown, ShutdownPhase};
+use origin_daemon::skill_catalog::SkillCatalog;
 use origin_daemon::stream_relay::relay_to_connection;
 use origin_ipc::frame::FrameKind;
 use origin_ipc::transport::{Listener, SharedConnection};
@@ -336,6 +337,19 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
         warn!("memory subsystem disabled (store init failed)");
     }
 
+    let skill_catalog: Arc<SkillCatalog> = {
+        let home = std::env::var_os("ORIGIN_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let path = home.join(".origin").join("skills");
+        SkillCatalog::load_or_empty(&path)
+    };
+    info!(
+        skill_count = skill_catalog.len(),
+        "skill catalog loaded at startup"
+    );
+
     spawn_idle_consolidator(memory.as_ref());
 
     // P11.12: optional bounded-cardinality Prometheus `/metrics` endpoint.
@@ -388,6 +402,7 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
             Arc::clone(&metrics),
             Arc::clone(&proposal_registry),
             plan_bus.clone(),
+            Arc::clone(&skill_catalog),
         );
     }
 }
@@ -481,6 +496,7 @@ fn spawn_handler_task(
     metrics: Arc<Metrics>,
     proposal_registry: Arc<ProposalRegistry>,
     plan_bus: PlanBus,
+    skill_catalog: Arc<SkillCatalog>,
 ) {
     spawn_in(TaskClass::Critical, async move {
         loop {
@@ -530,6 +546,7 @@ fn spawn_handler_task(
                         Arc::clone(&sidecar),
                         memory.as_ref(),
                         Arc::clone(&proposal_registry),
+                        Arc::clone(&skill_catalog),
                         req,
                     )
                     .await
@@ -752,6 +769,8 @@ async fn handle_request(
     sidecar: Arc<Sidecar>,
     memory: Option<&MemoryWiring>,
     proposal_registry: Arc<ProposalRegistry>,
+    // Task 4 wires this into the per-request skill stack (system-prompt injection).
+    #[allow(unused_variables)] skill_catalog: Arc<SkillCatalog>,
     req: PromptRequest,
 ) -> bool {
     let mut session = Session::new(provider.name(), &req.model);
