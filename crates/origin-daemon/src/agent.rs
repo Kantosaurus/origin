@@ -295,6 +295,11 @@ pub async fn run_loop(
     prompter: &dyn Prompter,
     opts: &LoopOptions,
 ) -> Result<LoopSummary, LoopError> {
+    // Falls back to an empty static `SkillRegistry` when none is wired,
+    // so the call path is identical; an empty stack's mask is `None`,
+    // which makes `check_with_skills` short-circuit to plain `check`.
+    static EMPTY_SKILLS: SkillRegistry = SkillRegistry::new();
+
     session.push(Message::new(Role::User).with_block(Block::text(user_text)));
 
     let tools_schema = registry_iter()
@@ -333,6 +338,7 @@ pub async fn run_loop(
         .skill_catalog
         .as_ref()
         .map(|cat| {
+            use std::fmt::Write as _;
             if cat.is_empty() {
                 String::new()
             } else {
@@ -350,7 +356,6 @@ pub async fn run_loop(
                     } else {
                         "-"
                     };
-                    use std::fmt::Write as _;
                     let _ = writeln!(out, "  {marker} {}: {}", s.front.name, s.front.description);
                 }
                 out
@@ -471,10 +476,6 @@ pub async fn run_loop(
             };
 
             // Permission check fires first — denied tools never use cached results.
-            // Falls back to an empty static `SkillRegistry` when none is wired,
-            // so the call path is identical; an empty stack's mask is `None`,
-            // which makes `check_with_skills` short-circuit to plain `check`.
-            static EMPTY_SKILLS: SkillRegistry = SkillRegistry::new();
             let skills: &SkillRegistry = opts.skills.as_deref().unwrap_or(&EMPTY_SKILLS);
             let decision = check_with_skills(meta, &preview, prompter, skills).await;
             if decision.outcome == Outcome::Deny {
@@ -601,6 +602,8 @@ pub fn rebuild_codegraph(
     skip(args, cas, code_graph, mem_router, memory, coordinator),
     fields(kind = "tool", tool = meta.name)
 )]
+// dispatch arm-per-tool registry; splitting would obscure tool->arm mapping.
+#[allow(clippy::too_many_lines)]
 async fn dispatch_tool(
     meta: &ToolMeta,
     args: &Value,
@@ -738,9 +741,11 @@ async fn dispatch_tool(
                     )))
                 }
             };
-            let idx = idx_arc.lock().await;
-            let result = origin_tools::builtins::graph_query::graph_query_tool(&idx, q)
-                .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
+            let result = {
+                let idx = idx_arc.lock().await;
+                origin_tools::builtins::graph_query::graph_query_tool(&idx, q)
+                    .map_err(|e| LoopError::ToolFailure(e.to_string()))?
+            };
             Ok(serialize_query_result(&result))
         }
         "graph_path" => {
@@ -767,10 +772,11 @@ async fn dispatch_tool(
                 args.get("max_hops").and_then(Value::as_u64).unwrap_or(8),
             )
             .unwrap_or(usize::MAX);
-            let idx = idx_arc.lock().await;
-            let result =
+            let result = {
+                let idx = idx_arc.lock().await;
                 origin_tools::builtins::graph_path::graph_path_tool(&idx, from, to, max_hops)
-                    .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
+                    .map_err(|e| LoopError::ToolFailure(e.to_string()))?
+            };
             Ok(serialize_query_result(&result))
         }
         "graph_summarize" => {
@@ -781,16 +787,21 @@ async fn dispatch_tool(
                 )
             })?;
             // `community_id` (int) or `node` (hex) is the target string.
-            let target = if let Some(cid) = args.get("community_id").and_then(Value::as_i64) {
-                cid.to_string()
-            } else if let Some(node) = args.get("node").and_then(Value::as_str) {
-                node.to_string()
-            } else {
-                String::new()
-            };
-            let idx = idx_arc.lock().await;
+            let target = args
+                .get("community_id")
+                .and_then(Value::as_i64)
+                .map(|cid| cid.to_string())
+                .or_else(|| {
+                    args.get("node")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                })
+                .unwrap_or_default();
             // graph_summarize_tool always returns QueryResult::Empty at P7.8.
-            let _result = origin_tools::builtins::graph_summarize::graph_summarize_tool(&idx, target);
+            {
+                let idx = idx_arc.lock().await;
+                let _result = origin_tools::builtins::graph_summarize::graph_summarize_tool(&idx, target);
+            }
             Ok("{}".to_string())
         }
         "graph_rebuild" => {
@@ -935,8 +946,10 @@ async fn dispatch_tool(
             let null_router = origin_codegraph::ask::NullMemRouter;
             let router: &dyn origin_codegraph::ask::MemRouter =
                 mem_router.unwrap_or(&null_router);
-            let idx = idx_arc.lock().await;
-            let result = origin_tools::builtins::ask::ask_tool(&idx, router, query);
+            let result = {
+                let idx = idx_arc.lock().await;
+                origin_tools::builtins::ask::ask_tool(&idx, router, query)
+            };
             let route_str = match result.route {
                 origin_codegraph::ask::Route::Code => "code",
                 origin_codegraph::ask::Route::Mem => "mem",
@@ -1327,6 +1340,7 @@ mod dispatch_table_tests {
     /// The stub arms return `ToolFailure` with messages naming the missing
     /// subsystem — never `UnknownTool`. Regression guard for accidental
     /// reversion to the silent-fall-through.
+    #[allow(clippy::panic)]
     #[tokio::test]
     async fn stub_arms_return_toolfailure_not_unknowntool() {
         // After Subsystems A (graph_* + ask), B (mem_*) merged, only `Task`
@@ -1431,7 +1445,7 @@ mod dispatch_table_tests {
     }
 
     impl StubMemoryHandle {
-        fn new() -> Self {
+        const fn new() -> Self {
             Self {
                 entries: Mutex::new(Vec::new()),
             }
@@ -1440,20 +1454,22 @@ mod dispatch_table_tests {
 
     impl MemoryHandle for StubMemoryHandle {
         fn search(&self, query: &str, k: usize, _fresh: bool) -> Result<Vec<SearchHit>, MemoryToolError> {
-            let entries = self.entries.lock().expect("lock");
             let q_lower = query.to_lowercase();
-            let hits: Vec<SearchHit> = entries
-                .iter()
-                .filter(|(_, body, _)| body.to_lowercase().contains(&q_lower))
-                .take(k)
-                .map(|(id, body, tags)| SearchHit {
-                    id: id.clone(),
-                    preview: body.chars().take(128).collect(),
-                    score: 1.0,
-                    age_days: 0.0,
-                    tags: tags.clone(),
-                })
-                .collect();
+            let hits: Vec<SearchHit> = {
+                let entries = self.entries.lock().expect("lock");
+                entries
+                    .iter()
+                    .filter(|(_, body, _)| body.to_lowercase().contains(&q_lower))
+                    .take(k)
+                    .map(|(id, body, tags)| SearchHit {
+                        id: id.clone(),
+                        preview: body.chars().take(128).collect(),
+                        score: 1.0,
+                        age_days: 0.0,
+                        tags: tags.clone(),
+                    })
+                    .collect()
+            };
             Ok(hits)
         }
 
@@ -1480,6 +1496,7 @@ mod dispatch_table_tests {
 
     /// `mem_search` with `memory_handle = None` must return `ToolFailure` containing
     /// "subsystem" — preserving the no-handle behavior.
+    #[allow(clippy::panic)]
     #[tokio::test]
     async fn mem_search_without_handle_returns_toolfailure() {
         let meta = registry_iter()
@@ -1550,6 +1567,7 @@ mod dispatch_table_tests {
 
     /// When `coordinator` is `None`, `Task` must return `ToolFailure` (not
     /// `UnknownTool`). Regression guard for the subsystem-not-configured path.
+    #[allow(clippy::panic)]
     #[tokio::test]
     async fn task_without_coordinator_returns_toolfailure() {
         let meta = registry_iter()
