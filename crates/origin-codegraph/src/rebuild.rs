@@ -85,19 +85,24 @@ fn rebuild_one(
     let mut added = 0;
     let updated = 0; // see module docs — opaque to caller in P7.8.
     for n in nodes {
-        let sig = format!("{:?} {} @{}-{}", n.kind, n.name, n.range.start, n.range.end);
         // tree-sitter byte offsets are bounded by `bytes.len()`; clamp
         // defensively so a future grammar change can't panic the slice.
-        let end = n.range.end.min(bytes.len());
-        let start = n.range.start.min(end);
+        let sig_end = n.signature_range.end.min(bytes.len());
+        let sig_start = n.signature_range.start.min(sig_end);
+        let signature = bytes[sig_start..sig_end].to_vec();
+        let body = n.body_range.map_or_else(Vec::new, |b| {
+            let end = b.end.min(bytes.len());
+            let start = b.start.min(end);
+            bytes[start..end].to_vec()
+        });
         let rec = CodeNodeRecord {
             kind: n.kind,
             name: n.name,
             language: lang,
             file_path: path.display().to_string(),
             range: n.range,
-            signature: sig.into_bytes(),
-            body: bytes[start..end].to_vec(),
+            signature,
+            body,
         };
         idx.insert_node(&rec)?;
         added += 1;
