@@ -3,6 +3,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 use crate::{Band, PrefixLedger, SectionId};
+use std::collections::HashMap;
 use std::ops::Range;
 
 /// One contiguous portion of the outgoing request. The planner sorts these
@@ -28,10 +29,19 @@ impl Section {
 
 /// Output of `CachePlanner::plan`. `marker_indices()[i]` means "emit a cache
 /// marker after `ordered_sections()[i]`".
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Plan {
     ordered: Vec<Section>,
     markers: Vec<usize>,
+    /// N4.3 handle→band index. Populated by `register_handle` after the
+    /// planner emits the section order; consulted by the message-to-wire
+    /// encoder in `O(1)` per CAS handle to decide `Inline` vs `Reference`.
+    ///
+    /// Competitor stacks (openclaude/jcode/opencode) re-serialize full
+    /// tool-result bytes every turn unconditionally — they have no
+    /// per-handle band assignment, so they cannot demote long-lived
+    /// handles to reference form. This map is the novel mechanism.
+    handle_bands: HashMap<[u8; 32], Band>,
 }
 
 impl Plan {
@@ -46,6 +56,37 @@ impl Plan {
     #[must_use]
     pub fn marker_indices(&self) -> &[usize] {
         &self.markers
+    }
+
+    /// Register a CAS handle with the band it lives in for this turn.
+    ///
+    /// Subsequent serialization passes (e.g. the Anthropic provider's
+    /// `expand_messages_for_wire`) consult `band_for_handle` to skip
+    /// inlining for handles parked in a non-Volatile band whose body
+    /// exceeds `INLINE_BYTE_BUDGET`.
+    ///
+    /// Idempotent: re-registering the same handle overwrites its band.
+    pub fn register_handle(&mut self, handle: [u8; 32], band: Band) {
+        self.handle_bands.insert(handle, band);
+    }
+
+    /// `O(1)` lookup of the band a CAS handle has been parked in.
+    ///
+    /// Returns `None` when the handle has not been registered. Callers
+    /// must treat `None` as "no information" and fall back to the safe
+    /// floor (`Band::Volatile`) — never assume a missing entry means
+    /// the handle is stable.
+    #[must_use]
+    pub fn band_for_handle(&self, handle: &[u8; 32]) -> Option<Band> {
+        self.handle_bands.get(handle).copied()
+    }
+
+    /// Number of registered CAS handles. Exposed for test assertions and
+    /// telemetry — callers should not rely on a particular value at any
+    /// specific point in the request lifecycle.
+    #[must_use]
+    pub fn handle_count(&self) -> usize {
+        self.handle_bands.len()
     }
 }
 
@@ -84,6 +125,10 @@ impl<'a> CachePlanner<'a> {
                 markers.push(i);
             }
         }
-        Plan { ordered, markers }
+        Plan {
+            ordered,
+            markers,
+            handle_bands: HashMap::new(),
+        }
     }
 }

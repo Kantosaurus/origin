@@ -20,6 +20,28 @@ fn plan_emits_four_bands_in_canonical_order() {
 }
 
 #[test]
+fn band_for_handle_returns_registered_band() {
+    let ledger = PrefixLedger::new();
+    let planner = CachePlanner::new(&ledger);
+    let mut plan = planner.plan(&[Section::new(SectionId::new("turn-1"), Band::Volatile, 0..32)]);
+
+    let h_sticky = [0xAA; 32];
+    let h_frozen = [0xBB; 32];
+    plan.register_handle(h_sticky, Band::Sticky);
+    plan.register_handle(h_frozen, Band::Frozen);
+
+    assert_eq!(plan.band_for_handle(&h_sticky), Some(Band::Sticky));
+    assert_eq!(plan.band_for_handle(&h_frozen), Some(Band::Frozen));
+    assert_eq!(plan.band_for_handle(&[0xCC; 32]), None);
+    assert_eq!(plan.handle_count(), 2);
+
+    // Re-registering overwrites.
+    plan.register_handle(h_sticky, Band::Sliding);
+    assert_eq!(plan.band_for_handle(&h_sticky), Some(Band::Sliding));
+    assert_eq!(plan.handle_count(), 2);
+}
+
+#[test]
 fn markers_are_emitted_at_band_boundaries_only() {
     let ledger = PrefixLedger::new();
     let planner = CachePlanner::new(&ledger);
