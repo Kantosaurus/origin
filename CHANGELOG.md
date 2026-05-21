@@ -4,6 +4,14 @@ All notable changes to `origin` will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely;
 versions correspond to phase milestones from the implementation plan.
 
+## Unreleased
+
+### Added
+- **Superpowers skills bundled** (`origin-skills`): 14 official superpowers skills (brainstorming, TDD, debugging, plans, code review, worktrees, etc.) embedded in the binary via `include_dir!`. Override per skill at `~/.origin/skills/<name>/SKILL.md`. New `load_all(user_root)` merger lets user copies replace embedded ones by name.
+- **`origin-browser` crate (new)**: dual-backend browser tool. `BrowserRouter` runs `agent-browser` as primary; on bot-detection (Cloudflare, reCAPTCHA, hCaptcha, PerimeterX, DataDome, Incapsula, Kasada, 4xx) transparently replays the verb against the vendored `CloakBrowser` sidecar and sticks to Cloak after two consecutive successes per session. Includes pure-Rust `WebFetch` (reqwest + readability + html2md) and `WebSearch` via Tavily (`TAVILY_API_KEY`).
+- **Vendored CloakBrowser sidecar** (`vendor/cloak-browser/`): Node ≥18 stdio-JSON CLI (`cloak-cli.mjs`) wire-compatible with `agent-browser`'s snapshot/ref protocol so the router can swap backends mid-session.
+- **`origin-tools` builtins**: `WebFetch`, `WebSearch`, `Browser` (all `Tier::RequiresPermission`).
+
 ## 1.0.0 — 2026-06-17
 
 ### Added
