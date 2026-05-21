@@ -1,4 +1,4 @@
-//! WebSearch via Tavily.
+//! `WebSearch` via Tavily.
 //!
 //! Tavily was chosen over Brave/SerpAPI for LLM-friendly snippets and a
 //! single-endpoint API. The function takes the endpoint as a parameter in

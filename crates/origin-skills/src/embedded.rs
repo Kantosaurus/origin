@@ -10,8 +10,18 @@ static EMBEDDED: include_dir::Dir<'_> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/embedded/superpowers");
 
 /// Walk the embedded `superpowers/` tree and return every `SKILL.md` parsed
-/// into a [`Skill`]. Malformed frontmatter is treated as a build-time bug —
-/// we panic in that case because the skills are vendored, not user input.
+/// into a [`Skill`].
+///
+/// Malformed frontmatter is treated as a build-time bug — we panic in that
+/// case because the skills are vendored, not user input.
+///
+/// # Panics
+///
+/// Panics if any vendored `SKILL.md` is not valid UTF-8 or fails frontmatter
+/// parsing. Both conditions are caught at build time by the embed step in
+/// CI; reaching them at runtime means the binary was assembled incorrectly.
+// name disambiguates from `load_all` and `load_skills_dir` at call sites.
+#[allow(clippy::module_name_repetitions)]
 #[must_use]
 pub fn load_embedded() -> Vec<Skill> {
     let mut out = Vec::new();

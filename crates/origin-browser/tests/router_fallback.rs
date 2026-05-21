@@ -1,4 +1,6 @@
-use origin_browser::router::{BrowserRouter, RouterError};
+#![allow(clippy::unwrap_used)]
+
+use origin_browser::router::BrowserRouter;
 use origin_browser::protocol::Verb;
 
 fn fake(name: &str) -> String {

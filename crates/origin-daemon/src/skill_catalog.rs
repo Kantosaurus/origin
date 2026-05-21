@@ -13,9 +13,10 @@ use origin_skills::{load_all, LoaderError, Skill};
 use std::path::Path;
 use std::sync::Arc;
 
-/// Read-only catalog of every `SKILL.md` available to the daemon. Always
-/// includes the 14 embedded superpowers skills; entries under `root` (defaults
-/// to `~/.origin/skills/`) override embedded ones with the same name.
+/// Read-only catalog of every `SKILL.md` available to the daemon.
+///
+/// Always includes the 14 embedded superpowers skills; entries under `root`
+/// (defaults to `~/.origin/skills/`) override embedded ones with the same name.
 #[derive(Debug, Default)]
 pub struct SkillCatalog {
     skills: Vec<Skill>,

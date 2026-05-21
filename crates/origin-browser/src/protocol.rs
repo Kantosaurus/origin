@@ -1,4 +1,4 @@
-//! Stdio-JSON verb protocol shared by agent-browser and CloakBrowser backends.
+//! Stdio-JSON verb protocol shared by `agent-browser` and `CloakBrowser` backends.
 //!
 //! Wire format: one JSON object per line in each direction.
 //! Both subprocess clients speak this; the router never sees raw bytes.

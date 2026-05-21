@@ -12,6 +12,9 @@ use crate::protocol::{SnapshotResp, Verb};
 use std::collections::HashMap;
 use thiserror::Error;
 
+// public error type for this module; the `Router` prefix is the documented
+// API surface and surfaces in user-facing log lines.
+#[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Error)]
 pub enum RouterError {
     #[error("primary: {0}")]
@@ -26,6 +29,9 @@ struct SessionState {
     sticky: bool,
 }
 
+// public router type; `Browser` prefix is the documented API surface and
+// pairs with `BrowserClient`s the consumer constructs above.
+#[allow(clippy::module_name_repetitions)]
 pub struct BrowserRouter {
     primary: AgentBrowserClient,
     cloak: CloakClient,

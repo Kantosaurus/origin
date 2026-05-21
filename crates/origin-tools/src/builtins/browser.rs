@@ -3,9 +3,11 @@
 use crate::{SideEffects, Tier, Urgency};
 use origin_browser::{BrowserRouter, Verb, SnapshotResp};
 
-/// Run a single verb against the router. Caller holds the router across
-/// turns; this function is intentionally not lifetimed to the registry
-/// (Origin's coordinator owns a `BrowserRouter` and dispatches into this).
+/// Run a single verb against the router.
+///
+/// Caller holds the router across turns; this function is intentionally not
+/// lifetimed to the registry (Origin's coordinator owns a `BrowserRouter`
+/// and dispatches into this).
 ///
 /// # Errors
 /// `String` describing primary/fallback failure.
