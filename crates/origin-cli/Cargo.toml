@@ -41,9 +41,13 @@ url = "2"
 thiserror = "1"
 origin-provider = { path = "../origin-provider" }
 origin-keyvault = { path = "../origin-keyvault" }
+origin-skills   = { path = "../origin-skills" }
+origin-tools    = { path = "../origin-tools" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rand = "0.8"
 urlencoding = "2"
+toml = "0.8"
+async-trait = "0.1"
 
 [dev-dependencies]
 criterion = "0.5"

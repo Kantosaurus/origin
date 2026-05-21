@@ -90,6 +90,9 @@ async fn main() -> Result<()> {
                 }
             };
         }
+        Some(Cmd::Init) => {
+            return origin_cli::init::run().await;
+        }
         Some(Cmd::Import(a)) => {
             let r = origin_cli::import::run_import(&a).map_err(anyhow::Error::from)?;
             if a.json {
@@ -111,8 +114,26 @@ async fn main() -> Result<()> {
         None => {}
     }
 
+    // First-run onboarding: if ~/.origin/config.toml does not exist, run the
+    // interactive init flow before entering the TUI's raw-mode alt screen.
+    // The flow only runs when no subcommand was given (the `None` branch
+    // above), so explicit subcommands stay non-interactive. Setting
+    // `ORIGIN_SKIP_INIT=1` bypasses for CI / scripted environments.
+    if !origin_cli::config::exists() && env::var_os("ORIGIN_SKIP_INIT").is_none() {
+        origin_cli::init::run().await?;
+    }
+
+    // Resolve TUI defaults from the saved config (falling back to env vars
+    // and finally to hard-coded "anthropic" / "claude-opus-4-7" so callers
+    // who declined / skipped onboarding still get a working session).
+    let (default_provider, default_model) = origin_cli::config::load()
+        .ok()
+        .flatten()
+        .map(|c| (c.primary.provider, c.primary.model))
+        .unwrap_or_else(|| ("anthropic".to_string(), "claude-opus-4-7".to_string()));
+
     let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
-    let model = env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".into());
+    let model = env::var("ORIGIN_MODEL").unwrap_or(default_model);
 
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen)?;
@@ -128,7 +149,12 @@ async fn main() -> Result<()> {
         cols: main_cols,
         rows: main_rows,
     })));
-    let app: SharedApp = Arc::new(Mutex::new(App::new("anthropic", model.clone())));
+    // `App::new` requires a `&'static str` for the provider label that the
+    // status bar renders. Leaking the onboarded provider string is bounded
+    // to a single allocation per process invocation, so it's the simplest
+    // path to satisfying the lifetime without touching the wider App API.
+    let provider_static: &'static str = Box::leak(default_provider.into_boxed_str());
+    let app: SharedApp = Arc::new(Mutex::new(App::new(provider_static, model.clone())));
     app.lock().add_line(
         "",
         "Connected; type a prompt and press Enter. Ctrl-C / Esc to quit.",
