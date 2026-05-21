@@ -9,6 +9,7 @@ pub mod headless;
 pub mod import;
 pub mod init;
 pub mod init_probe;
+pub mod first_run_prompt;
 pub mod input;
 pub mod keyring_login;
 pub mod plan_panel_wiring;
