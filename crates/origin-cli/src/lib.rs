@@ -3,6 +3,7 @@
 
 pub mod admin;
 pub mod admin_url;
+pub mod autocomplete;
 pub mod cli_def;
 pub mod config;
 pub mod headless;
