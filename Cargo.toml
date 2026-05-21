@@ -59,6 +59,10 @@ globset      = "0.4"
 walkdir      = "2"
 rusqlite     = { version = "0.32", default-features = false, features = ["bundled"] }
 clap_mangen  = "0.2"
+# P15 — embedded skills + browser/web tools
+include_dir  = "0.7"
+readability  = "0.3"
+html2md      = "0.2"
 
 # Limit debuginfo to keep PDB under the Windows 4 GB limit (LNK1318).
 # The origin-cli binary links the daemon, every provider, and every tool —
