@@ -9,25 +9,23 @@
 //! catalog + a `tracing::warn!`, so a corrupt or absent skills dir doesn't
 //! deny service. Re-loading at runtime is a P-future polish item.
 
-use origin_skills::{load_skills_dir, LoaderError, Skill};
+use origin_skills::{load_all, LoaderError, Skill};
 use std::path::Path;
 use std::sync::Arc;
 
-/// Read-only catalog of every `SKILL.md` under `root` at the time of
-/// construction. Lookup is by skill name (the `name:` frontmatter field).
+/// Read-only catalog of every `SKILL.md` available to the daemon. Always
+/// includes the 14 embedded superpowers skills; entries under `root` (defaults
+/// to `~/.origin/skills/`) override embedded ones with the same name.
 #[derive(Debug, Default)]
 pub struct SkillCatalog {
     skills: Vec<Skill>,
 }
 
 impl SkillCatalog {
-    /// Load every skill under `root`. Returns an empty catalog if `root`
-    /// does not exist; surfaces I/O or frontmatter errors via `Err`.
+    /// Load embedded skills plus any user overrides under `root`. The 14
+    /// superpowers skills are always present even if `root` does not exist.
     pub fn load_from(root: &Path) -> Result<Self, LoaderError> {
-        if !root.exists() {
-            return Ok(Self::default());
-        }
-        let skills = load_skills_dir(root)?;
+        let skills = load_all(root)?;
         Ok(Self { skills })
     }
 
@@ -83,22 +81,26 @@ mod tests {
     }
 
     #[test]
-    fn load_empty_when_missing() {
+    fn load_includes_embedded_when_user_dir_missing() {
+        // load_all always returns the 14 embedded superpowers skills, even if
+        // the user override dir does not exist.
         let dir = tempfile::tempdir().expect("tempdir");
         let cat = SkillCatalog::load_from(&dir.path().join("nope")).expect("ok");
-        assert!(cat.is_empty());
+        assert!(cat.find("brainstorming").is_some(), "embedded skills must appear");
+        assert!(cat.len() >= 14, "expected >=14 embedded skills, got {}", cat.len());
     }
 
     #[test]
-    fn load_two_skills() {
+    fn user_skills_merge_with_embedded() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_skill(dir.path(), "foo", &["Read"]);
         write_skill(dir.path(), "bar", &["Glob", "Grep"]);
         let cat = SkillCatalog::load_from(dir.path()).expect("ok");
-        assert_eq!(cat.len(), 2);
         assert!(cat.find("foo").is_some());
         assert!(cat.find("bar").is_some());
+        assert!(cat.find("brainstorming").is_some(), "embedded skill still present");
         assert!(cat.find("missing").is_none());
+        assert!(cat.len() >= 16, "expected >=16 (14 embedded + 2 user), got {}", cat.len());
     }
 
     #[test]

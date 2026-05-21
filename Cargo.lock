@@ -3950,6 +3950,7 @@ dependencies = [
  "hyper 1.9.0",
  "hyper-util",
  "origin-alloc",
+ "origin-browser",
  "origin-cas",
  "origin-codegraph",
  "origin-core",

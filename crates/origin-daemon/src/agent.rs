@@ -959,6 +959,59 @@ async fn dispatch_tool(
             })
             .to_string())
         }
+        // ── Web tools (stateless) ──
+        "WebFetch" => {
+            let url = args
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| LoopError::BadArgs("WebFetch: missing `url`".into()))?;
+            origin_tools::builtins::web_fetch::web_fetch(url)
+                .await
+                .map_err(LoopError::ToolFailure)
+        }
+        "WebSearch" => {
+            let query = args
+                .get("query")
+                .and_then(Value::as_str)
+                .ok_or_else(|| LoopError::BadArgs("WebSearch: missing `query`".into()))?;
+            let count = usize::try_from(args.get("count").and_then(Value::as_u64).unwrap_or(10))
+                .unwrap_or(10);
+            let hits = origin_tools::builtins::web_search::web_search(query, count)
+                .await
+                .map_err(LoopError::ToolFailure)?;
+            serde_json::to_string(&hits)
+                .map_err(|e| LoopError::ToolFailure(format!("WebSearch: json: {e}")))
+        }
+        // ── Browser (stateful; lazy process-global router) ──
+        //
+        // The router owns two long-lived Node child processes (agent-browser
+        // primary, CloakBrowser fallback). Spawning them is expensive, so we
+        // initialize the router once per process via `OnceCell`. Concurrent
+        // browser calls serialize on the Mutex — fine because the agent loop
+        // is sequential within a turn, and sessions are disambiguated by the
+        // `session` field in each verb.
+        "Browser" => {
+            use tokio::sync::{Mutex, OnceCell};
+            static ROUTER: OnceCell<Mutex<origin_browser::BrowserRouter>> = OnceCell::const_new();
+            let router_mu = ROUTER
+                .get_or_try_init(|| async {
+                    origin_browser::BrowserRouter::new()
+                        .await
+                        .map(Mutex::new)
+                        .map_err(|e| LoopError::ToolFailure(format!("Browser router init: {e}")))
+                })
+                .await?;
+            let verb: origin_browser::Verb = serde_json::from_value(args.clone())
+                .map_err(|e| LoopError::BadArgs(format!("Browser: {e}")))?;
+            let resp = {
+                let mut r = router_mu.lock().await;
+                r.run(&verb)
+                    .await
+                    .map_err(|e| LoopError::ToolFailure(format!("Browser: {e}")))?
+            };
+            serde_json::to_string(&resp)
+                .map_err(|e| LoopError::ToolFailure(format!("Browser: json: {e}")))
+        }
         // ── Task ──
         // Requires an `origin_swarm::Coordinator` threaded through `LoopOptions`.
         "Task" => {
