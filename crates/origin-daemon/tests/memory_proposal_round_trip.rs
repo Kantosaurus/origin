@@ -104,6 +104,7 @@ async fn memory_proposed_round_trip_via_stub_provider() {
             proposal_registry: None,
             skills: None,
             skill_catalog: None,
+            memory_handle: None,
         };
         let summary = run_loop(&mut session, &prompt.user_text, &provider, &AlwaysAllow, &opts)
             .await

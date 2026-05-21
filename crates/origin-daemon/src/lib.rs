@@ -5,6 +5,7 @@ pub mod agent;
 pub mod auth;
 pub mod compactor;
 pub mod config;
+pub mod daemon_memory_handle;
 pub mod memory_wiring;
 pub mod pairing;
 pub mod plan_bus;

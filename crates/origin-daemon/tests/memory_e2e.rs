@@ -101,6 +101,7 @@ async fn memory_e2e_proposer_to_store_via_wiremock() {
         proposal_registry: None,
         skills: None,
         skill_catalog: None,
+        memory_handle: None,
     };
     let _summary = run_loop(
         &mut session,
