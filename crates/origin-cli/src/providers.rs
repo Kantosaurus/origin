@@ -7,9 +7,17 @@ use origin_provider::catalog::{AuthScheme, Catalog};
 ///
 /// Custom-providers IO and parse errors are surfaced on stderr but do not
 /// abort the listing — the builtin catalog is always shown.
+///
+/// The home directory is normally resolved via [`dirs::home_dir`]; the
+/// `ORIGIN_HOME` env var overrides it so integration tests can point the
+/// merge at a scratch directory without racing `HOME` / `USERPROFILE` across
+/// threads.
 fn merged_catalog() -> Catalog {
     let mut cat = Catalog::builtin();
-    if let Some(home) = dirs::home_dir() {
+    let home = std::env::var_os("ORIGIN_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir);
+    if let Some(home) = home {
         let path = home.join(".origin").join("providers.toml");
         match origin_provider::custom::load(&path) {
             Ok(custom) => {
