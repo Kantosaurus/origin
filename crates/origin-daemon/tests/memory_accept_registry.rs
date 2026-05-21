@@ -91,6 +91,7 @@ async fn accept_persists_via_proposal_registry() {
         proposal_registry: Some(Arc::clone(&registry)),
         skills: None,
         skill_catalog: None,
+        memory_handle: None,
     };
     let _summary = run_loop(
         &mut session,
