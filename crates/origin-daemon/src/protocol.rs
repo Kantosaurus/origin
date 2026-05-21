@@ -108,6 +108,17 @@ pub enum ClientMessage {
     /// `TaskClass::Critical`. The full hydrate-from-CAS wiring is a P14
     /// polish item; P12 ships the wire shape + an immediate ack handler.
     ResumeRequest { token: ResumeToken },
+    /// Push `name` onto this connection's active skill stack. The daemon
+    /// looks up the skill in its `SkillCatalog`; on success it replies with
+    /// [`StreamEvent::SkillActive`] carrying the skill's `allowed-tools`
+    /// (so the CLI can render the narrowing it just applied). On failure
+    /// (skill not in catalog) it replies with [`StreamEvent::SkillError`].
+    ActivateSkill { name: String },
+    /// Pop the named skill off this connection's active stack (the
+    /// rightmost match if the same skill was activated multiple times).
+    /// Always replies with [`StreamEvent::AdminOk`] — deactivating an
+    /// inactive skill is not an error.
+    DeactivateSkill { name: String },
     /// Subscribe this connection to the daemon-wide plan-op broadcast.
     /// Every subsequent [`OpEnvelope`] published to the bus is forwarded as
     /// a [`StreamEvent::PlanOp`] event frame. The subscription terminates
@@ -225,6 +236,17 @@ pub enum StreamEvent {
         restored_to_turn: u32,
         had_resume_token: bool,
     },
+    /// Positive ack for a successful [`ClientMessage::ActivateSkill`].
+    /// `allowed_tools` is the intersection mask currently in effect after
+    /// pushing this skill — the CLI displays it so users can see what
+    /// they've just narrowed access to.
+    SkillActive {
+        name: String,
+        allowed_tools: Vec<String>,
+    },
+    /// Negative ack for [`ClientMessage::ActivateSkill`] — typically the
+    /// requested skill is not in the daemon's catalog.
+    SkillError { message: String },
     /// P13.4.2: negative acknowledgement carrying a human-readable error
     /// message. Used as the failure side of the admin mutation handlers.
     AdminError {
