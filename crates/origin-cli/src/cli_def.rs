@@ -66,6 +66,10 @@ pub enum Cmd {
         #[command(subcommand)]
         sub: ProvidersSub,
     },
+    /// Interactive first-time setup. Picks primary / backup / subagent
+    /// providers and models, captures credentials, and writes
+    /// `~/.origin/config.toml`. Re-running overwrites the existing config.
+    Init,
 }
 
 #[derive(Subcommand)]

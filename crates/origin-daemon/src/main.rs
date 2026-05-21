@@ -807,6 +807,7 @@ async fn handle_request(
             event_tx: Some(event_tx.clone()),
             injector: memory.and_then(|m| m.injector.clone()),
             proposal_registry: Some(Arc::clone(&proposal_registry)),
+            skills: None,
         };
         run_loop(&mut session, &req.user_text, provider, &AlwaysAllow, &opts).await
     };
