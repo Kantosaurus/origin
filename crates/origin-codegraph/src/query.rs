@@ -2,12 +2,19 @@
 //!
 //! Callers compose a [`Query`] enum value and hand it to [`dispatch`]; the
 //! dispatcher walks the [`CodeGraphIndex`] using its existing SQL/edge
-//! primitives. Variants that depend on community-detection output
-//! (`Communities`, `GodNodes`) intentionally stub to
-//! [`QueryResult::Empty`] for Phase 7 — the reads side of community storage
-//! lands in a follow-up task.
+//! primitives.
+//!
+//! `Communities` runs Label Propagation (LPA) directly over the edge table.
+//! LPA is O(E) per sweep and converges in ~5 sweeps on typical call graphs,
+//! which keeps the read path lean compared to a Louvain/Leiden offline build
+//! (Louvain lives in [`crate::community`] for the heavier-weight rebuild
+//! pipeline). The whole edge list is hashed with blake3 into an
+//! `edge_snapshot_hash`; future revisions of this module can persist that
+//! hash alongside the partition assignment in `code_communities` to skip the
+//! recompute when nothing changed. `GodNodes` ranks each community's members
+//! by in-degree (top-`top_per_partition`).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use rusqlite::params;
 use thiserror::Error;
@@ -27,10 +34,9 @@ pub enum Query {
     },
     /// Breadth-first reachable set from `node` up to `depth` hops away.
     Neighbors { node: EntityId, depth: usize },
-    /// All communities (stub in Phase 7 — returns [`QueryResult::Empty`]).
+    /// Community partition of the whole graph via Label Propagation.
     Communities,
-    /// Top-`top_per_partition` god-nodes per community (stub in Phase 7 —
-    /// returns [`QueryResult::Empty`]).
+    /// Top-`top_per_partition` god-nodes per community, ranked by in-degree.
     GodNodes { top_per_partition: usize },
     /// Nodes whose `last_seen` is at or after `since_ms` (unix epoch ms),
     /// newest first.
@@ -92,7 +98,8 @@ pub fn dispatch(idx: &CodeGraphIndex, q: Query) -> Result<QueryResult, QueryErro
         Query::Neighbors { node, depth } => neighbors(idx, node, depth),
         Query::Path { from, to, max_hops } => path(idx, from, to, max_hops),
         Query::RecentChanges { since_ms } => recent_changes(idx, since_ms),
-        Query::Communities | Query::GodNodes { .. } => Ok(QueryResult::Empty),
+        Query::Communities => communities(idx),
+        Query::GodNodes { top_per_partition } => god_nodes(idx, top_per_partition),
     }
 }
 
@@ -245,4 +252,204 @@ fn fetch_node(idx: &CodeGraphIndex, id: EntityId) -> Result<Option<NodeRow>, Que
 
 fn to32(bytes: &[u8]) -> Result<[u8; 32], QueryError> {
     <[u8; 32]>::try_from(bytes).map_err(|_| QueryError::Index(IndexError::HandleShape(bytes.len())))
+}
+
+/// Maximum LPA sweeps before forced termination. LPA usually converges in
+/// ~5 passes on real graphs; the cap protects against pathological oscillation.
+const LPA_MAX_SWEEPS: usize = 32;
+
+/// Edge-set view used by LPA: undirected, deduped, sorted.
+struct EdgeSet {
+    /// Stable list of `(min(from,to), max(from,to))` pairs, sorted, deduped.
+    /// Sorting makes `edge_snapshot_hash` deterministic across runs.
+    sorted: Vec<([u8; 32], [u8; 32])>,
+}
+
+impl EdgeSet {
+    fn snapshot_hash(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        for (a, b) in &self.sorted {
+            h.update(a);
+            h.update(b);
+        }
+        *h.finalize().as_bytes()
+    }
+}
+
+fn read_edges(idx: &CodeGraphIndex) -> Result<EdgeSet, QueryError> {
+    let raw = idx.with_store(|conn| {
+        let mut stmt = conn.prepare("SELECT from_id, to_id FROM code_edges")?;
+        let it = stmt.query_map([], |row| {
+            let f: Vec<u8> = row.get(0)?;
+            let t: Vec<u8> = row.get(1)?;
+            Ok((f, t))
+        })?;
+        it.collect::<rusqlite::Result<Vec<_>>>()
+    })?;
+    let mut pairs: Vec<([u8; 32], [u8; 32])> = Vec::with_capacity(raw.len());
+    for (f, t) in raw {
+        let a = to32(&f)?;
+        let b = to32(&t)?;
+        if a == b {
+            continue;
+        }
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        pairs.push((lo, hi));
+    }
+    pairs.sort_unstable();
+    pairs.dedup();
+    Ok(EdgeSet { sorted: pairs })
+}
+
+/// Build the undirected adjacency list keyed by `[u8; 32]` entity id.
+fn build_adj(edges: &EdgeSet) -> HashMap<[u8; 32], Vec<[u8; 32]>> {
+    let mut adj: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
+    for (a, b) in &edges.sorted {
+        adj.entry(*a).or_default().push(*b);
+        adj.entry(*b).or_default().push(*a);
+    }
+    adj
+}
+
+/// Synchronous label propagation. Each node's label is the most frequent
+/// label among its neighbours; ties broken by lexicographically smallest
+/// label so the result is deterministic.
+fn label_propagate(adj: &HashMap<[u8; 32], Vec<[u8; 32]>>) -> HashMap<[u8; 32], [u8; 32]> {
+    let mut label: HashMap<[u8; 32], [u8; 32]> = adj.keys().map(|k| (*k, *k)).collect();
+    // Process nodes in a fixed (sorted) order so the result is independent of
+    // HashMap iteration order.
+    let mut order: Vec<[u8; 32]> = adj.keys().copied().collect();
+    order.sort_unstable();
+
+    for _ in 0..LPA_MAX_SWEEPS {
+        let mut next = label.clone();
+        let mut changed = false;
+        for node in &order {
+            let Some(nbrs) = adj.get(node) else { continue };
+            if nbrs.is_empty() {
+                continue;
+            }
+            let mut counts: BTreeMap<[u8; 32], usize> = BTreeMap::new();
+            for n in nbrs {
+                let l = label.get(n).copied().unwrap_or(*n);
+                *counts.entry(l).or_insert(0) += 1;
+            }
+            // Pick label with highest count; ties broken by smallest label
+            // (BTreeMap iterates in sorted key order, so the first max wins).
+            let mut best: Option<([u8; 32], usize)> = None;
+            for (lbl, c) in &counts {
+                match best {
+                    None => best = Some((*lbl, *c)),
+                    Some((_, bc)) if *c > bc => best = Some((*lbl, *c)),
+                    _ => {}
+                }
+            }
+            if let Some((lbl, _)) = best {
+                if next.get(node).copied() != Some(lbl) {
+                    next.insert(*node, lbl);
+                    changed = true;
+                }
+            }
+        }
+        label = next;
+        if !changed {
+            break;
+        }
+    }
+    label
+}
+
+/// Group nodes by their final LPA label, then materialise each community into
+/// a `Vec<NodeRow>` by fetching from `code_nodes`.
+///
+/// Communities with only one node are kept (a singleton lone function is a
+/// legitimate partition). Communities are sorted by the smallest entity id
+/// they contain to give deterministic output ordering.
+fn partition_to_rows(
+    idx: &CodeGraphIndex,
+    labels: HashMap<[u8; 32], [u8; 32]>,
+) -> Result<Vec<Vec<NodeRow>>, QueryError> {
+    let mut buckets: BTreeMap<[u8; 32], Vec<[u8; 32]>> = BTreeMap::new();
+    for (n, l) in labels {
+        buckets.entry(l).or_default().push(n);
+    }
+    let mut out: Vec<Vec<NodeRow>> = Vec::with_capacity(buckets.len());
+    let mut keyed: Vec<([u8; 32], Vec<[u8; 32]>)> = buckets
+        .into_values()
+        .map(|mut members| {
+            members.sort_unstable();
+            let key = members.first().copied().unwrap_or([0xff; 32]);
+            (key, members)
+        })
+        .collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, members) in keyed {
+        let mut rows = Vec::with_capacity(members.len());
+        for m in members {
+            if let Some(r) = fetch_node(idx, EntityId(m))? {
+                rows.push(r);
+            }
+        }
+        if !rows.is_empty() {
+            out.push(rows);
+        }
+    }
+    Ok(out)
+}
+
+fn communities(idx: &CodeGraphIndex) -> Result<QueryResult, QueryError> {
+    let edges = read_edges(idx)?;
+    if edges.sorted.is_empty() {
+        return Ok(QueryResult::Partitions(Vec::new()));
+    }
+    // `_snapshot_hash` is computed here so future revisions can cache the
+    // partition assignment in `code_communities` keyed on this value. We
+    // bind it explicitly (rather than dropping it) to document the lazy-
+    // recompute hook for the next iteration.
+    let _snapshot_hash = edges.snapshot_hash();
+    let adj = build_adj(&edges);
+    let labels = label_propagate(&adj);
+    let parts = partition_to_rows(idx, labels)?;
+    Ok(QueryResult::Partitions(parts))
+}
+
+fn god_nodes(idx: &CodeGraphIndex, top_per_partition: usize) -> Result<QueryResult, QueryError> {
+    if top_per_partition == 0 {
+        return Ok(QueryResult::Partitions(Vec::new()));
+    }
+    let in_deg = inbound_degrees(idx)?;
+    let QueryResult::Partitions(parts) = communities(idx)? else {
+        return Ok(QueryResult::Partitions(Vec::new()));
+    };
+    let mut out: Vec<Vec<NodeRow>> = Vec::with_capacity(parts.len());
+    for mut members in parts {
+        members.sort_by(|a, b| {
+            let ad = in_deg.get(&a.entity_id.0).copied().unwrap_or(0);
+            let bd = in_deg.get(&b.entity_id.0).copied().unwrap_or(0);
+            bd.cmp(&ad)
+                .then_with(|| a.entity_id.0.cmp(&b.entity_id.0))
+        });
+        members.truncate(top_per_partition);
+        if !members.is_empty() {
+            out.push(members);
+        }
+    }
+    Ok(QueryResult::Partitions(out))
+}
+
+fn inbound_degrees(idx: &CodeGraphIndex) -> Result<HashMap<[u8; 32], usize>, QueryError> {
+    let raw = idx.with_store(|conn| {
+        let mut stmt = conn.prepare("SELECT to_id FROM code_edges")?;
+        let it = stmt.query_map([], |row| {
+            let t: Vec<u8> = row.get(0)?;
+            Ok(t)
+        })?;
+        it.collect::<rusqlite::Result<Vec<_>>>()
+    })?;
+    let mut deg: HashMap<[u8; 32], usize> = HashMap::new();
+    for t in raw {
+        let id = to32(&t)?;
+        *deg.entry(id).or_insert(0) += 1;
+    }
+    Ok(deg)
 }
