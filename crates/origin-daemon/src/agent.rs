@@ -643,6 +643,113 @@ async fn dispatch_tool(meta: &ToolMeta, args: &Value, cas: Option<&Store>) -> Re
             origin_tools::builtins::recall::recall_tool(store, handle, region)
                 .map_err(|e| LoopError::ToolFailure(e.to_string()))
         }
+        // ── Code-graph tools ──
+        // These four require an `Arc<origin_codegraph::index::CodeGraphIndex>`
+        // threaded through `LoopOptions`. The daemon currently constructs
+        // neither the index nor the SQL pool side it needs, so dispatch returns
+        // a clear `ToolFailure` rather than `UnknownTool` — the tool IS in the
+        // catalog the model receives, the subsystem behind it just isn't wired.
+        "graph_query" => Err(LoopError::ToolFailure(
+            "graph_query: code-graph subsystem not yet wired. Thread a CodeGraphIndex \
+             through LoopOptions and extend dispatch_tool to consume it."
+                .into(),
+        )),
+        "graph_path" => Err(LoopError::ToolFailure(
+            "graph_path: code-graph subsystem not yet wired (see graph_query notes).".into(),
+        )),
+        "graph_summarize" => Err(LoopError::ToolFailure(
+            "graph_summarize: code-graph subsystem not yet wired (see graph_query notes).".into(),
+        )),
+        "graph_rebuild" => Err(LoopError::ToolFailure(
+            "graph_rebuild: code-graph subsystem not yet wired. The free function \
+             `agent::rebuild_codegraph` exists but no IPC verb or background hook \
+             routes to it; this dispatch arm activates once both are present."
+                .into(),
+        )),
+        // `graph_explain` has zero infrastructure dependency — it just classifies
+        // a typed `Query` into a deterministic English gloss. Wired here as a
+        // real call so the model gets a working tool, not a stub error.
+        "graph_explain" => {
+            use origin_codegraph::index::EntityId;
+            use origin_codegraph::query::Query;
+            let kind = args
+                .get("kind")
+                .and_then(Value::as_str)
+                .ok_or_else(|| LoopError::BadArgs("graph_explain: missing `kind`".into()))?;
+            let q_args = args.get("args").cloned().unwrap_or(Value::Null);
+            let parse_id = |v: &Value, field: &str| -> Result<EntityId, LoopError> {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| LoopError::BadArgs(format!("graph_explain.{field}: not a string")))?;
+                let mut buf = [0u8; 32];
+                hex::decode_to_slice(s, &mut buf).map_err(|e| {
+                    LoopError::BadArgs(format!("graph_explain.{field}: bad hex: {e}"))
+                })?;
+                Ok(EntityId(buf))
+            };
+            let q = match kind {
+                "path" => Query::Path {
+                    from: parse_id(&q_args["from"], "args.from")?,
+                    to: parse_id(&q_args["to"], "args.to")?,
+                    max_hops: usize::try_from(q_args["max_hops"].as_u64().unwrap_or(8))
+                        .unwrap_or(usize::MAX),
+                },
+                "neighbors" => Query::Neighbors {
+                    node: parse_id(&q_args["node"], "args.node")?,
+                    depth: usize::try_from(q_args["depth"].as_u64().unwrap_or(1))
+                        .unwrap_or(usize::MAX),
+                },
+                "communities" => Query::Communities,
+                "god_nodes" => Query::GodNodes {
+                    top_per_partition: usize::try_from(
+                        q_args["top_per_partition"].as_u64().unwrap_or(3),
+                    )
+                    .unwrap_or(usize::MAX),
+                },
+                "recent_changes" => Query::RecentChanges {
+                    since_ms: q_args["since_ms"].as_i64().unwrap_or(0),
+                },
+                other => {
+                    return Err(LoopError::BadArgs(format!(
+                        "graph_explain: unknown kind `{other}`"
+                    )))
+                }
+            };
+            Ok(origin_tools::builtins::graph_explain::graph_explain_tool(&q))
+        }
+        // ── Memory tools ──
+        // `mem_search` / `mem_save` / `mem_forget` need a `&dyn MemoryHandle`.
+        // The trait lives in `origin_tools::dispatch::MemoryHandle`; a concrete
+        // adapter wrapping `MemoryWiring` (store + embedder + index) is the
+        // follow-up. Until then: clear ToolFailure, not UnknownTool.
+        "mem_search" => Err(LoopError::ToolFailure(
+            "mem_search: memory subsystem not yet wired into dispatch. Thread a \
+             MemoryHandle adapter (wrapping MemoryWiring) through LoopOptions."
+                .into(),
+        )),
+        "mem_save" => Err(LoopError::ToolFailure(
+            "mem_save: memory subsystem not yet wired (see mem_search notes).".into(),
+        )),
+        "mem_forget" => Err(LoopError::ToolFailure(
+            "mem_forget: memory subsystem not yet wired (see mem_search notes).".into(),
+        )),
+        // ── ask ──
+        // Needs both a CodeGraphIndex (for code routing) and a MemRouter.
+        // `NullMemRouter` is available as a stub but the full router needs
+        // wiring against the daemon's mem index.
+        "ask" => Err(LoopError::ToolFailure(
+            "ask: free-text router not yet wired. Needs CodeGraphIndex + MemRouter \
+             threaded through LoopOptions."
+                .into(),
+        )),
+        // ── Task ──
+        // Needs an `origin_swarm::Coordinator` constructed against a PlanHandle.
+        // The daemon has a PlanBus but no Coordinator instance yet.
+        "Task" => Err(LoopError::ToolFailure(
+            "Task: swarm subsystem not yet wired. Construct an origin_swarm::Coordinator \
+             at daemon startup and thread it through LoopOptions."
+                .into(),
+        )),
         other => Err(LoopError::UnknownTool(other.into())),
     }
 }
@@ -875,4 +982,91 @@ async fn drain_subscriber_into_response(
         response: origin_provider::ChatResponse { assistant, usage },
         speculative: registry,
     })
+}
+
+#[cfg(test)]
+mod dispatch_table_tests {
+    use super::*;
+    use origin_tools::registry_iter;
+
+    /// Every tool advertised to the model via `tools_schema = registry_iter().map(...)`
+    /// MUST be recognized by `dispatch_tool`. An `UnknownTool` error means the
+    /// model received a tool name it can pick, then got told "I don't know that
+    /// tool" — which is misleading. Tools whose subsystems are not yet wired
+    /// should return `ToolFailure(<reason>)`, NOT `UnknownTool`.
+    #[tokio::test]
+    async fn dispatch_tool_recognizes_every_registered_tool() {
+        let empty = serde_json::Value::Object(serde_json::Map::new());
+        let mut unrecognized: Vec<String> = Vec::new();
+        for meta in registry_iter() {
+            let result = dispatch_tool(meta, &empty, None).await;
+            if let Err(LoopError::UnknownTool(name)) = &result {
+                unrecognized.push(name.clone());
+            }
+        }
+        assert!(
+            unrecognized.is_empty(),
+            "tools registered in the inventory but not handled by dispatch_tool: {unrecognized:?}"
+        );
+    }
+
+    /// `graph_explain` is the only non-`Recall` tool wired here with a real
+    /// implementation (no missing subsystem). Verify it produces the expected
+    /// English gloss for each Query variant.
+    #[tokio::test]
+    async fn graph_explain_returns_real_nl_gloss() {
+        let meta = registry_iter()
+            .find(|m| m.name == "graph_explain")
+            .expect("graph_explain registered");
+        let args = serde_json::json!({"kind": "communities"});
+        let out = dispatch_tool(meta, &args, None).await.expect("communities dispatch");
+        assert_eq!(out, "all detected communities");
+
+        let args = serde_json::json!({
+            "kind": "recent_changes",
+            "args": {"since_ms": 1_700_000_000_000_i64}
+        });
+        let out = dispatch_tool(meta, &args, None).await.expect("recent_changes dispatch");
+        assert!(out.contains("1700000000000"), "got: {out}");
+
+        // Unknown kind surfaces as BadArgs, not ToolFailure or UnknownTool.
+        let args = serde_json::json!({"kind": "bogus"});
+        let err = dispatch_tool(meta, &args, None).await.expect_err("bogus must fail");
+        assert!(matches!(err, LoopError::BadArgs(_)));
+    }
+
+    /// The stub arms return `ToolFailure` with messages naming the missing
+    /// subsystem — never `UnknownTool`. Regression guard for accidental
+    /// reversion to the silent-fall-through.
+    #[tokio::test]
+    async fn stub_arms_return_toolfailure_not_unknowntool() {
+        let names = [
+            "graph_query",
+            "graph_path",
+            "graph_summarize",
+            "graph_rebuild",
+            "mem_search",
+            "mem_save",
+            "mem_forget",
+            "ask",
+            "Task",
+        ];
+        let args = serde_json::Value::Object(serde_json::Map::new());
+        for name in names {
+            let meta = registry_iter()
+                .find(|m| m.name == name)
+                .unwrap_or_else(|| panic!("{name} not registered"));
+            let err = dispatch_tool(meta, &args, None).await.expect_err(name);
+            match err {
+                LoopError::ToolFailure(msg) => {
+                    assert!(
+                        msg.contains("not yet wired") || msg.contains("subsystem"),
+                        "{name}: ToolFailure message must name the missing subsystem; got `{msg}`"
+                    );
+                }
+                LoopError::UnknownTool(_) => panic!("{name}: regressed to UnknownTool"),
+                other => panic!("{name}: unexpected error variant {other:?}"),
+            }
+        }
+    }
 }
