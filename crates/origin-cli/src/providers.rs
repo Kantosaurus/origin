@@ -2,9 +2,34 @@
 
 use origin_provider::catalog::{AuthScheme, Catalog};
 
-/// Print every builtin catalog entry as a fixed-width table.
+/// Build the catalog the CLI should display, mirroring the daemon's merge of
+/// `~/.origin/providers.toml` on top of the builtin entries.
+///
+/// Custom-providers IO and parse errors are surfaced on stderr but do not
+/// abort the listing — the builtin catalog is always shown.
+fn merged_catalog() -> Catalog {
+    let mut cat = Catalog::builtin();
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".origin").join("providers.toml");
+        match origin_provider::custom::load(&path) {
+            Ok(custom) => {
+                if !custom.is_empty() {
+                    if let Err(e) = cat.merge_custom(custom) {
+                        eprintln!("warning: providers.toml merge failed: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("warning: failed to load {}: {e}", path.display());
+            }
+        }
+    }
+    cat
+}
+
+/// Print every catalog entry (builtin + custom) as a fixed-width table.
 pub fn ls() {
-    let cat = Catalog::builtin();
+    let cat = merged_catalog();
     println!("{:<20} {:<35} {:<14} AUTH", "ID", "DISPLAY NAME", "WIRE");
     for e in cat.entries() {
         let wire = format!("{:?}", e.wire);
@@ -21,7 +46,7 @@ pub fn ls() {
 
 /// Print the full config for a single provider by catalog id.
 pub fn describe(id: &str) {
-    let cat = Catalog::builtin();
+    let cat = merged_catalog();
     if let Some(e) = cat.lookup(id) {
         println!("id:            {}", e.id);
         println!("display_name:  {}", e.display_name);
