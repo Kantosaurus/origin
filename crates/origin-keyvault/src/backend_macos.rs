@@ -4,10 +4,13 @@
 //! is passed through verbatim. All sync FFI calls are dispatched to
 //! `spawn_blocking` so they never stall the async runtime.
 //!
-//! `list` is a stub for now and returns an empty `Vec`; Phase 11 will wire
-//! `SecItemCopyMatching` for proper enumeration.
+//! UNTESTED ON THIS HOST: requires macOS for compile + runtime verification.
+//! The `set`/`get`/`delete` paths are unchanged from earlier phases; only
+//! `list` is new in Phase 11 and is gated behind a best-effort wrapper
+//! around `SecItemCopyMatching` (via `security_framework::item`).
 
 use async_trait::async_trait;
+use security_framework::item::{ItemClass, ItemSearchOptions, Limit, SearchResult};
 use security_framework::passwords::{delete_generic_password, get_generic_password, set_generic_password};
 use tokio::task::spawn_blocking;
 
@@ -28,6 +31,19 @@ fn service_name(provider: &str) -> String {
 fn join_err<E: std::fmt::Display>(e: E) -> Error {
     Error::Backend(format!("join: {e}"))
 }
+
+/// `errSecItemNotFound` — keychain returns this when the query matches
+/// zero entries. We translate it into an empty `Vec` rather than an error.
+const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
+/// CoreFoundation short-attribute key for `kSecAttrAccount`.
+///
+/// `security_framework`'s `SearchResult::simplify_dict` returns a
+/// `HashMap<String, String>` keyed on the CFString underlying
+/// `kSecAttr*` constants. The string value for `kSecAttrAccount` is
+/// the well-known four-letter Apple identifier `"acct"`; see
+/// `<Security/SecItem.h>` in the Apple SDK.
+const K_SEC_ATTR_ACCOUNT_STR: &str = "acct";
 
 #[async_trait]
 impl Backend for MacBackend {
@@ -91,8 +107,45 @@ impl Backend for MacBackend {
         .map_err(join_err)?
     }
 
-    async fn list(&self, _provider: &str) -> Result<Vec<String>, Error> {
-        // P11 will wire `SecItemCopyMatching` for proper enumeration.
-        Ok(Vec::new())
+    // UNTESTED — Phase 11 macOS keychain enumeration. Verify on macOS before relying on the returned set.
+    async fn list(&self, provider: &str) -> Result<Vec<String>, Error> {
+        let svc = service_name(provider);
+        spawn_blocking(move || -> Result<Vec<String>, Error> {
+            // Build a query restricted to generic-password items whose
+            // `kSecAttrService` equals our namespaced service. Ask the
+            // keychain to return the dictionary of attributes for each
+            // match (we only need `kSecAttrAccount`, but the API only
+            // toggles "load_attributes" as a whole).
+            let search_result = ItemSearchOptions::new()
+                .class(ItemClass::generic_password())
+                .service(&svc)
+                .limit(Limit::All)
+                .load_attributes(true)
+                .search();
+
+            let results = match search_result {
+                Ok(r) => r,
+                Err(e) => {
+                    if e.code() == ERR_SEC_ITEM_NOT_FOUND {
+                        return Ok(Vec::new());
+                    }
+                    return Err(Error::Backend(format!("SecItemCopyMatching: {e}")));
+                }
+            };
+
+            let mut accounts: Vec<String> = Vec::with_capacity(results.len());
+            for r in &results {
+                if let SearchResult::Dict(_) = r {
+                    if let Some(map) = r.simplify_dict() {
+                        if let Some(acct) = map.get(K_SEC_ATTR_ACCOUNT_STR) {
+                            accounts.push(acct.clone());
+                        }
+                    }
+                }
+            }
+            Ok(accounts)
+        })
+        .await
+        .map_err(join_err)?
     }
 }
