@@ -12,7 +12,7 @@
 //! ## Per-role step order
 //!
 //! 1. Provider — full catalog menu (grouped by wire) + "Other (catalog id)".
-//! 2. Credential — branches on [`AuthScheme`] (API key / OAuth / SigV4 / none).
+//! 2. Credential — branches on [`AuthScheme`] (API key / OAuth / `SigV4` / none).
 //! 3. Probe — issues a GET against the provider's `/models` endpoint;
 //!    on auth failure offers a retry loop, on unreachable/skipped continues
 //!    after a notice.
@@ -40,19 +40,27 @@ pub enum Role {
 }
 
 impl Role {
+    #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Role::Primary => "primary",
-            Role::Backup => "backup",
-            Role::Subagent => "subagent / swarm",
+            Self::Primary => "primary",
+            Self::Backup => "backup",
+            Self::Subagent => "subagent / swarm",
         }
     }
 }
 
-/// Entry point used by `main.rs`. Wraps the runner with real stdin/stdout,
-/// a freshly detected `KeyVault`, the default config path, and a live HTTP
-/// connectivity probe; then runs the post-init walkthrough (Toolbox,
-/// Skill Repository, port skills, Workflows).
+/// Entry point used by `main.rs`.
+///
+/// Wraps the runner with real stdin/stdout, a freshly detected `KeyVault`,
+/// the default config path, and a live HTTP connectivity probe; then runs
+/// the post-init walkthrough (Toolbox, Skill Repository, port skills,
+/// Workflows).
+///
+/// # Errors
+/// Propagates failure from keyvault detection, config-path resolution, the
+/// inner [`run_with`] flow, or the post-init walkthrough.
+#[allow(clippy::future_not_send)] // CLI entry: stdin/stdout locks are inherently !Send and never crossed.
 pub async fn run() -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -66,11 +74,17 @@ pub async fn run() -> Result<()> {
     crate::welcome::run()
 }
 
-/// Drive the flow against arbitrary reader/writer + an explicit config path
-/// + an injected connectivity probe, so tests can stand up an in-memory
-/// vault (`KeyVault::in_memory`), a tempdir config, and a [`MockProbe`]
-/// without touching process-wide env vars (Rust 1.83 flags `set_var` as
-/// `unsafe`).
+/// Drive the flow against arbitrary reader/writer, an explicit config path,
+/// and an injected connectivity probe.
+///
+/// Tests can stand up an in-memory vault (`KeyVault::in_memory`), a tempdir
+/// config, and a [`MockProbe`](crate::init_probe::MockProbe) without touching
+/// process-wide env vars (Rust 1.83 flags `set_var` as `unsafe`).
+///
+/// # Errors
+/// Propagates I/O failures from `r`/`w`, vault writes, config persistence,
+/// and probe execution.
+#[allow(clippy::future_not_send)] // Generic over !Send readers/writers; only awaited from the CLI thread.
 pub async fn run_with<R: BufRead, W: Write>(
     mut r: R,
     mut w: W,
@@ -134,6 +148,7 @@ fn greet<W: Write>(w: &mut W) -> std::io::Result<()> {
 /// Per-role steps: provider → auth → probe → model. The probe step loops
 /// on auth failure so a typo'd key can be re-entered without restarting
 /// the whole flow.
+#[allow(clippy::future_not_send)] // Generic over !Send readers/writers; only awaited from the CLI thread.
 async fn configure_role<R: BufRead, W: Write>(
     r: &mut R,
     w: &mut W,
@@ -221,12 +236,11 @@ fn pick_provider<R: BufRead, W: Write>(
         w.flush()?;
         let line = read_line(r)?;
         let trimmed = line.trim();
-        let pick: usize = match trimmed.parse() {
-            Ok(n) => n,
-            Err(_) => {
-                writeln!(w, "  (not a number; try again)")?;
-                continue;
-            }
+        let pick: usize = if let Ok(n) = trimmed.parse() {
+            n
+        } else {
+            writeln!(w, "  (not a number; try again)")?;
+            continue;
         };
         if pick >= 1 && pick <= entries.len() {
             return Ok(entries[pick - 1].clone());
@@ -248,6 +262,7 @@ fn pick_provider<R: BufRead, W: Write>(
 
 /// Capture the credential matching the provider's [`AuthScheme`]. Persists
 /// directly to the vault; `None` / `Custom` do nothing beyond a notice.
+#[allow(clippy::future_not_send)] // Generic over !Send readers/writers; only awaited from the CLI thread.
 async fn capture_credentials<R: BufRead, W: Write>(
     r: &mut R,
     w: &mut W,
@@ -327,6 +342,7 @@ async fn capture_credentials<R: BufRead, W: Write>(
 
 /// Run the probe and print a one-line summary. Returns the result; the
 /// caller decides whether the retry loop fires.
+#[allow(clippy::future_not_send)] // Generic over !Send writer; only awaited from the CLI thread.
 async fn run_probe<W: Write>(
     w: &mut W,
     probe: &dyn ConnectivityProbe,
@@ -417,12 +433,11 @@ fn pick_model<R: BufRead, W: Write>(
         if trimmed.is_empty() {
             return Ok(ordered[0].clone());
         }
-        let pick: usize = match trimmed.parse() {
-            Ok(n) => n,
-            Err(_) => {
-                writeln!(w, "  (not a number; try again)")?;
-                continue;
-            }
+        let pick: usize = if let Ok(n) = trimmed.parse() {
+            n
+        } else {
+            writeln!(w, "  (not a number; try again)")?;
+            continue;
         };
         if pick >= 1 && pick <= ordered.len() {
             return Ok(ordered[pick - 1].clone());
@@ -453,7 +468,7 @@ const fn wire_section_label(w: WireFormat) -> &'static str {
     }
 }
 
-fn auth_label(a: &AuthScheme) -> &'static str {
+const fn auth_label(a: &AuthScheme) -> &'static str {
     match a {
         AuthScheme::None => "no auth",
         AuthScheme::ApiKey { .. } => "API key",
@@ -492,6 +507,7 @@ fn yes_no<R: BufRead, W: Write>(
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::map_unwrap_or, clippy::future_not_send)] // unit-test ergonomics
 mod tests {
     use super::*;
     use crate::init_probe::MockProbe;

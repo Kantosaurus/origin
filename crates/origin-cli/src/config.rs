@@ -17,6 +17,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 /// One provider/model selection slot. The `account` is the keyvault account
 /// the secret was filed under during onboarding (typically `"default"`).
+#[allow(clippy::module_name_repetitions)] // `RoleConfig` is part of the public config API
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleConfig {
     pub provider: String,
@@ -30,6 +31,7 @@ fn default_account() -> String {
 }
 
 /// Top-level on-disk shape of `~/.origin/config.toml`.
+#[allow(clippy::module_name_repetitions)] // `OriginConfig` is the documented public config type
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OriginConfig {
     /// Schema version. Files with a higher version than [`SCHEMA_VERSION`]
@@ -52,6 +54,7 @@ const fn default_schema_version() -> u32 {
     SCHEMA_VERSION
 }
 
+#[allow(clippy::module_name_repetitions)] // `ConfigError` is the public error name
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("home directory not found (set $ORIGIN_HOME or $HOME)")]
@@ -69,6 +72,10 @@ pub enum ConfigError {
 /// Resolve `~/.origin/config.toml`. Honors `$ORIGIN_HOME` for tests and
 /// alternate-root installs, matching the convention used elsewhere in the
 /// CLI (see `crates/origin-cli/src/providers.rs`).
+///
+/// # Errors
+/// Returns [`ConfigError::NoHome`] if neither `$ORIGIN_HOME` nor a home
+/// directory can be resolved.
 pub fn path() -> Result<PathBuf, ConfigError> {
     let home = std::env::var_os("ORIGIN_HOME")
         .map(PathBuf::from)
@@ -87,19 +94,32 @@ pub fn exists() -> bool {
 /// Load the config from disk. Returns `Ok(None)` if the file does not exist,
 /// `Err` only for genuine read/parse failures so callers can distinguish
 /// first-run from corruption.
+///
+/// # Errors
+/// Forwards [`ConfigError`] from [`path`] or [`load_from`] (io, parse,
+/// unsupported schema version).
 pub fn load() -> Result<Option<OriginConfig>, ConfigError> {
     load_from(&path()?)
 }
 
 /// Persist `cfg` atomically to the default location.
+///
+/// # Errors
+/// Forwards [`ConfigError`] from [`path`] or [`save_to`].
 pub fn save(cfg: &OriginConfig) -> Result<(), ConfigError> {
     save_to(&path()?, cfg)
 }
 
-/// Load from an explicit path. Exposed so tests (and a future
-/// `--config <path>` flag) can avoid the process-wide `$ORIGIN_HOME` env
-/// var, which Rust 1.83 flags `set_var` as `unsafe` and can race other
-/// threads.
+/// Load from an explicit path.
+///
+/// Exposed so tests (and a future `--config <path>` flag) can avoid the
+/// process-wide `$ORIGIN_HOME` env var, which Rust 1.83 flags `set_var` as
+/// `unsafe` and can race other threads.
+///
+/// # Errors
+/// Returns [`ConfigError::Io`] on read failure, [`ConfigError::Parse`] on
+/// malformed TOML, or [`ConfigError::UnsupportedSchemaVersion`] if the file
+/// declares a `schema_version` newer than [`SCHEMA_VERSION`].
 pub fn load_from(p: &Path) -> Result<Option<OriginConfig>, ConfigError> {
     if !p.exists() {
         return Ok(None);
@@ -118,6 +138,10 @@ pub fn load_from(p: &Path) -> Result<Option<OriginConfig>, ConfigError> {
 /// Persist to an explicit path. Creates the parent directory if missing,
 /// writes to a `.tmp` sibling, then renames — so a crash mid-write can't
 /// leave a half-written `config.toml`.
+///
+/// # Errors
+/// Returns [`ConfigError::Io`] on directory create / write / rename failure
+/// or [`ConfigError::Serialize`] if `cfg` fails to serialise.
 pub fn save_to(p: &Path, cfg: &OriginConfig) -> Result<(), ConfigError> {
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent)?;

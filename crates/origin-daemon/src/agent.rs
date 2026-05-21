@@ -1426,8 +1426,9 @@ mod dispatch_table_tests {
     // ── Subsystem A tests: graph_* + ask (with CodeGraphIndex) ────────────────
 
     /// Dispatch `graph_query` with `kind=communities` against an empty index.
-    /// Communities is always `QueryResult::Empty` at P7.8, so the result JSON
-    /// must be `"{}"`.
+    /// Post-P7.8 Communities returns `QueryResult::Partitions` (empty list
+    /// when the edge table has no rows), which serializes with a
+    /// `partitions` field.
     #[tokio::test]
     async fn graph_query_runs_against_empty_index_returns_empty_result() {
         let (code_graph, _tmp) = make_empty_code_graph();
@@ -1438,8 +1439,11 @@ mod dispatch_table_tests {
         let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None, None)
             .await
             .expect("graph_query dispatch");
-        // QueryResult::Empty serializes as "{}".
-        assert_eq!(out, "{}", "expected empty JSON, got: {out}");
+        // Empty edge table yields an empty Partitions list.
+        assert_eq!(
+            out, r#"{"partitions":[]}"#,
+            "expected empty partitions JSON, got: {out}"
+        );
     }
 
     /// Dispatch `ask` with a code-flavored query against an empty index +

@@ -124,8 +124,10 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Build a [`CompletionSources`] by reading `~/.origin/skills/` (every
-/// `<dir>/SKILL.md`) and `~/.origin/workflows.toml`. Failures degrade to
-/// empty lists so a missing directory or corrupt file doesn't break Tab.
+/// `<dir>/SKILL.md`) and `~/.origin/workflows.toml`.
+///
+/// Failures degrade to empty lists so a missing directory or corrupt file
+/// doesn't break Tab.
 #[must_use]
 pub fn load_sources() -> CompletionSources {
     let home = std::env::var_os("ORIGIN_HOME")
@@ -147,6 +149,7 @@ pub fn load_sources() -> CompletionSources {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::useless_vec)] // unit-test ergonomics
 mod tests {
     use super::*;
 

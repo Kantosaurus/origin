@@ -75,9 +75,10 @@ async fn system_prompt_lists_each_skill_in_catalog() {
 
 #[tokio::test]
 async fn empty_catalog_does_not_pollute_system_prompt() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    // No skills written.
-    let catalog = Arc::new(SkillCatalog::load_from(dir.path()).expect("load"));
+    // `SkillCatalog::default()` is the truly-empty catalog. `load_from` on
+    // an empty dir still returns the embedded superpowers skills, which is
+    // intentional but not what this test wants to exercise.
+    let catalog = Arc::new(SkillCatalog::default());
     let provider = CapturingProvider {
         seen_systems: Mutex::new(Vec::new()),
     };

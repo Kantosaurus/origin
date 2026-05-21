@@ -44,6 +44,10 @@ pub const KNOWN_HARNESS_SOURCES: &[(&str, &str)] = &[
 /// Entry point used by `init::run`. Reads from stdin, writes to stdout,
 /// scans `$HOME` (or `$ORIGIN_HOME`) for the known source dirs, and
 /// targets `~/.origin/skills/` + `~/.origin/workflows.toml`.
+///
+/// # Errors
+/// Returns an error if the home directory cannot be resolved or any of the
+/// interactive screens or import steps fails.
 pub fn run() -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -66,6 +70,10 @@ pub fn run() -> Result<()> {
 /// `sources` is the ordered list of `(source_dir, label_for_user)` pairs.
 /// `skills_dst` is the merge target (typically `~/.origin/skills/`).
 /// `workflows_path` is where the example workflow seed lands.
+///
+/// # Errors
+/// Returns an I/O error from `r`/`w` or propagates failures from the
+/// underlying screen handlers (skill import, workflow seeding, etc.).
 pub fn run_with<R: BufRead, W: Write>(
     mut r: R,
     mut w: W,

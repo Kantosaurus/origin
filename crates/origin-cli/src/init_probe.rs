@@ -5,7 +5,7 @@
 //! returns the catalog of models the credential is authorized to call. A
 //! 200 means auth works AND we can populate the model picker; 401/403 means
 //! the credential is wrong; everything else means the provider is unreachable
-//! (network down, base_url wrong, server 5xx).
+//! (network down, `base_url` wrong, server 5xx).
 //!
 //! Encapsulating it behind [`ConnectivityProbe`] keeps `init.rs` testable —
 //! tests inject a [`MockProbe`] returning a fixed outcome and model list,
@@ -16,9 +16,11 @@ use origin_keyvault::KeyVault;
 use origin_provider::catalog::{AuthScheme, ProviderEntry, WireFormat};
 use std::time::Duration;
 
-/// What happened during the probe. The variant tells `init.rs` how to react:
-/// `Ok` → continue, `AuthFailed` → offer to retry credentials, `Unreachable`
-/// → warn and ask to continue anyway, `Skipped` → no test performed (silent).
+/// What happened during the probe.
+///
+/// The variant tells `init.rs` how to react: `Ok` → continue, `AuthFailed`
+/// → offer to retry credentials, `Unreachable` → warn and ask to continue
+/// anyway, `Skipped` → no test performed (silent).
 #[derive(Debug, Clone)]
 pub enum ProbeOutcome {
     /// 2xx response from the models endpoint. Credentials work.
@@ -42,10 +44,11 @@ impl ProbeOutcome {
     }
 }
 
-/// Probe result: outcome plus any model ids the endpoint advertised. The
-/// list is `Vec::new()` for skipped probes, network errors, parse failures,
-/// or providers whose endpoint shape we don't recognize — callers should
-/// always fall back to `entry.default_model` when this is empty.
+/// Probe result: outcome plus any model ids the endpoint advertised.
+///
+/// The list is `Vec::new()` for skipped probes, network errors, parse
+/// failures, or providers whose endpoint shape we don't recognize — callers
+/// should always fall back to `entry.default_model` when this is empty.
 #[derive(Debug, Clone)]
 pub struct ProbeResult {
     pub outcome: ProbeOutcome,
@@ -196,8 +199,8 @@ impl ConnectivityProbe for LiveProbe {
 }
 
 /// Wire-specific GET path that returns the list of available models.
-/// `None` means probing is not supported for that wire (Bedrock needs SigV4
-/// signing; GitHubCopilot's models endpoint requires a separate token
+/// `None` means probing is not supported for that wire (Bedrock needs `SigV4`
+/// signing; `GitHubCopilot`'s models endpoint requires a separate token
 /// exchange that's beyond v1 scope).
 fn models_endpoint(entry: &ProviderEntry) -> Option<String> {
     match entry.wire {
@@ -209,14 +212,14 @@ fn models_endpoint(entry: &ProviderEntry) -> Option<String> {
     }
 }
 
-/// Derive an OpenAI-compatible models path from a chat path. Each OpenAI-
-/// compatible gateway puts its API under a different prefix
+/// Derive an `OpenAI`-compatible models path from a chat path. Each
+/// `OpenAI`-compatible gateway puts its API under a different prefix
 /// (`/v1`, `/api/v1`, `/inference/v1`, …), but every one of them puts
 /// `models` next to `chat/completions`, so the derivation just swaps the
 /// last two segments.
 ///
 /// Falls back to `/v1/models` for catalog entries whose `chat_path` doesn't
-/// follow the `chat/completions` convention (e.g. OpenAI Codex `/responses`).
+/// follow the `chat/completions` convention (e.g. `OpenAI` Codex `/responses`).
 fn openai_models_path(chat_path: &str) -> String {
     if let Some(stem) = chat_path.strip_suffix("/chat/completions") {
         return format!("{stem}/models");
@@ -329,7 +332,7 @@ pub struct MockProbe {
 
 impl MockProbe {
     #[must_use]
-    pub fn ok_with_models(models: Vec<String>) -> Self {
+    pub const fn ok_with_models(models: Vec<String>) -> Self {
         Self {
             outcome: ProbeOutcome::Ok,
             models,
@@ -337,7 +340,7 @@ impl MockProbe {
     }
 
     #[must_use]
-    pub fn ok_no_models() -> Self {
+    pub const fn ok_no_models() -> Self {
         Self::ok_with_models(Vec::new())
     }
 

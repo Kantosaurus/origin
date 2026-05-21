@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 
 /// Resolve `~/.origin/pending-prompt.txt`. Honors `$ORIGIN_HOME` for tests
 /// and alternate-root installs, matching `crate::config::path`.
+///
+/// # Errors
+/// Returns an error if neither `$ORIGIN_HOME` nor the home directory can be
+/// resolved.
 pub fn path() -> Result<PathBuf> {
     let home = std::env::var_os("ORIGIN_HOME")
         .map(PathBuf::from)
@@ -25,7 +29,7 @@ pub fn path() -> Result<PathBuf> {
 /// The markdown body of the discovery prompt. Public so tests + welcome
 /// screens can render it for the user as a preview.
 #[must_use]
-pub fn discovery_prompt_body() -> &'static str {
+pub const fn discovery_prompt_body() -> &'static str {
     "Please do a one-time skill and tool discovery sweep for this origin install.\n\
      \n\
      1. Use Glob to find every `SKILL.md` under `~/.claude/`, `~/.config/opencode/`, \
@@ -47,6 +51,10 @@ pub fn discovery_prompt_body() -> &'static str {
 
 /// Write the seed prompt to `p`. Overwrites any existing file (re-running
 /// `origin init` re-arms the discovery).
+///
+/// # Errors
+/// Returns an I/O error if the parent directory cannot be created or the
+/// file cannot be written.
 pub fn seed_to(p: &Path) -> Result<()> {
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent)?;
@@ -55,10 +63,15 @@ pub fn seed_to(p: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read + delete the pending prompt at `p`. Returns `Ok(None)` when the
-/// file does not exist (steady state after first run). The delete is
-/// best-effort — read errors propagate, but a delete failure is logged
-/// and ignored so a permission glitch doesn't block the chat.
+/// Read + delete the pending prompt at `p`.
+///
+/// Returns `Ok(None)` when the file does not exist (steady state after
+/// first run). The delete is best-effort — read errors propagate, but a
+/// delete failure is logged and ignored so a permission glitch doesn't
+/// block the chat.
+///
+/// # Errors
+/// Returns an I/O error if the file exists but cannot be read.
 pub fn drain(p: &Path) -> Result<Option<String>> {
     let body = match std::fs::read_to_string(p) {
         Ok(b) => b,
