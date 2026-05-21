@@ -81,3 +81,33 @@ pub fn load_skills_dir(root: &Path) -> Result<Vec<Skill>, LoaderError> {
 
     Ok(out)
 }
+
+/// Load embedded skills plus any user overrides from `user_root`, with user
+/// entries taking precedence on name collision. Missing `user_root` is fine —
+/// embedded skills are still returned.
+///
+/// # Errors
+/// Forwards [`LoaderError`] from `load_skills_dir` when `user_root` exists but
+/// a file under it is malformed.
+pub fn load_all(user_root: &std::path::Path) -> Result<Vec<Skill>, LoaderError> {
+    let mut acc = crate::embedded::load_embedded();
+    if user_root.exists() {
+        let user = load_skills_dir(user_root)?;
+        // Index embedded by name for O(1) replacement.
+        let mut by_name: std::collections::HashMap<String, usize> = acc
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.front.name.clone(), i))
+            .collect();
+        for skill in user {
+            match by_name.get(&skill.front.name).copied() {
+                Some(i) => acc[i] = skill,
+                None => {
+                    by_name.insert(skill.front.name.clone(), acc.len());
+                    acc.push(skill);
+                }
+            }
+        }
+    }
+    Ok(acc)
+}
