@@ -4,14 +4,14 @@
 pub mod arena_id;
 pub mod scope;
 
-#[cfg(not(feature = "jemalloc"))]
+#[cfg(not(all(feature = "jemalloc", unix)))]
 mod noop_backend;
-#[cfg(not(feature = "jemalloc"))]
+#[cfg(not(all(feature = "jemalloc", unix)))]
 pub(crate) use noop_backend as backend;
 
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", unix))]
 mod jemalloc_backend;
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", unix))]
 pub(crate) use jemalloc_backend as backend;
 
 pub use arena_id::ArenaId;
@@ -28,16 +28,16 @@ pub use scope::ArenaScope;
 /// The library itself does NOT install a `#[global_allocator]` — that is the
 /// binary's choice. Per-arena MALLCTL calls still function regardless because
 /// `tikv-jemalloc-sys` links the jemalloc symbols in unconditionally.
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", unix))]
 pub use tikv_jemallocator::Jemalloc as JemallocAllocator;
 
 use thiserror::Error;
 
 /// Per-arena resident / allocated byte snapshot.
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", unix))]
 pub use crate::jemalloc_backend::ArenaStat;
 /// Per-arena resident / allocated byte snapshot (no-op backend — all zeros).
-#[cfg(not(feature = "jemalloc"))]
+#[cfg(not(all(feature = "jemalloc", unix)))]
 pub use crate::noop_backend::ArenaStat;
 
 #[derive(Debug, Error)]
