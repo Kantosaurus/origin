@@ -12,7 +12,7 @@ use origin_permission::prompt::AlwaysAllow;
 use origin_provider::{ChatRequest, ChatResponse, Provider, ProviderError, Usage};
 use std::sync::{Arc, Mutex};
 
-/// Capture the `system` field of every ChatRequest the run_loop emits, so
+/// Capture the `system` field of every `ChatRequest` the `run_loop` emits, so
 /// the test can assert the catalog text was injected.
 struct CapturingProvider {
     seen_systems: Mutex<Vec<String>>,
@@ -65,7 +65,7 @@ async fn system_prompt_lists_each_skill_in_catalog() {
         .await
         .expect("loop ok");
 
-    let systems = provider.seen_systems.lock().expect("lock");
+    let systems = provider.seen_systems.lock().expect("lock").clone();
     assert_eq!(systems.len(), 1);
     let sys = &systems[0];
     assert!(sys.contains("alpha"), "system prompt missing alpha:\n{sys}");
@@ -90,7 +90,7 @@ async fn empty_catalog_does_not_pollute_system_prompt() {
     let _ = run_loop(&mut session, "hi", &provider, &AlwaysAllow, &opts)
         .await
         .expect("loop ok");
-    let systems = provider.seen_systems.lock().expect("lock");
+    let systems = provider.seen_systems.lock().expect("lock").clone();
     // Empty catalog → empty (or unchanged-by-injection) system prompt.
     assert!(
         !systems[0].contains("Available skills"),

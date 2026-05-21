@@ -23,6 +23,12 @@ pub struct SkillCatalog {
 impl SkillCatalog {
     /// Load every skill under `root`. Returns an empty catalog if `root`
     /// does not exist; surfaces I/O or frontmatter errors via `Err`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LoaderError`] if a skill directory exists at `root` but
+    /// cannot be walked, or if any individual skill's `SKILL.md` frontmatter
+    /// fails to parse / validate.
     pub fn load_from(root: &Path) -> Result<Self, LoaderError> {
         if !root.exists() {
             return Ok(Self::default());
