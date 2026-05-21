@@ -87,6 +87,11 @@ pub struct LoopOptions {
     /// HNSW index. When `None`, those tools return
     /// `ToolFailure("memory subsystem not configured")`.
     pub memory_handle: Option<Arc<dyn MemoryHandle>>,
+    /// Optional swarm coordinator for the `Task` tool. When `None`, Task
+    /// returns `ToolFailure("Task subsystem not configured")`. When `Some`,
+    /// Task spawns a noop (P9.6) or real (P9.8+) worker and returns the
+    /// structured `TaskOutput` JSON.
+    pub coordinator: Option<Arc<origin_swarm::Coordinator>>,
 }
 
 impl Default for LoopOptions {
@@ -107,6 +112,7 @@ impl Default for LoopOptions {
             skills: None,
             skill_catalog: None,
             memory_handle: None,
+            coordinator: None,
         }
     }
 }
@@ -243,12 +249,12 @@ impl SpeculativeRegistry {
             return;
         }
         let handle = spawn_in(TaskClass::Critical, async move {
-            // Speculative tasks pass `None` for graph/mem/memory-handle:
-            // those subsystem-dependent tools (graph_*, ask, mem_*) are routed
-            // through the main dispatch path where the real handles are
-            // available. Speculation here only benefits the handle-free tools
-            // (Read/Glob/Grep/Edit/Bash/Recall/graph_explain).
-            let text = dispatch_tool(meta, &args, cas.as_deref(), None, None, None).await?;
+            // Speculative tasks pass `None` for every subsystem handle.
+            // Tools that need a handle (graph_*, ask, mem_*, Task) flow
+            // through the main dispatch path. Task is Mutating so it never
+            // speculatively dispatches anyway; the None for coordinator here
+            // is API consistency.
+            let text = dispatch_tool(meta, &args, cas.as_deref(), None, None, None, None).await?;
             Ok::<_, LoopError>(text.into_bytes())
         });
         self.in_flight.insert(tool_use_id, handle);
@@ -513,6 +519,7 @@ pub async fn run_loop(
                         opts.code_graph.as_ref(),
                         opts.mem_router.as_ref().map(Arc::as_ref),
                         opts.memory_handle.as_deref(),
+                        opts.coordinator.as_deref(),
                     )
                     .await?
                     .into_bytes()
@@ -591,7 +598,7 @@ pub fn rebuild_codegraph(
 
 #[tracing::instrument(
     level = "info",
-    skip(args, cas, code_graph, mem_router, memory),
+    skip(args, cas, code_graph, mem_router, memory, coordinator),
     fields(kind = "tool", tool = meta.name)
 )]
 async fn dispatch_tool(
@@ -601,6 +608,7 @@ async fn dispatch_tool(
     code_graph: Option<&Arc<tokio::sync::Mutex<origin_codegraph::index::CodeGraphIndex>>>,
     mem_router: Option<&dyn origin_codegraph::ask::MemRouter>,
     memory: Option<&dyn MemoryHandle>,
+    coordinator: Option<&origin_swarm::Coordinator>,
 ) -> Result<String, LoopError> {
     match meta.name {
         "Read" => {
@@ -952,13 +960,20 @@ async fn dispatch_tool(
             .to_string())
         }
         // ── Task ──
-        // Needs an `origin_swarm::Coordinator` constructed against a PlanHandle.
-        // The daemon has a PlanBus but no Coordinator instance yet.
-        "Task" => Err(LoopError::ToolFailure(
-            "Task: swarm subsystem not yet wired. Construct an origin_swarm::Coordinator \
-             at daemon startup and thread it through LoopOptions."
-                .into(),
-        )),
+        // Requires an `origin_swarm::Coordinator` threaded through `LoopOptions`.
+        "Task" => {
+            let coord = coordinator.ok_or_else(|| {
+                LoopError::ToolFailure("Task subsystem not configured".into())
+            })?;
+            let input: origin_tools::builtins::task::TaskInput =
+                serde_json::from_value(args.clone())
+                    .map_err(|e| LoopError::BadArgs(format!("Task: {e}")))?;
+            let output = origin_tools::builtins::task::task_tool(coord, input)
+                .await
+                .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
+            serde_json::to_string(&output)
+                .map_err(|e| LoopError::ToolFailure(format!("Task: json: {e}")))
+        }
         other => Err(LoopError::UnknownTool(other.into())),
     }
 }
@@ -1273,7 +1288,7 @@ mod dispatch_table_tests {
         let empty = serde_json::Value::Object(serde_json::Map::new());
         let mut unrecognized: Vec<String> = Vec::new();
         for meta in registry_iter() {
-            let result = dispatch_tool(meta, &empty, None, None, None, None).await;
+            let result = dispatch_tool(meta, &empty, None, None, None, None, None).await;
             if let Err(LoopError::UnknownTool(name)) = &result {
                 unrecognized.push(name.clone());
             }
@@ -1293,19 +1308,19 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_explain")
             .expect("graph_explain registered");
         let args = serde_json::json!({"kind": "communities"});
-        let out = dispatch_tool(meta, &args, None, None, None, None).await.expect("communities dispatch");
+        let out = dispatch_tool(meta, &args, None, None, None, None, None).await.expect("communities dispatch");
         assert_eq!(out, "all detected communities");
 
         let args = serde_json::json!({
             "kind": "recent_changes",
             "args": {"since_ms": 1_700_000_000_000_i64}
         });
-        let out = dispatch_tool(meta, &args, None, None, None, None).await.expect("recent_changes dispatch");
+        let out = dispatch_tool(meta, &args, None, None, None, None, None).await.expect("recent_changes dispatch");
         assert!(out.contains("1700000000000"), "got: {out}");
 
         // Unknown kind surfaces as BadArgs, not ToolFailure or UnknownTool.
         let args = serde_json::json!({"kind": "bogus"});
-        let err = dispatch_tool(meta, &args, None, None, None, None).await.expect_err("bogus must fail");
+        let err = dispatch_tool(meta, &args, None, None, None, None, None).await.expect_err("bogus must fail");
         assert!(matches!(err, LoopError::BadArgs(_)));
     }
 
@@ -1327,7 +1342,7 @@ mod dispatch_table_tests {
             let meta = registry_iter()
                 .find(|m| m.name == name)
                 .unwrap_or_else(|| panic!("{name} not registered"));
-            let err = dispatch_tool(meta, &args, None, None, None, None).await.expect_err(name);
+            let err = dispatch_tool(meta, &args, None, None, None, None, None).await.expect_err(name);
             match err {
                 LoopError::ToolFailure(msg) => {
                     assert!(
@@ -1353,7 +1368,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_query")
             .expect("graph_query registered");
         let args = serde_json::json!({"kind": "communities"});
-        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None)
+        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None, None)
             .await
             .expect("graph_query dispatch");
         // QueryResult::Empty serializes as "{}".
@@ -1378,6 +1393,7 @@ mod dispatch_table_tests {
             Some(&code_graph),
             Some(&null_router as &dyn origin_codegraph::ask::MemRouter),
             None,
+            None,
         )
         .await
         .expect("ask dispatch");
@@ -1395,7 +1411,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_rebuild")
             .expect("graph_rebuild registered");
         let args = serde_json::json!({"paths": []});
-        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None)
+        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None, None)
             .await
             .expect("graph_rebuild dispatch");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
@@ -1470,7 +1486,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "mem_search")
             .expect("mem_search registered");
         let args = serde_json::json!({"query": "anything"});
-        let err = dispatch_tool(meta, &args, None, None, None, None)
+        let err = dispatch_tool(meta, &args, None, None, None, None, None)
             .await
             .expect_err("must fail without handle");
         match err {
@@ -1497,7 +1513,7 @@ mod dispatch_table_tests {
             "body": "the quick brown fox",
             "tags": ["test", "roundtrip"]
         });
-        let save_out = dispatch_tool(save_meta, &save_args, None, None, None, Some(&handle))
+        let save_out = dispatch_tool(save_meta, &save_args, None, None, None, Some(&handle), None)
             .await
             .expect("mem_save must succeed");
         let save_json: serde_json::Value =
@@ -1511,7 +1527,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "mem_search")
             .expect("mem_search registered");
         let search_args = serde_json::json!({"query": "quick brown", "k": 5});
-        let search_out = dispatch_tool(search_meta, &search_args, None, None, None, Some(&handle))
+        let search_out = dispatch_tool(search_meta, &search_args, None, None, None, Some(&handle), None)
             .await
             .expect("mem_search must succeed");
         let hits: serde_json::Value =
@@ -1528,5 +1544,89 @@ mod dispatch_table_tests {
                 .map_or(false, |p| p.contains("quick brown")),
             "hit preview must contain the saved body; got {first}"
         );
+    }
+
+    // ── Subsystem C tests: Task (with swarm Coordinator) ──────────────────────
+
+    /// When `coordinator` is `None`, `Task` must return `ToolFailure` (not
+    /// `UnknownTool`). Regression guard for the subsystem-not-configured path.
+    #[tokio::test]
+    async fn task_without_coordinator_returns_toolfailure() {
+        let meta = registry_iter()
+            .find(|m| m.name == "Task")
+            .expect("Task registered");
+        let args = serde_json::json!({
+            "goal": "do something",
+            "allowed_tools": []
+        });
+        let err = dispatch_tool(meta, &args, None, None, None, None, None)
+            .await
+            .expect_err("Task without coordinator must fail");
+        match err {
+            LoopError::ToolFailure(msg) => {
+                assert!(
+                    msg.contains("subsystem"),
+                    "Task ToolFailure message must mention subsystem; got `{msg}`"
+                );
+            }
+            LoopError::UnknownTool(_) => panic!("Task regressed to UnknownTool"),
+            other => panic!("unexpected error variant {other:?}"),
+        }
+    }
+
+    /// When a real `Coordinator` (backed by an in-memory `Plan` + `PlanStore`
+    /// over in-memory `CasStore` + `SqlStore`) is threaded through, `Task` must
+    /// return a valid `TaskOutput` JSON. The default noop worker always completes
+    /// successfully, so the round-trip asserts shape, not semantic content.
+    #[tokio::test]
+    async fn task_with_coordinator_spawns_noop_worker() {
+        use std::sync::Arc;
+
+        // Build in-memory backing stores.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("plan.db");
+        let sql = Arc::new(
+            origin_store::Store::open(db_path.to_str().expect("utf8"))
+                .expect("sql open"),
+        );
+        let cas_root = tmp.path().join("cas");
+        let cas = Arc::new(
+            origin_cas::Store::open(origin_cas::StoreConfig {
+                root: cas_root,
+                hot_capacity: 16,
+                warm_pack_target_bytes: 1024 * 1024,
+                cold_zstd_level: 1,
+            })
+            .expect("cas open"),
+        );
+
+        // Construct Plan / PlanStore / PlanHandle / Coordinator.
+        let plan = Arc::new(tokio::sync::Mutex::new(origin_plan::Plan::new()));
+        let plan_store = Arc::new(
+            origin_plan::PlanStore::open(Arc::clone(&sql), Arc::clone(&cas))
+                .expect("plan store open"),
+        );
+        let plan_handle = origin_swarm::PlanHandle::new(plan, plan_store);
+        let coordinator = Arc::new(origin_swarm::Coordinator::new(plan_handle, "test-ring"));
+
+        let meta = registry_iter()
+            .find(|m| m.name == "Task")
+            .expect("Task registered");
+        let args = serde_json::json!({
+            "goal": "noop integration test",
+            "allowed_tools": []
+        });
+
+        let out = dispatch_tool(meta, &args, None, None, None, None, Some(coordinator.as_ref()))
+            .await
+            .expect("Task with coordinator must succeed");
+
+        // Assert the output is valid JSON with the expected shape.
+        let v: serde_json::Value =
+            serde_json::from_str(&out).expect("TaskOutput must be valid JSON");
+        assert!(v.get("status").is_some(), "TaskOutput must have `status`");
+        assert!(v.get("summary").is_some(), "TaskOutput must have `summary`");
+        assert!(v.get("files_touched").is_some(), "TaskOutput must have `files_touched`");
+        assert!(v.get("follow_ups").is_some(), "TaskOutput must have `follow_ups`");
     }
 }
