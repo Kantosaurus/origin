@@ -2,6 +2,7 @@
 //!
 //! Edges land in P7.3; this module emits nodes only.
 
+use origin_cas::{Store as CasStore, StoreError as CasError};
 use thiserror::Error;
 use tree_sitter::Node;
 
@@ -24,14 +25,25 @@ pub struct Range {
     pub end: usize,
 }
 
-/// Public stub. Full `CodeNode` (with `signature_handle`, `body_handle`) lands
-/// in P7.3 when records are wired through CAS. Here we surface just enough
-/// (name, kind, byte range) to validate extraction.
+/// Extracted code-graph node.
+///
+/// `range` is the whole declaration span; `signature_range` covers the header
+/// (start → opening `{` for blocked declarations, or the whole node when there
+/// is no body block); `body_range` is the inside of the block when present,
+/// otherwise `None`.
+///
+/// `signature_handle` / `body_handle` are zeroed when produced via
+/// [`extract_nodes`], and populated with CAS hashes when produced via
+/// [`extract_nodes_with_cas`].
 #[derive(Debug, Clone)]
 pub struct CodeNode {
     pub name: String,
     pub kind: NodeKind,
     pub range: Range,
+    pub signature_range: Range,
+    pub body_range: Option<Range>,
+    pub signature_handle: [u8; 32],
+    pub body_handle: [u8; 32],
 }
 
 /// Public stub — P7.3 expands to the full edge record.
@@ -60,9 +72,14 @@ pub enum ExtractError {
     Lang(#[from] LangError),
     #[error("source not utf-8: {0}")]
     Utf8(#[from] std::str::Utf8Error),
+    #[error("cas: {0}")]
+    Cas(#[from] CasError),
 }
 
 /// Extract top-level node declarations.
+///
+/// The returned [`CodeNode`]s have `signature_handle` and `body_handle` set to
+/// the zero hash; use [`extract_nodes_with_cas`] to populate them via CAS.
 ///
 /// # Errors
 /// Returns [`ExtractError::Lang`] if parsing fails and [`ExtractError::Utf8`]
@@ -77,15 +94,50 @@ pub fn extract_nodes(lang: Language, src: &[u8]) -> Result<Vec<CodeNode>, Extrac
     Ok(out)
 }
 
+/// Same as [`extract_nodes`] but CAS-writes signature/body byte slices.
+///
+/// The resulting handles populate every emitted [`CodeNode`]. Nodes with no
+/// body block (e.g. unit structs) get the zero handle for `body_handle`.
+///
+/// # Errors
+/// Propagates [`ExtractError::Lang`], [`ExtractError::Utf8`], and
+/// [`ExtractError::Cas`] when the CAS store rejects a write.
+#[allow(clippy::module_name_repetitions)]
+pub fn extract_nodes_with_cas(
+    lang: Language,
+    src: &[u8],
+    cas: &CasStore,
+) -> Result<Vec<CodeNode>, ExtractError> {
+    let mut nodes = extract_nodes(lang, src)?;
+    for n in &mut nodes {
+        let sig_end = n.signature_range.end.min(src.len());
+        let sig_start = n.signature_range.start.min(sig_end);
+        let sig_bytes = &src[sig_start..sig_end];
+        n.signature_handle = *cas.put(sig_bytes)?.as_bytes();
+        if let Some(b) = n.body_range {
+            let end = b.end.min(src.len());
+            let start = b.start.min(end);
+            n.body_handle = *cas.put(&src[start..end])?.as_bytes();
+        }
+    }
+    Ok(nodes)
+}
+
 fn walk(node: Node, lang: Language, src: &[u8], out: &mut Vec<CodeNode>) -> Result<(), ExtractError> {
     if let Some((name, kind)) = classify(node, lang, src)? {
+        let whole = Range {
+            start: node.start_byte(),
+            end: node.end_byte(),
+        };
+        let (signature_range, body_range) = sig_and_body_ranges(node, whole);
         out.push(CodeNode {
             name,
             kind,
-            range: Range {
-                start: node.start_byte(),
-                end: node.end_byte(),
-            },
+            range: whole,
+            signature_range,
+            body_range,
+            signature_handle: [0u8; 32],
+            body_handle: [0u8; 32],
         });
     }
     let mut cursor = node.walk();
@@ -93,6 +145,38 @@ fn walk(node: Node, lang: Language, src: &[u8], out: &mut Vec<CodeNode>) -> Resu
         walk(child, lang, src, out)?;
     }
     Ok(())
+}
+
+/// Compute `(signature_range, body_range)` for a classified declaration node.
+///
+/// The body is the child reached via tree-sitter's `body` field (function
+/// blocks, class bodies, etc). The signature is everything from the node's
+/// start up to the body's start, less any trailing whitespace. When there is
+/// no body field the signature is the whole declaration and `body_range` is
+/// `None` (true for e.g. Rust unit / tuple structs and `mod foo;`).
+fn sig_and_body_ranges(node: Node, whole: Range) -> (Range, Option<Range>) {
+    node.child_by_field_name("body").map_or((whole, None), |body| {
+        let body_outer_start = body.start_byte();
+        let body_outer_end = body.end_byte();
+        // For blocked bodies (`{ ... }`, indented Python suites) tree-sitter
+        // includes the delimiters in the body node's span. Trim the leading
+        // `{` so `body_handle` content matches the human notion of "body".
+        // Python suites lead with `:` + newline; we can't easily strip those
+        // without language-specific logic, so we just keep the outer span.
+        let body_inner_start = body_outer_start.saturating_add(1).min(body_outer_end);
+        let body_inner_end = body_outer_end.saturating_sub(1).max(body_inner_start);
+        let signature_end = body_outer_start.max(whole.start);
+        (
+            Range {
+                start: whole.start,
+                end: signature_end,
+            },
+            Some(Range {
+                start: body_inner_start,
+                end: body_inner_end,
+            }),
+        )
+    })
 }
 
 /// Classify a tree-sitter node as a `NodeKind` if it represents a top-level
