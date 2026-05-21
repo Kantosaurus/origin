@@ -371,11 +371,20 @@ fn expand_messages_for_wire(
                     .map_err(|e| ProviderError::Api(format!("cas get: {e}")))?
                     .ok_or_else(|| ProviderError::Api("cas miss for tool result handle".into()))?;
 
-                // Phase 3 stub: any handle in the active turn is treated as Volatile.
-                // The full section-to-block mapping arrives with the N4.3 encoder codegen in Phase 11.
-                let band = plan.map_or(origin_planner::Band::Volatile, |_p| {
-                    origin_planner::Band::Volatile
-                });
+                // N4.3: consult the per-handle band index in `O(1)`. The
+                // planner populates this via `Plan::register_handle` as
+                // it threads sections through the compactor; callers that
+                // have not registered a particular handle fall through to
+                // the safe floor (`Band::Volatile`), which preserves the
+                // pre-N4.3 behavior of aggressive inlining.
+                //
+                // This is the novel angle that beats openclaude/jcode/
+                // opencode on tokens: they re-serialize every tool result
+                // unconditionally, while we can demote long-lived handles
+                // to a short `<result handle:… — N bytes>` reference.
+                let band = plan
+                    .and_then(|p| p.band_for_handle(h))
+                    .unwrap_or(origin_planner::Band::Volatile);
 
                 match origin_planner::WireDecision::for_block(band, bytes.len()) {
                     origin_planner::WireDecision::Inline => {
