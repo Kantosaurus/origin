@@ -8,7 +8,7 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt as _;
 use origin_cli::cli_def::{Cli, Cmd, KeyringSub, PairSub, ProvidersSub, SessionsSub, TraceSub};
-use origin_cli::input::{parse_mem_command, reduce, InputAction};
+use origin_cli::input::{parse_mem_command, parse_skill_command, reduce, InputAction};
 use origin_cli::plan_panel_wiring::Wiring as PlanPanelWiring;
 use origin_cli::tui::App;
 use origin_daemon::protocol::{ClientMessage, PromptRequest, StreamEvent};
@@ -323,6 +323,21 @@ async fn handle_submit(app: &SharedApp, handle: &Handle, path: &str, model: &str
         handle.mark_dirty();
         return;
     }
+    // `/<name>` / `/<plugin>:<name>` activate; `/-<name>` deactivates.
+    // Route through a one-shot IPC connection just like /mem and /account.
+    if let Some(msg) = parse_skill_command(text) {
+        {
+            let mut a = app.lock();
+            a.add_line("you> ", text);
+        }
+        handle.mark_dirty();
+        match send_skill_command(path, &msg).await {
+            Ok(line) => app.lock().add_line("ok> ", &line),
+            Err(e) => app.lock().add_line("error> ", &format!("{e}")),
+        }
+        handle.mark_dirty();
+        return;
+    }
     {
         let mut a = app.lock();
         a.add_line("you> ", text);
@@ -494,6 +509,34 @@ async fn send_decision(path: &str, decision: &ClientMessage) -> Result<()> {
     // Errors here are non-fatal — the decision has already been sent.
     let _ = client.read_frame_body().await;
     Ok(())
+}
+
+/// Send a skill activate/deactivate message and drain the daemon's reply,
+/// returning a one-line summary to render in the TUI. Mirrors the
+/// `/mem` send_decision helper in shape.
+async fn send_skill_command(path: &str, msg: &ClientMessage) -> Result<String> {
+    let mut client: Connection = Connector::connect(path).await?;
+    let body = serde_json::to_vec(msg)?;
+    let frame = encode(1, FrameKind::Request, &body);
+    client.write_raw(&frame).await?;
+    let resp = client.read_frame_body().await?;
+    let ev: StreamEvent = serde_json::from_slice(&resp)
+        .map_err(|e| anyhow::anyhow!("bad reply: {e}"))?;
+    match ev {
+        StreamEvent::SkillActive { name, allowed_tools } => {
+            if allowed_tools.is_empty() {
+                Ok(format!("skill `{name}` active (no narrowing)"))
+            } else {
+                Ok(format!(
+                    "skill `{name}` active; allowed tools: {}",
+                    allowed_tools.join(", ")
+                ))
+            }
+        }
+        StreamEvent::SkillError { message } => Err(anyhow::anyhow!("{message}")),
+        StreamEvent::AdminOk => Ok("skill deactivated".to_string()),
+        other => Err(anyhow::anyhow!("unexpected reply: {other:?}")),
+    }
 }
 
 fn sub_to_action(sub: SessionsSub) -> origin_cli::admin::SessionsAction {

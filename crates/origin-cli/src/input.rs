@@ -85,6 +85,63 @@ pub fn parse_mem_command(line: &str) -> Option<ClientMessage> {
     }
 }
 
+/// Slash verbs that already have dedicated handlers — they must not be
+/// re-routed through the skill parser even though they start with `/`.
+/// Update this list when a new slash verb is added.
+const RESERVED_SLASH_VERBS: &[&str] = &["mem", "account", "help"];
+
+/// Parse `/<name>` (activate) and `/-<name>` (deactivate) into a
+/// [`ClientMessage::ActivateSkill`] or [`ClientMessage::DeactivateSkill`].
+///
+/// Rules:
+/// - Leading `/` required; the rest is the skill name (or `-<name>` for
+///   deactivate). Names may contain `:` (namespaced skills like
+///   `frontend-design:frontend-design`).
+/// - Names must not contain whitespace — a slash with embedded spaces is
+///   prompt text mentioning a path, not a skill invocation.
+/// - Reserved slash verbs (`/mem`, `/account`, `/help`) and the workflow
+///   shape (`{workflow:...}`) are rejected so callers can fall through to
+///   their own handlers.
+///
+/// Returns `None` for any non-matching input.
+#[must_use]
+pub fn parse_skill_command(line: &str) -> Option<ClientMessage> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix('/')?;
+    if rest.is_empty() {
+        return None;
+    }
+    // Whitespace inside the slash invalidates it as a skill — free-form
+    // chat that happens to contain a `/` shouldn't activate anything.
+    if rest.chars().any(char::is_whitespace) {
+        return None;
+    }
+    // Disambiguate the deactivate sigil first.
+    if let Some(name) = rest.strip_prefix('-') {
+        if name.is_empty() {
+            return None;
+        }
+        // Apply the reserved-verb guard to the deactivate form too, so
+        // `/-mem` (silly but possible) never deactivates something named
+        // `mem` that would shadow the `/mem` verb if one existed.
+        if RESERVED_SLASH_VERBS.iter().any(|v| name == *v) {
+            return None;
+        }
+        return Some(ClientMessage::DeactivateSkill {
+            name: name.to_string(),
+        });
+    }
+    // Activate form: `/<name>` or `/<plugin>:<name>`.
+    // First word before any `:` is checked against reserved verbs.
+    let first_segment = rest.split(':').next().unwrap_or(rest);
+    if RESERVED_SLASH_VERBS.iter().any(|v| first_segment == *v) {
+        return None;
+    }
+    Some(ClientMessage::ActivateSkill {
+        name: rest.to_string(),
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unreachable)] // panic! is the idiomatic mismatched-variant assertion in test code
 mod tests {
@@ -176,5 +233,67 @@ mod tests {
         assert!(parse_mem_command("/mem").is_none());
         assert!(parse_mem_command("/mem accept abc").is_none());
         assert!(parse_mem_command("/mem edit 1").is_none()); // missing body
+    }
+
+    #[test]
+    fn parse_skill_bare_name() {
+        let m = parse_skill_command("/frontend-design").expect("parse");
+        match m {
+            ClientMessage::ActivateSkill { name } => assert_eq!(name, "frontend-design"),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_skill_namespaced() {
+        let m = parse_skill_command("/frontend-design:frontend-design").expect("parse");
+        match m {
+            ClientMessage::ActivateSkill { name } => {
+                assert_eq!(name, "frontend-design:frontend-design");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_skill_deactivate_with_dash_prefix() {
+        let m = parse_skill_command("/-frontend-design").expect("parse");
+        match m {
+            ClientMessage::DeactivateSkill { name } => assert_eq!(name, "frontend-design"),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_skill_deactivate_namespaced() {
+        let m = parse_skill_command("/-frontend-design:frontend-design").expect("parse");
+        match m {
+            ClientMessage::DeactivateSkill { name } => {
+                assert_eq!(name, "frontend-design:frontend-design");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_skill_rejects_empty_and_whitespace() {
+        // Bare slash with no name, dash with no name, slash with trailing text.
+        assert!(parse_skill_command("/").is_none());
+        assert!(parse_skill_command("/-").is_none());
+        assert!(parse_skill_command("/ ").is_none());
+        // Embedded whitespace disambiguates the slash from chat content
+        // (e.g. "/foo bar baz" is a free-form prompt mentioning a path).
+        assert!(parse_skill_command("/foo bar").is_none());
+    }
+
+    #[test]
+    fn parse_skill_does_not_shadow_known_verbs() {
+        // `/mem accept 1`, `/account default`, and `/workflow X` are not skills.
+        assert!(parse_skill_command("/mem").is_none());
+        assert!(parse_skill_command("/account").is_none());
+        // Free-form text never parses as a skill.
+        assert!(parse_skill_command("hello").is_none());
+        // `{workflow:foo}` is a workflow, not a skill.
+        assert!(parse_skill_command("{workflow:foo}").is_none());
     }
 }
