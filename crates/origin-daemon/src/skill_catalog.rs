@@ -24,6 +24,12 @@ pub struct SkillCatalog {
 impl SkillCatalog {
     /// Load embedded skills plus any user overrides under `root`. The 14
     /// superpowers skills are always present even if `root` does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LoaderError`] if a skill directory exists at `root` but
+    /// cannot be walked, or if any individual skill's `SKILL.md` frontmatter
+    /// fails to parse / validate.
     pub fn load_from(root: &Path) -> Result<Self, LoaderError> {
         let skills = load_all(root)?;
         Ok(Self { skills })

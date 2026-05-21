@@ -348,7 +348,7 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
                 let tmp = std::env::temp_dir().join("origin-cg-fallback");
                 let _ = std::fs::create_dir_all(&tmp);
                 let fallback_cas = origin_cas::Store::open(origin_cas::StoreConfig {
-                    root: tmp.clone(),
+                    root: tmp,
                     hot_capacity: 8,
                     warm_pack_target_bytes: 1 << 20,
                     cold_zstd_level: 1,
@@ -966,7 +966,7 @@ async fn handle_memory_decision(
 /// loop deterministically.
 // `handle_request` threads each subsystem handle a `Prompt` may touch in one
 // signature. Bundling them into a struct is a P14 polish item.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_request(
     conn: &SharedConnection,
     provider: &dyn Provider,
@@ -1045,15 +1045,17 @@ async fn handle_request(
                 // don't want to hold the per-connection lock across an
                 // arbitrarily long turn.
                 let guard = active_skills.lock().await;
-                if guard.allowed_tools().is_some() {
+                let snapshot_opt: Option<SkillRegistry> = if guard.allowed_tools().is_some() {
                     let mut snapshot = SkillRegistry::new();
                     for s in guard.iter_active() {
                         snapshot.activate(s.clone());
                     }
-                    Some(Arc::new(snapshot))
+                    Some(snapshot)
                 } else {
                     None
-                }
+                };
+                drop(guard);
+                snapshot_opt.map(Arc::new)
             },
             skill_catalog: Some(Arc::clone(&skill_catalog)),
             memory_handle: memory_handle.clone(),
