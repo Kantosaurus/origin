@@ -18,5 +18,6 @@ pub mod shutdown;
 pub mod stream_relay;
 pub mod tool_use_parser;
 pub mod skill_catalog;
+pub mod workflows;
 
 pub use memory_wiring::{MemoryDispatchHandle, MemoryWiring};

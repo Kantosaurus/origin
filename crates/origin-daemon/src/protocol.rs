@@ -119,6 +119,12 @@ pub enum ClientMessage {
     /// Always replies with [`StreamEvent::AdminOk`] — deactivating an
     /// inactive skill is not an error.
     DeactivateSkill { name: String },
+    /// Walk `name`'s steps in `~/.origin/workflows.toml`, activating each
+    /// step's skill in order on this connection's stack. The daemon
+    /// replies with [`StreamEvent::WorkflowActive`] listing the skills it
+    /// activated, or [`StreamEvent::SkillError`] if the workflow isn't
+    /// found / no skill in the chain resolves.
+    ActivateWorkflow { name: String },
     /// Subscribe this connection to the daemon-wide plan-op broadcast.
     /// Every subsequent [`OpEnvelope`] published to the bus is forwarded as
     /// a [`StreamEvent::PlanOp`] event frame. The subscription terminates
@@ -247,6 +253,13 @@ pub enum StreamEvent {
     /// Negative ack for [`ClientMessage::ActivateSkill`] — typically the
     /// requested skill is not in the daemon's catalog.
     SkillError { message: String },
+    /// Ack for a successful [`ClientMessage::ActivateWorkflow`]. `steps` is
+    /// the ordered list of skill names that were activated; the CLI renders
+    /// them so the user can see the chain that just took effect.
+    WorkflowActive {
+        name: String,
+        steps: Vec<String>,
+    },
     /// P13.4.2: negative acknowledgement carrying a human-readable error
     /// message. Used as the failure side of the admin mutation handlers.
     AdminError {
