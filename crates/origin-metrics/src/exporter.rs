@@ -6,14 +6,8 @@
 #[cfg(feature = "otel")]
 pub mod otel {
     use opentelemetry::global;
-    // `WithExportConfig` is imported as a trait so downstream call sites have
-    // a stable path even though the stub body below does not invoke it yet.
-    // `WithExportConfig` is not dyn-compatible (generic methods, `-> Self`),
-    // so we can't reference it through `dyn`. The `use as _` import keeps the
-    // trait in scope without producing a `unused_imports` warning.
-    use opentelemetry_otlp::WithExportConfig as _;
 
-    /// Install a global OTel meter provider pointing at `endpoint`.
+    /// Install a global `OTel` meter provider pointing at `endpoint`.
     ///
     /// # Errors
     /// Returns a string error if exporter setup fails.
