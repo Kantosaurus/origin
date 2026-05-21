@@ -14,7 +14,7 @@ use rusqlite::{params, OptionalExtension};
 use ulid::Ulid;
 
 use crate::quantizer::{EncodedVector, Quantizer};
-use origin_cas::Store as CasStore;
+use origin_cas::{Hash, RefTable, Store as CasStore};
 use origin_store::Store as SqlStore;
 
 /// Stable public identity for a stored memory.
@@ -53,6 +53,8 @@ pub enum StorageError {
     Sql(#[from] rusqlite::Error),
     #[error("cas: {0}")]
     Cas(#[from] origin_cas::StoreError),
+    #[error("cas refs: {0}")]
+    CasRefs(#[from] origin_cas::RefError),
     #[error("ulid: {0}")]
     Ulid(#[from] ulid::DecodeError),
     #[error("no quantizer trained yet")]
@@ -183,24 +185,57 @@ impl MemoryStore {
                     superseded_by,
                 ],
             )?;
+            // Increment the CAS refcount for the body handle so GC can track
+            // liveness. The CAS `put` above is dedup'd by hash, so multiple
+            // memories sharing the same body all contribute +1 each here.
+            //
+            // `RefTable::incr` errors are wrapped into `rusqlite::Error::SqliteFailure`
+            // so they propagate through the SQL transaction; the outer
+            // `with_conn` returns `rusqlite::Result`, and `?` in the
+            // surrounding `save` upgrades it to `StorageError::Sql`. (Pure
+            // sqlite errors inside `incr` already surface as `RefError::Sqlite`.)
+            RefTable::new().incr(&tx, hash).map_err(map_ref_err_to_sql)?;
             tx.commit()
         })?;
 
         Ok(id)
     }
 
-    /// Delete a memory row.  The CAS blob is left for the GC sweeper to reap.
+    /// Delete a memory row and decrement the CAS refcount of its body handle.
+    ///
+    /// The pack-level CAS blob is left in place; once the refcount hits zero
+    /// the GC sweeper (`RefTable::dead_hashes`) will surface the hash for
+    /// reclamation. Both the row delete and the refcount decrement run in a
+    /// single transaction so a partial state is impossible: either both land
+    /// or neither does.
+    ///
+    /// No-op (returns `Ok`) if `id` does not exist.
     ///
     /// # Errors
-    /// Propagates SQL errors.
-    ///
-    /// # Note
-    /// Refcount decrement is deferred to the existing idle GC (see P2 / `RefTable`).
-    /// TODO(P6.x): call `RefTable::decr` here once the GC is wired to `MemoryStore`.
+    /// Propagates SQL and `RefTable` errors.
     pub fn forget(&self, id: MemoryId) -> Result<(), StorageError> {
         let id_str = id.to_string();
         self.sql.with_conn(|conn| {
-            conn.execute("DELETE FROM memories WHERE id = ?1", params![id_str])?;
+            let tx = conn.unchecked_transaction()?;
+            // Read the body_handle for this row (if any) so we can decrement
+            // its CAS refcount after the delete. If the row is absent, the
+            // delete + decrement are both no-ops and we return cleanly.
+            let handle_blob: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT body_handle FROM memories WHERE id = ?1",
+                    params![id_str],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )
+                .optional()?;
+            tx.execute("DELETE FROM memories WHERE id = ?1", params![id_str])?;
+            if let Some(blob) = handle_blob {
+                let mut arr = [0u8; 32];
+                let n = blob.len().min(32);
+                arr[..n].copy_from_slice(&blob[..n]);
+                let hash = Hash::from_bytes(arr);
+                RefTable::new().decr(&tx, hash).map_err(map_ref_err_to_sql)?;
+            }
+            tx.commit()?;
             Ok(())
         })?;
         Ok(())
@@ -560,4 +595,19 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+/// Re-wrap a `RefError` into a `rusqlite::Error` so it can flow through the
+/// outer SQL transaction's `?` operator. Pure sqlite-shaped errors are
+/// unwrapped; the `BelowZero` invariant violation is reported as a
+/// `SqliteFailure` with a synthetic CONSTRAINT code so it surfaces in logs
+/// but does not require a separate error variant in the transaction body.
+fn map_ref_err_to_sql(e: origin_cas::RefError) -> rusqlite::Error {
+    match e {
+        origin_cas::RefError::Sqlite(s) => s,
+        origin_cas::RefError::BelowZero(_) => rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some(format!("cas_refs: {e}")),
+        ),
+    }
 }
