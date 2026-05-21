@@ -19,6 +19,10 @@ pub enum ClientError {
     Exited,
 }
 
+// name `AgentBrowserClient` mirrors `CloakClient` as the matching backend
+// pair — renaming to drop the module-name overlap would obscure the
+// pair-symmetry that the router relies on.
+#[allow(clippy::module_name_repetitions)]
 pub struct AgentBrowserClient {
     #[allow(dead_code)]
     child: Child,
@@ -43,6 +47,10 @@ impl AgentBrowserClient {
     ///
     /// # Errors
     /// Forwards spawn IO errors.
+    // signature stays async so callers can keep their `.await` and the
+    // pair `CloakClient::spawn_with_command` (also async) shares the same
+    // shape; the body uses no await today but the trait pair is async.
+    #[allow(clippy::unused_async)]
     pub async fn spawn_with_command(prog: &str, args: &[&str]) -> Result<Self, ClientError> {
         let mut child = Command::new(prog)
             .args(args)

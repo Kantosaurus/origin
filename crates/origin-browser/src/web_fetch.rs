@@ -1,4 +1,4 @@
-//! WebFetch: GET a URL, run readability over the HTML, return markdown.
+//! `WebFetch`: GET a URL, run readability over the HTML, return markdown.
 //!
 //! Pure Rust path — no subprocess required. Used for one-shot reader-mode
 //! summaries where the router's snapshot/ref protocol would be overkill.

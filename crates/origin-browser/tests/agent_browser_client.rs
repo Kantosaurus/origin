@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use origin_browser::agent_browser::AgentBrowserClient;
 use origin_browser::protocol::Verb;
 

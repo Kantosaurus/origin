@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use origin_browser::web_search::{search_with_endpoint, SearchOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;

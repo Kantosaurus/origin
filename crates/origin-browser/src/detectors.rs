@@ -26,6 +26,12 @@ const BOT_PATTERNS: &[(&str, &str)] = &[
     ("kasada",        "kasada"),
 ];
 
+/// Classify a snapshot response as `Verdict::Clean` or `Verdict::BotDetected`.
+///
+/// # Panics
+///
+/// Panics if the static title-detection regex fails to compile — which would
+/// indicate a build-time bug in the literal pattern, not user input.
 #[must_use]
 pub fn classify(r: &SnapshotResp) -> Verdict {
     if matches!(r.status, Some(429)) {

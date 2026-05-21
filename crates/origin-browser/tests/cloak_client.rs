@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use origin_browser::cloak::CloakClient;
 use origin_browser::protocol::Verb;
 

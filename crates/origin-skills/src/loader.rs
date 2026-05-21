@@ -100,12 +100,11 @@ pub fn load_all(user_root: &std::path::Path) -> Result<Vec<Skill>, LoaderError> 
             .map(|(i, s)| (s.front.name.clone(), i))
             .collect();
         for skill in user {
-            match by_name.get(&skill.front.name).copied() {
-                Some(i) => acc[i] = skill,
-                None => {
-                    by_name.insert(skill.front.name.clone(), acc.len());
-                    acc.push(skill);
-                }
+            if let Some(i) = by_name.get(&skill.front.name).copied() {
+                acc[i] = skill;
+            } else {
+                by_name.insert(skill.front.name.clone(), acc.len());
+                acc.push(skill);
             }
         }
     }

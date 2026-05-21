@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use origin_skills::{load_all, load_embedded};
 use tempfile::tempdir;
 

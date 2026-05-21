@@ -1,4 +1,4 @@
-//! origin-browser: dual-backend browser routing + WebFetch + WebSearch.
+//! `origin-browser`: dual-backend browser routing + `WebFetch` + `WebSearch`.
 //!
 //! Public surface is the three top-level entry points:
 //!  - `BrowserRouter::run(verb)` for stateful browsing

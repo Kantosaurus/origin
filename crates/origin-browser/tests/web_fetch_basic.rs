@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use origin_browser::web_fetch::{fetch, FetchOptions};
 
 #[tokio::test]

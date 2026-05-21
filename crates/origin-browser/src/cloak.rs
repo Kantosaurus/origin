@@ -1,4 +1,4 @@
-//! Subprocess client for the vendored CloakBrowser sidecar.
+//! Subprocess client for the vendored `CloakBrowser` sidecar.
 //!
 //! Resolves the sidecar via `ORIGIN_CLOAK_DIR` env var, or falls back to
 //! `<exe-dir>/../vendor/cloak-browser/cloak-cli.mjs`. Runs `node` on it.
@@ -22,6 +22,10 @@ pub enum ClientError {
     NotFound(std::path::PathBuf),
 }
 
+// name `CloakClient` mirrors `AgentBrowserClient` as the matching backend
+// pair — renaming to drop the module-name overlap would obscure the
+// pair-symmetry that the router relies on.
+#[allow(clippy::module_name_repetitions)]
 pub struct CloakClient {
     #[allow(dead_code)]
     child: Child,
@@ -44,6 +48,10 @@ impl CloakClient {
     ///
     /// # Errors
     /// Forwards spawn IO errors.
+    // signature stays async so callers can keep their `.await` and the
+    // pair `AgentBrowserClient::spawn_with_command` (also async) shares the
+    // same shape; the body uses no await today but the trait pair is async.
+    #[allow(clippy::unused_async)]
     pub async fn spawn_with_command(prog: &str, args: &[&str]) -> Result<Self, ClientError> {
         let mut child = Command::new(prog)
             .args(args)
