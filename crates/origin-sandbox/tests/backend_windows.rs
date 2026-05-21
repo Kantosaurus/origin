@@ -5,7 +5,7 @@
 //! is then expected to invoke `attach_job_object_if_needed` on the spawned
 //! child before resuming the main thread.
 
-#![cfg(all(target_os = "windows", feature = "windows"))]
+#![cfg(all(target_os = "windows", feature = "windows", not(feature = "no-sandbox")))]
 
 use origin_sandbox::{apply, backend_windows::attach_job_object_if_needed, SandboxProfile};
 use std::process::Command;
