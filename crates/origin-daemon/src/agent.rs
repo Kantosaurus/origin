@@ -13,6 +13,7 @@ use origin_provider::{ChatRequest, Provider};
 use origin_runtime::{spawn_in, TaskClass};
 use origin_sidecar::{ExtractDeliverer, Sidecar, SummaryDeliverer};
 use origin_skills::SkillRegistry;
+use crate::skill_catalog::SkillCatalog;
 use origin_tools::{registry_iter, SideEffects, ToolMeta};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -68,6 +69,11 @@ pub struct LoopOptions {
     /// through to the default tier rules — equivalent to passing an empty
     /// registry, since an empty stack's mask is `None` (no narrowing).
     pub skills: Option<Arc<SkillRegistry>>,
+    /// Daemon-wide skill catalog injected into each turn's system prompt
+    /// so the model knows which skills are available. The actual
+    /// activation state lives in `skills` above; this is the catalog of
+    /// all loadable skills, separate from "currently active".
+    pub skill_catalog: Option<Arc<SkillCatalog>>,
 }
 
 impl Default for LoopOptions {
@@ -84,6 +90,7 @@ impl Default for LoopOptions {
             injector: None,
             proposal_registry: None,
             skills: None,
+            skill_catalog: None,
         }
     }
 }
@@ -280,7 +287,7 @@ pub async fn run_loop(
     // once at turn-start and reuse the resulting `<context>` block as the
     // system prompt of every turn in this run_loop call. Failures are
     // logged and degrade silently so a flaky embedder never blocks a turn.
-    let recalled_system =
+    let recall_block =
         opts.injector
             .as_ref()
             .map_or_else(String::new, |injector| match injector.for_prompt(user_text, 5) {
@@ -291,6 +298,46 @@ pub async fn run_loop(
                     String::new()
                 }
             });
+
+    // Build the skill-catalog block. One line per skill: "- <name>: <description>".
+    // We mark currently-active skills with a leading `*` so the model knows
+    // which mask is already in effect.
+    let catalog_block = opts
+        .skill_catalog
+        .as_ref()
+        .map(|cat| {
+            if cat.is_empty() {
+                String::new()
+            } else {
+                let active_names: std::collections::HashSet<String> = opts
+                    .skills
+                    .as_ref()
+                    .map(|reg| reg.iter_active().map(|s| s.name.clone()).collect())
+                    .unwrap_or_default();
+                let mut out = String::from("Available skills (invoke via `/skill <name>`):\n");
+                for s in cat.iter() {
+                    let marker = if active_names.contains(&s.front.name) {
+                        "*"
+                    } else {
+                        "-"
+                    };
+                    use std::fmt::Write as _;
+                    let _ = writeln!(out, "  {marker} {}: {}", s.front.name, s.front.description);
+                }
+                out
+            }
+        })
+        .unwrap_or_default();
+
+    // Concatenate: catalog first (so it's stable across recall variation),
+    // then recall context.
+    let recalled_system = if catalog_block.is_empty() {
+        recall_block
+    } else if recall_block.is_empty() {
+        catalog_block
+    } else {
+        format!("{catalog_block}\n{recall_block}")
+    };
 
     for turn in 1..=opts.max_turns {
         let req = ChatRequest {
