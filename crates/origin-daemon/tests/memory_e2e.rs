@@ -89,6 +89,8 @@ async fn memory_e2e_proposer_to_store_via_wiremock() {
     let opts = LoopOptions {
         max_turns: 5,
         cas: Some(Arc::clone(&cas)),
+        code_graph: None,
+        mem_router: None,
         relay_tx: None,
         streaming_disabled: true,
         proposer: Some(Arc::clone(&proposer)),
