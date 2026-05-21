@@ -9,7 +9,7 @@
 //! host because the per-arena MALLCTL surface is independent of the global
 //! allocator choice.
 
-#![cfg(feature = "jemalloc")]
+#![cfg(all(feature = "jemalloc", unix))]
 
 #[global_allocator]
 static GLOBAL: origin_alloc::JemallocAllocator = origin_alloc::JemallocAllocator;

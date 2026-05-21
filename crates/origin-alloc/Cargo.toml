@@ -27,6 +27,12 @@ jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc
 thiserror = "1"
 tracing = { workspace = true }
 
+# `tikv-jemalloc-sys` builds jemalloc via autotools and is unix-only.
+# Gate the optional deps to `cfg(unix)` so `--all-features` resolves on
+# Windows (the `jemalloc` feature becomes a no-op there because the
+# optional deps never materialise; `lib.rs` cfg-gates the backend the
+# same way).
+[target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
 tikv-jemalloc-sys = { version = "0.6", optional = true }
