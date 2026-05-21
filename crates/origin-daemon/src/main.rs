@@ -848,8 +848,7 @@ async fn handle_request(
     sidecar: Arc<Sidecar>,
     memory: Option<&MemoryWiring>,
     proposal_registry: Arc<ProposalRegistry>,
-    // Task 4 wires this into the per-request skill stack (system-prompt injection).
-    #[allow(unused_variables)] skill_catalog: Arc<SkillCatalog>,
+    skill_catalog: Arc<SkillCatalog>,
     active_skills: Arc<tokio::sync::Mutex<SkillRegistry>>,
     req: PromptRequest,
 ) -> bool {
@@ -923,6 +922,7 @@ async fn handle_request(
                     None
                 }
             },
+            skill_catalog: Some(Arc::clone(&skill_catalog)),
         };
         run_loop(&mut session, &req.user_text, provider, &AlwaysAllow, &opts).await
     };
