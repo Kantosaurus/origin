@@ -249,22 +249,32 @@ fn message_to_wire<'a>(m: &'a Message, plan: Option<&Plan>, msg_idx: usize) -> w
         Role::Assistant => "assistant",
     };
     let marker_indices: &[usize] = plan.map_or(&[], Plan::marker_indices);
+    // Count emitted `cache_control` markers across the message so we can warn
+    // when callers approach Anthropic's per-request 4-marker ceiling. The
+    // warn fires at the message level; aggregating across messages would
+    // require a wider pass, so we settle for per-message visibility here.
+    let mut emitted_markers: usize = 0;
     let content = m
         .blocks
         .iter()
         .enumerate()
         .filter_map(|(block_idx, b)| {
-            // Emit a cache marker on a block when:
-            // - a plan is present
-            // - this is the first message (msg_idx == 0)
-            // - block_idx is in the plan's marker_indices
-            // TODO(N4.3/Phase 11): lift the `msg_idx == 0` gate once handle-substitution lands and
-            // the planner's marker_indices() map to a stable section-to-wire-block index.
-            // Also: enumerate over wire-block index (post `block_to_wire` filter) to avoid
-            // index skew when assistant messages contain `Block::Thinking` (which is
-            // dropped from the wire). At P3.2 only user messages (msg_idx == 0) carry
-            // markers, so the skew is unreachable.
-            let cache_control = if plan.is_some() && msg_idx == 0 && marker_indices.contains(&block_idx) {
+            // Two paths can emit a `cache_control` on a block:
+            //
+            // 1. A `Plan` planted a marker at `(msg_idx == 0, block_idx)`
+            //    via `Plan::marker_indices`. This is the legacy P3.2 path
+            //    for first-message section boundaries.
+            //
+            // 2. The block itself carries `cache_marker: Some(_)`. Phase 11
+            //    handle-substitution makes section markers viable on any
+            //    message (not just msg 0), so we honour the in-band marker
+            //    regardless of `msg_idx`. All `CacheBoundary` variants map
+            //    to `"ephemeral"`: that is the only `cache_control.type`
+            //    the Anthropic Messages API accepts today.
+            let plan_marker_here = plan.is_some() && msg_idx == 0 && marker_indices.contains(&block_idx);
+            let block_marker_here = block_has_cache_marker(b);
+            let cache_control = if plan_marker_here || block_marker_here {
+                emitted_markers = emitted_markers.saturating_add(1);
                 Some(wire::WireCacheControl::ephemeral())
             } else {
                 None
@@ -272,7 +282,24 @@ fn message_to_wire<'a>(m: &'a Message, plan: Option<&Plan>, msg_idx: usize) -> w
             block_to_wire(b, cache_control)
         })
         .collect();
+    if emitted_markers > 4 {
+        tracing::warn!(
+            msg_idx,
+            emitted_markers,
+            "Anthropic accepts at most 4 cache_control markers per request; \
+             the API will reject the overflow. Trim cache markers or split the request."
+        );
+    }
     wire::WireMessage { role, content }
+}
+
+const fn block_has_cache_marker(b: &Block) -> bool {
+    match b {
+        Block::Text { cache_marker, .. }
+        | Block::ToolUse { cache_marker, .. }
+        | Block::ToolResult { cache_marker, .. } => cache_marker.is_some(),
+        Block::Thinking { .. } => false,
+    }
 }
 
 fn block_to_wire(b: &Block, cache_control: Option<wire::WireCacheControl>) -> Option<wire::WireBlock<'_>> {
@@ -385,6 +412,52 @@ fn short_hex(h: &[u8; 32]) -> String {
         .chars()
         .take(8)
         .collect()
+}
+
+/// Test-only: build the JSON body that `Provider::chat` would POST to
+/// `/v1/messages`, without any plan, CAS expansion, or network I/O.
+///
+/// This mirrors the encode pipeline used in `Provider::chat` but returns the
+/// `serde_json::Value` body directly so integration tests can assert on the
+/// wire shape (in particular, the placement of `cache_control` markers).
+///
+/// Marked `#[doc(hidden)]` so it does not bloat the public docs surface — it
+/// is not part of the supported API and may change without a semver bump.
+///
+/// # Panics
+/// Panics if serialisation fails. Serialisation here cannot fail in practice
+/// (all fields are owned `String` / `Vec<u8>` / `&str`); callers may
+/// `expect("encode")` on the surrounding flow as needed.
+#[doc(hidden)]
+#[must_use]
+pub fn encode_request_for_test(req: &ChatRequest) -> serde_json::Value {
+    let wire_messages = req
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(idx, m)| message_to_wire(m, None, idx))
+        .collect::<Vec<_>>();
+    let wire_tools = req
+        .tools
+        .iter()
+        .map(|t| wire::WireTool {
+            name: &t.name,
+            description: &t.description,
+            input_schema: serde_json::from_str(&t.input_schema_json).unwrap_or_else(|_| json!({})),
+        })
+        .collect::<Vec<_>>();
+    let body = wire::WireRequest {
+        model: &req.model,
+        max_tokens: DEFAULT_MAX_TOKENS,
+        system: if req.system.is_empty() {
+            None
+        } else {
+            Some(req.system.as_str())
+        },
+        messages: wire_messages,
+        tools: wire_tools,
+    };
+    serde_json::to_value(&body).expect("WireRequest serialises to JSON")
 }
 
 fn decode_response(wire: wire::WireResponse) -> ChatResponse {
