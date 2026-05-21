@@ -14,6 +14,7 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = { workspace = true }
 thiserror = "1"
 blake3 = "1"
+include_dir = { workspace = true }
 origin-mem = { path = "../origin-mem" }
 
 [dev-dependencies]
