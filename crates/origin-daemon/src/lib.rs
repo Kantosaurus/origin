@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod auth;
+pub mod default_workflow;
 pub mod compactor;
 pub mod config;
 pub mod daemon_memory_handle;

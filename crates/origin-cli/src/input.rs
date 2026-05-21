@@ -143,10 +143,11 @@ pub fn parse_skill_command(line: &str) -> Option<ClientMessage> {
 }
 
 /// Parse `{workflow:<name>}` (the whole trimmed line) into a
-/// [`ClientMessage::ActivateWorkflow`]. Surrounding whitespace is allowed;
-/// inline references mid-prompt are NOT — the entire trimmed line must be
-/// the brace token, to keep the form unambiguous with chat content that
-/// happens to mention braces.
+/// [`ClientMessage::ActivateWorkflow`].
+///
+/// Surrounding whitespace is allowed; inline references mid-prompt are NOT
+/// — the entire trimmed line must be the brace token, to keep the form
+/// unambiguous with chat content that happens to mention braces.
 ///
 /// Returns `None` for unrecognized input.
 #[must_use]

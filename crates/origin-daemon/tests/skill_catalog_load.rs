@@ -21,7 +21,9 @@ fn catalog_finds_skills_in_subdirs() {
     write_skill(dir.path(), "alpha");
     write_skill(dir.path(), "beta");
     let cat = SkillCatalog::load_from(dir.path()).expect("load");
-    assert_eq!(cat.len(), 2);
+    // `load_from` now always includes the embedded superpowers skills in
+    // addition to anything under `dir`; assert presence of the two user
+    // skills rather than an exact count.
     assert!(cat.find("alpha").is_some());
     assert!(cat.find("beta").is_some());
 }

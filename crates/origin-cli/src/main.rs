@@ -131,8 +131,10 @@ async fn main() -> Result<()> {
     let (default_provider, default_model) = origin_cli::config::load()
         .ok()
         .flatten()
-        .map(|c| (c.primary.provider, c.primary.model))
-        .unwrap_or_else(|| ("anthropic".to_string(), "claude-opus-4-7".to_string()));
+        .map_or_else(
+            || ("anthropic".to_string(), "claude-opus-4-7".to_string()),
+            |c| (c.primary.provider, c.primary.model),
+        );
 
     let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
     let model = env::var("ORIGIN_MODEL").unwrap_or(default_model);
@@ -166,10 +168,9 @@ async fn main() -> Result<()> {
     // prompt, fire it as the user's first turn and remove the file so it
     // never auto-fires twice. Errors are non-fatal — the user can always
     // type a prompt manually.
-    let pending_prompt = match origin_cli::first_run_prompt::path() {
-        Ok(p) => origin_cli::first_run_prompt::drain(&p).ok().flatten(),
-        Err(_) => None,
-    };
+    let pending_prompt = origin_cli::first_run_prompt::path()
+        .ok()
+        .and_then(|p| origin_cli::first_run_prompt::drain(&p).ok().flatten());
 
     let scheduler = Scheduler::new(Duration::from_millis(6));
     let handle = scheduler.handle();
@@ -311,6 +312,7 @@ fn spawn_plan_subscription(path: String, wiring: Arc<Mutex<PlanPanelWiring>>, re
     });
 }
 
+#[allow(clippy::too_many_lines)] // Single linear dispatch over many slash commands; splitting hurts readability.
 async fn handle_submit(app: &SharedApp, handle: &Handle, path: &str, model: &str, text: &str) {
     if let Some(rest) = slash_account_args(text) {
         {
@@ -555,7 +557,7 @@ async fn send_decision(path: &str, decision: &ClientMessage) -> Result<()> {
 
 /// Send a skill activate/deactivate message and drain the daemon's reply,
 /// returning a one-line summary to render in the TUI. Mirrors the
-/// `/mem` send_decision helper in shape.
+/// `/mem` `send_decision` helper in shape.
 async fn send_skill_command(path: &str, msg: &ClientMessage) -> Result<String> {
     let mut client: Connection = Connector::connect(path).await?;
     let body = serde_json::to_vec(msg)?;

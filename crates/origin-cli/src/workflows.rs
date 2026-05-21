@@ -39,6 +39,7 @@ pub struct Workflow {
 }
 
 /// Top-level on-disk shape of `~/.origin/workflows.toml`.
+#[allow(clippy::module_name_repetitions)] // `WorkflowsFile` is the documented public type
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowsFile {
     #[serde(default = "default_schema_version")]
@@ -51,6 +52,7 @@ const fn default_schema_version() -> u32 {
     SCHEMA_VERSION
 }
 
+#[allow(clippy::module_name_repetitions)] // `WorkflowsError` is the public error name
 #[derive(Debug, Error)]
 pub enum WorkflowsError {
     #[error("home directory not found (set $ORIGIN_HOME or $HOME)")]
@@ -63,6 +65,12 @@ pub enum WorkflowsError {
     Serialize(#[from] toml::ser::Error),
 }
 
+/// Resolve `~/.origin/workflows.toml`. Honors `$ORIGIN_HOME` for tests and
+/// alternate-root installs.
+///
+/// # Errors
+/// Returns [`WorkflowsError::NoHome`] if neither `$ORIGIN_HOME` nor a home
+/// directory can be resolved.
 pub fn path() -> Result<PathBuf, WorkflowsError> {
     let home = std::env::var_os("ORIGIN_HOME")
         .map(PathBuf::from)
@@ -79,6 +87,10 @@ pub fn exists() -> bool {
 
 /// Atomic save: write to `.tmp` sibling, then rename — same convention
 /// as `crate::config::save_to`.
+///
+/// # Errors
+/// Returns [`WorkflowsError::Io`] on directory create / write / rename
+/// failure or [`WorkflowsError::Serialize`] if `file` fails to serialise.
 pub fn save_to(p: &Path, file: &WorkflowsFile) -> Result<(), WorkflowsError> {
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent)?;
@@ -90,6 +102,12 @@ pub fn save_to(p: &Path, file: &WorkflowsFile) -> Result<(), WorkflowsError> {
     Ok(())
 }
 
+/// Load `workflows.toml` from `p`, returning `Ok(None)` when the file is
+/// absent so callers can distinguish first-run from corruption.
+///
+/// # Errors
+/// Returns [`WorkflowsError::Io`] on read failure or
+/// [`WorkflowsError::Parse`] on malformed TOML.
 pub fn load_from(p: &Path) -> Result<Option<WorkflowsFile>, WorkflowsError> {
     if !p.exists() {
         return Ok(None);
@@ -99,6 +117,7 @@ pub fn load_from(p: &Path) -> Result<Option<WorkflowsFile>, WorkflowsError> {
 }
 
 /// An example workflow used during onboarding to demonstrate the format.
+///
 /// Chains `frontend-design:frontend-design` (shape the UX) with
 /// `impeccable` invoked as `teach` (set up project design context) —
 /// matches the example the operator gave during setup.
@@ -125,6 +144,9 @@ pub fn example_workflow() -> Workflow {
 /// Write a starter `workflows.toml` containing one example workflow.
 /// Returns `Ok(false)` if a file already exists at `p` (so re-running
 /// onboarding doesn't clobber user edits).
+///
+/// # Errors
+/// Forwards [`WorkflowsError`] from [`save_to`].
 pub fn seed_if_missing(p: &Path) -> Result<bool, WorkflowsError> {
     if p.exists() {
         return Ok(false);
