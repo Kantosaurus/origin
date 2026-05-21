@@ -142,6 +142,29 @@ pub fn parse_skill_command(line: &str) -> Option<ClientMessage> {
     })
 }
 
+/// Parse `{workflow:<name>}` (the whole trimmed line) into a
+/// [`ClientMessage::ActivateWorkflow`]. Surrounding whitespace is allowed;
+/// inline references mid-prompt are NOT — the entire trimmed line must be
+/// the brace token, to keep the form unambiguous with chat content that
+/// happens to mention braces.
+///
+/// Returns `None` for unrecognized input.
+#[must_use]
+pub fn parse_workflow_command(line: &str) -> Option<ClientMessage> {
+    let trimmed = line.trim();
+    let inner = trimmed.strip_prefix('{')?.strip_suffix('}')?;
+    let name = inner.strip_prefix("workflow:")?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    if name.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(ClientMessage::ActivateWorkflow {
+        name: name.to_string(),
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unreachable)] // panic! is the idiomatic mismatched-variant assertion in test code
 mod tests {
@@ -295,5 +318,33 @@ mod tests {
         assert!(parse_skill_command("hello").is_none());
         // `{workflow:foo}` is a workflow, not a skill.
         assert!(parse_skill_command("{workflow:foo}").is_none());
+    }
+
+    #[test]
+    fn parse_workflow_command_basic() {
+        let m = parse_workflow_command("{workflow:frontend-design}").expect("parse");
+        match m {
+            ClientMessage::ActivateWorkflow { name } => assert_eq!(name, "frontend-design"),
+            other => panic!("wrong: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_workflow_command_tolerates_surrounding_whitespace() {
+        let m = parse_workflow_command("  {workflow:frontend-design}  ").expect("parse");
+        match m {
+            ClientMessage::ActivateWorkflow { name } => assert_eq!(name, "frontend-design"),
+            other => panic!("wrong: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_workflow_command_rejects_malformed() {
+        assert!(parse_workflow_command("{workflow:}").is_none());
+        assert!(parse_workflow_command("{workflow}").is_none());
+        assert!(parse_workflow_command("{wf:foo}").is_none());
+        // Inline references mid-prompt are explicitly out of scope.
+        assert!(parse_workflow_command("please run {workflow:x}").is_none());
+        assert!(parse_workflow_command("/foo").is_none());
     }
 }

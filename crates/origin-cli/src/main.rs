@@ -8,7 +8,9 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt as _;
 use origin_cli::cli_def::{Cli, Cmd, KeyringSub, PairSub, ProvidersSub, SessionsSub, TraceSub};
-use origin_cli::input::{parse_mem_command, parse_skill_command, reduce, InputAction};
+use origin_cli::input::{
+    parse_mem_command, parse_skill_command, parse_workflow_command, reduce, InputAction,
+};
 use origin_cli::plan_panel_wiring::Wiring as PlanPanelWiring;
 use origin_cli::tui::App;
 use origin_daemon::protocol::{ClientMessage, PromptRequest, StreamEvent};
@@ -338,6 +340,21 @@ async fn handle_submit(app: &SharedApp, handle: &Handle, path: &str, model: &str
         handle.mark_dirty();
         return;
     }
+    // `{workflow:<name>}` walks a chain of skills server-side. Same IPC
+    // helper as /skill since both replies flow through send_skill_command.
+    if let Some(msg) = parse_workflow_command(text) {
+        {
+            let mut a = app.lock();
+            a.add_line("you> ", text);
+        }
+        handle.mark_dirty();
+        match send_skill_command(path, &msg).await {
+            Ok(line) => app.lock().add_line("ok> ", &line),
+            Err(e) => app.lock().add_line("error> ", &format!("{e}")),
+        }
+        handle.mark_dirty();
+        return;
+    }
     {
         let mut a = app.lock();
         a.add_line("you> ", text);
@@ -535,6 +552,16 @@ async fn send_skill_command(path: &str, msg: &ClientMessage) -> Result<String> {
         }
         StreamEvent::SkillError { message } => Err(anyhow::anyhow!("{message}")),
         StreamEvent::AdminOk => Ok("skill deactivated".to_string()),
+        StreamEvent::WorkflowActive { name, steps } => {
+            if steps.is_empty() {
+                Ok(format!("workflow `{name}` activated (no steps resolved)"))
+            } else {
+                Ok(format!(
+                    "workflow `{name}` activated; skills: {}",
+                    steps.join(" → ")
+                ))
+            }
+        }
         other => Err(anyhow::anyhow!("unexpected reply: {other:?}")),
     }
 }

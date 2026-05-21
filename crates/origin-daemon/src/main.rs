@@ -690,6 +690,63 @@ fn spawn_handler_task(
                         .write_frame(FrameKind::Event, &body)
                         .await;
                 }
+                ClientMessage::ActivateWorkflow { name } => {
+                    let conn_clone = Arc::clone(&conn);
+                    // Load workflows.toml fresh so user edits land without a
+                    // daemon restart.
+                    let home = std::env::var_os("ORIGIN_HOME")
+                        .map(std::path::PathBuf::from)
+                        .or_else(dirs::home_dir)
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    let wf_path = home.join(".origin").join("workflows.toml");
+                    let file = match origin_daemon::workflows::load_from(&wf_path) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            let ev = StreamEvent::SkillError {
+                                message: format!("workflows.toml load: {e}"),
+                            };
+                            let body = serde_json::to_vec(&ev).unwrap_or_default();
+                            let _ = conn_clone.lock().await.write_frame(FrameKind::Event, &body).await;
+                            continue;
+                        }
+                    };
+                    let Some(wf) = file.workflows.iter().find(|w| w.name == name) else {
+                        let ev = StreamEvent::SkillError {
+                            message: format!("no such workflow: {name}"),
+                        };
+                        let body = serde_json::to_vec(&ev).unwrap_or_default();
+                        let _ = conn_clone.lock().await.write_frame(FrameKind::Event, &body).await;
+                        continue;
+                    };
+                    let mut activated: Vec<String> = Vec::new();
+                    for step in &wf.steps {
+                        if let Some(skill) = skill_load_cache.iter().find(|s| s.front.name == step.skill) {
+                            active_skills.lock().await.activate(skill.front.clone());
+                            activated.push(step.skill.clone());
+                        } else {
+                            // Surface the missing skill but keep going — a partial chain is still useful.
+                            let ev = StreamEvent::SkillError {
+                                message: format!(
+                                    "workflow {name} step {} missing from catalog: {}",
+                                    activated.len() + 1,
+                                    step.skill
+                                ),
+                            };
+                            let body = serde_json::to_vec(&ev).unwrap_or_default();
+                            let _ = conn_clone
+                                .lock()
+                                .await
+                                .write_frame(FrameKind::Event, &body)
+                                .await;
+                        }
+                    }
+                    let ev = StreamEvent::WorkflowActive {
+                        name: name.clone(),
+                        steps: activated,
+                    };
+                    let body = serde_json::to_vec(&ev).unwrap_or_default();
+                    let _ = conn_clone.lock().await.write_frame(FrameKind::Event, &body).await;
+                }
                 ClientMessage::SubscribePlan => {
                     spawn_plan_relay(plan_bus.subscribe(), Arc::clone(&conn));
                 }
@@ -1089,7 +1146,8 @@ async fn handle_admin(
         | ClientMessage::ResumeRequest { .. }
         | ClientMessage::SubscribePlan
         | ClientMessage::ActivateSkill { .. }
-        | ClientMessage::DeactivateSkill { .. } => return true,
+        | ClientMessage::DeactivateSkill { .. }
+        | ClientMessage::ActivateWorkflow { .. } => return true,
     };
     write_event(conn, &ev).await.is_ok()
 }
