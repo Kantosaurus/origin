@@ -1,4 +1,4 @@
-//! Integration test: SkillCatalog loads from a real directory layout.
+//! Integration test: `SkillCatalog` loads from a real directory layout.
 
 use origin_daemon::skill_catalog::SkillCatalog;
 use std::path::Path;

@@ -1,4 +1,6 @@
-//! Daemon-side workflow loader. Mirrors the on-disk shape produced by
+//! Daemon-side workflow loader.
+//!
+//! Mirrors the on-disk shape produced by
 //! `origin init` (see `crates/origin-cli/src/workflows.rs`). Kept as a
 //! small duplicate rather than introducing a daemon→cli dep; consolidating
 //! into an `origin-workflows` crate is a follow-up.
@@ -21,6 +23,8 @@ pub struct Workflow {
     pub steps: Vec<WorkflowStep>,
 }
 
+// name appears in user-facing config error messages, must be unambiguous.
+#[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkflowsFile {
     #[serde(default)]
@@ -29,6 +33,15 @@ pub struct WorkflowsFile {
     pub workflows: Vec<Workflow>,
 }
 
+/// Load a `workflows.toml` file from disk into a [`WorkflowsFile`].
+///
+/// Returns an empty `WorkflowsFile` if `p` does not exist.
+///
+/// # Errors
+///
+/// Returns an [`std::io::Error`] if the file exists but cannot be read,
+/// or if its contents are not valid TOML matching the [`WorkflowsFile`]
+/// schema (wrapped as `ErrorKind::InvalidData`).
 pub fn load_from(p: &Path) -> std::io::Result<WorkflowsFile> {
     if !p.exists() {
         return Ok(WorkflowsFile::default());

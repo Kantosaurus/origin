@@ -1,5 +1,6 @@
-//! `DaemonMemoryHandle` — re-exports the daemon's concrete [`MemoryHandle`]
-//! implementation so callers can refer to it by the canonical name expected by
+//! `DaemonMemoryHandle` — re-exports the daemon's concrete [`MemoryHandle`].
+//!
+//! Implementation so callers can refer to it by the canonical name expected by
 //! the P6.9 subsystem-B spec without importing from `memory_wiring` directly.
 //!
 //! The actual adapter logic lives in [`crate::memory_wiring::MemoryDispatchHandle`];
