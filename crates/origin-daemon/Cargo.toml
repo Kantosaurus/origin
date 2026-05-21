@@ -49,6 +49,7 @@ origin-runtime          = { path = "../origin-runtime" }
 origin-alloc            = { path = "../origin-alloc" }
 origin-resume-token     = { path = "../origin-resume-token" }
 origin-plan             = { path = "../origin-plan" }
+origin-swarm            = { path = "../origin-swarm" }
 ctrlc                   = "3"
 dirs                    = "5"
 hyper                   = { workspace = true }
