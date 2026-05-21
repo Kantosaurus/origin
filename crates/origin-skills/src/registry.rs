@@ -25,6 +25,13 @@ impl SkillRegistry {
         }
     }
 
+    /// Iterate the currently-active skills in activation order (oldest
+    /// first). Used by daemon snapshotting where we need to clone the
+    /// stack without holding a lock across a turn.
+    pub fn iter_active(&self) -> impl Iterator<Item = &SkillFrontmatter> {
+        self.stack.iter()
+    }
+
     /// Intersection of every active skill's `allowed-tools`. `None` means no
     /// narrowing is in effect (the permission engine should fall through to
     /// the default tier check). An empty set means *no tool is allowed*.

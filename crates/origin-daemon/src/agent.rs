@@ -8,10 +8,11 @@ use crate::tool_use_parser::{ToolUseDelta, ToolUseParser};
 use origin_cas::{Hash, Store};
 use origin_core::types::{Block, Message, Role};
 use origin_mem::{Injector, Proposer};
-use origin_permission::{check, prompt::Prompter, Outcome};
+use origin_permission::{check_with_skills, prompt::Prompter, Outcome};
 use origin_provider::{ChatRequest, Provider};
 use origin_runtime::{spawn_in, TaskClass};
 use origin_sidecar::{ExtractDeliverer, Sidecar, SummaryDeliverer};
+use origin_skills::SkillRegistry;
 use origin_tools::{registry_iter, SideEffects, ToolMeta};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -61,6 +62,12 @@ pub struct LoopOptions {
     /// [`ClientMessage::MemoryDecision::Accept`](crate::protocol::ClientMessage::MemoryDecision)
     /// on a different connection can still persist the proposal.
     pub proposal_registry: Option<Arc<ProposalRegistry>>,
+    /// Active skill stack. When `Some`, every per-turn permission check runs
+    /// through [`check_with_skills`] so the intersection of active skills'
+    /// `allowed-tools` masks narrows tool access. When `None`, the loop falls
+    /// through to the default tier rules — equivalent to passing an empty
+    /// registry, since an empty stack's mask is `None` (no narrowing).
+    pub skills: Option<Arc<SkillRegistry>>,
 }
 
 impl Default for LoopOptions {
@@ -76,6 +83,7 @@ impl Default for LoopOptions {
             event_tx: None,
             injector: None,
             proposal_registry: None,
+            skills: None,
         }
     }
 }
@@ -116,6 +124,14 @@ impl LoopOptions {
     #[must_use]
     pub fn with_session_store(mut self, store: Arc<SessionStore>) -> Self {
         self.session_store = Some(store);
+        self
+    }
+
+    /// Attach an active skill stack so the loop's per-turn permission check
+    /// enforces the intersection of every active skill's `allowed-tools` mask.
+    #[must_use]
+    pub fn with_skills(mut self, skills: Arc<SkillRegistry>) -> Self {
+        self.skills = Some(skills);
         self
     }
 }
@@ -379,10 +395,20 @@ pub async fn run_loop(
             };
 
             // Permission check fires first — denied tools never use cached results.
-            let decision = check(meta, &preview, prompter).await;
+            // Falls back to an empty static `SkillRegistry` when none is wired,
+            // so the call path is identical; an empty stack's mask is `None`,
+            // which makes `check_with_skills` short-circuit to plain `check`.
+            static EMPTY_SKILLS: SkillRegistry = SkillRegistry::new();
+            let skills: &SkillRegistry = opts.skills.as_deref().unwrap_or(&EMPTY_SKILLS);
+            let decision = check_with_skills(meta, &preview, prompter, skills).await;
             if decision.outcome == Outcome::Deny {
                 // Drain any speculative slot to keep the registry clean.
                 let _ = speculative.take(&id).await;
+                tracing::warn!(
+                    tool = %name,
+                    reason = %decision.reason,
+                    "tool denied"
+                );
                 return Err(LoopError::Denied(name.clone()));
             }
 

@@ -35,6 +35,7 @@ origin-provider-bedrock    = { path = "../origin-provider-bedrock",    optional 
 origin-provider-github     = { path = "../origin-provider-github",     optional = true }
 origin-tools            = { path = "../origin-tools" }
 origin-permission       = { path = "../origin-permission" }
+origin-skills           = { path = "../origin-skills" }
 origin-store            = { path = "../origin-store" }
 origin-cas              = { path = "../origin-cas" }
 origin-codegraph        = { path = "../origin-codegraph" }

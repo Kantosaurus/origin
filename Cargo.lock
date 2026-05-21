@@ -3625,6 +3625,7 @@ dependencies = [
  "origin-resume-token",
  "origin-runtime",
  "origin-sidecar",
+ "origin-skills",
  "origin-store",
  "origin-stream",
  "origin-tools",

@@ -8,6 +8,7 @@ use anyhow::Result;
 use origin_cas::Store;
 use origin_core::types::Role;
 use origin_daemon::agent::{run_loop, LoopOptions, SessionStoreSummaryDeliverer};
+use origin_skills::{load_skills_dir, SkillRegistry};
 use origin_daemon::auth::BearerStore;
 use origin_daemon::config::bearer_ttl_secs;
 use origin_daemon::memory_wiring::MemoryWiring;
@@ -483,6 +484,33 @@ fn spawn_handler_task(
     plan_bus: PlanBus,
 ) {
     spawn_in(TaskClass::Critical, async move {
+        // Per-connection skill activation state. Each ActivateSkill mutates
+        // this registry; each Prompt reads its `allowed_tools` mask and passes
+        // it through LoopOptions.skills so the permission engine narrows
+        // accordingly. Wrapped in Arc<Mutex<...>> so we can hand `Arc::clone`s
+        // to async handlers without giving up the registry.
+        let active_skills: Arc<tokio::sync::Mutex<SkillRegistry>> =
+            Arc::new(tokio::sync::Mutex::new(SkillRegistry::new()));
+
+        // Task-2 scaffold: Task 1's SkillCatalog merge replaces this.
+        // Load on-disk skills once per connection so ActivateSkill can look up
+        // skill frontmatter without referencing the (not-yet-existing)
+        // daemon-wide SkillCatalog from Task 1. Loaded eagerly here (rather
+        // than lazily inside the loop) so it doesn't straddle an await point,
+        // which would require Sync.
+        let skill_load_cache: Vec<origin_skills::Skill> = {
+            let home = std::env::var_os("ORIGIN_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(dirs::home_dir)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let skills_path = home.join(".origin").join("skills");
+            if skills_path.exists() {
+                load_skills_dir(&skills_path).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        };
+
         loop {
             let body = {
                 let mut g = conn.lock().await;
@@ -530,6 +558,7 @@ fn spawn_handler_task(
                         Arc::clone(&sidecar),
                         memory.as_ref(),
                         Arc::clone(&proposal_registry),
+                        Arc::clone(&active_skills),
                         req,
                     )
                     .await
@@ -593,6 +622,56 @@ fn spawn_handler_task(
                 }
                 ClientMessage::ResumeRequest { token } => {
                     handle_resume_request(&conn, Arc::clone(&session_store), token).await;
+                }
+                ClientMessage::ActivateSkill { name } => {
+                    // Task-2 scaffold: Task 1's SkillCatalog merge replaces this.
+                    // Look up the skill in the per-connection cache loaded at
+                    // connection start; Task 1 will replace this with
+                    // Arc::clone(&skill_catalog).find(&name).
+                    let conn_clone = Arc::clone(&conn);
+                    if let Some(skill) = skill_load_cache.iter().find(|s| s.front.name == name) {
+                        let front = skill.front.clone();
+                        let allowed_tools: Vec<String> = {
+                            let mut guard = active_skills.lock().await;
+                            guard.activate(front);
+                            // After activation, the intersection always exists (we just pushed a skill).
+                            // Sort for stable wire output so clients see a deterministic order.
+                            guard.allowed_tools().map(|set| {
+                                let mut v: Vec<String> = set.into_iter().collect();
+                                v.sort();
+                                v
+                            }).unwrap_or_default()
+                        };
+                        let ev = StreamEvent::SkillActive {
+                            name: name.clone(),
+                            allowed_tools,
+                        };
+                        let body = serde_json::to_vec(&ev).unwrap_or_default();
+                        let _ = conn_clone
+                            .lock()
+                            .await
+                            .write_frame(FrameKind::Event, &body)
+                            .await;
+                    } else {
+                        let ev = StreamEvent::SkillError {
+                            message: format!("no such skill: {name}"),
+                        };
+                        let body = serde_json::to_vec(&ev).unwrap_or_default();
+                        let _ = conn_clone
+                            .lock()
+                            .await
+                            .write_frame(FrameKind::Event, &body)
+                            .await;
+                    }
+                }
+                ClientMessage::DeactivateSkill { name } => {
+                    active_skills.lock().await.deactivate(&name);
+                    let body = serde_json::to_vec(&StreamEvent::AdminOk).unwrap_or_default();
+                    let _ = conn
+                        .lock()
+                        .await
+                        .write_frame(FrameKind::Event, &body)
+                        .await;
                 }
                 ClientMessage::SubscribePlan => {
                     spawn_plan_relay(plan_bus.subscribe(), Arc::clone(&conn));
@@ -752,6 +831,7 @@ async fn handle_request(
     sidecar: Arc<Sidecar>,
     memory: Option<&MemoryWiring>,
     proposal_registry: Arc<ProposalRegistry>,
+    active_skills: Arc<tokio::sync::Mutex<SkillRegistry>>,
     req: PromptRequest,
 ) -> bool {
     let mut session = Session::new(provider.name(), &req.model);
@@ -807,6 +887,23 @@ async fn handle_request(
             event_tx: Some(event_tx.clone()),
             injector: memory.and_then(|m| m.injector.clone()),
             proposal_registry: Some(Arc::clone(&proposal_registry)),
+            skills: {
+                // Snapshot the current active-skill stack into a fresh
+                // SkillRegistry. We deep-clone the stack via re-activation
+                // because the agent loop wants a `&SkillRegistry`, and we
+                // don't want to hold the per-connection lock across an
+                // arbitrarily long turn.
+                let guard = active_skills.lock().await;
+                if guard.allowed_tools().is_some() {
+                    let mut snapshot = SkillRegistry::new();
+                    for s in guard.iter_active() {
+                        snapshot.activate(s.clone());
+                    }
+                    Some(Arc::new(snapshot))
+                } else {
+                    None
+                }
+            },
         };
         run_loop(&mut session, &req.user_text, provider, &AlwaysAllow, &opts).await
     };
@@ -971,7 +1068,9 @@ async fn handle_admin(
         | ClientMessage::PairStart { .. }
         | ClientMessage::PairRedeem { .. }
         | ClientMessage::ResumeRequest { .. }
-        | ClientMessage::SubscribePlan => return true,
+        | ClientMessage::SubscribePlan
+        | ClientMessage::ActivateSkill { .. }
+        | ClientMessage::DeactivateSkill { .. } => return true,
     };
     write_event(conn, &ev).await.is_ok()
 }
