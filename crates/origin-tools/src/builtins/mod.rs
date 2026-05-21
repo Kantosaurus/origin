@@ -12,3 +12,6 @@ pub mod mem;
 pub mod read;
 pub mod recall;
 pub mod task;
+pub mod browser;
+pub mod web_fetch;
+pub mod web_search;
