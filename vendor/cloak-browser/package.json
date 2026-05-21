@@ -1,0 +1,12 @@
+{
+  "name": "origin-cloak-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": { "cloak-cli": "./cloak-cli.mjs" },
+  "dependencies": {
+    "cloak-browser": "github:CloakHQ/CloakBrowser#main",
+    "playwright-core": "^1.45.0"
+  },
+  "engines": { "node": ">=18" }
+}
