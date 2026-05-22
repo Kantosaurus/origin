@@ -3890,6 +3890,7 @@ dependencies = [
  "unicode-segmentation",
  "url",
  "urlencoding",
+ "which",
 ]
 
 [[package]]

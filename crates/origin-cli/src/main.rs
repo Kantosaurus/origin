@@ -40,9 +40,27 @@ type SharedWidget = Arc<Mutex<StreamWidget>>;
 #[allow(clippy::too_many_lines)]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    // Auto-update: swap in any binary staged from a prior run BEFORE we
+    // touch clap, so the very next invocation runs the new code path. The
+    // swap renames the live exe to `<exe>.old` (Windows keeps using the
+    // renamed file) and renames `<exe>.new` over the original path. Any
+    // failure is logged via tracing and silently skipped — the user's
+    // command must never block on the updater.
+    match origin_cli::updater::apply_staged_if_present() {
+        Ok(true) => tracing::info!("updater: swapped staged binary in on startup"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!("updater: apply_staged_if_present failed: {e}"),
+    }
+
     // Dispatch a subcommand if one was given, otherwise fall through to the
     // TUI entry path (preserves the existing env-driven invocation).
     let cli = Cli::parse();
+
+    // Kick off the background update check. Detached on purpose: the task
+    // may be cut short by process exit on short-lived subcommands (Run /
+    // Usage / Init); the next invocation simply retries. The 24h on-disk
+    // cache at `~/.origin/update_check.json` prevents hammering GitHub.
+    tokio::spawn(origin_cli::updater::run_background_check());
     if cli.tutorial {
         let stdin = std::io::stdin();
         let stdout = std::io::stdout();
