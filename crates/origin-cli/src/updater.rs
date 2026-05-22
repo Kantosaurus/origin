@@ -4,19 +4,23 @@
 //!
 //! 1. Calls [`apply_staged_if_present`] at startup. If a `<exe>.new` file is
 //!    sitting next to the running binary (left there by a previous run's
-//!    background check), it is renamed over the current executable. On
-//!    Windows the live process keeps using the now-renamed `.old` file, so
-//!    the swap is safe for a running process — the NEXT invocation picks up
-//!    the new binary.
-//! 2. Spawns [`run_background_check`] on the tokio runtime without awaiting
-//!    it. The task hits `api.github.com`, compares versions, downloads the
-//!    matching platform asset + its cosign sig bundle, verifies with the
-//!    `cosign` CLI, and stages the result as `<exe>.new`. Failures are
-//!    logged via `tracing::warn!` and never surface to the user.
+//!    check), it is renamed over the current executable. On Windows the
+//!    live process keeps using the now-renamed `.old` file, so the swap is
+//!    safe for a running process.
+//! 2. Calls [`check_and_stage_blocking`] synchronously. The call hits
+//!    `api.github.com`, compares versions, downloads the matching platform
+//!    asset + its cosign sig bundle, verifies with the `cosign` CLI, and
+//!    stages the result as `<exe>.new`. If anything is staged, the caller
+//!    is expected to re-apply + re-exec so the user's command runs on the
+//!    new binary. Failures are logged via `tracing::warn!` and degraded to
+//!    `Ok(false)` so offline / unsigned / network-flaky users still run.
+//! 3. The legacy [`run_background_check`] entry point remains for
+//!    callers that prefer the detached/best-effort flow.
 //!
-//! No knobs, no banners, no opt-out — by design. A 24h on-disk cache at
-//! `$ORIGIN_HOME/.origin/update_check.json` (falling back to `~/.origin/`)
-//! prevents hammering the GitHub API.
+//! Setting `ORIGIN_NO_UPDATE=1` (any value) short-circuits both the apply
+//! and the network check — the binary then behaves as if the updater were
+//! absent. A 24h on-disk cache at `$ORIGIN_HOME/.origin/update_check.json`
+//! (falling back to `~/.origin/`) prevents hammering the GitHub API.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -358,6 +362,13 @@ fn current_exe() -> Result<PathBuf, UpdateError> {
 /// # Errors
 /// [`UpdateError::Io`] on rename / canonicalize failures.
 pub fn apply_staged_if_present() -> Result<bool, UpdateError> {
+    // ORIGIN_NO_UPDATE escape hatch: skip the swap entirely so CI and
+    // offline users can run with a staged `.new` file sitting on disk
+    // without the next invocation suddenly swapping it in. Mirrors the
+    // short-circuit in `check_and_stage_blocking`.
+    if std::env::var_os("ORIGIN_NO_UPDATE").is_some() {
+        return Ok(false);
+    }
     let exe = current_exe()?;
     let staged = staged_path(&exe);
     if !staged.exists() {
@@ -493,6 +504,140 @@ async fn run_background_check_inner() -> Result<(), UpdateError> {
     Ok(())
 }
 
+/// Synchronous update check that resolves to `Ok(true)` iff a new binary
+/// was downloaded, verified, and staged this call.
+///
+/// Returns `Ok(false)` when there's nothing to do (cache fresh, no newer
+/// release, already up-to-date, or `ORIGIN_NO_UPDATE` is set). Network
+/// failures, cosign-missing, and signature-verify failures all resolve to
+/// `Ok(false)` (with a `tracing::warn`) so the caller can fall through to
+/// running the current binary. Only programming bugs propagate as `Err`.
+///
+/// # Errors
+/// Currently never; the signature reserves room for future failure modes.
+pub async fn check_and_stage_blocking() -> Result<bool, UpdateError> {
+    // ORIGIN_NO_UPDATE bypass: CI and offline users can short-circuit
+    // every network round trip + the cosign shell-out by exporting this
+    // variable. Any value (even empty) counts as "set", matching how
+    // env-var feature flags conventionally behave.
+    if std::env::var_os("ORIGIN_NO_UPDATE").is_some() {
+        return Ok(false);
+    }
+    Ok(check_and_stage_inner().await)
+}
+
+/// Print a user-visible failure message + log via `tracing::warn!`, then
+/// return `false` so the caller can `return` directly. Centralizing both
+/// outputs keeps `check_and_stage_inner` linear and avoids the
+/// `clippy::cognitive_complexity` ceiling.
+fn skip_with_warn(stage: &str, err: impl std::fmt::Display) -> bool {
+    eprintln!("Update check failed ({err}); continuing with current version.");
+    tracing::warn!("updater: {stage} failed: {err}");
+    false
+}
+
+/// Inner body returning `bool` so the public entry stays trivially
+/// shaped. Every non-fatal failure becomes `false`; only the
+/// already-up-to-date and cache-hit paths skip silently.
+async fn check_and_stage_inner() -> bool {
+    let current = env!("CARGO_PKG_VERSION");
+
+    // Cache hit: if we recently saw the same-or-older latest version,
+    // skip the network round trip entirely.
+    if let Some(cached) = cached_latest(UPDATE_CHECK_TTL_SECS) {
+        if !is_newer(current, &cached) {
+            return false;
+        }
+    } else {
+        eprintln!("Checking for updates…");
+    }
+
+    let release = match fetch_release().await {
+        Ok(r) => r,
+        Err(e) => return skip_with_warn("fetch_release", e),
+    };
+    let latest = release.tag_name.clone();
+    write_cache(&latest);
+
+    if !is_newer(current, &latest) {
+        return false;
+    }
+
+    let asset_name = match current_target_asset_name() {
+        Ok(n) => n,
+        Err(e) => return skip_with_warn("current_target_asset_name", e),
+    };
+    let sig_name = format!("{asset_name}.sig");
+
+    let asset_url = match release.assets.iter().find(|a| a.name == asset_name) {
+        Some(a) => a.browser_download_url.clone(),
+        None => return skip_with_warn("find asset", UpdateError::NoMatchingAsset(asset_name.clone())),
+    };
+    let sig_url = match release.assets.iter().find(|a| a.name == sig_name) {
+        Some(a) => a.browser_download_url.clone(),
+        None => return skip_with_warn("find sig", UpdateError::NoMatchingAsset(sig_name.clone())),
+    };
+
+    eprintln!("origin {current} → {latest}: downloading…");
+    tracing::info!(
+        "updater: update available (current={current} latest={latest}); downloading {asset_name}"
+    );
+
+    let exe = match current_exe() {
+        Ok(p) => p,
+        Err(e) => return skip_with_warn("current_exe", e),
+    };
+    let Some(parent) = exe.parent() else {
+        return skip_with_warn("exe parent", "exe has no parent directory");
+    };
+    let download_path = parent.join(format!("{asset_name}.download"));
+    let sig_path = parent.join(&sig_name);
+
+    download_verify_stage(&asset_url, &sig_url, &download_path, &sig_path, &exe).await
+}
+
+/// Download, verify, and stage. Split out so the orchestrator above stays
+/// under the workspace cognitive-complexity ceiling. Cleans up any
+/// partial downloads on failure so a later run doesn't pick up an
+/// unverified binary.
+async fn download_verify_stage(
+    asset_url: &str,
+    sig_url: &str,
+    download_path: &std::path::Path,
+    sig_path: &std::path::Path,
+    exe: &std::path::Path,
+) -> bool {
+    if let Err(e) = download_to(asset_url, download_path).await {
+        let _ = std::fs::remove_file(download_path);
+        return skip_with_warn("download asset", e);
+    }
+    if let Err(e) = download_to(sig_url, sig_path).await {
+        let _ = std::fs::remove_file(download_path);
+        let _ = std::fs::remove_file(sig_path);
+        return skip_with_warn("download sig", e);
+    }
+
+    eprintln!("Verifying signature…");
+    if let Err(e) = cosign_verify(sig_path, download_path) {
+        let _ = std::fs::remove_file(download_path);
+        let _ = std::fs::remove_file(sig_path);
+        return skip_with_warn("cosign verify", e);
+    }
+    let _ = std::fs::remove_file(sig_path);
+
+    let staged = staged_path(exe);
+    if let Err(e) = std::fs::rename(download_path, &staged) {
+        let _ = std::fs::remove_file(download_path);
+        return skip_with_warn("stage rename", e);
+    }
+    eprintln!("Update staged; relaunching…");
+    tracing::info!(
+        "updater: staged {} for swap-in this invocation",
+        staged.display()
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,6 +745,33 @@ mod tests {
         assert_eq!(parse_semver("1.2.3"), Some((1, 2, 3)));
         assert_eq!(parse_semver("1.2"), None);
         assert_eq!(parse_semver("1.2.3.4"), None);
+    }
+
+    #[tokio::test]
+    async fn env_var_bypass_short_circuits_check() {
+        // ORIGIN_NO_UPDATE must short-circuit `check_and_stage_blocking`
+        // before any network call. Holding the env lock guarantees a
+        // parallel test isn't racing us on the same variable.
+        let _g = ENV_LOCK.lock().await;
+        std::env::set_var("ORIGIN_NO_UPDATE", "1");
+        let result = check_and_stage_blocking().await;
+        std::env::remove_var("ORIGIN_NO_UPDATE");
+        assert!(matches!(result, Ok(false)), "bypass should return Ok(false)");
+    }
+
+    #[tokio::test]
+    async fn env_var_bypass_short_circuits_apply() {
+        // ORIGIN_NO_UPDATE must short-circuit `apply_staged_if_present`
+        // even when a `<exe>.new` neighbor exists on disk — the whole
+        // point of the var is to render the updater invisible. We can't
+        // stub `std::env::current_exe()` so we just rely on the env-var
+        // check running before any FS work; the function should return
+        // Ok(false) without touching disk.
+        let _g = ENV_LOCK.lock().await;
+        std::env::set_var("ORIGIN_NO_UPDATE", "1");
+        let result = apply_staged_if_present();
+        std::env::remove_var("ORIGIN_NO_UPDATE");
+        assert!(matches!(result, Ok(false)), "bypass should return Ok(false)");
     }
 
     #[test]

@@ -40,27 +40,40 @@ type SharedWidget = Arc<Mutex<StreamWidget>>;
 #[allow(clippy::too_many_lines)]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    // Auto-update: swap in any binary staged from a prior run BEFORE we
-    // touch clap, so the very next invocation runs the new code path. The
-    // swap renames the live exe to `<exe>.old` (Windows keeps using the
-    // renamed file) and renames `<exe>.new` over the original path. Any
-    // failure is logged via tracing and silently skipped — the user's
-    // command must never block on the updater.
+    // Auto-update — synchronous. The flow is:
+    //   1. Swap in any binary staged from a prior run (rename `.new` over exe).
+    //   2. Check the GitHub releases API for a newer tag. If newer, download
+    //      + cosign-verify + stage as `<exe>.new` BEFORE proceeding.
+    //   3. If we just staged a new binary, swap it in and re-exec with the
+    //      same argv so the user's command runs on the new code path.
+    // Failures along the way fall through to running the current binary.
     match origin_cli::updater::apply_staged_if_present() {
-        Ok(true) => tracing::info!("updater: swapped staged binary in on startup"),
+        Ok(true) => eprintln!("Applied staged update from previous run."),
         Ok(false) => {}
         Err(e) => tracing::warn!("updater: apply_staged_if_present failed: {e}"),
+    }
+
+    match origin_cli::updater::check_and_stage_blocking().await {
+        Ok(true) => {
+            // We just staged a new binary. Swap it in and re-exec.
+            if matches!(origin_cli::updater::apply_staged_if_present(), Ok(true)) {
+                let exe = std::env::current_exe()?;
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                eprintln!("Update staged; relaunching…");
+                let status = std::process::Command::new(&exe)
+                    .args(&args)
+                    .status()
+                    .map_err(|e| anyhow::anyhow!("relaunch failed: {e}"))?;
+                std::process::exit(status.code().unwrap_or(0));
+            }
+        }
+        Ok(false) => {}
+        Err(e) => tracing::warn!("updater: check_and_stage_blocking failed: {e}"),
     }
 
     // Dispatch a subcommand if one was given, otherwise fall through to the
     // TUI entry path (preserves the existing env-driven invocation).
     let cli = Cli::parse();
-
-    // Kick off the background update check. Detached on purpose: the task
-    // may be cut short by process exit on short-lived subcommands (Run /
-    // Usage / Init); the next invocation simply retries. The 24h on-disk
-    // cache at `~/.origin/update_check.json` prevents hammering GitHub.
-    tokio::spawn(origin_cli::updater::run_background_check());
     if cli.tutorial {
         let stdin = std::io::stdin();
         let stdout = std::io::stdout();
