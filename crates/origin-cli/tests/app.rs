@@ -10,3 +10,20 @@ fn assistant_turn_lifecycle() {
     assert!(app.current_assistant.is_none());
     assert!(app.scrollback.iter().any(|l| l == "origin (2 turns)> Hello"));
 }
+
+// /model slash command parser is reachable from the CLI surface and
+// returns the requested model name. Wired into `handle_submit` in
+// main.rs; this test pins the parser contract so a future refactor
+// can't accidentally break the slash routing.
+#[test]
+fn model_command_parser_is_exported() {
+    use origin_cli::input::parse_model_command;
+    let name = parse_model_command("/model claude-haiku-4-5").expect("parse");
+    assert_eq!(name, "claude-haiku-4-5");
+}
+
+#[test]
+fn model_command_rejects_bare_verb() {
+    use origin_cli::input::parse_model_command;
+    assert!(parse_model_command("/model").is_none());
+}
