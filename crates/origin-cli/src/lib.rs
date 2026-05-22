@@ -20,6 +20,7 @@ pub mod status;
 pub mod trace_cmd;
 pub mod tui;
 pub mod tutorial;
+pub mod updater;
 pub mod welcome;
 pub mod workflows;
 
