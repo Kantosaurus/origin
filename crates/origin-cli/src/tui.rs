@@ -30,6 +30,13 @@ impl App {
         }
     }
 
+    /// Replace the model name shown on the status line. Used by the
+    /// `/model <name>` slash command to reflect the new active model
+    /// without resetting the running token / cost counters.
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        self.usage.model = model.into();
+    }
+
     pub fn add_line(&mut self, prefix: &str, body: &str) {
         self.scrollback.push(format!("{prefix}{body}"));
     }
@@ -134,5 +141,33 @@ fn write_str(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16) {
         }
         grid.put(row, c, Cell::glyph(ch));
         c = c.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_model_updates_usage_snapshot() {
+        let mut app = App::new("anthropic", "claude-opus-4-7");
+        assert_eq!(app.usage.model, "claude-opus-4-7");
+        app.set_model("claude-sonnet-4-6");
+        assert_eq!(app.usage.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn set_model_does_not_reset_token_counters() {
+        // Accumulated usage must survive a model swap — otherwise the
+        // status bar would zero out mid-session every time the user runs
+        // `/model`, which is misleading. (Pricing is per-model lookup,
+        // so the cost reading after a swap reflects new model's rates
+        // applied to the running token totals — that's intentional.)
+        let mut app = App::new("anthropic", "claude-opus-4-7");
+        app.record_usage(100, 50, 0, 0, std::time::Duration::from_millis(200));
+        app.set_model("claude-sonnet-4-6");
+        assert_eq!(app.usage.input_tokens, 100);
+        assert_eq!(app.usage.output_tokens, 50);
+        assert_eq!(app.usage.model, "claude-sonnet-4-6");
     }
 }
