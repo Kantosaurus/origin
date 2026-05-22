@@ -40,8 +40,13 @@ mod strategy;
 mod reflink_linux;
 #[cfg(target_os = "macos")]
 mod reflink_macos;
+// Public + hidden so the Phase 11 ReFS integration test in
+// `tests/windows_refs_reflink.rs` can call `reflink_tree` directly when
+// `ORIGIN_REFS_TEST_DIR` is set to a ReFS / Dev Drive volume. Documented as
+// internal so the surface area users see remains `Workspace`.
 #[cfg(target_os = "windows")]
-mod reflink_windows;
+#[doc(hidden)]
+pub mod reflink_windows;
 
 use std::path::{Path, PathBuf};
 

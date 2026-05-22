@@ -124,7 +124,7 @@ async fn large_tool_result_inlined_when_handle_registered_sticky() {
 
     let ledger = PrefixLedger::new();
     let planner = CachePlanner::new(&ledger);
-    let mut plan = planner.plan(&[Section::new(
+    let plan = planner.plan(&[Section::new(
         SectionId::new("memories"),
         Band::Sticky,
         0..big.len(),
@@ -214,7 +214,7 @@ async fn large_tool_result_referenced_when_handle_registered_sliding() {
 
     let ledger = PrefixLedger::new();
     let planner = CachePlanner::new(&ledger);
-    let mut plan = planner.plan(&[Section::new(
+    let plan = planner.plan(&[Section::new(
         SectionId::new("history"),
         Band::Sliding,
         0..big.len(),

@@ -94,7 +94,7 @@ async fn accept_persists_via_proposal_registry() {
         skills: None,
         skill_catalog: None,
         memory_handle: None,
-        coordinator: None,
+        coordinator: None, plan: None,
     };
     let _summary = run_loop(
         &mut session,

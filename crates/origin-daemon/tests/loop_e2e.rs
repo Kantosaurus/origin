@@ -207,3 +207,98 @@ async fn tool_result_goes_to_cas_and_block_carries_handle_only() {
     }
     assert_eq!(summary.turns, 2);
 }
+
+/// Phase 11 N4.3 wiring contract: when `LoopOptions::plan` is `Some`, the
+/// per-tool-result dispatch path registers every produced CAS handle into
+/// the shared `Plan` with a band derived from the tool's `SideEffects`
+/// metadata (`Pure` → `Sticky`, `Mutating` → `Volatile`). A clone of the
+/// same `Plan` — what the Anthropic provider holds — sees the
+/// registrations immediately because the inner `Arc<RwLock<…>>` is shared.
+#[tokio::test]
+async fn dispatch_registers_pure_tool_handle_as_sticky_in_shared_plan() {
+    let dir = tempdir().expect("tempdir");
+    let store = Arc::new(
+        Store::open(StoreConfig {
+            root: dir.path().to_path_buf(),
+            hot_capacity: 32,
+            warm_pack_target_bytes: 1024 * 1024,
+            cold_zstd_level: 3,
+        })
+        .expect("store"),
+    );
+
+    let path = std::env::temp_dir().join(format!("origin-plan-wire-{}.txt", ulid::Ulid::new()));
+    std::fs::write(&path, "sticky body content").expect("write tempfile");
+    let path_str = path.to_str().expect("utf8 path").to_string();
+
+    let tool_use = Block::ToolUse {
+        id: "tu_plan".into(),
+        name: "Read".into(), // Read has SideEffects::Pure → Band::Sticky
+        input_json: serde_json::to_vec(&serde_json::json!({"path": path_str.clone()})).expect("json"),
+        cache_marker: None,
+    };
+    let provider = ScriptedProvider::new(vec![
+        ChatResponse {
+            assistant: Message::new(Role::Assistant).with_block(tool_use),
+            usage: Usage::default(),
+        },
+        ChatResponse {
+            assistant: Message::new(Role::Assistant).with_block(Block::text("done")),
+            usage: Usage::default(),
+        },
+    ]);
+
+    // Two clones of the same Plan — the daemon side (passed via LoopOptions)
+    // and an "encoder side" the test holds to assert on. They share the
+    // inner Arc<RwLock<HashMap>>, so registrations on either side are
+    // visible on the other.
+    let writer_plan = origin_planner::Plan::default();
+    let encoder_plan = writer_plan.clone();
+    assert_eq!(encoder_plan.handle_count(), 0, "encoder plan starts empty");
+
+    let mut session = Session::new("test", "claude-opus-4-7");
+    let opts = LoopOptions {
+        max_turns: 5,
+        cas: Some(Arc::clone(&store)),
+        relay_tx: None,
+        streaming_disabled: true,
+        plan: Some(writer_plan),
+        ..LoopOptions::default()
+    };
+
+    let _summary = run_loop(
+        &mut session,
+        "please read the file",
+        &provider,
+        &AlwaysAllow,
+        &opts,
+    )
+    .await
+    .expect("loop");
+
+    let _ = std::fs::remove_file(&path);
+
+    // The dispatch site must have registered exactly one handle (Read produced
+    // one tool result this turn) into the shared map, classified as Sticky.
+    assert_eq!(
+        encoder_plan.handle_count(),
+        1,
+        "encoder plan must see the handle the dispatch site registered"
+    );
+
+    // Find the registered handle from the ToolResult block and check its band.
+    let tool_msg = session
+        .messages
+        .iter()
+        .find(|m| matches!(m.role, Role::Tool))
+        .expect("tool message present");
+    let handle = match tool_msg.blocks.first().expect("at least one block") {
+        Block::ToolResult { handle: Some(h), .. } => *h,
+        other => panic!("expected ToolResult with handle, got {other:?}"),
+    };
+    assert_eq!(
+        encoder_plan.band_for_handle(&handle),
+        Some(origin_planner::Band::Sticky),
+        "Read (SideEffects::Pure) must map to Band::Sticky in the encoder's plan view"
+    );
+}

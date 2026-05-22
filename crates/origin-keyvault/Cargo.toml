@@ -41,7 +41,11 @@ age = "0.10"
 dirs = "5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "3"
+# Upper bound on 3.7.0 keeps the dep MSRV-compatible: 3.7+ requires the
+# `edition2024` Cargo feature, which is not available on the workspace's
+# pinned Rust 1.83. Mirrors the broader `cargo update --precise` pattern
+# documented in the project's transitive-dep pinning notes.
+security-framework = ">=3.5, <3.7"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Credentials"] }

@@ -5,6 +5,7 @@
 use crate::{Band, PrefixLedger, SectionId};
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::{Arc, RwLock};
 
 /// One contiguous portion of the outgoing request. The planner sorts these
 /// by `band` and emits cache markers between adjacent bands.
@@ -29,7 +30,14 @@ impl Section {
 
 /// Output of `CachePlanner::plan`. `marker_indices()[i]` means "emit a cache
 /// marker after `ordered_sections()[i]`".
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// `Plan` is cheaply cloneable: the `ordered`/`markers` vectors are deep-cloned
+/// (small) but `handle_bands` is `Arc<RwLock<…>>`, so every clone of the same
+/// `Plan` shares the same handle→band map. This is the N4.3 wiring contract:
+/// the daemon and the wire-encoder hold separate `Plan` values that point at
+/// the same underlying map, so registrations on one side are immediately
+/// visible to the other without any explicit channel.
+#[derive(Debug, Clone, Default)]
 pub struct Plan {
     ordered: Vec<Section>,
     markers: Vec<usize>,
@@ -37,12 +45,36 @@ pub struct Plan {
     /// planner emits the section order; consulted by the message-to-wire
     /// encoder in `O(1)` per CAS handle to decide `Inline` vs `Reference`.
     ///
+    /// Wrapped in `Arc<RwLock<…>>` so the daemon's tool-result dispatch path
+    /// (writer) and the provider's wire-encoder (reader) can share the same
+    /// map through their respective `Plan` clones — exposing interior
+    /// mutability through `&self` on `register_handle` keeps the public API
+    /// ergonomic for both call sites.
+    ///
     /// Competitor stacks (openclaude/jcode/opencode) re-serialize full
     /// tool-result bytes every turn unconditionally — they have no
     /// per-handle band assignment, so they cannot demote long-lived
     /// handles to reference form. This map is the novel mechanism.
-    handle_bands: HashMap<[u8; 32], Band>,
+    handle_bands: Arc<RwLock<HashMap<[u8; 32], Band>>>,
 }
+
+impl PartialEq for Plan {
+    fn eq(&self, other: &Self) -> bool {
+        if self.ordered != other.ordered || self.markers != other.markers {
+            return false;
+        }
+        // Compare map contents under read locks. Identical Arc pointers
+        // short-circuit cheaply; distinct Arcs fall through to per-entry
+        // equality. Lock poisoning on either side defaults to "not equal"
+        // rather than panicking — equality is a query, not a state mutation.
+        match (self.handle_bands.read(), other.handle_bands.read()) {
+            (Ok(a), Ok(b)) => *a == *b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Plan {}
 
 impl Plan {
     /// Return the sections in canonical band order (Frozen→Sticky→Sliding→Volatile).
@@ -66,8 +98,15 @@ impl Plan {
     /// exceeds `INLINE_BYTE_BUDGET`.
     ///
     /// Idempotent: re-registering the same handle overwrites its band.
-    pub fn register_handle(&mut self, handle: [u8; 32], band: Band) {
-        self.handle_bands.insert(handle, band);
+    /// Takes `&self` (not `&mut self`) so the daemon's per-turn dispatch
+    /// path and the provider's wire-encoder can both write through their
+    /// own `Plan` clones; the underlying map is shared via `Arc<RwLock<…>>`.
+    pub fn register_handle(&self, handle: [u8; 32], band: Band) {
+        let mut guard = self
+            .handle_bands
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.insert(handle, band);
     }
 
     /// `O(1)` lookup of the band a CAS handle has been parked in.
@@ -78,7 +117,11 @@ impl Plan {
     /// the handle is stable.
     #[must_use]
     pub fn band_for_handle(&self, handle: &[u8; 32]) -> Option<Band> {
-        self.handle_bands.get(handle).copied()
+        let guard = self
+            .handle_bands
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.get(handle).copied()
     }
 
     /// Number of registered CAS handles. Exposed for test assertions and
@@ -86,7 +129,11 @@ impl Plan {
     /// specific point in the request lifecycle.
     #[must_use]
     pub fn handle_count(&self) -> usize {
-        self.handle_bands.len()
+        let guard = self
+            .handle_bands
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.len()
     }
 }
 
@@ -128,7 +175,7 @@ impl<'a> CachePlanner<'a> {
         Plan {
             ordered,
             markers,
-            handle_bands: HashMap::new(),
+            handle_bands: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }

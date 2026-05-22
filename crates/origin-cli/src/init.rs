@@ -60,14 +60,17 @@ impl Role {
 /// # Errors
 /// Propagates failure from keyvault detection, config-path resolution, the
 /// inner [`run_with`] flow, or the post-init walkthrough.
-#[allow(clippy::future_not_send)] // CLI entry: stdin/stdout locks are inherently !Send and never crossed.
 pub async fn run() -> Result<()> {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
+    // `Stdin` / `Stdout` themselves are Send; only their `.lock()` guards are
+    // not. Wrap stdin in a `BufReader` for `BufRead` semantics — each
+    // `read_line` call acquires and releases the internal lock atomically, so
+    // no `!Send` guard ever spans an `.await`.
+    let r = std::io::BufReader::new(std::io::stdin());
+    let w = std::io::stdout();
     let vault = KeyVault::detect().map_err(|e| anyhow!("keyvault detect: {e}"))?;
     let cfg_path = config::path().map_err(|e| anyhow!("config path: {e}"))?;
     let probe = LiveProbe::new();
-    run_with(stdin.lock(), stdout.lock(), &vault, &cfg_path, &probe).await?;
+    run_with(r, w, &vault, &cfg_path, &probe).await?;
     // Walkthrough takes over stdin/stdout after `run_with` has dropped its
     // locks. We don't pass the welcome flow through `run_with` so that the
     // existing test surface stays focused on the config-capture loop.
@@ -84,8 +87,7 @@ pub async fn run() -> Result<()> {
 /// # Errors
 /// Propagates I/O failures from `r`/`w`, vault writes, config persistence,
 /// and probe execution.
-#[allow(clippy::future_not_send)] // Generic over !Send readers/writers; only awaited from the CLI thread.
-pub async fn run_with<R: BufRead, W: Write>(
+pub async fn run_with<R: BufRead + Send, W: Write + Send>(
     mut r: R,
     mut w: W,
     vault: &KeyVault,
@@ -148,8 +150,7 @@ fn greet<W: Write>(w: &mut W) -> std::io::Result<()> {
 /// Per-role steps: provider → auth → probe → model. The probe step loops
 /// on auth failure so a typo'd key can be re-entered without restarting
 /// the whole flow.
-#[allow(clippy::future_not_send)] // Generic over !Send readers/writers; only awaited from the CLI thread.
-async fn configure_role<R: BufRead, W: Write>(
+async fn configure_role<R: BufRead + Send, W: Write + Send>(
     r: &mut R,
     w: &mut W,
     cat: &Catalog,
@@ -262,8 +263,7 @@ fn pick_provider<R: BufRead, W: Write>(
 
 /// Capture the credential matching the provider's [`AuthScheme`]. Persists
 /// directly to the vault; `None` / `Custom` do nothing beyond a notice.
-#[allow(clippy::future_not_send)] // Generic over !Send readers/writers; only awaited from the CLI thread.
-async fn capture_credentials<R: BufRead, W: Write>(
+async fn capture_credentials<R: BufRead + Send, W: Write + Send>(
     r: &mut R,
     w: &mut W,
     vault: &KeyVault,
@@ -342,8 +342,7 @@ async fn capture_credentials<R: BufRead, W: Write>(
 
 /// Run the probe and print a one-line summary. Returns the result; the
 /// caller decides whether the retry loop fires.
-#[allow(clippy::future_not_send)] // Generic over !Send writer; only awaited from the CLI thread.
-async fn run_probe<W: Write>(
+async fn run_probe<W: Write + Send>(
     w: &mut W,
     probe: &dyn ConnectivityProbe,
     entry: &ProviderEntry,
@@ -507,7 +506,7 @@ fn yes_no<R: BufRead, W: Write>(
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::map_unwrap_or, clippy::future_not_send)] // unit-test ergonomics
+#[allow(clippy::panic, clippy::map_unwrap_or)] // unit-test ergonomics
 mod tests {
     use super::*;
     use crate::init_probe::MockProbe;

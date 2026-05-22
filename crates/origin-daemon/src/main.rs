@@ -301,7 +301,18 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
             Err(e) => tracing::warn!(target: "origin::provider", error = %e, "failed to load providers.toml"),
         }
     }
-    let factory = ProviderFactory::new(vault.clone(), catalog).with_cas(Arc::clone(&cas));
+    // N4.3 shared handle→band index. One instance for the daemon's
+    // lifetime: cloned into the provider factory (so each `Anthropic` build
+    // gets `with_plan(plan.clone())`) and into per-request `LoopOptions`
+    // (so the tool-result dispatch site registers each freshly produced
+    // CAS handle). All clones share the same inner `Arc<RwLock<…>>`, so
+    // registrations from the writer side are immediately visible to the
+    // wire-encoder reader. Map size grows roughly linearly in unique tool
+    // results across the daemon's run; per-entry cost is ~33 bytes.
+    let wire_plan: origin_planner::Plan = origin_planner::Plan::default();
+    let factory = ProviderFactory::new(vault.clone(), catalog)
+        .with_cas(Arc::clone(&cas))
+        .with_plan(wire_plan.clone());
 
     let initial_provider_str = env::var("ORIGIN_PROVIDER").unwrap_or_else(|_| "anthropic".into());
     let initial_provider_id = ProviderId::parse(&initial_provider_str, factory.catalog())
@@ -491,6 +502,7 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
             Arc::clone(&code_graph),
             Arc::clone(&mem_router),
             Arc::clone(&coordinator),
+            wire_plan.clone(),
         );
     }
 }
@@ -588,6 +600,7 @@ fn spawn_handler_task(
     code_graph: Arc<tokio::sync::Mutex<CodeGraphIndex>>,
     mem_router: Arc<dyn origin_codegraph::ask::MemRouter>,
     coordinator: Arc<Coordinator>,
+    wire_plan: origin_planner::Plan,
 ) {
     // Build a type-erased memory handle once per connection so `handle_request`
     // doesn't need to know about `MemoryWiring` internals.
@@ -655,6 +668,7 @@ fn spawn_handler_task(
                         Arc::clone(&code_graph),
                         Arc::clone(&mem_router),
                         Arc::clone(&coordinator),
+                        wire_plan.clone(),
                         req,
                     )
                     .await
@@ -981,6 +995,7 @@ async fn handle_request(
     code_graph: Arc<tokio::sync::Mutex<CodeGraphIndex>>,
     mem_router: Arc<dyn origin_codegraph::ask::MemRouter>,
     coordinator: Arc<Coordinator>,
+    plan: origin_planner::Plan,
     req: PromptRequest,
 ) -> bool {
     let mut session = Session::new(provider.name(), &req.model);
@@ -1060,6 +1075,12 @@ async fn handle_request(
             skill_catalog: Some(Arc::clone(&skill_catalog)),
             memory_handle: memory_handle.clone(),
             coordinator: Some(Arc::clone(&coordinator)),
+            plan: Some(plan.clone()),
+            // ^ shared with the Anthropic provider's wire-encoder via the
+            // `Arc<RwLock<…>>` inside `Plan`. The dispatch loop registers
+            // every produced CAS handle (Sticky for Pure tools, Volatile
+            // for Mutating) so the encoder can downgrade `Inline` to
+            // `Reference` on subsequent turns.
         };
         run_loop(&mut session, &req.user_text, provider, &AlwaysAllow, &opts).await
     };
