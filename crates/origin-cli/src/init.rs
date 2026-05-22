@@ -139,14 +139,11 @@ pub async fn run_with<R: BufRead + Send, W: Write + Send>(
     Ok(())
 }
 
-/// Optional onboarding step: explain Tavily, offer free signup, capture a
-/// key into the vault if the user has one.
+/// Required onboarding step: capture a Tavily API key into the vault.
 ///
-/// The `WebSearch` built-in tool reads `TAVILY_API_KEY` from the environment
-/// at call time (see `crates/origin-browser/src/web_search.rs`), so this
-/// step also prints platform-appropriate shell-export instructions after a
-/// successful paste — the vault save preserves the secret for future
-/// re-use while the env var makes it usable in the current shell.
+/// Explains the free-tier signup, then loops on empty input until the user
+/// pastes a non-empty key. The key is stored at `tavily:default` — the
+/// same path `origin_browser::web_search::resolve_api_key` checks first.
 ///
 /// # Errors
 /// Returns an error if stdin reads or vault writes fail.
@@ -156,11 +153,11 @@ pub async fn configure_tavily<R: BufRead + Send, W: Write + Send>(
     vault: &KeyVault,
 ) -> Result<()> {
     writeln!(w)?;
-    writeln!(w, "── Optional: Web search (Tavily) ──")?;
+    writeln!(w, "── Web search (Tavily) ──")?;
     writeln!(
         w,
-        "The WebSearch tool is backed by Tavily. You can skip this and \
-         add a key later, or grab a free one now:"
+        "The WebSearch tool is backed by Tavily and requires an API key. \
+         You can grab a free one in under a minute:"
     )?;
     writeln!(w, "  1. Visit https://tavily.com/ and sign up (Google or email).")?;
     writeln!(
@@ -169,44 +166,22 @@ pub async fn configure_tavily<R: BufRead + Send, W: Write + Send>(
     )?;
     writeln!(w, "  3. Copy the API key from your dashboard.")?;
     writeln!(w)?;
-    if !yes_no(r, w, "Paste a Tavily API key now? [y/N]: ", false)? {
-        writeln!(
-            w,
-            "  Skipped. Run `origin keyring add tavily default <key>` later, \
-             or set TAVILY_API_KEY in your shell environment."
-        )?;
-        return Ok(());
-    }
-    write!(w, "  Paste Tavily API key: ")?;
-    w.flush()?;
-    let line = read_line(r)?;
-    let key = line.trim().to_string();
-    if key.is_empty() {
-        writeln!(
-            w,
-            "  (empty — skipping. Re-run `origin init` or use `origin keyring add tavily default <key>`.)"
-        )?;
-        return Ok(());
-    }
+    let key = loop {
+        write!(w, "  Paste Tavily API key (required): ")?;
+        w.flush()?;
+        let line = read_line(r)?;
+        let trimmed = line.trim().to_string();
+        if trimmed.is_empty() {
+            writeln!(w, "  (empty — a key is required; please paste one)")?;
+            continue;
+        }
+        break trimmed;
+    };
     vault
         .set("tavily", "default", Secret::new(key))
         .await
         .map_err(|e| anyhow!("vault set tavily: {e}"))?;
-    writeln!(w, "  Saved key to vault under tavily:default.")?;
-    writeln!(
-        w,
-        "  WebSearch reads TAVILY_API_KEY from the environment, so export it for this shell:"
-    )?;
-    if cfg!(windows) {
-        writeln!(w, "    $env:TAVILY_API_KEY = \"<your-key>\"   (current PowerShell session)")?;
-        writeln!(
-            w,
-            "    [Environment]::SetEnvironmentVariable(\"TAVILY_API_KEY\", \"<your-key>\", \"User\")   (persistent)"
-        )?;
-    } else {
-        writeln!(w, "    export TAVILY_API_KEY=<your-key>   (current shell)")?;
-        writeln!(w, "  Add the same line to ~/.bashrc or ~/.zshrc for persistence.")?;
-    }
+    writeln!(w, "  Saved to vault under tavily:default. WebSearch will pick it up automatically.")?;
     Ok(())
 }
 
@@ -810,26 +785,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tavily_skip_does_not_touch_vault() {
-        // Script: answer "n" to the prompt.
-        let input = std::io::Cursor::new(b"n\n".as_slice());
-        let mut output: Vec<u8> = Vec::new();
-        let vault = KeyVault::in_memory();
-        configure_tavily(&mut std::io::BufReader::new(input), &mut output, &vault)
-            .await
-            .expect("configure_tavily ok");
-        // Vault has nothing under tavily.
-        let accounts = vault.list("tavily").await.unwrap_or_default();
-        assert!(accounts.is_empty(), "expected no tavily entries, got {accounts:?}");
-        let out = String::from_utf8(output).expect("utf8");
-        // Skip hint is shown so users know how to add later.
-        assert!(out.contains("origin keyring add tavily default"));
-    }
-
-    #[tokio::test]
-    async fn tavily_paste_saves_to_vault_and_prints_env_hint() {
-        // Script: y -> paste a key.
-        let input = std::io::Cursor::new(b"y\ntvly-abc123\n".as_slice());
+    async fn tavily_paste_saves_to_vault() {
+        // Script: one valid key paste.
+        let input = std::io::Cursor::new(b"tvly-abc123\n".as_slice());
         let mut output: Vec<u8> = Vec::new();
         let vault = KeyVault::in_memory();
         configure_tavily(&mut std::io::BufReader::new(input), &mut output, &vault)
@@ -838,29 +796,33 @@ mod tests {
         let stored = vault.get("tavily", "default").await.expect("vault get");
         assert_eq!(stored.expose(), "tvly-abc123");
         let out = String::from_utf8(output).expect("utf8");
-        // The existing WebSearch tool reads TAVILY_API_KEY from env, so the
-        // step must tell the user how to export it.
-        assert!(out.contains("TAVILY_API_KEY"));
+        // Saved-confirmation message mentions the vault path the WebSearch
+        // tool now resolves against.
+        assert!(out.contains("tavily:default"), "saved confirmation missing: {out}");
     }
 
     #[tokio::test]
-    async fn tavily_empty_paste_is_a_graceful_skip() {
-        // Script: y -> empty paste (blank line).
-        let input = std::io::Cursor::new(b"y\n\n".as_slice());
+    async fn tavily_empty_paste_reprompts_until_valid() {
+        // Script: two empty lines, then a valid key. The loop must accept
+        // the third attempt and persist it.
+        let input = std::io::Cursor::new(b"\n\ntvly-recovered\n".as_slice());
         let mut output: Vec<u8> = Vec::new();
         let vault = KeyVault::in_memory();
         configure_tavily(&mut std::io::BufReader::new(input), &mut output, &vault)
             .await
             .expect("configure_tavily ok");
-        let accounts = vault.list("tavily").await.unwrap_or_default();
-        assert!(accounts.is_empty(), "empty paste must not write a vault entry");
+        let stored = vault.get("tavily", "default").await.expect("vault get");
+        assert_eq!(stored.expose(), "tvly-recovered");
+        let out = String::from_utf8(output).expect("utf8");
+        // The "key is required" hint must fire at least once.
+        assert!(out.contains("required"), "missing required-hint: {out}");
     }
 
     #[tokio::test]
     async fn tavily_prompt_includes_signup_instructions() {
-        // The prompt must surface the signup URL and free-tier mention so a
-        // first-time user knows how to obtain a key.
-        let input = std::io::Cursor::new(b"n\n".as_slice());
+        // First-time users must see the signup URL and free-tier mention.
+        // Script provides one valid key so the function returns cleanly.
+        let input = std::io::Cursor::new(b"tvly-test\n".as_slice());
         let mut output: Vec<u8> = Vec::new();
         let vault = KeyVault::in_memory();
         configure_tavily(&mut std::io::BufReader::new(input), &mut output, &vault)
