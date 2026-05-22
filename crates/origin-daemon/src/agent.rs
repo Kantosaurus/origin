@@ -92,6 +92,16 @@ pub struct LoopOptions {
     /// Task spawns a noop (P9.6) or real (P9.8+) worker and returns the
     /// structured `TaskOutput` JSON.
     pub coordinator: Option<Arc<origin_swarm::Coordinator>>,
+    /// Optional N4.3 handle→band index, shared with the active provider's
+    /// wire-encoder (the Anthropic provider's `expand_messages_for_wire`
+    /// reads `band_for_handle` to decide `Inline` vs `Reference`). When
+    /// `Some`, the per-tool-result dispatch path calls `register_handle`
+    /// for every CAS handle produced by a tool, classifying the band from
+    /// the tool's `SideEffects` metadata (`Pure` → `Sticky`, `Mutating` →
+    /// `Volatile`). When `None`, no registrations happen and the wire-
+    /// encoder falls through to the `Volatile` floor — exactly the
+    /// behavior before Phase 11 N4.3 landed.
+    pub plan: Option<origin_planner::Plan>,
 }
 
 impl Default for LoopOptions {
@@ -113,6 +123,7 @@ impl Default for LoopOptions {
             skill_catalog: None,
             memory_handle: None,
             coordinator: None,
+            plan: None,
         }
     }
 }
@@ -531,6 +542,24 @@ pub async fn run_loop(
                 let h: Hash = cas
                     .put(&result_bytes)
                     .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
+
+                // Phase 11 N4.3 wiring: register the freshly produced handle
+                // with the active Plan so the Anthropic wire-encoder can
+                // downgrade `Inline` → `Reference` for handles whose bodies
+                // are stable enough to cache client-side. Heuristic: a Pure
+                // tool's output is reusable across turns (`Sticky`);
+                // a Mutating tool's output is a snapshot of state that just
+                // changed (`Volatile`, the safe floor). Tools missing meta
+                // (e.g. MCP-discovered runtime tools) inherit the floor.
+                if let Some(plan) = opts.plan.as_ref() {
+                    use origin_planner::Band;
+                    use origin_tools::SideEffects;
+                    let band = match meta.side_effects {
+                        SideEffects::Pure => Band::Sticky,
+                        SideEffects::Mutating => Band::Volatile,
+                    };
+                    plan.register_handle(*h.as_bytes(), band);
+                }
 
                 // Fire Extract job for large tool outputs (P5.3, N2.5.c).
                 if result_bytes.len() >= origin_sidecar::extract::EXTRACT_THRESHOLD_BYTES {

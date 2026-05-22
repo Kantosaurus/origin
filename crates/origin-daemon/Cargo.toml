@@ -49,6 +49,7 @@ origin-runtime          = { path = "../origin-runtime" }
 origin-alloc            = { path = "../origin-alloc" }
 origin-resume-token     = { path = "../origin-resume-token" }
 origin-plan             = { path = "../origin-plan" }
+origin-planner          = { path = "../origin-planner" }
 origin-swarm            = { path = "../origin-swarm" }
 origin-browser          = { path = "../origin-browser" }
 ctrlc                   = "3"

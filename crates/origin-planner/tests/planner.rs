@@ -23,7 +23,7 @@ fn plan_emits_four_bands_in_canonical_order() {
 fn band_for_handle_returns_registered_band() {
     let ledger = PrefixLedger::new();
     let planner = CachePlanner::new(&ledger);
-    let mut plan = planner.plan(&[Section::new(SectionId::new("turn-1"), Band::Volatile, 0..32)]);
+    let plan = planner.plan(&[Section::new(SectionId::new("turn-1"), Band::Volatile, 0..32)]);
 
     let h_sticky = [0xAA; 32];
     let h_frozen = [0xBB; 32];

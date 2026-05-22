@@ -114,6 +114,14 @@ pub struct ProviderFactory {
     vault: KeyVault,
     cas: Option<Arc<origin_cas::Store>>,
     catalog: Catalog,
+    /// N4.3 handle→band index, shared with every Anthropic provider this
+    /// factory builds via `Anthropic::with_plan(plan.clone())`. The same
+    /// `Plan` instance is also cloned into per-request `LoopOptions` so
+    /// the daemon's dispatch site can `register_handle` for each produced
+    /// CAS handle; both ends see the same map via `Arc<RwLock<…>>` inside
+    /// `Plan`. `None` skips the wiring (preserves the pre-N4.3 behavior
+    /// of inlining every handle).
+    plan: Option<origin_planner::Plan>,
 }
 
 impl core::fmt::Debug for ProviderFactory {
@@ -122,6 +130,7 @@ impl core::fmt::Debug for ProviderFactory {
             .field("vault", &self.vault)
             .field("cas", &self.cas.as_ref().map(|_| "<cas>"))
             .field("catalog_entries", &self.catalog.entries().len())
+            .field("plan", &self.plan.as_ref().map(|_| "<plan>"))
             .finish()
     }
 }
@@ -133,12 +142,21 @@ impl ProviderFactory {
             vault,
             cas: None,
             catalog,
+            plan: None,
         }
     }
 
     #[must_use]
     pub fn with_cas(mut self, cas: Arc<origin_cas::Store>) -> Self {
         self.cas = Some(cas);
+        self
+    }
+
+    /// Attach the daemon-wide handle→band plan. Cloned into every
+    /// Anthropic-wire provider built by this factory.
+    #[must_use]
+    pub fn with_plan(mut self, plan: origin_planner::Plan) -> Self {
+        self.plan = Some(plan);
         self
     }
 
@@ -294,6 +312,11 @@ impl ProviderFactory {
                 };
                 if let Some(cas) = self.cas.clone() {
                     p = p.with_cas(cas);
+                }
+                if let Some(plan) = self.plan.clone() {
+                    // Shared Plan: cheap clone of the inner Arc<RwLock<…>>.
+                    // The dispatch loop registers handles into the same map.
+                    p = p.with_plan(plan);
                 }
                 Ok(Arc::new(p))
             }
