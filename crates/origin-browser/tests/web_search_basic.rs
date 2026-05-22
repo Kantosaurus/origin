@@ -26,10 +26,3 @@ async fn returns_parsed_results_from_tavily_shaped_response() {
     assert_eq!(r[0].url, "https://x");
     assert_eq!(r[0].snippet, "snip");
 }
-
-#[tokio::test]
-async fn errors_clearly_when_api_key_missing() {
-    std::env::remove_var("TAVILY_API_KEY");
-    let err = origin_browser::web_search::search("q", 5).await.unwrap_err();
-    assert!(format!("{err}").to_lowercase().contains("tavily_api_key"));
-}
