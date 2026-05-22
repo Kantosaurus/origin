@@ -3817,6 +3817,7 @@ name = "origin-browser"
 version = "0.0.1"
 dependencies = [
  "html2md",
+ "origin-keyvault",
  "readability",
  "regex",
  "reqwest 0.12.28",
