@@ -88,7 +88,7 @@ pub fn parse_mem_command(line: &str) -> Option<ClientMessage> {
 /// Slash verbs that already have dedicated handlers — they must not be
 /// re-routed through the skill parser even though they start with `/`.
 /// Update this list when a new slash verb is added.
-const RESERVED_SLASH_VERBS: &[&str] = &["mem", "account", "help"];
+const RESERVED_SLASH_VERBS: &[&str] = &["mem", "account", "help", "model"];
 
 /// Parse `/<name>` (activate) and `/-<name>` (deactivate) into a
 /// [`ClientMessage::ActivateSkill`] or [`ClientMessage::DeactivateSkill`].
@@ -164,6 +164,32 @@ pub fn parse_workflow_command(line: &str) -> Option<ClientMessage> {
     Some(ClientMessage::ActivateWorkflow {
         name: name.to_string(),
     })
+}
+
+/// Parse a `/model <name>` slash command into the requested model name.
+///
+/// Recognized form:
+/// - `/model <name>` — switch the TUI's active model to `<name>` for
+///   subsequent prompts. Surrounding whitespace is tolerated; the name
+///   itself must be a single token.
+///
+/// Returns `None` for any non-matching input (including `/model` with no
+/// argument and `/model foo bar` with extra tokens) so the caller can
+/// surface a usage hint.
+#[must_use]
+pub fn parse_model_command(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("/model")?;
+    // Require a word boundary so `/modelfoo` is not matched.
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut parts = rest.split_whitespace();
+    let name = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 #[cfg(test)]
@@ -347,5 +373,45 @@ mod tests {
         // Inline references mid-prompt are explicitly out of scope.
         assert!(parse_workflow_command("please run {workflow:x}").is_none());
         assert!(parse_workflow_command("/foo").is_none());
+    }
+
+    #[test]
+    fn parse_model_basic() {
+        let name = parse_model_command("/model claude-opus-4-7").expect("parse");
+        assert_eq!(name, "claude-opus-4-7");
+    }
+
+    #[test]
+    fn parse_model_tolerates_surrounding_whitespace() {
+        let name = parse_model_command("   /model   claude-sonnet-4-6   ").expect("parse");
+        assert_eq!(name, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn parse_model_rejects_no_argument() {
+        assert!(parse_model_command("/model").is_none());
+        assert!(parse_model_command("/model    ").is_none());
+    }
+
+    #[test]
+    fn parse_model_rejects_multiple_args() {
+        // Model names are a single token; extra args is a usage error,
+        // surfaced as None so the caller can show the usage hint.
+        assert!(parse_model_command("/model foo bar").is_none());
+    }
+
+    #[test]
+    fn parse_model_requires_word_boundary() {
+        // `/modelfoo` is not `/model foo` — must not be treated as a model
+        // command. (The skill parser will pick it up instead.)
+        assert!(parse_model_command("/modelfoo").is_none());
+    }
+
+    #[test]
+    fn parse_skill_does_not_shadow_model() {
+        // After registering "model" as reserved, the skill parser must
+        // refuse `/model` so /model handling owns the verb.
+        assert!(parse_skill_command("/model").is_none());
+        assert!(parse_skill_command("/model:foo").is_none());
     }
 }
