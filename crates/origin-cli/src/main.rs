@@ -9,7 +9,8 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScree
 use futures_util::StreamExt as _;
 use origin_cli::cli_def::{Cli, Cmd, KeyringSub, PairSub, ProvidersSub, SessionsSub, TraceSub};
 use origin_cli::input::{
-    parse_mem_command, parse_skill_command, parse_workflow_command, reduce, InputAction,
+    parse_mem_command, parse_model_command, parse_skill_command, parse_workflow_command, reduce,
+    InputAction,
 };
 use origin_cli::plan_panel_wiring::Wiring as PlanPanelWiring;
 use origin_cli::tui::App;
@@ -137,7 +138,7 @@ async fn main() -> Result<()> {
         );
 
     let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
-    let model = env::var("ORIGIN_MODEL").unwrap_or(default_model);
+    let mut model = env::var("ORIGIN_MODEL").unwrap_or(default_model);
 
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen)?;
@@ -206,10 +207,10 @@ async fn main() -> Result<()> {
         app.lock()
             .add_line("system> ", "Running queued first-run discovery prompt\u{2026}");
         handle.mark_dirty();
-        handle_submit(&app, &handle, &path, &model, &text).await;
+        handle_submit(&app, &handle, &path, &mut model, &text).await;
     }
 
-    let result = run_event_loop(app, composer, widget, handle, &path, &model).await;
+    let result = run_event_loop(app, composer, widget, handle, &path, &mut model).await;
 
     render_task.abort();
     disable_raw_mode()?;
@@ -223,7 +224,7 @@ async fn run_event_loop(
     _widget: SharedWidget,
     handle: Handle,
     path: &str,
-    model: &str,
+    model: &mut String,
 ) -> Result<()> {
     // Plan side panel: subscribe to the daemon's PlanBus over IPC. Each
     // received envelope feeds `PlanPanelWiring::ingest`. The subscribe
@@ -313,7 +314,38 @@ fn spawn_plan_subscription(path: String, wiring: Arc<Mutex<PlanPanelWiring>>, re
 }
 
 #[allow(clippy::too_many_lines)] // Single linear dispatch over many slash commands; splitting hurts readability.
-async fn handle_submit(app: &SharedApp, handle: &Handle, path: &str, model: &str, text: &str) {
+async fn handle_submit(
+    app: &SharedApp,
+    handle: &Handle,
+    path: &str,
+    model: &mut String,
+    text: &str,
+) {
+    // `/model <name>` swaps the active model for subsequent prompts.
+    // Client-side only: the daemon doesn't store an "active model" —
+    // every PromptRequest carries its model string, so updating the
+    // local `model` and the status-line snapshot is enough.
+    if let Some(rest) = slash_model_args(text) {
+        {
+            let mut a = app.lock();
+            a.add_line("you> ", text);
+        }
+        handle.mark_dirty();
+        if let Some(name) = parse_model_command(text) {
+            model.clear();
+            model.push_str(&name);
+            let mut a = app.lock();
+            a.set_model(name.clone());
+            a.add_line("system> ", &format!("model set: {name}"));
+            drop(a);
+        } else {
+            let _ = rest; // unused when usage hint fires; matches `/account`'s shape
+            app.lock()
+                .add_line("error> ", "usage: /model <name>");
+        }
+        handle.mark_dirty();
+        return;
+    }
     if let Some(rest) = slash_account_args(text) {
         {
             let mut a = app.lock();
@@ -495,6 +527,23 @@ fn slash_account_args(line: &str) -> Option<&str> {
     let trimmed = line.trim_start();
     let rest = trimmed.strip_prefix("/account")?;
     // Require a word boundary so `/accountfoo` is not matched.
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        Some(rest.trim())
+    } else {
+        None
+    }
+}
+
+/// Returns `Some(rest)` when `line` is a `/model` command (with or
+/// without arguments), where `rest` is the trimmed argument tail.
+/// Mirrors the shape of [`slash_account_args`] so the `handle_submit`
+/// branches read identically; the argument-validation parsing happens
+/// downstream in `parse_model_command`.
+fn slash_model_args(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix("/model")?;
+    // Require a word boundary so `/modelfoo` falls through to the skill
+    // parser instead of being eaten by the model handler.
     if rest.is_empty() || rest.starts_with(char::is_whitespace) {
         Some(rest.trim())
     } else {
