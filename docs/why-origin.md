@@ -183,6 +183,12 @@ args = "teach"
   `workflow_progress` state machine advances one step at a time —
   deactivating the prior step's skill and activating the next — until
   it emits `StreamEvent::WorkflowComplete`.
+- **Halt-on-error with resume.** If a prompt fails mid-workflow the
+  daemon emits `StreamEvent::WorkflowStepHeld { step_index, skill,
+  message }` and keeps the same step's skill active. The next
+  successful prompt against that step is what advances the workflow —
+  there's no rollback or restart from step 0; you fix the error and
+  pick up where you were.
 
 **Autocomplete is wired:** `autocomplete.rs:43` handles `{workflow:<partial>`
 and tab-completes against the names actually in your `workflows.toml`.
@@ -206,6 +212,7 @@ one comes back in `skipped` — one ack frame, no multi-frame error loop.
 | Tab-complete from on-disk file | ❌ | ❌ | ❌ | ✅ |
 | Partial activation w/ skipped reporting | n/a | n/a | n/a | ✅ |
 | Step-by-step gating (one skill active per prompt) | ❌ | ❌ | ❌ | ✅ |
+| Halt-on-error with resume-from-failed-step | ❌ | ❌ | ❌ | ✅ |
 
 ### Where it's genuinely young
 

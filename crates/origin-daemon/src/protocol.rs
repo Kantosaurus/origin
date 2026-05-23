@@ -293,6 +293,19 @@ pub enum StreamEvent {
         #[serde(default)]
         skipped: Vec<String>,
     },
+    /// Emitted when a `Prompt` fails while a workflow is in progress.
+    /// The workflow stays paused at the SAME step — its skill remains
+    /// active on the connection's stack — and the next successful
+    /// prompt advances. `message` is the provider/loop error
+    /// rendering. Use this to render a "step held; retry to resume"
+    /// indicator in the CLI.
+    WorkflowStepHeld {
+        name: String,
+        step_index: u32,
+        total_steps: u32,
+        skill: String,
+        message: String,
+    },
     /// P13.4.2: negative acknowledgement carrying a human-readable error
     /// message. Used as the failure side of the admin mutation handlers.
     AdminError {

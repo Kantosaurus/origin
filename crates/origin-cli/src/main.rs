@@ -699,6 +699,18 @@ async fn send_skill_command(path: &str, msg: &ClientMessage) -> Result<String> {
                 ))
             }
         }
+        StreamEvent::WorkflowStepHeld {
+            name,
+            step_index,
+            total_steps,
+            skill,
+            message,
+        } => {
+            let pos = step_index + 1;
+            Ok(format!(
+                "workflow `{name}` step {pos}/{total_steps} held on `{skill}` — {message}; retry your prompt to resume"
+            ))
+        }
         other => Err(anyhow::anyhow!("unexpected reply: {other:?}")),
     }
 }
