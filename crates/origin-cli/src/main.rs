@@ -674,6 +674,31 @@ async fn send_skill_command(path: &str, msg: &ClientMessage) -> Result<String> {
                 Ok(format!("{main}  (skipped: {})", skipped.join(", ")))
             }
         }
+        StreamEvent::WorkflowStepActive {
+            name,
+            step_index,
+            total_steps,
+            skill,
+            skipped,
+        } => {
+            let pos = step_index + 1;
+            let main = format!("workflow `{name}` step {pos}/{total_steps}: `{skill}` active");
+            if skipped.is_empty() {
+                Ok(main)
+            } else {
+                Ok(format!("{main}  (skipped: {})", skipped.join(", ")))
+            }
+        }
+        StreamEvent::WorkflowComplete { name, skipped } => {
+            if skipped.is_empty() {
+                Ok(format!("workflow `{name}` complete"))
+            } else {
+                Ok(format!(
+                    "workflow `{name}` complete  (skipped: {})",
+                    skipped.join(", ")
+                ))
+            }
+        }
         other => Err(anyhow::anyhow!("unexpected reply: {other:?}")),
     }
 }
