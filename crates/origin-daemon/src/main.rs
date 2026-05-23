@@ -614,6 +614,12 @@ fn spawn_handler_task(
         // to async handlers without giving up the registry.
         let active_skills: Arc<tokio::sync::Mutex<SkillRegistry>> =
             Arc::new(tokio::sync::Mutex::new(SkillRegistry::new()));
+        // Per-connection workflow progress. Populated by
+        // `ActivateWorkflow` with the first resolvable step; advanced
+        // by `advance_workflow` after each successful `Prompt`.
+        let active_workflow: Arc<
+            tokio::sync::Mutex<Option<origin_daemon::workflow_progress::WorkflowProgress>>,
+        > = Arc::new(tokio::sync::Mutex::new(None));
 
         loop {
             let body = {
@@ -675,6 +681,16 @@ fn spawn_handler_task(
                     {
                         break;
                     }
+                    // Gate: if a workflow is in progress on this connection,
+                    // advance to the next step now that the prompt's turn
+                    // finished. No-op if no workflow is active.
+                    advance_workflow(
+                        &conn,
+                        Arc::clone(&active_workflow),
+                        Arc::clone(&active_skills),
+                        Arc::clone(&skill_catalog),
+                    )
+                    .await;
                 }
                 ClientMessage::SwitchAccount { provider, account_id } => {
                     if !handle_switch(&conn, &active, &factory, &provider, &account_id).await {
@@ -783,6 +799,7 @@ fn spawn_handler_task(
                         .await;
                 }
                 ClientMessage::ActivateWorkflow { name } => {
+                    use origin_daemon::workflow_progress::{StartOutcome, WorkflowProgress};
                     let conn_clone = Arc::clone(&conn);
                     // Load workflows.toml fresh so user edits land without a
                     // daemon restart.
@@ -810,23 +827,38 @@ fn spawn_handler_task(
                         let _ = conn_clone.lock().await.write_frame(FrameKind::Event, &body).await;
                         continue;
                     };
-                    let mut activated: Vec<String> = Vec::new();
-                    let mut skipped: Vec<String> = Vec::new();
-                    for step in &wf.steps {
-                        if let Some(skill) = skill_catalog.find(&step.skill) {
-                            active_skills.lock().await.activate(skill.front.clone());
-                            activated.push(step.skill.clone());
-                        } else {
-                            // Partial chain still useful — collect the misses
-                            // and surface them in the single ack frame so the
-                            // CLI doesn't need a multi-frame read loop.
-                            skipped.push(step.skill.clone());
+                    // Defensive: if a prior workflow's step is still active
+                    // on this connection, drop its skill before starting a
+                    // new one. (User invoked /workflow before the previous
+                    // one ran to completion.)
+                    {
+                        let mut wf_guard = active_workflow.lock().await;
+                        if let Some(prev) = wf_guard.take() {
+                            active_skills.lock().await.deactivate(&prev.current_skill);
                         }
                     }
-                    let ev = StreamEvent::WorkflowActive {
-                        name: name.clone(),
-                        steps: activated,
-                        skipped,
+                    let ev = match WorkflowProgress::start(wf, skill_catalog.as_ref()) {
+                        StartOutcome::Stepped { progress, front, skipped } => {
+                            active_skills.lock().await.activate(front);
+                            let step_index = u32::try_from(progress.current_step_index).unwrap_or(u32::MAX);
+                            let total_steps = u32::try_from(progress.total_steps).unwrap_or(u32::MAX);
+                            let skill = progress.current_skill.clone();
+                            *active_workflow.lock().await = Some(progress);
+                            StreamEvent::WorkflowStepActive {
+                                name: name.clone(),
+                                step_index,
+                                total_steps,
+                                skill,
+                                skipped,
+                            }
+                        }
+                        StartOutcome::NoResolvableSteps { skipped } => {
+                            StreamEvent::WorkflowActive {
+                                name: name.clone(),
+                                steps: Vec::new(),
+                                skipped,
+                            }
+                        }
                     };
                     let body = serde_json::to_vec(&ev).unwrap_or_default();
                     let _ = conn_clone.lock().await.write_frame(FrameKind::Event, &body).await;
@@ -1128,6 +1160,66 @@ async fn handle_request(
             true
         }
     }
+}
+
+/// If a workflow is in progress on this connection, advance past the
+/// step that just completed. Deactivates the current step's skill,
+/// activates the next resolvable step's skill, and emits the
+/// corresponding `WorkflowStepActive` or `WorkflowComplete` event.
+/// No-op when no workflow is active.
+///
+/// Called unconditionally after every `Prompt` turn end — both success
+/// and provider-error paths advance the workflow, since reaching the
+/// end of a turn IS the gate. Users re-activate the workflow if they
+/// need to restart from step 0.
+async fn advance_workflow(
+    conn: &SharedConnection,
+    active_workflow: Arc<
+        tokio::sync::Mutex<Option<origin_daemon::workflow_progress::WorkflowProgress>>,
+    >,
+    active_skills: Arc<tokio::sync::Mutex<SkillRegistry>>,
+    skill_catalog: Arc<origin_daemon::skill_catalog::SkillCatalog>,
+) {
+    use origin_daemon::workflow_progress::AdvanceOutcome;
+    let mut wf_guard = active_workflow.lock().await;
+    let Some(progress) = wf_guard.as_mut() else {
+        return;
+    };
+    let outcome = progress.advance(skill_catalog.as_ref());
+    let ev = match outcome {
+        AdvanceOutcome::Stepped {
+            previous_skill,
+            front,
+            skipped,
+        } => {
+            let name = progress.name.clone();
+            let step_index = u32::try_from(progress.current_step_index).unwrap_or(u32::MAX);
+            let total_steps = u32::try_from(progress.total_steps).unwrap_or(u32::MAX);
+            let skill = progress.current_skill.clone();
+            let mut skills = active_skills.lock().await;
+            skills.deactivate(&previous_skill);
+            skills.activate(front);
+            drop(skills);
+            StreamEvent::WorkflowStepActive {
+                name,
+                step_index,
+                total_steps,
+                skill,
+                skipped,
+            }
+        }
+        AdvanceOutcome::Complete {
+            previous_skill,
+            skipped,
+        } => {
+            let name = progress.name.clone();
+            active_skills.lock().await.deactivate(&previous_skill);
+            *wf_guard = None;
+            StreamEvent::WorkflowComplete { name, skipped }
+        }
+    };
+    let body = serde_json::to_vec(&ev).unwrap_or_default();
+    let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
 }
 
 /// Handle a `ClientMessage::SwitchAccount`. Builds the new provider via the
