@@ -6,10 +6,10 @@
 //! invokes a workflow by name. Onboarding seeds it with an example so
 //! the file shape is discoverable.
 //!
-//! Execution semantics — i.e. how the agent actually walks a workflow
-//! during a turn — are out of scope for this module; this is the storage
-//! and config-shape layer. Future work will read this file from the
-//! daemon and dispatch skill activations in order.
+//! This module is the storage and config-shape layer. The daemon owns
+//! execution: on `ClientMessage::ActivateWorkflow` it activates the
+//! first resolvable step's skill, then advances one step per completed
+//! prompt turn (see `crates/origin-daemon/src/workflow_progress.rs`).
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
