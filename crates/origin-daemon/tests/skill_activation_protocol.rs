@@ -112,6 +112,39 @@ fn workflow_step_active_event_round_trips_as_json() {
 }
 
 #[test]
+fn workflow_step_held_event_round_trips_as_json() {
+    // Emitted when a Prompt fails while a workflow is in progress.
+    // The workflow stays paused at the same step; the next successful
+    // prompt advances. The event surfaces the held step + error so the
+    // CLI can show "retry your prompt to resume".
+    let ev = StreamEvent::WorkflowStepHeld {
+        name: "frontend-design".into(),
+        step_index: 1,
+        total_steps: 3,
+        skill: "impeccable".into(),
+        message: "loop error: provider timeout".into(),
+    };
+    let body = serde_json::to_vec(&ev).expect("encode");
+    let decoded: StreamEvent = serde_json::from_slice(&body).expect("decode");
+    match decoded {
+        StreamEvent::WorkflowStepHeld {
+            name,
+            step_index,
+            total_steps,
+            skill,
+            message,
+        } => {
+            assert_eq!(name, "frontend-design");
+            assert_eq!(step_index, 1);
+            assert_eq!(total_steps, 3);
+            assert_eq!(skill, "impeccable");
+            assert_eq!(message, "loop error: provider timeout");
+        }
+        other => panic!("expected WorkflowStepHeld, got {other:?}"),
+    }
+}
+
+#[test]
 fn workflow_complete_event_round_trips_as_json() {
     let ev = StreamEvent::WorkflowComplete {
         name: "frontend-design".into(),

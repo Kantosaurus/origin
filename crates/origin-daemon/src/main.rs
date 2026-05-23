@@ -660,7 +660,7 @@ fn spawn_handler_task(
                         let g = active.read().await;
                         Arc::clone(&*g)
                     };
-                    if !handle_request(
+                    let outcome = handle_request(
                         &conn,
                         provider_snapshot.as_ref(),
                         Arc::clone(&session_store),
@@ -677,20 +677,25 @@ fn spawn_handler_task(
                         wire_plan.clone(),
                         req,
                     )
-                    .await
-                    {
-                        break;
-                    }
-                    // Gate: if a workflow is in progress on this connection,
-                    // advance to the next step now that the prompt's turn
-                    // finished. No-op if no workflow is active.
-                    advance_workflow(
-                        &conn,
-                        Arc::clone(&active_workflow),
-                        Arc::clone(&active_skills),
-                        Arc::clone(&skill_catalog),
-                    )
                     .await;
+                    match outcome {
+                        PromptOutcome::ConnectionDead => break,
+                        PromptOutcome::Succeeded => {
+                            // Gate cleared: advance the workflow one step.
+                            advance_workflow(
+                                &conn,
+                                Arc::clone(&active_workflow),
+                                Arc::clone(&active_skills),
+                                Arc::clone(&skill_catalog),
+                            )
+                            .await;
+                        }
+                        PromptOutcome::Failed { message } => {
+                            // Halt-on-error: workflow stays paused at the
+                            // same step. Next successful Prompt resumes.
+                            hold_workflow(&conn, Arc::clone(&active_workflow), &message).await;
+                        }
+                    }
                 }
                 ClientMessage::SwitchAccount { provider, account_id } => {
                     if !handle_switch(&conn, &active, &factory, &provider, &account_id).await {
@@ -1012,6 +1017,18 @@ async fn handle_memory_decision(
 /// loop deterministically.
 // `handle_request` threads each subsystem handle a `Prompt` may touch in one
 // signature. Bundling them into a struct is a P14 polish item.
+/// Outcome of a single `Prompt` dispatch.
+///
+/// The dispatcher branches on this to decide whether to advance the
+/// per-connection workflow (`Succeeded`), hold it on the same step
+/// (`Failed`), or tear down the connection (`ConnectionDead`).
+#[derive(Debug)]
+enum PromptOutcome {
+    Succeeded,
+    Failed { message: String },
+    ConnectionDead,
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_request(
     conn: &SharedConnection,
@@ -1029,7 +1046,7 @@ async fn handle_request(
     coordinator: Arc<Coordinator>,
     plan: origin_planner::Plan,
     req: PromptRequest,
-) -> bool {
+) -> PromptOutcome {
     let mut session = Session::new(provider.name(), &req.model);
     let (tx_sub, mut rx_sub) = mpsc::channel::<Subscriber>(1);
     let conn_for_relay = Arc::clone(conn);
@@ -1141,7 +1158,7 @@ async fn handle_request(
                 let mut g = conn.lock().await;
                 if let Err(e) = g.write_frame(FrameKind::Response, &bytes).await {
                     error!(error = %e, "write reply");
-                    return false;
+                    return PromptOutcome::ConnectionDead;
                 }
             }
             // Persist first so the rows exist before the sidecar deliverer
@@ -1149,15 +1166,16 @@ async fn handle_request(
             persist(session_store.as_ref(), &session);
             // Submit one Summarize job per assistant turn (P5.2, N2.5.a).
             submit_summarize_jobs(&sidecar, &session_store, &session);
-            true
+            PromptOutcome::Succeeded
         }
         Err(e) => {
+            let message = format!("loop error: {e}");
             let _ = conn
                 .lock()
                 .await
-                .write_frame(FrameKind::ErrorFrame, format!("loop error: {e}").as_bytes())
+                .write_frame(FrameKind::ErrorFrame, message.as_bytes())
                 .await;
-            true
+            PromptOutcome::Failed { message }
         }
     }
 }
@@ -1222,6 +1240,43 @@ async fn advance_workflow(
     // suspend on a slow consumer and we don't want to hold the per-conn
     // workflow mutex for that span.
     drop(wf_guard);
+    let body = serde_json::to_vec(&ev).unwrap_or_default();
+    let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
+}
+
+/// If a workflow is in progress and the prompt that just ran failed,
+/// emit a `WorkflowStepHeld` event. The workflow stays paused at the
+/// same step — its skill remains on the active stack — and the next
+/// successful `Prompt` will trigger `advance_workflow`. No-op when no
+/// workflow is active.
+async fn hold_workflow(
+    conn: &SharedConnection,
+    active_workflow: Arc<
+        tokio::sync::Mutex<Option<origin_daemon::workflow_progress::WorkflowProgress>>,
+    >,
+    message: &str,
+) {
+    let snapshot = {
+        let wf_guard = active_workflow.lock().await;
+        wf_guard.as_ref().map(|progress| {
+            (
+                progress.name.clone(),
+                u32::try_from(progress.current_step_index).unwrap_or(u32::MAX),
+                u32::try_from(progress.total_steps).unwrap_or(u32::MAX),
+                progress.current_skill.clone(),
+            )
+        })
+    };
+    let Some((name, step_index, total_steps, skill)) = snapshot else {
+        return;
+    };
+    let ev = StreamEvent::WorkflowStepHeld {
+        name,
+        step_index,
+        total_steps,
+        skill,
+        message: message.to_string(),
+    };
     let body = serde_json::to_vec(&ev).unwrap_or_default();
     let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
 }
