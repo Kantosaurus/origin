@@ -83,19 +83,67 @@ fn activate_workflow_message_round_trips_as_json() {
 }
 
 #[test]
-fn workflow_active_event_round_trips_as_json() {
-    let ev = StreamEvent::WorkflowActive {
+fn workflow_step_active_event_round_trips_as_json() {
+    let ev = StreamEvent::WorkflowStepActive {
         name: "frontend-design".into(),
-        steps: vec!["frontend-design:frontend-design".into(), "impeccable".into()],
-        skipped: vec!["ghost-skill".into()],
+        step_index: 0,
+        total_steps: 2,
+        skill: "frontend-design:frontend-design".into(),
+        skipped: vec!["ghost".into()],
+    };
+    let body = serde_json::to_vec(&ev).expect("encode");
+    let decoded: StreamEvent = serde_json::from_slice(&body).expect("decode");
+    match decoded {
+        StreamEvent::WorkflowStepActive {
+            name,
+            step_index,
+            total_steps,
+            skill,
+            skipped,
+        } => {
+            assert_eq!(name, "frontend-design");
+            assert_eq!(step_index, 0);
+            assert_eq!(total_steps, 2);
+            assert_eq!(skill, "frontend-design:frontend-design");
+            assert_eq!(skipped, vec!["ghost"]);
+        }
+        other => panic!("expected WorkflowStepActive, got {other:?}"),
+    }
+}
+
+#[test]
+fn workflow_complete_event_round_trips_as_json() {
+    let ev = StreamEvent::WorkflowComplete {
+        name: "frontend-design".into(),
+        skipped: vec!["tail-ghost".into()],
+    };
+    let body = serde_json::to_vec(&ev).expect("encode");
+    let decoded: StreamEvent = serde_json::from_slice(&body).expect("decode");
+    match decoded {
+        StreamEvent::WorkflowComplete { name, skipped } => {
+            assert_eq!(name, "frontend-design");
+            assert_eq!(skipped, vec!["tail-ghost"]);
+        }
+        other => panic!("expected WorkflowComplete, got {other:?}"),
+    }
+}
+
+#[test]
+fn workflow_active_event_still_carries_no_resolved_path() {
+    // Retained variant: emitted ONLY when the workflow exists but no step
+    // resolves through the catalog. `steps` is always empty in this path.
+    let ev = StreamEvent::WorkflowActive {
+        name: "all-ghost".into(),
+        steps: vec![],
+        skipped: vec!["ghost-a".into(), "ghost-b".into()],
     };
     let body = serde_json::to_vec(&ev).expect("encode");
     let decoded: StreamEvent = serde_json::from_slice(&body).expect("decode");
     match decoded {
         StreamEvent::WorkflowActive { name, steps, skipped } => {
-            assert_eq!(name, "frontend-design");
-            assert_eq!(steps.len(), 2);
-            assert_eq!(skipped, vec!["ghost-skill"]);
+            assert_eq!(name, "all-ghost");
+            assert!(steps.is_empty());
+            assert_eq!(skipped.len(), 2);
         }
         other => panic!("expected WorkflowActive, got {other:?}"),
     }
