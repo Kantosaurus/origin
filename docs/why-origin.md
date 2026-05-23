@@ -176,10 +176,13 @@ args = "teach"
 - User types `{workflow:frontend-design}` in the TUI.
 - `input.rs:154 parse_workflow_command` recognizes the shape.
 - CLI sends `ClientMessage::ActivateWorkflow { name }` over IPC.
-- Daemon at `main.rs:785` reloads `workflows.toml` fresh (so edits land
-  without restart), walks the steps, activates each skill via the skill
-  catalog, and replies with
-  `StreamEvent::WorkflowActive { name, steps, skipped }`.
+- Daemon reloads `workflows.toml` fresh (so edits land without restart),
+  activates the **first resolvable step's** skill, and replies with
+  `StreamEvent::WorkflowStepActive { name, step_index, total_steps,
+  skill, skipped }`. After each successful prompt the daemon's
+  `workflow_progress` state machine advances one step at a time —
+  deactivating the prior step's skill and activating the next — until
+  it emits `StreamEvent::WorkflowComplete`.
 
 **Autocomplete is wired:** `autocomplete.rs:43` handles `{workflow:<partial>`
 and tab-completes against the names actually in your `workflows.toml`.
@@ -202,15 +205,10 @@ one comes back in `skipped` — one ack frame, no multi-frame error loop.
 | Hot-reload on user edit | n/a | restart | n/a | ✅ (load-on-activate) |
 | Tab-complete from on-disk file | ❌ | ❌ | ❌ | ✅ |
 | Partial activation w/ skipped reporting | n/a | n/a | n/a | ✅ |
+| Step-by-step gating (one skill active per prompt) | ❌ | ❌ | ❌ | ✅ |
 
 ### Where it's genuinely young
 
-- The CLI module's own doc-comment says "execution semantics … are out of
-  scope for this module; this is the storage and config-shape layer"
-  (`workflows.rs:9`). The daemon **does** walk and activate the steps today,
-  but there's no inter-step gating yet — every step's skill becomes active
-  simultaneously rather than being driven one-at-a-time with a result check
-  between them.
 - The daemon's `workflows.rs` is a deliberate duplicate of the CLI's; a
   comment flags `origin-workflows` as a follow-up crate.
 - Workflow steps can't yet carry their own permission tier or sandbox
