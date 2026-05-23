@@ -10,10 +10,11 @@ use crate::skill_catalog::SkillCatalog;
 use crate::workflows::{Workflow, WorkflowStep};
 use origin_skills::frontmatter::SkillFrontmatter;
 
-/// Per-connection state for a workflow currently being walked one step
-/// at a time. `current_skill` is the name of the skill activated for the
-/// step now in effect; `next_index` points at the next step in
-/// `workflow.steps` to consider on the following `advance`.
+/// Per-connection state for a workflow being walked one step at a time.
+///
+/// `current_skill` is the name of the skill activated for the step now
+/// in effect; `next_index` points at the next step in `workflow.steps`
+/// to consider on the following `advance`.
 #[derive(Debug, Clone)]
 pub struct WorkflowProgress {
     pub name: String,
@@ -118,6 +119,7 @@ impl WorkflowProgress {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::match_wildcard_for_single_variants)]
 mod tests {
     use super::*;
     use std::path::Path;
