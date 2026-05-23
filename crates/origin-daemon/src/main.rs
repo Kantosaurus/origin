@@ -1218,6 +1218,10 @@ async fn advance_workflow(
             StreamEvent::WorkflowComplete { name, skipped }
         }
     };
+    // Release the workflow lock before the IPC write — write_frame can
+    // suspend on a slow consumer and we don't want to hold the per-conn
+    // workflow mutex for that span.
+    drop(wf_guard);
     let body = serde_json::to_vec(&ev).unwrap_or_default();
     let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
 }
