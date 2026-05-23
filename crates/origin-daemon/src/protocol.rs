@@ -119,11 +119,13 @@ pub enum ClientMessage {
     /// Always replies with [`StreamEvent::AdminOk`] — deactivating an
     /// inactive skill is not an error.
     DeactivateSkill { name: String },
-    /// Walk `name`'s steps in `~/.origin/workflows.toml`, activating each
-    /// step's skill in order on this connection's stack. The daemon
-    /// replies with [`StreamEvent::WorkflowActive`] listing the skills it
-    /// activated, or [`StreamEvent::SkillError`] if the workflow isn't
-    /// found / no skill in the chain resolves.
+    /// Walk `name`'s steps in `~/.origin/workflows.toml`, activating the
+    /// FIRST resolvable step's skill on this connection's stack. The
+    /// daemon replies with [`StreamEvent::WorkflowStepActive`] for the
+    /// active step, or [`StreamEvent::WorkflowActive`] (with empty
+    /// `steps`) when no step resolves, or [`StreamEvent::SkillError`]
+    /// when the workflow name isn't found. Subsequent steps activate
+    /// one-at-a-time after each successful `Prompt`.
     ActivateWorkflow { name: String },
     /// Subscribe this connection to the daemon-wide plan-op broadcast.
     /// Every subsequent [`OpEnvelope`] published to the bus is forwarded as
@@ -260,6 +262,34 @@ pub enum StreamEvent {
     WorkflowActive {
         name: String,
         steps: Vec<String>,
+        #[serde(default)]
+        skipped: Vec<String>,
+    },
+    /// Emitted both on initial [`ClientMessage::ActivateWorkflow`] (for
+    /// the first resolvable step) and after each successful `Prompt`
+    /// while a workflow is in progress (for the next resolvable step).
+    /// Step activation is gated on prompt completion — only one step's
+    /// skill is on the stack at a time.
+    ///
+    /// `step_index` is the 0-based index into the workflow's `steps` of
+    /// the step now in effect. `total_steps` is the length of that
+    /// vector. `skill` is the catalog name of the active skill.
+    /// `skipped` lists any earlier steps walked past during this
+    /// transition because they had no catalog match.
+    WorkflowStepActive {
+        name: String,
+        step_index: u32,
+        total_steps: u32,
+        skill: String,
+        #[serde(default)]
+        skipped: Vec<String>,
+    },
+    /// Emitted after the last step's `Prompt` completes. The previous
+    /// step's skill has already been deactivated by the daemon when this
+    /// fires. `skipped` lists any trailing unresolvable steps walked
+    /// past on the way to completion.
+    WorkflowComplete {
+        name: String,
         #[serde(default)]
         skipped: Vec<String>,
     },
