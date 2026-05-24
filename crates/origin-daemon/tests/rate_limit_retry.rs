@@ -115,12 +115,28 @@ async fn run_loop_gives_up_after_max_rate_limit_retries() {
     )
     .await
     .expect_err("must give up eventually");
+    match &err {
+        LoopError::RateLimitExhausted {
+            model,
+            attempts,
+            last_retry_after_secs,
+        } => {
+            assert_eq!(model, "claude-test");
+            assert_eq!(*attempts, 4);
+            assert_eq!(*last_retry_after_secs, 1);
+        }
+        other => panic!("expected RateLimitExhausted, got {other:?}"),
+    }
+    // The Display string must surface the mid-session model-swap hint so a
+    // human reading the TUI error knows the workaround without grepping docs.
+    let rendered = format!("{err}");
     assert!(
-        matches!(
-            err,
-            LoopError::Provider(ProviderError::RateLimit { .. })
-        ),
-        "expected RateLimit, got {err:?}"
+        rendered.contains("/model"),
+        "expected `/model` hint in rendered error, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("claude-test"),
+        "expected failing model in rendered error, got: {rendered}"
     );
     // 1 initial attempt + MAX_PROVIDER_RETRIES (3) = 4 attempts total
     assert_eq!(provider.attempts(), 4);

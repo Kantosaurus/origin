@@ -248,6 +248,21 @@ pub enum LoopError {
     ToolFailure(String),
     #[error("malformed tool args: {0}")]
     BadArgs(String),
+    /// Emitted by `run_loop` when every retry budgeted by `MAX_PROVIDER_RETRIES`
+    /// has returned `ProviderError::RateLimit`. The Display string is the
+    /// user-facing message the daemon writes into the `ErrorFrame`, so it
+    /// embeds actionable next steps (mid-session model swap) instead of
+    /// just restating "rate limit; retry after Ns".
+    #[error(
+        "rate limit on `{model}` after {attempts} attempts (last retry-after {last_retry_after_secs}s). \
+         Try `/model claude-haiku-4-5` to switch to a less-loaded model bucket mid-session, \
+         or wait for the quota window to reset"
+    )]
+    RateLimitExhausted {
+        model: String,
+        attempts: u32,
+        last_retry_after_secs: u32,
+    },
 }
 
 /// Tracks speculative tasks fired off mid-stream. Keyed by the assistant
@@ -435,6 +450,18 @@ pub async fn run_loop(
                         );
                         tokio::time::sleep(std::time::Duration::from_secs(sleep_secs.into())).await;
                         attempt += 1;
+                    }
+                    Err(LoopError::Provider(origin_provider::ProviderError::RateLimit {
+                        retry_after_secs,
+                    })) => {
+                        // Budget exhausted. The plain "rate limit; retry after Ns"
+                        // message gives operators no hint that Pro/Max OAuth quotas
+                        // are per-model — swapping to Haiku usually clears the wall.
+                        return Err(LoopError::RateLimitExhausted {
+                            model: session.model.clone(),
+                            attempts: MAX_PROVIDER_RETRIES + 1,
+                            last_retry_after_secs: retry_after_secs,
+                        });
                     }
                     other => break other?,
                 }
