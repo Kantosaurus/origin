@@ -223,10 +223,29 @@ impl Provider for Anthropic {
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api(format!("status {status}: {text}")));
+        // Mirror the non-streaming `chat()` status mapping so 429s become
+        // `ProviderError::RateLimit` and 401/403 become `Auth`. Before this,
+        // every non-success status flattened into `Api(...)`, which meant
+        // any retry-with-backoff layer upstream that pattern-matches on
+        // `RateLimit` never fired for streaming calls.
+        match resp.status() {
+            StatusCode::OK => {}
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => return Err(ProviderError::Auth),
+            StatusCode::TOO_MANY_REQUESTS => {
+                let retry = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(1);
+                return Err(ProviderError::RateLimit {
+                    retry_after_secs: retry,
+                });
+            }
+            s => {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(ProviderError::Api(format!("status {s}: {text}")));
+            }
         }
 
         let byte_stream = resp.bytes_stream();
