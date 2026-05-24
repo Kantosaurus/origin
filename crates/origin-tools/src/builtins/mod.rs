@@ -15,3 +15,4 @@ pub mod task;
 pub mod browser;
 pub mod web_fetch;
 pub mod web_search;
+pub mod write;

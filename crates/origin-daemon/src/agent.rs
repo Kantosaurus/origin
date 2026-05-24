@@ -688,6 +688,19 @@ async fn dispatch_tool(
                 .map(|()| "edit ok".to_string())
                 .map_err(LoopError::ToolFailure)
         }
+        "Write" => {
+            let path = args
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| LoopError::BadArgs("Write: missing `path`".into()))?;
+            let content = args
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| LoopError::BadArgs("Write: missing `content`".into()))?;
+            origin_tools::builtins::write::write_tool(path, content)
+                .map(|()| "write ok".to_string())
+                .map_err(LoopError::ToolFailure)
+        }
         "Bash" => {
             let cmd = args
                 .get("command")
