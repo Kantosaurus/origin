@@ -23,6 +23,17 @@ use thiserror::Error;
 use tokio::task::spawn_blocking as sb;
 use tokio::task::JoinHandle;
 
+/// Maximum number of times `run_loop` retries a single turn's provider call
+/// after a `ProviderError::RateLimit`. After the cap is hit the error is
+/// propagated as a `LoopError::Provider` and the turn fails normally.
+const MAX_PROVIDER_RETRIES: u32 = 3;
+
+/// Upper bound on the per-attempt sleep duration when honouring a
+/// `retry-after` header. Anthropic occasionally returns large values that
+/// would stall the loop for minutes; clamping keeps worst-case latency
+/// bounded while still respecting short server-side backoffs.
+const MAX_RATE_LIMIT_SLEEP_SECS: u32 = 60;
+
 #[derive(Clone)]
 pub struct LoopOptions {
     pub max_turns: u32,
@@ -392,12 +403,42 @@ pub async fn run_loop(
             tools: tools_schema.clone(),
         };
 
-        let (resp, mut speculative) = if opts.streaming_disabled {
-            let r = provider.chat(req).await?;
-            (r, SpeculativeRegistry::default())
-        } else {
-            let st = run_streaming_turn(provider, req, opts).await?;
-            (st.response, st.speculative)
+        // Retry transient `ProviderError::RateLimit` here so a single 429
+        // doesn't kill the turn. We honour the server-supplied `retry-after`
+        // up to `MAX_RATE_LIMIT_SLEEP_SECS`, and cap attempts at
+        // `MAX_PROVIDER_RETRIES`. `ChatRequest` is `Clone`, so we re-build
+        // the wire request each attempt without re-snapshotting the session.
+        let (resp, mut speculative) = {
+            let mut attempt: u32 = 0;
+            loop {
+                let result: Result<(origin_provider::ChatResponse, SpeculativeRegistry), LoopError> =
+                    if opts.streaming_disabled {
+                        provider
+                            .chat(req.clone())
+                            .await
+                            .map(|r| (r, SpeculativeRegistry::default()))
+                            .map_err(LoopError::Provider)
+                    } else {
+                        run_streaming_turn(provider, req.clone(), opts)
+                            .await
+                            .map(|st| (st.response, st.speculative))
+                    };
+                match result {
+                    Err(LoopError::Provider(origin_provider::ProviderError::RateLimit {
+                        retry_after_secs,
+                    })) if attempt < MAX_PROVIDER_RETRIES => {
+                        let sleep_secs = retry_after_secs.clamp(1, MAX_RATE_LIMIT_SLEEP_SECS);
+                        tracing::warn!(
+                            attempt,
+                            sleep_secs,
+                            "provider rate-limited; backing off and retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs.into())).await;
+                        attempt += 1;
+                    }
+                    other => break other?,
+                }
+            }
         };
 
         session.push(resp.assistant.clone());
