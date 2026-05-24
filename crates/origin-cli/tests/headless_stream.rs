@@ -79,6 +79,54 @@ async fn json_lines_stream_matches_golden() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn error_frame_surfaces_to_stderr_and_nonzero_exit() {
+    // Before this fix, `origin run` (no --json) silently dropped ErrorFrame
+    // bodies and returned exit 0, leaving the operator with no signal that
+    // their prompt failed. The --json path *did* render the body but still
+    // exited 0. Both paths must now propagate the error.
+    let dir = TempDir::new().expect("tempdir");
+    let sock = if cfg!(windows) {
+        format!(r"\\.\pipe\origin-err-{}", ulid::Ulid::new())
+    } else {
+        format!("{}/origin-err.sock", dir.path().display())
+    };
+    let listener = Listener::bind(&sock).await.expect("bind");
+
+    let listen_sock = sock.clone();
+    let server = tokio::spawn(async move {
+        let mut conn = listener.accept().await.expect("accept");
+        let _req = conn.read_frame_body().await.expect("read req");
+        let msg = b"loop error: provider: rate limit; retry after 5s";
+        conn.write_raw(&encode(1, FrameKind::ErrorFrame, msg))
+            .await
+            .expect("write err");
+        let _ = listen_sock;
+    });
+
+    let cmd = env!("CARGO_BIN_EXE_origin");
+    let output = tokio::process::Command::new(cmd)
+        .env("ORIGIN_SOCK", &sock)
+        .args(["run", "summarize"])
+        .output()
+        .await
+        .expect("run binary");
+    server.await.expect("server task");
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit on ErrorFrame, got {}; stdout={}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("loop error") && stderr.contains("rate limit"),
+        "stderr missing daemon message: {stderr}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_url_routes_through_quic() {
     use origin_ipc::quic::QuicListener;

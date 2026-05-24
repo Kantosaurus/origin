@@ -22,13 +22,10 @@ impl Conn {
         }
     }
 
-    async fn read_frame_body(&mut self) -> anyhow::Result<Vec<u8>> {
+    async fn read_frame(&mut self) -> anyhow::Result<(FrameKind, Vec<u8>)> {
         match self {
-            Self::Local(c) => Ok(c.read_frame_body().await?),
-            Self::Remote(c) => {
-                let (_k, body) = c.read_frame().await.map_err(|e| anyhow::anyhow!("{e}"))?;
-                Ok(body)
-            }
+            Self::Local(c) => Ok(c.read_frame().await?),
+            Self::Remote(c) => c.read_frame().await.map_err(|e| anyhow::anyhow!("{e}")),
         }
     }
 }
@@ -80,7 +77,15 @@ pub async fn run(
     conn.write_raw(&encode(1, FrameKind::Request, &body)).await?;
 
     loop {
-        let frame = conn.read_frame_body().await?;
+        let (kind, frame) = conn.read_frame().await?;
+        // The daemon's `ErrorFrame` carries a plain UTF-8 message describing
+        // a loop/provider failure. Without this branch the body would fail to
+        // parse as a `StreamEvent`, fall through, and silently exit 0 in the
+        // non-JSON path — leaving the operator with no idea their prompt
+        // errored. Surface as a non-zero exit + stderr-visible error.
+        if matches!(kind, FrameKind::ErrorFrame) {
+            return Err(anyhow::anyhow!("{}", String::from_utf8_lossy(&frame)));
+        }
         if let Ok(ev) = serde_json::from_slice::<StreamEvent>(&frame) {
             // Acquire the stdout lock inside this iteration so the
             // (non-Send) guard never crosses an `.await`.
