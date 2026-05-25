@@ -158,18 +158,27 @@ async fn main() -> Result<()> {
     }
 
     // Resolve TUI defaults from the saved config (falling back to env vars
-    // and finally to hard-coded "anthropic" / "claude-opus-4-7" so callers
-    // who declined / skipped onboarding still get a working session).
-    let (default_provider, default_model) = origin_cli::config::load()
+    // and finally to hard-coded "anthropic" / "claude-opus-4-7" / "default"
+    // so callers who declined / skipped onboarding still get a working
+    // session). The provider/account pair is also forwarded to the daemon
+    // when we auto-spawn it — the daemon itself only reads ORIGIN_PROVIDER /
+    // ORIGIN_ACCOUNT, not config.toml, so we have to hand it the answer.
+    let (default_provider, default_account, default_model) = origin_cli::config::load()
         .ok()
         .flatten()
         .map_or_else(
-            || ("anthropic".to_string(), "claude-opus-4-7".to_string()),
-            |c| (c.primary.provider, c.primary.model),
+            || ("anthropic".to_string(), "default".to_string(), "claude-opus-4-7".to_string()),
+            |c| (c.primary.provider, c.primary.account, c.primary.model),
         );
 
     let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
     let mut model = env::var("ORIGIN_MODEL").unwrap_or(default_model);
+
+    // Quickstart docs promise auto-spawn: stand up `origin-daemon` as a
+    // detached child if nothing is listening on the IPC path yet, and wait
+    // for it to bind the pipe before we drop into the TUI's alt-screen.
+    // (Doing this before `enable_raw_mode` keeps spawn errors readable.)
+    ensure_daemon_running(&path, &default_provider, &default_account).await?;
 
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen)?;
@@ -266,6 +275,15 @@ async fn run_event_loop(
     let mut input_stream = crossterm::event::EventStream::new();
     while let Some(maybe_ev) = input_stream.next().await {
         if let crossterm::event::Event::Key(ev) = maybe_ev? {
+            // crossterm on Windows reports both Press and Release for every
+            // keystroke; without this filter, every character would land in
+            // the buffer twice. Allow Repeat so autorepeat still works.
+            if !matches!(
+                ev.kind,
+                crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
+            ) {
+                continue;
+            }
             // Tab fires the autocomplete pass before the buffer reducer
             // sees the keypress; only fall through to `reduce` when Tab
             // didn't recognize the buffer shape.
@@ -521,7 +539,17 @@ async fn call_daemon(
     client.write_raw(&frame).await?;
 
     loop {
-        let body = client.read_frame_body().await?;
+        let (kind, body) = client.read_frame().await?;
+        // The daemon's error path (agent loop failures, provider errors)
+        // writes plain UTF-8 into an `ErrorFrame`. Without this branch we'd
+        // try to JSON-decode the text and surface serde's "expected value at
+        // line 1 column 1" instead of the actual failure reason.
+        if matches!(kind, FrameKind::ErrorFrame) {
+            return Err(anyhow::anyhow!(
+                "{}",
+                String::from_utf8_lossy(&body)
+            ));
+        }
         // Try to decode as a StreamEvent first; if that fails, treat as the
         // terminal `PromptReply` Response frame.
         if let Ok(ev) = serde_json::from_slice::<StreamEvent>(&body) {
@@ -814,4 +842,97 @@ fn default_path() -> String {
     {
         r"\\.\pipe\origin".to_string()
     }
+}
+
+/// Fast probe: try to open the IPC path. Returns `true` when something is
+/// already listening (the daemon is up), `false` on any connect error.
+async fn daemon_reachable(path: &str) -> bool {
+    origin_ipc::transport::Connector::connect(path).await.is_ok()
+}
+
+/// Make sure `origin-daemon` is listening on `path`. If a fresh probe fails,
+/// resolve a daemon binary (sibling of the current exe, or `origin-daemon` on
+/// PATH), spawn it detached and poll until the pipe accepts a connection —
+/// bounded by `STARTUP_DEADLINE`. `provider`/`account` flow through as
+/// `ORIGIN_PROVIDER` / `ORIGIN_ACCOUNT` because the daemon doesn't read
+/// `~/.origin/config.toml` — without these, it defaults to `anthropic` and
+/// fails the initial credential lookup for any other configured provider.
+async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Result<()> {
+    if daemon_reachable(path).await {
+        return Ok(());
+    }
+
+    let daemon_name = if cfg!(windows) { "origin-daemon.exe" } else { "origin-daemon" };
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("could not resolve current exe: {e}"))?;
+    let sibling = exe.parent().map(|p| p.join(daemon_name));
+    let cmd_path: std::ffi::OsString = match &sibling {
+        Some(p) if p.exists() => p.clone().into_os_string(),
+        _ => daemon_name.into(),
+    };
+
+    // Daemon stderr captures fatal startup errors that wouldn't otherwise
+    // reach the user (the daemon's tracing layer writes to parquet only).
+    // Append to `~/.origin/daemon.log` so the user has evidence on disk if
+    // the spawn succeeds but the daemon fails to bind. Best-effort: fall
+    // back to `null` if we can't open the log.
+    let log_stderr: std::process::Stdio = dirs::home_dir()
+        .map(|h| h.join(".origin").join("daemon.log"))
+        .and_then(|p| {
+            p.parent().map(std::fs::create_dir_all).transpose().ok()?;
+            std::fs::OpenOptions::new().create(true).append(true).open(&p).ok()
+        })
+        .map_or_else(std::process::Stdio::null, std::process::Stdio::from);
+
+    // Forward the config's provider/account to the daemon child. The daemon
+    // resolves the initial provider purely from env vars today; without this
+    // the auto-spawned daemon would always try `anthropic/default` even when
+    // the user picked `anthropic-oauth` (or any other id) in onboarding.
+    let mut command = std::process::Command::new(&cmd_path);
+    command
+        .env("ORIGIN_PROVIDER", provider)
+        .env("ORIGIN_ACCOUNT", account)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(log_stderr);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // CREATE_NEW_PROCESS_GROUP (0x200) | DETACHED_PROCESS (0x08):
+        // detach from the parent console so Ctrl-C in the TUI doesn't take
+        // the daemon down with it, and the daemon survives this process.
+        command.creation_flags(0x0000_0208);
+    }
+
+    let child = command.spawn().map_err(|e| {
+        let searched = sibling
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<no exe dir>".to_string());
+        anyhow::anyhow!(
+            "could not spawn origin-daemon: {e}\n\
+             searched: {searched}, then PATH for `{daemon_name}`\n\
+             build it with `cargo build --release -p origin-daemon` and place the binary \
+             next to origin, or set ORIGIN_SOCK to an existing daemon's pipe path"
+        )
+    })?;
+    // Drop the handle: on Windows, with DETACHED_PROCESS, the child outlives
+    // us; on Unix the kernel reaps when the parent exits, which is fine for
+    // subsequent `origin` runs (each spawns its own daemon if none is up).
+    drop(child);
+
+    const STARTUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + STARTUP_DEADLINE;
+    while std::time::Instant::now() < deadline {
+        if daemon_reachable(path).await {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err(anyhow::anyhow!(
+        "origin-daemon did not bind {path} within {}s — see ~/.origin/daemon.log \
+         for the daemon's stderr (it likely panicked during startup)",
+        STARTUP_DEADLINE.as_secs()
+    ))
 }
