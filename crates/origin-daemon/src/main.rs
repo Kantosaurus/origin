@@ -108,6 +108,12 @@ fn main() -> Result<()> {
             .raw()
             .expect("worker handle populated");
         if let Err(e) = h.block_on(daemon_setup(state_for_setup)) {
+            // tracing::error! lands in the parquet trace ring, which is great
+            // for postmortems but useless when the daemon is failing during
+            // boot under auto-spawn (no console attached, no chance for the
+            // operator to see it). Mirror the error to stderr so the parent
+            // sees *something* before exit code 0.
+            eprintln!("origin-daemon: daemon_setup terminated with error: {e}");
             error!(error = %e, "daemon_setup terminated with error");
             signal_for_setup.trigger();
         }

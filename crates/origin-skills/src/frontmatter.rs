@@ -33,10 +33,24 @@ pub enum FrontmatterError {
 
 /// Split `source` into a frontmatter block + body, then deserialize the block.
 ///
+/// Accepts either Unix (`\n`) or Windows (`\r\n`) line endings and strips an
+/// optional leading UTF-8 BOM, so files checked out by `git config
+/// core.autocrlf=true` or saved by BOM-emitting editors round-trip cleanly.
+/// The returned `body` is normalized to LF.
+///
 /// # Errors
 /// Returns [`FrontmatterError`] for missing delimiters or invalid YAML.
 #[allow(clippy::module_name_repetitions)] // unambiguous from outside the crate
 pub fn parse_frontmatter(source: &str) -> Result<ParsedSkill, FrontmatterError> {
+    let stripped = source.strip_prefix('\u{FEFF}').unwrap_or(source);
+    // Lazy allocation: only normalize when CRLF is actually present.
+    let normalized;
+    let source: &str = if stripped.contains('\r') {
+        normalized = stripped.replace("\r\n", "\n");
+        &normalized
+    } else {
+        stripped
+    };
     let rest = source
         .strip_prefix("---\n")
         .ok_or(FrontmatterError::MissingOpen)?;

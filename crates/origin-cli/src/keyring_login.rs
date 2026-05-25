@@ -204,7 +204,7 @@ async fn run_auth_code_flow(
         println!("Waiting for the browser redirect on http://localhost:{port} …");
 
         let code = receive_code_via_listener(port).await?;
-        exchange_and_persist(provider_id, account, spec, vault, &pkce, &code).await
+        exchange_and_persist(provider_id, account, spec, vault, &pkce, &code, &state).await
     } else {
         // Remote redirect URI (e.g. Anthropic's console callback) — user must
         // paste the code manually.
@@ -215,18 +215,35 @@ async fn run_auth_code_flow(
         io::stdout().flush().ok();
 
         let stdin = io::stdin();
-        let code = stdin
+        let pasted = stdin
             .lock()
             .lines()
             .next()
             .ok_or_else(|| anyhow!("no input"))?
             .map_err(|e| anyhow!("read stdin: {e}"))?;
-        let code = code.trim().to_string();
-        if code.is_empty() {
+        let pasted = pasted.trim();
+        if pasted.is_empty() {
             return Err(anyhow!("empty code"));
         }
 
-        exchange_and_persist(provider_id, account, spec, vault, &pkce, &code).await
+        // Claude.ai's manual-paste flow returns "<code>#<state>" — the console
+        // redirect page concatenates the URL fragment into the copyable string.
+        // Strip the state suffix (and verify it round-tripped, when present) so
+        // the bare `code` is what reaches the /token endpoint.
+        let (code, returned_state) = pasted
+            .split_once('#')
+            .map_or((pasted, None), |(c, s)| (c, Some(s)));
+        if let Some(returned) = returned_state {
+            if returned != state {
+                return Err(anyhow!(
+                    "OAuth state mismatch: authorization response did not echo \
+                     the expected state — aborting to prevent CSRF"
+                ));
+            }
+        }
+        let code = code.to_string();
+
+        exchange_and_persist(provider_id, account, spec, vault, &pkce, &code, &state).await
     }
 }
 
@@ -299,13 +316,86 @@ async fn exchange_and_persist(
     vault: &KeyVault,
     pkce: &Pkce,
     code: &str,
+    state: &str,
 ) -> Result<()> {
+    // Anthropic's /v1/oauth/token is JSON-only and rejects RFC 6749 form bodies
+    // with a 400 "Invalid request format" (Anthropic's API error envelope, not
+    // an OAuth error). Route it through the Anthropic-specific JSON exchange.
+    if provider_id == "anthropic-oauth" {
+        return exchange_anthropic_and_persist(provider_id, account, spec, vault, pkce, code, state)
+            .await;
+    }
     let oauth = OAuthClient::new(provider_id, spec.token_url.as_ref(), spec.client_id.as_ref());
     let req = AuthCodeRequest::new(code, pkce.verifier(), spec.redirect_uri.as_ref());
     oauth
         .exchange(vault, account, req)
         .await
         .map_err(|e| anyhow!("token exchange failed: {e}"))?;
+    println!("Stored OAuth tokens for {provider_id}:{account}");
+    Ok(())
+}
+
+// Anthropic OAuth token exchange — JSON body with `state` echoed back, matching
+// the Claude.ai pairing flow used by the official Claude CLI and other
+// Anthropic-aware clients. Refresh still flows through `OAuthClient::refresh`
+// (form-encoded) and will need its own JSON-aware path before long-lived
+// sessions can rotate tokens against this endpoint.
+async fn exchange_anthropic_and_persist(
+    provider_id: &str,
+    account: &str,
+    spec: &origin_provider::catalog::OAuthSpec,
+    vault: &KeyVault,
+    pkce: &Pkce,
+    code: &str,
+    state: &str,
+) -> Result<()> {
+    #[derive(Deserialize)]
+    struct TokenResp {
+        access_token: String,
+        #[serde(default)]
+        refresh_token: Option<String>,
+        expires_in: u64,
+    }
+
+    let body = serde_json::json!({
+        "grant_type": "authorization_code",
+        "code": code,
+        "state": state,
+        "client_id": spec.client_id.as_ref(),
+        "redirect_uri": spec.redirect_uri.as_ref(),
+        "code_verifier": pkce.verifier(),
+    });
+
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(spec.token_url.as_ref())
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow!("oauth POST {}: {e}", spec.token_url))?;
+    let status = resp.status();
+    let body_text = resp
+        .text()
+        .await
+        .map_err(|e| anyhow!("oauth read body: {e}"))?;
+    if !status.is_success() {
+        return Err(anyhow!(
+            "token exchange failed: oauth token endpoint returned {status}: {body_text}"
+        ));
+    }
+    let tok: TokenResp = serde_json::from_str(&body_text)
+        .map_err(|e| anyhow!("parse token response: {e}"))?;
+    let expires_at = now_epoch_secs().saturating_add(tok.expires_in);
+    persist_tokens(
+        vault,
+        provider_id,
+        account,
+        &tok.access_token,
+        tok.refresh_token.as_deref(),
+        expires_at,
+    )
+    .await?;
     println!("Stored OAuth tokens for {provider_id}:{account}");
     Ok(())
 }
