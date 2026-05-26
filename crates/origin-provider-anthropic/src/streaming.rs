@@ -126,12 +126,14 @@ where
             serde_json::from_str(&raw).map_err(|e| StreamingError::Sse(format!("json: {e}; raw={raw}")))?;
         match parsed {
             WireEvent::ContentBlockStart {
+                index,
                 content_block: WireContentBlock { kind, id, name },
-                ..
             } if kind == "tool_use" => {
-                // Payload layout: id bytes + '\0' + name bytes (both UTF-8).
-                // `id` is always ASCII (`toolu_…`) and cannot contain '\0'.
-                let payload = [id.as_bytes(), b"\0", name.as_bytes()].concat();
+                // Payload: 4-byte LE index + id bytes + '\0' + name bytes.
+                let mut payload = index.to_le_bytes().to_vec();
+                payload.extend_from_slice(id.as_bytes());
+                payload.push(b'\0');
+                payload.extend_from_slice(name.as_bytes());
                 ring.publish(&TokenEvent::new(TokenKind::ToolUseStart, payload))?;
             }
             WireEvent::ContentBlockDelta {
@@ -141,13 +143,13 @@ where
                 ring.publish(&TokenEvent::new(TokenKind::TextDelta, text.into_bytes()))?;
             }
             WireEvent::ContentBlockDelta {
+                index,
                 delta: WireDelta::InputJsonDelta { partial_json },
-                ..
             } => {
-                ring.publish(&TokenEvent::new(
-                    TokenKind::ToolUseDelta,
-                    partial_json.into_bytes(),
-                ))?;
+                // Payload: 4-byte LE index + partial JSON bytes.
+                let mut payload = index.to_le_bytes().to_vec();
+                payload.extend_from_slice(partial_json.as_bytes());
+                ring.publish(&TokenEvent::new(TokenKind::ToolUseDelta, payload))?;
             }
             WireEvent::ContentBlockDelta {
                 delta: WireDelta::ThinkingDelta { thinking },
