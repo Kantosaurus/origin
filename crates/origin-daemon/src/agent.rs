@@ -1273,13 +1273,46 @@ fn node_row_to_json(row: &origin_codegraph::index::NodeRow) -> serde_json::Value
 }
 
 fn tool_activity_summary(name: &str, args: &Value) -> String {
-    match name {
-        "Write" | "Read" | "Edit" => args
-            .get("path")
+    let path_str = || {
+        args.get("path")
             .or_else(|| args.get("file_path"))
             .and_then(Value::as_str)
             .unwrap_or("")
-            .to_string(),
+    };
+    match name {
+        "Write" => {
+            let path = path_str();
+            let lines = args
+                .get("content")
+                .and_then(Value::as_str)
+                .map_or(0, |c| c.lines().count());
+            format!("{path} ({lines} lines)")
+        }
+        "Edit" => {
+            let path = path_str();
+            let old_lines = args
+                .get("old_string")
+                .and_then(Value::as_str)
+                .map_or(0, |s| s.lines().count());
+            let new_lines = args
+                .get("new_string")
+                .and_then(Value::as_str)
+                .map_or(0, |s| s.lines().count());
+            let added = new_lines.saturating_sub(old_lines);
+            let removed = old_lines.saturating_sub(new_lines);
+            let mut parts = Vec::new();
+            if added > 0 {
+                parts.push(format!("+{added}"));
+            }
+            if removed > 0 {
+                parts.push(format!("-{removed}"));
+            }
+            if parts.is_empty() {
+                parts.push(format!("~{new_lines}"));
+            }
+            format!("{path} ({} lines)", parts.join(", "))
+        }
+        "Read" => path_str().to_string(),
         "Bash" => {
             let cmd = args
                 .get("command")
