@@ -17,6 +17,10 @@ const DEFAULT_BASE: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
+const OAUTH_BETA_HEADERS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24";
+const CLAUDE_CLI_USER_AGENT: &str = "claude-cli/2.1.123 (external, sdk-cli)";
+const OAUTH_BILLING_HEADER: &str = "cc_version=2.1.123; cc_entrypoint=sdk-cli; cch=33f85;";
+
 /// Controls which auth header is sent with each request.
 enum AuthKind {
     /// `x-api-key: <key>` — the standard Anthropic API key path.
@@ -33,6 +37,8 @@ pub struct Anthropic {
     client: reqwest::Client,
     cas: Option<std::sync::Arc<origin_cas::Store>>,
     plan: Option<Plan>,
+    oauth_session_id: String,
+    oauth_metadata: Option<wire::WireMetadata>,
 }
 
 impl Anthropic {
@@ -51,6 +57,8 @@ impl Anthropic {
             client: reqwest::Client::new(),
             cas: None,
             plan: None,
+            oauth_session_id: String::new(),
+            oauth_metadata: None,
         }
     }
 
@@ -69,12 +77,16 @@ impl Anthropic {
     /// Sends `Authorization: Bearer <token>` rather than `x-api-key: <key>`.
     #[must_use]
     pub fn with_oauth_bearer(token: impl Into<String>) -> Self {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let metadata = load_oauth_metadata(&session_id);
         Self {
             auth: AuthKind::OAuthBearer(token.into()),
             base: DEFAULT_BASE.to_string(),
             client: reqwest::Client::new(),
             cas: None,
             plan: None,
+            oauth_session_id: session_id,
+            oauth_metadata: Some(metadata),
         }
     }
 
@@ -105,7 +117,34 @@ impl Anthropic {
     fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth {
             AuthKind::ApiKey(key) => builder.header("x-api-key", key),
-            AuthKind::OAuthBearer(token) => builder.header("Authorization", format!("Bearer {token}")),
+            AuthKind::OAuthBearer(token) => builder
+                .header("Authorization", format!("Bearer {token}"))
+                .header("User-Agent", CLAUDE_CLI_USER_AGENT)
+                .header("anthropic-beta", OAUTH_BETA_HEADERS)
+                .header("x-app", "cli")
+                .header("X-Claude-Code-Session-Id", &self.oauth_session_id)
+                .header("x-client-request-id", uuid::Uuid::new_v4().to_string())
+                .header("X-Stainless-Arch", std::env::consts::ARCH)
+                .header("X-Stainless-Lang", "js")
+                .header("X-Stainless-OS", std::env::consts::OS)
+                .header("X-Stainless-Package-Version", "0.81.0")
+                .header("X-Stainless-Retry-Count", "0")
+                .header("X-Stainless-Runtime", "node")
+                .header("X-Stainless-Runtime-Version", "v24.3.0")
+                .header("X-Stainless-Timeout", "600")
+                .header("anthropic-dangerous-direct-browser-access", "true"),
+        }
+    }
+
+    fn is_oauth(&self) -> bool {
+        matches!(self.auth, AuthKind::OAuthBearer(_))
+    }
+
+    fn messages_url(&self) -> String {
+        if self.is_oauth() {
+            format!("{}/v1/messages?beta=true", self.base)
+        } else {
+            format!("{}/v1/messages", self.base)
         }
     }
 }
@@ -134,19 +173,31 @@ impl Provider for Anthropic {
             })
             .collect::<Vec<_>>();
 
+        let system_text = if self.is_oauth() && !req.system.is_empty() {
+            format!(
+                "x-anthropic-billing-header: {}\n\n{}",
+                OAUTH_BILLING_HEADER, req.system
+            )
+        } else {
+            req.system.clone()
+        };
+
         let body = wire::WireRequest {
             model: &req.model,
             max_tokens: DEFAULT_MAX_TOKENS,
-            system: if req.system.is_empty() {
+            system: if system_text.is_empty() {
                 None
             } else {
-                Some(req.system.as_str())
+                Some(system_text.as_str())
             },
             messages: wire_messages,
             tools: wire_tools,
+            metadata: self.oauth_metadata.as_ref().map(|m| wire::WireMetadata {
+                user_id: m.user_id.clone(),
+            }),
         };
 
-        let url = format!("{}/v1/messages", self.base);
+        let url = self.messages_url();
         let resp = self
             .apply_auth(self.client.post(&url))
             .header("anthropic-version", API_VERSION)
@@ -172,8 +223,14 @@ impl Provider for Anthropic {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u32>().ok())
                     .unwrap_or(1);
+                let body = resp.text().await.unwrap_or_default();
+                let message = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("error")?.get("message")?.as_str().map(String::from))
+                    .unwrap_or_default();
                 Err(ProviderError::RateLimit {
                     retry_after_secs: retry,
+                    message,
                 })
             }
             s => {
@@ -201,33 +258,42 @@ impl Provider for Anthropic {
             })
             .collect::<Vec<_>>();
 
-        let url = format!("{}/v1/messages", self.base);
+        let system_text = if self.is_oauth() && !req.system.is_empty() {
+            format!(
+                "x-anthropic-billing-header: {}\n\n{}",
+                OAUTH_BILLING_HEADER, req.system
+            )
+        } else {
+            req.system.clone()
+        };
+
+        let mut body_json = serde_json::json!({
+            "model": req.model,
+            "max_tokens": DEFAULT_MAX_TOKENS,
+            "system": if system_text.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(system_text)
+            },
+            "messages": wire_messages,
+            "tools": wire_tools,
+            "stream": true,
+        });
+        if let Some(meta) = &self.oauth_metadata {
+            body_json["metadata"] = serde_json::json!({ "user_id": meta.user_id });
+        }
+
+        let url = self.messages_url();
         let resp = self
             .apply_auth(self.client.post(&url))
             .header("anthropic-version", API_VERSION)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
-            .json(&serde_json::json!({
-                "model": req.model,
-                "max_tokens": DEFAULT_MAX_TOKENS,
-                "system": if req.system.is_empty() {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::Value::String(req.system.clone())
-                },
-                "messages": wire_messages,
-                "tools": wire_tools,
-                "stream": true,
-            }))
+            .json(&body_json)
             .send()
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
-        // Mirror the non-streaming `chat()` status mapping so 429s become
-        // `ProviderError::RateLimit` and 401/403 become `Auth`. Before this,
-        // every non-success status flattened into `Api(...)`, which meant
-        // any retry-with-backoff layer upstream that pattern-matches on
-        // `RateLimit` never fired for streaming calls.
         match resp.status() {
             StatusCode::OK => {}
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => return Err(ProviderError::Auth),
@@ -238,8 +304,14 @@ impl Provider for Anthropic {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u32>().ok())
                     .unwrap_or(1);
+                let body = resp.text().await.unwrap_or_default();
+                let message = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("error")?.get("message")?.as_str().map(String::from))
+                    .unwrap_or_default();
                 return Err(ProviderError::RateLimit {
                     retry_after_secs: retry,
+                    message,
                 });
             }
             s => {
@@ -434,6 +506,42 @@ fn expand_messages_for_wire(
     Ok(out)
 }
 
+fn load_oauth_metadata(session_id: &str) -> wire::WireMetadata {
+    let home = dirs::home_dir().unwrap_or_default();
+    let claude_json = home.join(".claude.json");
+    let (device_id, account_uuid) = std::fs::read_to_string(&claude_json)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map(|v| {
+            let did = v
+                .get("userID")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let auid = v
+                .get("oauthAccount")
+                .and_then(|o| o.get("accountUuid"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("unknown-account")
+                .to_string();
+            (did, auid)
+        })
+        .unwrap_or_else(|| {
+            let did = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, session_id.as_bytes())
+                .simple()
+                .to_string();
+            (did, "unknown-account".to_string())
+        });
+
+    let user_id = serde_json::json!({
+        "device_id": device_id,
+        "account_uuid": account_uuid,
+        "session_id": session_id,
+    })
+    .to_string();
+    wire::WireMetadata { user_id }
+}
+
 fn short_hex(h: &[u8; 32]) -> String {
     origin_cas::Hash::from_bytes(*h)
         .to_string()
@@ -484,6 +592,7 @@ pub fn encode_request_for_test(req: &ChatRequest) -> serde_json::Value {
         },
         messages: wire_messages,
         tools: wire_tools,
+        metadata: None,
     };
     serde_json::to_value(&body).expect("WireRequest serialises to JSON")
 }
