@@ -120,7 +120,17 @@ pub fn run_with<R: BufRead, W: Write>(
         }
     }
 
-    writeln!(&mut w, "\nSetup complete. `origin --help` lists every subcommand.")?;
+    writeln!(
+        &mut w,
+        "\n  {} {}",
+        crate::ansi::green("\u{2714}"),
+        crate::ansi::bright("Setup complete."),
+    )?;
+    writeln!(
+        &mut w,
+        "  {}",
+        crate::ansi::muted("`origin --help` lists every subcommand."),
+    )?;
     Ok(())
 }
 
@@ -129,28 +139,29 @@ pub fn run_with<R: BufRead, W: Write>(
 // ---------------------------------------------------------------------------
 
 fn screen_toolbox<R: BufRead, W: Write>(r: &mut R, w: &mut W) -> Result<()> {
-    writeln!(w, "\n── The Toolbox ──")?;
-    writeln!(
-        w,
-        "The Toolbox is origin's tool registry — every concrete action the \
-         agent can take is a tool registered here at build time."
-    )?;
+    use crate::ansi;
+    writeln!(w)?;
+    writeln!(w, "  {}  {}", ansi::step_number(1, 4), ansi::heading("toolbox"))?;
+    writeln!(w)?;
     let tools: Vec<&'static ToolMeta> = registry_iter().collect();
-    writeln!(w, "\nYour Toolbox has {} tools available:", tools.len())?;
-    for t in &tools {
-        // Truncate the description so wide entries don't blow out the prompt
-        // line on narrow terminals; users can `origin run "describe Read"`
-        // for the full text later.
-        let desc = truncate(t.description, 72);
-        writeln!(w, "  {:<18} {desc}", t.name)?;
-    }
     writeln!(
         w,
-        "\nWhen you add a skill, origin checks that every tool the skill \
-         declares in its `allowed-tools:` exists in the Toolbox; missing \
-         tools surface as warnings during import."
+        "  {} {} tools available:",
+        ansi::muted("Your agent has"),
+        ansi::accent(&tools.len().to_string()),
     )?;
-    press_enter(r, w, "Press Enter to continue.")
+    writeln!(w)?;
+    for t in &tools {
+        let desc = truncate(t.description, 60);
+        writeln!(w, "    {}  {}", ansi::accent(&format!("{:<16}", t.name)), ansi::muted(&desc))?;
+    }
+    writeln!(w)?;
+    writeln!(
+        w,
+        "  {}",
+        ansi::muted("Skills are validated against this toolbox on import.")
+    )?;
+    press_enter(r, w, "  Press Enter to continue.")
 }
 
 // ---------------------------------------------------------------------------
@@ -162,31 +173,30 @@ fn screen_skill_repository<R: BufRead, W: Write>(
     w: &mut W,
     skills_dst: &Path,
 ) -> Result<()> {
-    writeln!(w, "\n── The Skill Repository ──")?;
+    use crate::ansi;
+    writeln!(w)?;
+    writeln!(w, "  {}  {}", ansi::step_number(2, 4), ansi::heading("skills"))?;
+    writeln!(w)?;
     writeln!(
         w,
-        "Skills are markdown files with YAML frontmatter that teach the \
-         agent specialized procedures: when to invoke them, which tools \
-         they need, and how to behave once active."
+        "  {}",
+        ansi::muted("Markdown files with YAML frontmatter that teach the agent procedures.")
     )?;
-    writeln!(w, "\nYour skill repository lives at:\n  {}", skills_dst.display())?;
+    writeln!(w, "  {}  {}", ansi::muted("Repository:"), ansi::accent(&skills_dst.display().to_string()))?;
 
-    // If the directory exists, surface the count so the user can see what
-    // they already have (e.g. on a re-run of `origin init`).
     let existing = count_skills(skills_dst);
     if existing > 0 {
-        writeln!(w, "  ({existing} skill(s) already installed.)")?;
+        writeln!(w, "  {}",
+            ansi::muted(&format!("{existing} skill(s) already installed.")))?;
     }
 
+    writeln!(w)?;
     writeln!(
         w,
-        "\nAdding a skill is just placing its `SKILL.md` into a \
-         subdirectory under the path above. Origin loads every skill in \
-         that tree, parses its frontmatter, hashes the body (so duplicates \
-         dedup), and validates that the tools the skill declares exist in \
-         your Toolbox."
+        "  {}",
+        ansi::muted("Drop SKILL.md files into subdirectories. Origin deduplicates by hash.")
     )?;
-    press_enter(r, w, "Press Enter to continue.")
+    press_enter(r, w, "  Press Enter to continue.")
 }
 
 // ---------------------------------------------------------------------------
@@ -198,10 +208,12 @@ fn screen_port_skills<W: Write>(
     sources: &[(PathBuf, String)],
     skills_dst: &Path,
 ) -> Result<()> {
-    writeln!(w, "\n── Porting skills from other harnesses ──")?;
-    writeln!(w, "Scanning known locations:")?;
+    use crate::ansi;
+    writeln!(w)?;
+    writeln!(w, "  {}  {}", ansi::step_number(3, 4), ansi::heading("import skills"))?;
+    writeln!(w)?;
     for (path, label) in sources {
-        writeln!(w, "  - {label:<20} {}", path.display())?;
+        writeln!(w, "    {}  {}", ansi::accent(&format!("{label:<18}")), ansi::muted(&path.display().to_string()))?;
     }
     writeln!(w)?;
 
@@ -299,32 +311,36 @@ fn screen_workflows<R: BufRead, W: Write>(
     w: &mut W,
     workflows_path: &Path,
 ) -> Result<()> {
-    writeln!(w, "\n── Workflows ──")?;
+    use crate::ansi;
+    writeln!(w)?;
+    writeln!(w, "  {}  {}", ansi::step_number(4, 4), ansi::heading("workflows"))?;
+    writeln!(w)?;
     writeln!(
         w,
-        "Workflows chain skills into a streamlined sequence. Each step \
-         names a skill and optional arguments; the agent walks the steps \
-         in order, threading the result of each into the next.\n"
+        "  {}",
+        ansi::muted("Chain skills into sequences. Each step names a skill + optional args.")
     )?;
-    writeln!(w, "Example (the seed file we'll write below):")?;
-    writeln!(w, "  [[workflows]]")?;
-    writeln!(w, "  name = \"frontend-design\"")?;
-    writeln!(w, "  steps = [")?;
-    writeln!(w, "    {{ skill = \"frontend-design:frontend-design\" }},")?;
-    writeln!(w, "    {{ skill = \"impeccable\", args = \"teach\" }},")?;
-    writeln!(w, "  ]\n")?;
+    writeln!(w)?;
+    writeln!(w, "    {}", ansi::muted("[[workflows]]"))?;
+    writeln!(w, "    {}", ansi::muted("name = \"frontend-design\""))?;
+    writeln!(w, "    {}", ansi::muted("steps = ["))?;
+    writeln!(w, "      {}", ansi::muted("{ skill = \"frontend-design:frontend-design\" },"))?;
+    writeln!(w, "      {}", ansi::muted("{ skill = \"impeccable\", args = \"teach\" },"))?;
+    writeln!(w, "    {}", ansi::muted("]"))?;
+    writeln!(w)?;
 
     match workflows::seed_if_missing(workflows_path) {
-        Ok(true) => writeln!(w, "Wrote example to {}.", workflows_path.display())?,
+        Ok(true) => writeln!(w, "  {} Seeded {}", ansi::green("\u{2714}"), ansi::muted(&workflows_path.display().to_string()))?,
         Ok(false) => writeln!(
             w,
-            "{} already exists; leaving your edits in place.",
-            workflows_path.display()
+            "  {} {}",
+            ansi::muted("\u{2500}"),
+            ansi::muted(&format!("{} already exists", workflows_path.display())),
         )?,
-        Err(e) => writeln!(w, "warning: could not seed workflows.toml: {e}")?,
+        Err(e) => writeln!(w, "  {} {}", ansi::red("\u{2718}"), ansi::red(&format!("could not seed: {e}")))?,
     }
 
-    press_enter(r, w, "Press Enter to finish setup.")
+    press_enter(r, w, "  Press Enter to finish setup.")
 }
 
 // ---------------------------------------------------------------------------
