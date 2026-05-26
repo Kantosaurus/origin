@@ -173,6 +173,7 @@ async fn main() -> Result<()> {
 
     let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
     let mut model = env::var("ORIGIN_MODEL").unwrap_or(default_model);
+    let session_id = format!("{:032x}", rand::random::<u128>());
 
     // Quickstart docs promise auto-spawn: stand up `origin-daemon` as a
     // detached child if nothing is listening on the IPC path yet, and wait
@@ -247,10 +248,10 @@ async fn main() -> Result<()> {
         app.lock()
             .add_line("system> ", "Running queued first-run discovery prompt\u{2026}");
         handle.mark_dirty();
-        handle_submit(&app, &handle, &path, &mut model, &text).await;
+        handle_submit(&app, &handle, &path, &mut model, &text, &session_id).await;
     }
 
-    let result = run_event_loop(app, composer, widget, handle, &path, &mut model).await;
+    let result = run_event_loop(app, composer, widget, handle, &path, &mut model, &session_id).await;
 
     render_task.abort();
     disable_raw_mode()?;
@@ -265,6 +266,7 @@ async fn run_event_loop(
     handle: Handle,
     path: &str,
     model: &mut String,
+    session_id: &str,
 ) -> Result<()> {
     // Plan side panel: subscribe to the daemon's PlanBus over IPC. Each
     // received envelope feeds `PlanPanelWiring::ingest`. The subscribe
@@ -316,7 +318,7 @@ async fn run_event_loop(
             match action {
                 InputAction::Quit => break,
                 InputAction::Submit(text) => {
-                    handle_submit(&app, &handle, path, model, &text).await;
+                    handle_submit(&app, &handle, path, model, &text, session_id).await;
                 }
                 _ => {
                     handle.mark_dirty();
@@ -369,6 +371,7 @@ async fn handle_submit(
     path: &str,
     model: &mut String,
     text: &str,
+    session_id: &str,
 ) {
     // `/model <name>` swaps the active model for subsequent prompts.
     // Client-side only: the daemon doesn't store an "active model" —
@@ -477,6 +480,7 @@ async fn handle_submit(
         path,
         model,
         text,
+        session_id,
         |d| deltas.push(d.to_string()),
         |i, o, cr, cw| usage_events.push((i, o, cr, cw)),
         |id, body, tags| proposals.push((id, body, tags)),
@@ -523,6 +527,7 @@ async fn call_daemon(
     path: &str,
     model: &str,
     user_text: &str,
+    session_id: &str,
     mut on_delta: impl FnMut(&str) + Send,
     mut on_usage: impl FnMut(u32, u32, u32, u32) + Send,
     mut on_proposal: impl FnMut(u32, String, Vec<String>) + Send,
@@ -533,6 +538,7 @@ async fn call_daemon(
         system: String::new(),
         model: model.to_string(),
         user_text: user_text.to_string(),
+        session_id: Some(session_id.to_string()),
     });
     let body = serde_json::to_vec(&msg)?;
     let frame = encode(1, FrameKind::Request, &body);
