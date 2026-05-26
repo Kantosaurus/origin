@@ -593,11 +593,32 @@ pub async fn run_loop(
         // Dispatch each tool_use sequentially.
         let mut tool_results: Vec<Block> = Vec::with_capacity(tool_uses.len());
         for (id, name, input_bytes) in tool_uses {
-            let meta = registry_iter()
-                .find(|m| m.name == name)
-                .ok_or_else(|| LoopError::UnknownTool(name.clone()))?;
-            let args: Value =
-                serde_json::from_slice(&input_bytes).map_err(|e| LoopError::BadArgs(e.to_string()))?;
+            let meta = match registry_iter().find(|m| m.name == name) {
+                Some(m) => m,
+                None => {
+                    tracing::warn!(tool = %name, "unknown tool; returning error to model");
+                    tool_results.push(Block::ToolResult {
+                        tool_use_id: id,
+                        handle: None,
+                        inline: Some(format!("Error: unknown tool `{name}`").into_bytes()),
+                        cache_marker: None,
+                    });
+                    continue;
+                }
+            };
+            let args: Value = match serde_json::from_slice(&input_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(tool = %name, error = %e, "malformed tool args; returning error to model");
+                    tool_results.push(Block::ToolResult {
+                        tool_use_id: id,
+                        handle: None,
+                        inline: Some(format!("Error: malformed args: {e}").into_bytes()),
+                        cache_marker: None,
+                    });
+                    continue;
+                }
+            };
             let preview = args.to_string();
 
             // Compute the memoization key using the RAW input bytes (not
