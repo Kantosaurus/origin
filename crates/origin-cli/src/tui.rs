@@ -6,7 +6,7 @@ use origin_tui::composer::Composer;
 use origin_tui::grid::{Attr, Cell, Grid};
 use origin_tui::stream_widget::StreamWidget;
 
-use crate::status::{render_line, UsageSnapshot};
+use crate::status::UsageSnapshot;
 use crate::theme;
 
 #[derive(Debug, Clone)]
@@ -18,10 +18,6 @@ pub struct ScrollLine {
 }
 
 impl ScrollLine {
-    fn plain(text: String) -> Self {
-        Self { text, fg: 0, bg: 0, bold: false }
-    }
-
     fn styled(text: String, fg: u32, bg: u32, bold: bool) -> Self {
         Self { text, fg, bg, bold }
     }
@@ -60,8 +56,17 @@ impl App {
             "ok> " => (theme::GREEN, false),
             _ => (theme::BODY, false),
         };
+        let display_prefix = match prefix {
+            "you> " => "\u{25B8} ",
+            "error> " => "\u{2718} ",
+            "system> " => "\u{2500} ",
+            "ok> " => "\u{2714} ",
+            "mem> " => "\u{25CB} ",
+            "tab> " => "  ",
+            _ => prefix,
+        };
         self.scrollback.push(ScrollLine::styled(
-            format!("{prefix}{body}"),
+            format!("{display_prefix}{body}"),
             fg,
             0,
             bold,
@@ -87,27 +92,19 @@ impl App {
         }
     }
 
-    pub fn finalize_assistant_turn(&mut self, turns: u32) {
+    pub fn finalize_assistant_turn(&mut self, _turns: u32) {
         if let Some(text) = self.current_assistant.take() {
             if !text.is_empty() {
-                let prefix = format!("origin ({turns} turns)> ");
-                let mut lines = text.split('\n');
-                if let Some(first) = lines.next() {
+                self.scrollback.push(ScrollLine::styled(String::new(), 0, 0, false));
+                for line in text.split('\n') {
                     self.scrollback.push(ScrollLine::styled(
-                        format!("{prefix}{first}"),
+                        format!("  {line}"),
                         theme::BODY,
                         0,
                         false,
                     ));
                 }
-                for rest in lines {
-                    self.scrollback.push(ScrollLine::styled(
-                        rest.to_string(),
-                        theme::BODY,
-                        0,
-                        false,
-                    ));
-                }
+                self.scrollback.push(ScrollLine::styled(String::new(), 0, 0, false));
             }
         }
     }
@@ -153,8 +150,10 @@ impl App {
                     &mut visual_lines,
                 );
             }
+            let live_buf;
             if let Some(buf) = self.current_assistant.as_ref() {
-                wrap_into(buf, theme::BODY, 0, false, cols_usize, &mut visual_lines);
+                live_buf = format!("  {buf}");
+                wrap_into(&live_buf, theme::BODY, 0, false, cols_usize, &mut visual_lines);
             }
 
             let total = visual_lines.len() as u16;
@@ -168,26 +167,29 @@ impl App {
                 row = row.saturating_add(1);
             }
         }
-        // Status bar + prompt
         {
             let prompt = composer.prompt_grid();
             let pcols = prompt.cols();
             let prows = prompt.rows();
-            // Fill status bar row with surface color
-            for c in 0..pcols {
-                prompt.put(0, c, Cell::new(' ', 0, theme::SURFACE, Attr::PLAIN));
-            }
-            if prows >= 2 {
+
+            for r in 0..prows {
                 for c in 0..pcols {
-                    prompt.put(1, c, Cell::blank());
+                    prompt.put(r, c, Cell::new(' ', 0, theme::SURFACE, Attr::PLAIN));
                 }
             }
 
-            let status_line = render_line(&self.usage);
-            write_str_styled(prompt, 0, 0, &status_line, pcols, theme::MUTED, theme::SURFACE, false);
+            let cost = crate::status::cost_usd(&self.usage);
+            let secs = self.usage.elapsed.as_secs_f64();
+            let tok_in = format_tokens(self.usage.input_tokens);
+            let tok_out = format_tokens(self.usage.output_tokens);
 
-            // Highlight the model name in the status bar with accent color
-            if let Some(pos) = status_line.find(&self.usage.model) {
+            let status = format!(
+                " {} \u{2502} {tok_in} in \u{00B7} {tok_out} out \u{2502} ${cost:.3} \u{00B7} {secs:.1}s",
+                self.usage.model,
+            );
+            write_str_styled(prompt, 0, 0, &status, pcols, theme::MUTED, theme::SURFACE, false);
+
+            if let Some(pos) = status.find(&self.usage.model) {
                 let col_start = pos as u16;
                 for (i, ch) in self.usage.model.chars().enumerate() {
                     let c = col_start + i as u16;
@@ -198,10 +200,9 @@ impl App {
             }
 
             if prows >= 2 {
-                // Copper-colored prompt prefix
-                let prefix = "> ";
-                write_str_styled(prompt, 1, 0, prefix, pcols, theme::ACCENT, 0, true);
-                let prefix_len = prefix.len() as u16;
+                let prefix = "\u{25B8} ";
+                write_str_styled(prompt, 1, 0, prefix, pcols, theme::ACCENT, theme::SURFACE, true);
+                let prefix_len = prefix.chars().count() as u16;
                 write_str_styled(
                     prompt,
                     1,
@@ -209,11 +210,21 @@ impl App {
                     &self.input,
                     pcols.saturating_sub(prefix_len),
                     theme::BRIGHT,
-                    0,
+                    theme::SURFACE,
                     false,
                 );
             }
         }
+    }
+}
+
+fn format_tokens(n: u32) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
     }
 }
 
