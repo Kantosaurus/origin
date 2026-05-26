@@ -678,7 +678,20 @@ pub async fn run_loop(
                 // Try speculative precomputed result first; fall back to fresh
                 // synchronous dispatch if the registry has no entry.
                 if let Some(pre) = speculative.take(&id).await {
-                    pre?
+                    match pre {
+                        Ok(bytes) => bytes,
+                        Err(LoopError::BadArgs(msg) | LoopError::ToolFailure(msg)) => {
+                            tracing::warn!(tool = %name, %msg, "speculative tool dispatch failed; returning error to model");
+                            tool_results.push(Block::ToolResult {
+                                tool_use_id: id,
+                                handle: None,
+                                inline: Some(format!("Error: {msg}").into_bytes()),
+                                cache_marker: None,
+                            });
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 } else {
                     match dispatch_tool(
                         meta,

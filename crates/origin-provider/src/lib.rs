@@ -75,7 +75,7 @@ pub enum ProviderError {
     #[error("auth")]
     Auth,
     #[error("rate limit; retry after {retry_after_secs}s")]
-    RateLimit { retry_after_secs: u32 },
+    RateLimit { retry_after_secs: u32, message: String },
 }
 
 #[async_trait::async_trait]

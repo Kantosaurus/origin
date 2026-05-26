@@ -72,18 +72,26 @@ async fn run_device_flow(
     vault: &KeyVault,
 ) -> Result<()> {
     let client = reqwest::Client::new();
+    let pkce = if spec.pkce { Some(Pkce::new()) } else { None };
 
-    // POST to device/code endpoint
     let scopes: Vec<&str> = spec.scopes.iter().map(AsRef::as_ref).collect();
     let scope_str = scopes.join(" ");
+
+    let mut form: Vec<(&str, &str)> = vec![
+        ("client_id", spec.client_id.as_ref()),
+        ("scope", &scope_str),
+    ];
+    let challenge_str;
+    if let Some(ref p) = pkce {
+        challenge_str = p.challenge().to_string();
+        form.push(("code_challenge", &challenge_str));
+        form.push(("code_challenge_method", "S256"));
+    }
 
     let resp = client
         .post(spec.authorize_url.as_ref())
         .header("Accept", "application/json")
-        .form(&[
-            ("client_id", spec.client_id.as_ref()),
-            ("scope", scope_str.as_str()),
-        ])
+        .form(&form)
         .send()
         .await
         .map_err(|e| anyhow!("device code request failed: {e}"))?;
@@ -94,8 +102,8 @@ async fn run_device_flow(
         return Err(anyhow!("device code endpoint returned {status}: {body}"));
     }
 
-    let dc: DeviceCodeResponse =
-        serde_json::from_str(&body).map_err(|e| anyhow!("parse device code response: {e}"))?;
+    let dc: DeviceCodeResponse = serde_json::from_str(&body)
+        .map_err(|e| anyhow!("parse device code response: {e}\nraw response: {body}"))?;
 
     println!("Open this URL in your browser: {}", dc.verification_uri);
     println!("Enter this code:               {}", dc.user_code);
@@ -111,14 +119,21 @@ async fn run_device_flow(
 
         tokio::time::sleep(poll_interval).await;
 
+        let mut poll_form: Vec<(&str, &str)> = vec![
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", dc.device_code.as_str()),
+            ("client_id", spec.client_id.as_ref()),
+        ];
+        let verifier_str;
+        if let Some(ref p) = pkce {
+            verifier_str = p.verifier().to_string();
+            poll_form.push(("code_verifier", &verifier_str));
+        }
+
         let poll = client
             .post(spec.token_url.as_ref())
             .header("Accept", "application/json")
-            .form(&[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("device_code", dc.device_code.as_str()),
-                ("client_id", spec.client_id.as_ref()),
-            ])
+            .form(&poll_form)
             .send()
             .await
             .map_err(|e| anyhow!("token poll request failed: {e}"))?;
