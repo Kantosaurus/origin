@@ -1492,13 +1492,18 @@ async fn run_streaming_turn(
     turn_res
 }
 
-/// Decode a `ToolUseStart` payload into `(id, name)`.
-/// Layout: `id` bytes + `\0` + `name` bytes.
-fn decode_tool_use_start(payload: &[u8]) -> Option<(&str, &str)> {
-    let sep = payload.iter().position(|&b| b == 0)?;
-    let id = std::str::from_utf8(&payload[..sep]).ok()?;
-    let name = std::str::from_utf8(&payload[sep + 1..]).ok()?;
-    Some((id, name))
+/// Decode a `ToolUseStart` payload into `(index, id, name)`.
+/// Layout: 4-byte LE index + `id` bytes + `\0` + `name` bytes.
+fn decode_tool_use_start(payload: &[u8]) -> Option<(u32, &str, &str)> {
+    if payload.len() < 5 {
+        return None;
+    }
+    let index = u32::from_le_bytes(payload[..4].try_into().ok()?);
+    let rest = &payload[4..];
+    let sep = rest.iter().position(|&b| b == 0)?;
+    let id = std::str::from_utf8(&rest[..sep]).ok()?;
+    let name = std::str::from_utf8(&rest[sep + 1..]).ok()?;
+    Some((index, id, name))
 }
 
 /// Try to speculatively spawn a pure tool when the first `Field` event fires.
@@ -1544,16 +1549,11 @@ async fn drain_subscriber_into_response(
     let mut usage = origin_provider::Usage::default();
     let mut blocks: Vec<Block> = Vec::new();
 
-    // P3.4: per-id incremental JSON parsers for active tool_use blocks.
-    // DONE_WITH_CONCERNS: routing deltas to the "most recent" parser is a
-    // simplification — Anthropic can interleave deltas for concurrent
-    // tool_use blocks by index. Full index-based routing is deferred to a
-    // follow-up that adds an `index` field to the ToolUseDelta payload.
     let mut parsers: HashMap<String, ToolUseParser> = HashMap::new();
-    let mut active_id: Option<String> = None;
     let mut tool_input_bufs: HashMap<String, Vec<u8>> = HashMap::new();
     let mut tool_input_order: Vec<String> = Vec::new();
     let mut tool_names: HashMap<String, String> = HashMap::new();
+    let mut index_to_id: HashMap<u32, String> = HashMap::new();
     let mut registry = SpeculativeRegistry::default();
     let mut speculative_spawned: HashSet<String> = HashSet::new();
 
@@ -1567,7 +1567,7 @@ async fn drain_subscriber_into_response(
                 text.push_str(&String::from_utf8_lossy(ev.payload()));
             }
             origin_stream::TokenKind::ToolUseStart => {
-                if let Some((id, name)) = decode_tool_use_start(ev.payload()) {
+                if let Some((index, id, name)) = decode_tool_use_start(ev.payload()) {
                     let mut parser = ToolUseParser::new();
                     parser.begin_tool_use(name);
                     parsers.insert(id.to_owned(), parser);
@@ -1576,23 +1576,28 @@ async fn drain_subscriber_into_response(
                     if !tool_input_order.contains(&id.to_owned()) {
                         tool_input_order.push(id.to_owned());
                     }
-                    active_id = Some(id.to_owned());
+                    index_to_id.insert(index, id.to_owned());
                 } else {
                     tracing::warn!(
                         bytes = ev.payload().len(),
-                        "malformed ToolUseStart payload; \
-                         routing for subsequent ToolUseDelta events may be incorrect"
+                        "malformed ToolUseStart payload"
                     );
                 }
             }
             origin_stream::TokenKind::ToolUseDelta => {
-                if let Some(id) = &active_id {
+                let payload = ev.payload();
+                if payload.len() < 4 {
+                    continue;
+                }
+                let index = u32::from_le_bytes(payload[..4].try_into().expect("4 bytes"));
+                let json_bytes = &payload[4..];
+                if let Some(id) = index_to_id.get(&index) {
                     if let Some(buf) = tool_input_bufs.get_mut(id) {
-                        buf.extend_from_slice(ev.payload());
+                        buf.extend_from_slice(json_bytes);
                     }
                     let id_owned = id.clone();
                     if let Some(parser) = parsers.get_mut(&id_owned) {
-                        let events = parser.feed(ev.payload());
+                        let events = parser.feed(json_bytes);
                         if !speculative_spawned.contains(&id_owned)
                             && events.iter().any(|e| matches!(e, ToolUseDelta::Field { .. }))
                             && try_speculative_spawn(
