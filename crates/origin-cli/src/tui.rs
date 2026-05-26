@@ -1,10 +1,14 @@
 //! Composer-driven TUI app state and draw routine.
+//!
+//! Features: unicode-width-aware wrapping, keyboard scrollback,
+//! inline markdown (bold, headers), Burnished Copper theme.
 
 use std::time::Duration;
 
 use origin_tui::composer::Composer;
 use origin_tui::grid::{Attr, Cell, Grid};
 use origin_tui::stream_widget::StreamWidget;
+use unicode_width::UnicodeWidthChar;
 
 use crate::status::UsageSnapshot;
 use crate::theme;
@@ -29,6 +33,7 @@ pub struct App {
     pub input: String,
     pub current_assistant: Option<String>,
     pub usage: UsageSnapshot,
+    pub scroll_offset: usize,
 }
 
 impl App {
@@ -39,11 +44,24 @@ impl App {
             input: String::new(),
             current_assistant: None,
             usage: UsageSnapshot::new(provider, model),
+            scroll_offset: 0,
         }
     }
 
     pub fn set_model(&mut self, model: impl Into<String>) {
         self.usage.model = model.into();
+    }
+
+    pub fn scroll_up(&mut self, n: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_add(n);
+    }
+
+    pub fn scroll_down(&mut self, n: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(n);
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = 0;
     }
 
     pub fn add_line(&mut self, prefix: &str, body: &str) {
@@ -107,6 +125,7 @@ impl App {
                 ));
             }
         }
+        self.scroll_offset = 0;
     }
 
     pub fn add_colored_line(&mut self, text: String, fg: u32, bg: u32) {
@@ -126,17 +145,19 @@ impl App {
         if let Some(buf) = &mut self.current_assistant {
             buf.push_str(delta);
         }
+        self.scroll_offset = 0;
     }
 
     pub fn finalize_assistant_turn(&mut self, _turns: u32) {
         if let Some(text) = self.current_assistant.take() {
             if !text.is_empty() {
                 for line in text.split('\n') {
+                    let (fg, bold) = md_line_style(line);
                     self.scrollback.push(ScrollLine::styled(
                         format!("  {line}"),
-                        theme::BODY,
+                        fg,
                         0,
-                        false,
+                        bold,
                     ));
                 }
             }
@@ -190,15 +211,25 @@ impl App {
                 wrap_into(&live_buf, theme::BRIGHT, 0, false, cols_usize, &mut visual_lines);
             }
 
-            let total = visual_lines.len() as u16;
-            let skip = total.saturating_sub(rows) as usize;
+            let total = visual_lines.len();
+            let visible = rows as usize;
+            let max_offset = total.saturating_sub(visible);
+            let offset = self.scroll_offset.min(max_offset);
+            let skip = total.saturating_sub(visible).saturating_sub(offset);
+
             let mut row: u16 = 0;
-            for vl in visual_lines.iter().skip(skip) {
+            for vl in visual_lines.iter().skip(skip).take(visible) {
                 if row >= rows {
                     break;
                 }
-                write_str_styled(main, row, 0, vl.text, cols, vl.fg, vl.bg, vl.bold);
+                render_md_line(main, row, vl.text, cols, vl.fg, vl.bg, vl.bold);
                 row = row.saturating_add(1);
+            }
+
+            if offset > 0 {
+                let indicator = format!(" \u{2191} {offset} more ");
+                let start_col = cols.saturating_sub(indicator.len() as u16 + 1);
+                write_str_styled(main, 0, start_col, &indicator, cols, theme::ACCENT, theme::SURFACE, false);
             }
         }
         {
@@ -236,7 +267,7 @@ impl App {
             if prows >= 2 {
                 let arrow = "\u{276F} ";
                 write_str_styled(prompt, 1, 0, arrow, pcols, theme::ACCENT, theme::SURFACE, true);
-                let arrow_len = arrow.chars().count() as u16;
+                let arrow_len = char_display_width(arrow);
                 write_str_styled(
                     prompt,
                     1,
@@ -250,6 +281,99 @@ impl App {
             }
         }
     }
+}
+
+fn char_display_width(s: &str) -> u16 {
+    s.chars()
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(1) as u16)
+        .sum()
+}
+
+fn md_line_style(line: &str) -> (u32, bool) {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("# ") || trimmed.starts_with("## ") || trimmed.starts_with("### ") {
+        (theme::BRIGHT, true)
+    } else if trimmed.starts_with("---") && trimmed.chars().all(|c| c == '-' || c == ' ') {
+        (theme::BORDER, false)
+    } else if trimmed.starts_with("```") {
+        (theme::MUTED, false)
+    } else if trimmed.starts_with("> ") {
+        (theme::ACCENT_DIM, false)
+    } else if trimmed.starts_with("| ") || trimmed.starts_with("|---") || trimmed.starts_with("|:") {
+        (theme::BODY, false)
+    } else {
+        (theme::BODY, false)
+    }
+}
+
+fn render_md_line(grid: &mut Grid, row: u16, text: &str, max_cols: u16, base_fg: u32, bg: u32, base_bold: bool) {
+    let attr_plain = if base_bold { Attr::BOLD } else { Attr::PLAIN };
+    let mut col: u16 = 0;
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len && col < max_cols {
+        if chars[i] == '*' && i + 1 < len && chars[i + 1] == '*' {
+            let close = find_closing(&chars, i + 2, '*', '*');
+            if let Some(end) = close {
+                i += 2;
+                while i < end && col < max_cols {
+                    let w = UnicodeWidthChar::width(chars[i]).unwrap_or(1) as u16;
+                    if col + w > max_cols {
+                        break;
+                    }
+                    grid.put(row, col, Cell::new(chars[i], theme::BRIGHT, bg, Attr::BOLD));
+                    col += w;
+                    i += 1;
+                }
+                i = end + 2;
+                continue;
+            }
+        }
+        if chars[i] == '`' && !(i + 1 < len && chars[i + 1] == '`') {
+            if let Some(end) = chars[i + 1..].iter().position(|&c| c == '`').map(|p| i + 1 + p) {
+                i += 1;
+                while i < end && col < max_cols {
+                    let w = UnicodeWidthChar::width(chars[i]).unwrap_or(1) as u16;
+                    if col + w > max_cols {
+                        break;
+                    }
+                    grid.put(row, col, Cell::new(chars[i], theme::ACCENT, bg, Attr::PLAIN));
+                    col += w;
+                    i += 1;
+                }
+                i = end + 1;
+                continue;
+            }
+        }
+
+        let w = UnicodeWidthChar::width(chars[i]).unwrap_or(1) as u16;
+        if col + w > max_cols {
+            break;
+        }
+        grid.put(row, col, Cell::new(chars[i], base_fg, bg, attr_plain));
+        col += w;
+        i += 1;
+    }
+
+    if bg != 0 {
+        while col < max_cols {
+            grid.put(row, col, Cell::new(' ', 0, bg, Attr::PLAIN));
+            col += 1;
+        }
+    }
+}
+
+fn find_closing(chars: &[char], start: usize, c1: char, c2: char) -> Option<usize> {
+    let mut j = start;
+    while j + 1 < chars.len() {
+        if chars[j] == c1 && chars[j + 1] == c2 {
+            return Some(j);
+        }
+        j += 1;
+    }
+    None
 }
 
 fn format_tokens(n: u32) -> String {
@@ -284,20 +408,36 @@ fn wrap_into<'a>(
         let chars: Vec<char> = sub.chars().collect();
         if chars.is_empty() {
             out.push(VisualLine { text: "", fg, bg, bold });
-        } else {
-            let mut start = 0;
-            while start < chars.len() {
-                let end = (start + cols).min(chars.len());
-                let byte_start: usize = chars[..start].iter().map(|c| c.len_utf8()).sum();
-                let byte_end: usize = chars[..end].iter().map(|c| c.len_utf8()).sum();
+            continue;
+        }
+        let mut start_idx = 0;
+        let mut col_width = 0usize;
+        let mut end_idx = 0;
+        while end_idx < chars.len() {
+            let w = UnicodeWidthChar::width(chars[end_idx]).unwrap_or(1);
+            if col_width + w > cols {
+                let byte_start: usize = chars[..start_idx].iter().map(|c| c.len_utf8()).sum();
+                let byte_end: usize = chars[..end_idx].iter().map(|c| c.len_utf8()).sum();
                 out.push(VisualLine {
                     text: &sub[byte_start..byte_end],
                     fg,
                     bg,
                     bold,
                 });
-                start = end;
+                start_idx = end_idx;
+                col_width = 0;
             }
+            col_width += w;
+            end_idx += 1;
+        }
+        if start_idx < chars.len() {
+            let byte_start: usize = chars[..start_idx].iter().map(|c| c.len_utf8()).sum();
+            out.push(VisualLine {
+                text: &sub[byte_start..],
+                fg,
+                bg,
+                bold,
+            });
         }
     }
 }
@@ -315,16 +455,17 @@ fn write_str_styled(
     let attr = if bold { Attr::BOLD } else { Attr::PLAIN };
     let mut c = col;
     for ch in s.chars() {
-        if c >= max_cols {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(1) as u16;
+        if c + w > max_cols {
             break;
         }
         grid.put(row, c, Cell::new(ch, fg, bg, attr));
-        c = c.saturating_add(1);
+        c += w;
     }
     if bg != 0 {
         while c < max_cols {
             grid.put(row, c, Cell::new(' ', 0, bg, Attr::PLAIN));
-            c = c.saturating_add(1);
+            c += 1;
         }
     }
 }
@@ -349,5 +490,12 @@ mod tests {
         assert_eq!(app.usage.input_tokens, 100);
         assert_eq!(app.usage.output_tokens, 50);
         assert_eq!(app.usage.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn wrap_respects_unicode_width() {
+        let mut lines = Vec::new();
+        wrap_into("ab\u{276F}cd", 0, 0, false, 4, &mut lines);
+        assert_eq!(lines.len(), 2, "wide char should cause wrap at col 4");
     }
 }
