@@ -173,6 +173,10 @@ pub enum StreamEvent {
         cache_read_input_tokens: u32,
         cache_creation_input_tokens: u32,
     },
+    ToolActivity {
+        tool: String,
+        summary: String,
+    },
     TurnEnd,
     /// Emitted after a successful `ClientMessage::SwitchAccount` so the CLI
     /// can confirm the new provider/account is in effect for subsequent
