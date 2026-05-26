@@ -34,6 +34,18 @@ const MAX_PROVIDER_RETRIES: u32 = 3;
 /// bounded while still respecting short server-side backoffs.
 const MAX_RATE_LIMIT_SLEEP_SECS: u32 = 60;
 
+/// When the primary model is rate-limited and all retries are exhausted,
+/// try a cheaper model from the same family before killing the turn.
+fn rate_limit_fallback(model: &str) -> Option<&'static str> {
+    if model.contains("opus") {
+        Some("claude-sonnet-4-6")
+    } else if model.contains("sonnet") && !model.contains("haiku") {
+        Some("claude-haiku-4-5")
+    } else {
+        None
+    }
+}
+
 #[derive(Clone)]
 pub struct LoopOptions {
     pub max_turns: u32,
@@ -256,12 +268,13 @@ pub enum LoopError {
     #[error(
         "rate limit on `{model}` after {attempts} attempts (last retry-after {last_retry_after_secs}s). \
          Try `/model claude-haiku-4-5` to switch to a less-loaded model bucket mid-session, \
-         or wait for the quota window to reset"
+         or wait for the quota window to reset{api_hint}"
     )]
     RateLimitExhausted {
         model: String,
         attempts: u32,
         last_retry_after_secs: u32,
+        api_hint: String,
     },
 }
 
@@ -441,11 +454,18 @@ pub async fn run_loop(
                 match result {
                     Err(LoopError::Provider(origin_provider::ProviderError::RateLimit {
                         retry_after_secs,
+                        message,
                     })) if attempt < MAX_PROVIDER_RETRIES => {
-                        let sleep_secs = retry_after_secs.clamp(1, MAX_RATE_LIMIT_SLEEP_SECS);
+                        // Exponential floor: 2, 4, 8 … so we don't hammer a
+                        // server whose `retry-after: 1` is too optimistic.
+                        let exp_floor = 1u32 << (attempt + 1);
+                        let sleep_secs =
+                            retry_after_secs.max(exp_floor).clamp(1, MAX_RATE_LIMIT_SLEEP_SECS);
                         tracing::warn!(
                             attempt,
                             sleep_secs,
+                            retry_after_secs,
+                            %message,
                             "provider rate-limited; backing off and retrying"
                         );
                         tokio::time::sleep(std::time::Duration::from_secs(sleep_secs.into())).await;
@@ -453,14 +473,49 @@ pub async fn run_loop(
                     }
                     Err(LoopError::Provider(origin_provider::ProviderError::RateLimit {
                         retry_after_secs,
+                        message,
                     })) => {
-                        // Budget exhausted. The plain "rate limit; retry after Ns"
-                        // message gives operators no hint that Pro/Max OAuth quotas
-                        // are per-model — swapping to Haiku usually clears the wall.
+                        let mut fallback_detail = String::new();
+                        if let Some(fallback) = rate_limit_fallback(&req.model) {
+                            tracing::warn!(
+                                primary = %req.model,
+                                fallback,
+                                "primary model rate-limited; attempting fallback"
+                            );
+                            let mut fb_req = req.clone();
+                            fb_req.model = fallback.to_string();
+                            let fb_result = if opts.streaming_disabled {
+                                provider
+                                    .chat(fb_req)
+                                    .await
+                                    .map(|r| (r, SpeculativeRegistry::default()))
+                                    .map_err(LoopError::Provider)
+                            } else {
+                                run_streaming_turn(provider, fb_req, opts)
+                                    .await
+                                    .map(|st| (st.response, st.speculative))
+                            };
+                            match fb_result {
+                                Ok(r) => {
+                                    tracing::info!(fallback, "fallback model succeeded");
+                                    break r;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%e, fallback, "fallback model also failed");
+                                    fallback_detail = format!("\nFallback `{fallback}` also failed: {e}");
+                                }
+                            }
+                        }
+                        let api_hint = if message.is_empty() {
+                            fallback_detail
+                        } else {
+                            format!("\nAPI: {message}{fallback_detail}")
+                        };
                         return Err(LoopError::RateLimitExhausted {
                             model: session.model.clone(),
                             attempts: MAX_PROVIDER_RETRIES + 1,
                             last_retry_after_secs: retry_after_secs,
+                            api_hint,
                         });
                     }
                     other => break other?,
@@ -592,7 +647,7 @@ pub async fn run_loop(
                 if let Some(pre) = speculative.take(&id).await {
                     pre?
                 } else {
-                    dispatch_tool(
+                    match dispatch_tool(
                         meta,
                         &args,
                         opts.cas.as_deref(),
@@ -601,8 +656,21 @@ pub async fn run_loop(
                         opts.memory_handle.as_deref(),
                         opts.coordinator.as_deref(),
                     )
-                    .await?
-                    .into_bytes()
+                    .await
+                    {
+                        Ok(s) => s.into_bytes(),
+                        Err(LoopError::BadArgs(msg) | LoopError::ToolFailure(msg)) => {
+                            tracing::warn!(tool = %name, %msg, "tool dispatch failed; returning error to model");
+                            tool_results.push(Block::ToolResult {
+                                tool_use_id: id,
+                                handle: None,
+                                inline: Some(format!("Error: {msg}").into_bytes()),
+                                cache_marker: None,
+                            });
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             };
 
