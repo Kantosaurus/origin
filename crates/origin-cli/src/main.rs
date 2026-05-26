@@ -477,6 +477,8 @@ async fn handle_submit(
     let mut proposals: Vec<(u32, String, Vec<String>)> = Vec::new();
     let app_for_delta = Arc::clone(app);
     let handle_for_delta = handle.clone();
+    let app_for_tool = Arc::clone(app);
+    let handle_for_tool = handle.clone();
     let reply = call_daemon(
         path,
         model,
@@ -485,6 +487,18 @@ async fn handle_submit(
         move |d| {
             app_for_delta.lock().append_to_current_assistant(d);
             handle_for_delta.mark_dirty();
+        },
+        move |tool, summary| {
+            let line = if summary.is_empty() {
+                format!("[{tool}]")
+            } else {
+                format!("[{tool}] {summary}")
+            };
+            let mut a = app_for_tool.lock();
+            a.finalize_assistant_turn(0);
+            a.add_line("tool> ", &line);
+            a.start_assistant_turn();
+            handle_for_tool.mark_dirty();
         },
         |i, o, cr, cw| usage_events.push((i, o, cr, cw)),
         |id, body, tags| proposals.push((id, body, tags)),
@@ -530,6 +544,7 @@ async fn call_daemon(
     user_text: &str,
     session_id: &str,
     mut on_delta: impl FnMut(&str) + Send,
+    mut on_tool: impl FnMut(&str, &str) + Send,
     mut on_usage: impl FnMut(u32, u32, u32, u32) + Send,
     mut on_proposal: impl FnMut(u32, String, Vec<String>) + Send,
 ) -> Result<(PromptReply, Duration)> {
@@ -562,6 +577,7 @@ async fn call_daemon(
         if let Ok(ev) = serde_json::from_slice::<StreamEvent>(&body) {
             match ev {
                 StreamEvent::TextDelta { text } => on_delta(&text),
+                StreamEvent::ToolActivity { tool, summary } => on_tool(&tool, &summary),
                 StreamEvent::Usage {
                     input_tokens,
                     output_tokens,

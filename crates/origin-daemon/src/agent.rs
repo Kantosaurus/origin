@@ -623,6 +623,16 @@ pub async fn run_loop(
                 return Err(LoopError::Denied(name.clone()));
             }
 
+            if let Some(tx) = &opts.event_tx {
+                let summary = tool_activity_summary(&name, &args);
+                let _ = tx
+                    .send(StreamEvent::ToolActivity {
+                        tool: name.clone(),
+                        summary,
+                    })
+                    .await;
+            }
+
             let result_bytes: Vec<u8> = if let Some(hit) = cache_hit {
                 // Serve the cached body annotated with the originating turn.
                 let store = opts.cas.as_ref().ok_or_else(|| {
@@ -1260,6 +1270,33 @@ fn node_row_to_json(row: &origin_codegraph::index::NodeRow) -> serde_json::Value
         "signature_handle": hex::encode(row.signature_handle),
         "body_handle": hex::encode(row.body_handle),
     })
+}
+
+fn tool_activity_summary(name: &str, args: &Value) -> String {
+    match name {
+        "Write" | "Read" | "Edit" => args
+            .get("path")
+            .or_else(|| args.get("file_path"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        "Bash" => {
+            let cmd = args
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            cmd.chars().take(80).collect()
+        }
+        "WebFetch" => args
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        _ => {
+            let s = args.to_string();
+            s.chars().take(60).collect()
+        }
+    }
 }
 
 fn parse_region(v: &Value) -> Result<origin_tools::builtins::recall::Region, LoopError> {
