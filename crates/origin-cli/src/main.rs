@@ -473,24 +473,25 @@ async fn handle_submit(
     }
     handle.mark_dirty();
 
-    let mut deltas: Vec<String> = Vec::new();
     let mut usage_events: Vec<(u32, u32, u32, u32)> = Vec::new();
     let mut proposals: Vec<(u32, String, Vec<String>)> = Vec::new();
+    let app_for_delta = Arc::clone(app);
+    let handle_for_delta = handle.clone();
     let reply = call_daemon(
         path,
         model,
         text,
         session_id,
-        |d| deltas.push(d.to_string()),
+        move |d| {
+            app_for_delta.lock().append_to_current_assistant(d);
+            handle_for_delta.mark_dirty();
+        },
         |i, o, cr, cw| usage_events.push((i, o, cr, cw)),
         |id, body, tags| proposals.push((id, body, tags)),
     )
     .await;
 
     let mut a = app.lock();
-    for d in &deltas {
-        a.append_to_current_assistant(d);
-    }
     match reply {
         Ok((r, elapsed)) => {
             let mut sum = (0u32, 0u32, 0u32, 0u32);
