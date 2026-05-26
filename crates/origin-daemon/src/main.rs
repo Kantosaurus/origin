@@ -320,10 +320,27 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
         .with_cas(Arc::clone(&cas))
         .with_plan(wire_plan.clone());
 
-    let initial_provider_str = env::var("ORIGIN_PROVIDER").unwrap_or_else(|_| "anthropic".into());
+    let initial_account = env::var("ORIGIN_ACCOUNT").unwrap_or_else(|_| "default".into());
+    let initial_provider_str = match env::var("ORIGIN_PROVIDER") {
+        Ok(v) => v,
+        Err(_) => {
+            // Auto-detect: prefer anthropic-oauth when OAuth tokens exist in
+            // the vault but no raw API key is stored.
+            let has_api_key = vault.get("anthropic", &initial_account).await.is_ok();
+            let has_oauth = vault
+                .get("anthropic-oauth", &format!("{initial_account}/oauth"))
+                .await
+                .is_ok();
+            if !has_api_key && has_oauth {
+                info!("no anthropic API key found; using anthropic-oauth");
+                "anthropic-oauth".into()
+            } else {
+                "anthropic".into()
+            }
+        }
+    };
     let initial_provider_id = ProviderId::parse(&initial_provider_str, factory.catalog())
         .ok_or_else(|| anyhow::anyhow!("ORIGIN_PROVIDER `{initial_provider_str}` is not a known provider"))?;
-    let initial_account = env::var("ORIGIN_ACCOUNT").unwrap_or_else(|_| "default".into());
 
     let initial_provider: Arc<dyn Provider> = factory
         .build(&initial_provider_id, &initial_account)

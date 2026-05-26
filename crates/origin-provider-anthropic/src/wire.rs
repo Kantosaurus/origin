@@ -36,6 +36,13 @@ pub struct WireRequest<'a> {
     pub messages: Vec<WireMessage<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<WireTool<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<WireMetadata>,
+}
+
+#[derive(Serialize)]
+pub struct WireMetadata {
+    pub user_id: String,
 }
 
 #[derive(Serialize)]

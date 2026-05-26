@@ -55,15 +55,18 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
             display_name: "Anthropic (Claude CLI OAuth)".into(),
             wire: WireFormat::Anthropic,
             auth: AuthScheme::OAuth(OAuthSpec {
-                authorize_url: "https://claude.ai/oauth/authorize".into(),
-                token_url: "https://console.anthropic.com/v1/oauth/token".into(),
-                client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".into(), // public Claude.ai pairing id
+                authorize_url: "https://claude.com/cai/oauth/authorize".into(),
+                token_url: "https://platform.claude.com/v1/oauth/token".into(),
+                client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".into(),
                 scopes: Cow::Borrowed(&[
                     Cow::Borrowed("org:create_api_key"),
                     Cow::Borrowed("user:profile"),
                     Cow::Borrowed("user:inference"),
+                    Cow::Borrowed("user:sessions:claude_code"),
+                    Cow::Borrowed("user:mcp_servers"),
+                    Cow::Borrowed("user:file_upload"),
                 ]),
-                redirect_uri: "https://console.anthropic.com/oauth/code/callback".into(),
+                redirect_uri: "https://platform.claude.com/oauth/code/callback".into(),
                 pkce: true,
                 device_flow: false,
             }),
@@ -152,7 +155,7 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
                 pkce: false,
                 device_flow: true,
             }),
-            base_url: "https://api.githubcopilot.com".into(),
+            base_url: "https://api.individual.githubcopilot.com".into(),
             chat_path: "/chat/completions".into(),
             default_model: "gpt-4o".into(),
             capabilities: FULL_CAPS,
@@ -183,7 +186,7 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
                 ]),
                 redirect_uri: "http://localhost:1455/auth/callback".into(),
                 pkce: true,
-                device_flow: false,
+                device_flow: true,
             }),
             base_url: "https://chatgpt.com/backend-api/codex".into(),
             chat_path: "/responses".into(),
@@ -208,7 +211,11 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
             base_url: "https://api.deepseek.com".into(),
             chat_path: "/v1/chat/completions".into(),
             default_model: "deepseek-chat".into(),
-            capabilities: FULL_CAPS,
+            capabilities: Capabilities {
+                thinking: true,
+                prompt_cache: true,
+                ..FULL_CAPS
+            },
         },
         ProviderEntry {
             id: "fireworks".into(),
@@ -238,7 +245,11 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
             base_url: "https://api.x.ai".into(),
             chat_path: "/v1/chat/completions".into(),
             default_model: "grok-4".into(),
-            capabilities: FULL_CAPS,
+            capabilities: Capabilities {
+                thinking: true,
+                prompt_cache: true,
+                ..FULL_CAPS
+            },
         },
         ProviderEntry {
             id: "mistral".into(),
@@ -265,8 +276,8 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
             display_name: "MiniMax".into(),
             wire: WireFormat::OpenAIChat,
             auth: bearer(),
-            base_url: "https://api.minimaxi.chat".into(),
-            chat_path: "/v1/text/chatcompletion_v2".into(),
+            base_url: "https://api.minimax.io".into(),
+            chat_path: "/v1/chat/completions".into(),
             default_model: "abab6.5s-chat".into(),
             capabilities: FULL_CAPS,
         },
@@ -275,7 +286,7 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
             display_name: "StepFun".into(),
             wire: WireFormat::OpenAIChat,
             auth: bearer(),
-            base_url: "https://api.stepfun.com".into(),
+            base_url: "https://api.stepfun.ai".into(),
             chat_path: "/v1/chat/completions".into(),
             default_model: "step-2-16k".into(),
             capabilities: FULL_CAPS,
@@ -305,7 +316,7 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
             display_name: "Arcee AI".into(),
             wire: WireFormat::OpenAIChat,
             auth: bearer(),
-            base_url: "https://api.arcee.ai".into(),
+            base_url: "https://chat.arcee.ai".into(),
             chat_path: "/v1/chat/completions".into(),
             default_model: "arcee-spark".into(),
             capabilities: FULL_CAPS,
@@ -351,7 +362,7 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
             capabilities: FULL_CAPS,
         },
         ProviderEntry {
-            id: "volcano".into(),
+            id: "volcengine".into(),
             display_name: "Volcano Engine".into(),
             wire: WireFormat::OpenAIChat,
             auth: bearer(),
@@ -362,12 +373,12 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
         },
         ProviderEntry {
             id: "xiaomi".into(),
-            display_name: "Xiaomi".into(),
+            display_name: "Xiaomi (MiMo)".into(),
             wire: WireFormat::OpenAIChat,
             auth: bearer(),
-            base_url: "https://api.xiaomi.com".into(),
+            base_url: "https://api.xiaomimimo.com".into(),
             chat_path: "/v1/chat/completions".into(),
-            default_model: "mimo".into(),
+            default_model: "mimo-v2-flash".into(),
             capabilities: FULL_CAPS,
         },
         ProviderEntry {
@@ -376,7 +387,7 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
             wire: WireFormat::OpenAIChat,
             auth: bearer(),
             base_url: "https://api.z.ai".into(),
-            chat_path: "/api/coding/paas/v4/chat/completions".into(),
+            chat_path: "/api/paas/v4/chat/completions".into(),
             default_model: "glm-4.6".into(),
             capabilities: FULL_CAPS,
         },
@@ -428,8 +439,8 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
             display_name: "Kilo Gateway".into(),
             wire: WireFormat::OpenAIChat,
             auth: bearer(),
-            base_url: "https://api.kilocode.ai".into(),
-            chat_path: "/v1/chat/completions".into(),
+            base_url: "https://api.kilo.ai".into(),
+            chat_path: "/api/gateway/chat/completions".into(),
             default_model: "gpt-4o".into(),
             capabilities: FULL_CAPS,
         },
@@ -438,8 +449,8 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
             display_name: "OpenCode".into(),
             wire: WireFormat::OpenAIChat,
             auth: bearer(),
-            base_url: "https://api.opencode.ai".into(),
-            chat_path: "/v1/chat/completions".into(),
+            base_url: "https://opencode.ai".into(),
+            chat_path: "/zen/go/v1/chat/completions".into(),
             default_model: "default".into(),
             capabilities: FULL_CAPS,
         },
@@ -483,6 +494,93 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
             default_model: "meta-llama/Llama-3.3-70B-Instruct".into(),
             capabilities: FULL_CAPS,
         },
+        // ---- Providers added from OpenClaw production catalog ----
+        ProviderEntry {
+            id: "groq".into(),
+            display_name: "Groq".into(),
+            wire: WireFormat::OpenAIChat,
+            auth: bearer(),
+            base_url: "https://api.groq.com".into(),
+            chat_path: "/openai/v1/chat/completions".into(),
+            default_model: "llama-3.3-70b-versatile".into(),
+            capabilities: FULL_CAPS,
+        },
+        ProviderEntry {
+            id: "cerebras".into(),
+            display_name: "Cerebras".into(),
+            wire: WireFormat::OpenAIChat,
+            auth: bearer(),
+            base_url: "https://api.cerebras.ai".into(),
+            chat_path: "/v1/chat/completions".into(),
+            default_model: "llama-3.3-70b".into(),
+            capabilities: FULL_CAPS,
+        },
+        ProviderEntry {
+            id: "deepinfra".into(),
+            display_name: "DeepInfra".into(),
+            wire: WireFormat::OpenAIChat,
+            auth: bearer(),
+            base_url: "https://api.deepinfra.com".into(),
+            chat_path: "/v1/openai/chat/completions".into(),
+            default_model: "meta-llama/Llama-3.3-70B-Instruct".into(),
+            capabilities: FULL_CAPS,
+        },
+        ProviderEntry {
+            id: "nvidia".into(),
+            display_name: "NVIDIA".into(),
+            wire: WireFormat::OpenAIChat,
+            auth: bearer(),
+            base_url: "https://integrate.api.nvidia.com".into(),
+            chat_path: "/v1/chat/completions".into(),
+            default_model: "meta/llama-3.3-70b-instruct".into(),
+            capabilities: FULL_CAPS,
+        },
+        ProviderEntry {
+            id: "tencent".into(),
+            display_name: "Tencent Cloud (TokenHub)".into(),
+            wire: WireFormat::OpenAIChat,
+            auth: bearer(),
+            base_url: "https://tokenhub.tencentmaas.com".into(),
+            chat_path: "/v1/chat/completions".into(),
+            default_model: "deepseek-v3".into(),
+            capabilities: Capabilities {
+                prompt_cache: true,
+                ..FULL_CAPS
+            },
+        },
+        ProviderEntry {
+            id: "lmstudio".into(),
+            display_name: "LM Studio (local)".into(),
+            wire: WireFormat::OpenAIChat,
+            auth: AuthScheme::None,
+            base_url: "http://localhost:1234".into(),
+            chat_path: "/v1/chat/completions".into(),
+            default_model: "default".into(),
+            capabilities: FULL_CAPS,
+        },
+        ProviderEntry {
+            id: "kimi".into(),
+            display_name: "Kimi Code (subscription)".into(),
+            wire: WireFormat::OpenAIChat,
+            auth: bearer(),
+            base_url: "https://api.moonshot.ai".into(),
+            chat_path: "/v1/chat/completions".into(),
+            default_model: "kimi-k2.5".into(),
+            capabilities: Capabilities {
+                thinking: true,
+                ..FULL_CAPS
+            },
+        },
+        ProviderEntry {
+            id: "qwen-intl".into(),
+            display_name: "Qwen Cloud (Global)".into(),
+            wire: WireFormat::OpenAIChat,
+            auth: bearer(),
+            base_url: "https://dashscope-intl.aliyuncs.com".into(),
+            chat_path: "/compatible-mode/v1/chat/completions".into(),
+            default_model: "qwen-max".into(),
+            capabilities: FULL_CAPS,
+        },
     ]
 }
 
@@ -498,7 +596,7 @@ mod tests {
         for e in &cat {
             assert!(seen.insert(e.id.clone()), "duplicate id: {}", e.id);
         }
-        assert!(cat.len() >= 30, "expected >=30 providers, got {}", cat.len());
+        assert!(cat.len() >= 40, "expected >=40 providers, got {}", cat.len());
     }
 
     #[test]
