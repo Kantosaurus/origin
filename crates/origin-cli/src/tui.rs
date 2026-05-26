@@ -51,9 +51,9 @@ impl App {
             "you> " => {
                 self.scrollback.push(ScrollLine::styled(String::new(), 0, 0, false));
                 self.scrollback.push(ScrollLine::styled(
-                    format!("  you  {body}"),
+                    format!("\u{276F} {body}"),
                     theme::BRIGHT,
-                    0,
+                    theme::SURFACE,
                     true,
                 ));
                 self.scrollback.push(ScrollLine::styled(String::new(), 0, 0, false));
@@ -234,15 +234,15 @@ impl App {
             }
 
             if prows >= 2 {
-                let label = "  you  ";
-                write_str_styled(prompt, 1, 0, label, pcols, theme::MUTED, theme::SURFACE, false);
-                let label_len = label.chars().count() as u16;
+                let arrow = "\u{276F} ";
+                write_str_styled(prompt, 1, 0, arrow, pcols, theme::ACCENT, theme::SURFACE, true);
+                let arrow_len = arrow.chars().count() as u16;
                 write_str_styled(
                     prompt,
                     1,
-                    label_len,
+                    arrow_len,
                     &self.input,
-                    pcols.saturating_sub(label_len),
+                    pcols.saturating_sub(arrow_len),
                     theme::BRIGHT,
                     theme::SURFACE,
                     false,
