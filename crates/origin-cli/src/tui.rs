@@ -85,30 +85,66 @@ impl App {
     /// `widget` is threaded through for future per-delta streaming use;
     /// this method does direct cell writes for simplicity.
     pub fn draw(&self, composer: &mut Composer, widget: &mut StreamWidget) {
-        let _ = widget; // future: live-delta cursor mgmt
-                        // Main pane
+        let _ = widget;
         {
             let main = composer.main_grid();
             let cols = main.cols();
             let rows = main.rows();
-            // Clear
             for r in 0..rows {
                 for c in 0..cols {
                     main.put(r, c, Cell::blank());
                 }
             }
+
+            let mut visual_lines: Vec<&str> = Vec::new();
+            for entry in &self.scrollback {
+                for sub in entry.split('\n') {
+                    if cols > 0 {
+                        let chars: Vec<char> = sub.chars().collect();
+                        if chars.is_empty() {
+                            visual_lines.push("");
+                        } else {
+                            let mut start = 0;
+                            while start < chars.len() {
+                                let end = (start + cols as usize).min(chars.len());
+                                let byte_start = chars[..start].iter().map(|c| c.len_utf8()).sum::<usize>();
+                                let byte_end = chars[..end].iter().map(|c| c.len_utf8()).sum::<usize>();
+                                visual_lines.push(&sub[byte_start..byte_end]);
+                                start = end;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(buf) = self.current_assistant.as_ref() {
+                for sub in buf.split('\n') {
+                    if cols > 0 {
+                        let chars: Vec<char> = sub.chars().collect();
+                        if chars.is_empty() {
+                            visual_lines.push("");
+                        } else {
+                            let mut start = 0;
+                            while start < chars.len() {
+                                let end = (start + cols as usize).min(chars.len());
+                                let byte_start = chars[..start].iter().map(|c| c.len_utf8()).sum::<usize>();
+                                let byte_end = chars[..end].iter().map(|c| c.len_utf8()).sum::<usize>();
+                                visual_lines.push(&sub[byte_start..byte_end]);
+                                start = end;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let total = visual_lines.len() as u16;
+            let skip = total.saturating_sub(rows) as usize;
             let mut row: u16 = 0;
-            for line in &self.scrollback {
+            for vl in visual_lines.iter().skip(skip) {
                 if row >= rows {
                     break;
                 }
-                write_str(main, row, 0, line, cols);
+                write_str(main, row, 0, vl, cols);
                 row = row.saturating_add(1);
-            }
-            if let Some(buf) = self.current_assistant.as_ref() {
-                if row < rows {
-                    write_str(main, row, 0, buf, cols);
-                }
             }
         }
         // Prompt bar

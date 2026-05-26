@@ -850,18 +850,8 @@ async fn daemon_reachable(path: &str) -> bool {
     origin_ipc::transport::Connector::connect(path).await.is_ok()
 }
 
-/// Make sure `origin-daemon` is listening on `path`. If a fresh probe fails,
-/// resolve a daemon binary (sibling of the current exe, or `origin-daemon` on
-/// PATH), spawn it detached and poll until the pipe accepts a connection —
-/// bounded by `STARTUP_DEADLINE`. `provider`/`account` flow through as
-/// `ORIGIN_PROVIDER` / `ORIGIN_ACCOUNT` because the daemon doesn't read
-/// `~/.origin/config.toml` — without these, it defaults to `anthropic` and
-/// fails the initial credential lookup for any other configured provider.
-async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Result<()> {
-    if daemon_reachable(path).await {
-        return Ok(());
-    }
-
+/// Resolve the daemon binary: sibling of current exe, or fall back to PATH.
+fn resolve_daemon_binary() -> Result<(std::ffi::OsString, Option<std::path::PathBuf>)> {
     let daemon_name = if cfg!(windows) { "origin-daemon.exe" } else { "origin-daemon" };
     let exe = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("could not resolve current exe: {e}"))?;
@@ -870,6 +860,86 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
         Some(p) if p.exists() => p.clone().into_os_string(),
         _ => daemon_name.into(),
     };
+    Ok((cmd_path, sibling))
+}
+
+/// Path to the stamp file written each time we spawn a daemon.
+fn daemon_stamp_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".origin").join("daemon.stamp"))
+}
+
+/// Returns `true` when the daemon binary on disk is newer than the last spawn
+/// recorded in `~/.origin/daemon.stamp`.
+fn daemon_binary_is_newer(binary: &std::ffi::OsStr) -> bool {
+    let stamp = match daemon_stamp_path() {
+        Some(p) => p,
+        None => return false,
+    };
+    let bin_mtime = std::fs::metadata(binary)
+        .and_then(|m| m.modified())
+        .ok();
+    let stamp_mtime = std::fs::metadata(&stamp)
+        .and_then(|m| m.modified())
+        .ok();
+    match (bin_mtime, stamp_mtime) {
+        (Some(bin), Some(stamp)) => bin > stamp,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// Touch the stamp file so subsequent launches know when this daemon was spawned.
+fn touch_daemon_stamp() {
+    if let Some(p) = daemon_stamp_path() {
+        let _ = p.parent().map(std::fs::create_dir_all);
+        let _ = std::fs::File::create(&p);
+    }
+}
+
+/// Kill any running `origin-daemon` processes.
+fn kill_stale_daemon() {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/IM", "origin-daemon.exe"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "origin-daemon"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+/// Make sure `origin-daemon` is listening on `path`. If a fresh probe fails,
+/// resolve a daemon binary (sibling of the current exe, or `origin-daemon` on
+/// PATH), spawn it detached and poll until the pipe accepts a connection —
+/// bounded by `STARTUP_DEADLINE`. `provider`/`account` flow through as
+/// `ORIGIN_PROVIDER` / `ORIGIN_ACCOUNT` because the daemon doesn't read
+/// `~/.origin/config.toml` — without these, it defaults to `anthropic` and
+/// fails the initial credential lookup for any other configured provider.
+///
+/// If a daemon is already running but the binary on disk is newer, the stale
+/// daemon is killed and a fresh one is spawned.
+async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Result<()> {
+    let (cmd_path, sibling) = resolve_daemon_binary()?;
+
+    if daemon_reachable(path).await {
+        if daemon_binary_is_newer(&cmd_path) {
+            tracing::info!("daemon binary is newer than running daemon — restarting");
+            kill_stale_daemon();
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        } else {
+            return Ok(());
+        }
+    }
 
     // Daemon stderr captures fatal startup errors that wouldn't otherwise
     // reach the user (the daemon's tracing layer writes to parquet only).
@@ -912,15 +982,13 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
             .unwrap_or_else(|| "<no exe dir>".to_string());
         anyhow::anyhow!(
             "could not spawn origin-daemon: {e}\n\
-             searched: {searched}, then PATH for `{daemon_name}`\n\
+             searched: {searched}, then PATH for `origin-daemon`\n\
              build it with `cargo build --release -p origin-daemon` and place the binary \
              next to origin, or set ORIGIN_SOCK to an existing daemon's pipe path"
         )
     })?;
-    // Drop the handle: on Windows, with DETACHED_PROCESS, the child outlives
-    // us; on Unix the kernel reaps when the parent exits, which is fine for
-    // subsequent `origin` runs (each spawns its own daemon if none is up).
     drop(child);
+    touch_daemon_stamp();
 
     const STARTUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
     let deadline = std::time::Instant::now() + STARTUP_DEADLINE;
