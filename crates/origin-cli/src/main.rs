@@ -286,9 +286,40 @@ async fn run_event_loop(
             ) {
                 continue;
             }
-            // Tab fires the autocomplete pass before the buffer reducer
-            // sees the keypress; only fall through to `reduce` when Tab
-            // didn't recognize the buffer shape.
+            // Scrollback navigation — intercept before the buffer reducer.
+            match ev.code {
+                crossterm::event::KeyCode::PageUp => {
+                    app.lock().scroll_up(10);
+                    handle.mark_dirty();
+                    continue;
+                }
+                crossterm::event::KeyCode::PageDown => {
+                    app.lock().scroll_down(10);
+                    handle.mark_dirty();
+                    continue;
+                }
+                crossterm::event::KeyCode::Up
+                    if ev.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) =>
+                {
+                    app.lock().scroll_up(3);
+                    handle.mark_dirty();
+                    continue;
+                }
+                crossterm::event::KeyCode::Down
+                    if ev.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) =>
+                {
+                    app.lock().scroll_down(3);
+                    handle.mark_dirty();
+                    continue;
+                }
+                crossterm::event::KeyCode::End => {
+                    app.lock().scroll_to_bottom();
+                    handle.mark_dirty();
+                    continue;
+                }
+                _ => {}
+            }
+
             if matches!(ev.code, crossterm::event::KeyCode::Tab) {
                 let result = {
                     let mut a = app.lock();
