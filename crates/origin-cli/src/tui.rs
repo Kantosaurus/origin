@@ -47,30 +47,65 @@ impl App {
     }
 
     pub fn add_line(&mut self, prefix: &str, body: &str) {
-        let (fg, bold) = match prefix {
-            "you> " => (theme::ACCENT, true),
-            "error> " => (theme::RED, false),
-            "system> " => (theme::MUTED, false),
-            "mem> " => (theme::ACCENT_DIM, false),
-            "tab> " => (theme::MUTED, false),
-            "ok> " => (theme::GREEN, false),
-            _ => (theme::BODY, false),
-        };
-        let display_prefix = match prefix {
-            "you> " => "\u{25B8} ",
-            "error> " => "\u{2718} ",
-            "system> " => "\u{2500} ",
-            "ok> " => "\u{2714} ",
-            "mem> " => "\u{25CB} ",
-            "tab> " => "  ",
-            _ => prefix,
-        };
-        self.scrollback.push(ScrollLine::styled(
-            format!("{display_prefix}{body}"),
-            fg,
-            0,
-            bold,
-        ));
+        match prefix {
+            "you> " => {
+                self.scrollback.push(ScrollLine::styled(String::new(), 0, 0, false));
+                self.scrollback.push(ScrollLine::styled(
+                    format!("  you  {body}"),
+                    theme::BRIGHT,
+                    0,
+                    true,
+                ));
+            }
+            "error> " => {
+                self.scrollback.push(ScrollLine::styled(
+                    format!("  \u{2718} {body}"),
+                    theme::RED,
+                    0,
+                    false,
+                ));
+            }
+            "system> " => {
+                self.scrollback.push(ScrollLine::styled(
+                    format!("  {body}"),
+                    theme::MUTED,
+                    0,
+                    false,
+                ));
+            }
+            "ok> " => {
+                self.scrollback.push(ScrollLine::styled(
+                    format!("  \u{2714} {body}"),
+                    theme::GREEN,
+                    0,
+                    false,
+                ));
+            }
+            "mem> " => {
+                self.scrollback.push(ScrollLine::styled(
+                    format!("  {body}"),
+                    theme::ACCENT_DIM,
+                    0,
+                    false,
+                ));
+            }
+            "tab> " => {
+                self.scrollback.push(ScrollLine::styled(
+                    format!("    {body}"),
+                    theme::MUTED,
+                    0,
+                    false,
+                ));
+            }
+            _ => {
+                self.scrollback.push(ScrollLine::styled(
+                    format!("  {body}"),
+                    theme::BODY,
+                    0,
+                    false,
+                ));
+            }
+        }
     }
 
     pub fn add_colored_line(&mut self, text: String, fg: u32, bg: u32) {
@@ -95,7 +130,6 @@ impl App {
     pub fn finalize_assistant_turn(&mut self, _turns: u32) {
         if let Some(text) = self.current_assistant.take() {
             if !text.is_empty() {
-                self.scrollback.push(ScrollLine::styled(String::new(), 0, 0, false));
                 for line in text.split('\n') {
                     self.scrollback.push(ScrollLine::styled(
                         format!("  {line}"),
@@ -104,7 +138,6 @@ impl App {
                         false,
                     ));
                 }
-                self.scrollback.push(ScrollLine::styled(String::new(), 0, 0, false));
             }
         }
     }
@@ -200,15 +233,15 @@ impl App {
             }
 
             if prows >= 2 {
-                let prefix = "\u{25B8} ";
-                write_str_styled(prompt, 1, 0, prefix, pcols, theme::ACCENT, theme::SURFACE, true);
-                let prefix_len = prefix.chars().count() as u16;
+                let label = "  you  ";
+                write_str_styled(prompt, 1, 0, label, pcols, theme::ACCENT, theme::SURFACE, true);
+                let label_len = label.chars().count() as u16;
                 write_str_styled(
                     prompt,
                     1,
-                    prefix_len,
+                    label_len,
                     &self.input,
-                    pcols.saturating_sub(prefix_len),
+                    pcols.saturating_sub(label_len),
                     theme::BRIGHT,
                     theme::SURFACE,
                     false,
