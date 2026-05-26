@@ -176,6 +176,8 @@ pub enum StreamEvent {
     ToolActivity {
         tool: String,
         summary: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        diff_lines: Vec<DiffLine>,
     },
     TurnEnd,
     /// Emitted after a successful `ClientMessage::SwitchAccount` so the CLI
@@ -317,6 +319,17 @@ pub enum StreamEvent {
     AdminError {
         message: String,
     },
+}
+
+/// A single line in a unified diff view.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DiffLine {
+    /// `"+"` for added, `"-"` for removed, `" "` for context.
+    pub kind: String,
+    /// 1-based line number (in old file for `-`, new file for `+`, either for context).
+    pub line_no: u32,
+    /// The text content of the line.
+    pub text: String,
 }
 
 /// Wire-shape projection of `SessionStore::SessionSummary`.

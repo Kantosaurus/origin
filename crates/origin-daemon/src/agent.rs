@@ -625,10 +625,12 @@ pub async fn run_loop(
 
             if let Some(tx) = &opts.event_tx {
                 let summary = tool_activity_summary(&name, &args);
+                let diff_lines = tool_diff_lines(&name, &args);
                 let _ = tx
                     .send(StreamEvent::ToolActivity {
                         tool: name.clone(),
                         summary,
+                        diff_lines,
                     })
                     .await;
             }
@@ -1329,6 +1331,75 @@ fn tool_activity_summary(name: &str, args: &Value) -> String {
             let s = args.to_string();
             s.chars().take(60).collect()
         }
+    }
+}
+
+fn tool_diff_lines(name: &str, args: &Value) -> Vec<crate::protocol::DiffLine> {
+    use crate::protocol::DiffLine;
+    match name {
+        "Edit" => {
+            let old = args.get("old_string").and_then(Value::as_str).unwrap_or("");
+            let new = args.get("new_string").and_then(Value::as_str).unwrap_or("");
+            let old_lines: Vec<&str> = old.lines().collect();
+            let new_lines: Vec<&str> = new.lines().collect();
+            let mut out = Vec::new();
+            let mut old_i = 0u32;
+            let mut new_i = 0u32;
+            let max_old = old_lines.len();
+            let max_new = new_lines.len();
+            let mut oi = 0;
+            let mut ni = 0;
+            while oi < max_old || ni < max_new {
+                if oi < max_old && ni < max_new && old_lines[oi] == new_lines[ni] {
+                    old_i += 1;
+                    new_i += 1;
+                    out.push(DiffLine {
+                        kind: " ".to_string(),
+                        line_no: new_i,
+                        text: new_lines[ni].to_string(),
+                    });
+                    oi += 1;
+                    ni += 1;
+                } else {
+                    while oi < max_old
+                        && (ni >= max_new || !new_lines[ni..].contains(&old_lines[oi]))
+                    {
+                        old_i += 1;
+                        out.push(DiffLine {
+                            kind: "-".to_string(),
+                            line_no: old_i,
+                            text: old_lines[oi].to_string(),
+                        });
+                        oi += 1;
+                    }
+                    while ni < max_new
+                        && (oi >= max_old || !old_lines[oi..].contains(&new_lines[ni]))
+                    {
+                        new_i += 1;
+                        out.push(DiffLine {
+                            kind: "+".to_string(),
+                            line_no: new_i,
+                            text: new_lines[ni].to_string(),
+                        });
+                        ni += 1;
+                    }
+                }
+            }
+            out
+        }
+        "Write" => {
+            let content = args.get("content").and_then(Value::as_str).unwrap_or("");
+            content
+                .lines()
+                .enumerate()
+                .map(|(i, line)| DiffLine {
+                    kind: "+".to_string(),
+                    line_no: (i + 1) as u32,
+                    text: line.to_string(),
+                })
+                .collect()
+        }
+        _ => Vec::new(),
     }
 }
 

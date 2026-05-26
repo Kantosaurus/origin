@@ -488,7 +488,7 @@ async fn handle_submit(
             app_for_delta.lock().append_to_current_assistant(d);
             handle_for_delta.mark_dirty();
         },
-        move |tool, summary| {
+        move |tool, summary, diff_lines: Vec<origin_daemon::protocol::DiffLine>| {
             let line = if summary.is_empty() {
                 format!("[{tool}]")
             } else {
@@ -497,6 +497,20 @@ async fn handle_submit(
             let mut a = app_for_tool.lock();
             a.finalize_assistant_turn(0);
             a.add_line("tool> ", &line);
+            for dl in &diff_lines {
+                let (fg, bg) = match dl.kind.as_str() {
+                    "+" => (0x00_FF_FF_FF, 0x00_1B_3D_1B),
+                    "-" => (0x00_FF_FF_FF, 0x00_3D_1B_1B),
+                    _ => (0, 0),
+                };
+                let prefix = match dl.kind.as_str() {
+                    "+" => "+",
+                    "-" => "-",
+                    _ => " ",
+                };
+                let text = format!("{:>4} {prefix} {}", dl.line_no, dl.text);
+                a.add_colored_line(text, fg, bg);
+            }
             a.start_assistant_turn();
             handle_for_tool.mark_dirty();
         },
@@ -544,7 +558,7 @@ async fn call_daemon(
     user_text: &str,
     session_id: &str,
     mut on_delta: impl FnMut(&str) + Send,
-    mut on_tool: impl FnMut(&str, &str) + Send,
+    mut on_tool: impl FnMut(&str, &str, Vec<origin_daemon::protocol::DiffLine>) + Send,
     mut on_usage: impl FnMut(u32, u32, u32, u32) + Send,
     mut on_proposal: impl FnMut(u32, String, Vec<String>) + Send,
 ) -> Result<(PromptReply, Duration)> {
@@ -577,7 +591,11 @@ async fn call_daemon(
         if let Ok(ev) = serde_json::from_slice::<StreamEvent>(&body) {
             match ev {
                 StreamEvent::TextDelta { text } => on_delta(&text),
-                StreamEvent::ToolActivity { tool, summary } => on_tool(&tool, &summary),
+                StreamEvent::ToolActivity {
+                    tool,
+                    summary,
+                    diff_lines,
+                } => on_tool(&tool, &summary, diff_lines),
                 StreamEvent::Usage {
                     input_tokens,
                     output_tokens,
