@@ -21,3 +21,6 @@ pub const DIFF_DEL_BG: u32 = 0x00_2A_14_14;
 pub const GREEN: u32 = 0x00_8C_D4_8C;
 pub const YELLOW: u32 = 0x00_D4_C0_4E;
 pub const RED: u32 = 0x00_D4_5A_5A;
+
+pub const RULE: u32 = 0x00_2E_2A_25;
+pub const DIM: u32 = 0x00_50_4B_46;

@@ -56,6 +56,7 @@ impl App {
                     0,
                     true,
                 ));
+                self.scrollback.push(ScrollLine::styled(String::new(), 0, 0, false));
             }
             "error> " => {
                 self.scrollback.push(ScrollLine::styled(
@@ -114,7 +115,7 @@ impl App {
 
     pub fn add_tool_line(&mut self, text: String) {
         self.scrollback
-            .push(ScrollLine::styled(text, theme::YELLOW, 0, true));
+            .push(ScrollLine::styled(text, theme::ACCENT_DIM, 0, false));
     }
 
     pub fn start_assistant_turn(&mut self) {
@@ -186,7 +187,7 @@ impl App {
             let live_buf;
             if let Some(buf) = self.current_assistant.as_ref() {
                 live_buf = format!("  {buf}");
-                wrap_into(&live_buf, theme::BODY, 0, false, cols_usize, &mut visual_lines);
+                wrap_into(&live_buf, theme::BRIGHT, 0, false, cols_usize, &mut visual_lines);
             }
 
             let total = visual_lines.len() as u16;
@@ -220,21 +221,21 @@ impl App {
                 " {} \u{2502} {tok_in} in \u{00B7} {tok_out} out \u{2502} ${cost:.3} \u{00B7} {secs:.1}s",
                 self.usage.model,
             );
-            write_str_styled(prompt, 0, 0, &status, pcols, theme::MUTED, theme::SURFACE, false);
+            write_str_styled(prompt, 0, 0, &status, pcols, theme::DIM, theme::SURFACE, false);
 
             if let Some(pos) = status.find(&self.usage.model) {
                 let col_start = pos as u16;
                 for (i, ch) in self.usage.model.chars().enumerate() {
                     let c = col_start + i as u16;
                     if c < pcols {
-                        prompt.put(0, c, Cell::new(ch, theme::ACCENT, theme::SURFACE, Attr::BOLD));
+                        prompt.put(0, c, Cell::new(ch, theme::ACCENT, theme::SURFACE, Attr::PLAIN));
                     }
                 }
             }
 
             if prows >= 2 {
                 let label = "  you  ";
-                write_str_styled(prompt, 1, 0, label, pcols, theme::ACCENT, theme::SURFACE, true);
+                write_str_styled(prompt, 1, 0, label, pcols, theme::MUTED, theme::SURFACE, false);
                 let label_len = label.chars().count() as u16;
                 write_str_styled(
                     prompt,
