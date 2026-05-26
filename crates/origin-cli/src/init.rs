@@ -128,13 +128,16 @@ pub async fn run_with<R: BufRead + Send, W: Write + Send>(
         subagent,
     };
     config::save_to(cfg_path, &cfg).map_err(|e| anyhow!("save config: {e}"))?;
-    writeln!(w, "\nSaved to {}.", cfg_path.display())?;
-    writeln!(
-        w,
-        "Secrets are stored in your OS keychain via `origin keyring`. \
-         You can re-run `origin init` any time to overwrite, or use \
-         `origin keyring add` / `origin keyring login` for finer control."
-    )?;
+    {
+        use crate::ansi;
+        writeln!(w)?;
+        writeln!(w, "  {} Saved to {}", ansi::green("\u{2714}"), ansi::muted(&cfg_path.display().to_string()))?;
+        writeln!(
+            w,
+            "  {}",
+            ansi::muted("Secrets in OS keychain. Re-run `origin init` or use `origin keyring` to change.")
+        )?;
+    }
 
     Ok(())
 }
@@ -152,20 +155,21 @@ pub async fn configure_tavily<R: BufRead + Send, W: Write + Send>(
     w: &mut W,
     vault: &KeyVault,
 ) -> Result<()> {
-    writeln!(w)?;
-    writeln!(w, "── Web search (Tavily) ──")?;
-    writeln!(
-        w,
-        "The WebSearch tool is backed by Tavily and requires an API key. \
-         You can grab a free one in under a minute:"
-    )?;
-    writeln!(w, "  1. Visit https://tavily.com/ and sign up (Google or email).")?;
-    writeln!(
-        w,
-        "  2. The free tier includes ~1,000 searches/month — plenty for personal use."
-    )?;
-    writeln!(w, "  3. Copy the API key from your dashboard.")?;
-    writeln!(w)?;
+    {
+        use crate::ansi;
+        writeln!(w)?;
+        writeln!(w, "  {}", ansi::heading("web search"))?;
+        writeln!(w)?;
+        writeln!(
+            w,
+            "  {}",
+            ansi::muted("WebSearch uses Tavily. Grab a free key in under a minute:")
+        )?;
+        writeln!(w, "  {} Visit {} and sign up", ansi::muted("1."), ansi::accent("https://tavily.com/"))?;
+        writeln!(w, "  {} Free tier: ~1,000 searches/month", ansi::muted("2."))?;
+        writeln!(w, "  {} Copy the API key from your dashboard", ansi::muted("3."))?;
+        writeln!(w)?;
+    }
     let key = loop {
         write!(w, "  Paste Tavily API key (required): ")?;
         w.flush()?;
@@ -186,12 +190,19 @@ pub async fn configure_tavily<R: BufRead + Send, W: Write + Send>(
 }
 
 fn greet<W: Write>(w: &mut W) -> std::io::Result<()> {
-    writeln!(w, "Welcome to origin.")?;
+    use crate::ansi;
+    writeln!(w)?;
+    writeln!(w, "  {}", ansi::heading("origin"))?;
+    writeln!(w)?;
     writeln!(
         w,
-        "Let's pick the providers and models origin should talk to. \
-         This runs once; we'll save the choices to ~/.origin/config.toml \
-         and your secrets to your OS keychain."
+        "  {}",
+        ansi::muted("Pick the providers and models origin should talk to.")
+    )?;
+    writeln!(
+        w,
+        "  {}",
+        ansi::muted("Choices save to ~/.origin/config.toml, secrets to your OS keychain.")
     )?;
     writeln!(w)?;
     Ok(())
@@ -208,7 +219,8 @@ async fn configure_role<R: BufRead + Send, W: Write + Send>(
     probe: &dyn ConnectivityProbe,
     role: Role,
 ) -> Result<RoleConfig> {
-    writeln!(w, "── Configuring {} provider ──", role.label())?;
+    writeln!(w, "  {}", crate::ansi::heading(&format!("{} provider", role.label())))?;
+    writeln!(w)?;
     let entry = pick_provider(r, w, cat)?;
     let account = "default".to_string();
 
