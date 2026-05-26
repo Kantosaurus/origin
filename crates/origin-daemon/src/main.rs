@@ -1070,7 +1070,25 @@ async fn handle_request(
     plan: origin_planner::Plan,
     req: PromptRequest,
 ) -> PromptOutcome {
-    let mut session = Session::new(provider.name(), &req.model);
+    let mut session = if let Some(sid) = &req.session_id {
+        match session_store.load_messages(sid) {
+            Ok(msgs) if !msgs.is_empty() => {
+                let mut s = Session::new_with_id(sid.clone(), req.model.clone());
+                s.provider_name = provider.name().to_string();
+                for m in msgs {
+                    s.push(m);
+                }
+                s
+            }
+            _ => {
+                let mut s = Session::new(provider.name(), &req.model);
+                s.id = sid.clone();
+                s
+            }
+        }
+    } else {
+        Session::new(provider.name(), &req.model)
+    };
     let (tx_sub, mut rx_sub) = mpsc::channel::<Subscriber>(1);
     let conn_for_relay = Arc::clone(conn);
     let relay_handle: tokio::task::JoinHandle<()> = spawn_in(TaskClass::Realtime, async move {

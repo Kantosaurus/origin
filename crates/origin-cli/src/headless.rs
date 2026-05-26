@@ -73,6 +73,7 @@ pub async fn run(
         system: String::new(),
         model,
         user_text: text,
+        session_id: None,
     }))?;
     conn.write_raw(&encode(1, FrameKind::Request, &body)).await?;
 

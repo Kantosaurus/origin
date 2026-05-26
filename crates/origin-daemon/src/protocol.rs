@@ -11,6 +11,8 @@ pub struct PromptRequest {
     pub system: String,
     pub model: String,
     pub user_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Request to rebuild the code graph over a set of paths.
