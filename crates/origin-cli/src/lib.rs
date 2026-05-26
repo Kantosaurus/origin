@@ -17,6 +17,7 @@ pub mod plan_panel_wiring;
 pub mod providers;
 pub mod screen;
 pub mod status;
+pub mod theme;
 pub mod trace_cmd;
 pub mod tui;
 pub mod tutorial;
