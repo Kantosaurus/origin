@@ -489,6 +489,7 @@ async fn handle_submit(
             handle_for_delta.mark_dirty();
         },
         move |tool, summary, diff_lines: Vec<origin_daemon::protocol::DiffLine>| {
+            use origin_cli::theme;
             let line = if summary.is_empty() {
                 format!("[{tool}]")
             } else {
@@ -496,12 +497,12 @@ async fn handle_submit(
             };
             let mut a = app_for_tool.lock();
             a.finalize_assistant_turn(0);
-            a.add_line("tool> ", &line);
+            a.add_tool_line(format!("  {line}"));
             for dl in &diff_lines {
                 let (fg, bg) = match dl.kind.as_str() {
-                    "+" => (0x00_FF_FF_FF, 0x00_1B_3D_1B),
-                    "-" => (0x00_FF_FF_FF, 0x00_3D_1B_1B),
-                    _ => (0, 0),
+                    "+" => (theme::DIFF_ADD_FG, theme::DIFF_ADD_BG),
+                    "-" => (theme::DIFF_DEL_FG, theme::DIFF_DEL_BG),
+                    _ => (theme::MUTED, 0),
                 };
                 let prefix = match dl.kind.as_str() {
                     "+" => "+",

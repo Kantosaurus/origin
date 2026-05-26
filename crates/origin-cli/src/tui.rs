@@ -3,25 +3,27 @@
 use std::time::Duration;
 
 use origin_tui::composer::Composer;
-use origin_tui::grid::{Cell, Grid};
+use origin_tui::grid::{Attr, Cell, Grid};
 use origin_tui::stream_widget::StreamWidget;
 
 use crate::status::{render_line, UsageSnapshot};
+use crate::theme;
 
 #[derive(Debug, Clone)]
 pub struct ScrollLine {
     pub text: String,
     pub fg: u32,
     pub bg: u32,
+    pub bold: bool,
 }
 
 impl ScrollLine {
     fn plain(text: String) -> Self {
-        Self { text, fg: 0, bg: 0 }
+        Self { text, fg: 0, bg: 0, bold: false }
     }
 
-    fn colored(text: String, fg: u32, bg: u32) -> Self {
-        Self { text, fg, bg }
+    fn styled(text: String, fg: u32, bg: u32, bold: bool) -> Self {
+        Self { text, fg, bg, bold }
     }
 }
 
@@ -29,9 +31,6 @@ impl ScrollLine {
 pub struct App {
     pub scrollback: Vec<ScrollLine>,
     pub input: String,
-    /// `Some` for the duration of an in-flight assistant turn — the live
-    /// stream relay appends `TextDelta`s here, and `finalize_assistant_turn`
-    /// commits the buffer to scrollback as a single line.
     pub current_assistant: Option<String>,
     pub usage: UsageSnapshot,
 }
@@ -47,23 +46,37 @@ impl App {
         }
     }
 
-    /// Replace the model name shown on the status line. Used by the
-    /// `/model <name>` slash command to reflect the new active model
-    /// without resetting the running token / cost counters.
     pub fn set_model(&mut self, model: impl Into<String>) {
         self.usage.model = model.into();
     }
 
     pub fn add_line(&mut self, prefix: &str, body: &str) {
-        self.scrollback.push(ScrollLine::plain(format!("{prefix}{body}")));
+        let (fg, bold) = match prefix {
+            "you> " => (theme::ACCENT, true),
+            "error> " => (theme::RED, false),
+            "system> " => (theme::MUTED, false),
+            "mem> " => (theme::ACCENT_DIM, false),
+            "tab> " => (theme::MUTED, false),
+            "ok> " => (theme::GREEN, false),
+            _ => (theme::BODY, false),
+        };
+        self.scrollback.push(ScrollLine::styled(
+            format!("{prefix}{body}"),
+            fg,
+            0,
+            bold,
+        ));
     }
 
     pub fn add_colored_line(&mut self, text: String, fg: u32, bg: u32) {
-        self.scrollback.push(ScrollLine::colored(text, fg, bg));
+        self.scrollback.push(ScrollLine::styled(text, fg, bg, false));
     }
 
-    /// Begin a new assistant turn — `append_to_current_assistant` deltas
-    /// accumulate into the in-flight buffer until `finalize_assistant_turn`.
+    pub fn add_tool_line(&mut self, text: String) {
+        self.scrollback
+            .push(ScrollLine::styled(text, theme::YELLOW, 0, true));
+    }
+
     pub fn start_assistant_turn(&mut self) {
         self.current_assistant = Some(String::new());
     }
@@ -74,20 +87,31 @@ impl App {
         }
     }
 
-    /// Commit the in-flight assistant buffer to scrollback under the standard
-    /// prefix and clear the live buffer.
     pub fn finalize_assistant_turn(&mut self, turns: u32) {
         if let Some(text) = self.current_assistant.take() {
             if !text.is_empty() {
-                self.scrollback
-                    .push(ScrollLine::plain(format!("origin ({turns} turns)> {text}")));
+                let prefix = format!("origin ({turns} turns)> ");
+                let mut lines = text.split('\n');
+                if let Some(first) = lines.next() {
+                    self.scrollback.push(ScrollLine::styled(
+                        format!("{prefix}{first}"),
+                        theme::BODY,
+                        0,
+                        false,
+                    ));
+                }
+                for rest in lines {
+                    self.scrollback.push(ScrollLine::styled(
+                        rest.to_string(),
+                        theme::BODY,
+                        0,
+                        false,
+                    ));
+                }
             }
         }
     }
 
-    /// Accumulate one batch of token usage + wallclock elapsed into the
-    /// running status snapshot. Called once per `Submit` cycle after
-    /// `call_daemon` returns.
     pub fn record_usage(
         &mut self,
         input_tokens: u32,
@@ -104,10 +128,6 @@ impl App {
         self.usage.elapsed += elapsed;
     }
 
-    /// Render the current app state into the composer's grids.
-    ///
-    /// `widget` is threaded through for future per-delta streaming use;
-    /// this method does direct cell writes for simplicity.
     pub fn draw(&self, composer: &mut Composer, widget: &mut StreamWidget) {
         let _ = widget;
         {
@@ -124,10 +144,17 @@ impl App {
             let mut visual_lines: Vec<VisualLine<'_>> = Vec::new();
 
             for entry in &self.scrollback {
-                wrap_into(&entry.text, entry.fg, entry.bg, cols_usize, &mut visual_lines);
+                wrap_into(
+                    &entry.text,
+                    entry.fg,
+                    entry.bg,
+                    entry.bold,
+                    cols_usize,
+                    &mut visual_lines,
+                );
             }
             if let Some(buf) = self.current_assistant.as_ref() {
-                wrap_into(buf, 0, 0, cols_usize, &mut visual_lines);
+                wrap_into(buf, theme::BODY, 0, false, cols_usize, &mut visual_lines);
             }
 
             let total = visual_lines.len() as u16;
@@ -137,27 +164,54 @@ impl App {
                 if row >= rows {
                     break;
                 }
-                write_str_colored(main, row, 0, vl.text, cols, vl.fg, vl.bg);
+                write_str_styled(main, row, 0, vl.text, cols, vl.fg, vl.bg, vl.bold);
                 row = row.saturating_add(1);
             }
         }
-        // Prompt bar
+        // Status bar + prompt
         {
             let prompt = composer.prompt_grid();
             let pcols = prompt.cols();
             let prows = prompt.rows();
-            for r in 0..prows {
+            // Fill status bar row with surface color
+            for c in 0..pcols {
+                prompt.put(0, c, Cell::new(' ', 0, theme::SURFACE, Attr::PLAIN));
+            }
+            if prows >= 2 {
                 for c in 0..pcols {
-                    prompt.put(r, c, Cell::blank());
+                    prompt.put(1, c, Cell::blank());
                 }
             }
+
             let status_line = render_line(&self.usage);
-            write_str(prompt, 0, 0, &status_line, pcols);
-            // Input echo on next row, prefixed "> "
-            let mut input_line = String::from("> ");
-            input_line.push_str(&self.input);
+            write_str_styled(prompt, 0, 0, &status_line, pcols, theme::MUTED, theme::SURFACE, false);
+
+            // Highlight the model name in the status bar with accent color
+            if let Some(pos) = status_line.find(&self.usage.model) {
+                let col_start = pos as u16;
+                for (i, ch) in self.usage.model.chars().enumerate() {
+                    let c = col_start + i as u16;
+                    if c < pcols {
+                        prompt.put(0, c, Cell::new(ch, theme::ACCENT, theme::SURFACE, Attr::BOLD));
+                    }
+                }
+            }
+
             if prows >= 2 {
-                write_str(prompt, 1, 0, &input_line, pcols);
+                // Copper-colored prompt prefix
+                let prefix = "> ";
+                write_str_styled(prompt, 1, 0, prefix, pcols, theme::ACCENT, 0, true);
+                let prefix_len = prefix.len() as u16;
+                write_str_styled(
+                    prompt,
+                    1,
+                    prefix_len,
+                    &self.input,
+                    pcols.saturating_sub(prefix_len),
+                    theme::BRIGHT,
+                    0,
+                    false,
+                );
             }
         }
     }
@@ -167,12 +221,14 @@ struct VisualLine<'a> {
     text: &'a str,
     fg: u32,
     bg: u32,
+    bold: bool,
 }
 
 fn wrap_into<'a>(
     text: &'a str,
     fg: u32,
     bg: u32,
+    bold: bool,
     cols: usize,
     out: &mut Vec<VisualLine<'a>>,
 ) {
@@ -182,7 +238,7 @@ fn wrap_into<'a>(
         }
         let chars: Vec<char> = sub.chars().collect();
         if chars.is_empty() {
-            out.push(VisualLine { text: "", fg, bg });
+            out.push(VisualLine { text: "", fg, bg, bold });
         } else {
             let mut start = 0;
             while start < chars.len() {
@@ -193,6 +249,7 @@ fn wrap_into<'a>(
                     text: &sub[byte_start..byte_end],
                     fg,
                     bg,
+                    bold,
                 });
                 start = end;
             }
@@ -200,26 +257,28 @@ fn wrap_into<'a>(
     }
 }
 
-fn write_str(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16) {
-    write_str_colored(grid, row, col, s, max_cols, 0, 0);
-}
-
-fn write_str_colored(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16, fg: u32, bg: u32) {
+fn write_str_styled(
+    grid: &mut Grid,
+    row: u16,
+    col: u16,
+    s: &str,
+    max_cols: u16,
+    fg: u32,
+    bg: u32,
+    bold: bool,
+) {
+    let attr = if bold { Attr::BOLD } else { Attr::PLAIN };
     let mut c = col;
     for ch in s.chars() {
         if c >= max_cols {
             break;
         }
-        if fg == 0 && bg == 0 {
-            grid.put(row, c, Cell::glyph(ch));
-        } else {
-            grid.put(row, c, Cell::new(ch, fg, bg, origin_tui::grid::Attr::PLAIN));
-        }
+        grid.put(row, c, Cell::new(ch, fg, bg, attr));
         c = c.saturating_add(1);
     }
     if bg != 0 {
         while c < max_cols {
-            grid.put(row, c, Cell::new(' ', 0, bg, origin_tui::grid::Attr::PLAIN));
+            grid.put(row, c, Cell::new(' ', 0, bg, Attr::PLAIN));
             c = c.saturating_add(1);
         }
     }
@@ -239,11 +298,6 @@ mod tests {
 
     #[test]
     fn set_model_does_not_reset_token_counters() {
-        // Accumulated usage must survive a model swap — otherwise the
-        // status bar would zero out mid-session every time the user runs
-        // `/model`, which is misleading. (Pricing is per-model lookup,
-        // so the cost reading after a swap reflects new model's rates
-        // applied to the running token totals — that's intentional.)
         let mut app = App::new("anthropic", "claude-opus-4-7");
         app.record_usage(100, 50, 0, 0, std::time::Duration::from_millis(200));
         app.set_model("claude-sonnet-4-6");
