@@ -164,6 +164,7 @@ async fn status_error(resp: reqwest::Response) -> ProviderError {
                 .unwrap_or(1);
             ProviderError::RateLimit {
                 retry_after_secs: retry,
+                message: String::new(),
             }
         }
         s => {

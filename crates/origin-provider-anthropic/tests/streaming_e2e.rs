@@ -92,7 +92,10 @@ async fn anthropic_stream_429_returns_rate_limit_error() {
         .expect_err("must surface 429 as ProviderError");
 
     match err {
-        ProviderError::RateLimit { retry_after_secs } => assert_eq!(retry_after_secs, 7),
+        ProviderError::RateLimit { retry_after_secs, message } => {
+            assert_eq!(retry_after_secs, 7);
+            assert_eq!(message, "slow down");
+        }
         other => panic!("expected RateLimit, got {other:?}"),
     }
 }

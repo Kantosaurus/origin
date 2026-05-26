@@ -44,6 +44,7 @@ impl Provider for RateLimitedThenOk {
         if n < self.fail_n {
             return Err(ProviderError::RateLimit {
                 retry_after_secs: 1,
+                message: String::new(),
             });
         }
         Ok(ChatResponse {
@@ -80,6 +81,7 @@ impl Provider for AlwaysRateLimited {
         self.attempts.fetch_add(1, Ordering::SeqCst);
         Err(ProviderError::RateLimit {
             retry_after_secs: 1,
+            message: String::new(),
         })
     }
 }
@@ -120,10 +122,12 @@ async fn run_loop_gives_up_after_max_rate_limit_retries() {
             model,
             attempts,
             last_retry_after_secs,
+            api_hint,
         } => {
             assert_eq!(model, "claude-test");
             assert_eq!(*attempts, 4);
             assert_eq!(*last_retry_after_secs, 1);
+            assert!(api_hint.is_empty());
         }
         other => panic!("expected RateLimitExhausted, got {other:?}"),
     }
