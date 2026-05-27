@@ -214,6 +214,8 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|p| origin_cli::first_run_prompt::drain(&p).ok().flatten());
 
+    let plan_panel: Arc<Mutex<PlanPanelWiring>> = Arc::new(Mutex::new(PlanPanelWiring::new()));
+
     let scheduler = Scheduler::new(Duration::from_millis(6));
     let handle = scheduler.handle();
     handle.mark_dirty();
@@ -222,15 +224,19 @@ async fn main() -> Result<()> {
         let c2 = composer.clone();
         let a2 = app.clone();
         let w2 = widget.clone();
+        let pp2 = plan_panel.clone();
         spawn_in(TaskClass::Realtime, async move {
             scheduler
                 .run(move || {
-                    // Draw into composer, then collect frame bytes while lock is held,
-                    // then release locks before writing to stdout.
                     let bytes = {
                         let mut c = c2.lock();
                         let mut w = w2.lock();
                         a2.lock().draw(&mut c, &mut w);
+                        {
+                            let pp = pp2.lock();
+                            let lines = pp.render();
+                            origin_cli::tui::draw_side(c.side_grid(), &lines);
+                        }
                         c.frame()
                     };
                     if !bytes.is_empty() {
@@ -251,7 +257,7 @@ async fn main() -> Result<()> {
         handle_submit(&app, &handle, &path, &mut model, &text, &session_id).await;
     }
 
-    let result = run_event_loop(app, composer, widget, handle, &path, &mut model, &session_id).await;
+    let result = run_event_loop(app, composer, widget, handle, &path, &mut model, &session_id, plan_panel).await;
 
     render_task.abort();
     disable_raw_mode()?;
@@ -267,12 +273,8 @@ async fn run_event_loop(
     path: &str,
     model: &mut String,
     session_id: &str,
+    plan_panel: Arc<Mutex<PlanPanelWiring>>,
 ) -> Result<()> {
-    // Plan side panel: subscribe to the daemon's PlanBus over IPC. Each
-    // received envelope feeds `PlanPanelWiring::ingest`. The subscribe
-    // runs on a dedicated long-lived connection so it survives the
-    // one-shot prompt/admin connections each request opens.
-    let plan_panel = Arc::new(Mutex::new(PlanPanelWiring::new()));
     spawn_plan_subscription(path.to_string(), Arc::clone(&plan_panel), handle.clone());
     let mut input_stream = crossterm::event::EventStream::new();
     while let Some(maybe_ev) = input_stream.next().await {

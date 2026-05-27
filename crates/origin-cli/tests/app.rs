@@ -8,7 +8,7 @@ fn assistant_turn_lifecycle() {
     app.append_to_current_assistant("lo");
     app.finalize_assistant_turn(2);
     assert!(app.current_assistant.is_none());
-    assert!(app.scrollback.iter().any(|l| l == "origin (2 turns)> Hello"));
+    assert!(app.scrollback.iter().any(|l| l.text == "  Hello"));
 }
 
 // /model slash command parser is reachable from the CLI surface and
