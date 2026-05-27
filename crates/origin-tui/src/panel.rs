@@ -110,44 +110,65 @@ impl Panel {
         }
     }
 
-    /// Render queued events into `side`, one event per row.
+    /// Render queued events into `side`, one event per row starting at
+    /// `start_row`. Text is truncated to the grid's column width.
     ///
-    /// Text is truncated to the grid's column width. Only ASCII labels are
-    /// written — `Ask: <tool> [<tier>]`.
-    pub fn render(&self, side: &mut Grid) {
+    /// Styled output: permission asks show tool name + tier with
+    /// color-coded tier indicators; decided events render dimmed.
+    pub fn render(&self, side: &mut Grid, start_row: u16) {
         let width = side.cols();
         for (row_idx, ev) in self.items.iter().enumerate() {
-            let row = u16::try_from(row_idx).unwrap_or(u16::MAX);
+            let row = start_row.saturating_add(u16::try_from(row_idx).unwrap_or(u16::MAX));
             if row >= side.rows() {
                 break;
             }
-            let label = match ev {
+            match ev {
                 PanelEvent::PermissionAsk { tool, tier, .. } => {
-                    let tier_str = match tier {
-                        Tier::AutoAllowed => "AutoAllowed",
-                        Tier::RequiresPermission => "RequiresPermission",
+                    let (tier_ch, tier_fg) = match tier {
+                        Tier::AutoAllowed => ('\u{25CB}', 0x00_5C_57_52),
+                        Tier::RequiresPermission => ('\u{25CF}', 0x00_E5_C0_7B),
                     };
-                    format!("Ask: {tool} [{tier_str}]")
+                    if width > 2 {
+                        side.put(
+                            row,
+                            1,
+                            Cell::new(tier_ch, tier_fg, 0, crate::grid::Attr::PLAIN),
+                        );
+                    }
+                    let label = format!(" {tool}");
+                    for (col_idx, ch) in label.chars().enumerate() {
+                        let col = 2u16.saturating_add(u16::try_from(col_idx).unwrap_or(u16::MAX));
+                        if col >= width {
+                            break;
+                        }
+                        side.put(
+                            row,
+                            col,
+                            Cell::new(ch, 0x00_C8_C1_B8, 0, crate::grid::Attr::PLAIN),
+                        );
+                    }
                 }
                 PanelEvent::PermissionDecided { id, outcome } => {
                     let outcome_str = match outcome {
-                        PermissionOutcome::Allow => "Allow",
-                        PermissionOutcome::Deny => "Deny",
-                        PermissionOutcome::Edit => "Edit",
+                        PermissionOutcome::Allow => "\u{2714}",
+                        PermissionOutcome::Deny => "\u{2718}",
+                        PermissionOutcome::Edit => "\u{270E}",
                     };
-                    format!("Done: {id} {outcome_str}")
+                    let label = format!(" {outcome_str} #{id}");
+                    for (col_idx, ch) in label.chars().enumerate() {
+                        let col = u16::try_from(col_idx).unwrap_or(u16::MAX);
+                        if col >= width {
+                            break;
+                        }
+                        side.put(
+                            row,
+                            col,
+                            Cell::new(ch, 0x00_5C_57_52, 0, crate::grid::Attr::PLAIN),
+                        );
+                    }
                 }
-                // `ShowMetrics` is a control event handled by `push`; it never
-                // sits in the queue. Skip if it somehow appears.
                 PanelEvent::ShowMetrics => continue,
             };
-            for (col_idx, ch) in label.chars().enumerate() {
-                let col = u16::try_from(col_idx).unwrap_or(u16::MAX);
-                if col >= width {
-                    break;
-                }
-                side.put(row, col, Cell::glyph(ch));
-            }
         }
     }
 }
