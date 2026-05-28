@@ -80,7 +80,7 @@ crate::origin_tool! {
             "command":           { "type": "string", "description": "Shell command line" },
             "timeout":           { "type": "integer", "minimum": 1, "maximum": 600, "description": "Timeout in seconds (default 120, max 600)" },
             "cwd":               { "type": "string", "description": "Working directory" },
-            "env":               { "type": "array", "items": { "type": "array", "items": [{"type": "string"}, {"type": "string"}], "minItems": 2, "maxItems": 2 }, "description": "Environment variables as [[key, value], ...]" },
+            "env":               { "type": "array", "items": { "type": "array", "prefixItems": [{"type": "string"}, {"type": "string"}], "items": false, "minItems": 2, "maxItems": 2 }, "description": "Environment variables as [[key, value], ...]" },
             "run_in_background": { "type": "boolean", "default": false, "description": "Return immediately with pid; use Monitor to tail output" }
         },
         "required": ["command"]
