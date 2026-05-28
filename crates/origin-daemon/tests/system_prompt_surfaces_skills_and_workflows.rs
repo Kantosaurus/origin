@@ -52,6 +52,36 @@ fn write_skill(dir: &std::path::Path, name: &str, desc: &str) {
 }
 
 #[tokio::test]
+async fn system_prompt_opens_with_origin_identity_block() {
+    // Without an identity block, models with strong Claude-Code training
+    // priors keep answering as CC and ignore origin's directive/skills.
+    let provider = CapturingProvider {
+        seen_systems: Mutex::new(Vec::new()),
+    };
+    let mut session = Session::new("test", "test-model");
+    let opts = LoopOptions {
+        max_turns: 1,
+        ..LoopOptions::default().without_streaming()
+    };
+    let _ = run_loop(&mut session, "hi", &provider, &AlwaysAllow, &opts)
+        .await
+        .expect("loop ok");
+    let sys = provider.seen_systems.lock().expect("lock").remove(0);
+    assert!(
+        sys.starts_with("<origin-identity>"),
+        "system prompt must open with <origin-identity>:\n{sys}"
+    );
+    assert!(
+        sys.contains("You are Origin"),
+        "identity block must name the agent:\n{sys}"
+    );
+    assert!(
+        sys.contains("NOT Claude Code"),
+        "identity block must disclaim CC behavior:\n{sys}"
+    );
+}
+
+#[tokio::test]
 async fn system_prompt_includes_default_workflow_directive() {
     // No skills, no workflows — directive should still land so the model
     // knows the brainstorm → plan → dispatch flow exists.
@@ -120,8 +150,8 @@ async fn system_prompt_lists_workflows_by_name() {
         .expect("loop ok");
     let sys = provider.seen_systems.lock().expect("lock").remove(0);
     assert!(
-        sys.contains("Available workflows"),
-        "system prompt missing `Available workflows` header:\n{sys}"
+        sys.contains("<origin-workflows>"),
+        "system prompt missing <origin-workflows> tag:\n{sys}"
     );
     assert!(
         sys.contains("frontend-design"),

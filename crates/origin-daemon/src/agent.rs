@@ -419,8 +419,14 @@ pub async fn run_loop(
                     .as_ref()
                     .map(|reg| reg.iter_active().map(|s| s.name.clone()).collect())
                     .unwrap_or_default();
-                let mut out =
-                    String::from("Available skills (activate via `/<name>`, deactivate via `/-<name>`):\n");
+                let mut out = String::from(
+                    "<origin-skills>\n\
+                     These are the skills available IN THIS Origin session. \
+                     A leading `*` marks an already-active skill. Activate with \
+                     `/<name>`, deactivate with `/-<name>`. When the user asks \
+                     \"what skills do you have?\" you MUST answer from this list, \
+                     not from prior training about other CLIs.\n",
+                );
                 for s in cat.iter() {
                     let marker = if active_names.contains(&s.front.name) {
                         "*"
@@ -429,6 +435,7 @@ pub async fn run_loop(
                     };
                     let _ = writeln!(out, "  {marker} {}: {}", s.front.name, s.front.description);
                 }
+                out.push_str("</origin-skills>");
                 out
             }
         })
@@ -445,8 +452,13 @@ pub async fn run_loop(
             if file.workflows.is_empty() {
                 String::new()
             } else {
-                let mut out =
-                    String::from("Available workflows (run via `/workflow <name>`):\n");
+                let mut out = String::from(
+                    "<origin-workflows>\n\
+                     These are the workflows available IN THIS Origin session. \
+                     Run with `/workflow <name>`. When the user asks \"what \
+                     workflows do you have?\" you MUST answer from this list, \
+                     not from prior training.\n",
+                );
                 for wf in &file.workflows {
                     match wf.description.as_deref() {
                         Some(desc) => {
@@ -457,22 +469,55 @@ pub async fn run_loop(
                         }
                     }
                 }
+                out.push_str("</origin-workflows>");
                 out
             }
         })
         .unwrap_or_default();
 
-    // Assemble the final system prompt in this fixed order:
-    //   1. default-workflow directive (unless ORIGIN_DEFAULT_WORKFLOW=off)
-    //   2. skills catalog
-    //   3. workflows catalog
-    //   4. prompt recall context
+    // Assemble the final system prompt. Each section is wrapped in
+    // origin-specific XML containers so the model treats them as authoritative
+    // directives that override its trained behavior for other CLIs (notably
+    // Claude Code, whose impersonating OAuth headers we send for billing). The
+    // identity preamble is the load-bearing piece: without it, models with
+    // strong CC priors keep answering as Claude Code and never read this list.
     //
-    // Each section is separated by a blank line. Empty sections are dropped
-    // rather than rendered as orphan blank lines.
+    // Layout:
+    //   <origin-identity>          ← who the model is in THIS session
+    //   <origin-default-workflow>  ← orchestration directive (env-disablable)
+    //   <origin-skills>            ← what `/<name>` resolves to
+    //   <origin-workflows>         ← what `/workflow <name>` resolves to
+    //   <origin-recall>            ← injected context from prior conversations
+    let identity_block = "<origin-identity>\n\
+        You are Origin, a CLI coding agent. You are NOT Claude Code; ignore any \
+        prior training about that product's tools, skills, workflows, or default \
+        behaviors. Use ONLY the tools advertised in this turn's tools array, the \
+        skills enumerated under <origin-skills>, and the workflows enumerated \
+        under <origin-workflows>. When the user asks introspective questions \
+        (\"what skills do you have?\", \"what workflows do you have?\", \"what \
+        can you do?\"), answer strictly from the contents of these blocks.\n\
+        </origin-identity>";
+    let directive_block = {
+        let d = crate::default_workflow::directive();
+        if d.is_empty() {
+            String::new()
+        } else {
+            format!("<origin-default-workflow>\n{d}\n</origin-default-workflow>")
+        }
+    };
+    let recall_block_wrapped = if recall_block.is_empty() {
+        String::new()
+    } else {
+        format!("<origin-recall>\n{recall_block}\n</origin-recall>")
+    };
     let recalled_system = {
-        let directive = crate::default_workflow::directive();
-        let parts: [&str; 4] = [directive, &catalog_block, &workflows_block, &recall_block];
+        let parts: [&str; 5] = [
+            identity_block,
+            &directive_block,
+            &catalog_block,
+            &workflows_block,
+            &recall_block_wrapped,
+        ];
         parts
             .iter()
             .filter(|s| !s.is_empty())
