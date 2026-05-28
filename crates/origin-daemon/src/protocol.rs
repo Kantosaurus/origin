@@ -379,6 +379,11 @@ pub enum StreamEvent {
         max_iter: u32,
         token_budget: u64,
     },
+    /// Emitted when the user runs bare `/goal` and no goal is active on
+    /// the connection. Distinct from [`StreamEvent::SkillError`] so the
+    /// CLI renders it as a benign info line ("no active goal") rather
+    /// than an error row.
+    GoalInactive,
     /// Emitted after each `run_loop` tick while a goal is active.
     GoalIteration {
         iter: u32,

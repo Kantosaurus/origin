@@ -9,6 +9,7 @@ pub mod config;
 pub mod daemon_memory_handle;
 pub mod default_workflow;
 pub mod goal_checkpoint;
+pub mod goal_clear_all;
 pub mod goal_driver;
 pub mod memory_wiring;
 pub mod pairing;
