@@ -45,12 +45,23 @@ fn build_outcome(attrs: &str, inner: &str) -> Option<TagOutcome> {
 
 fn extract_state(attrs: &str) -> Option<&str> {
     // Hand-rolled to stay dependency-free. Looks for `state` (ws) `=` (ws) `"..."`.
+    //
+    // Boundary discipline: `state` must be a whole token. The byte before it
+    // must be start-of-attrs or ASCII whitespace, AND the byte after it must
+    // be `=`, ASCII whitespace, or end-of-attrs. Without the trailing check,
+    // attribute names like `state-extra` or `statemachine` would also match
+    // the `state` prefix; the inner parser would then fail on the `-`/`m`
+    // (not `=`) and re-loop via `i += 1`, which happens to recover today but
+    // is fragile to future tweaks.
     let bytes = attrs.as_bytes();
     let mut i = 0;
     while i + 5 <= bytes.len() {
-        if &bytes[i..i + 5] == b"state"
-            && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\r' | b'\n'))
-        {
+        let prefix_ok = &bytes[i..i + 5] == b"state";
+        let left_boundary_ok =
+            i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\r' | b'\n');
+        let right_boundary_ok = i + 5 == bytes.len()
+            || matches!(bytes[i + 5], b'=' | b' ' | b'\t' | b'\r' | b'\n');
+        if prefix_ok && left_boundary_ok && right_boundary_ok {
             let mut j = i + 5;
             while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') { j += 1; }
             if j >= bytes.len() || bytes[j] != b'=' { i += 1; continue; }

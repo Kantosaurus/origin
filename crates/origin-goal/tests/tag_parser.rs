@@ -74,3 +74,18 @@ fn extra_attributes_ignored() {
     let s = "<goal-status state=\"met\" extra=\"foo\"><reason>r</reason></goal-status>";
     assert_eq!(parse_tag(s), TagOutcome::Met);
 }
+
+// Bug #2: extract_state must not match `state` as a prefix of a longer attr
+// name (e.g. `state-extra`, `statemachine`). The real `state="met"` must still
+// be found when it appears after such a decoy attribute.
+#[test]
+fn similar_attribute_prefix_does_not_block_real_state() {
+    let s = r#"<goal-status state-extra="foo" state="met"><reason>r</reason></goal-status>"#;
+    assert_eq!(parse_tag(s), TagOutcome::Met);
+}
+
+#[test]
+fn state_prefix_in_other_attribute_name_ignored() {
+    let s = r#"<goal-status statemachine="x"><reason>r</reason></goal-status>"#;
+    assert_eq!(parse_tag(s), TagOutcome::Missing);
+}
