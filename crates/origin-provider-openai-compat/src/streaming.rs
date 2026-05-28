@@ -114,9 +114,7 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
                     let idx_bytes = index.to_le_bytes();
                     if let (Some(id), Some(func)) = (tc.id.as_ref(), tc.function.as_ref()) {
                         if let Some(name) = func.name.as_ref() {
-                            let mut payload = Vec::with_capacity(
-                                4 + id.len() + 1 + name.len(),
-                            );
+                            let mut payload = Vec::with_capacity(4 + id.len() + 1 + name.len());
                             payload.extend_from_slice(&idx_bytes);
                             payload.extend_from_slice(id.as_bytes());
                             payload.push(b'\0');

@@ -129,9 +129,7 @@ impl Connection {
 /// Returns [`io::ErrorKind::InvalidData`] for an unknown frame kind or a
 /// body-length field exceeding [`crate::frame::MAX_FRAME_BYTES`], or any
 /// underlying I/O error from the reader.
-pub async fn read_frame_from<R: AsyncRead + Unpin>(
-    reader: &mut R,
-) -> io::Result<(FrameKind, Vec<u8>)> {
+pub async fn read_frame_from<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<(FrameKind, Vec<u8>)> {
     let mut header = [0_u8; HEADER_LEN];
     reader.read_exact(&mut header).await?;
     // header layout (must match crate::frame::encode):
@@ -166,7 +164,7 @@ pub async fn read_frame_from<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{MAX_FRAME_BYTES, HEADER_LEN as FRAME_HEADER_LEN};
+    use crate::frame::{HEADER_LEN as FRAME_HEADER_LEN, MAX_FRAME_BYTES};
     use tokio::io::AsyncWriteExt;
 
     /// Build a raw frame header with the given body length. Body bytes are
@@ -179,7 +177,7 @@ mod tests {
         h[2] = 0x4F;
         h[3] = 0x4E;
         h[4] = 1; // kind = Request
-        // request_id (8 bytes) = 0, already zeroed
+                  // request_id (8 bytes) = 0, already zeroed
         let len_be = body_len.to_be_bytes();
         h[13] = len_be[0];
         h[14] = len_be[1];

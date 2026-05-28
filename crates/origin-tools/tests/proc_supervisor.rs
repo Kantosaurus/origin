@@ -1,4 +1,4 @@
-use origin_tools::proc_supervisor::{Supervisor, SpawnOpts};
+use origin_tools::proc_supervisor::{SpawnOpts, Supervisor};
 use std::time::Duration;
 
 #[tokio::test]
@@ -37,7 +37,10 @@ async fn timeout_terminates_long_process() {
     let cmd = "sleep 60";
     #[cfg(windows)]
     let cmd = "Start-Sleep -Seconds 60";
-    let opts = SpawnOpts { timeout: Some(Duration::from_millis(300)), ..SpawnOpts::default() };
+    let opts = SpawnOpts {
+        timeout: Some(Duration::from_millis(300)),
+        ..SpawnOpts::default()
+    };
     let pid = sup.spawn(cmd, &opts).unwrap();
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let chunk = sup.read_since(pid, 0, 4096).unwrap();

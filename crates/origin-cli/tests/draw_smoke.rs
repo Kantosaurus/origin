@@ -57,7 +57,12 @@ fn scrollback_does_not_lose_lines_behind_input_card() {
     let cols: u16 = 80;
     let rows: u16 = 20;
     let mut composer = Composer::new(cols, rows);
-    let mut widget = StreamWidget::new(Rect { row: 0, col: 0, cols, rows: rows - 1 });
+    let mut widget = StreamWidget::new(Rect {
+        row: 0,
+        col: 0,
+        cols,
+        rows: rows - 1,
+    });
     eprintln!("scrollback.len() = {}", app.scrollback.len());
     app.draw(&mut composer, &mut widget);
 
@@ -80,9 +85,7 @@ fn scrollback_does_not_lose_lines_behind_input_card() {
             let rest_after = &rest[digits.len()..];
             // Reject partial matches like "line-4shift+enter…" produced when
             // a row is partially overpainted by the cap-line hint text.
-            if !digits.is_empty()
-                && (rest_after.is_empty() || rest_after.starts_with(' '))
-            {
+            if !digits.is_empty() && (rest_after.is_empty() || rest_after.starts_with(' ')) {
                 if let Ok(n) = digits.parse::<u32>() {
                     visible_line_nums.push(n);
                 }

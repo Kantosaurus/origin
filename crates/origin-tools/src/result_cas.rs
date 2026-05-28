@@ -29,7 +29,9 @@ impl Default for ResultStore {
 impl ResultStore {
     #[must_use]
     pub fn new() -> Self {
-        Self { inner: Arc::new(RwLock::new(HashMap::new())) }
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 
     /// Store `body` under its blake3 hash and return the hash.
@@ -41,7 +43,8 @@ impl ResultStore {
     pub fn put(&self, body: &[u8]) -> Blake3Hash {
         let h = blake3::hash(body);
         let mut w = self.inner.write().expect("ResultStore RwLock poisoned");
-        w.entry(*h.as_bytes()).or_insert_with(|| Arc::from(body.to_vec().into_boxed_slice()));
+        w.entry(*h.as_bytes())
+            .or_insert_with(|| Arc::from(body.to_vec().into_boxed_slice()));
         h
     }
 
@@ -51,7 +54,11 @@ impl ResultStore {
     /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn get(&self, h: &Blake3Hash) -> Option<Arc<[u8]>> {
-        self.inner.read().expect("ResultStore RwLock poisoned").get(h.as_bytes()).cloned()
+        self.inner
+            .read()
+            .expect("ResultStore RwLock poisoned")
+            .get(h.as_bytes())
+            .cloned()
     }
 }
 

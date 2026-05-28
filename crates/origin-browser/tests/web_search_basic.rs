@@ -15,12 +15,18 @@ async fn returns_parsed_results_from_tavily_shaped_response() {
         let body = r#"{"results":[{"title":"T","url":"https://x","content":"snip"}]}"#;
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(), body
+            body.len(),
+            body
         );
         s.write_all(resp.as_bytes()).await.unwrap();
     });
-    let opts = SearchOptions { api_key: "k".into(), count: 5 };
-    let r = search_with_endpoint(&format!("http://{addr}/search"), "q", opts).await.unwrap();
+    let opts = SearchOptions {
+        api_key: "k".into(),
+        count: 5,
+    };
+    let r = search_with_endpoint(&format!("http://{addr}/search"), "q", opts)
+        .await
+        .unwrap();
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].title, "T");
     assert_eq!(r[0].url, "https://x");

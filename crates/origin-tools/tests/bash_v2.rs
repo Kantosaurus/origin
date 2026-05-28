@@ -22,7 +22,11 @@ async fn foreground_returns_full_output() {
     .await
     .unwrap();
     assert_eq!(out["status"], "exited");
-    assert!(out["stdout"].as_str().unwrap().contains("hello"), "stdout: {:?}", out["stdout"]);
+    assert!(
+        out["stdout"].as_str().unwrap().contains("hello"),
+        "stdout: {:?}",
+        out["stdout"]
+    );
     assert_eq!(out["exit_code"], 0);
 }
 

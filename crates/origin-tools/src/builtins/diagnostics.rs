@@ -23,10 +23,7 @@ pub struct DiagnosticsArgs {
 ///
 /// # Errors
 /// `subsystem.ra_unavailable` if RA is unreachable.
-pub async fn diagnostics(
-    args: DiagnosticsArgs,
-    h: &dyn DiagnosticsHandle,
-) -> Result<Value, ToolError> {
+pub async fn diagnostics(args: DiagnosticsArgs, h: &dyn DiagnosticsHandle) -> Result<Value, ToolError> {
     let path: Option<PathBuf> = args.path.as_deref().map(PathBuf::from);
     let diags = h.diagnostics(path.as_deref(), args.severity).await?;
     let filtered: Vec<Value> = diags

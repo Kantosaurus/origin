@@ -71,13 +71,25 @@ impl CloakClient {
     pub async fn send(&mut self, verb: &Verb) -> Result<SnapshotResp, ClientError> {
         let mut line = serde_json::to_vec(verb)?;
         line.push(b'\n');
-        self.stdin.write_all(&line).await.map_err(|e| ClientError::Io(e.to_string()))?;
-        self.stdin.flush().await.map_err(|e| ClientError::Io(e.to_string()))?;
+        self.stdin
+            .write_all(&line)
+            .await
+            .map_err(|e| ClientError::Io(e.to_string()))?;
+        self.stdin
+            .flush()
+            .await
+            .map_err(|e| ClientError::Io(e.to_string()))?;
         let mut buf = String::new();
-        let n = self.stdout.read_line(&mut buf).await.map_err(|e| ClientError::Io(e.to_string()))?;
-        if n == 0 { return Err(ClientError::Exited); }
-        let resp: SnapshotResp = serde_json::from_str(buf.trim_end())
-            .map_err(|e| ClientError::Io(format!("decode: {e}")))?;
+        let n = self
+            .stdout
+            .read_line(&mut buf)
+            .await
+            .map_err(|e| ClientError::Io(e.to_string()))?;
+        if n == 0 {
+            return Err(ClientError::Exited);
+        }
+        let resp: SnapshotResp =
+            serde_json::from_str(buf.trim_end()).map_err(|e| ClientError::Io(format!("decode: {e}")))?;
         Ok(resp)
     }
 }
@@ -85,14 +97,19 @@ impl CloakClient {
 fn resolve_sidecar() -> Result<std::path::PathBuf, ClientError> {
     if let Ok(p) = std::env::var("ORIGIN_CLOAK_DIR") {
         let cli = std::path::PathBuf::from(p).join("cloak-cli.mjs");
-        if cli.exists() { return Ok(cli); }
+        if cli.exists() {
+            return Ok(cli);
+        }
         return Err(ClientError::NotFound(cli));
     }
     let exe = std::env::current_exe().map_err(ClientError::Spawn)?;
     let cand = exe
-        .parent().and_then(|p| p.parent())
+        .parent()
+        .and_then(|p| p.parent())
         .map(|p| p.join("vendor/cloak-browser/cloak-cli.mjs"))
         .unwrap_or_default();
-    if cand.exists() { return Ok(cand); }
+    if cand.exists() {
+        return Ok(cand);
+    }
     Err(ClientError::NotFound(cand))
 }

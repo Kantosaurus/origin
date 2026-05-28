@@ -16,7 +16,9 @@ use std::collections::HashMap;
 
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Clone)]
-pub struct ApplyPatchArgs { pub patch: String }
+pub struct ApplyPatchArgs {
+    pub patch: String,
+}
 
 #[derive(Debug)]
 struct Hunk {
@@ -39,8 +41,8 @@ pub fn apply_patch(args: &ApplyPatchArgs) -> Result<Value, ToolError> {
         } else {
             // Resolve the diff path to a native OS path.
             let native_path = to_native_path(&h.file);
-            let bytes = std::fs::read(&native_path).map_err(|e| ToolError::new(
-                ErrClass::Io, "not_found", format!("{}: {e}", h.file)))?;
+            let bytes = std::fs::read(&native_path)
+                .map_err(|e| ToolError::new(ErrClass::Io, "not_found", format!("{}: {e}", h.file)))?;
             let det = text_fmt::detect(&bytes);
             let text = text_fmt::normalise_to_lf(&bytes, &det)?;
             staged.insert(h.file.clone(), (bytes, det, text.clone()));
@@ -79,30 +81,42 @@ fn parse_patch(patch: &str) -> Result<Vec<Hunk>, ToolError> {
     let mut cur: Option<Hunk> = None;
     for line in patch.lines() {
         if let Some(rest) = line.strip_prefix("+++ b/") {
-            if let Some(h) = cur.take() { hunks.push(h); }
+            if let Some(h) = cur.take() {
+                hunks.push(h);
+            }
             cur_file = Some(rest.to_string());
         } else if line.starts_with("--- a/") || line.starts_with("diff --git") {
             // ignore; +++ line drives the path
         } else if let Some(rest) = line.strip_prefix("@@ -") {
-            if let Some(h) = cur.take() { hunks.push(h); }
+            if let Some(h) = cur.take() {
+                hunks.push(h);
+            }
             // parse "L1,C1 +L2,C2 @@"
             let mut parts = rest.split(' ');
-            let old_part = parts.next()
+            let old_part = parts
+                .next()
                 .ok_or_else(|| ToolError::new(ErrClass::Validation, "bad_patch", "missing old range"))?;
             let l_str = old_part.split(',').next().unwrap_or("1");
-            let old_start: usize = l_str.parse().map_err(|_| {
-                ToolError::new(ErrClass::Validation, "bad_patch", "bad old line number")
+            let old_start: usize = l_str
+                .parse()
+                .map_err(|_| ToolError::new(ErrClass::Validation, "bad_patch", "bad old line number"))?;
+            let file = cur_file.clone().ok_or_else(|| {
+                ToolError::new(ErrClass::Validation, "bad_patch", "hunk before file header")
             })?;
-            let file = cur_file.clone().ok_or_else(|| ToolError::new(
-                ErrClass::Validation, "bad_patch", "hunk before file header"))?;
-            cur = Some(Hunk { file, old_start, lines: Vec::new() });
+            cur = Some(Hunk {
+                file,
+                old_start,
+                lines: Vec::new(),
+            });
         } else if let Some(h) = cur.as_mut() {
             if line.starts_with(' ') || line.starts_with('-') || line.starts_with('+') {
                 h.lines.push(line.to_string());
             }
         }
     }
-    if let Some(h) = cur.take() { hunks.push(h); }
+    if let Some(h) = cur.take() {
+        hunks.push(h);
+    }
     Ok(hunks)
 }
 
@@ -114,30 +128,53 @@ fn apply_one_hunk(text: &str, h: &Hunk) -> Result<String, ToolError> {
     for l in &h.lines {
         let body = &l[1..];
         match l.as_bytes()[0] {
-            b' ' => { old_block.push(body); new_block.push(body.to_string()); }
-            b'-' => { old_block.push(body); }
-            b'+' => { new_block.push(body.to_string()); }
+            b' ' => {
+                old_block.push(body);
+                new_block.push(body.to_string());
+            }
+            b'-' => {
+                old_block.push(body);
+            }
+            b'+' => {
+                new_block.push(body.to_string());
+            }
             _ => {}
         }
     }
     let start_idx = h.old_start.saturating_sub(1);
     if start_idx + old_block.len() > lines.len() {
-        return Err(ToolError::new(ErrClass::Edit, "no_match",
-            format!("hunk @{} extends past EOF in {}", h.old_start, h.file)));
+        return Err(ToolError::new(
+            ErrClass::Edit,
+            "no_match",
+            format!("hunk @{} extends past EOF in {}", h.old_start, h.file),
+        ));
     }
     for (off, exp) in old_block.iter().enumerate() {
         let got = lines[start_idx + off];
         if got != *exp {
-            return Err(ToolError::new(ErrClass::Edit, "no_match",
-                format!("context mismatch at {}:{}: expected `{exp}`, got `{got}`", h.file, h.old_start + off)));
+            return Err(ToolError::new(
+                ErrClass::Edit,
+                "no_match",
+                format!(
+                    "context mismatch at {}:{}: expected `{exp}`, got `{got}`",
+                    h.file,
+                    h.old_start + off
+                ),
+            ));
         }
     }
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     out.extend(lines[..start_idx].iter().map(|s| (*s).to_string()));
     out.extend(new_block);
-    out.extend(lines[start_idx + old_block.len()..].iter().map(|s| (*s).to_string()));
+    out.extend(
+        lines[start_idx + old_block.len()..]
+            .iter()
+            .map(|s| (*s).to_string()),
+    );
     let mut joined = out.join("\n");
-    if text.ends_with('\n') { joined.push('\n'); }
+    if text.ends_with('\n') {
+        joined.push('\n');
+    }
     Ok(joined)
 }
 
@@ -149,8 +186,10 @@ fn atomic_write(path: &str, bytes: &[u8]) -> Result<(), ToolError> {
     {
         let mut f = std::fs::File::create(&tmp)
             .map_err(|e| ToolError::new(ErrClass::Io, "permission", e.to_string()))?;
-        f.write_all(bytes).map_err(|e| ToolError::new(ErrClass::Io, "permission", e.to_string()))?;
-        f.sync_all().map_err(|e| ToolError::new(ErrClass::Io, "permission", e.to_string()))?;
+        f.write_all(bytes)
+            .map_err(|e| ToolError::new(ErrClass::Io, "permission", e.to_string()))?;
+        f.sync_all()
+            .map_err(|e| ToolError::new(ErrClass::Io, "permission", e.to_string()))?;
     }
     std::fs::rename(&tmp, p).map_err(|e| ToolError::new(ErrClass::Io, "permission", e.to_string()))
 }

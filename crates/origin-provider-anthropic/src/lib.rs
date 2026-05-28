@@ -535,11 +535,7 @@ fn load_oauth_metadata(session_id: &str) -> wire::WireMetadata {
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .map(|v| {
-            let did = v
-                .get("userID")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
+            let did = v.get("userID").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let auid = v
                 .get("oauthAccount")
                 .and_then(|o| o.get("accountUuid"))

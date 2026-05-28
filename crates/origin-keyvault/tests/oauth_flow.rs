@@ -154,14 +154,8 @@ async fn concurrent_refresh_if_due_makes_only_one_http_call() {
     let c2 = client.clone();
     let v2 = vault.clone();
     let (r1, r2) = tokio::join!(
-        tokio::spawn(async move {
-            c1.refresh_if_due(&v1, "default", Duration::from_secs(60))
-                .await
-        }),
-        tokio::spawn(async move {
-            c2.refresh_if_due(&v2, "default", Duration::from_secs(60))
-                .await
-        }),
+        tokio::spawn(async move { c1.refresh_if_due(&v1, "default", Duration::from_secs(60)).await }),
+        tokio::spawn(async move { c2.refresh_if_due(&v2, "default", Duration::from_secs(60)).await }),
     );
     let r1 = r1.expect("join r1").expect("refresh_if_due 1");
     let r2 = r2.expect("join r2").expect("refresh_if_due 2");

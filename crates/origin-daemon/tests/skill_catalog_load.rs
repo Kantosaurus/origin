@@ -8,9 +8,7 @@ fn write_skill(dir: &Path, name: &str) {
     std::fs::create_dir_all(&skill_dir).expect("mkdir");
     std::fs::write(
         skill_dir.join("SKILL.md"),
-        format!(
-            "---\nname: {name}\ndescription: integration\nallowed-tools: [\"Read\"]\n---\nbody\n"
-        ),
+        format!("---\nname: {name}\ndescription: integration\nallowed-tools: [\"Read\"]\n---\nbody\n"),
     )
     .expect("write");
 }

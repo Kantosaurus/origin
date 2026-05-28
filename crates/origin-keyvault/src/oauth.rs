@@ -256,11 +256,7 @@ impl OAuthClient {
     /// Lock-free body of [`Self::refresh`]. The caller MUST be holding the
     /// per-account [`refresh_lock_for`] mutex before invoking this — it
     /// performs the HTTP refresh + vault persist that must not interleave.
-    async fn refresh_locked(
-        &self,
-        vault: &KeyVault,
-        account: &str,
-    ) -> Result<RefreshOutcome, Error> {
+    async fn refresh_locked(&self, vault: &KeyVault, account: &str) -> Result<RefreshOutcome, Error> {
         let stored = self.load(vault, account).await?;
         let refresh_token = stored
             .refresh

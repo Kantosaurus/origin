@@ -426,8 +426,7 @@ fn god_nodes(idx: &CodeGraphIndex, top_per_partition: usize) -> Result<QueryResu
         members.sort_by(|a, b| {
             let ad = in_deg.get(&a.entity_id.0).copied().unwrap_or(0);
             let bd = in_deg.get(&b.entity_id.0).copied().unwrap_or(0);
-            bd.cmp(&ad)
-                .then_with(|| a.entity_id.0.cmp(&b.entity_id.0))
+            bd.cmp(&ad).then_with(|| a.entity_id.0.cmp(&b.entity_id.0))
         });
         members.truncate(top_per_partition);
         if !members.is_empty() {

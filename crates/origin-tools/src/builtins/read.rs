@@ -24,9 +24,8 @@ pub fn read_v2(args: ReadArgs) -> Result<String, ToolError> {
     // Defense in depth: refuse to follow symlinks. SandboxProfile::ReadFs is the
     // real gate, but a symlink planted inside an allowed dir could otherwise
     // resolve to sensitive paths (~/.aws/credentials, SSH keys, etc.).
-    let meta = std::fs::symlink_metadata(&args.file_path).map_err(|e| {
-        ToolError::new(ErrClass::Io, "not_found", format!("{}: {e}", args.file_path))
-    })?;
+    let meta = std::fs::symlink_metadata(&args.file_path)
+        .map_err(|e| ToolError::new(ErrClass::Io, "not_found", format!("{}: {e}", args.file_path)))?;
     if meta.file_type().is_symlink() {
         return Err(ToolError::new(
             ErrClass::Validation,
@@ -34,9 +33,8 @@ pub fn read_v2(args: ReadArgs) -> Result<String, ToolError> {
             format!("refusing to read symlink: {}", args.file_path),
         ));
     }
-    let bytes = std::fs::read(&args.file_path).map_err(|e| {
-        ToolError::new(ErrClass::Io, "not_found", format!("{}: {e}", args.file_path))
-    })?;
+    let bytes = std::fs::read(&args.file_path)
+        .map_err(|e| ToolError::new(ErrClass::Io, "not_found", format!("{}: {e}", args.file_path)))?;
 
     match as_kind {
         "text" => read_text(&bytes, &args),

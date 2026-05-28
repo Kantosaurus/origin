@@ -2,17 +2,17 @@
 //! binary and for unit tests.
 
 pub mod admin;
-pub mod ansi;
 pub mod admin_url;
+pub mod ansi;
 pub mod autocomplete;
 pub mod cli_def;
 pub mod config;
 pub mod editor;
+pub mod first_run_prompt;
 pub mod headless;
 pub mod import;
 pub mod init;
 pub mod init_probe;
-pub mod first_run_prompt;
 pub mod input;
 pub mod keyring_login;
 pub mod plan_panel_wiring;

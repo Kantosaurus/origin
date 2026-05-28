@@ -31,7 +31,10 @@ impl WriteGuard {
     /// while holding the lock — not expected in normal operation).
     pub fn note_read(&self, path: &str) {
         let canon = canonical_key(path);
-        self.read_paths.write().expect("WriteGuard RwLock poisoned").insert(canon);
+        self.read_paths
+            .write()
+            .expect("WriteGuard RwLock poisoned")
+            .insert(canon);
     }
 
     /// Returns `true` if `path` has been marked as read in this session.
@@ -40,13 +43,15 @@ impl WriteGuard {
     /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn has_read(&self, path: &str) -> bool {
-        self.read_paths.read().expect("WriteGuard RwLock poisoned").contains(&canonical_key(path))
+        self.read_paths
+            .read()
+            .expect("WriteGuard RwLock poisoned")
+            .contains(&canonical_key(path))
     }
 }
 
 fn canonical_key(path: &str) -> String {
-    std::fs::canonicalize(path)
-        .map_or_else(|_| path.to_string(), |p| p.to_string_lossy().into_owned())
+    std::fs::canonicalize(path).map_or_else(|_| path.to_string(), |p| p.to_string_lossy().into_owned())
 }
 
 /// # Errors
@@ -77,8 +82,13 @@ pub fn write_v2(args: WriteArgs, guard: &WriteGuard) -> Result<(), ToolError> {
 
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| ToolError::new(ErrClass::Io, "permission", format!("mkdir {}: {e}", parent.display())))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ToolError::new(
+                    ErrClass::Io,
+                    "permission",
+                    format!("mkdir {}: {e}", parent.display()),
+                )
+            })?;
         }
     }
 

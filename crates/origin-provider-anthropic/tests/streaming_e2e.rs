@@ -92,7 +92,10 @@ async fn anthropic_stream_429_returns_rate_limit_error() {
         .expect_err("must surface 429 as ProviderError");
 
     match err {
-        ProviderError::RateLimit { retry_after_secs, message } => {
+        ProviderError::RateLimit {
+            retry_after_secs,
+            message,
+        } => {
             assert_eq!(retry_after_secs, 7);
             assert_eq!(message, "slow down");
         }
@@ -124,8 +127,5 @@ async fn anthropic_stream_401_returns_auth_error() {
         .await
         .expect_err("must surface 401 as ProviderError::Auth");
 
-    assert!(
-        matches!(err, ProviderError::Auth),
-        "expected Auth, got {err:?}"
-    );
+    assert!(matches!(err, ProviderError::Auth), "expected Auth, got {err:?}");
 }

@@ -42,8 +42,8 @@ async fn bedrock_request_max_tokens_matches_anthropic_ceiling() {
 
     let received = server.received_requests().await.expect("wiremock recorded");
     assert_eq!(received.len(), 1, "expected exactly one outbound request");
-    let body: serde_json::Value = serde_json::from_slice(&received[0].body)
-        .expect("request body should be JSON");
+    let body: serde_json::Value =
+        serde_json::from_slice(&received[0].body).expect("request body should be JSON");
     let max_tokens = body
         .get("max_tokens")
         .and_then(serde_json::Value::as_u64)

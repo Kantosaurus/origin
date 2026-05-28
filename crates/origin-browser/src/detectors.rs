@@ -14,16 +14,16 @@ pub enum Verdict {
 }
 
 const BOT_PATTERNS: &[(&str, &str)] = &[
-    ("cf-chl-",       "cloudflare-challenge"),
-    ("__cf_chl_",     "cloudflare-challenge"),
-    ("cf-mitigated",  "cloudflare-mitigation"),
-    ("g-recaptcha",   "recaptcha"),
-    ("h-captcha",     "hcaptcha"),
-    ("px-captcha",    "perimeterx"),
-    ("_pxhd",         "perimeterx"),
-    ("datadome",      "datadome"),
+    ("cf-chl-", "cloudflare-challenge"),
+    ("__cf_chl_", "cloudflare-challenge"),
+    ("cf-mitigated", "cloudflare-mitigation"),
+    ("g-recaptcha", "recaptcha"),
+    ("h-captcha", "hcaptcha"),
+    ("px-captcha", "perimeterx"),
+    ("_pxhd", "perimeterx"),
+    ("datadome", "datadome"),
     ("_Incapsula_Resource", "imperva-incapsula"),
-    ("kasada",        "kasada"),
+    ("kasada", "kasada"),
 ];
 
 /// Classify a snapshot response as `Verdict::Clean` or `Verdict::BotDetected`.

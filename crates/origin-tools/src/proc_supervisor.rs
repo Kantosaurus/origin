@@ -190,23 +190,12 @@ impl Supervisor {
     ///
     /// # Panics
     /// Never panics in normal operation.
-    pub fn read_since(
-        &self,
-        pid: ProcessId,
-        offset: u64,
-        max: usize,
-    ) -> Result<ReadChunk, ToolError> {
+    pub fn read_since(&self, pid: ProcessId, offset: u64, max: usize) -> Result<ReadChunk, ToolError> {
         let guard = unlock(self.inner.lock());
         guard
             .get(&pid)
             .map(|s| s.read_since(offset, max))
-            .ok_or_else(|| {
-                ToolError::new(
-                    ErrClass::Validation,
-                    "unknown_pid",
-                    format!("no such pid {pid}"),
-                )
-            })
+            .ok_or_else(|| ToolError::new(ErrClass::Validation, "unknown_pid", format!("no such pid {pid}")))
     }
 
     /// Mark a process as killed in the slot table.

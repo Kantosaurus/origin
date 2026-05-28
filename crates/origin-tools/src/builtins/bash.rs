@@ -42,8 +42,7 @@ pub async fn bash_v2(args: BashArgs, sup: &Supervisor) -> Result<Value, ToolErro
     }
     // Foreground: poll until status terminal, then return final body.
     let mut next = 0u64;
-    let deadline =
-        std::time::Instant::now() + Duration::from_secs(u64::from(timeout_secs) + 5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(u64::from(timeout_secs) + 5);
     let mut acc = String::new();
     loop {
         let chunk = sup.read_since(pid, next, 64 * 1024)?;

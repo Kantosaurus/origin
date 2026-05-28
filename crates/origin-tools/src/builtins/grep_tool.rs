@@ -3,7 +3,7 @@
 use crate::error::{ErrClass, ToolError};
 use crate::{SideEffects, Tier, Urgency};
 use grep_regex::RegexMatcher;
-use grep_searcher::{SearcherBuilder, sinks::UTF8};
+use grep_searcher::{sinks::UTF8, SearcherBuilder};
 use ignore::types::TypesBuilder;
 use ignore::WalkBuilder;
 use serde_json::{json, Value};
@@ -47,7 +47,8 @@ pub fn grep_v2(args: GrepArgs) -> Result<Value, ToolError> {
         let mut tb = TypesBuilder::new();
         tb.add_defaults();
         tb.select(t);
-        let types = tb.build()
+        let types = tb
+            .build()
             .map_err(|e| ToolError::new(ErrClass::Validation, "bad_type", e.to_string()))?;
         walker.types(types);
     }
@@ -55,8 +56,10 @@ pub fn grep_v2(args: GrepArgs) -> Result<Value, ToolError> {
         let mut ob = ignore::overrides::OverrideBuilder::new(&root);
         ob.add(g)
             .map_err(|e| ToolError::new(ErrClass::Validation, "bad_glob", e.to_string()))?;
-        walker.overrides(ob.build()
-            .map_err(|e| ToolError::new(ErrClass::Validation, "bad_glob_build", e.to_string()))?);
+        walker.overrides(
+            ob.build()
+                .map_err(|e| ToolError::new(ErrClass::Validation, "bad_glob_build", e.to_string()))?,
+        );
     }
 
     let mut searcher = SearcherBuilder::new()
@@ -70,24 +73,36 @@ pub fn grep_v2(args: GrepArgs) -> Result<Value, ToolError> {
     let mut files: BTreeSet<String> = BTreeSet::new();
     'walk: for raw_entry in walker.build() {
         let Ok(entry) = raw_entry else { continue };
-        if !entry.file_type().is_some_and(|t| t.is_file()) { continue; }
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
         let path = entry.path().to_path_buf();
         let path_display = path.display().to_string();
         let mut local_count: u64 = 0;
         let mut local_lines: Vec<(u64, String)> = Vec::new();
-        let res = searcher.search_path(&matcher, &path, UTF8(|lnum, line| {
-            local_count += 1;
-            local_lines.push((lnum, line.trim_end_matches('\n').to_string()));
-            Ok(true)
-        }));
-        if res.is_err() { continue; }
-        if local_count == 0 { continue; }
+        let res = searcher.search_path(
+            &matcher,
+            &path,
+            UTF8(|lnum, line| {
+                local_count += 1;
+                local_lines.push((lnum, line.trim_end_matches('\n').to_string()));
+                Ok(true)
+            }),
+        );
+        if res.is_err() {
+            continue;
+        }
+        if local_count == 0 {
+            continue;
+        }
         files.insert(path_display.clone());
         counts.insert(path_display.clone(), local_count);
         if matches!(mode, OutputMode::Content) {
             for (lnum, line) in local_lines {
                 match_results.push(json!({"file": path_display, "line": lnum, "text": line}));
-                if match_results.len() >= head_limit { break 'walk; }
+                if match_results.len() >= head_limit {
+                    break 'walk;
+                }
             }
         }
     }
@@ -99,7 +114,8 @@ pub fn grep_v2(args: GrepArgs) -> Result<Value, ToolError> {
         }
         OutputMode::Content => json!({"matches": match_results}),
         OutputMode::Count => {
-            let arr: Vec<Value> = counts.into_iter()
+            let arr: Vec<Value> = counts
+                .into_iter()
                 .take(head_limit)
                 .map(|(f, c)| json!({"file": f, "count": c}))
                 .collect();

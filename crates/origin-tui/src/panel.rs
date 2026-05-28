@@ -129,11 +129,7 @@ impl Panel {
                         Tier::RequiresPermission => ('\u{25CF}', 0x00_E5_C0_7B),
                     };
                     if width > 2 {
-                        side.put(
-                            row,
-                            1,
-                            Cell::new(tier_ch, tier_fg, 0, crate::grid::Attr::PLAIN),
-                        );
+                        side.put(row, 1, Cell::new(tier_ch, tier_fg, 0, crate::grid::Attr::PLAIN));
                     }
                     let label = format!(" {tool}");
                     for (col_idx, ch) in label.chars().enumerate() {

@@ -85,10 +85,7 @@ fn match_candidates(
 
     // Ghost text mirrors `unique_match_produces_ghost`: only when there's
     // exactly one match AND it extends the current trailing token.
-    let ghost = if matches.len() == 1
-        && matches[0].starts_with(token)
-        && matches[0].len() > token.len()
-    {
+    let ghost = if matches.len() == 1 && matches[0].starts_with(token) && matches[0].len() > token.len() {
         matches[0][token.len()..].to_string()
     } else {
         String::new()

@@ -43,7 +43,10 @@ async fn list_returns_seeded_accounts_then_empty_after_delete() {
 
     // Phase 1: empty service → empty list.
     let empty = vault.list(&svc).await.expect("list empty");
-    assert!(empty.is_empty(), "fresh service should have zero entries, got {empty:?}");
+    assert!(
+        empty.is_empty(),
+        "fresh service should have zero entries, got {empty:?}"
+    );
 
     // Phase 2: seed three accounts, then list returns all three.
     let accounts = ["one", "two", "three"];

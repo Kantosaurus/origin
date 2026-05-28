@@ -1,11 +1,15 @@
-use origin_browser::protocol::SnapshotResp;
 use origin_browser::detectors::{classify, Verdict};
+use origin_browser::protocol::SnapshotResp;
 
 fn resp(status: Option<u16>, html: &str, title: &str) -> SnapshotResp {
     SnapshotResp {
-        ok: true, r#ref: None, snapshot: None,
+        ok: true,
+        r#ref: None,
+        snapshot: None,
         html: Some(html.into()),
-        status, title: Some(title.into()), error: None,
+        status,
+        title: Some(title.into()),
+        error: None,
     }
 }
 

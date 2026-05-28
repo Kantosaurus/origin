@@ -111,12 +111,10 @@ async fn orphan_tool_use_delta_emits_warn_with_index() {
     assert_eq!(summary.assistant_text, "");
     assert_eq!(summary.turns, 1);
 
-    let captured = String::from_utf8(buf_handle.lock().expect("lock").clone())
-        .expect("utf8 logs");
+    let captured = String::from_utf8(buf_handle.lock().expect("lock").clone()).expect("utf8 logs");
     // The warn must (a) be at WARN level and (b) name the orphan index in
     // some form so operators can correlate. We accept either decimal or hex.
-    let mentions_index =
-        captured.contains(&orphan_index.to_string()) || captured.contains("deadbeef");
+    let mentions_index = captured.contains(&orphan_index.to_string()) || captured.contains("deadbeef");
     assert!(
         captured.contains("WARN"),
         "expected a WARN-level log entry; captured:\n{captured}"

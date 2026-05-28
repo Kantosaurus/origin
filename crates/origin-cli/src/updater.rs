@@ -466,17 +466,18 @@ async fn run_background_check_inner() -> Result<(), UpdateError> {
         .find(|a| a.name == sig_name)
         .ok_or_else(|| UpdateError::NoMatchingAsset(sig_name.clone()))?;
 
-    tracing::info!(
-        "updater: update available (current={current} latest={latest}); downloading {asset_name}"
-    );
+    tracing::info!("updater: update available (current={current} latest={latest}); downloading {asset_name}");
 
     // Stage into a temp dir adjacent to the exe so the final rename stays
     // on the same filesystem (rename across filesystems is not atomic on
     // Windows and can fail on Linux).
     let exe = current_exe()?;
-    let parent = exe
-        .parent()
-        .ok_or_else(|| UpdateError::Io(std::io::Error::new(std::io::ErrorKind::Other, "exe has no parent")))?;
+    let parent = exe.parent().ok_or_else(|| {
+        UpdateError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "exe has no parent",
+        ))
+    })?;
     let download_path = parent.join(format!("{asset_name}.download"));
     let sig_path = parent.join(sig_name);
 
@@ -579,9 +580,7 @@ async fn check_and_stage_inner() -> bool {
     };
 
     eprintln!("origin {current} → {latest}: downloading…");
-    tracing::info!(
-        "updater: update available (current={current} latest={latest}); downloading {asset_name}"
-    );
+    tracing::info!("updater: update available (current={current} latest={latest}); downloading {asset_name}");
 
     let exe = match current_exe() {
         Ok(p) => p,
@@ -631,10 +630,7 @@ async fn download_verify_stage(
         return skip_with_warn("stage rename", e);
     }
     eprintln!("Update staged; relaunching…");
-    tracing::info!(
-        "updater: staged {} for swap-in this invocation",
-        staged.display()
-    );
+    tracing::info!("updater: staged {} for swap-in this invocation", staged.display());
     true
 }
 
@@ -701,7 +697,10 @@ mod tests {
             other => panic!("unexpected test host OS: {other}"),
         };
         assert!(name.contains(needle), "asset {name} should contain {needle}");
-        assert!(name.starts_with("origin-"), "asset {name} should start with origin-");
+        assert!(
+            name.starts_with("origin-"),
+            "asset {name} should start with origin-"
+        );
     }
 
     #[tokio::test]
@@ -723,10 +722,7 @@ mod tests {
         assert_eq!(v, "0.1.0");
 
         // Stale TTL miss: passing 0 means "expire everything".
-        assert!(
-            cached_latest(0).is_none(),
-            "TTL of 0 should always miss"
-        );
+        assert!(cached_latest(0).is_none(), "TTL of 0 should always miss");
 
         std::env::remove_var("ORIGIN_HOME");
     }
@@ -781,13 +777,7 @@ mod tests {
         assert_eq!(old_path(p), std::path::PathBuf::from("/tmp/origin.old"));
 
         let pe = std::path::Path::new("C:/bin/origin.exe");
-        assert_eq!(
-            staged_path(pe),
-            std::path::PathBuf::from("C:/bin/origin.exe.new")
-        );
-        assert_eq!(
-            old_path(pe),
-            std::path::PathBuf::from("C:/bin/origin.exe.old")
-        );
+        assert_eq!(staged_path(pe), std::path::PathBuf::from("C:/bin/origin.exe.new"));
+        assert_eq!(old_path(pe), std::path::PathBuf::from("C:/bin/origin.exe.old"));
     }
 }
