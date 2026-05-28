@@ -1121,11 +1121,16 @@ async fn dispatch_tool(
 ) -> Result<String, LoopError> {
     match meta.name {
         "Read" => {
-            let path = args
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| LoopError::BadArgs("Read: missing `path`".into()))?;
-            origin_tools::builtins::read::read_tool(path).map_err(|e| LoopError::ToolFailure(e.to_string()))
+            let args = origin_tools::builtins::read::ReadArgs {
+                file_path: args.get("file_path").and_then(Value::as_str)
+                    .ok_or_else(|| LoopError::BadArgs("Read: missing `file_path`".into()))?
+                    .to_string(),
+                offset: args.get("offset").and_then(Value::as_u64).map(|n| n as u32),
+                limit:  args.get("limit").and_then(Value::as_u64).map(|n| n as u32),
+                as_:    args.get("as").and_then(Value::as_str).map(str::to_string),
+            };
+            origin_tools::builtins::read::read_v2(args)
+                .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "Glob" => {
             let pat = args
