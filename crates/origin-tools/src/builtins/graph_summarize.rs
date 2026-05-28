@@ -31,4 +31,7 @@ crate::origin_tool! {
             "node": {"type": "string", "description": "Lowercase hex entity id (64 chars)."}
         }
     }"#,
+    sandbox: ::origin_sandbox::SandboxProfile::Inherit,
+    token_budget: crate::DEFAULT_TOKEN_BUDGET,
+    hot: false,
 }

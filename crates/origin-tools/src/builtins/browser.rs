@@ -22,4 +22,7 @@ crate::origin_tool! {
     urgency: Urgency::Medium,
     side_effects: SideEffects::Mutating,
     input_schema: r#"{"type":"object","required":["v","session"],"properties":{"v":{"type":"string","enum":["open","click","fill","extract","snapshot","screenshot","close"]},"session":{"type":"string"},"url":{"type":"string"},"ref":{"type":"string"},"value":{"type":"string"},"path":{"type":"string"}}}"#,
+    sandbox: ::origin_sandbox::SandboxProfile::Inherit,
+    token_budget: crate::DEFAULT_TOKEN_BUDGET,
+    hot: false,
 }
