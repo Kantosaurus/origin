@@ -44,6 +44,7 @@ mod unix_only {
             cas_handle_root: [0u8; 32],
             pending_tool_calls: Vec::new(),
             plan_seq: 0,
+            goal: None,
         };
         token.save(tmp.path()).expect("save");
         let loaded: Vec<ResumeToken> = ResumeToken::load_all(tmp.path()).expect("load");

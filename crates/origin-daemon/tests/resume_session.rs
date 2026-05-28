@@ -56,6 +56,7 @@ fn session_store_round_trips_messages_and_resume_token() {
         cas_handle_root: [0u8; 32],
         pending_tool_calls: Vec::new(),
         plan_seq: 0,
+        goal: None,
     };
     store.save_resume_token(&token).expect("save token");
 
