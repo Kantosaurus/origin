@@ -22,6 +22,10 @@ pub struct ToolMeta {
     /// Approximate token budget for this tool's serialised result. The
     /// envelope's `ResultWriter` truncates / elides at this cap. Default 25k.
     pub token_budget: u32,
+    /// "Hot" tools have their full schema embedded in the system prompt.
+    /// "Deferred" tools advertise only {name, description}; their schemas
+    /// are fetched on demand via `ToolSearch`.
+    pub hot: bool,
 }
 
 inventory::collect!(ToolMeta);

@@ -145,4 +145,7 @@ crate::origin_tool! {
     urgency: crate::Urgency::Medium,
     side_effects: crate::SideEffects::Mutating,
     input_schema: r#"{"type":"object","required":["goal","allowed_tools"],"properties":{"goal":{"type":"string"},"allowed_tools":{"type":"array","items":{"type":"string"}},"budget":{"type":"object"}}}"#,
+    sandbox: ::origin_sandbox::SandboxProfile::Inherit,
+    token_budget: crate::DEFAULT_TOKEN_BUDGET,
+    hot: false,
 }

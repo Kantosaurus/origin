@@ -21,4 +21,7 @@ crate::origin_tool! {
     urgency: Urgency::Low,
     side_effects: SideEffects::Pure,
     input_schema: r#"{"type":"object","required":["url"],"properties":{"url":{"type":"string"}}}"#,
+    sandbox: ::origin_sandbox::SandboxProfile::Inherit,
+    token_budget: crate::DEFAULT_TOKEN_BUDGET,
+    hot: false,
 }

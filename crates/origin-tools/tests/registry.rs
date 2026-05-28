@@ -8,6 +8,9 @@ origin_tools::origin_tool! {
     urgency: Urgency::Low,
     side_effects: SideEffects::Pure,
     input_schema: r#"{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}"#,
+    sandbox: ::origin_sandbox::SandboxProfile::Inherit,
+    token_budget: origin_tools::DEFAULT_TOKEN_BUDGET,
+    hot: false,
 }
 
 #[test]
@@ -35,4 +38,20 @@ fn every_tool_has_nonzero_token_budget() {
     for meta in origin_tools::registry_iter() {
         assert!(meta.token_budget > 0, "tool {} has zero token_budget", meta.name);
     }
+}
+
+#[test]
+fn hot_set_contains_exactly_the_11() {
+    let hot: Vec<&str> = origin_tools::registry_iter()
+        .filter(|m| m.hot)
+        .map(|m| m.name)
+        .collect();
+    let mut expected = vec![
+        "Read", "Edit", "Write", "Grep", "Glob", "Bash",
+        "MultiEdit", "ApplyPatch", "Monitor", "Diagnostics", "ToolSearch",
+    ];
+    let mut got: Vec<&str> = hot.clone();
+    got.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(got, expected, "hot set drifted");
 }
