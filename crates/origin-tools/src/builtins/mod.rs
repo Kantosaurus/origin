@@ -18,3 +18,4 @@ pub mod web_fetch;
 pub mod web_search;
 pub mod write;
 pub mod multi_edit;
+pub mod apply_patch;
