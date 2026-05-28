@@ -1171,17 +1171,21 @@ async fn dispatch_tool(
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "Write" => {
-            let path = args
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| LoopError::BadArgs("Write: missing `path`".into()))?;
-            let content = args
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| LoopError::BadArgs("Write: missing `content`".into()))?;
-            origin_tools::builtins::write::write_tool(path, content)
+            let guard = origin_tools::builtins::write::WriteGuard::default();
+            // Production callers pass the session's guard via dispatch_with_envelope;
+            // this passthrough path is used only by tests that bypass the envelope.
+            let args = origin_tools::builtins::write::WriteArgs {
+                file_path: args.get("file_path").and_then(Value::as_str)
+                    .ok_or_else(|| LoopError::BadArgs("Write: missing `file_path`".into()))?
+                    .to_string(),
+                content: args.get("content").and_then(Value::as_str)
+                    .ok_or_else(|| LoopError::BadArgs("Write: missing `content`".into()))?
+                    .to_string(),
+                force: args.get("force").and_then(Value::as_bool).unwrap_or(false),
+            };
+            origin_tools::builtins::write::write_v2(args, &guard)
                 .map(|()| "write ok".to_string())
-                .map_err(LoopError::ToolFailure)
+                .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "Bash" => {
             let cmd = args

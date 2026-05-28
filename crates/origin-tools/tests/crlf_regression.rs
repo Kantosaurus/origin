@@ -70,3 +70,19 @@ fn write_preserves_eol_when_appending_via_edit() {
     // Inserted line inherits CRLF from preceding line.
     assert_eq!(fs::read(&p).unwrap(), b"a\r\nb\r\nINSERTED\r\n");
 }
+
+#[test]
+fn write_preserves_existing_file_crlf() {
+    use origin_tools::builtins::write::{write_v2, WriteArgs, WriteGuard};
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("crlf.txt");
+    fs::write(&p, b"a\r\nb\r\n").unwrap();
+    let guard = WriteGuard::default();
+    guard.note_read(p.to_string_lossy().as_ref());
+    write_v2(WriteArgs {
+        file_path: p.to_string_lossy().into_owned(),
+        content: "x\ny\nz\n".into(),
+        force: false,
+    }, &guard).unwrap();
+    assert_eq!(fs::read(&p).unwrap(), b"x\r\ny\r\nz\r\n");
+}
