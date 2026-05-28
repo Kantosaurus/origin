@@ -8,7 +8,9 @@ use origin_browser::web_fetch::{fetch, FetchOptions};
 /// # Errors
 /// Returns a `String` describing HTTP, size, or parse failure.
 pub async fn web_fetch(url: &str) -> Result<String, String> {
-    let r = fetch(url, FetchOptions::default()).await.map_err(|e| e.to_string())?;
+    let r = fetch(url, FetchOptions::default())
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(r.markdown)
 }
 

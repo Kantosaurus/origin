@@ -66,6 +66,34 @@ impl Provider for ErroringProvider {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn fallback_handles_multibyte_utf8_without_panic() {
+    // 60 copies of "🦀" (4 bytes each in UTF-8) = 240 bytes total. Byte
+    // index 120 falls in the *middle* of a 4-byte codepoint (120 % 4 == 0
+    // would be a boundary; but 120 = 30 * 4 = 120 — boundary). Use a
+    // mix to guarantee byte 120 lands mid-codepoint: prefix with one ASCII
+    // char so the offsets shift by 1, then 60 crabs.
+    let provider: Arc<dyn Provider> = Arc::new(ErroringProvider);
+    let cap = Arc::new(Capture::default());
+    let mut s = String::from("x");
+    for _ in 0..60 {
+        s.push('🦀');
+    }
+    // s.len() == 1 + 240 == 241. Byte 120: (120-1)/4 = 29.75 → mid-codepoint.
+    let transcript = vec![Message {
+        role: Role::Assistant,
+        blocks: vec![Block::Text {
+            text: s,
+            cache_marker: None,
+        }],
+    }];
+    summarize::run(&provider, "m", "s", 0, &transcript, cap.as_ref()).await;
+    let (_, _, summary) = cap.0.lock().await.clone().expect("delivered");
+    assert!(summary.ends_with("..."), "expected truncation, got {summary:?}");
+    // Byte length must respect a char boundary (no mid-codepoint slicing).
+    assert!(summary.is_char_boundary(summary.len()));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn provider_error_falls_back_to_synthesized_summary() {
     let provider: Arc<dyn Provider> = Arc::new(ErroringProvider);
     let cap = Arc::new(Capture::default());

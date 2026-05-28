@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 /// cheap (`Arc` clone).
 pub type SharedConnection = Arc<Mutex<Connection>>;
 
-use crate::frame::{encode, FrameKind, HEADER_LEN};
+use crate::frame::{encode, FrameKind, HEADER_LEN, MAX_FRAME_BYTES};
 
 #[allow(clippy::module_name_repetitions)]
 pub struct Listener {
@@ -152,6 +152,12 @@ pub async fn read_frame_from<R: AsyncRead + Unpin>(
         }
     };
     let len = u32::from_be_bytes([header[13], header[14], header[15], header[16]]) as usize;
+    if len > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame too large: {len} bytes (cap {MAX_FRAME_BYTES})"),
+        ));
+    }
     let mut body = vec![0_u8; len];
     reader.read_exact(&mut body).await?;
     Ok((kind, body))

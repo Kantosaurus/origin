@@ -63,10 +63,14 @@ struct FamilyHeader {
     family: &'static str,
 }
 
-/// Fast-encode index. Lookups are keyed by `(family, sorted-label-tuple)`.
+/// Fast-encode index. Lookups are keyed by `(family, sorted-label-pairs)`
+/// where each pair is `(label-name, label-value)`. Using the full pair
+/// (not just names or just values) is what makes the key truly canonical:
+/// it correctly dedups identical (family, labels) registrations while
+/// keeping registrations that differ in either name or value distinct.
 #[derive(Default)]
 struct FastIndex {
-    by_key: HashMap<(&'static str, Vec<&'static str>), usize>,
+    by_key: HashMap<(&'static str, Vec<(&'static str, &'static str)>), usize>,
     rows: Vec<FastRow>,
 }
 
@@ -178,11 +182,14 @@ impl Metrics {
         labels: &[(&'static str, &'static str)],
         counter: &IntCounter,
     ) {
-        // Sort label names alphabetically for a canonical lookup key.
+        // Sort label NAMES alphabetically and store the full (name, value)
+        // pairs as the canonical lookup key. This dedups identical
+        // registrations (same family, same labels) while keeping
+        // registrations that differ in any label value distinct.
         let mut sorted: Vec<(&'static str, &'static str)> = labels.to_vec();
         sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        let key_names: Vec<&'static str> = sorted.iter().map(|(_, v)| *v).collect();
-        let key = (family, key_names);
+        let key_pairs: Vec<(&'static str, &'static str)> = sorted.clone();
+        let key = (family, key_pairs);
 
         let mut fast = match self.fast.lock() {
             Ok(g) => g,

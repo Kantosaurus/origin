@@ -98,24 +98,39 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
         }
 
         for choice in chunk.choices {
-            // `index` on each tool_call lets future routing demux concurrent
-            // tool calls. The current ring payload format is unchanged; the
-            // index is preserved on the wire-level struct for downstream use.
+            // Each fragment must carry the `tc.index` from the wire so the
+            // daemon can demux interleaved parallel tool calls back to the
+            // right tool. The payload shapes match the Anthropic provider:
+            //   ToolUseStart: 4-byte LE index + id + b'\0' + name
+            //   ToolUseDelta: 4-byte LE index + partial JSON bytes
+            //
+            // `tc.index` is required by the OpenAI spec, but non-strict
+            // compat servers occasionally omit it; fall back to the position
+            // within this fragment so we still emit valid (if degenerate)
+            // demux bytes rather than silently corrupting downstream state.
             if let Some(tcs) = &choice.delta.tool_calls {
-                for tc in tcs {
+                for (pos, tc) in tcs.iter().enumerate() {
+                    let index = tc.index.unwrap_or_else(|| u32::try_from(pos).unwrap_or(0));
+                    let idx_bytes = index.to_le_bytes();
                     if let (Some(id), Some(func)) = (tc.id.as_ref(), tc.function.as_ref()) {
                         if let Some(name) = func.name.as_ref() {
-                            let payload = [id.as_bytes(), b"\0", name.as_bytes()].concat();
+                            let mut payload = Vec::with_capacity(
+                                4 + id.len() + 1 + name.len(),
+                            );
+                            payload.extend_from_slice(&idx_bytes);
+                            payload.extend_from_slice(id.as_bytes());
+                            payload.push(b'\0');
+                            payload.extend_from_slice(name.as_bytes());
                             ring.publish(&TokenEvent::new(TokenKind::ToolUseStart, payload))
                                 .map_err(|e| ProviderError::Api(e.to_string()))?;
                         }
                     }
                     if let Some(args) = tc.function.as_ref().and_then(|f| f.arguments.as_ref()) {
-                        ring.publish(&TokenEvent::new(
-                            TokenKind::ToolUseDelta,
-                            args.clone().into_bytes(),
-                        ))
-                        .map_err(|e| ProviderError::Api(e.to_string()))?;
+                        let mut payload = Vec::with_capacity(4 + args.len());
+                        payload.extend_from_slice(&idx_bytes);
+                        payload.extend_from_slice(args.as_bytes());
+                        ring.publish(&TokenEvent::new(TokenKind::ToolUseDelta, payload))
+                            .map_err(|e| ProviderError::Api(e.to_string()))?;
                     }
                 }
             }

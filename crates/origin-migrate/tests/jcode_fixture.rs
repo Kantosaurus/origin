@@ -33,3 +33,35 @@ fn jcode_scan_reads_one_session_two_messages() {
     assert_eq!(bundle.sessions[0].messages[0].role, "user");
     assert_eq!(bundle.sessions[0].messages[0].body, "hi");
 }
+
+#[test]
+fn jcode_scan_skips_session_with_negative_timestamp() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("sessions.sqlite");
+    let c = Connection::open(&db).expect("open");
+    c.execute_batch(
+        "
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, created_at INTEGER);
+        CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, body TEXT, ts INTEGER);
+        INSERT INTO sessions (id,title,created_at) VALUES ('bad','negative_ts',-1);
+        INSERT INTO sessions (id,title,created_at) VALUES ('good','normal',1700000000000);
+        INSERT INTO messages (session_id,role,body,ts) VALUES
+          ('good','user','hi',1700000000001);
+        ",
+    )
+    .expect("seed");
+
+    let src = JcodeSource;
+    let bundle = src.scan(dir.path()).expect("scan ok");
+
+    // The negative-ts session must NOT be silently mapped to Unix epoch.
+    // It should be skipped, leaving only the valid one.
+    assert_eq!(bundle.sessions.len(), 1, "expected only the valid session");
+    assert_eq!(bundle.sessions[0].source_id, "good");
+    // Defensive: no session should have created_at == 0 (which is what the
+    // pre-fix `u64::try_from(ts).unwrap_or(0)` would produce on negative ts).
+    assert!(
+        bundle.sessions.iter().all(|s| s.created_at_unix_ms != 0),
+        "no session should have epoch-zero created_at (silent negative-ts coercion)"
+    );
+}

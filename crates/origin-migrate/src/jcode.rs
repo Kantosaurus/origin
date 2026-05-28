@@ -46,10 +46,22 @@ impl Source for JcodeSource {
                 path: "sessions".into(),
                 reason: e.to_string(),
             })?;
+            let created_at_unix_ms = match u64::try_from(ts) {
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::warn!(
+                        source = "jcode",
+                        session_id = %id,
+                        ts,
+                        "skipping session with negative created_at timestamp"
+                    );
+                    continue;
+                }
+            };
             let mut s = ImportedSession {
                 source_id: id.clone(),
                 title,
-                created_at_unix_ms: u64::try_from(ts).unwrap_or(0),
+                created_at_unix_ms,
                 messages: vec![],
             };
             let mut mstmt = c

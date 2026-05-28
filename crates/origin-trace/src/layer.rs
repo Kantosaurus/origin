@@ -231,9 +231,59 @@ impl FieldCollector {
     }
 }
 
-// `tracing` stash strings need a `'static` lifetime. We intern at span open.
-// Strings are bounded by the number of distinct (kind, provider, tool, error)
-// quadruples in the process — for our daemon, dozens.
+// `tracing` stash strings need a `'static` lifetime. We intern at span open
+// through a deduplicating pool capped at [`MAX_INTERNED`]. The pre-cap design
+// `Box::leak`ed every distinct string unboundedly; long-running daemons
+// seeing many distinct tool/error names suffered slow memory growth.
+// Past the cap we return a sentinel rather than continuing to leak.
+const MAX_INTERNED: usize = 4096;
+
 fn leak_str(s: String) -> &'static str {
-    Box::leak(s.into_boxed_str())
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static POOL: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+    let pool = POOL.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match pool.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(&interned) = guard.get(&s) {
+        return interned;
+    }
+    if guard.len() >= MAX_INTERNED {
+        return "<interned-pool-full>";
+    }
+    let leaked: &'static str = Box::leak(s.clone().into_boxed_str());
+    guard.insert(s, leaked);
+    leaked
+}
+
+#[cfg(test)]
+pub(crate) const MAX_INTERNED_FOR_TEST: usize = MAX_INTERNED;
+
+#[cfg(test)]
+mod intern_tests {
+    use super::{leak_str, MAX_INTERNED_FOR_TEST};
+
+    #[test]
+    fn intern_caps_at_max_interned_and_returns_sentinel() {
+        // Insert MAX_INTERNED + extra distinct strings. The pool must not
+        // grow unboundedly; once at the cap, extra strings fall back to a
+        // sentinel value.
+        let mut last_unique: &'static str = "";
+        for i in 0..MAX_INTERNED_FOR_TEST + 200 {
+            last_unique = leak_str(format!("origin-trace-bug2-test-{i}"));
+        }
+        // The very last (over-cap) insert must hit the sentinel branch.
+        assert_eq!(
+            last_unique, "<interned-pool-full>",
+            "expected sentinel once pool is saturated"
+        );
+
+        // De-dup invariant: re-interning a known-present string returns the
+        // same pointer rather than leaking a new allocation.
+        let a = leak_str(String::from("origin-trace-bug2-test-0"));
+        let b = leak_str(String::from("origin-trace-bug2-test-0"));
+        assert!(std::ptr::eq(a, b), "intern must dedup repeated strings");
+    }
 }

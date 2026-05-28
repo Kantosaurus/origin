@@ -1,4 +1,4 @@
-use origin_tools::budget_writer::{ResultWriter, approx_tokens};
+use origin_tools::budget_writer::{approx_tokens, ResultWriter};
 use serde_json::json;
 
 #[test]

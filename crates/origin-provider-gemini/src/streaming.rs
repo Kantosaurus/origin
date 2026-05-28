@@ -73,6 +73,13 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
     let stream = sse::from_reqwest(resp);
     pin_utils::pin_mut!(stream);
 
+    // Per-turn counter for synthesised tool-use ids. Gemini's wire format
+    // does not carry an id for `functionCall` parts, so we mint one — but
+    // if the same `name` appears twice in a turn (legitimate for parallel
+    // calls), `call_<name>` alone collides. Suffixing with the call's
+    // position within the turn keeps every id unique.
+    let mut tool_call_idx: u32 = 0;
+
     while let Some(item) = stream.next().await {
         let ev = item?;
         let raw = ev.data;
@@ -100,7 +107,8 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
                 }
                 if let Some(fc) = part.function_call {
                     if let Some(name) = fc.name.as_ref() {
-                        let id = format!("call_{name}");
+                        let id = format!("call_{name}_{tool_call_idx}");
+                        tool_call_idx = tool_call_idx.saturating_add(1);
                         let payload = [id.as_bytes(), b"\0", name.as_bytes()].concat();
                         ring.publish(&TokenEvent::new(TokenKind::ToolUseStart, payload))
                             .map_err(|e| ProviderError::Api(e.to_string()))?;

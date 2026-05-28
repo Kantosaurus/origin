@@ -21,6 +21,7 @@ walkdir.workspace = true
 globset.workspace = true
 rusqlite = { version = "0.31", features = ["bundled"] }
 blake3 = "1"
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

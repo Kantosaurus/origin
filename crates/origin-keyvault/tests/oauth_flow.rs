@@ -96,6 +96,97 @@ async fn exchange_then_refresh_rotates_tokens() {
 }
 
 #[tokio::test]
+async fn concurrent_refresh_if_due_makes_only_one_http_call() {
+    // Bug 2 regression: two concurrent `refresh_if_due` callers raced into
+    // both performing the refresh + `persist()`, with the loser's write
+    // clobbering the winner's freshly rotated refresh token. The fix wraps
+    // refresh in a per-account `tokio::sync::Mutex` with double-checked
+    // locking, so only one HTTP round-trip is issued and the other caller
+    // observes the rotated token after the lock is released.
+    let server = MockServer::start().await;
+
+    // Initial auth-code exchange: 1 call, near-expiry token so the
+    // subsequent `refresh_if_due` callers both think a refresh is due.
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=authorization_code"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "access-1",
+            "refresh_token": "refresh-1",
+            // 30s expiry vs the 60s safety window below → refresh is due.
+            "expires_in": 30
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Refresh: must fire EXACTLY ONCE across both concurrent callers. The
+    // wiremock `expect(1)` invariant trips on server shutdown if a second
+    // request hits it (which is the pre-fix bug).
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains("refresh_token=refresh-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "access-2",
+            "refresh_token": "refresh-2",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let vault = KeyVault::in_memory();
+    let client = OAuthClient::new("github", format!("{}/token", server.uri()), "client-id");
+    client
+        .exchange(
+            &vault,
+            "default",
+            AuthCodeRequest::new("auth-code", "verifier", "https://example.invalid/callback"),
+        )
+        .await
+        .expect("exchange should succeed");
+
+    // Spawn two concurrent `refresh_if_due` calls; tokio's scheduler will
+    // park one of them on the per-account refresh mutex.
+    let c1 = client.clone();
+    let v1 = vault.clone();
+    let c2 = client.clone();
+    let v2 = vault.clone();
+    let (r1, r2) = tokio::join!(
+        tokio::spawn(async move {
+            c1.refresh_if_due(&v1, "default", Duration::from_secs(60))
+                .await
+        }),
+        tokio::spawn(async move {
+            c2.refresh_if_due(&v2, "default", Duration::from_secs(60))
+                .await
+        }),
+    );
+    let r1 = r1.expect("join r1").expect("refresh_if_due 1");
+    let r2 = r2.expect("join r2").expect("refresh_if_due 2");
+
+    // Exactly one caller must observe Rotated (the winner); the loser must
+    // see NotDue because the winner already rotated the token before the
+    // loser re-checked expiry inside the lock.
+    let rotated = [&r1, &r2]
+        .iter()
+        .filter(|o| matches!(o, RefreshOutcome::Rotated { .. }))
+        .count();
+    let not_due = [&r1, &r2]
+        .iter()
+        .filter(|o| matches!(o, RefreshOutcome::NotDue { .. }))
+        .count();
+    assert_eq!(rotated, 1, "exactly one refresh_if_due must perform the rotation");
+    assert_eq!(not_due, 1, "the losing refresh_if_due must observe NotDue");
+
+    // Vault must hold the rotated tokens (loser did NOT clobber the winner).
+    let (stored_access, stored_refresh) = read_stored(&vault, "github", "default").await;
+    assert_eq!(stored_access, "access-2");
+    assert_eq!(stored_refresh.as_deref(), Some("refresh-2"));
+}
+
+#[tokio::test]
 async fn refresh_if_due_skips_when_not_due() {
     let server = MockServer::start().await;
 

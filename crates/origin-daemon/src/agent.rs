@@ -1922,6 +1922,36 @@ fn decode_tool_use_start(payload: &[u8]) -> Option<(u32, &str, &str)> {
     Some((index, id, name))
 }
 
+/// Decode a `Usage` token payload (4× BE u32 = 16 bytes) into [`origin_provider::Usage`].
+/// Returns `None` on any size mismatch so the caller cleanly skips malformed
+/// payloads instead of panicking. Replaces a string of `try_into().expect("4 bytes")`
+/// calls whose safety was load-bearing on the outer `p.len() == 16` guard.
+fn decode_usage_payload(p: &[u8]) -> Option<origin_provider::Usage> {
+    // The single fallible step: assert the whole payload is exactly 16 bytes.
+    // After that, the four 4-byte sub-arrays come from `let-else` slice
+    // conversions that re-check locally — no `expect` and no panic risk if
+    // the outer length guard is ever refactored away.
+    let arr: &[u8; 16] = p.try_into().ok()?;
+    let Ok(a) = <[u8; 4]>::try_from(&arr[0..4]) else {
+        return None;
+    };
+    let Ok(b) = <[u8; 4]>::try_from(&arr[4..8]) else {
+        return None;
+    };
+    let Ok(c) = <[u8; 4]>::try_from(&arr[8..12]) else {
+        return None;
+    };
+    let Ok(d) = <[u8; 4]>::try_from(&arr[12..16]) else {
+        return None;
+    };
+    Some(origin_provider::Usage {
+        input_tokens: u32::from_be_bytes(a),
+        output_tokens: u32::from_be_bytes(b),
+        cache_read_input_tokens: u32::from_be_bytes(c),
+        cache_creation_input_tokens: u32::from_be_bytes(d),
+    })
+}
+
 /// Try to speculatively spawn a pure tool when the first `Field` event fires.
 /// Called at most once per `tool_use_id`. Returns `true` if a task was spawned.
 fn try_speculative_spawn(
@@ -2002,16 +2032,33 @@ async fn drain_subscriber_into_response(
             }
             origin_stream::TokenKind::ToolUseDelta => {
                 let payload = ev.payload();
-                if payload.len() < 4 {
+                // Decode the 4-byte LE index locally without `expect` so any
+                // future refactor that weakens an outer length guard cannot
+                // turn this into a daemon-wide panic. A payload shorter than
+                // 4 bytes is silently skipped (same behaviour as before).
+                let Some(idx_slice) = payload.get(..4) else {
                     continue;
-                }
-                let index = u32::from_le_bytes(payload[..4].try_into().expect("4 bytes"));
+                };
+                let Ok(idx_bytes) = <[u8; 4]>::try_from(idx_slice) else {
+                    continue;
+                };
+                let index = u32::from_le_bytes(idx_bytes);
                 let json_bytes = &payload[4..];
                 if let Some(id) = index_to_id.get(&index) {
-                    if let Some(buf) = tool_input_bufs.get_mut(id) {
-                        buf.extend_from_slice(json_bytes);
-                    }
                     let id_owned = id.clone();
+                    if let Some(buf) = tool_input_bufs.get_mut(&id_owned) {
+                        buf.extend_from_slice(json_bytes);
+                    } else {
+                        // Invariant violation: `index_to_id` resolved but the
+                        // per-id input buffer is missing. Should never happen
+                        // unless `ToolUseStart` and these maps drift apart.
+                        tracing::warn!(
+                            index,
+                            tool_use_id = %id_owned,
+                            bytes = json_bytes.len(),
+                            "ToolUseDelta: tool_input_bufs missing entry for known id; dropping bytes"
+                        );
+                    }
                     if let Some(parser) = parsers.get_mut(&id_owned) {
                         let events = parser.feed(json_bytes);
                         if !speculative_spawned.contains(&id_owned)
@@ -2026,20 +2073,29 @@ async fn drain_subscriber_into_response(
                         {
                             speculative_spawned.insert(id_owned);
                         }
+                    } else {
+                        // Same invariant: parsers map should mirror index_to_id.
+                        tracing::warn!(
+                            index,
+                            tool_use_id = %id_owned,
+                            "ToolUseDelta: parsers missing entry for known id; speculative dispatch skipped"
+                        );
                     }
+                } else {
+                    // Orphan delta: index was never opened (likely because a
+                    // prior `ToolUseStart` payload was malformed and warned
+                    // out at the decode site above). Log it so the dropped
+                    // tool input is at least observable.
+                    tracing::warn!(
+                        index,
+                        bytes = json_bytes.len(),
+                        "ToolUseDelta for unknown index; dropping bytes (no matching ToolUseStart)"
+                    );
                 }
             }
             origin_stream::TokenKind::Usage => {
-                let p = ev.payload();
-                if p.len() == 16 {
-                    usage = origin_provider::Usage {
-                        input_tokens: u32::from_be_bytes(p[0..4].try_into().expect("4 bytes")),
-                        output_tokens: u32::from_be_bytes(p[4..8].try_into().expect("4 bytes")),
-                        cache_read_input_tokens: u32::from_be_bytes(p[8..12].try_into().expect("4 bytes")),
-                        cache_creation_input_tokens: u32::from_be_bytes(
-                            p[12..16].try_into().expect("4 bytes"),
-                        ),
-                    };
+                if let Some(parsed) = decode_usage_payload(ev.payload()) {
+                    usage = parsed;
                 }
             }
             origin_stream::TokenKind::TurnEnd => break,
@@ -2464,5 +2520,40 @@ mod dispatch_table_tests {
         assert!(v.get("summary").is_some(), "TaskOutput must have `summary`");
         assert!(v.get("files_touched").is_some(), "TaskOutput must have `files_touched`");
         assert!(v.get("follow_ups").is_some(), "TaskOutput must have `follow_ups`");
+    }
+
+    /// Defensive guard against the previous `try_into().expect("4 bytes")`
+    /// pattern in the `Usage` decode path. After the refactor to
+    /// [`decode_usage_payload`], a payload shorter than 16 bytes (or longer)
+    /// must return `None` rather than panicking — matching the pre-fix
+    /// outer `if p.len() == 16` skip semantics.
+    #[test]
+    fn decode_usage_payload_returns_none_on_size_mismatch() {
+        // Too short: pre-fix `if p.len() == 16` would have skipped this; the
+        // helper must also return None (no panic from the inner `expect`).
+        assert!(decode_usage_payload(&[]).is_none());
+        assert!(decode_usage_payload(&[0; 3]).is_none());
+        assert!(decode_usage_payload(&[0; 15]).is_none());
+        // Too long: previously fell through the `==` guard silently; the
+        // helper must also return None for consistency.
+        assert!(decode_usage_payload(&[0; 17]).is_none());
+        assert!(decode_usage_payload(&[0; 32]).is_none());
+    }
+
+    /// Round-trip a 16-byte BE-encoded payload through [`decode_usage_payload`]
+    /// to lock down the byte layout: 4× u32 BE in field order
+    /// (input, output, cache_read, cache_creation).
+    #[test]
+    fn decode_usage_payload_parses_canonical_16_byte_layout() {
+        let mut p = [0u8; 16];
+        p[0..4].copy_from_slice(&1_111_u32.to_be_bytes());
+        p[4..8].copy_from_slice(&2_222_u32.to_be_bytes());
+        p[8..12].copy_from_slice(&3_333_u32.to_be_bytes());
+        p[12..16].copy_from_slice(&4_444_u32.to_be_bytes());
+        let usage = decode_usage_payload(&p).expect("valid 16-byte payload");
+        assert_eq!(usage.input_tokens, 1_111);
+        assert_eq!(usage.output_tokens, 2_222);
+        assert_eq!(usage.cache_read_input_tokens, 3_333);
+        assert_eq!(usage.cache_creation_input_tokens, 4_444);
     }
 }

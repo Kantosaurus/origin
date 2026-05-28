@@ -43,6 +43,34 @@ fn snapshot_returns_every_registered_metric() {
 }
 
 #[test]
+fn fast_index_keeps_distinct_rows_for_distinct_label_values() {
+    // Bug-1 regression: two registrations of the same counter family with
+    // identical label *names* but different label *values* must produce
+    // two distinct rows in the fast index — they encode as two distinct
+    // Prometheus series. A faulty canonical key that uses only label
+    // *names* (and not values) would lump them into a single row.
+    let m = Metrics::new();
+    m.tokens_in_total("anthropic", "model-a").inc_by(5);
+    m.tokens_in_total("anthropic", "model-b").inc_by(7);
+    let text = m.encode_text().expect("encode");
+    assert!(
+        text.contains("origin_tokens_in_total{model=\"model-a\",provider=\"anthropic\"} 5"),
+        "missing model-a row: {text}"
+    );
+    assert!(
+        text.contains("origin_tokens_in_total{model=\"model-b\",provider=\"anthropic\"} 7"),
+        "missing model-b row: {text}"
+    );
+    // Snapshot must also reflect both distinct series.
+    let snap = m.snapshot();
+    let in_rows: Vec<&_> = snap
+        .iter()
+        .filter(|r| r.name == "origin_tokens_in_total")
+        .collect();
+    assert_eq!(in_rows.len(), 2, "expected two distinct rows, got {in_rows:?}");
+}
+
+#[test]
 fn cardinality_is_bounded() {
     // Unknown tool names collapse into `_other_` via the label allowlist.
     let m = Metrics::new();

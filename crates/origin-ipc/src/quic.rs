@@ -19,7 +19,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ClientConfig as RustlsClientConfig, RootCertStore, ServerConfig as RustlsServerConfig};
 use thiserror::Error;
 
-use crate::frame::{FrameKind, HEADER_LEN};
+use crate::frame::{FrameKind, HEADER_LEN, MAX_FRAME_BYTES};
 use crate::tls::CertBundle;
 
 #[allow(clippy::module_name_repetitions)]
@@ -251,6 +251,11 @@ fn decode_header(header: &[u8; HEADER_LEN]) -> Result<(FrameKind, usize), QuicEr
         x => return Err(QuicError::Frame(format!("unknown frame kind: {x}"))),
     };
     let len = u32::from_be_bytes([header[13], header[14], header[15], header[16]]) as usize;
+    if len > MAX_FRAME_BYTES {
+        return Err(QuicError::Frame(format!(
+            "frame too large: {len} bytes (cap {MAX_FRAME_BYTES})"
+        )));
+    }
     Ok((kind, len))
 }
 
