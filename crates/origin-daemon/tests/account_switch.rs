@@ -67,6 +67,7 @@ fn client_message_prompt_round_trips() {
         system: "sys".into(),
         model: "claude-opus-4-7".into(),
         user_text: "hello".into(),
+        session_id: None,
     });
     let json = serde_json::to_string(&msg).expect("serialize prompt");
     // Internally-tagged: `kind` discriminator sits next to the flattened fields.
