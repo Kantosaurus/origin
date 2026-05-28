@@ -45,7 +45,16 @@ fn fallback(transcript: &[Message]) -> String {
             if trimmed.len() <= 120 {
                 trimmed.to_string()
             } else {
-                format!("{}...", &trimmed[..120])
+                // 120 is a byte budget; walk char_indices to find the largest
+                // byte index <= 120 so we never slice mid-codepoint.
+                let mut end = 0;
+                for (i, _) in trimmed.char_indices() {
+                    if i > 120 {
+                        break;
+                    }
+                    end = i;
+                }
+                format!("{}...", &trimmed[..end])
             }
         },
     )

@@ -613,3 +613,48 @@ fn map_ref_err_to_sql(e: origin_cas::RefError) -> rusqlite::Error {
         ),
     }
 }
+
+#[cfg(test)]
+mod tag_resolution_contract {
+    //! Compile-time + runtime contract checks for [`resolve_tags`].
+    //!
+    //! Bug 1 (origin-mem): the original signature took `&Connection`, so the
+    //! "must be called inside an active transaction" rule from the docstring
+    //! was unenforceable. We tightened the signature to
+    //! `&rusqlite::Transaction<'_>`. The first test below pins that contract
+    //! at compile time via a function-pointer coercion — if anyone widens the
+    //! signature back to `&Connection`, the coercion fails to type-check.
+    //!
+    //! The second test exercises a real flow: two distinct tag names resolve
+    //! to distinct, well-defined `bit_idx` slots inside a single transaction.
+    use super::resolve_tags;
+
+    /// Compile-time contract: `resolve_tags` accepts `&Transaction`, NOT
+    /// `&Connection`. Coercing the function item to the strongly-typed fn
+    /// pointer is the actual assertion — this test would fail to *compile*
+    /// against the pre-fix `&Connection` signature.
+    #[test]
+    fn signature_requires_transaction_at_compile_time() {
+        let _coerced: for<'a, 'b, 'c> fn(
+            &'a rusqlite::Transaction<'b>,
+            &'c [&'c str],
+        ) -> rusqlite::Result<Vec<u8>> = resolve_tags;
+    }
+
+    /// Runtime sanity: inside an active transaction, two tags get bits 0+1
+    /// (LSB-first into a 16-byte BLOB → byte 0 == 0b0000_0011).
+    #[test]
+    fn resolves_two_tags_to_low_bits_inside_tx() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open mem db");
+        conn.execute(
+            "CREATE TABLE mem_tags (bit_idx INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
+            [],
+        )
+        .expect("create mem_tags");
+        let tx = conn.transaction().expect("begin tx");
+        let bitset = resolve_tags(&tx, &["alpha", "beta"]).expect("resolve");
+        tx.commit().expect("commit");
+        assert_eq!(bitset.len(), 16);
+        assert_eq!(bitset[0], 0b0000_0011);
+    }
+}

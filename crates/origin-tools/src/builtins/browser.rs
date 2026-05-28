@@ -1,7 +1,7 @@
 //! `Browser` tool — dual-backend browser with transparent agent-detection fallback.
 
 use crate::{SideEffects, Tier, Urgency};
-use origin_browser::{BrowserRouter, Verb, SnapshotResp};
+use origin_browser::{BrowserRouter, SnapshotResp, Verb};
 
 /// Run a single verb against the router.
 ///

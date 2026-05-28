@@ -32,9 +32,9 @@ use std::path::Path;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_FUNCTION, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, GetFileSizeEx, SetEndOfFile, SetFilePointerEx, CREATE_ALWAYS,
+    CreateFileW, GetFileSizeEx, MoveFileExW, SetEndOfFile, SetFilePointerEx, CREATE_ALWAYS,
     FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_WRITE,
-    FILE_SHARE_READ, OPEN_EXISTING,
+    FILE_SHARE_READ, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
 };
 use windows::Win32::System::Ioctl::{DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE};
 use windows::Win32::System::IO::DeviceIoControl;
@@ -106,14 +106,26 @@ fn clone_one_file(src: &Path, dst: &Path) -> Result<(), Error> {
     unsafe { GetFileSizeEx(src_handle, &mut src_size) }
         .map_err(|e| unsupported(format!("GetFileSizeEx({}): {e}", src.display())))?;
 
-    // Open destination: writable, create-always so we own a fresh file.
-    let dst_handle = open_write_create(dst)?;
+    // Reflink and trim run against a sibling temp file; we only expose
+    // the final `dst` name via an atomic `MoveFileExW(..,
+    // MOVEFILE_REPLACE_EXISTING)` once the trim has succeeded. This
+    // closes the crash window in which the destination at `dst` was
+    // cluster-aligned-sized with a zero-padded garbage tail because the
+    // FSCTL had completed but the subsequent `SetEndOfFile` trim had
+    // not yet been issued.
+    let tmp = temp_sibling(dst);
+
+    // Open the temp destination: writable, create-always so we own a
+    // fresh file even if a previous run left an orphan temp behind.
+    let dst_handle = open_write_create(&tmp)?;
     let _dst_guard = HandleGuard(dst_handle);
 
     if src_size == 0 {
-        // Empty file: nothing to duplicate. The CreateFileW above already
-        // produced a zero-length file at `dst`; we're done.
-        return Ok(());
+        // Empty file: nothing to duplicate. The CreateFileW above
+        // already produced a zero-length temp; drop the handle so the
+        // rename can take it, then move into place.
+        drop(_dst_guard);
+        return rename_replacing(&tmp, dst);
     }
 
     // Pre-extend the destination to the cluster-aligned size required
@@ -121,8 +133,10 @@ fn clone_one_file(src: &Path, dst: &Path) -> Result<(), Error> {
     // fail with ERROR_INVALID_PARAMETER on `ReFS` because the target
     // range falls past EOF.
     let aligned_size = align_up(src_size, REFS_CLUSTER);
-    set_file_size(dst_handle, aligned_size)
-        .map_err(|e| unsupported(format!("SetEndOfFile({}): {e}", dst.display())))?;
+    if let Err(e) = set_file_size(dst_handle, aligned_size) {
+        let _ = fs::remove_file(&tmp);
+        return Err(unsupported(format!("SetEndOfFile({}): {e}", tmp.display())));
+    }
 
     // Issue the FSCTL. Single call covers the whole file — the kernel
     // splits internally as needed; per-call upper bound on `ReFS` is
@@ -160,6 +174,10 @@ fn clone_one_file(src: &Path, dst: &Path) -> Result<(), Error> {
         // Any other failure also falls back — we never want to leave a
         // half-written destination claiming success.
         let win32 = hresult_to_win32(hr);
+        // Drop the handle and remove the temp before reporting Unsupported
+        // so we never leave an oversized orphan at the final path's sibling.
+        drop(_dst_guard);
+        let _ = fs::remove_file(&tmp);
         if win32 == Some(ERROR_INVALID_FUNCTION.0) {
             return Err(Error::Unsupported(format!(
                 "FSCTL_DUPLICATE_EXTENTS_TO_FILE not supported on dst volume ({}); \
@@ -174,22 +192,83 @@ fn clone_one_file(src: &Path, dst: &Path) -> Result<(), Error> {
         )));
     }
 
-    // Trim the destination back down to the exact source size; the
-    // aligned tail past EOF is otherwise observable as a zero-padded
-    // suffix. SetFilePointerEx + SetEndOfFile is the canonical idiom.
+    // Trim the temp back down to the exact source size; the aligned
+    // tail past EOF is otherwise observable as a zero-padded suffix.
+    // SetFilePointerEx + SetEndOfFile is the canonical idiom. We do
+    // this *before* the rename: if a crash interrupts us here, the
+    // tail-padded file lives only at the temp name and is invisible to
+    // callers — the worst case is an orphan temp the next walker will
+    // overwrite with CREATE_ALWAYS.
     if aligned_size != src_size {
         if let Err(e) = seek_set(dst_handle, src_size) {
+            drop(_dst_guard);
+            let _ = fs::remove_file(&tmp);
             return Err(unsupported(format!(
                 "SetFilePointerEx({}, {src_size}): {e}",
-                dst.display()
+                tmp.display()
             )));
         }
         if let Err(e) = set_eof(dst_handle) {
+            drop(_dst_guard);
+            let _ = fs::remove_file(&tmp);
             return Err(unsupported(format!(
                 "SetEndOfFile-trim({}): {e}",
-                dst.display()
+                tmp.display()
             )));
         }
+    }
+
+    // Close the handle on the temp before renaming. MoveFileExW with
+    // MOVEFILE_REPLACE_EXISTING needs no other handle holding write
+    // access to the source name; closing here also flushes any pending
+    // metadata on this handle.
+    drop(_dst_guard);
+    rename_replacing(&tmp, dst)
+}
+
+/// Build a sibling temp path next to `dst`. We keep the temp in the
+/// same directory so `MoveFileExW` stays within a single volume (which
+/// is required for a rename instead of a copy+delete).
+fn temp_sibling(dst: &Path) -> std::path::PathBuf {
+    let parent = dst.parent().unwrap_or(Path::new("."));
+    // Two nanos-precision tokens collide only on the same nanosecond
+    // *and* same destination — vanishingly unlikely, and the temp is
+    // opened with CREATE_ALWAYS which would overwrite anyway.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let file_name = dst
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("reflink"));
+    parent.join(format!(".{file_name}.reflink-tmp-{nanos}"))
+}
+
+/// Atomic rename `from` → `to`, replacing any existing `to`. Uses
+/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` so
+/// the directory entry update is itself durable.
+fn rename_replacing(from: &Path, to: &Path) -> Result<(), Error> {
+    let from_w = to_wide(from);
+    let to_w = to_wide(to);
+    // SAFETY: both `from_w` and `to_w` are NUL-terminated UTF-16 buffers
+    // that outlive this call; `MoveFileExW` does not retain the pointers.
+    let r = unsafe {
+        MoveFileExW(
+            PCWSTR(from_w.as_ptr()),
+            PCWSTR(to_w.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if let Err(e) = r {
+        // The temp still exists at `from`; remove it so we don't leak
+        // an oversized orphan.
+        let _ = fs::remove_file(from);
+        return Err(unsupported(format!(
+            "MoveFileExW({} → {}): {e}",
+            from.display(),
+            to.display()
+        )));
     }
     Ok(())
 }

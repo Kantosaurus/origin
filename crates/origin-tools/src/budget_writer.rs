@@ -97,8 +97,7 @@ impl ResultWriter {
                 self.body.push('\n');
             }
             self.body.push_str(
-                &serde_json::to_string(&sentinel)
-                    .expect("sentinel is a well-formed serde_json::Value"),
+                &serde_json::to_string(&sentinel).expect("sentinel is a well-formed serde_json::Value"),
             );
         }
         self.body

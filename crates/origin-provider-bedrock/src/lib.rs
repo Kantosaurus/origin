@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 const ANTHROPIC_VERSION: &str = "bedrock-2023-05-31";
-const DEFAULT_MAX_TOKENS: u32 = 4096;
+const DEFAULT_MAX_TOKENS: u32 = 16_384;
 
 /// AWS Bedrock provider backed by `POST /model/{model_id}/invoke`.
 pub struct Bedrock {

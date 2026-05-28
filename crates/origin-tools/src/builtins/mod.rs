@@ -1,5 +1,6 @@
 pub mod ask;
 pub mod bash;
+pub mod browser;
 pub mod edit;
 pub mod glob_tool;
 pub mod graph_explain;
@@ -12,7 +13,6 @@ pub mod mem;
 pub mod read;
 pub mod recall;
 pub mod task;
-pub mod browser;
 pub mod web_fetch;
 pub mod web_search;
 pub mod write;
