@@ -1974,6 +1974,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs4"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c29c30684418547d476f0b48e84f4821639119c483b1eccd566c8cd0cd05f521"
+dependencies = [
+ "rustix 0.38.44",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2135,12 +2145,6 @@ dependencies = [
  "wasip2",
  "wasm-bindgen",
 ]
-
-[[package]]
-name = "glob"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "globset"
@@ -4454,8 +4458,12 @@ dependencies = [
 name = "origin-resume-token"
 version = "0.0.1"
 dependencies = [
+ "blake3",
+ "getrandom 0.2.17",
+ "hex",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "thiserror 1.0.69",
 ]
@@ -4593,7 +4601,8 @@ dependencies = [
  "async-trait",
  "blake3",
  "encoding_rs",
- "glob",
+ "fs4",
+ "globset",
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
