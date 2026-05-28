@@ -28,6 +28,8 @@ pub enum FlagParseError {
     EmptyCondition,
     #[error("goal condition exceeds 4000 characters")]
     ConditionTooLong,
+    #[error("duplicate flag: --{0}")]
+    DuplicateFlag(String),
 }
 
 /// Parse the args portion of `/goal <args>`. The leading `/goal` token must
@@ -58,16 +60,36 @@ pub fn parse_goal_args(raw: &str) -> Result<GoalArgs, FlagParseError> {
             .ok_or_else(|| FlagParseError::MissingValue(inner.to_string()))?;
         match key {
             "max-iter" => {
-                max_iter = Some(value.parse::<u32>().map_err(|_| FlagParseError::InvalidValue {
+                if max_iter.is_some() {
+                    return Err(FlagParseError::DuplicateFlag(key.to_string()));
+                }
+                let parsed: u32 = value.parse().map_err(|_| FlagParseError::InvalidValue {
                     flag: key.to_string(),
                     value: value.to_string(),
-                })?);
+                })?;
+                if parsed == 0 {
+                    return Err(FlagParseError::InvalidValue {
+                        flag: key.to_string(),
+                        value: value.to_string(),
+                    });
+                }
+                max_iter = Some(parsed);
             }
             "budget" => {
-                token_budget = Some(parse_budget(value).ok_or_else(|| FlagParseError::InvalidValue {
+                if token_budget.is_some() {
+                    return Err(FlagParseError::DuplicateFlag(key.to_string()));
+                }
+                let parsed = parse_budget(value).ok_or_else(|| FlagParseError::InvalidValue {
                     flag: key.to_string(),
                     value: value.to_string(),
-                })?);
+                })?;
+                if parsed == 0 {
+                    return Err(FlagParseError::InvalidValue {
+                        flag: key.to_string(),
+                        value: value.to_string(),
+                    });
+                }
+                token_budget = Some(parsed);
             }
             other => return Err(FlagParseError::UnknownFlag(other.to_string())),
         }
@@ -85,10 +107,16 @@ pub fn parse_goal_args(raw: &str) -> Result<GoalArgs, FlagParseError> {
 }
 
 fn parse_budget(s: &str) -> Option<u64> {
-    let (num_part, mult) = match s.as_bytes().last()? {
-        b'k' | b'K' => (&s[..s.len() - 1], 1_000u64),
-        b'm' | b'M' => (&s[..s.len() - 1], 1_000_000u64),
-        _ => (s, 1u64),
+    // Split on the trailing *char* (not byte) so we never slice mid-codepoint.
+    // In valid UTF-8 the original byte-level check happened to be safe
+    // (continuation bytes are 0x80..=0xBF, never collide with ASCII k/K/m/M)
+    // but the char-level form is obviously correct and surfaces non-ASCII
+    // suffixes as a clean None → InvalidValue at the caller.
+    let last_char = s.chars().last()?;
+    let (num_part, mult): (&str, u64) = match last_char {
+        'k' | 'K' => (&s[..s.len() - last_char.len_utf8()], 1_000),
+        'm' | 'M' => (&s[..s.len() - last_char.len_utf8()], 1_000_000),
+        _ => (s, 1),
     };
     let n: u64 = num_part.parse().ok()?;
     n.checked_mul(mult)

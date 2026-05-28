@@ -80,3 +80,50 @@ fn condition_exceeding_4000_chars_rejected() {
     let err = parse_goal_args(&big).unwrap_err();
     matches!(err, FlagParseError::ConditionTooLong);
 }
+
+// Bug #1: parse_budget must not panic on values whose last UTF-8 byte happens
+// to coincide with an ASCII suffix marker (k/K/m/M). In practice, valid UTF-8
+// continuation bytes are 0x80..=0xBF, so a multi-byte char can never *end* in
+// 0x6B/0x4B/0x6D/0x4D — the panic is unreachable for valid UTF-8 input. But
+// the code was fragile-looking (byte-level slicing keyed on byte equality);
+// after refactoring to `chars().last()`, a non-ASCII suffix must surface as a
+// clean InvalidValue, never a panic.
+#[test]
+fn budget_with_multibyte_suffix_returns_error_not_panic() {
+    // 'ä' is U+00E4 = 0xC3 0xA4. The last byte (0xA4) is a continuation byte,
+    // never matches an ASCII suffix marker.
+    let err = parse_goal_args("--budget=10ä do thing").unwrap_err();
+    assert!(matches!(err, FlagParseError::InvalidValue { .. }));
+}
+
+// Bug #13: --max-iter=0 must be rejected at parse time. A goal with 0 max-iter
+// hits cap_check immediately and drops the user prompt.
+#[test]
+fn max_iter_zero_rejected() {
+    let err = parse_goal_args("--max-iter=0 do thing").unwrap_err();
+    assert!(matches!(err, FlagParseError::InvalidValue { .. }));
+}
+
+// Bug #13: --budget=0 must be rejected at parse time. Same reasoning — a
+// 0-budget goal triggers BudgetExhausted on first iteration.
+#[test]
+fn budget_zero_rejected() {
+    let err = parse_goal_args("--budget=0 do thing").unwrap_err();
+    assert!(matches!(err, FlagParseError::InvalidValue { .. }));
+    let err2 = parse_goal_args("--budget=0k do thing").unwrap_err();
+    assert!(matches!(err2, FlagParseError::InvalidValue { .. }));
+}
+
+// Bug #19: a duplicate flag (e.g. --budget=1k --budget=2k) must be rejected
+// rather than silently last-wins.
+#[test]
+fn duplicate_budget_flag_rejected() {
+    let err = parse_goal_args("--budget=1k --budget=2k cond").unwrap_err();
+    assert!(matches!(err, FlagParseError::DuplicateFlag(_)));
+}
+
+#[test]
+fn duplicate_max_iter_flag_rejected() {
+    let err = parse_goal_args("--max-iter=3 --max-iter=5 cond").unwrap_err();
+    assert!(matches!(err, FlagParseError::DuplicateFlag(_)));
+}
