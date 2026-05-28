@@ -97,6 +97,7 @@ async fn accept_persists_via_proposal_registry() {
         memory_handle: None,
         coordinator: None,
         plan: None,
+        goal: Arc::new(tokio::sync::Mutex::new(None)),
     };
     let _summary = run_loop(
         &mut session,

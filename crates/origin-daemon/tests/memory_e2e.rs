@@ -105,6 +105,7 @@ async fn memory_e2e_proposer_to_store_via_wiremock() {
         memory_handle: None,
         coordinator: None,
         plan: None,
+        goal: Arc::new(tokio::sync::Mutex::new(None)),
     };
     let _summary = run_loop(
         &mut session,

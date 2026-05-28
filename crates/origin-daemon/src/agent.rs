@@ -131,6 +131,16 @@ pub struct LoopOptions {
     /// encoder falls through to the `Volatile` floor — exactly the
     /// behavior before Phase 11 N4.3 landed.
     pub plan: Option<origin_planner::Plan>,
+    /// Per-connection `/goal` slot. The driver in `main.rs` mutates this
+    /// under the lock; `run_loop` reads it while assembling the system
+    /// prompt and renders an `<origin-goal>` block whenever the goal's
+    /// status is `Active` or `Verifying`.
+    ///
+    /// Shape is `Arc<Mutex<Option<_>>>` (not `Option<Arc<Mutex<_>>>`) so the
+    /// driver can install or remove the goal without rebuilding the
+    /// per-request `LoopOptions`. Defaults to an empty slot (no active
+    /// goal); set via [`LoopOptions::with_goal`].
+    pub goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
 }
 
 impl Default for LoopOptions {
@@ -154,6 +164,7 @@ impl Default for LoopOptions {
             memory_handle: None,
             coordinator: None,
             plan: None,
+            goal: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
@@ -204,6 +215,19 @@ impl LoopOptions {
         self.skills = Some(skills);
         self
     }
+
+    /// Attach a per-connection goal slot. The slot is shared with the
+    /// driver in `main.rs`; mutations made by the driver between
+    /// `run_loop` calls are visible on the next call's
+    /// `<origin-goal>` block render.
+    #[must_use]
+    pub fn with_goal(
+        mut self,
+        goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
+    ) -> Self {
+        self.goal = goal;
+        self
+    }
 }
 
 /// Deliverer that writes a summary to the `SQLite` `messages.summary` column via
@@ -251,6 +275,15 @@ impl ExtractDeliverer for NoopExtractDeliverer {
 pub struct LoopSummary {
     pub assistant_text: String,
     pub turns: u32,
+    /// Total input tokens consumed across every provider call inside this
+    /// `run_loop` invocation. Surfaced so the goal driver can charge
+    /// cumulative spend against the per-goal token budget without
+    /// re-instrumenting the provider trait.
+    pub input_tokens: u64,
+    /// Total output tokens consumed across every provider call inside this
+    /// `run_loop` invocation. Paired with `input_tokens` for the same reason —
+    /// the goal driver's budget cap counts both directions.
+    pub output_tokens: u64,
 }
 
 #[derive(Debug, Error)]
@@ -510,13 +543,54 @@ pub async fn run_loop(
     } else {
         format!("<origin-recall>\n{recall_block}\n</origin-recall>")
     };
+    // Render the `<origin-goal>` block only when a goal is active or
+    // currently being verified. The block changes every iteration (iter
+    // counter + token spend), so it MUST come last — Anthropic's prompt
+    // cache breakpoints sit on the static blocks above; placing the goal
+    // block here means only the trailing ~80-token block re-tokenizes
+    // per iteration instead of the whole system prompt.
+    let goal_block = {
+        let guard = opts.goal.lock().await;
+        guard
+            .as_ref()
+            .filter(|g| {
+                matches!(
+                    g.status,
+                    origin_goal::GoalStatus::Active | origin_goal::GoalStatus::Verifying
+                )
+            })
+            .map(|g| {
+                format!(
+                    "<origin-goal>\nACTIVE GOAL — iteration {iter}/{max}, tokens spent {tok}/{budget}.\n\
+                     \n\
+                     Condition: {cond}\n\
+                     \n\
+                     You MUST end every response with exactly one <goal-status> tag:\n  \
+                     <goal-status state=\"met|in_progress|blocked\"><reason>...</reason></goal-status>\n\
+                     \n\
+                     - met:         only when the condition is fully satisfied AND visible in this conversation's output\n\
+                     - in_progress: real work is happening; describe what still remains in <reason>\n\
+                     - blocked:     you need user input or an irreversible action; describe the blocker in <reason>\n\
+                     \n\
+                     The driver will auto-continue on in_progress, run a verifier on met, and surface blocked to the user.\n\
+                     </origin-goal>",
+                    iter = g.iter,
+                    max = g.max_iter,
+                    tok = g.tokens_spent,
+                    budget = g.token_budget,
+                    cond = g.condition,
+                )
+            })
+            .unwrap_or_default()
+    };
     let recalled_system = {
-        let parts: [&str; 5] = [
+        let parts: [&str; 6] = [
             identity_block,
             &directive_block,
             &catalog_block,
             &workflows_block,
             &recall_block_wrapped,
+            &goal_block,
         ];
         parts
             .iter()
@@ -525,6 +599,12 @@ pub async fn run_loop(
             .collect::<Vec<_>>()
             .join("\n\n")
     };
+
+    // Cumulative token counters for this `run_loop` invocation. Surfaced
+    // via `LoopSummary` so the goal driver can charge the per-iteration
+    // spend against the goal's token budget.
+    let mut total_input_tokens: u64 = 0;
+    let mut total_output_tokens: u64 = 0;
 
     for turn in 1..=opts.max_turns {
         let req = ChatRequest {
@@ -641,6 +721,14 @@ pub async fn run_loop(
             }
         };
 
+        // Charge this turn's provider call against the cumulative counters
+        // BEFORE pushing the assistant message. Cache reads/creation are
+        // already folded into `input_tokens` by the provider impls, so we
+        // only need the two top-level fields here.
+        total_input_tokens = total_input_tokens.saturating_add(u64::from(resp.usage.input_tokens));
+        total_output_tokens =
+            total_output_tokens.saturating_add(u64::from(resp.usage.output_tokens));
+
         session.push(resp.assistant.clone());
 
         // Gather tool_use blocks (clone owned data because we'll borrow `meta`).
@@ -705,6 +793,8 @@ pub async fn run_loop(
             return Ok(LoopSummary {
                 assistant_text: text,
                 turns: turn,
+                input_tokens: total_input_tokens,
+                output_tokens: total_output_tokens,
             });
         }
 

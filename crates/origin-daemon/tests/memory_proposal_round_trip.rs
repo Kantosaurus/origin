@@ -108,6 +108,7 @@ async fn memory_proposed_round_trip_via_stub_provider() {
             memory_handle: None,
             coordinator: None,
             plan: None,
+            goal: Arc::new(tokio::sync::Mutex::new(None)),
         };
         let summary = run_loop(&mut session, &prompt.user_text, &provider, &AlwaysAllow, &opts)
             .await

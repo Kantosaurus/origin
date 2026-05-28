@@ -9,7 +9,7 @@ use origin_cas::Store;
 use origin_codegraph::ask::NullMemRouter;
 use origin_codegraph::index::CodeGraphIndex;
 use origin_core::types::Role;
-use origin_daemon::agent::{run_loop, LoopOptions, SessionStoreSummaryDeliverer};
+use origin_daemon::agent::{LoopOptions, SessionStoreSummaryDeliverer};
 use origin_daemon::auth::BearerStore;
 use origin_daemon::config::bearer_ttl_secs;
 use origin_daemon::memory_wiring::MemoryWiring;
@@ -701,6 +701,11 @@ fn spawn_handler_task(
         let active_workflow: Arc<
             tokio::sync::Mutex<Option<origin_daemon::workflow_progress::WorkflowProgress>>,
         > = Arc::new(tokio::sync::Mutex::new(None));
+        // Per-connection `/goal` slot. `Some` while a goal is active; the
+        // post-`run_loop` driver in `drive_goal_loop` reads/mutates it and
+        // emits `Goal*` events back through the connection.
+        let active_goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
 
         loop {
             let body = {
@@ -741,6 +746,17 @@ fn spawn_handler_task(
                         let g = active.read().await;
                         Arc::clone(&*g)
                     };
+                    // Build a Haiku-backed verifier per prompt so it always
+                    // reflects the current provider snapshot. The verifier is
+                    // only invoked when a goal is active AND the main model
+                    // claimed `met`, so per-prompt construction is cheap
+                    // (allocation only; no network calls here).
+                    let verifier: Arc<dyn origin_goal::verifier::Verifier> = Arc::new(
+                        origin_daemon::anthropic_verifier::AnthropicHaikuVerifier {
+                            provider: Arc::clone(&provider_snapshot),
+                            model: "claude-haiku-4-5".to_string(),
+                        },
+                    );
                     let outcome = handle_request(
                         &conn,
                         provider_snapshot.as_ref(),
@@ -757,6 +773,8 @@ fn spawn_handler_task(
                         Arc::clone(&mem_router),
                         Arc::clone(&coordinator),
                         wire_plan.clone(),
+                        Arc::clone(&active_goal),
+                        verifier,
                         req,
                     )
                     .await;
@@ -834,15 +852,31 @@ fn spawn_handler_task(
                     }
                 }
                 ClientMessage::ResumeRequest { token } => {
-                    handle_resume_request(&conn, Arc::clone(&session_store), token).await;
+                    handle_resume_request(
+                        &conn,
+                        Arc::clone(&session_store),
+                        Arc::clone(&active_goal),
+                        token,
+                    )
+                    .await;
                 }
                 ClientMessage::ActivateSkill { name, args } => {
-                    // `args` is consumed in Task 10 when goal routing lands; for now ignore it.
-                    let _ = &args;
+                    let conn_clone = Arc::clone(&conn);
+                    // `/goal` has dedicated routing — it does NOT push onto the
+                    // skill stack like a normal skill. Bare `/goal` is a status
+                    // query; `/goal <cond>` activates (replacing any prior goal).
+                    if name == "goal" {
+                        handle_goal_activation(
+                            &conn_clone,
+                            Arc::clone(&active_goal),
+                            args.as_deref(),
+                        )
+                        .await;
+                        continue;
+                    }
                     // Look up the skill in the daemon-wide catalog loaded at
                     // startup. The catalog is the single source of truth shared
                     // with the system-prompt injection (see agent.rs::run_loop).
-                    let conn_clone = Arc::clone(&conn);
                     if let Some(skill) = skill_catalog.find(&name) {
                         let front = skill.front.clone();
                         let allowed_tools: Vec<String> = {
@@ -874,6 +908,26 @@ fn spawn_handler_task(
                     }
                 }
                 ClientMessage::DeactivateSkill { name } => {
+                    // `/-goal` clears the per-connection goal slot. Other
+                    // names go to the skill stack as before.
+                    if name == "goal" {
+                        let mut slot = active_goal.lock().await;
+                        if let Some(prior) = slot.take() {
+                            let ev = StreamEvent::GoalCleared {
+                                reason: origin_goal::ClearReasonWire::UserSlash,
+                                iter: prior.iter,
+                                tokens_spent: prior.tokens_spent,
+                            };
+                            drop(slot);
+                            let body = serde_json::to_vec(&ev).unwrap_or_default();
+                            let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
+                        } else {
+                            let body =
+                                serde_json::to_vec(&StreamEvent::AdminOk).unwrap_or_default();
+                            let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
+                        }
+                        continue;
+                    }
                     active_skills.lock().await.deactivate(&name);
                     let body = serde_json::to_vec(&StreamEvent::AdminOk).unwrap_or_default();
                     let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
@@ -977,11 +1031,52 @@ fn spawn_handler_task(
 async fn handle_resume_request(
     conn: &SharedConnection,
     session_store: Arc<SessionStore>,
+    active_goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
     token: origin_resume_token::ResumeToken,
 ) {
     let session_id = token.session_id.clone();
     if let Err(e) = session_store.save_resume_token(&token) {
         warn!(error = %e, session = %session_id, "resume: could not persist token");
+    }
+    // Hydrate a previously-active goal back into the per-connection slot.
+    // Only `Active` or `Verifying` snapshots are restored — terminal
+    // statuses (`Met`/`Cleared`) carry their own outcomes that the CLI
+    // already saw, so re-installing them would be confusing. The user's
+    // next `Prompt` resumes the driver loop; we deliberately do NOT
+    // auto-iterate on resume per §5 of the spec.
+    if let Some(snapshot) = token.goal.as_ref() {
+        use origin_goal::{GoalSnapshot, GoalStatusWire};
+        let GoalSnapshot {
+            condition,
+            iter,
+            max_iter,
+            tokens_spent,
+            token_budget,
+            started_at_unix,
+            status,
+        } = snapshot.clone();
+        if matches!(status, GoalStatusWire::Active | GoalStatusWire::Verifying) {
+            let started_at = std::time::UNIX_EPOCH
+                + std::time::Duration::from_secs(started_at_unix);
+            let restored = origin_goal::GoalState {
+                condition: condition.clone(),
+                status: origin_goal::GoalStatus::Active,
+                iter,
+                max_iter,
+                tokens_spent,
+                token_budget,
+                started_at,
+                last_status_tag: None,
+            };
+            *active_goal.lock().await = Some(restored);
+            let ev = StreamEvent::GoalActive {
+                condition,
+                max_iter,
+                token_budget,
+            };
+            let body = serde_json::to_vec(&ev).unwrap_or_default();
+            let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
+        }
     }
     let messages = match session_store.load_messages(&session_id) {
         Ok(m) => m,
@@ -1123,6 +1218,8 @@ async fn handle_request(
     mem_router: Arc<dyn origin_codegraph::ask::MemRouter>,
     coordinator: Arc<Coordinator>,
     plan: origin_planner::Plan,
+    active_goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
+    verifier: Arc<dyn origin_goal::verifier::Verifier>,
     req: PromptRequest,
 ) -> PromptOutcome {
     let mut session = if let Some(sid) = &req.session_id {
@@ -1227,8 +1324,22 @@ async fn handle_request(
             // every produced CAS handle (Sticky for Pure tools, Volatile
             // for Mutating) so the encoder can downgrade `Inline` to
             // `Reference` on subsequent turns.
+            goal: Arc::clone(&active_goal),
+            // ^ per-connection goal slot. When `Some(Active|Verifying)` the
+            // `run_loop` body renders an `<origin-goal>` block on each turn;
+            // the post-loop driver below decides verify-vs-iterate-vs-clear.
         };
-        run_loop(&mut session, &req.user_text, provider, &AlwaysAllow, &opts).await
+        drive_goal_loop(
+            conn,
+            &mut session,
+            req.user_text.clone(),
+            provider,
+            &opts,
+            Arc::clone(&active_goal),
+            verifier.as_ref(),
+            event_tx.clone(),
+        )
+        .await
     };
     // Close per-request channels so both relay tasks exit cleanly.
     drop(tx_sub);
@@ -1273,6 +1384,249 @@ async fn handle_request(
                 .write_frame(FrameKind::ErrorFrame, message.as_bytes())
                 .await;
             PromptOutcome::Failed { message }
+        }
+    }
+}
+
+/// Handle `/goal [<args>]` (the dedicated `ActivateSkill { name: "goal", ... }`
+/// path). Bare `/goal` queries the active goal; `/goal <cond>` parses + activates
+/// (replacing any prior goal). All wire writes go through `conn`.
+async fn handle_goal_activation(
+    conn: &SharedConnection,
+    active_goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
+    raw_args: Option<&str>,
+) {
+    let Some(raw) = raw_args else {
+        // Bare `/goal` — status query.
+        let ev = if let Some(g) = active_goal.lock().await.as_ref() {
+            StreamEvent::GoalActive {
+                condition: g.condition.clone(),
+                max_iter: g.max_iter,
+                token_budget: g.token_budget,
+            }
+        } else {
+            StreamEvent::SkillError {
+                message: "no active goal".into(),
+            }
+        };
+        let body = serde_json::to_vec(&ev).unwrap_or_default();
+        let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
+        return;
+    };
+    match origin_goal::parse_goal_args(raw) {
+        Ok(parsed) => {
+            // Replace any prior goal, emitting `GoalCleared { UserSlash }` so
+            // the CLI sees the old goal end before the new one starts.
+            let mut slot = active_goal.lock().await;
+            if let Some(prior) = slot.take() {
+                let ev = StreamEvent::GoalCleared {
+                    reason: origin_goal::ClearReasonWire::UserSlash,
+                    iter: prior.iter,
+                    tokens_spent: prior.tokens_spent,
+                };
+                let body = serde_json::to_vec(&ev).unwrap_or_default();
+                let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
+            }
+            let new_goal = origin_goal::GoalState::new(
+                parsed.condition.clone(),
+                parsed.max_iter,
+                parsed.token_budget,
+            );
+            let active = StreamEvent::GoalActive {
+                condition: new_goal.condition.clone(),
+                max_iter: new_goal.max_iter,
+                token_budget: new_goal.token_budget,
+            };
+            *slot = Some(new_goal);
+            drop(slot);
+            let body = serde_json::to_vec(&active).unwrap_or_default();
+            let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
+        }
+        Err(e) => {
+            let ev = StreamEvent::SkillError {
+                message: format!("/goal: {e}"),
+            };
+            let body = serde_json::to_vec(&ev).unwrap_or_default();
+            let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
+        }
+    }
+}
+
+/// Pull the last assistant text out of `session` for tag parsing + verifier
+/// input. Concatenates every `Block::Text` body of the most recent
+/// `Role::Assistant` message; returns empty when none exists (shouldn't
+/// happen after a successful `run_loop` but the empty fallback keeps the
+/// driver from panicking).
+fn last_assistant_text(session: &Session) -> String {
+    use origin_core::types::{Block, Role};
+    for msg in session.messages.iter().rev() {
+        if matches!(msg.role, Role::Assistant) {
+            return msg
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+        }
+    }
+    String::new()
+}
+
+/// Goal-driver loop wrapping `run_loop`. When no goal is active this is a
+/// single passthrough call; when a goal IS active the driver re-enters
+/// `run_loop` with synthesized continuation prompts, emitting `GoalIteration`
+/// events between turns, until the driver decides to clear (verified,
+/// cap-hit, etc.). Between iterations we peek at the connection's incoming-
+/// message channel via a zero-duration `timeout` poll — if any other
+/// `ClientMessage` is waiting, we break out so the outer message loop
+/// handles it (the spec's "user interrupt mid-iteration" case).
+#[allow(clippy::too_many_arguments)]
+async fn drive_goal_loop(
+    conn: &SharedConnection,
+    session: &mut Session,
+    initial_user_text: String,
+    provider: &dyn Provider,
+    opts: &LoopOptions,
+    active_goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
+    verifier: &dyn origin_goal::verifier::Verifier,
+    event_tx: tokio::sync::mpsc::Sender<StreamEvent>,
+) -> Result<origin_daemon::agent::LoopSummary, origin_daemon::agent::LoopError> {
+    use origin_daemon::goal_driver::{drive, DriverDecision};
+    let mut next_text = initial_user_text;
+    let mut last_summary: Option<origin_daemon::agent::LoopSummary> = None;
+    loop {
+        // Top-of-iteration cap check: if a goal exists and is already over
+        // budget / max-iter, skip the provider call entirely and clear.
+        {
+            let mut slot = active_goal.lock().await;
+            if let Some(g) = slot.as_mut() {
+                if let Some(reason) = g.cap_check() {
+                    let iter = g.iter;
+                    let tokens_spent = g.tokens_spent;
+                    let wire: origin_goal::ClearReasonWire = reason.into();
+                    *slot = None;
+                    drop(slot);
+                    let _ = event_tx
+                        .send(StreamEvent::GoalCleared {
+                            reason: wire,
+                            iter,
+                            tokens_spent,
+                        })
+                        .await;
+                    // We always need a summary to return; if the very first
+                    // user prompt cap-checks immediately, return a synthetic
+                    // empty summary so the caller can still write a reply
+                    // frame. In practice this only fires if a resumed goal
+                    // is already at the cap.
+                    return Ok(last_summary.unwrap_or(origin_daemon::agent::LoopSummary {
+                        assistant_text: String::new(),
+                        turns: 0,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    }));
+                }
+            }
+        }
+
+        let summary = origin_daemon::agent::run_loop(
+            session,
+            &next_text,
+            provider,
+            &AlwaysAllow,
+            opts,
+        )
+        .await?;
+
+        // If no goal is active, we're done after one turn.
+        let goal_active = active_goal.lock().await.is_some();
+        if !goal_active {
+            return Ok(summary);
+        }
+
+        // Parse the final assistant turn's tag, record this iteration's
+        // spend + tag, then dispatch via `drive`.
+        let last_text = last_assistant_text(session);
+        let tag = origin_goal::parse_tag(&last_text);
+        let decision = {
+            let mut slot = active_goal.lock().await;
+            let Some(g) = slot.as_mut() else {
+                // Goal cleared by another path (e.g. /-goal) while we were
+                // running. Just return what we have.
+                return Ok(summary);
+            };
+            g.record_iteration(summary.input_tokens, summary.output_tokens, tag);
+            // Emit `GoalVerifying` BEFORE calling the verifier so the CLI's
+            // status line flips before the Haiku call latency lands.
+            if matches!(g.last_status_tag, Some(origin_goal::TagOutcome::Met)) {
+                let _ = event_tx.send(StreamEvent::GoalVerifying).await;
+            }
+            drive(g, &last_text, verifier).await
+        };
+        last_summary = Some(summary);
+
+        match decision {
+            DriverDecision::Iterate {
+                synthesized_prompt,
+                iter_event,
+            } => {
+                let _ = event_tx.send(iter_event).await;
+                next_text = synthesized_prompt;
+                // Peek for a pending user message. If one is waiting we
+                // break out so the outer per-connection message loop can
+                // handle it (the user's reply replaces our synth prompt).
+                let peek = {
+                    let mut g = conn.lock().await;
+                    tokio::time::timeout(std::time::Duration::ZERO, g.read_frame_body()).await
+                };
+                if let Ok(Ok(_pending)) = peek {
+                    // A pending frame would be consumed by the peek; this is
+                    // a deliberate stop. We can't push it back into the
+                    // connection, so we drop it — but since the outer loop
+                    // races on `read_frame_body` anyway and the peek's body
+                    // would have been an `Interrupt`/`Prompt`, the best
+                    // user-visible behaviour is to clear the goal with
+                    // `UserSlash` and let them re-issue.
+                    let mut slot = active_goal.lock().await;
+                    let cleared_ev = slot.take().map(|prior| StreamEvent::GoalCleared {
+                        reason: origin_goal::ClearReasonWire::UserSlash,
+                        iter: prior.iter,
+                        tokens_spent: prior.tokens_spent,
+                    });
+                    drop(slot);
+                    if let Some(ev) = cleared_ev {
+                        let _ = event_tx.send(ev).await;
+                    }
+                    return Ok(last_summary.unwrap_or(origin_daemon::agent::LoopSummary {
+                        assistant_text: String::new(),
+                        turns: 0,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    }));
+                }
+            }
+            DriverDecision::Cleared {
+                reason,
+                iter,
+                tokens_spent,
+            } => {
+                *active_goal.lock().await = None;
+                let _ = event_tx
+                    .send(StreamEvent::GoalCleared {
+                        reason,
+                        iter,
+                        tokens_spent,
+                    })
+                    .await;
+                return Ok(last_summary.unwrap_or(origin_daemon::agent::LoopSummary {
+                    assistant_text: String::new(),
+                    turns: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                }));
+            }
         }
     }
 }
