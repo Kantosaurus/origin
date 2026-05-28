@@ -2,8 +2,11 @@
 
 pub mod builtins;
 pub mod dispatch;
+pub mod error;
 pub mod macros;
 pub mod registry;
+
+pub use error::{ErrClass, ToolError};
 
 pub use dispatch::{Cache, CacheHit, NormalizedInput, MEMOIZATION_SKIPLIST};
 // Re-export so downstream tests + callers can construct `ToolMeta` literals

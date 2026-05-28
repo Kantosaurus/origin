@@ -61,12 +61,14 @@ pub async fn bash_tool(command: &str) -> Result<BashOutput, String> {
     })
 }
 
-/// Streaming variant of [`bash_tool`]: spawns the shell child with piped
-/// stdout/stderr, reads each stream line-by-line, forwards every line to
-/// `chunk_tx` as it arrives, and still returns the fully accumulated
-/// `BashOutput` for the LLM's `tool_result`. Stderr lines are prefixed
-/// with `"stderr: "` so the consumer can distinguish them in the live
-/// view; the returned `BashOutput.stderr` keeps the unprefixed text.
+/// Streaming variant of [`bash_tool`].
+///
+/// Spawns the shell child with piped stdout/stderr, reads each stream
+/// line-by-line, forwards every line to `chunk_tx` as it arrives, and
+/// still returns the fully accumulated `BashOutput` for the LLM's
+/// `tool_result`. Stderr lines are prefixed with `"stderr: "` so the
+/// consumer can distinguish them in the live view; the returned
+/// `BashOutput.stderr` keeps the unprefixed text.
 ///
 /// If the receiver of `chunk_tx` is gone (CLI disconnected), forwarding
 /// silently fails — accumulation still completes so the LLM gets the
@@ -113,9 +115,7 @@ pub async fn bash_tool_streaming(
             fallback.stdout(Stdio::piped());
             fallback.stderr(Stdio::piped());
             fallback.stdin(Stdio::null());
-            fallback
-                .spawn()
-                .map_err(|e| format!("spawn powershell: {e}"))?
+            fallback.spawn().map_err(|e| format!("spawn powershell: {e}"))?
         }
         #[cfg(unix)]
         Err(e) => return Err(format!("spawn sh: {e}")),
@@ -155,10 +155,7 @@ pub async fn bash_tool_streaming(
         acc
     });
 
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| format!("wait child: {e}"))?;
+    let status = child.wait().await.map_err(|e| format!("wait child: {e}"))?;
 
     let stdout_text = stdout_task.await.map_err(|e| format!("stdout task: {e}"))?;
     let stderr_text = stderr_task.await.map_err(|e| format!("stderr task: {e}"))?;
