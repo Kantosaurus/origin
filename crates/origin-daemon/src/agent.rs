@@ -1186,6 +1186,25 @@ async fn dispatch_tool(
                 .map(|v| serde_json::to_string(&v).unwrap())
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
+        "MultiEdit" => {
+            let edits_v = args.get("edits").and_then(Value::as_array)
+                .ok_or_else(|| LoopError::BadArgs("MultiEdit: missing `edits`".into()))?;
+            let edits = edits_v.iter().map(|e| {
+                let o = e.get("old").and_then(Value::as_str).unwrap_or("");
+                let n = e.get("new").and_then(Value::as_str).unwrap_or("");
+                let r = e.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+                origin_tools::builtins::multi_edit::EditOp { old: o.into(), new: n.into(), replace_all: r }
+            }).collect();
+            let margs = origin_tools::builtins::multi_edit::MultiEditArgs {
+                file_path: args.get("file_path").and_then(Value::as_str)
+                    .ok_or_else(|| LoopError::BadArgs("MultiEdit: missing `file_path`".into()))?
+                    .to_string(),
+                edits,
+            };
+            origin_tools::builtins::multi_edit::multi_edit(&margs)
+                .map(|v| serde_json::to_string(&v).unwrap())
+                .map_err(|e| LoopError::ToolFailure(e.message))
+        }
         "Write" => {
             let guard = origin_tools::builtins::write::WriteGuard::default();
             // Production callers pass the session's guard via dispatch_with_envelope;

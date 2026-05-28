@@ -17,3 +17,4 @@ pub mod task;
 pub mod web_fetch;
 pub mod web_search;
 pub mod write;
+pub mod multi_edit;
