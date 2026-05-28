@@ -1204,17 +1204,43 @@ async fn dispatch_tool(
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "Bash" => {
-            let cmd = args
-                .get("command")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| LoopError::BadArgs("Bash: missing `command`".into()))?;
-            let out = origin_tools::builtins::bash::bash_tool(cmd)
+            let bargs = origin_tools::builtins::bash::BashArgs {
+                command: args
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| LoopError::BadArgs("Bash: missing `command`".into()))?
+                    .to_string(),
+                timeout: args.get("timeout").and_then(Value::as_u64).map(|n| n as u32),
+                cwd: args.get("cwd").and_then(Value::as_str).map(str::to_string),
+                env: args
+                    .get("env")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|e| {
+                                let arr = e.as_array()?;
+                                Some((
+                                    arr.first()?.as_str()?.to_string(),
+                                    arr.get(1)?.as_str()?.to_string(),
+                                ))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                run_in_background: args
+                    .get("run_in_background")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            };
+            // Local supervisor for the passthrough path; the envelope path
+            // uses ctx.supervisor (shared across calls within a session).
+            // NOTE: run_in_background + Monitor across separate tool
+            // invocations won't work via this path — see known limitations.
+            let sup = origin_tools::proc_supervisor::Supervisor::new();
+            origin_tools::builtins::bash::bash_v2(bargs, &sup)
                 .await
-                .map_err(LoopError::ToolFailure)?;
-            Ok(format!(
-                "exit_code: {}\nstdout:\n{}\nstderr:\n{}",
-                out.exit_code, out.stdout, out.stderr
-            ))
+                .map(|v| serde_json::to_string(&v).unwrap())
+                .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "Recall" => {
             let store =
@@ -1628,65 +1654,78 @@ fn node_row_to_json(row: &origin_codegraph::index::NodeRow) -> serde_json::Value
     })
 }
 
-/// Dispatch the `Bash` tool through its streaming reader so each stdout /
-/// stderr line is forwarded to `event_tx` as a [`StreamEvent::ToolChunk`]
-/// the moment the child writes it. Returns the same canonical result-byte
-/// format as the synchronous `Bash` arm in [`dispatch_tool`] so the LLM
-/// sees identical content regardless of which path ran. `event_tx` being
-/// `None` (e.g. unit tests, headless runs without a relay) is supported —
-/// chunks are drained and discarded but accumulation still completes.
+/// Dispatch the `Bash` tool via `bash_v2` and forward buffered output lines
+/// to `event_tx` as [`StreamEvent::ToolChunk`] events. Returns the
+/// serialised JSON result bytes so the LLM sees the full structured output.
+/// `event_tx` being `None` (unit tests, headless runs) is supported — chunks
+/// are skipped but execution still completes.
 async fn run_bash_streaming(
     args: &Value,
     event_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
 ) -> Result<Vec<u8>, String> {
-    let cmd = args
-        .get("command")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "Bash: missing `command`".to_string())?;
-
-    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let event_tx_owned = event_tx.cloned();
-    // The forwarder returns the number of chunks it relayed so the caller
-    // can decide whether the command produced any visible output. Silent
-    // commands (e.g. write-only `powershell -File foo.ps1`) report zero
-    // chunks and trigger a fallback `ToolResult` below so the CLI never
-    // shows just an activity line followed by a silent gap.
-    let forwarder = tokio::spawn(async move {
-        let mut chunk_count: u32 = 0;
-        while let Some(content) = chunk_rx.recv().await {
-            chunk_count += 1;
-            if let Some(tx) = &event_tx_owned {
-                let _ = tx
-                    .send(StreamEvent::ToolChunk {
-                        tool: "Bash".to_string(),
-                        content,
+    let bargs = origin_tools::builtins::bash::BashArgs {
+        command: args
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Bash: missing `command`".to_string())?
+            .to_string(),
+        timeout: args.get("timeout").and_then(Value::as_u64).map(|n| n as u32),
+        cwd: args.get("cwd").and_then(Value::as_str).map(str::to_string),
+        env: args
+            .get("env")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| {
+                        let arr = e.as_array()?;
+                        Some((
+                            arr.first()?.as_str()?.to_string(),
+                            arr.get(1)?.as_str()?.to_string(),
+                        ))
                     })
-                    .await;
-            }
-        }
-        chunk_count
-    });
-    let out = origin_tools::builtins::bash::bash_tool_streaming(cmd, chunk_tx).await?;
-    let chunk_count = forwarder.await.unwrap_or(0);
+                    .collect()
+            })
+            .unwrap_or_default(),
+        run_in_background: args
+            .get("run_in_background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    };
+    // Per-call supervisor: run_in_background + Monitor across separate tool
+    // invocations won't work via this legacy path (known limitation —
+    // Phase 8 replaces with envelope-level shared supervisor).
+    let sup = origin_tools::proc_supervisor::Supervisor::new();
+    let result = origin_tools::builtins::bash::bash_v2(bargs, &sup)
+        .await
+        .map_err(|e| e.message)?;
 
-    if chunk_count == 0 {
-        if let Some(tx) = event_tx {
+    // Forward stdout lines as ToolChunk events.
+    let stdout_str = result["stdout"].as_str().unwrap_or("");
+    let exit_code = result["exit_code"].as_i64().unwrap_or(-1);
+    let mut chunk_count: u32 = 0;
+    if let Some(tx) = event_tx {
+        for line in stdout_str.lines() {
+            chunk_count += 1;
+            let _ = tx
+                .send(StreamEvent::ToolChunk {
+                    tool: "Bash".to_string(),
+                    content: line.to_string(),
+                })
+                .await;
+        }
+        if chunk_count == 0 {
             let _ = tx
                 .send(StreamEvent::ToolResult {
                     tool: "Bash".to_string(),
-                    ok: out.exit_code == 0,
-                    preview: format!("(exit {}, no output)", out.exit_code),
+                    ok: exit_code == 0,
+                    preview: format!("(exit {exit_code}, no output)"),
                     elided_bytes: 0,
                 })
                 .await;
         }
     }
 
-    Ok(format!(
-        "exit_code: {}\nstdout:\n{}\nstderr:\n{}",
-        out.exit_code, out.stdout, out.stderr
-    )
-    .into_bytes())
+    Ok(serde_json::to_string(&result).unwrap().into_bytes())
 }
 
 /// Build a bounded preview of a tool's result bytes for live display in the
