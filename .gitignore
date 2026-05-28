@@ -4,6 +4,9 @@
 **/*.rs.bk
 *.pdb
 
+# proptest regression files (auto-generated)
+**/*.proptest-regressions
+
 # Cargo
 .cargo/
 

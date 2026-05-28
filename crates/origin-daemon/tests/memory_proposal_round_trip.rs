@@ -173,6 +173,7 @@ async fn memory_proposed_round_trip_via_stub_provider() {
         system: String::new(),
         model: "claude-opus-4-7".into(),
         user_text: "remember: x is the variable name we use".into(),
+        session_id: None,
     });
     let body = serde_json::to_vec(&prompt).expect("encode prompt");
     let frame = encode(1, FrameKind::Request, &body);
