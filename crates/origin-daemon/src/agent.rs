@@ -2113,74 +2113,7 @@ fn tool_diff_lines(name: &str, args: &Value) -> Vec<crate::protocol::DiffLine> {
             let new = args.get("new_string").and_then(Value::as_str).unwrap_or("");
             let old_lines: Vec<&str> = old.lines().collect();
             let new_lines: Vec<&str> = new.lines().collect();
-            let mut out = Vec::new();
-            let mut old_i = 0u32;
-            let mut new_i = 0u32;
-            let max_old = old_lines.len();
-            let max_new = new_lines.len();
-            let mut oi = 0;
-            let mut ni = 0;
-            while oi < max_old || ni < max_new {
-                if oi < max_old && ni < max_new && old_lines[oi] == new_lines[ni] {
-                    old_i += 1;
-                    new_i += 1;
-                    out.push(DiffLine {
-                        kind: " ".to_string(),
-                        line_no: new_i,
-                        text: new_lines[ni].to_string(),
-                    });
-                    oi += 1;
-                    ni += 1;
-                } else {
-                    let (oi_before, ni_before) = (oi, ni);
-                    while oi < max_old && (ni >= max_new || !new_lines[ni..].contains(&old_lines[oi])) {
-                        old_i += 1;
-                        out.push(DiffLine {
-                            kind: "-".to_string(),
-                            line_no: old_i,
-                            text: old_lines[oi].to_string(),
-                        });
-                        oi += 1;
-                    }
-                    while ni < max_new && (oi >= max_old || !old_lines[oi..].contains(&new_lines[ni])) {
-                        new_i += 1;
-                        out.push(DiffLine {
-                            kind: "+".to_string(),
-                            line_no: new_i,
-                            text: new_lines[ni].to_string(),
-                        });
-                        ni += 1;
-                    }
-                    // Forward-progress guard. When the current old and new lines
-                    // differ yet each recurs later in the *opposite* side (a
-                    // reorder/transposition), both runs above match zero lines and
-                    // neither cursor moves — the outer `while` then spins forever.
-                    // Emit the current pair as delete+insert so every iteration
-                    // advances at least one cursor (the outer condition guarantees
-                    // at least one side still has a line).
-                    if oi == oi_before && ni == ni_before {
-                        if oi < max_old {
-                            old_i += 1;
-                            out.push(DiffLine {
-                                kind: "-".to_string(),
-                                line_no: old_i,
-                                text: old_lines[oi].to_string(),
-                            });
-                            oi += 1;
-                        }
-                        if ni < max_new {
-                            new_i += 1;
-                            out.push(DiffLine {
-                                kind: "+".to_string(),
-                                line_no: new_i,
-                                text: new_lines[ni].to_string(),
-                            });
-                            ni += 1;
-                        }
-                    }
-                }
-            }
-            out
+            diff_lines_lcs(&old_lines, &new_lines)
         }
         "Write" => {
             let content = args.get("content").and_then(Value::as_str).unwrap_or("");
@@ -2196,6 +2129,87 @@ fn tool_diff_lines(name: &str, args: &Value) -> Vec<crate::protocol::DiffLine> {
         }
         _ => Vec::new(),
     }
+}
+
+/// Cap on the LCS dynamic-programming table (`old.len() * new.len()`). Typical
+/// Edit hunks are tiny; whole-file replacements are not, and an O(n*m) table
+/// would cost too much there. Past this, fall back to a linear diff.
+const MAX_DIFF_CELLS: usize = 4_000_000;
+
+/// Line diff via longest-common-subsequence. Produces a minimal sequence of
+/// context (`" "`), delete (`"-"`), and insert (`"+"`) lines that reproduces
+/// `old` (delete+context) and `new` (insert+context) exactly and in order.
+///
+/// Replaces a hand-rolled two-cursor walk that could spin forever when lines
+/// were reordered (each side's current line recurred later in the other, so
+/// neither cursor advanced). `O(n*m)` time/space, bounded by [`MAX_DIFF_CELLS`];
+/// larger inputs degrade to a correct-but-non-minimal delete-all/insert-all diff.
+fn diff_lines_lcs(old: &[&str], new: &[&str]) -> Vec<crate::protocol::DiffLine> {
+    use crate::protocol::DiffLine;
+    let n = old.len();
+    let m = new.len();
+
+    if n.saturating_mul(m) > MAX_DIFF_CELLS {
+        let mut out = Vec::with_capacity(n + m);
+        let mut old_no = 0u32;
+        for line in old {
+            old_no += 1;
+            out.push(DiffLine { kind: "-".to_string(), line_no: old_no, text: (*line).to_string() });
+        }
+        let mut new_no = 0u32;
+        for line in new {
+            new_no += 1;
+            out.push(DiffLine { kind: "+".to_string(), line_no: new_no, text: (*line).to_string() });
+        }
+        return out;
+    }
+
+    // dp[i][j] = LCS length of old[i..] and new[j..].
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if old[i] == new[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+
+    // Backtrack from (0,0); prefer deletes on ties for stable output. Context
+    // and insert lines are numbered by the new file, deletes by the old file
+    // (matching the prior rendering convention).
+    let mut out = Vec::with_capacity(n + m);
+    let (mut i, mut j) = (0usize, 0usize);
+    let (mut old_no, mut new_no) = (0u32, 0u32);
+    while i < n && j < m {
+        if old[i] == new[j] {
+            old_no += 1;
+            new_no += 1;
+            out.push(DiffLine { kind: " ".to_string(), line_no: new_no, text: new[j].to_string() });
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            old_no += 1;
+            out.push(DiffLine { kind: "-".to_string(), line_no: old_no, text: old[i].to_string() });
+            i += 1;
+        } else {
+            new_no += 1;
+            out.push(DiffLine { kind: "+".to_string(), line_no: new_no, text: new[j].to_string() });
+            j += 1;
+        }
+    }
+    while i < n {
+        old_no += 1;
+        out.push(DiffLine { kind: "-".to_string(), line_no: old_no, text: old[i].to_string() });
+        i += 1;
+    }
+    while j < m {
+        new_no += 1;
+        out.push(DiffLine { kind: "+".to_string(), line_no: new_no, text: new[j].to_string() });
+        j += 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -2234,6 +2248,50 @@ mod diff_line_tests {
         let texts: Vec<&str> = diff.iter().map(|d| d.text.as_str()).collect();
         assert!(texts.contains(&"alpha"), "missing 'alpha' in diff: {texts:?}");
         assert!(texts.contains(&"beta"), "missing 'beta' in diff: {texts:?}");
+    }
+
+    /// Reconstruct one side of the diff: deletes+context yield the old file,
+    /// inserts+context yield the new file. A correct diff must reproduce both
+    /// sides exactly and in order.
+    fn reconstruct(diff: &[crate::protocol::DiffLine], side: &str) -> Vec<String> {
+        diff.iter()
+            .filter(|d| d.kind == " " || d.kind == side)
+            .map(|d| d.text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn edit_diff_keeps_common_line_as_context_on_swap() {
+        // old [A,B] -> new [B,A]. The longest common subsequence has length 1,
+        // so a minimal diff keeps exactly one line as context. The hand-rolled
+        // walk kept zero (pure delete+insert churn); a proper LCS diff keeps one.
+        let args = serde_json::json!({ "old_string": "A\nB", "new_string": "B\nA" });
+        let diff = tool_diff_lines("Edit", &args);
+        let context = diff.iter().filter(|d| d.kind == " ").count();
+        assert_eq!(context, 1, "minimal diff should keep the common line as context: {diff:?}");
+    }
+
+    #[test]
+    fn edit_diff_reconstructs_both_sides() {
+        // The fundamental diff invariant across a representative mix.
+        let cases = [
+            ("A\nB\nC", "A\nB\nC"),       // identical
+            ("A\nB\nC", "A\nX\nC"),       // substitution
+            ("A", "A\nB"),               // pure insert
+            ("A\nB", "A"),               // pure delete
+            ("A\nB", "B\nA"),            // swap
+            ("", "A\nB"),                // empty old
+            ("A\nB", ""),                // empty new
+            ("a\nb\nc\nd", "b\nd\ne"),    // mixed
+        ];
+        for (old, new) in cases {
+            let args = serde_json::json!({ "old_string": old, "new_string": new });
+            let diff = tool_diff_lines("Edit", &args);
+            let old_lines: Vec<String> = old.lines().map(str::to_string).collect();
+            let new_lines: Vec<String> = new.lines().map(str::to_string).collect();
+            assert_eq!(reconstruct(&diff, "-"), old_lines, "old side mismatch for {old:?}->{new:?}");
+            assert_eq!(reconstruct(&diff, "+"), new_lines, "new side mismatch for {old:?}->{new:?}");
+        }
     }
 }
 
