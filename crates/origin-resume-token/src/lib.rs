@@ -53,6 +53,11 @@ pub struct ResumeToken {
     pub pending_tool_calls: Vec<String>,
     /// Plan CRDT sequence number at the checkpoint.
     pub plan_seq: u64,
+    /// Optional snapshot of the active `/goal` for the session, persisted so
+    /// the resumed daemon can re-hydrate the goal state. `#[serde(default)]`
+    /// keeps old tokens (written before this field existed) deserializable.
+    #[serde(default)]
+    pub goal: Option<origin_goal::GoalSnapshot>,
 }
 
 /// On-disk wrapper. `payload` is the inner `ResumeToken` JSON serialized
@@ -283,6 +288,7 @@ mod tests {
             cas_handle_root: [7u8; 32],
             pending_tool_calls: vec!["tool-1".into()],
             plan_seq: 42,
+            goal: None,
         }
     }
 

@@ -4058,6 +4058,7 @@ dependencies = [
  "origin-cas",
  "origin-codegraph",
  "origin-core",
+ "origin-goal",
  "origin-ipc",
  "origin-keyvault",
  "origin-lsp-client",
@@ -4102,6 +4103,16 @@ dependencies = [
  "ulid",
  "which",
  "wiremock",
+]
+
+[[package]]
+name = "origin-goal"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -4475,6 +4486,7 @@ dependencies = [
  "blake3",
  "getrandom 0.2.17",
  "hex",
+ "origin-goal",
  "serde",
  "serde_json",
  "subtle",
