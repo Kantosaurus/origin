@@ -1,6 +1,7 @@
 # Rust build artifacts
 /target/
 **/target/
+/target-tdd/
 **/*.rs.bk
 *.pdb
 
