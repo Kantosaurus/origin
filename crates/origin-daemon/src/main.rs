@@ -1380,6 +1380,7 @@ async fn handle_request(
             &opts,
             Arc::clone(&active_goal),
             Arc::clone(&pending_message),
+            Arc::clone(&session_store),
             verifier.as_ref(),
             event_tx.clone(),
         )
@@ -1536,10 +1537,34 @@ async fn drive_goal_loop(
     opts: &LoopOptions,
     active_goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
     pending_message: Arc<tokio::sync::Mutex<Option<ClientMessage>>>,
+    session_store: Arc<SessionStore>,
     verifier: &dyn origin_goal::verifier::Verifier,
     event_tx: tokio::sync::mpsc::Sender<StreamEvent>,
 ) -> Result<origin_daemon::agent::LoopSummary, origin_daemon::agent::LoopError> {
+    use origin_daemon::goal_checkpoint::make_goal_checkpoint_token;
     use origin_daemon::goal_driver::{drive, DriverDecision};
+    // Local closure: build a ResumeToken from the current goal state and
+    // persist it. Best-effort — a write failure should not interrupt the
+    // iteration. `session.messages.len()` is the highest persisted-or-
+    // about-to-be-persisted turn index; we subtract one to refer to the
+    // last completed turn, saturating at 0 so an empty session reports
+    // `last_turn: 0` rather than panicking on underflow.
+    let checkpoint = |sess: &Session| {
+        let last_turn = u32::try_from(sess.messages.len().saturating_sub(1))
+            .unwrap_or(u32::MAX);
+        let store = Arc::clone(&session_store);
+        let goal_slot = Arc::clone(&active_goal);
+        let session_id = sess.id.clone();
+        async move {
+            let token = {
+                let guard = goal_slot.lock().await;
+                make_goal_checkpoint_token(&session_id, last_turn, &guard)
+            };
+            if let Err(e) = store.save_resume_token(&token) {
+                warn!(error = %e, "goal checkpoint: save failed; iteration continues");
+            }
+        }
+    };
     let mut next_text = initial_user_text;
     let mut last_summary: Option<origin_daemon::agent::LoopSummary> = None;
     loop {
@@ -1552,8 +1577,38 @@ async fn drive_goal_loop(
                     let iter = g.iter;
                     let tokens_spent = g.tokens_spent;
                     let wire: origin_goal::ClearReasonWire = reason.into();
+                    // Terminal-status checkpoint (mirrors the post-iter
+                    // Cleared path). Built inline because we have a
+                    // ClearReasonWire in hand and no reverse mapping
+                    // back to ClearReason.
+                    let snap = origin_goal::GoalSnapshot {
+                        condition: g.condition.clone(),
+                        iter: g.iter,
+                        max_iter: g.max_iter,
+                        tokens_spent: g.tokens_spent,
+                        token_budget: g.token_budget,
+                        started_at_unix: g
+                            .started_at
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                        status: origin_goal::GoalStatusWire::Cleared { by: wire.clone() },
+                    };
                     *slot = None;
                     drop(slot);
+                    let last_turn = u32::try_from(session.messages.len().saturating_sub(1))
+                        .unwrap_or(u32::MAX);
+                    let token = origin_resume_token::ResumeToken {
+                        session_id: session.id.clone(),
+                        last_turn,
+                        cas_handle_root: [0u8; 32],
+                        pending_tool_calls: Vec::new(),
+                        plan_seq: 0,
+                        goal: Some(snap),
+                    };
+                    if let Err(e) = session_store.save_resume_token(&token) {
+                        warn!(error = %e, "goal checkpoint: cap-clear save failed");
+                    }
                     let _ = event_tx
                         .send(StreamEvent::GoalCleared {
                             reason: wire,
@@ -1612,6 +1667,11 @@ async fn drive_goal_loop(
         };
         last_summary = Some(summary);
 
+        // Persist a fresh goal-aware ResumeToken AFTER record_iteration so
+        // a crash between iterations restarts mid-goal at the correct
+        // tokens_spent / iter counters. Best-effort — see closure body.
+        checkpoint(session).await;
+
         match decision {
             DriverDecision::Iterate {
                 synthesized_prompt,
@@ -1654,14 +1714,47 @@ async fn drive_goal_loop(
                     let is_interrupt = matches!(parsed, Some(ClientMessage::Interrupt));
                     // Clear the active goal before yielding control. The
                     // outer loop sees a stable `None` slot when it picks
-                    // up the pushed-back message.
+                    // up the pushed-back message. Build a terminal
+                    // checkpoint from the prior goal first so a crash
+                    // between here and the next message write does not
+                    // resurrect a now-stale Active snapshot.
                     let mut slot = active_goal.lock().await;
-                    let cleared_ev = slot.take().map(|prior| StreamEvent::GoalCleared {
-                        reason: origin_goal::ClearReasonWire::UserSlash,
-                        iter: prior.iter,
-                        tokens_spent: prior.tokens_spent,
-                    });
+                    let prior = slot.take();
                     drop(slot);
+                    let cleared_ev = prior.as_ref().map(|p| StreamEvent::GoalCleared {
+                        reason: origin_goal::ClearReasonWire::UserSlash,
+                        iter: p.iter,
+                        tokens_spent: p.tokens_spent,
+                    });
+                    if let Some(p) = prior {
+                        let last_turn = u32::try_from(session.messages.len().saturating_sub(1))
+                            .unwrap_or(u32::MAX);
+                        let token = origin_resume_token::ResumeToken {
+                            session_id: session.id.clone(),
+                            last_turn,
+                            cas_handle_root: [0u8; 32],
+                            pending_tool_calls: Vec::new(),
+                            plan_seq: 0,
+                            goal: Some(origin_goal::GoalSnapshot {
+                                condition: p.condition.clone(),
+                                iter: p.iter,
+                                max_iter: p.max_iter,
+                                tokens_spent: p.tokens_spent,
+                                token_budget: p.token_budget,
+                                started_at_unix: p
+                                    .started_at
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
+                                status: origin_goal::GoalStatusWire::Cleared {
+                                    by: origin_goal::ClearReasonWire::UserSlash,
+                                },
+                            }),
+                        };
+                        if let Err(e) = session_store.save_resume_token(&token) {
+                            warn!(error = %e, "goal checkpoint: user-slash save failed");
+                        }
+                    }
                     if let Some(ev) = cleared_ev {
                         let _ = event_tx.send(ev).await;
                     }
@@ -1688,7 +1781,48 @@ async fn drive_goal_loop(
                 iter,
                 tokens_spent,
             } => {
-                *active_goal.lock().await = None;
+                // Build a terminal-status snapshot ourselves so the
+                // checkpoint reflects the final wire-shape, then clear
+                // the slot. Doing this BEFORE the `take()` would require
+                // a reverse `From<ClearReasonWire>` for `ClearReason`
+                // (we currently only have the forward); building the
+                // snapshot directly is simpler and keeps the inverse
+                // mapping in one place.
+                let terminal_token = {
+                    let mut slot = active_goal.lock().await;
+                    slot.take().map(|g| {
+                        let last_turn = u32::try_from(session.messages.len().saturating_sub(1))
+                            .unwrap_or(u32::MAX);
+                        origin_resume_token::ResumeToken {
+                            session_id: session.id.clone(),
+                            last_turn,
+                            cas_handle_root: [0u8; 32],
+                            pending_tool_calls: Vec::new(),
+                            plan_seq: 0,
+                            goal: Some(origin_goal::GoalSnapshot {
+                                condition: g.condition.clone(),
+                                iter: g.iter,
+                                max_iter: g.max_iter,
+                                tokens_spent: g.tokens_spent,
+                                token_budget: g.token_budget,
+                                started_at_unix: g
+                                    .started_at
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
+                                status: origin_goal::GoalStatusWire::Cleared { by: reason.clone() },
+                            }),
+                        }
+                    })
+                };
+                if let Some(token) = terminal_token {
+                    if let Err(e) = session_store.save_resume_token(&token) {
+                        warn!(error = %e, "goal checkpoint: terminal save failed");
+                    }
+                }
+                // `handle_resume_request` only re-installs Active /
+                // Verifying snapshots — a terminal Cleared snapshot is
+                // correctly ignored on the next resume.
                 let _ = event_tx
                     .send(StreamEvent::GoalCleared {
                         reason,
