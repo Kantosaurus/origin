@@ -10,7 +10,10 @@
 
 use crate::protocol::StreamEvent;
 use origin_goal::verifier::{Verdict, Verifier, VerifierError};
-use origin_goal::{ClearReason, ClearReasonWire, GoalState, TagOutcome, TagOutcomeWire};
+use origin_goal::{
+    state::MAX_CONSECUTIVE_VERIFIER_REJECTIONS, ClearReason, ClearReasonWire, GoalState,
+    TagOutcome, TagOutcomeWire,
+};
 
 /// What the connection task should do after handling the driver's decision.
 #[derive(Debug)]
@@ -29,105 +32,315 @@ pub enum DriverDecision {
     },
 }
 
-/// Translate a `TagOutcome` + cap state into a [`DriverDecision`].
+/// Owned inputs the driver needs to make a decision.
 ///
-/// Caller responsibilities:
-/// - Charge `LoopSummary` tokens to `state` via `record_iteration` BEFORE calling.
-/// - On `Iterate`, send the `iter_event` to the client, then call `run_loop`
-///   with `synthesized_prompt` as the user message.
-/// - On `Cleared`, send a `GoalCleared` event and drop the state from the
-///   connection.
+/// Caller copies the relevant fields out of `GoalState` under a short
+/// lock, then calls [`drive_decision`] WITHOUT holding the slot lock.
+/// The returned [`DecisionOutcome`] carries any mutations the caller
+/// must apply to the state under a fresh lock. Bug #6.
+#[derive(Debug)]
+pub struct DriverInputs {
+    pub condition: String,
+    pub iter: u32,
+    pub tokens_spent: u64,
+    pub last_status_tag: Option<TagOutcome>,
+    pub consecutive_rejections: u32,
+}
+
+impl DriverInputs {
+    /// Snapshot the fields the driver needs out of a `GoalState`. Hold the
+    /// slot lock only across this call, then drop it before calling
+    /// [`drive_decision`].
+    #[must_use]
+    pub fn snapshot(state: &GoalState) -> Self {
+        Self {
+            condition: state.condition.clone(),
+            iter: state.iter,
+            tokens_spent: state.tokens_spent,
+            last_status_tag: state.last_status_tag.clone(),
+            consecutive_rejections: state.consecutive_rejections,
+        }
+    }
+}
+
+/// Mutations the caller must apply to the live `GoalState` after a driver call.
 ///
-/// The verifier is called by the driver only on `TagOutcome::Met`. We pass it
-/// in as a trait object so tests can substitute a `MockVerifier`.
+/// Built without the slot lock held; the caller re-acquires the lock,
+/// applies these in order, then dispatches the [`DriverDecision`].
+#[derive(Debug, Default)]
+pub struct DecisionOutcome {
+    pub decision: DriverDecision,
+    /// Verifier input tokens to charge via `record_verifier_tokens`.
+    pub verifier_in_tok: u64,
+    /// Verifier output tokens to charge via `record_verifier_tokens`.
+    pub verifier_out_tok: u64,
+    /// Absolute value to assign to `state.consecutive_rejections`.
+    /// `None` means "leave unchanged"; `Some(n)` means "set to n".
+    pub set_consecutive_rejections: Option<u32>,
+}
+
+impl Default for DriverDecision {
+    fn default() -> Self {
+        Self::Cleared {
+            reason: ClearReasonWire::VerifierUnavailable,
+            iter: 0,
+            tokens_spent: 0,
+        }
+    }
+}
+
+/// Pure-async driver dispatch.
+///
+/// Takes owned inputs (no slot lock held across the await) and returns
+/// mutations + decision for the caller to apply. Bug #6.
+#[allow(clippy::too_many_lines)] // the match-on-tag dispatch is one logical unit
+pub async fn drive_decision(
+    inputs: DriverInputs,
+    last_turn_text: &str,
+    verifier: &dyn Verifier,
+) -> DecisionOutcome {
+    let tag = inputs
+        .last_status_tag
+        .clone()
+        .unwrap_or(TagOutcome::Missing);
+    match tag {
+        TagOutcome::Met => {
+            let truncated = truncate_for_verifier(last_turn_text);
+            match verifier.verify(&inputs.condition, &truncated).await {
+                Ok((Verdict::Met, in_tok, out_tok)) => DecisionOutcome {
+                    // The caller will charge tokens THEN cap-check before
+                    // committing to `Met` (Bug #11). The decision here is
+                    // tentative; we still pass `Met` so the caller knows
+                    // the verifier confirmed.
+                    decision: cleared_from_inputs(
+                        &inputs,
+                        in_tok + out_tok,
+                        ClearReason::Met {
+                            reason: "verifier confirmed".into(),
+                        },
+                    ),
+                    verifier_in_tok: in_tok,
+                    verifier_out_tok: out_tok,
+                    // Bug #15: reset the rejection counter on a successful met.
+                    set_consecutive_rejections: Some(0),
+                },
+                Ok((Verdict::NotMet { reason }, in_tok, out_tok)) => {
+                    // Bug #15: count consecutive rejections; clear with
+                    // `VerifierRejected` once the cap is hit.
+                    let next = inputs.consecutive_rejections.saturating_add(1);
+                    if next >= MAX_CONSECUTIVE_VERIFIER_REJECTIONS {
+                        DecisionOutcome {
+                            decision: cleared_from_inputs(
+                                &inputs,
+                                in_tok + out_tok,
+                                ClearReason::VerifierRejected(reason),
+                            ),
+                            verifier_in_tok: in_tok,
+                            verifier_out_tok: out_tok,
+                            set_consecutive_rejections: Some(next),
+                        }
+                    } else {
+                        DecisionOutcome {
+                            decision: iterate_from_inputs(
+                                &inputs,
+                                in_tok + out_tok,
+                                format!(
+                                    "[goal-driver] You claimed the goal was met, but the verifier disagreed: \
+                                     {reason}. Address that specific gap and continue."
+                                ),
+                            ),
+                            verifier_in_tok: in_tok,
+                            verifier_out_tok: out_tok,
+                            set_consecutive_rejections: Some(next),
+                        }
+                    }
+                }
+                Err(VerifierError::Malformed(_)) => {
+                    // Bug #3: malformed verifier output is NOT fail-open. Treat
+                    // it as `NotMet { unparseable }` so the iteration resumes
+                    // and the model gets another chance instead of falsely
+                    // confirming the goal.
+                    let next = inputs.consecutive_rejections.saturating_add(1);
+                    if next >= MAX_CONSECUTIVE_VERIFIER_REJECTIONS {
+                        DecisionOutcome {
+                            decision: cleared_from_inputs(
+                                &inputs,
+                                0,
+                                ClearReason::VerifierRejected(
+                                    "verifier returned unparseable output".into(),
+                                ),
+                            ),
+                            set_consecutive_rejections: Some(next),
+                            ..DecisionOutcome::default()
+                        }
+                    } else {
+                        DecisionOutcome {
+                            decision: iterate_from_inputs(
+                                &inputs,
+                                0,
+                                "[goal-driver] The verifier returned unparseable output; \
+                                 re-state your status this turn and emit a fresh \
+                                 <goal-status> tag."
+                                    .to_string(),
+                            ),
+                            set_consecutive_rejections: Some(next),
+                            ..DecisionOutcome::default()
+                        }
+                    }
+                }
+                Err(VerifierError::RateLimit | VerifierError::Transport(_)) => {
+                    // Fail open — trust the main model's `met` claim rather
+                    // than burn more budget on a verifier we can't reach.
+                    DecisionOutcome {
+                        decision: cleared_from_inputs(
+                            &inputs,
+                            0,
+                            ClearReason::VerifierUnavailable,
+                        ),
+                        ..DecisionOutcome::default()
+                    }
+                }
+            }
+        }
+        TagOutcome::InProgress { what_remains } => DecisionOutcome {
+            decision: iterate_from_inputs(
+                &inputs,
+                0,
+                format!(
+                    "[goal-driver] Continue toward the active goal. What remains: {}",
+                    if what_remains.is_empty() {
+                        "unspecified — keep going.".to_string()
+                    } else {
+                        what_remains
+                    }
+                ),
+            ),
+            // Bug #15: any non-Met tag resets the rejection counter.
+            set_consecutive_rejections: Some(0),
+            ..DecisionOutcome::default()
+        },
+        TagOutcome::Missing => DecisionOutcome {
+            decision: iterate_from_inputs(
+                &inputs,
+                0,
+                "[goal-driver] Continue toward the active goal. What remains: \
+                 unknown — main model did not emit a <goal-status> tag last turn; \
+                 emit one this turn."
+                    .to_string(),
+            ),
+            set_consecutive_rejections: Some(0),
+            ..DecisionOutcome::default()
+        },
+        TagOutcome::Blocked { why } => DecisionOutcome {
+            decision: iterate_from_inputs(
+                &inputs,
+                0,
+                format!(
+                    "[goal-driver] Last turn reported the goal blocked: {why}. \
+                     Either resolve the blocker yourself, or if it truly requires the human, \
+                     restate the blocker clearly and end the turn — the driver will then \
+                     clear the goal so the user can respond."
+                ),
+            ),
+            set_consecutive_rejections: Some(0),
+            ..DecisionOutcome::default()
+        },
+    }
+}
+
+/// Legacy facade — mutates `state` under the caller's existing lock contract.
+///
+/// New callers should use [`drive_decision`] + [`apply_outcome`] for the
+/// lock-free async path; this wrapper preserves the original `drive` API
+/// for tests and any callers that don't need the lock optimization.
+///
+/// Bug #16: the legacy duplicate `cap_check` was removed; the caller is
+/// now expected to perform the cap-check before invoking `drive`. The
+/// unit tests of `drive` were updated to match.
+///
+/// Bug #11: after the verifier returns `Met`, the caller's `cap_check`
+/// fires once more — handled in `apply_outcome`.
 pub async fn drive(
     state: &mut GoalState,
     last_turn_text: &str,
     verifier: &dyn Verifier,
 ) -> DriverDecision {
-    // Cap check first — never overshoot.
-    if let Some(reason) = state.cap_check() {
-        return cleared(state, reason);
+    let inputs = DriverInputs::snapshot(state);
+    let outcome = drive_decision(inputs, last_turn_text, verifier).await;
+    apply_outcome(state, outcome)
+}
+
+/// Apply the driver's mutations to `state` and return the final [`DriverDecision`].
+///
+/// Implements Bug #11: when the verifier confirmed `Met` but the
+/// post-charge `cap_check` fires (budget exhausted by the verifier's own
+/// spend), the cap reason wins.
+#[must_use]
+pub fn apply_outcome(state: &mut GoalState, outcome: DecisionOutcome) -> DriverDecision {
+    state.record_verifier_tokens(outcome.verifier_in_tok, outcome.verifier_out_tok);
+    if let Some(n) = outcome.set_consecutive_rejections {
+        state.consecutive_rejections = n;
     }
-    let tag = state.last_status_tag.clone().unwrap_or(TagOutcome::Missing);
-    match tag {
-        TagOutcome::Met => {
-            let truncated = truncate_for_verifier(last_turn_text);
-            match verifier.verify(&state.condition, &truncated).await {
-                Ok((Verdict::Met, in_tok, out_tok)) => {
-                    state.record_verifier_tokens(in_tok, out_tok);
-                    cleared(
-                        state,
-                        ClearReason::Met {
-                            reason: "verifier confirmed".into(),
-                        },
-                    )
-                }
-                Ok((Verdict::NotMet { reason }, in_tok, out_tok)) => {
-                    state.record_verifier_tokens(in_tok, out_tok);
-                    iterate(
-                        state,
-                        format!(
-                            "[goal-driver] You claimed the goal was met, but the verifier disagreed: \
-                             {reason}. Address that specific gap and continue."
-                        ),
-                    )
-                }
-                Err(
-                    VerifierError::RateLimit
-                    | VerifierError::Transport(_)
-                    | VerifierError::Malformed(_),
-                ) => {
-                    // Fail open — trust the main model's `met` claim rather
-                    // than burn more budget on a verifier we can't reach.
-                    cleared(state, ClearReason::VerifierUnavailable)
-                }
-            }
+    // Bug #11: after charging verifier spend, re-check the budget cap.
+    // If the verifier pushed us past budget, prefer the cap reason over
+    // any `Met` the driver tentatively decided on.
+    if matches!(outcome.decision, DriverDecision::Cleared { ref reason, .. }
+        if matches!(reason, ClearReasonWire::Met { .. }))
+    {
+        if let Some(cap_reason) = state.cap_check() {
+            return DriverDecision::Cleared {
+                reason: cap_reason.into(),
+                iter: state.iter,
+                tokens_spent: state.tokens_spent,
+            };
         }
-        TagOutcome::InProgress { what_remains } => iterate(
-            state,
-            format!(
-                "[goal-driver] Continue toward the active goal. What remains: {}",
-                if what_remains.is_empty() {
-                    "unspecified — keep going.".to_string()
-                } else {
-                    what_remains
-                }
-            ),
-        ),
-        TagOutcome::Missing => iterate(
-            state,
-            "[goal-driver] Continue toward the active goal. What remains: \
-             unknown — main model did not emit a <goal-status> tag last turn; \
-             emit one this turn."
-                .to_string(),
-        ),
-        TagOutcome::Blocked { why } => iterate(
-            state,
-            format!(
-                "[goal-driver] Last turn reported the goal blocked: {why}. \
-                 Either resolve the blocker yourself, or if it truly requires the human, \
-                 restate the blocker clearly and end the turn — the driver will then \
-                 clear the goal so the user can respond."
-            ),
-        ),
+    }
+    // Refresh iter/tokens_spent in the decision so the wire event reflects
+    // the post-charge totals (the original decision was built from the
+    // pre-charge snapshot).
+    match outcome.decision {
+        DriverDecision::Cleared { reason, .. } => DriverDecision::Cleared {
+            reason,
+            iter: state.iter,
+            tokens_spent: state.tokens_spent,
+        },
+        DriverDecision::Iterate {
+            synthesized_prompt,
+            iter_event: _,
+        } => DriverDecision::Iterate {
+            synthesized_prompt,
+            iter_event: StreamEvent::GoalIteration {
+                iter: state.iter,
+                tokens_spent: state.tokens_spent,
+                last_tag: TagOutcomeWire::from(
+                    state.last_status_tag.clone().unwrap_or(TagOutcome::Missing),
+                ),
+            },
+        },
     }
 }
 
-fn cleared(state: &GoalState, reason: ClearReason) -> DriverDecision {
+fn cleared_from_inputs(
+    inputs: &DriverInputs,
+    extra_tokens: u64,
+    reason: ClearReason,
+) -> DriverDecision {
     DriverDecision::Cleared {
         reason: reason.into(),
-        iter: state.iter,
-        tokens_spent: state.tokens_spent,
+        iter: inputs.iter,
+        tokens_spent: inputs.tokens_spent.saturating_add(extra_tokens),
     }
 }
 
-fn iterate(state: &GoalState, prompt: String) -> DriverDecision {
+fn iterate_from_inputs(inputs: &DriverInputs, extra_tokens: u64, prompt: String) -> DriverDecision {
     let iter_event = StreamEvent::GoalIteration {
-        iter: state.iter,
-        tokens_spent: state.tokens_spent,
+        iter: inputs.iter,
+        tokens_spent: inputs.tokens_spent.saturating_add(extra_tokens),
         last_tag: TagOutcomeWire::from(
-            state.last_status_tag.clone().unwrap_or(TagOutcome::Missing),
+            inputs
+                .last_status_tag
+                .clone()
+                .unwrap_or(TagOutcome::Missing),
         ),
     };
     DriverDecision::Iterate {
@@ -321,44 +534,152 @@ mod tests {
         assert_eq!(v.call_count(), 1);
     }
 
+    // Bug #16: `drive` no longer does its own cap_check; the caller is
+    // expected to check `state.cap_check()` BEFORE calling `drive`. The
+    // tests below verify that contract: when `drive` is called on a state
+    // already past the cap, it still dispatches via the tag (it does NOT
+    // emit a phantom `MaxIter` reason). The cap_check is the caller's job.
     #[tokio::test]
-    async fn cap_check_max_iter_fires_without_calling_verifier_even_on_met() {
-        // Set up a goal already at the iter cap; even with a Met tag the
-        // cap check fires first and the verifier MUST NOT be invoked.
-        let mut g = GoalState::new("x".into(), Some(3), None);
-        g.iter = 3;
+    async fn drive_dispatches_by_tag_even_when_caller_skipped_cap_check() {
+        // This documents the new contract — `drive` will happily call the
+        // verifier even when iter > max_iter, because the cap_check is the
+        // caller's responsibility (deduplicated from `main.rs::1576`).
+        //
+        // Note: we use a HIGH iter cap here so the post-charge cap_check
+        // (Bug #11) does NOT fire — the point of this test is to prove
+        // that `drive` no longer short-circuits on cap_check at the top.
+        let mut g = GoalState::new("x".into(), Some(100), None);
+        g.iter = 50;
         g.last_status_tag = Some(TagOutcome::Met);
-        let v = MockVerifier::new(Vec::new()); // empty — would panic if consumed
+        let v = MockVerifier::new(vec![Ok((Verdict::Met, 10, 5))]);
         let d = drive(&mut g, "done", &v).await;
+        // Verifier WAS called; the cap is the caller's responsibility now.
+        assert_eq!(v.call_count(), 1);
+        // The verifier confirmed Met, so the decision is Cleared { Met }.
         match d {
-            DriverDecision::Cleared { reason, iter, .. } => {
-                assert!(matches!(reason, ClearReasonWire::MaxIter));
-                assert_eq!(iter, 3);
+            DriverDecision::Cleared { reason, .. } => {
+                assert!(matches!(reason, ClearReasonWire::Met { .. }));
             }
-            other => panic!("expected Cleared MaxIter, got {other:?}"),
+            other => panic!("expected Cleared Met, got {other:?}"),
         }
-        assert_eq!(v.call_count(), 0);
     }
 
+    // Bug #11: when the verifier returns Met but its own token spend pushes
+    // us past the budget, the cap reason wins over Met.
     #[tokio::test]
-    async fn cap_check_budget_exhausted_fires_without_calling_verifier() {
+    async fn verifier_met_but_post_charge_budget_exhausted_clears_as_budget() {
+        // Budget = 100; pre-call we've already spent 50; verifier returns
+        // Met with 60 token spend → total 110 > 100. Cap fires.
         let mut g = GoalState::new("x".into(), None, Some(100));
-        g.tokens_spent = 100;
+        g.tokens_spent = 50;
         g.last_status_tag = Some(TagOutcome::Met);
-        let v = MockVerifier::new(Vec::new());
+        let v = MockVerifier::new(vec![Ok((Verdict::Met, 40, 20))]);
         let d = drive(&mut g, "done", &v).await;
         match d {
-            DriverDecision::Cleared {
-                reason,
-                tokens_spent,
-                ..
-            } => {
-                assert!(matches!(reason, ClearReasonWire::BudgetExhausted));
-                assert_eq!(tokens_spent, 100);
+            DriverDecision::Cleared { reason, tokens_spent, .. } => {
+                assert!(
+                    matches!(reason, ClearReasonWire::BudgetExhausted),
+                    "expected BudgetExhausted, got {reason:?}"
+                );
+                assert_eq!(tokens_spent, 110);
             }
             other => panic!("expected Cleared BudgetExhausted, got {other:?}"),
         }
-        assert_eq!(v.call_count(), 0);
+    }
+
+    // Bug #3: malformed verifier output must NOT fail-open as Met. It
+    // should retry (treated as NotMet { unparseable }) so the model gets
+    // another chance.
+    #[tokio::test]
+    async fn malformed_verifier_output_retries_does_not_clear_as_met() {
+        let mut g = fresh("x");
+        g.last_status_tag = Some(TagOutcome::Met);
+        let v = MockVerifier::new(vec![Err(VerifierError::Malformed("garbage".into()))]);
+        let d = drive(&mut g, "done", &v).await;
+        match d {
+            DriverDecision::Iterate { synthesized_prompt, .. } => {
+                assert!(
+                    synthesized_prompt.contains("unparseable"),
+                    "expected the synthesized prompt to mention unparseable; got: {synthesized_prompt:?}"
+                );
+            }
+            DriverDecision::Cleared { reason, .. } => {
+                panic!(
+                    "malformed verifier output must NOT clear as Met or Unavailable; got {reason:?}"
+                );
+            }
+        }
+        assert_eq!(v.call_count(), 1);
+    }
+
+    // Bug #3 control: a RateLimit (vs Malformed) still fails OPEN — that's
+    // intentional, so the model doesn't get stuck waiting on a verifier
+    // we genuinely can't reach.
+    #[tokio::test]
+    async fn rate_limit_still_fails_open_as_verifier_unavailable() {
+        let mut g = fresh("x");
+        g.last_status_tag = Some(TagOutcome::Met);
+        let v = MockVerifier::new(vec![Err(VerifierError::RateLimit)]);
+        let d = drive(&mut g, "done", &v).await;
+        match d {
+            DriverDecision::Cleared { reason, .. } => {
+                assert!(matches!(reason, ClearReasonWire::VerifierUnavailable));
+            }
+            other => panic!("expected Cleared VerifierUnavailable, got {other:?}"),
+        }
+    }
+
+    // Bug #15: after MAX_CONSECUTIVE_VERIFIER_REJECTIONS NotMet returns,
+    // the driver gives up and emits Cleared { VerifierRejected }.
+    #[tokio::test]
+    async fn three_consecutive_rejections_clear_as_verifier_rejected() {
+        let mut g = fresh("x");
+        // Simulate the state after two prior rejections — the third should
+        // trip the cap.
+        g.consecutive_rejections = 2;
+        g.last_status_tag = Some(TagOutcome::Met);
+        let v = MockVerifier::new(vec![Ok((
+            Verdict::NotMet {
+                reason: "still failing".into(),
+            },
+            10,
+            5,
+        ))]);
+        let d = drive(&mut g, "done", &v).await;
+        match d {
+            DriverDecision::Cleared { reason, .. } => match reason {
+                ClearReasonWire::VerifierRejected { why } => {
+                    assert!(why.contains("still failing"));
+                }
+                other => panic!("expected VerifierRejected, got {other:?}"),
+            },
+            other => panic!("expected Cleared, got {other:?}"),
+        }
+        assert_eq!(g.consecutive_rejections, 3);
+    }
+
+    // Bug #15: a non-Met tag (or a Met that the verifier confirms) resets
+    // the counter so a stale prior-rejection streak doesn't get carried.
+    #[tokio::test]
+    async fn in_progress_tag_resets_consecutive_rejections() {
+        let mut g = fresh("x");
+        g.consecutive_rejections = 2;
+        g.last_status_tag = Some(TagOutcome::InProgress {
+            what_remains: "more work".into(),
+        });
+        let v = MockVerifier::new(Vec::new());
+        let _ = drive(&mut g, "", &v).await;
+        assert_eq!(g.consecutive_rejections, 0);
+    }
+
+    #[tokio::test]
+    async fn verifier_met_resets_consecutive_rejections() {
+        let mut g = fresh("x");
+        g.consecutive_rejections = 2;
+        g.last_status_tag = Some(TagOutcome::Met);
+        let v = MockVerifier::new(vec![Ok((Verdict::Met, 5, 5))]);
+        let _ = drive(&mut g, "done", &v).await;
+        assert_eq!(g.consecutive_rejections, 0);
     }
 
     #[test]

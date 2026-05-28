@@ -59,6 +59,14 @@ impl Verifier for AnthropicHaikuVerifier {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        // Bug #3: an empty assistant text would fall through to
+        // `parse_verdict("")` which already returns `Malformed`, but the
+        // error message is the empty string — useless when debugging a
+        // verifier that's silently producing zero text blocks. Surface a
+        // more informative error so logs make the failure mode obvious.
+        if text.trim().is_empty() {
+            return Err(VerifierError::Malformed("empty reply".into()));
+        }
         let verdict = parse_verdict(&text)?;
         Ok((
             verdict,
