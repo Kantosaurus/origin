@@ -19,6 +19,7 @@ pub enum TagOutcome {
     Missing,
 }
 
+#[allow(clippy::module_name_repetitions)] // `GoalState` is the documented public type
 #[derive(Debug, Clone)]
 pub struct GoalState {
     pub condition: String,
@@ -68,7 +69,7 @@ impl GoalState {
     /// Top-of-iteration cap check. Returns `Some(reason)` if the iteration
     /// should not run; the caller emits `GoalCleared { reason }` and stops.
     #[must_use]
-    pub fn cap_check(&self) -> Option<ClearReason> {
+    pub const fn cap_check(&self) -> Option<ClearReason> {
         if self.iter >= self.max_iter {
             Some(ClearReason::MaxIter)
         } else if self.tokens_spent >= self.token_budget {

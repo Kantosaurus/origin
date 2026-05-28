@@ -12,6 +12,7 @@ pub enum Verdict {
     NotMet { reason: String },
 }
 
+#[allow(clippy::module_name_repetitions)] // `VerifierError` is the public error type
 #[derive(Debug, Error)]
 pub enum VerifierError {
     #[error("verifier transport: {0}")]

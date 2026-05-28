@@ -11,6 +11,7 @@ use crate::state::TagOutcome;
 ///
 /// Returns [`TagOutcome::Missing`] if no tag is found or the rightmost one
 /// has an unknown `state=` value.
+#[allow(clippy::module_name_repetitions)] // `parse_tag` is the public entry point of the `tag` module
 #[must_use]
 pub fn parse_tag(text: &str) -> TagOutcome {
     let mut last = TagOutcome::Missing;

@@ -64,7 +64,7 @@ pub fn parse_goal_args(raw: &str) -> Result<GoalArgs, FlagParseError> {
                 })?);
             }
             "budget" => {
-                token_budget = Some(parse_budget(value).ok_or(FlagParseError::InvalidValue {
+                token_budget = Some(parse_budget(value).ok_or_else(|| FlagParseError::InvalidValue {
                     flag: key.to_string(),
                     value: value.to_string(),
                 })?);

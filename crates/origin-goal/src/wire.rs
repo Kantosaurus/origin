@@ -5,6 +5,7 @@
 use crate::state::{ClearReason, GoalStatus, TagOutcome};
 use serde::{Deserialize, Serialize};
 
+#[allow(clippy::module_name_repetitions)] // `TagOutcomeWire` mirrors `TagOutcome` for protocol/resume use
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TagOutcomeWire {
@@ -25,6 +26,7 @@ impl From<TagOutcome> for TagOutcomeWire {
     }
 }
 
+#[allow(clippy::module_name_repetitions)] // `ClearReasonWire` mirrors `ClearReason` for protocol/resume use
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClearReasonWire {
@@ -51,6 +53,7 @@ impl From<ClearReason> for ClearReasonWire {
     }
 }
 
+#[allow(clippy::module_name_repetitions)] // `GoalStatusWire` mirrors `GoalStatus` for protocol/resume use
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GoalStatusWire {
