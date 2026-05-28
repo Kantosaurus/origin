@@ -1133,12 +1133,16 @@ async fn dispatch_tool(
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "Glob" => {
-            let pat = args
-                .get("pattern")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| LoopError::BadArgs("Glob: missing `pattern`".into()))?;
-            let hits = origin_tools::builtins::glob_tool::glob_tool(pat).map_err(LoopError::ToolFailure)?;
-            Ok(hits.join("\n"))
+            let gargs = origin_tools::builtins::glob_tool::GlobArgs {
+                pattern: args.get("pattern").and_then(Value::as_str)
+                    .ok_or_else(|| LoopError::BadArgs("Glob: missing `pattern`".into()))?
+                    .to_string(),
+                path: args.get("path").and_then(Value::as_str).map(str::to_string),
+                head_limit: args.get("head_limit").and_then(Value::as_u64).map(|n| n as u32),
+            };
+            origin_tools::builtins::glob_tool::glob_v2(gargs)
+                .map(|v| serde_json::to_string(&v).unwrap())
+                .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "Grep" => {
             let mode = args.get("output_mode").and_then(Value::as_str).map(|s| match s {
