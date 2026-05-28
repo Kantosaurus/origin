@@ -5,7 +5,7 @@
 //! tokio or providers.
 
 use serde::{Deserialize, Serialize};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 pub const DEFAULT_MAX_ITER: u32 = 20;
 pub const DEFAULT_TOKEN_BUDGET: u64 = 200_000;
@@ -29,8 +29,22 @@ pub struct GoalState {
     pub tokens_spent: u64,
     pub token_budget: u64,
     pub started_at: SystemTime,
+    /// Monotonic counterpart to `started_at` for elapsed-time math. Not
+    /// serialized — when a `GoalState` is rebuilt from a snapshot on resume
+    /// the wall-clock origin is unknown, so we default this to
+    /// `Instant::now()` (i.e. "started now"). Bug #25.
+    pub started_at_instant: Instant,
     pub last_status_tag: Option<TagOutcome>,
+    /// Number of CONSECUTIVE verifier rejections so far. Reset to 0 on any
+    /// non-`Met` tag or a successful verification; incremented when the
+    /// verifier returns `Verdict::NotMet`. When it reaches
+    /// [`MAX_CONSECUTIVE_VERIFIER_REJECTIONS`] the driver gives up and
+    /// emits `Cleared { VerifierRejected(..) }`. Bug #15.
+    pub consecutive_rejections: u32,
 }
+
+/// Cap on consecutive verifier rejections before the driver gives up.
+pub const MAX_CONSECUTIVE_VERIFIER_REJECTIONS: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalStatus {
@@ -62,7 +76,9 @@ impl GoalState {
             tokens_spent: 0,
             token_budget: token_budget.unwrap_or(DEFAULT_TOKEN_BUDGET),
             started_at: SystemTime::now(),
+            started_at_instant: Instant::now(),
             last_status_tag: None,
+            consecutive_rejections: 0,
         }
     }
 
@@ -94,5 +110,32 @@ impl GoalState {
         self.tokens_spent = self
             .tokens_spent
             .saturating_add(input_tokens.saturating_add(output_tokens));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    // Bug #25: `started_at_instant` is monotonic — elapsed-time math
+    // works even if the wall clock jumps backwards. Test that
+    // elapsed() returns a sensible positive duration.
+    #[test]
+    fn started_at_instant_is_monotonic_and_measures_elapsed() {
+        let g = GoalState::new("test".into(), None, None);
+        let captured = g.started_at_instant;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let elapsed = captured.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(10),
+            "started_at_instant.elapsed() must measure >= 10ms after sleep; got {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn fresh_goal_starts_with_zero_consecutive_rejections() {
+        let g = GoalState::new("test".into(), None, None);
+        assert_eq!(g.consecutive_rejections, 0);
     }
 }

@@ -85,4 +85,10 @@ pub struct GoalSnapshot {
     pub token_budget: u64,
     pub started_at_unix: u64,
     pub status: GoalStatusWire,
+    /// Preserved across resume so the driver's first post-resume tick
+    /// knows whether the model last claimed `Met` (triggers a fresh
+    /// verifier call) vs. ordinary in-progress. `serde(default)` so
+    /// pre-Phase-9-fix tokens without this field still deserialize. Bug #9.
+    #[serde(default)]
+    pub last_status_tag: Option<TagOutcomeWire>,
 }

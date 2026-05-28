@@ -19,6 +19,7 @@ fn token_round_trips_with_active_goal() {
             token_budget: 200_000,
             started_at_unix: 1_716_000_000,
             status: GoalStatusWire::Active,
+            last_status_tag: None,
         }),
     };
     let bytes = serde_json::to_vec(&token).unwrap();
@@ -58,6 +59,7 @@ fn token_round_trips_with_terminal_status() {
             token_budget: 200_000,
             started_at_unix: 1_716_000_000,
             status: GoalStatusWire::Cleared { by: ClearReasonWire::MaxIter },
+            last_status_tag: None,
         }),
     };
     let bytes = serde_json::to_vec(&token).unwrap();
