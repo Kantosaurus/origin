@@ -2132,6 +2132,7 @@ fn tool_diff_lines(name: &str, args: &Value) -> Vec<crate::protocol::DiffLine> {
                     oi += 1;
                     ni += 1;
                 } else {
+                    let (oi_before, ni_before) = (oi, ni);
                     while oi < max_old && (ni >= max_new || !new_lines[ni..].contains(&old_lines[oi])) {
                         old_i += 1;
                         out.push(DiffLine {
@@ -2150,6 +2151,33 @@ fn tool_diff_lines(name: &str, args: &Value) -> Vec<crate::protocol::DiffLine> {
                         });
                         ni += 1;
                     }
+                    // Forward-progress guard. When the current old and new lines
+                    // differ yet each recurs later in the *opposite* side (a
+                    // reorder/transposition), both runs above match zero lines and
+                    // neither cursor moves — the outer `while` then spins forever.
+                    // Emit the current pair as delete+insert so every iteration
+                    // advances at least one cursor (the outer condition guarantees
+                    // at least one side still has a line).
+                    if oi == oi_before && ni == ni_before {
+                        if oi < max_old {
+                            old_i += 1;
+                            out.push(DiffLine {
+                                kind: "-".to_string(),
+                                line_no: old_i,
+                                text: old_lines[oi].to_string(),
+                            });
+                            oi += 1;
+                        }
+                        if ni < max_new {
+                            new_i += 1;
+                            out.push(DiffLine {
+                                kind: "+".to_string(),
+                                line_no: new_i,
+                                text: new_lines[ni].to_string(),
+                            });
+                            ni += 1;
+                        }
+                    }
                 }
             }
             out
@@ -2167,6 +2195,45 @@ fn tool_diff_lines(name: &str, args: &Value) -> Vec<crate::protocol::DiffLine> {
                 .collect()
         }
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod diff_line_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Regression: an `Edit` whose old/new lines are *reordered* (each current
+    /// line recurs later in the opposite side) used to make `tool_diff_lines`
+    /// spin forever — neither cursor advanced, so the outer `while` never
+    /// exited. It runs on the live turn path (`agent.rs:848`, building the
+    /// `ToolActivity` diff), so the bug wedged the whole daemon at 100% CPU on
+    /// one thread. This test fails by *non-termination* if the bug regresses:
+    /// the diff is computed on a worker thread guarded by a wall-clock deadline.
+    #[test]
+    fn edit_diff_terminates_on_reordered_lines() {
+        let worker = std::thread::spawn(|| {
+            let args = serde_json::json!({
+                "old_string": "alpha\nbeta",
+                "new_string": "beta\nalpha",
+            });
+            tool_diff_lines("Edit", &args)
+        });
+
+        let start = Instant::now();
+        while !worker.is_finished() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "tool_diff_lines did not terminate on reordered lines (infinite-loop regression)"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let diff = worker.join().expect("tool_diff_lines panicked");
+        // A correct diff is finite and accounts for every line on both sides.
+        let texts: Vec<&str> = diff.iter().map(|d| d.text.as_str()).collect();
+        assert!(texts.contains(&"alpha"), "missing 'alpha' in diff: {texts:?}");
+        assert!(texts.contains(&"beta"), "missing 'beta' in diff: {texts:?}");
     }
 }
 
