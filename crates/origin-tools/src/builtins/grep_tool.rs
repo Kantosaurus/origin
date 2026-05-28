@@ -1,12 +1,18 @@
 //! `Grep` tool — search files under a root for a regex pattern.
 //!
 //! Returns lines as `"<path>:<line_number>: <line_content>"`.
+//!
+//! Traversal uses [`ignore::WalkBuilder`] (the same walker `ripgrep`
+//! uses), so `.gitignore`, `.git/`, `node_modules/`, hidden files, and
+//! sibling `.ignore` files are skipped by default. Without this filter a
+//! workspace-root grep would walk every build artifact under `target/`
+//! and hang for minutes; with it, the same call completes in seconds.
 
 use crate::{SideEffects, Tier, Urgency};
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
-use walkdir::WalkDir;
+use ignore::WalkBuilder;
 
 /// Search for `pattern` (regex) under `root` (directory or file).
 ///
@@ -16,9 +22,13 @@ use walkdir::WalkDir;
 pub fn grep_tool(pattern: &str, root: &str) -> Result<Vec<String>, String> {
     let matcher = RegexMatcher::new(pattern).map_err(|e| format!("regex error: {e}"))?;
     let mut results = Vec::new();
-    for entry in WalkDir::new(root).follow_links(false) {
+    let walker = WalkBuilder::new(root)
+        .follow_links(false)
+        .standard_filters(true)
+        .build();
+    for entry in walker {
         let entry = entry.map_err(|e| format!("walk error: {e}"))?;
-        if !entry.file_type().is_file() {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         let path = entry.path().to_path_buf();

@@ -10,7 +10,7 @@ fn bench_keystroke_to_pixel(c: &mut Criterion) {
     group.bench_function("type_then_render_one_frame", |b| {
         b.iter_batched(
             || {
-                let app = App::new("anthropic", "claude-opus-4-7".to_string());
+                let app = App::new("anthropic", "claude-opus-4-7".to_string(), Default::default());
                 let composer = Composer::new(200, 60);
                 let widget = StreamWidget::new(Rect {
                     row: 0,

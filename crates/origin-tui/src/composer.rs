@@ -46,6 +46,8 @@ pub struct Composer {
 
 // ─── layout helpers ──────────────────────────────────────────────────────────
 
+pub const PROMPT_ROWS: u16 = 1;
+
 fn compute_side_cols(cols: u16, visible: bool) -> u16 {
     if visible {
         (cols / 3).clamp(20, 40)
@@ -170,9 +172,12 @@ impl Composer {
     ///   characters that would otherwise look identical to blank scratch.
     #[must_use]
     pub fn new(cols: u16, rows: u16) -> Self {
-        let side_visible = true;
+        // The side panel is hidden by default — the main pane uses the
+        // full terminal width so the input card stays centered. Callers
+        // that want a sidebar can flip `side_visible` via `resize`.
+        let side_visible = false;
         let side_cols = compute_side_cols(cols, side_visible);
-        let pane_rows = rows.saturating_sub(3);
+        let pane_rows = rows.saturating_sub(PROMPT_ROWS);
         let main_cols = cols.saturating_sub(side_cols);
 
         Self {
@@ -181,10 +186,10 @@ impl Composer {
             side_cols,
             main: Grid::new_filled(main_cols, pane_rows, SCRATCH_SENTINEL),
             side: Grid::new_filled(side_cols.max(1), pane_rows, SCRATCH_SENTINEL),
-            prompt: Grid::new_filled(cols, 3, SCRATCH_SENTINEL),
+            prompt: Grid::new_filled(cols, PROMPT_ROWS, SCRATCH_SENTINEL),
             scratch_main: Grid::new_filled(main_cols, pane_rows, SCRATCH_SENTINEL),
             scratch_side: Grid::new_filled(side_cols.max(1), pane_rows, SCRATCH_SENTINEL),
-            scratch_prompt: Grid::new_filled(cols, 3, SCRATCH_SENTINEL),
+            scratch_prompt: Grid::new_filled(cols, PROMPT_ROWS, SCRATCH_SENTINEL),
             side_visible,
         }
     }
@@ -198,20 +203,20 @@ impl Composer {
         let side_cols = compute_side_cols(cols, side_visible);
         self.side_cols = side_cols;
 
-        let pane_rows = rows.saturating_sub(3);
+        let pane_rows = rows.saturating_sub(PROMPT_ROWS);
         let main_cols = cols.saturating_sub(side_cols);
 
         // Preserve existing content in the live grids (clip, not rewrap).
         self.main = resize_clipped(&self.main, main_cols, pane_rows);
         self.side = resize_clipped(&self.side, side_cols.max(1), pane_rows);
-        self.prompt = resize_clipped(&self.prompt, cols, 3);
+        self.prompt = resize_clipped(&self.prompt, cols, PROMPT_ROWS);
 
         // Scratch grids also resize (clear) so the next diff is a full repaint.
         // Use SCRATCH_SENTINEL to match the initialization in `new()`, ensuring
         // that the scratch grid stays distinct from the live grid post-draw.
         self.scratch_main = Grid::new_filled(main_cols, pane_rows, SCRATCH_SENTINEL);
         self.scratch_side = Grid::new_filled(side_cols.max(1), pane_rows, SCRATCH_SENTINEL);
-        self.scratch_prompt = Grid::new_filled(cols, 3, SCRATCH_SENTINEL);
+        self.scratch_prompt = Grid::new_filled(cols, PROMPT_ROWS, SCRATCH_SENTINEL);
     }
 
     /// Mutable reference to the main pane grid.
@@ -222,6 +227,13 @@ impl Composer {
     /// Mutable reference to the side panel grid.
     pub fn side_grid(&mut self) -> &mut Grid {
         &mut self.side
+    }
+
+    /// Whether the side panel is currently visible. Callers can skip
+    /// expensive `side_grid` rendering when this returns `false`.
+    #[must_use]
+    pub const fn side_visible(&self) -> bool {
+        self.side_visible
     }
 
     /// Mutable reference to the prompt bar grid.
@@ -235,7 +247,7 @@ impl Composer {
     ///
     /// Returns an empty `Vec` when nothing has changed since the last frame.
     pub fn frame(&mut self) -> Vec<u8> {
-        let pane_rows = self.rows.saturating_sub(3);
+        let pane_rows = self.rows.saturating_sub(PROMPT_ROWS);
         let side_col_offset = self.cols.saturating_sub(self.side_cols);
 
         // Main pane: offset (0, 0).

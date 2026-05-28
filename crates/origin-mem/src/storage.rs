@@ -529,15 +529,17 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PartialRow> {
 /// Lookup-or-insert each tag name into `mem_tags`; return a 16-byte bitset BLOB.
 ///
 /// Uses INSERT OR IGNORE (UPSERT) so concurrent callers racing on the same tag
-/// name all converge to the same `bit_idx`.  Must be called inside an active
-/// transaction so the next-free-slot lookup and the INSERT are race-free.
+/// name all converge to the same `bit_idx`.  Takes a [`rusqlite::Transaction`]
+/// by reference rather than a bare [`rusqlite::Connection`] so the compiler
+/// enforces — at every call site — that the next-free-slot lookup and the
+/// INSERT happen inside an active transaction (race-free).
 ///
 /// Tags beyond bit index 127 are silently dropped with a `tracing::warn!`.
-fn resolve_tags(conn: &rusqlite::Connection, tags: &[&str]) -> rusqlite::Result<Vec<u8>> {
+fn resolve_tags(tx: &rusqlite::Transaction<'_>, tags: &[&str]) -> rusqlite::Result<Vec<u8>> {
     let mut bits = BitArray::<[u8; 16], Lsb0>::new([0u8; 16]);
     for &name in tags {
         // Pick the candidate next-free slot before attempting the INSERT.
-        let max_idx: Option<i64> = conn
+        let max_idx: Option<i64> = tx
             .query_row("SELECT MAX(bit_idx) FROM mem_tags", [], |r| r.get(0))
             .optional()?
             .flatten();
@@ -549,14 +551,14 @@ fn resolve_tags(conn: &rusqlite::Connection, tags: &[&str]) -> rusqlite::Result<
 
         // INSERT OR IGNORE: if another caller already inserted this name (race),
         // the existing row wins and the INSERT is silently skipped.
-        conn.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO mem_tags (bit_idx, name) VALUES (?1, ?2)",
             params![next, name],
         )?;
 
         // Always resolve bit_idx from the authoritative row (handles both the
         // fresh-insert case and the already-existed case).
-        let bit_idx: i64 = conn.query_row(
+        let bit_idx: i64 = tx.query_row(
             "SELECT bit_idx FROM mem_tags WHERE name = ?1",
             params![name],
             |r| r.get(0),

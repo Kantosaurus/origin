@@ -4,15 +4,17 @@
 //! inline markdown (bold, headers, code), heading hierarchy,
 //! code block backgrounds, side panel rendering.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use origin_tui::composer::Composer;
+use origin_tui::composer::{Composer, PROMPT_ROWS};
 use origin_tui::grid::{Attr, Cell, Grid};
 use origin_tui::stream_widget::StreamWidget;
 use origin_tui::widgets::plan_panel::PlanLine;
 use unicode_width::UnicodeWidthChar;
 
+use crate::autocomplete::CompletionSources;
 use crate::status::UsageSnapshot;
+use crate::suggestions::SuggestionState;
 use crate::theme;
 
 #[derive(Debug, Clone)]
@@ -29,25 +31,158 @@ impl ScrollLine {
     }
 }
 
+const SPINNER_FRAMES: &[char] = &[
+    '\u{280B}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283C}', '\u{2834}', '\u{2826}',
+    '\u{2827}', '\u{2807}', '\u{280F}',
+];
+const SPINNER_INTERVAL_MS: u64 = 80;
+
+#[derive(Debug)]
+pub struct Spinner {
+    pub active: bool,
+    start: Instant,
+}
+
+impl Spinner {
+    fn new() -> Self {
+        Self {
+            active: false,
+            start: Instant::now(),
+        }
+    }
+
+    pub fn start(&mut self) {
+        self.active = true;
+        self.start = Instant::now();
+    }
+
+    pub fn stop(&mut self) {
+        self.active = false;
+    }
+
+    fn frame_char(&self) -> char {
+        if !self.active {
+            return ' ';
+        }
+        let elapsed = self.start.elapsed().as_millis() as u64;
+        let idx = (elapsed / SPINNER_INTERVAL_MS) as usize % SPINNER_FRAMES.len();
+        SPINNER_FRAMES[idx]
+    }
+}
+
 #[derive(Debug)]
 pub struct App {
     pub scrollback: Vec<ScrollLine>,
     pub input: String,
+    pub cursor: usize,
     pub current_assistant: Option<String>,
     pub usage: UsageSnapshot,
     pub scroll_offset: usize,
+    pub suggestions: SuggestionState,
+    pub sources: CompletionSources,
+    pub workflow: String,
+    pub spinner: Spinner,
+    /// `Some(start)` while a prompt turn is in flight. The status line adds
+    /// `start.elapsed()` to `usage.elapsed` so seconds tick live during a
+    /// turn without waiting for the final reply.
+    pub turn_started: Option<Instant>,
 }
+
+const BANNER: &[&str] = &[
+    " \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2588}\u{2557}   \u{2588}\u{2588}\u{2557}",
+    "\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D} \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}  \u{2588}\u{2588}\u{2551}",
+    "\u{2588}\u{2588}\u{2551}   \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255D}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}  \u{2588}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2554}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2551}",
+    "\u{2588}\u{2588}\u{2551}   \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}   \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}\u{255A}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}",
+    "\u{255A}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255D}\u{2588}\u{2588}\u{2551}  \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}\u{255A}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255D}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551} \u{255A}\u{2588}\u{2588}\u{2588}\u{2588}\u{2551}",
+    " \u{255A}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D} \u{255A}\u{2550}\u{255D}  \u{255A}\u{2550}\u{255D}\u{255A}\u{2550}\u{255D} \u{255A}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D} \u{255A}\u{2550}\u{255D}\u{255A}\u{2550}\u{255D}  \u{255A}\u{2550}\u{2550}\u{2550}\u{255D}",
+];
 
 impl App {
     #[must_use]
-    pub fn new(provider: &'static str, model: impl Into<String>) -> Self {
+    pub fn new(
+        provider: &'static str,
+        model: impl Into<String>,
+        sources: CompletionSources,
+    ) -> Self {
         Self {
             scrollback: Vec::new(),
             input: String::new(),
+            cursor: 0,
             current_assistant: None,
             usage: UsageSnapshot::new(provider, model),
             scroll_offset: 0,
+            suggestions: SuggestionState::default(),
+            sources,
+            workflow: "Code".to_string(),
+            spinner: Spinner::new(),
+            turn_started: None,
         }
+    }
+
+    /// Start the live turn timer. Called when a user submission begins.
+    pub fn start_turn_timer(&mut self) {
+        self.turn_started = Some(Instant::now());
+    }
+
+    /// Stop the live timer and fold the elapsed delta into `usage.elapsed`
+    /// so the status line transitions seamlessly from "ticking" to the
+    /// final accumulated total.
+    pub fn stop_turn_timer(&mut self) {
+        if let Some(start) = self.turn_started.take() {
+            self.usage.elapsed += start.elapsed();
+        }
+    }
+
+    /// Apply a streaming usage delta. Mirrors `record_usage` but takes no
+    /// elapsed value — used while a turn is in flight so the token counts
+    /// and cost in the status line update as events stream in.
+    pub fn record_usage_tokens(
+        &mut self,
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_read: u32,
+        cache_write: u32,
+    ) {
+        self.usage.input_tokens = self.usage.input_tokens.saturating_add(input_tokens);
+        self.usage.output_tokens = self.usage.output_tokens.saturating_add(output_tokens);
+        self.usage.cache_read_input_tokens =
+            self.usage.cache_read_input_tokens.saturating_add(cache_read);
+        self.usage.cache_creation_input_tokens =
+            self.usage.cache_creation_input_tokens.saturating_add(cache_write);
+    }
+
+    pub fn recompute_suggestions(&mut self) {
+        self.suggestions = crate::suggestions::suggest(&self.input, &self.sources);
+    }
+
+    pub fn push_banner(&mut self, cols: u16, rows: u16) {
+        let main_rows = rows.saturating_sub(PROMPT_ROWS) as usize;
+        let content_height = BANNER.len() + 4;
+        let card_height = 4usize;
+        let group = content_height + 2 + card_height;
+        let top_pad = main_rows.saturating_sub(group) / 2;
+
+        for _ in 0..top_pad {
+            self.scrollback
+                .push(ScrollLine::styled(String::new(), 0, 0, false));
+        }
+        for line in BANNER {
+            let w = char_display_width(line) as usize;
+            let pad = (cols as usize).saturating_sub(w) / 2;
+            let padded = format!("{:>width$}{line}", "", width = pad);
+            self.scrollback
+                .push(ScrollLine::styled(padded, theme::ACCENT_DIM, 0, false));
+        }
+        for _ in 0..3 {
+            self.scrollback
+                .push(ScrollLine::styled(String::new(), 0, 0, false));
+        }
+        let tip = "\u{25CF} Tip  Type / to browse skills and workflows";
+        let tw = char_display_width(tip) as usize;
+        let tpad = (cols as usize).saturating_sub(tw) / 2;
+        let padded_tip = format!("{:>width$}{tip}", "", width = tpad);
+        self.scrollback
+            .push(ScrollLine::styled(padded_tip, theme::MUTED, 0, false));
     }
 
     pub fn set_model(&mut self, model: impl Into<String>) {
@@ -186,6 +321,10 @@ impl App {
                         ));
                     }
                 }
+                // Trailing blank line so the next user turn (or the input
+                // card) has visible separation from this response.
+                self.scrollback
+                    .push(ScrollLine::styled(String::new(), 0, 0, false));
             }
         }
     }
@@ -219,41 +358,49 @@ impl App {
                 }
             }
 
+            let card_w = 75u16.min(cols.saturating_sub(4));
+            let cl = cols.saturating_sub(card_w) / 2;
+            let cr = cl + card_w;
+            let cs = cl + 2;
+            let text_w = cr.saturating_sub(cs) as usize;
+
+            let wrapped = wrap_input_lines(&self.input, text_w);
+            let line_count = (wrapped.len() as u16).min(6);
+            let card_h = line_count + 1;
+            let card_total = card_h + 2;
+            let at_bottom = rows.saturating_sub(card_total);
+            // Reserve a single row of breathing room below the scrollback so
+            // the last line of output never sits flush against the input
+            // card. `finalize_assistant_turn` also appends a trailing blank
+            // line after each LLM message, giving 2 rows of separation for
+            // persistent content while only costing 1 visible row.
+            const INPUT_GAP_ROWS: u16 = 1;
+            let scrollback_limit = at_bottom.saturating_sub(INPUT_GAP_ROWS) as usize;
+
             let cols_usize = cols as usize;
             let mut visual_lines: Vec<VisualLine<'_>> = Vec::new();
 
             for entry in &self.scrollback {
                 wrap_into(
-                    &entry.text,
-                    entry.fg,
-                    entry.bg,
-                    entry.bold,
-                    cols_usize,
+                    &entry.text, entry.fg, entry.bg, entry.bold, cols_usize,
                     &mut visual_lines,
                 );
             }
             let live_buf;
             if let Some(buf) = self.current_assistant.as_ref() {
                 live_buf = format!("  {buf}");
-                wrap_into(
-                    &live_buf,
-                    theme::BODY,
-                    0,
-                    false,
-                    cols_usize,
-                    &mut visual_lines,
-                );
+                wrap_into(&live_buf, theme::BODY, 0, false, cols_usize, &mut visual_lines);
             }
 
             let total = visual_lines.len();
-            let visible = rows as usize;
+            let visible = scrollback_limit;
             let max_offset = total.saturating_sub(visible);
             let offset = self.scroll_offset.min(max_offset);
             let skip = total.saturating_sub(visible).saturating_sub(offset);
 
             let mut row: u16 = 0;
             for vl in visual_lines.iter().skip(skip).take(visible) {
-                if row >= rows {
+                if row >= at_bottom {
                     break;
                 }
                 render_md_line(main, row, vl.text, cols, vl.fg, vl.bg, vl.bold);
@@ -264,95 +411,169 @@ impl App {
                 let indicator = format!(" \u{2191} {offset} more ");
                 let start_col = cols.saturating_sub(indicator.len() as u16 + 1);
                 write_str_styled(
-                    main,
-                    0,
-                    start_col,
-                    &indicator,
-                    cols,
-                    theme::ACCENT,
-                    theme::SURFACE_RAISED,
-                    false,
+                    main, 0, start_col, &indicator, cols,
+                    theme::ACCENT, theme::SURFACE_RAISED, false,
                 );
             }
-        }
-        {
-            let prompt = composer.prompt_grid();
-            let pcols = prompt.cols();
-            let prows = prompt.rows();
 
-            for r in 0..prows {
-                for c in 0..pcols {
-                    prompt.put(r, c, Cell::new(' ', 0, theme::SURFACE, Attr::PLAIN));
+            let r_top = row.saturating_add(2).min(at_bottom);
+            let r_status = r_top + line_count;
+            let r_cap = r_status + 1;
+
+            for r in r_top..=r_status.min(rows.saturating_sub(1)) {
+                for c in cl..cr.min(cols) {
+                    main.put(r, c, Cell::new(' ', 0, theme::SURFACE_RAISED, Attr::PLAIN));
+                }
+                if cl < cols {
+                    main.put(
+                        r, cl,
+                        Cell::new('\u{2503}', theme::ACCENT, theme::SURFACE_RAISED, Attr::PLAIN),
+                    );
                 }
             }
 
-            for c in 0..pcols {
-                prompt.put(
-                    0,
-                    c,
-                    Cell::new('\u{2500}', theme::BORDER, theme::SURFACE, Attr::PLAIN),
-                );
-            }
-
-            let cost = crate::status::cost_usd(&self.usage);
-            let secs = self.usage.elapsed.as_secs_f64();
-            let tok_in = format_tokens(self.usage.input_tokens);
-            let tok_out = format_tokens(self.usage.output_tokens);
-
-            let status = format!(
-                " {} \u{00B7} {tok_in}\u{2191} {tok_out}\u{2193} \u{00B7} ${cost:.3} \u{00B7} {secs:.1}s",
-                self.usage.model,
-            );
-            if prows >= 2 {
-                write_str_styled(
-                    prompt,
-                    1,
-                    0,
-                    &status,
-                    pcols,
-                    theme::DIM,
-                    theme::SURFACE,
-                    false,
-                );
-
-                if let Some(pos) = status.find(&self.usage.model) {
-                    let col_start = pos as u16;
-                    for (i, ch) in self.usage.model.chars().enumerate() {
-                        let c = col_start + i as u16;
-                        if c < pcols {
-                            prompt.put(
-                                1,
-                                c,
-                                Cell::new(ch, theme::ACCENT, theme::SURFACE, Attr::PLAIN),
-                            );
-                        }
+            if self.input.is_empty() && self.current_assistant.is_none() {
+                if r_top < rows {
+                    write_str_styled(
+                        main, r_top, cs, "Ask anything...", cr,
+                        theme::MUTED, theme::SURFACE_RAISED, false,
+                    );
+                }
+            } else if !self.input.is_empty() {
+                let vis_start = if wrapped.len() > 6 { wrapped.len() - 6 } else { 0 };
+                for (i, line) in wrapped[vis_start..].iter().enumerate() {
+                    let r = r_top + i as u16;
+                    if r >= r_status || r >= rows {
+                        break;
+                    }
+                    write_str_styled(
+                        main, r, cs, line, cr, theme::BRIGHT,
+                        theme::SURFACE_RAISED, false,
+                    );
+                    if vis_start + i == wrapped.len() - 1 && !self.suggestions.ghost.is_empty() {
+                        let gc = cs + char_display_width(line);
+                        write_str_styled(
+                            main, r, gc, &self.suggestions.ghost, cr,
+                            theme::DIM, theme::SURFACE_RAISED, false,
+                        );
                     }
                 }
             }
 
-            if prows >= 3 {
-                let arrow = " \u{276F} ";
+            if r_status < rows {
+                let cost = crate::status::cost_usd(&self.usage);
+                let live_elapsed = self
+                    .turn_started
+                    .map_or(self.usage.elapsed, |t| self.usage.elapsed + t.elapsed());
+                let secs = live_elapsed.as_secs_f64();
+                let tok_in = format_tokens(self.usage.input_tokens);
+                let tok_out = format_tokens(self.usage.output_tokens);
+
+                let (prefix, status) = if self.spinner.active {
+                    let sc = self.spinner.frame_char();
+                    (
+                        Some(sc),
+                        format!(
+                            "{sc} {} \u{00B7} {} \u{00B7} {tok_in}\u{2191} {tok_out}\u{2193} \u{00B7} ${cost:.3} \u{00B7} {secs:.1}s",
+                            self.workflow, self.usage.model,
+                        ),
+                    )
+                } else {
+                    (
+                        None,
+                        format!(
+                            "{} \u{00B7} {} \u{00B7} {tok_in}\u{2191} {tok_out}\u{2193} \u{00B7} ${cost:.3} \u{00B7} {secs:.1}s",
+                            self.workflow, self.usage.model,
+                        ),
+                    )
+                };
                 write_str_styled(
-                    prompt,
-                    2,
-                    0,
-                    arrow,
-                    pcols,
-                    theme::ACCENT,
-                    theme::SURFACE,
-                    true,
+                    main, r_status, cs, &status, cr,
+                    theme::DIM, theme::SURFACE_RAISED, false,
                 );
-                let arrow_len = char_display_width(arrow);
-                write_str_styled(
-                    prompt,
-                    2,
-                    arrow_len,
-                    &self.input,
-                    pcols.saturating_sub(arrow_len),
-                    theme::BRIGHT,
-                    theme::SURFACE,
-                    false,
-                );
+                if let Some(sc) = prefix {
+                    if let Some(pos) = status.find(sc) {
+                        let c = cs + pos as u16;
+                        if c < cr {
+                            main.put(
+                                r_status, c,
+                                Cell::new(sc, theme::ACCENT, theme::SURFACE_RAISED, Attr::PLAIN),
+                            );
+                        }
+                    }
+                }
+                let wf_offset = if prefix.is_some() { 2u16 } else { 0u16 };
+                for (i, ch) in self.workflow.chars().enumerate() {
+                    let c = cs + wf_offset + i as u16;
+                    if c < cr {
+                        main.put(
+                            r_status, c,
+                            Cell::new(ch, theme::ACCENT, theme::SURFACE_RAISED, Attr::BOLD),
+                        );
+                    }
+                }
+            }
+
+            if r_cap < rows {
+                if cl < cols {
+                    main.put(
+                        r_cap, cl,
+                        Cell::new('\u{2579}', theme::ACCENT, 0, Attr::PLAIN),
+                    );
+                }
+                let hint_parts: &[(&str, u32)] = &[
+                    ("shift+enter", theme::BODY),
+                    (" newline  ", theme::MUTED),
+                    ("tab", theme::BODY),
+                    (" skills  ", theme::MUTED),
+                    ("ctrl+c", theme::BODY),
+                    (" quit", theme::MUTED),
+                ];
+                let total_hw: u16 =
+                    hint_parts.iter().map(|(s, _)| char_display_width(s)).sum();
+                let mut hc = cr.saturating_sub(total_hw);
+                for (text, fg) in hint_parts {
+                    let tw = char_display_width(text);
+                    write_str_styled(main, r_cap, hc, text, hc + tw, *fg, 0, false);
+                    hc += tw;
+                }
+            }
+
+            if !self.suggestions.candidates.is_empty() {
+                let count = self.suggestions.candidates.len().min(6) as u16;
+                let popup_bottom = r_top.saturating_sub(1);
+                let popup_top = popup_bottom.saturating_sub(count);
+                let selected = self.suggestions.selected;
+                for (i, candidate) in self.suggestions.candidates.iter().take(6).enumerate() {
+                    let r = popup_top + i as u16;
+                    if r >= popup_bottom || r >= rows {
+                        break;
+                    }
+                    for c in cl..cr.min(cols) {
+                        main.put(r, c, Cell::new(' ', 0, theme::SURFACE_RAISED, Attr::PLAIN));
+                    }
+                    let (ind_fg, txt_fg) = if i == selected {
+                        (theme::ACCENT, theme::BODY)
+                    } else {
+                        (theme::MUTED, theme::MUTED)
+                    };
+                    let ind = if i == selected { " \u{25B8} " } else { "   " };
+                    let ps = cl + 1;
+                    write_str_styled(main, r, ps, ind, cr, ind_fg, theme::SURFACE_RAISED, false);
+                    let ind_w = char_display_width(ind);
+                    write_str_styled(
+                        main, r, ps + ind_w, candidate, cr, txt_fg,
+                        theme::SURFACE_RAISED, false,
+                    );
+                }
+            }
+        }
+        {
+            let prompt = composer.prompt_grid();
+            for r in 0..prompt.rows() {
+                for c in 0..prompt.cols() {
+                    prompt.put(r, c, Cell::new(' ', 0, theme::SURFACE, Attr::PLAIN));
+                }
             }
         }
     }
@@ -447,6 +668,36 @@ fn char_display_width(s: &str) -> u16 {
     s.chars()
         .map(|c| UnicodeWidthChar::width(c).unwrap_or(1) as u16)
         .sum()
+}
+
+fn wrap_input_lines(text: &str, width: usize) -> Vec<&str> {
+    if text.is_empty() {
+        return vec![""];
+    }
+    let mut lines = Vec::new();
+    for segment in text.split('\n') {
+        if segment.is_empty() || width == 0 {
+            lines.push(segment);
+            continue;
+        }
+        let chars: Vec<char> = segment.chars().collect();
+        let mut start = 0;
+        let mut col_w = 0usize;
+        for (idx, &ch) in chars.iter().enumerate() {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(1);
+            if col_w + w > width && start < idx {
+                let bs: usize = chars[..start].iter().map(|c| c.len_utf8()).sum();
+                let be: usize = chars[..idx].iter().map(|c| c.len_utf8()).sum();
+                lines.push(&segment[bs..be]);
+                start = idx;
+                col_w = 0;
+            }
+            col_w += w;
+        }
+        let bs: usize = chars[..start].iter().map(|c| c.len_utf8()).sum();
+        lines.push(&segment[bs..]);
+    }
+    lines
 }
 
 fn md_line_style(line: &str) -> (u32, bool) {
@@ -658,7 +909,7 @@ mod tests {
 
     #[test]
     fn set_model_updates_usage_snapshot() {
-        let mut app = App::new("anthropic", "claude-opus-4-7");
+        let mut app = App::new("anthropic", "claude-opus-4-7", Default::default());
         assert_eq!(app.usage.model, "claude-opus-4-7");
         app.set_model("claude-sonnet-4-6");
         assert_eq!(app.usage.model, "claude-sonnet-4-6");
@@ -666,7 +917,7 @@ mod tests {
 
     #[test]
     fn set_model_does_not_reset_token_counters() {
-        let mut app = App::new("anthropic", "claude-opus-4-7");
+        let mut app = App::new("anthropic", "claude-opus-4-7", Default::default());
         app.record_usage(100, 50, 0, 0, std::time::Duration::from_millis(200));
         app.set_model("claude-sonnet-4-6");
         assert_eq!(app.usage.input_tokens, 100);
@@ -679,5 +930,29 @@ mod tests {
         let mut lines = Vec::new();
         wrap_into("ab\u{276F}cd", 0, 0, false, 4, &mut lines);
         assert_eq!(lines.len(), 2, "wide char should cause wrap at col 4");
+    }
+
+    #[test]
+    fn wrap_input_lines_single_line() {
+        let lines = wrap_input_lines("hello world", 20);
+        assert_eq!(lines, vec!["hello world"]);
+    }
+
+    #[test]
+    fn wrap_input_lines_wraps_at_width() {
+        let lines = wrap_input_lines("abcdefghij", 5);
+        assert_eq!(lines, vec!["abcde", "fghij"]);
+    }
+
+    #[test]
+    fn wrap_input_lines_preserves_newlines() {
+        let lines = wrap_input_lines("abc\ndef", 10);
+        assert_eq!(lines, vec!["abc", "def"]);
+    }
+
+    #[test]
+    fn wrap_input_lines_empty() {
+        let lines = wrap_input_lines("", 10);
+        assert_eq!(lines, vec![""]);
     }
 }

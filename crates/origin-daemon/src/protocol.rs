@@ -179,6 +179,35 @@ pub enum StreamEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         diff_lines: Vec<DiffLine>,
     },
+    /// One incremental chunk of streaming output from a tool (today: only
+    /// `Bash`). Emitted line-by-line while the tool is still running so
+    /// the user sees output appear live rather than after completion.
+    /// `ToolResult` is normally suppressed for `Bash` because the chunks
+    /// already convey the output — except when zero chunks were emitted
+    /// (silent commands), in which case `run_bash_streaming` falls back
+    /// to a short `ToolResult` so completion is still visible.
+    ToolChunk {
+        tool: String,
+        content: String,
+    },
+    /// Emitted by the agent loop AFTER a tool dispatch completes (success
+    /// or failure). Carries a truncated preview of the tool's output so the
+    /// CLI can show *what the tool actually did* — without this the user
+    /// sees only the `ToolActivity` start line and a silent gap while the
+    /// LLM consumes the result.
+    ToolResult {
+        tool: String,
+        ok: bool,
+        /// Truncated UTF-8-lossy preview of the result bytes. Bounded in
+        /// the daemon so the wire frame stays small; the LLM still sees
+        /// the full body via the `Block::ToolResult` round-trip.
+        preview: String,
+        /// Number of bytes elided from the preview. `0` when the full
+        /// result fit. The CLI uses this to render a "+N bytes omitted"
+        /// affordance.
+        #[serde(default)]
+        elided_bytes: u32,
+    },
     TurnEnd,
     /// Emitted after a successful `ClientMessage::SwitchAccount` so the CLI
     /// can confirm the new provider/account is in effect for subsequent
@@ -186,6 +215,17 @@ pub enum StreamEvent {
     ProviderActive {
         provider: String,
         account_id: String,
+    },
+    /// Emitted by the agent loop just before it sleeps inside a rate-limit
+    /// retry backoff. Without this the CLI cannot distinguish a 60-second
+    /// `tokio::time::sleep` from a hang — both look like the same silence.
+    /// `attempt` is 1-indexed (first retry == 1); `max_attempts` is the
+    /// total budget (`MAX_PROVIDER_RETRIES + 1`, i.e. the initial call
+    /// plus the retry cap).
+    ProviderBackoff {
+        retry_in_secs: u32,
+        attempt: u32,
+        max_attempts: u32,
     },
     /// Surfaced at turn end when the [`origin_mem::Proposer`] extracts a
     /// memory candidate from the user/assistant exchange. The CLI displays

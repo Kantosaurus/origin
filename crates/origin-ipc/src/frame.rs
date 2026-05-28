@@ -36,6 +36,15 @@ pub enum FrameError {
 const MAGIC: u32 = 0x4F52_4F4E; // "ORON" big-endian
 pub const HEADER_LEN: usize = 4 + 1 + 8 + 4; // magic + kind + id + body_len
 
+/// Maximum accepted frame body size on the wire (64 MiB).
+///
+/// Frame readers (`transport::read_frame_from`, `quic::QuicConnection::read_frame`)
+/// reject any header advertising a body longer than this before allocating, so a
+/// hostile peer cannot induce a multi-GiB allocation by sending a crafted length
+/// header. 64 MiB is comfortably above any legitimate request or streamed event
+/// payload the daemon emits today.
+pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
 /// Encode a frame into a [`Vec<u8>`].
 ///
 /// # Panics
