@@ -1154,21 +1154,21 @@ async fn dispatch_tool(
             Ok(hits.join("\n"))
         }
         "Edit" => {
-            let path = args
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| LoopError::BadArgs("Edit: missing `path`".into()))?;
-            let old = args
-                .get("old_string")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| LoopError::BadArgs("Edit: missing `old_string`".into()))?;
-            let new = args
-                .get("new_string")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| LoopError::BadArgs("Edit: missing `new_string`".into()))?;
-            origin_tools::builtins::edit::edit_tool(path, old, new)
-                .map(|()| "edit ok".to_string())
-                .map_err(LoopError::ToolFailure)
+            let args = origin_tools::builtins::edit::EditArgs {
+                file_path: args.get("file_path").and_then(Value::as_str)
+                    .ok_or_else(|| LoopError::BadArgs("Edit: missing `file_path`".into()))?
+                    .to_string(),
+                old_string: args.get("old_string").and_then(Value::as_str)
+                    .ok_or_else(|| LoopError::BadArgs("Edit: missing `old_string`".into()))?
+                    .to_string(),
+                new_string: args.get("new_string").and_then(Value::as_str)
+                    .ok_or_else(|| LoopError::BadArgs("Edit: missing `new_string`".into()))?
+                    .to_string(),
+                replace_all: args.get("replace_all").and_then(Value::as_bool).unwrap_or(false),
+            };
+            origin_tools::builtins::edit::edit_v2(args)
+                .map(|v| serde_json::to_string(&v).unwrap())
+                .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "Write" => {
             let path = args

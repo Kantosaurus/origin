@@ -57,3 +57,33 @@ fn errors_on_missing_file() {
     .unwrap_err();
     assert_eq!(err.class, origin_tools::ErrClass::Io);
 }
+
+#[test]
+fn refuses_to_follow_symlink() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("target.txt");
+    fs::write(&target, "secret").unwrap();
+    let link = dir.path().join("link.txt");
+
+    #[cfg(windows)]
+    let link_result = std::os::windows::fs::symlink_file(&target, &link);
+    #[cfg(unix)]
+    let link_result = std::os::unix::fs::symlink(&target, &link);
+
+    if let Err(e) = &link_result {
+        let raw = e.raw_os_error().unwrap_or(0);
+        if e.kind() == std::io::ErrorKind::PermissionDenied || raw == 1314 {
+            eprintln!("SKIP refuses_to_follow_symlink: insufficient privileges to create symlink (needs admin or Developer Mode on Windows): {e}");
+            return;
+        }
+        panic!("unexpected symlink creation error: {e}");
+    }
+
+    let err = read_v2(ReadArgs {
+        file_path: link.to_string_lossy().into_owned(),
+        offset: None, limit: None, as_: None,
+    })
+    .expect_err("must refuse to read through symlink");
+    assert_eq!(err.class, origin_tools::ErrClass::Validation);
+    assert!(err.reason.contains("symlink"), "reason was {:?}", err.reason);
+}
