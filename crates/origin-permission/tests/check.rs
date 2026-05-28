@@ -12,6 +12,7 @@ const fn meta(name: &'static str, tier: Tier) -> ToolMeta {
         input_schema: "{}",
         sandbox_profile: SandboxProfile::Inherit,
         token_budget: origin_tools::DEFAULT_TOKEN_BUDGET,
+        hot: true,
     }
 }
 

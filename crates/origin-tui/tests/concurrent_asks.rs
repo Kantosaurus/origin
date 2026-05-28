@@ -13,6 +13,7 @@ const META_READ: ToolMeta = ToolMeta {
     input_schema: "{}",
     sandbox_profile: SandboxProfile::ReadFs,
     token_budget: origin_tools::DEFAULT_TOKEN_BUDGET,
+    hot: true,
 };
 
 const META_BASH: ToolMeta = ToolMeta {
@@ -24,6 +25,7 @@ const META_BASH: ToolMeta = ToolMeta {
     input_schema: "{}",
     sandbox_profile: SandboxProfile::Shell,
     token_budget: origin_tools::DEFAULT_TOKEN_BUDGET,
+    hot: true,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

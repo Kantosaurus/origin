@@ -73,14 +73,7 @@ impl SessionStore {
     /// # Errors
     /// Propagates I/O and serde decode errors.
     pub fn load_resume_token(&self, session_id: &str) -> std::io::Result<Option<ResumeToken>> {
-        let path = self.resume_dir().join(format!("{session_id}.json"));
-        if !path.exists() {
-            return Ok(None);
-        }
-        let bytes = std::fs::read(path)?;
-        let token: ResumeToken = serde_json::from_slice(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        Ok(Some(token))
+        ResumeToken::load_one(&self.resume_dir(), session_id)
     }
 
     /// Insert (or replace) a session metadata row.

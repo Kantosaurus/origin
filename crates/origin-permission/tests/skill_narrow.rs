@@ -11,6 +11,7 @@ const READ_META: ToolMeta = ToolMeta {
     input_schema: "{}",
     sandbox_profile: SandboxProfile::ReadFs,
     token_budget: origin_tools::DEFAULT_TOKEN_BUDGET,
+    hot: true,
 };
 
 const EDIT_META: ToolMeta = ToolMeta {
@@ -22,6 +23,7 @@ const EDIT_META: ToolMeta = ToolMeta {
     input_schema: "{}",
     sandbox_profile: SandboxProfile::WriteCwd,
     token_budget: origin_tools::DEFAULT_TOKEN_BUDGET,
+    hot: true,
 };
 
 #[tokio::test]

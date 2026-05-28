@@ -30,7 +30,7 @@ impl Provider for ScriptedProvider {
             0 | 1 => vec![Block::ToolUse {
                 id: format!("id-{t}"),
                 name: "Read".into(),
-                input_json: serde_json::to_vec(&serde_json::json!({"path": &self.target_path}))
+                input_json: serde_json::to_vec(&serde_json::json!({"file_path": &self.target_path}))
                     .expect("json"),
                 cache_marker: None,
             }],
