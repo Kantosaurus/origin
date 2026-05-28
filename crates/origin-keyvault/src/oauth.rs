@@ -5,6 +5,8 @@
 //! §6 refresh, with PKCE (RFC 7636). Higher-level concerns — token
 //! introspection, `DPoP`, the device-code flow — are out of scope.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -12,6 +14,7 @@ use base64::Engine as _;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Mutex as AsyncMutex;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::{Error, KeyVault, Secret};
@@ -146,13 +149,23 @@ struct TokenResponse {
     expires_in: u64,
 }
 
-/// Per-provider OAuth driver. Cheap to clone (`reqwest::Client` is `Arc`-ish).
+/// Per-provider OAuth driver. Cheap to clone (`reqwest::Client` is `Arc`-ish,
+/// and the per-account refresh-lock map is wrapped in [`Arc`] so cloned
+/// drivers serialise refreshes against the same locks).
 #[derive(Debug, Clone)]
 pub struct OAuthClient {
     provider: String,
     token_url: String,
     client_id: String,
     http: reqwest::Client,
+    /// Per-account refresh serialisation locks. Two concurrent
+    /// [`Self::refresh`] or [`Self::refresh_if_due`] callers for the same
+    /// account would otherwise both hit the `IdP` and both `persist()`, with
+    /// the loser silently overwriting the winner's freshly minted access
+    /// token. The outer [`AsyncMutex`] only guards the map insertion (held
+    /// for microseconds); the inner per-key [`AsyncMutex`] is held across
+    /// the HTTP round-trip and vault write.
+    refresh_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 impl OAuthClient {
@@ -170,7 +183,16 @@ impl OAuthClient {
             token_url: token_url.into(),
             client_id: client_id.into(),
             http: reqwest::Client::new(),
+            refresh_locks: Arc::new(AsyncMutex::new(HashMap::new())),
         }
+    }
+
+    /// Returns (cloning out of the map) the per-account refresh lock,
+    /// creating it on first access. The outer map mutex is held only long
+    /// enough to look up or insert the [`Arc`] handle.
+    async fn refresh_lock_for(&self, account: &str) -> Arc<AsyncMutex<()>> {
+        let mut map = self.refresh_locks.lock().await;
+        Arc::clone(map.entry(account.to_owned()).or_default())
     }
 
     /// Exchanges an auth-code for tokens and persists them under
@@ -213,12 +235,32 @@ impl OAuthClient {
 
     /// Unconditionally refreshes the stored tokens for `account`.
     ///
+    /// Concurrent refresh callers for the same `(provider, account)` pair
+    /// are serialised through a per-account [`AsyncMutex`], so only one
+    /// HTTP refresh round-trip + vault `persist()` runs at a time. Without
+    /// this, the loser of the race would overwrite the winner's freshly
+    /// minted refresh token (and the next refresh attempt would fail with
+    /// `invalid_grant` on rotating-refresh providers).
+    ///
     /// # Errors
     /// Returns [`Error::NotFound`] if no tokens are stored, [`Error::Serde`]
     /// on JSON parse failure, [`Error::Backend`] on HTTP failure, and
     /// [`Error::Backend`] with `"no refresh_token available …"` if the
     /// initial exchange never received a refresh token.
     pub async fn refresh(&self, vault: &KeyVault, account: &str) -> Result<RefreshOutcome, Error> {
+        let lock = self.refresh_lock_for(account).await;
+        let _guard = lock.lock().await;
+        self.refresh_locked(vault, account).await
+    }
+
+    /// Lock-free body of [`Self::refresh`]. The caller MUST be holding the
+    /// per-account [`refresh_lock_for`] mutex before invoking this — it
+    /// performs the HTTP refresh + vault persist that must not interleave.
+    async fn refresh_locked(
+        &self,
+        vault: &KeyVault,
+        account: &str,
+    ) -> Result<RefreshOutcome, Error> {
         let stored = self.load(vault, account).await?;
         let refresh_token = stored
             .refresh
@@ -244,6 +286,13 @@ impl OAuthClient {
     /// Refreshes only when the stored access token is within `safety_window`
     /// of expiry. Returns [`RefreshOutcome::NotDue`] otherwise.
     ///
+    /// Uses double-checked locking against the per-account refresh mutex:
+    /// the cheap pre-check is unlocked, but after acquiring the lock we
+    /// re-read the stored expiry so a caller that lost the race against a
+    /// concurrent refresher correctly observes the rotated token and
+    /// returns [`RefreshOutcome::NotDue`] instead of triggering a second
+    /// (redundant) HTTP round-trip.
+    ///
     /// # Errors
     /// See [`Self::refresh`].
     pub async fn refresh_if_due(
@@ -252,15 +301,21 @@ impl OAuthClient {
         account: &str,
         safety_window: Duration,
     ) -> Result<RefreshOutcome, Error> {
+        // Cheap unlocked pre-check: skip lock acquisition on the common
+        // not-due path.
         let stored = self.load(vault, account).await?;
-        let now = now_epoch_secs();
-        if stored.expires_at > now {
-            let remaining = Duration::from_secs(stored.expires_at - now);
-            if remaining > safety_window {
-                return Ok(RefreshOutcome::NotDue { remaining });
-            }
+        if let Some(remaining) = remaining_above_window(stored.expires_at, safety_window) {
+            return Ok(RefreshOutcome::NotDue { remaining });
         }
-        self.refresh(vault, account).await
+        // Lock acquired; re-check expiry inside the critical section so a
+        // concurrent winner's rotation is observed.
+        let lock = self.refresh_lock_for(account).await;
+        let _guard = lock.lock().await;
+        let stored = self.load(vault, account).await?;
+        if let Some(remaining) = remaining_above_window(stored.expires_at, safety_window) {
+            return Ok(RefreshOutcome::NotDue { remaining });
+        }
+        self.refresh_locked(vault, account).await
     }
 
     async fn post_form(&self, form: &[(&str, &str)]) -> Result<TokenResponse, Error> {
@@ -318,4 +373,19 @@ fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// Returns `Some(remaining)` when the stored token still has more than
+/// `safety_window` of life left, otherwise `None` (meaning a refresh is
+/// due). Centralised so [`OAuthClient::refresh_if_due`] applies the same
+/// rule before and after acquiring the per-account refresh lock.
+fn remaining_above_window(expires_at: u64, safety_window: Duration) -> Option<Duration> {
+    let now = now_epoch_secs();
+    if expires_at > now {
+        let remaining = Duration::from_secs(expires_at - now);
+        if remaining > safety_window {
+            return Some(remaining);
+        }
+    }
+    None
 }
