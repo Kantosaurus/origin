@@ -5,6 +5,7 @@ pub mod dispatch;
 pub mod error;
 pub mod macros;
 pub mod registry;
+pub mod text_fmt;
 
 pub use error::{ErrClass, ToolError};
 
