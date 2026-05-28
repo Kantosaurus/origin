@@ -706,33 +706,50 @@ fn spawn_handler_task(
         // emits `Goal*` events back through the connection.
         let active_goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>> =
             Arc::new(tokio::sync::Mutex::new(None));
+        // Per-connection push-back slot. `drive_goal_loop` decodes any
+        // frame it peeks mid-iteration; if the frame is a non-Interrupt
+        // `ClientMessage` (a follow-up `Prompt`, an admin call, …) the
+        // driver stashes it here and bails out, so the outer loop picks it
+        // up on its NEXT iteration instead of reading a fresh frame off
+        // the wire. This preserves the user's input that the previous
+        // peek-and-drop implementation silently discarded.
+        let pending_message: Arc<tokio::sync::Mutex<Option<ClientMessage>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
 
         loop {
-            let body = {
-                let mut g = conn.lock().await;
-                match g.read_frame_body().await {
-                    Ok(b) => b,
-                    Err(_) => break,
-                }
-            };
-            // Try the new ClientMessage envelope first, then fall back to the
-            // legacy raw `PromptRequest` shape (back-compat for clients that
-            // pre-date P6.7).
-            let msg: ClientMessage = if let Ok(m) = serde_json::from_slice::<ClientMessage>(&body) {
+            // Step 1: drain any pushed-back message left by the goal driver
+            // on the previous iteration. When `Some`, skip the wire read
+            // entirely and dispatch the buffered message directly.
+            let pushed_back: Option<ClientMessage> = pending_message.lock().await.take();
+            let msg: ClientMessage = if let Some(m) = pushed_back {
                 m
             } else {
-                #[allow(deprecated)]
-                let res = from_legacy_prompt_request(&body);
-                match res {
-                    Ok(m) => m,
-                    Err(e) => {
-                        error!(error = %e, "bad client message");
-                        let _ = conn
-                            .lock()
-                            .await
-                            .write_frame(FrameKind::ErrorFrame, format!("bad request: {e}").as_bytes())
-                            .await;
-                        continue;
+                let body = {
+                    let mut g = conn.lock().await;
+                    match g.read_frame_body().await {
+                        Ok(b) => b,
+                        Err(_) => break,
+                    }
+                };
+                // Try the new ClientMessage envelope first, then fall back
+                // to the legacy raw `PromptRequest` shape (back-compat for
+                // clients that pre-date P6.7).
+                if let Ok(m) = serde_json::from_slice::<ClientMessage>(&body) {
+                    m
+                } else {
+                    #[allow(deprecated)]
+                    let res = from_legacy_prompt_request(&body);
+                    match res {
+                        Ok(m) => m,
+                        Err(e) => {
+                            error!(error = %e, "bad client message");
+                            let _ = conn
+                                .lock()
+                                .await
+                                .write_frame(FrameKind::ErrorFrame, format!("bad request: {e}").as_bytes())
+                                .await;
+                            continue;
+                        }
                     }
                 }
             };
@@ -774,6 +791,7 @@ fn spawn_handler_task(
                         Arc::clone(&coordinator),
                         wire_plan.clone(),
                         Arc::clone(&active_goal),
+                        Arc::clone(&pending_message),
                         verifier,
                         req,
                     )
@@ -1002,6 +1020,30 @@ fn spawn_handler_task(
                 ClientMessage::SubscribePlan => {
                     spawn_plan_relay(plan_bus.subscribe(), Arc::clone(&conn));
                 }
+                ClientMessage::Interrupt => {
+                    // When `Interrupt` lands in the OUTER loop it means
+                    // the previous `Prompt` already finished (or there
+                    // was no in-flight prompt to begin with). The driver's
+                    // mid-iteration push-back path catches the more common
+                    // case where `Interrupt` arrives DURING a goal
+                    // iteration — see `drive_goal_loop`.
+                    //
+                    // If a goal is still active here it means a previous
+                    // iteration completed before the user's interrupt
+                    // was processed; clear it now with `UserSlash` so the
+                    // CLI sees the same terminal event regardless of
+                    // race timing. No-op when no goal is active.
+                    let mut slot = active_goal.lock().await;
+                    if let Some(prior) = slot.take() {
+                        let ev = StreamEvent::GoalCleared {
+                            reason: origin_goal::ClearReasonWire::UserSlash,
+                            iter: prior.iter,
+                            tokens_spent: prior.tokens_spent,
+                        };
+                        drop(slot);
+                        let _ = write_event(&conn, &ev).await;
+                    }
+                }
                 admin @ (ClientMessage::ListSessions
                 | ClientMessage::RemoveSession { .. }
                 | ClientMessage::ResumeSession { .. }
@@ -1219,6 +1261,7 @@ async fn handle_request(
     coordinator: Arc<Coordinator>,
     plan: origin_planner::Plan,
     active_goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
+    pending_message: Arc<tokio::sync::Mutex<Option<ClientMessage>>>,
     verifier: Arc<dyn origin_goal::verifier::Verifier>,
     req: PromptRequest,
 ) -> PromptOutcome {
@@ -1336,6 +1379,7 @@ async fn handle_request(
             provider,
             &opts,
             Arc::clone(&active_goal),
+            Arc::clone(&pending_message),
             verifier.as_ref(),
             event_tx.clone(),
         )
@@ -1491,6 +1535,7 @@ async fn drive_goal_loop(
     provider: &dyn Provider,
     opts: &LoopOptions,
     active_goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
+    pending_message: Arc<tokio::sync::Mutex<Option<ClientMessage>>>,
     verifier: &dyn origin_goal::verifier::Verifier,
     event_tx: tokio::sync::mpsc::Sender<StreamEvent>,
 ) -> Result<origin_daemon::agent::LoopSummary, origin_daemon::agent::LoopError> {
@@ -1574,21 +1619,42 @@ async fn drive_goal_loop(
             } => {
                 let _ = event_tx.send(iter_event).await;
                 next_text = synthesized_prompt;
-                // Peek for a pending user message. If one is waiting we
-                // break out so the outer per-connection message loop can
-                // handle it (the user's reply replaces our synth prompt).
+                // Peek for a pending user message between iterations. If
+                // one is waiting, parse it and decide:
+                //   * `Interrupt`         → clear the goal, drop the frame
+                //                           (Interrupt is itself a no-op
+                //                           after the clear).
+                //   * any other variant   → clear the goal AND push the
+                //                           parsed `ClientMessage` into
+                //                           `pending_message` so the outer
+                //                           message loop dispatches it on
+                //                           its next tick (replaces the
+                //                           previous "drop the frame"
+                //                           behaviour that silently lost
+                //                           the user's follow-up).
+                //   * decode failure      → clear the goal, drop the body
+                //                           (a malformed frame is the same
+                //                           as an Interrupt for our
+                //                           purposes; the outer loop would
+                //                           reject it on the next read).
                 let peek = {
                     let mut g = conn.lock().await;
                     tokio::time::timeout(std::time::Duration::ZERO, g.read_frame_body()).await
                 };
-                if let Ok(Ok(_pending)) = peek {
-                    // A pending frame would be consumed by the peek; this is
-                    // a deliberate stop. We can't push it back into the
-                    // connection, so we drop it — but since the outer loop
-                    // races on `read_frame_body` anyway and the peek's body
-                    // would have been an `Interrupt`/`Prompt`, the best
-                    // user-visible behaviour is to clear the goal with
-                    // `UserSlash` and let them re-issue.
+                if let Ok(Ok(pending_body)) = peek {
+                    // Mirror the outer loop's decode path: ClientMessage
+                    // envelope first, legacy raw PromptRequest fallback.
+                    let parsed: Option<ClientMessage> =
+                        serde_json::from_slice::<ClientMessage>(&pending_body)
+                            .ok()
+                            .or_else(|| {
+                                #[allow(deprecated)]
+                                from_legacy_prompt_request(&pending_body).ok()
+                            });
+                    let is_interrupt = matches!(parsed, Some(ClientMessage::Interrupt));
+                    // Clear the active goal before yielding control. The
+                    // outer loop sees a stable `None` slot when it picks
+                    // up the pushed-back message.
                     let mut slot = active_goal.lock().await;
                     let cleared_ev = slot.take().map(|prior| StreamEvent::GoalCleared {
                         reason: origin_goal::ClearReasonWire::UserSlash,
@@ -1598,6 +1664,16 @@ async fn drive_goal_loop(
                     drop(slot);
                     if let Some(ev) = cleared_ev {
                         let _ = event_tx.send(ev).await;
+                    }
+                    // Push back only when the user's intent was something
+                    // OTHER than a plain interrupt (a follow-up Prompt,
+                    // an admin call, etc). Interrupt itself is consumed
+                    // here — its job was to fire the GoalCleared we just
+                    // emitted.
+                    if !is_interrupt {
+                        if let Some(msg) = parsed {
+                            *pending_message.lock().await = Some(msg);
+                        }
                     }
                     return Ok(last_summary.unwrap_or(origin_daemon::agent::LoopSummary {
                         assistant_text: String::new(),
@@ -1844,6 +1920,7 @@ async fn handle_admin(
         | ClientMessage::PairRedeem { .. }
         | ClientMessage::ResumeRequest { .. }
         | ClientMessage::SubscribePlan
+        | ClientMessage::Interrupt
         | ClientMessage::ActivateSkill { .. }
         | ClientMessage::DeactivateSkill { .. }
         | ClientMessage::ActivateWorkflow { .. } => return true,

@@ -137,6 +137,15 @@ pub enum ClientMessage {
     /// a [`StreamEvent::PlanOp`] event frame. The subscription terminates
     /// when the connection closes.
     SubscribePlan,
+    /// User-issued cancel. Clears any in-flight goal iteration. The outer
+    /// message loop continues running afterward — the connection stays open.
+    ///
+    /// When sent mid-`drive_goal_loop` the driver's peek catches it between
+    /// iterations, emits `GoalCleared { UserSlash }`, and returns control
+    /// to the outer message loop without consuming another provider call.
+    /// When sent with no goal active the outer loop emits no event — the
+    /// signal is harmless.
+    Interrupt,
 }
 
 impl ClientMessage {

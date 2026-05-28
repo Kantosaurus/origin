@@ -96,7 +96,8 @@ fn client_message_prompt_round_trips() {
         | ClientMessage::SubscribePlan
         | ClientMessage::ActivateSkill { .. }
         | ClientMessage::DeactivateSkill { .. }
-        | ClientMessage::ActivateWorkflow { .. } => unreachable!("expected Prompt variant"),
+        | ClientMessage::ActivateWorkflow { .. }
+        | ClientMessage::Interrupt => unreachable!("expected Prompt variant"),
     }
 }
 
@@ -131,7 +132,8 @@ fn client_message_switch_account_round_trips() {
         | ClientMessage::SubscribePlan
         | ClientMessage::ActivateSkill { .. }
         | ClientMessage::DeactivateSkill { .. }
-        | ClientMessage::ActivateWorkflow { .. } => unreachable!("expected SwitchAccount variant"),
+        | ClientMessage::ActivateWorkflow { .. }
+        | ClientMessage::Interrupt => unreachable!("expected SwitchAccount variant"),
     }
 }
 
