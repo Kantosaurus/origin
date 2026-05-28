@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, MouseEventKind};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt as _;
@@ -182,7 +183,7 @@ async fn main() -> Result<()> {
     ensure_daemon_running(&path, &default_provider, &default_account).await?;
 
     enable_raw_mode()?;
-    execute!(std::io::stdout(), EnterAlternateScreen)?;
+    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let main_cols = cols.saturating_sub(20);
@@ -200,11 +201,9 @@ async fn main() -> Result<()> {
     // to a single allocation per process invocation, so it's the simplest
     // path to satisfying the lifetime without touching the wider App API.
     let provider_static: &'static str = Box::leak(default_provider.into_boxed_str());
-    let app: SharedApp = Arc::new(Mutex::new(App::new(provider_static, model.clone())));
-    app.lock().add_line(
-        "",
-        "Connected; type a prompt and press Enter. Ctrl-C / Esc to quit.",
-    );
+    let sources = origin_cli::autocomplete::load_sources();
+    let app: SharedApp = Arc::new(Mutex::new(App::new(provider_static, model.clone(), sources)));
+    app.lock().push_banner(cols, rows);
 
     // First-run discovery: if `origin init`'s welcome flow queued a pending
     // prompt, fire it as the user's first turn and remove the file so it
@@ -232,7 +231,7 @@ async fn main() -> Result<()> {
                         let mut c = c2.lock();
                         let mut w = w2.lock();
                         a2.lock().draw(&mut c, &mut w);
-                        {
+                        if c.side_visible() {
                             let pp = pp2.lock();
                             let lines = pp.render();
                             origin_cli::tui::draw_side(c.side_grid(), &lines);
@@ -249,6 +248,19 @@ async fn main() -> Result<()> {
         })
     };
 
+    {
+        let a3 = app.clone();
+        let h3 = handle.clone();
+        spawn_in(TaskClass::Realtime, async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                if a3.lock().spinner.active {
+                    h3.mark_dirty();
+                }
+            }
+        });
+    }
+
     // Auto-fire the pending discovery prompt now that the TUI is wired up.
     if let Some(text) = pending_prompt {
         app.lock()
@@ -261,7 +273,7 @@ async fn main() -> Result<()> {
 
     render_task.abort();
     disable_raw_mode()?;
-    execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
     result
 }
 
@@ -278,7 +290,25 @@ async fn run_event_loop(
     spawn_plan_subscription(path.to_string(), Arc::clone(&plan_panel), handle.clone());
     let mut input_stream = crossterm::event::EventStream::new();
     while let Some(maybe_ev) = input_stream.next().await {
-        if let crossterm::event::Event::Key(ev) = maybe_ev? {
+        let event = maybe_ev?;
+        // Mouse wheel scroll: drive the scrollback offset directly. Each
+        // wheel tick advances by ~3 visual rows, matching the Shift+Arrow
+        // handler below. Other mouse events (clicks, drag) are ignored.
+        if let crossterm::event::Event::Mouse(me) = &event {
+            match me.kind {
+                MouseEventKind::ScrollUp => {
+                    app.lock().scroll_up(3);
+                    handle.mark_dirty();
+                }
+                MouseEventKind::ScrollDown => {
+                    app.lock().scroll_down(3);
+                    handle.mark_dirty();
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if let crossterm::event::Event::Key(ev) = event {
             // crossterm on Windows reports both Press and Release for every
             // keystroke; without this filter, every character would land in
             // the buffer twice. Allow Repeat so autorepeat still works.
@@ -319,28 +349,40 @@ async fn run_event_loop(
                     handle.mark_dirty();
                     continue;
                 }
+                // Unshifted Up/Down navigate the suggestion popup when it
+                // is open. With no popup these keys are no-ops (history
+                // navigation isn't implemented yet); the SHIFT variants
+                // above still drive scrollback.
+                crossterm::event::KeyCode::Up => {
+                    let mut a = app.lock();
+                    if !a.suggestions.candidates.is_empty() {
+                        origin_cli::suggestions::select_prev(&mut a.suggestions);
+                        drop(a);
+                        handle.mark_dirty();
+                        continue;
+                    }
+                }
+                crossterm::event::KeyCode::Down => {
+                    let mut a = app.lock();
+                    if !a.suggestions.candidates.is_empty() {
+                        origin_cli::suggestions::select_next(&mut a.suggestions);
+                        drop(a);
+                        handle.mark_dirty();
+                        continue;
+                    }
+                }
                 _ => {}
             }
 
             if matches!(ev.code, crossterm::event::KeyCode::Tab) {
-                let result = {
-                    let mut a = app.lock();
-                    let sources = origin_cli::autocomplete::load_sources();
-                    origin_cli::autocomplete::complete(&mut a.input, &sources)
-                };
-                match result {
-                    origin_cli::autocomplete::CompletionResult::NoMatch => {}
-                    origin_cli::autocomplete::CompletionResult::UniqueCompletion => {
-                        handle.mark_dirty();
-                    }
-                    origin_cli::autocomplete::CompletionResult::MultipleCandidates {
-                        candidates,
-                    } => {
-                        let line = format!("candidates: {}", candidates.join(", "));
-                        app.lock().add_line("tab> ", &line);
-                        handle.mark_dirty();
-                    }
+                let mut a = app.lock();
+                if !a.suggestions.candidates.is_empty() {
+                    let suggestions = a.suggestions.clone();
+                    origin_cli::suggestions::accept_selected(&suggestions, &mut a.input);
+                    a.recompute_suggestions();
                 }
+                drop(a);
+                handle.mark_dirty();
                 continue;
             }
 
@@ -351,7 +393,19 @@ async fn run_event_loop(
             match action {
                 InputAction::Quit => break,
                 InputAction::Submit(text) => {
+                    {
+                        let mut a = app.lock();
+                        a.recompute_suggestions();
+                        a.spinner.start();
+                    }
+                    handle.mark_dirty();
                     handle_submit(&app, &handle, path, model, &text, session_id).await;
+                    app.lock().spinner.stop();
+                    handle.mark_dirty();
+                }
+                InputAction::Insert(_) | InputAction::Backspace | InputAction::Newline => {
+                    app.lock().recompute_suggestions();
+                    handle.mark_dirty();
                 }
                 _ => {
                     handle.mark_dirty();
@@ -503,15 +557,23 @@ async fn handle_submit(
         let mut a = app.lock();
         a.add_line("you> ", text);
         a.start_assistant_turn();
+        a.start_turn_timer();
     }
     handle.mark_dirty();
 
-    let mut usage_events: Vec<(u32, u32, u32, u32)> = Vec::new();
     let mut proposals: Vec<(u32, String, Vec<String>)> = Vec::new();
     let app_for_delta = Arc::clone(app);
     let handle_for_delta = handle.clone();
     let app_for_tool = Arc::clone(app);
     let handle_for_tool = handle.clone();
+    let app_for_chunk = Arc::clone(app);
+    let handle_for_chunk = handle.clone();
+    let app_for_result = Arc::clone(app);
+    let handle_for_result = handle.clone();
+    let app_for_usage = Arc::clone(app);
+    let handle_for_usage = handle.clone();
+    let app_for_backoff = Arc::clone(app);
+    let handle_for_backoff = handle.clone();
     let reply = call_daemon(
         path,
         model,
@@ -548,22 +610,75 @@ async fn handle_submit(
             a.start_assistant_turn();
             handle_for_tool.mark_dirty();
         },
-        |i, o, cr, cw| usage_events.push((i, o, cr, cw)),
+        move |_tool: &str, content: &str| {
+            // Live Bash output: render each incoming line under the tool
+            // header as a dim indented row so users see progress instead
+            // of a silent gap during long-running commands.
+            use origin_cli::theme;
+            let mut a = app_for_chunk.lock();
+            for line in content.lines() {
+                a.add_colored_line(format!("    {line}"), theme::DIM, 0);
+            }
+            drop(a);
+            handle_for_chunk.mark_dirty();
+        },
+        move |tool: &str, ok: bool, preview: &str, elided_bytes: u32| {
+            // Render the tool's output preview directly under its activity
+            // line so the user sees *what the tool did*, instead of just
+            // the start indicator followed by a silent gap.
+            use origin_cli::theme;
+            let mut a = app_for_result.lock();
+            let header_fg = if ok { theme::MUTED } else { theme::RED };
+            if !ok {
+                a.add_colored_line(format!("    \u{2718} {tool} failed"), header_fg, 0);
+            }
+            for line in preview.lines() {
+                a.add_colored_line(format!("    {line}"), theme::DIM, 0);
+            }
+            if elided_bytes > 0 {
+                a.add_colored_line(
+                    format!("    \u{2026} +{elided_bytes} bytes omitted"),
+                    theme::MUTED,
+                    0,
+                );
+            }
+            drop(a);
+            handle_for_result.mark_dirty();
+        },
+        move |i, o, cr, cw| {
+            // Apply usage deltas immediately so the status line's token
+            // counts and cost tick live during streaming. Elapsed time
+            // is driven by `turn_started` in the App.
+            app_for_usage.lock().record_usage_tokens(i, o, cr, cw);
+            handle_for_usage.mark_dirty();
+        },
         |id, body, tags| proposals.push((id, body, tags)),
+        move |secs, attempt, max_attempts| {
+            // Surface rate-limit backoff sleeps so they don't look like a
+            // hang. The daemon sleeps up to MAX_RATE_LIMIT_SLEEP_SECS (60s)
+            // per attempt; without this line the CLI shows zero output for
+            // the entire sleep window.
+            use origin_cli::theme;
+            let mut a = app_for_backoff.lock();
+            a.add_colored_line(
+                format!(
+                    "    rate limited - retrying in {secs}s (attempt {attempt}/{max_attempts})"
+                ),
+                theme::MUTED,
+                0,
+            );
+            drop(a);
+            handle_for_backoff.mark_dirty();
+        },
     )
     .await;
 
     let mut a = app.lock();
+    // End the live timer regardless of success/failure so elapsed stops
+    // ticking and folds into the cumulative total.
+    a.stop_turn_timer();
     match reply {
-        Ok((r, elapsed)) => {
-            let mut sum = (0u32, 0u32, 0u32, 0u32);
-            for (i, o, cr, cw) in &usage_events {
-                sum.0 = sum.0.saturating_add(*i);
-                sum.1 = sum.1.saturating_add(*o);
-                sum.2 = sum.2.saturating_add(*cr);
-                sum.3 = sum.3.saturating_add(*cw);
-            }
-            a.record_usage(sum.0, sum.1, sum.2, sum.3, elapsed);
+        Ok((r, _elapsed)) => {
             a.finalize_assistant_turn(r.turns);
             // Render each memory proposal as a status line (P6.7).
             for (id, body, tags) in &proposals {
@@ -593,8 +708,11 @@ async fn call_daemon(
     session_id: &str,
     mut on_delta: impl FnMut(&str) + Send,
     mut on_tool: impl FnMut(&str, &str, Vec<origin_daemon::protocol::DiffLine>) + Send,
+    mut on_tool_chunk: impl FnMut(&str, &str) + Send,
+    mut on_tool_result: impl FnMut(&str, bool, &str, u32) + Send,
     mut on_usage: impl FnMut(u32, u32, u32, u32) + Send,
     mut on_proposal: impl FnMut(u32, String, Vec<String>) + Send,
+    mut on_backoff: impl FnMut(u32, u32, u32) + Send,
 ) -> Result<(PromptReply, Duration)> {
     let start = std::time::Instant::now();
     let mut client = Connector::connect(path).await?;
@@ -630,6 +748,13 @@ async fn call_daemon(
                     summary,
                     diff_lines,
                 } => on_tool(&tool, &summary, diff_lines),
+                StreamEvent::ToolChunk { tool, content } => on_tool_chunk(&tool, &content),
+                StreamEvent::ToolResult {
+                    tool,
+                    ok,
+                    preview,
+                    elided_bytes,
+                } => on_tool_result(&tool, ok, &preview, elided_bytes),
                 StreamEvent::Usage {
                     input_tokens,
                     output_tokens,
@@ -646,6 +771,11 @@ async fn call_daemon(
                     body: pbody,
                     suggested_tags,
                 } => on_proposal(proposal_id, pbody, suggested_tags),
+                StreamEvent::ProviderBackoff {
+                    retry_in_secs,
+                    attempt,
+                    max_attempts,
+                } => on_backoff(retry_in_secs, attempt, max_attempts),
                 _ => {}
             }
             continue;

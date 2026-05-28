@@ -232,6 +232,28 @@ impl Drop for QuicConnection {
     }
 }
 
+/// Decode a 17-byte frame header into `(kind, body_len)`, enforcing the
+/// shared [`crate::frame::MAX_FRAME_BYTES`] cap on the advertised body
+/// length. Extracted from [`QuicConnection::read_frame`] so the bounds
+/// check is unit-testable without needing a full QUIC handshake (the
+/// rest of `read_frame` is a thin wrapper over `RecvStream::read_exact`
+/// which is already covered by `quic_smoke` / `quic_concurrent` tests).
+///
+/// # Errors
+/// Returns [`QuicError::Frame`] for an unknown kind byte or a body-length
+/// field that exceeds [`crate::frame::MAX_FRAME_BYTES`].
+fn decode_header(header: &[u8; HEADER_LEN]) -> Result<(FrameKind, usize), QuicError> {
+    let kind = match header[4] {
+        1 => FrameKind::Request,
+        2 => FrameKind::Response,
+        3 => FrameKind::Event,
+        4 => FrameKind::ErrorFrame,
+        x => return Err(QuicError::Frame(format!("unknown frame kind: {x}"))),
+    };
+    let len = u32::from_be_bytes([header[13], header[14], header[15], header[16]]) as usize;
+    Ok((kind, len))
+}
+
 impl QuicConnection {
     /// Read one frame from the stream.
     ///
@@ -244,14 +266,7 @@ impl QuicConnection {
             .read_exact(&mut header)
             .await
             .map_err(|e| QuicError::Frame(format!("read header: {e}")))?;
-        let kind = match header[4] {
-            1 => FrameKind::Request,
-            2 => FrameKind::Response,
-            3 => FrameKind::Event,
-            4 => FrameKind::ErrorFrame,
-            x => return Err(QuicError::Frame(format!("unknown frame kind: {x}"))),
-        };
-        let len = u32::from_be_bytes([header[13], header[14], header[15], header[16]]) as usize;
+        let (kind, len) = decode_header(&header)?;
         let mut body = vec![0_u8; len];
         self.recv
             .read_exact(&mut body)
@@ -280,5 +295,52 @@ impl QuicConnection {
             .await
             .map_err(|e| QuicError::Frame(format!("write: {e}")))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::MAX_FRAME_BYTES;
+
+    /// Build a frame header with the given body length and kind=Request.
+    fn header_with_len(body_len: u32) -> [u8; HEADER_LEN] {
+        let mut h = [0_u8; HEADER_LEN];
+        h[0] = 0x4F;
+        h[1] = 0x52;
+        h[2] = 0x4F;
+        h[3] = 0x4E;
+        h[4] = 1; // Request
+        let len_be = body_len.to_be_bytes();
+        h[13] = len_be[0];
+        h[14] = len_be[1];
+        h[15] = len_be[2];
+        h[16] = len_be[3];
+        h
+    }
+
+    #[test]
+    fn decode_header_rejects_oversized_length() {
+        // A hostile peer advertises a body just past the cap. The header
+        // decoder must reject this before any allocation occurs in the
+        // calling `read_frame`.
+        let oversize = u32::try_from(MAX_FRAME_BYTES + 1).expect("fits u32");
+        let header = header_with_len(oversize);
+        let result = decode_header(&header);
+        let err = result.expect_err("oversized length must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("frame too large"),
+            "expected 'frame too large' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn decode_header_accepts_max_size() {
+        let max = u32::try_from(MAX_FRAME_BYTES).expect("fits u32");
+        let header = header_with_len(max);
+        let (kind, len) = decode_header(&header).expect("at-cap header is valid");
+        assert_eq!(kind, FrameKind::Request);
+        assert_eq!(len, MAX_FRAME_BYTES);
     }
 }

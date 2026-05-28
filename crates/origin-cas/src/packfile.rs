@@ -100,7 +100,14 @@ impl PackBuilder {
         self.file.write_u64::<BigEndian>(entries)?;
         self.file.write_u64::<BigEndian>(index_offset)?;
         self.file.write_all(&MAGIC_FOOTER)?;
+        // Drain the BufWriter into the kernel...
         self.file.flush()?;
+        // ...then force the kernel to push the bytes (and metadata) out
+        // to stable storage. Without this, `flush()` only moves bytes
+        // from userspace into the page cache; a host crash before OS
+        // writeback would leave the pack missing its index + footer and
+        // the file unopenable by `PackReader`.
+        self.file.get_mut().sync_all()?;
         Ok(self.path)
     }
 }

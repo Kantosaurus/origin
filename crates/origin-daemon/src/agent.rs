@@ -130,7 +130,7 @@ pub struct LoopOptions {
 impl Default for LoopOptions {
     fn default() -> Self {
         Self {
-            max_turns: 25,
+            max_turns: 200,
             cas: None,
             code_graph: None,
             mem_router: None,
@@ -468,6 +468,20 @@ pub async fn run_loop(
                             %message,
                             "provider rate-limited; backing off and retrying"
                         );
+                        // Surface the backoff to the CLI so a 60s sleep
+                        // doesn't look identical to a hang. `attempt` here is
+                        // 0-indexed within the retry budget; we render it
+                        // 1-indexed and use `MAX_PROVIDER_RETRIES + 1` as the
+                        // ceiling (initial attempt plus retries).
+                        if let Some(tx) = &opts.event_tx {
+                            let _ = tx
+                                .send(StreamEvent::ProviderBackoff {
+                                    retry_in_secs: sleep_secs,
+                                    attempt: attempt + 1,
+                                    max_attempts: MAX_PROVIDER_RETRIES + 1,
+                                })
+                                .await;
+                        }
                         tokio::time::sleep(std::time::Duration::from_secs(sleep_secs.into())).await;
                         attempt += 1;
                     }
@@ -692,6 +706,35 @@ pub async fn run_loop(
                         }
                         Err(e) => return Err(e),
                     }
+                } else if meta.name == "Bash" {
+                    // Streaming dispatch path: forwards each stdout/stderr
+                    // line to the CLI as a `ToolChunk` event as soon as
+                    // the child writes it, so long-running commands no
+                    // longer feel hung. The LLM still receives the fully
+                    // accumulated body via `Block::ToolResult` below.
+                    match run_bash_streaming(&args, opts.event_tx.as_ref()).await {
+                        Ok(bytes) => bytes,
+                        Err(msg) => {
+                            tracing::warn!(tool = %name, %msg, "Bash dispatch failed; returning error to model");
+                            if let Some(tx) = &opts.event_tx {
+                                let _ = tx
+                                    .send(StreamEvent::ToolResult {
+                                        tool: name.clone(),
+                                        ok: false,
+                                        preview: msg.clone(),
+                                        elided_bytes: 0,
+                                    })
+                                    .await;
+                            }
+                            tool_results.push(Block::ToolResult {
+                                tool_use_id: id,
+                                handle: None,
+                                inline: Some(format!("Error: {msg}").into_bytes()),
+                                cache_marker: None,
+                            });
+                            continue;
+                        }
+                    }
                 } else {
                     match dispatch_tool(
                         meta,
@@ -707,6 +750,18 @@ pub async fn run_loop(
                         Ok(s) => s.into_bytes(),
                         Err(LoopError::BadArgs(msg) | LoopError::ToolFailure(msg)) => {
                             tracing::warn!(tool = %name, %msg, "tool dispatch failed; returning error to model");
+                            // Surface the error to the CLI so the user sees
+                            // *why* the tool stopped rather than a silent gap.
+                            if let Some(tx) = &opts.event_tx {
+                                let _ = tx
+                                    .send(StreamEvent::ToolResult {
+                                        tool: name.clone(),
+                                        ok: false,
+                                        preview: msg.clone(),
+                                        elided_bytes: 0,
+                                    })
+                                    .await;
+                            }
                             tool_results.push(Block::ToolResult {
                                 tool_use_id: id,
                                 handle: None,
@@ -719,6 +774,28 @@ pub async fn run_loop(
                     }
                 }
             };
+
+            // Stream a truncated preview of the result back to the CLI so the
+            // user sees the tool's actual output. The LLM still consumes the
+            // full body via the `Block::ToolResult` round-trip below.
+            // Bash is excluded here — it manages its own completion event
+            // inside `run_bash_streaming`, which emits a short `ToolResult`
+            // only when zero chunks were streamed (silent commands like
+            // write-only `powershell -File …` scripts), avoiding a redundant
+            // trailing echo for verbose commands.
+            if meta.name != "Bash" {
+                if let Some(tx) = &opts.event_tx {
+                    let (preview, elided) = build_tool_result_preview(&result_bytes);
+                    let _ = tx
+                        .send(StreamEvent::ToolResult {
+                            tool: name.clone(),
+                            ok: true,
+                            preview,
+                            elided_bytes: elided,
+                        })
+                        .await;
+                }
+            }
 
             let block = if let Some(cas) = opts.cas.as_ref() {
                 let h: Hash = cas
@@ -782,8 +859,226 @@ pub async fn run_loop(
         let mut tool_msg = Message::new(Role::Tool);
         tool_msg.blocks = tool_results;
         session.push(tool_msg);
+
+        // Place a prompt-cache breakpoint at the freshly closed turn boundary
+        // so the next iteration's `ChatRequest` (which re-sends the full
+        // `session.snapshot()`) is billed against Anthropic's prompt cache
+        // instead of as fresh input tokens. See [`apply_turn_cache_markers`].
+        apply_turn_cache_markers(&mut session.messages, opts.plan.as_ref());
     }
     Err(LoopError::MaxTurns(opts.max_turns))
+}
+
+/// Anthropic's Messages API accepts at most 4 `cache_control` markers per
+/// request. We stay strictly under that ceiling.
+const MAX_CACHE_MARKERS: usize = 4;
+
+/// Apply prompt-cache breakpoints after a completed agentic turn.
+///
+/// The Anthropic wire encoder has three independent emission paths for
+/// `cache_control`: (1) planner-planted markers at `msg_idx == 0`, (2) the
+/// per-block `cache_marker` field, and (3) the shared `Plan`'s
+/// `dynamic_message_markers`. Each block emits at most one `cache_control`
+/// via OR-combination, but the *count* of marker'd blocks is the union of
+/// the positions selected by paths (2) and (3). If those paths select
+/// different blocks the union can exceed Anthropic's per-request ceiling of
+/// 4 markers, and the API rejects the request with `invalid_request_error:
+/// "A maximum of 4 blocks with cache_control may be provided."`. That is the
+/// production bug this helper guards against.
+///
+/// The fix is a single source of truth: pick the marker positions once, then
+/// drive both the block-level field (path 2) and the plan's
+/// `dynamic_message_markers` (path 3) from the same set. The selection
+/// policy is "latest N turn boundaries", capped at [`MAX_CACHE_MARKERS`]:
+/// latest-N is cache-optimal because Anthropic's prompt cache hits work on
+/// prefix-extension — newer marker positions amortize across more subsequent
+/// turns than older ones.
+///
+/// Without these markers every iteration of [`run_loop`] re-bills the full
+/// `session.snapshot()` at the un-cached rate. Anthropic's prompt cache
+/// charges 0.1× for cache reads, so engaging caching at stable turn
+/// boundaries collapses the dominant cost of long agentic sessions.
+fn apply_turn_cache_markers(messages: &mut [Message], plan: Option<&origin_planner::Plan>) {
+    use origin_core::types::CacheBoundary;
+
+    // Turn boundaries are the last `ToolResult` blocks of `Role::Tool`
+    // messages. Each marks the close of one assistant turn's tool dispatch
+    // round and is the natural place to cut a cache prefix.
+    let turn_boundaries: Vec<(usize, usize)> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(mi, msg)| {
+            if !matches!(msg.role, Role::Tool) {
+                return None;
+            }
+            msg.blocks
+                .iter()
+                .rposition(|b| matches!(b, Block::ToolResult { .. }))
+                .map(|bi| (mi, bi))
+        })
+        .collect();
+
+    // Single source of truth: the latest `MAX_CACHE_MARKERS` turn boundaries.
+    // Empty session ⇒ no markers and the dynamic list is cleared so a previous
+    // turn's stale state never leaks into the wire.
+    let start = turn_boundaries
+        .len()
+        .saturating_sub(MAX_CACHE_MARKERS);
+    let chosen: Vec<(usize, usize)> = turn_boundaries[start..].to_vec();
+
+    // Clear every existing block-level cache_marker across the session before
+    // re-applying. This is the rotation: old marker positions that fall
+    // outside the latest-N window are unmarked here. Without this pass, stale
+    // markers from earlier calls would accumulate past the ceiling.
+    for msg in messages.iter_mut() {
+        for b in msg.blocks.iter_mut() {
+            clear_block_cache_marker(b);
+        }
+    }
+
+    // Path (2): block-level cache_marker on each chosen ToolResult block.
+    for &(mi, bi) in &chosen {
+        if let Block::ToolResult { cache_marker, .. } = &mut messages[mi].blocks[bi] {
+            *cache_marker = Some(CacheBoundary::Sticky);
+        }
+    }
+
+    // Path (3): mirror the same positions in the shared Plan's
+    // `dynamic_message_markers`. The wire encoder OR-combines paths (2) and
+    // (3) per block; because they target the same blocks here, the union
+    // equals the intersection and the marker count is exactly `chosen.len()`.
+    if let Some(plan) = plan {
+        let msg_indices: Vec<usize> = chosen.iter().map(|&(mi, _)| mi).collect();
+        plan.set_dynamic_message_markers(msg_indices);
+    }
+}
+
+#[cfg(test)]
+fn block_cache_marker_set(b: &Block) -> bool {
+    match b {
+        Block::Text { cache_marker, .. }
+        | Block::ToolUse { cache_marker, .. }
+        | Block::ToolResult { cache_marker, .. } => cache_marker.is_some(),
+        Block::Thinking { .. } => false,
+    }
+}
+
+fn clear_block_cache_marker(b: &mut Block) {
+    match b {
+        Block::Text { cache_marker, .. }
+        | Block::ToolUse { cache_marker, .. }
+        | Block::ToolResult { cache_marker, .. } => *cache_marker = None,
+        Block::Thinking { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod cache_marker_tests {
+    use super::*;
+    use origin_core::types::{Block, Message, Role};
+    use origin_planner::Plan;
+    use std::collections::HashSet;
+
+    /// Append one full user/assistant/tool turn to `msgs`.
+    fn push_turn(msgs: &mut Vec<Message>, turn_idx: usize) {
+        msgs.push(Message {
+            role: Role::User,
+            blocks: vec![Block::text(format!("user {turn_idx}"))],
+        });
+        msgs.push(Message {
+            role: Role::Assistant,
+            blocks: vec![Block::ToolUse {
+                id: format!("u{turn_idx}"),
+                name: "Read".into(),
+                input_json: b"{}".to_vec(),
+                cache_marker: None,
+            }],
+        });
+        msgs.push(Message {
+            role: Role::Tool,
+            blocks: vec![Block::ToolResult {
+                tool_use_id: format!("u{turn_idx}"),
+                handle: None,
+                inline: Some(b"ok".to_vec()),
+                cache_marker: None,
+            }],
+        });
+    }
+
+    fn block_marked_message_indices(msgs: &[Message]) -> HashSet<usize> {
+        msgs.iter()
+            .enumerate()
+            .filter_map(|(mi, m)| {
+                if m.blocks.iter().any(block_cache_marker_set) {
+                    Some(mi)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Anthropic rejects requests with > 4 `cache_control` markers. The wire
+    /// encoder emits one marker per block when *any* of three independent paths
+    /// fires for that block (block-level `cache_marker`, plan `marker_indices`,
+    /// or plan `dynamic_message_markers`). If those paths target different
+    /// blocks, their union can exceed 4 even when each path is individually
+    /// capped — which is exactly the 5-marker 400 the daemon hit in production.
+    ///
+    /// Invariant: after `apply_turn_cache_markers`, the set of message indices
+    /// marked at the block level must equal the set in `dynamic_message_markers`,
+    /// and the cardinality must stay at or below `MAX_CACHE_MARKERS`.
+    #[test]
+    fn block_and_dynamic_markers_converge_under_ceiling_after_20_turns() {
+        let plan = Plan::default();
+        let mut msgs: Vec<Message> = Vec::new();
+        for turn in 0..20 {
+            push_turn(&mut msgs, turn);
+            apply_turn_cache_markers(&mut msgs, Some(&plan));
+        }
+
+        let block_marked = block_marked_message_indices(&msgs);
+        let dyn_marked: HashSet<usize> =
+            plan.dynamic_message_markers().into_iter().collect();
+
+        assert_eq!(
+            block_marked, dyn_marked,
+            "block-level markers and dynamic_message_markers must target the \
+             same messages so the wire encoder's paths converge per block; got \
+             block={block_marked:?}, dyn={dyn_marked:?}"
+        );
+        assert!(
+            block_marked.len() <= MAX_CACHE_MARKERS,
+            "marker count must stay at or below {MAX_CACHE_MARKERS} \
+             (Anthropic's per-request ceiling); got {} at {block_marked:?}",
+            block_marked.len()
+        );
+    }
+
+    /// Same invariant at the smaller scale where bands collapse — exercises the
+    /// edge cases of the recency classifier.
+    #[test]
+    fn block_and_dynamic_markers_converge_for_small_sessions() {
+        for n_turns in 1..=6 {
+            let plan = Plan::default();
+            let mut msgs: Vec<Message> = Vec::new();
+            for turn in 0..n_turns {
+                push_turn(&mut msgs, turn);
+                apply_turn_cache_markers(&mut msgs, Some(&plan));
+            }
+            let block_marked = block_marked_message_indices(&msgs);
+            let dyn_marked: HashSet<usize> =
+                plan.dynamic_message_markers().into_iter().collect();
+            assert_eq!(
+                block_marked, dyn_marked,
+                "divergence at n_turns={n_turns}: block={block_marked:?}, dyn={dyn_marked:?}"
+            );
+            assert!(
+                block_marked.len() <= MAX_CACHE_MARKERS,
+                "over ceiling at n_turns={n_turns}: {block_marked:?}"
+            );
+        }
+    }
 }
 
 /// Rebuild entry-point invoked by the future IPC handler / git hook.
@@ -1308,6 +1603,101 @@ fn node_row_to_json(row: &origin_codegraph::index::NodeRow) -> serde_json::Value
     })
 }
 
+/// Dispatch the `Bash` tool through its streaming reader so each stdout /
+/// stderr line is forwarded to `event_tx` as a [`StreamEvent::ToolChunk`]
+/// the moment the child writes it. Returns the same canonical result-byte
+/// format as the synchronous `Bash` arm in [`dispatch_tool`] so the LLM
+/// sees identical content regardless of which path ran. `event_tx` being
+/// `None` (e.g. unit tests, headless runs without a relay) is supported —
+/// chunks are drained and discarded but accumulation still completes.
+async fn run_bash_streaming(
+    args: &Value,
+    event_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+) -> Result<Vec<u8>, String> {
+    let cmd = args
+        .get("command")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Bash: missing `command`".to_string())?;
+
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let event_tx_owned = event_tx.cloned();
+    // The forwarder returns the number of chunks it relayed so the caller
+    // can decide whether the command produced any visible output. Silent
+    // commands (e.g. write-only `powershell -File foo.ps1`) report zero
+    // chunks and trigger a fallback `ToolResult` below so the CLI never
+    // shows just an activity line followed by a silent gap.
+    let forwarder = tokio::spawn(async move {
+        let mut chunk_count: u32 = 0;
+        while let Some(content) = chunk_rx.recv().await {
+            chunk_count += 1;
+            if let Some(tx) = &event_tx_owned {
+                let _ = tx
+                    .send(StreamEvent::ToolChunk {
+                        tool: "Bash".to_string(),
+                        content,
+                    })
+                    .await;
+            }
+        }
+        chunk_count
+    });
+    let out = origin_tools::builtins::bash::bash_tool_streaming(cmd, chunk_tx).await?;
+    let chunk_count = forwarder.await.unwrap_or(0);
+
+    if chunk_count == 0 {
+        if let Some(tx) = event_tx {
+            let _ = tx
+                .send(StreamEvent::ToolResult {
+                    tool: "Bash".to_string(),
+                    ok: out.exit_code == 0,
+                    preview: format!("(exit {}, no output)", out.exit_code),
+                    elided_bytes: 0,
+                })
+                .await;
+        }
+    }
+
+    Ok(format!(
+        "exit_code: {}\nstdout:\n{}\nstderr:\n{}",
+        out.exit_code, out.stdout, out.stderr
+    )
+    .into_bytes())
+}
+
+/// Build a bounded preview of a tool's result bytes for live display in the
+/// CLI. Returns `(preview, elided_bytes)`. The preview is at most
+/// `MAX_PREVIEW_LINES` lines, each truncated to `MAX_PREVIEW_LINE_CHARS`
+/// chars; the elided byte count covers everything past that window so the
+/// CLI can render a "+N bytes omitted" affordance. Non-UTF8 input is
+/// lossily decoded — the model still sees the raw bytes upstream.
+fn build_tool_result_preview(bytes: &[u8]) -> (String, u32) {
+    const MAX_PREVIEW_LINES: usize = 8;
+    const MAX_PREVIEW_LINE_CHARS: usize = 200;
+
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = String::new();
+    let mut consumed: usize = 0;
+    let mut lines_iter = text.split_inclusive('\n');
+    for _ in 0..MAX_PREVIEW_LINES {
+        let Some(line) = lines_iter.next() else {
+            break;
+        };
+        consumed += line.len();
+        let trimmed: String = line.chars().take(MAX_PREVIEW_LINE_CHARS).collect();
+        out.push_str(&trimmed);
+        if trimmed.len() < line.len() && !trimmed.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    // Remove a single trailing newline so the CLI doesn't render a stray
+    // blank line — the renderer adds its own line breaks per scrollback row.
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    let elided = bytes.len().saturating_sub(consumed);
+    (out, u32::try_from(elided).unwrap_or(u32::MAX))
+}
+
 fn tool_activity_summary(name: &str, args: &Value) -> String {
     let path_str = || {
         args.get("path")
@@ -1349,6 +1739,19 @@ fn tool_activity_summary(name: &str, args: &Value) -> String {
             format!("{path} ({} lines)", parts.join(", "))
         }
         "Read" => path_str().to_string(),
+        "Grep" => {
+            let pat = args.get("pattern").and_then(Value::as_str).unwrap_or("");
+            let root = args.get("root").and_then(Value::as_str).unwrap_or(".");
+            // Cap the pattern so a long regex doesn't blow past the
+            // status column. Root is short by nature.
+            let pat_short: String = pat.chars().take(40).collect();
+            format!("{pat_short} @ {root}")
+        }
+        "Glob" => args
+            .get("pattern")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         "Bash" => {
             let cmd = args
                 .get("command")

@@ -32,11 +32,11 @@ impl Section {
 /// marker after `ordered_sections()[i]`".
 ///
 /// `Plan` is cheaply cloneable: the `ordered`/`markers` vectors are deep-cloned
-/// (small) but `handle_bands` is `Arc<RwLock<…>>`, so every clone of the same
-/// `Plan` shares the same handle→band map. This is the N4.3 wiring contract:
-/// the daemon and the wire-encoder hold separate `Plan` values that point at
-/// the same underlying map, so registrations on one side are immediately
-/// visible to the other without any explicit channel.
+/// (small) but `handle_bands` and `dynamic_message_markers` are `Arc<RwLock<…>>`,
+/// so every clone of the same `Plan` shares those interior-mutable state slots.
+/// This is the N4.3 wiring contract: the daemon and the wire-encoder hold
+/// separate `Plan` values that point at the same underlying state, so writes
+/// on one side are immediately visible to the other without any explicit channel.
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
     ordered: Vec<Section>,
@@ -56,6 +56,15 @@ pub struct Plan {
     /// per-handle band assignment, so they cannot demote long-lived
     /// handles to reference form. This map is the novel mechanism.
     handle_bands: Arc<RwLock<HashMap<[u8; 32], Band>>>,
+    /// Dynamic per-message cache breakpoints populated by the agent loop
+    /// each turn. Each index is a position in the session's message list;
+    /// the Anthropic wire encoder emits `cache_control` on the last emitting
+    /// block of any message whose index appears here.
+    ///
+    /// Shared via `Arc<RwLock<…>>` so writes from the daemon's per-turn
+    /// helper propagate to the provider's wire-encoder, matching the
+    /// `register_handle`/`band_for_handle` ergonomics on `handle_bands`.
+    dynamic_message_markers: Arc<RwLock<Vec<usize>>>,
 }
 
 impl PartialEq for Plan {
@@ -67,8 +76,13 @@ impl PartialEq for Plan {
         // short-circuit cheaply; distinct Arcs fall through to per-entry
         // equality. Lock poisoning on either side defaults to "not equal"
         // rather than panicking — equality is a query, not a state mutation.
-        match (self.handle_bands.read(), other.handle_bands.read()) {
-            (Ok(a), Ok(b)) => *a == *b,
+        match (
+            self.handle_bands.read(),
+            other.handle_bands.read(),
+            self.dynamic_message_markers.read(),
+            other.dynamic_message_markers.read(),
+        ) {
+            (Ok(a), Ok(b), Ok(c), Ok(d)) => *a == *b && *c == *d,
             _ => false,
         }
     }
@@ -135,6 +149,32 @@ impl Plan {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.len()
     }
+
+    /// Current dynamic per-message cache breakpoints, populated by the
+    /// agent loop via [`Plan::set_dynamic_message_markers`].
+    ///
+    /// Returns an owned `Vec` rather than a borrowed slice so callers don't
+    /// hold a read lock across an arbitrarily long encode pass. Empty by
+    /// default; the wire-encoder treats the empty case as "no extra markers"
+    /// and only emits via the legacy `marker_indices` and per-block paths.
+    #[must_use]
+    pub fn dynamic_message_markers(&self) -> Vec<usize> {
+        self.dynamic_message_markers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replace the dynamic per-message cache breakpoints. Writes through
+    /// `&self` so the agent loop can update without holding a `&mut Plan` —
+    /// matching the `register_handle` ergonomics on `handle_bands`.
+    pub fn set_dynamic_message_markers(&self, indices: Vec<usize>) {
+        let mut guard = self
+            .dynamic_message_markers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = indices;
+    }
 }
 
 /// Plans the cache-prefix layout for a single request.
@@ -176,6 +216,7 @@ impl<'a> CachePlanner<'a> {
             ordered,
             markers,
             handle_bands: Arc::new(RwLock::new(HashMap::new())),
+            dynamic_message_markers: Arc::new(RwLock::new(Vec::new())),
         }
     }
 }

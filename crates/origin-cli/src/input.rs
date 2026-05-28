@@ -7,6 +7,7 @@ use origin_daemon::protocol::{ClientMessage, MemoryAction};
 #[derive(Debug, PartialEq, Eq)]
 pub enum InputAction {
     Insert(char),
+    Newline,
     Backspace,
     Submit(String),
     Quit,
@@ -18,6 +19,10 @@ pub fn reduce(buffer: &mut String, ev: KeyEvent) -> InputAction {
     match (ev.code, ev.modifiers) {
         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => InputAction::Quit,
         (KeyCode::Esc, _) => InputAction::Quit,
+        (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => {
+            buffer.push('\n');
+            InputAction::Newline
+        }
         (KeyCode::Enter, _) => {
             if buffer.is_empty() {
                 InputAction::Noop

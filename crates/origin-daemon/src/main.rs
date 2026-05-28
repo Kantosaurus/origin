@@ -452,6 +452,25 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("plan store open: {e}"))?,
         );
         let plan_handle = origin_swarm::PlanHandle::new(plan, plan_store);
+        // Bridge the per-handle broadcast into the daemon-wide PlanBus so
+        // `ClientMessage::SubscribePlan` subscribers actually see plan ops.
+        // Without this bridge the subscribe path is silently empty.
+        {
+            let mut rx = plan_handle.subscribe();
+            let bus = plan_bus.clone();
+            spawn_in(TaskClass::Realtime, async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(env) => bus.publish(env),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(lagged = n, "plan bridge: fell behind PlanHandle broadcast");
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
         Arc::new(Coordinator::new(plan_handle, "origin-daemon"))
     };
     info!("swarm coordinator ready");
@@ -1131,7 +1150,7 @@ async fn handle_request(
     // `rx.recv()` never returns None, so the relay tasks hang forever.
     let loop_result = {
         let opts = LoopOptions {
-            max_turns: 25,
+            max_turns: 200,
             cas: Some(cas),
             code_graph: Some(Arc::clone(&code_graph)),
             mem_router: Some(Arc::clone(&mem_router)),

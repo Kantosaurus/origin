@@ -340,6 +340,22 @@ fn message_to_wire<'a>(m: &'a Message, plan: Option<&Plan>, msg_idx: usize) -> w
         Role::Assistant => "assistant",
     };
     let marker_indices: &[usize] = plan.map_or(&[], Plan::marker_indices);
+    // Dynamic per-message markers (populated each turn by the agent loop).
+    // Empty by default, so the read is cheap when no planner is wired.
+    let dyn_msg_marker_here = plan
+        .map(|p| p.dynamic_message_markers().contains(&msg_idx))
+        .unwrap_or(false);
+    // When path 3 fires we need to land the marker on the *last emitting*
+    // block. `Block::Thinking` is filtered out by `block_to_wire`, so we skip
+    // it when picking the boundary block — otherwise a trailing thinking
+    // block would silently swallow the cache marker.
+    let last_emit_idx = if dyn_msg_marker_here {
+        m.blocks
+            .iter()
+            .rposition(|b| !matches!(b, Block::Thinking { .. }))
+    } else {
+        None
+    };
     // Count emitted `cache_control` markers across the message so we can warn
     // when callers approach Anthropic's per-request 4-marker ceiling. The
     // warn fires at the message level; aggregating across messages would
@@ -350,7 +366,7 @@ fn message_to_wire<'a>(m: &'a Message, plan: Option<&Plan>, msg_idx: usize) -> w
         .iter()
         .enumerate()
         .filter_map(|(block_idx, b)| {
-            // Two paths can emit a `cache_control` on a block:
+            // Three paths can emit a `cache_control` on a block:
             //
             // 1. A `Plan` planted a marker at `(msg_idx == 0, block_idx)`
             //    via `Plan::marker_indices`. This is the legacy P3.2 path
@@ -362,9 +378,15 @@ fn message_to_wire<'a>(m: &'a Message, plan: Option<&Plan>, msg_idx: usize) -> w
             //    regardless of `msg_idx`. All `CacheBoundary` variants map
             //    to `"ephemeral"`: that is the only `cache_control.type`
             //    the Anthropic Messages API accepts today.
+            //
+            // 3. The agent loop populated `dynamic_message_markers` with
+            //    `msg_idx`. The marker lands on the *last emitting* block
+            //    of this message — i.e., the natural turn boundary. Skipped
+            //    when the planner is absent or the index list is empty.
             let plan_marker_here = plan.is_some() && msg_idx == 0 && marker_indices.contains(&block_idx);
             let block_marker_here = block_has_cache_marker(b);
-            let cache_control = if plan_marker_here || block_marker_here {
+            let dynamic_marker_here = Some(block_idx) == last_emit_idx;
+            let cache_control = if plan_marker_here || block_marker_here || dynamic_marker_here {
                 emitted_markers = emitted_markers.saturating_add(1);
                 Some(wire::WireCacheControl::ephemeral())
             } else {

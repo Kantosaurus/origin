@@ -123,8 +123,9 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 // Loader helpers — read the live catalog from disk.
 // ---------------------------------------------------------------------------
 
-/// Build a [`CompletionSources`] by reading `~/.origin/skills/` (every
-/// `<dir>/SKILL.md`) and `~/.origin/workflows.toml`.
+/// Build a [`CompletionSources`] by reading the embedded `superpowers/`
+/// skill catalog merged with any user overrides in `~/.origin/skills/`
+/// (every `<dir>/SKILL.md`), plus `~/.origin/workflows.toml` for workflows.
 ///
 /// Failures degrade to empty lists so a missing directory or corrupt file
 /// doesn't break Tab.
@@ -137,7 +138,12 @@ pub fn load_sources() -> CompletionSources {
     let skills_dir = home.join(".origin").join("skills");
     let workflows_path = home.join(".origin").join("workflows.toml");
 
-    let skills: Vec<String> = origin_skills::load_skills_dir(&skills_dir)
+    // Use `load_all` (embedded + user overrides) rather than `load_skills_dir`
+    // (user-only). Otherwise the suggestion popup is empty on a fresh install
+    // because `~/.origin/skills/` exists but is empty after onboarding — the
+    // bundled `superpowers` skills (systematic-debugging, impeccable, etc.)
+    // never become discoverable through `/`.
+    let skills: Vec<String> = origin_skills::load_all(&skills_dir)
         .map(|v| v.into_iter().map(|s| s.front.name).collect())
         .unwrap_or_default();
     let workflows: Vec<String> = crate::workflows::load_from(&workflows_path)
@@ -255,5 +261,31 @@ mod tests {
     #[test]
     fn common_prefix_len_handles_unicode_safely() {
         assert_eq!(common_prefix_len("αβ", "αγ"), "α".len());
+    }
+
+    /// Regression: `load_sources()` must merge embedded skills (the vendored
+    /// `superpowers/` catalog) with user overrides, not just read the user
+    /// directory. Otherwise a fresh install with an empty `~/.origin/skills/`
+    /// yields an empty suggestion list and typing `/` shows no popup.
+    ///
+    /// We don't drive `load_sources` directly (it reads `$HOME`/`ORIGIN_HOME`
+    /// and this crate forbids `unsafe`, which `std::env::set_var` now
+    /// requires). Instead we exercise the same `origin_skills::load_all`
+    /// path with a guaranteed-empty user root — if the embedded catalog is
+    /// wired up, the merged list is still non-empty.
+    #[test]
+    fn embedded_skills_populate_completion_sources() {
+        let empty_user_root = std::path::Path::new("/this/path/does/not/exist/zzz");
+        let names: Vec<String> = origin_skills::load_all(empty_user_root)
+            .map(|v| v.into_iter().map(|s| s.front.name).collect())
+            .unwrap_or_default();
+        assert!(
+            !names.is_empty(),
+            "expected embedded skills to populate completion sources, got empty list"
+        );
+        assert!(
+            names.iter().any(|n| n == "systematic-debugging"),
+            "expected `systematic-debugging` skill in completion sources, got: {names:?}"
+        );
     }
 }
