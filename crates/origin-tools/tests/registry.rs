@@ -29,3 +29,10 @@ fn tool_meta_fields_present() {
     assert_eq!(meta.side_effects, SideEffects::Pure);
     assert!(!meta.input_schema.is_empty());
 }
+
+#[test]
+fn every_tool_has_nonzero_token_budget() {
+    for meta in origin_tools::registry_iter() {
+        assert!(meta.token_budget > 0, "tool {} has zero token_budget", meta.name);
+    }
+}
