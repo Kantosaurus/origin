@@ -1,5 +1,6 @@
 pub mod ask;
 pub mod bash;
+pub mod monitor;
 pub mod browser;
 pub mod edit;
 pub mod glob_tool;

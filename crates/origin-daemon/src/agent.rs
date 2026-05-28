@@ -1242,6 +1242,37 @@ async fn dispatch_tool(
                 .map(|v| serde_json::to_string(&v).unwrap())
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
+        "Monitor" => {
+            let margs = origin_tools::builtins::monitor::MonitorArgs {
+                pid: args
+                    .get("pid")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as u32)
+                    .ok_or_else(|| LoopError::BadArgs("Monitor: missing `pid`".into()))?,
+                since_byte: args
+                    .get("since_byte")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                max_bytes: args
+                    .get("max_bytes")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as u32)
+                    .unwrap_or(4096),
+                wait: args
+                    .get("wait")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            };
+            // Envelope-routed path uses ctx.supervisor; this passthrough
+            // makes a stub supervisor that always returns unknown_pid.
+            // Production should reach this arm only when run_in_background
+            // was used — until Phase 8 wires the shared supervisor.
+            let sup = origin_tools::proc_supervisor::Supervisor::new();
+            origin_tools::builtins::monitor::monitor(margs, &sup)
+                .await
+                .map(|v| serde_json::to_string(&v).unwrap())
+                .map_err(|e| LoopError::ToolFailure(e.message))
+        }
         "Recall" => {
             let store =
                 cas.ok_or_else(|| LoopError::ToolFailure("Recall requires CAS to be configured".into()))?;
