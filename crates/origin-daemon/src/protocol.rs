@@ -364,6 +364,26 @@ pub enum StreamEvent {
     AdminError {
         message: String,
     },
+    /// Emitted when `/goal <cond>` activates a new goal.
+    GoalActive {
+        condition: String,
+        max_iter: u32,
+        token_budget: u64,
+    },
+    /// Emitted after each `run_loop` tick while a goal is active.
+    GoalIteration {
+        iter: u32,
+        tokens_spent: u64,
+        last_tag: origin_goal::TagOutcomeWire,
+    },
+    /// Emitted right before the Haiku verifier call.
+    GoalVerifying,
+    /// Terminal event for a goal.
+    GoalCleared {
+        reason: origin_goal::ClearReasonWire,
+        iter: u32,
+        tokens_spent: u64,
+    },
 }
 
 /// A single line in a unified diff view.

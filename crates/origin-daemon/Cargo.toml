@@ -48,6 +48,7 @@ origin-metrics          = { path = "../origin-metrics" }
 origin-runtime          = { path = "../origin-runtime" }
 origin-alloc            = { path = "../origin-alloc" }
 origin-resume-token     = { path = "../origin-resume-token" }
+origin-goal             = { path = "../origin-goal" }
 origin-plan             = { path = "../origin-plan" }
 origin-planner          = { path = "../origin-planner" }
 origin-swarm            = { path = "../origin-swarm" }
