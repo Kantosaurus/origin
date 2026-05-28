@@ -19,6 +19,9 @@ pub struct ToolMeta {
     /// that exec untrusted binaries override this to `Shell`, `WriteCwd`,
     /// etc. via the optional `sandbox: …` arm of [`crate::origin_tool!`].
     pub sandbox_profile: SandboxProfile,
+    /// Approximate token budget for this tool's serialised result. The
+    /// envelope's `ResultWriter` truncates / elides at this cap. Default 25k.
+    pub token_budget: u32,
 }
 
 inventory::collect!(ToolMeta);
