@@ -1205,6 +1205,16 @@ async fn dispatch_tool(
                 .map(|v| serde_json::to_string(&v).unwrap())
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
+        "ApplyPatch" => {
+            let pargs = origin_tools::builtins::apply_patch::ApplyPatchArgs {
+                patch: args.get("patch").and_then(Value::as_str)
+                    .ok_or_else(|| LoopError::BadArgs("ApplyPatch: missing `patch`".into()))?
+                    .to_string(),
+            };
+            origin_tools::builtins::apply_patch::apply_patch(&pargs)
+                .map(|v| serde_json::to_string(&v).unwrap())
+                .map_err(|e| LoopError::ToolFailure(e.message))
+        }
         "Write" => {
             let guard = origin_tools::builtins::write::WriteGuard::default();
             // Production callers pass the session's guard via dispatch_with_envelope;
