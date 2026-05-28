@@ -836,7 +836,9 @@ fn spawn_handler_task(
                 ClientMessage::ResumeRequest { token } => {
                     handle_resume_request(&conn, Arc::clone(&session_store), token).await;
                 }
-                ClientMessage::ActivateSkill { name } => {
+                ClientMessage::ActivateSkill { name, args } => {
+                    // `args` is consumed in Task 10 when goal routing lands; for now ignore it.
+                    let _ = &args;
                     // Look up the skill in the daemon-wide catalog loaded at
                     // startup. The catalog is the single source of truth shared
                     // with the system-prompt injection (see agent.rs::run_loop).

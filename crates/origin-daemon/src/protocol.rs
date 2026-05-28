@@ -115,7 +115,10 @@ pub enum ClientMessage {
     /// [`StreamEvent::SkillActive`] carrying the skill's `allowed-tools`
     /// (so the CLI can render the narrowing it just applied). On failure
     /// (skill not in catalog) it replies with [`StreamEvent::SkillError`].
-    ActivateSkill { name: String },
+    ActivateSkill {
+        name: String,
+        args: Option<String>,
+    },
     /// Pop the named skill off this connection's active stack (the
     /// rightmost match if the same skill was activated multiple times).
     /// Always replies with [`StreamEvent::AdminOk`] — deactivating an

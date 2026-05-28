@@ -9,11 +9,15 @@ use origin_daemon::protocol::{ClientMessage, StreamEvent};
 fn activate_skill_message_round_trips_as_json() {
     let msg = ClientMessage::ActivateSkill {
         name: "frontend-design".into(),
+        args: None,
     };
     let body = serde_json::to_vec(&msg).expect("encode");
     let decoded: ClientMessage = serde_json::from_slice(&body).expect("decode");
     match decoded {
-        ClientMessage::ActivateSkill { name } => assert_eq!(name, "frontend-design"),
+        ClientMessage::ActivateSkill { name, args } => {
+            assert_eq!(name, "frontend-design");
+            assert!(args.is_none());
+        }
         other => panic!("expected ActivateSkill, got {other:?}"),
     }
 }

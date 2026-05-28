@@ -116,19 +116,24 @@ pub fn parse_skill_command(line: &str) -> Option<ClientMessage> {
     if rest.is_empty() {
         return None;
     }
-    // Whitespace inside the slash invalidates it as a skill — free-form
-    // chat that happens to contain a `/` shouldn't activate anything.
-    if rest.chars().any(char::is_whitespace) {
+
+    // Split into `name_token` and `args` on the first whitespace.
+    let (name_token, args_str) = match rest.find(char::is_whitespace) {
+        Some(idx) => {
+            let (n, a) = rest.split_at(idx);
+            (n, a.trim_start())
+        }
+        None => (rest, ""),
+    };
+    if name_token.is_empty() {
         return None;
     }
-    // Disambiguate the deactivate sigil first.
-    if let Some(name) = rest.strip_prefix('-') {
-        if name.is_empty() {
+
+    // Deactivate sigil: `-<name>`, no args allowed (would be ambiguous).
+    if let Some(name) = name_token.strip_prefix('-') {
+        if name.is_empty() || !args_str.is_empty() {
             return None;
         }
-        // Apply the reserved-verb guard to the deactivate form too, so
-        // `/-mem` (silly but possible) never deactivates something named
-        // `mem` that would shadow the `/mem` verb if one existed.
         if RESERVED_SLASH_VERBS.iter().any(|v| name == *v) {
             return None;
         }
@@ -136,14 +141,20 @@ pub fn parse_skill_command(line: &str) -> Option<ClientMessage> {
             name: name.to_string(),
         });
     }
-    // Activate form: `/<name>` or `/<plugin>:<name>`.
-    // First word before any `:` is checked against reserved verbs.
-    let first_segment = rest.split(':').next().unwrap_or(rest);
+
+    // Activate form. Reserved-verb guard applies to the first `:`-segment.
+    let first_segment = name_token.split(':').next().unwrap_or(name_token);
     if RESERVED_SLASH_VERBS.iter().any(|v| first_segment == *v) {
         return None;
     }
+    let args = if args_str.is_empty() {
+        None
+    } else {
+        Some(args_str.to_string())
+    };
     Some(ClientMessage::ActivateSkill {
-        name: rest.to_string(),
+        name: name_token.to_string(),
+        args,
     })
 }
 
@@ -294,7 +305,10 @@ mod tests {
     fn parse_skill_bare_name() {
         let m = parse_skill_command("/frontend-design").expect("parse");
         match m {
-            ClientMessage::ActivateSkill { name } => assert_eq!(name, "frontend-design"),
+            ClientMessage::ActivateSkill { name, args } => {
+                assert_eq!(name, "frontend-design");
+                assert!(args.is_none());
+            }
             other => panic!("wrong variant: {other:?}"),
         }
     }
@@ -303,8 +317,9 @@ mod tests {
     fn parse_skill_namespaced() {
         let m = parse_skill_command("/frontend-design:frontend-design").expect("parse");
         match m {
-            ClientMessage::ActivateSkill { name } => {
+            ClientMessage::ActivateSkill { name, args } => {
                 assert_eq!(name, "frontend-design:frontend-design");
+                assert!(args.is_none());
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -336,9 +351,8 @@ mod tests {
         assert!(parse_skill_command("/").is_none());
         assert!(parse_skill_command("/-").is_none());
         assert!(parse_skill_command("/ ").is_none());
-        // Embedded whitespace disambiguates the slash from chat content
-        // (e.g. "/foo bar baz" is a free-form prompt mentioning a path).
-        assert!(parse_skill_command("/foo bar").is_none());
+        // Deactivate-with-args is ambiguous and must be rejected.
+        assert!(parse_skill_command("/-foo bar").is_none());
     }
 
     #[test]
@@ -418,5 +432,45 @@ mod tests {
         // refuse `/model` so /model handling owns the verb.
         assert!(parse_skill_command("/model").is_none());
         assert!(parse_skill_command("/model:foo").is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests_args {
+    use super::*;
+    use origin_daemon::protocol::ClientMessage;
+
+    #[test]
+    fn slash_with_args_returns_args_field() {
+        let got = parse_skill_command("/goal fix the failing tests");
+        assert!(matches!(
+            got,
+            Some(ClientMessage::ActivateSkill { ref name, args: Some(ref a) })
+                if name == "goal" && a == "fix the failing tests"
+        ));
+    }
+
+    #[test]
+    fn slash_without_args_returns_none_args() {
+        let got = parse_skill_command("/clear");
+        assert!(matches!(
+            got,
+            Some(ClientMessage::ActivateSkill { ref name, args: None })
+                if name == "clear"
+        ));
+    }
+
+    #[test]
+    fn deactivate_form_unaffected() {
+        let got = parse_skill_command("/-goal");
+        assert!(matches!(
+            got,
+            Some(ClientMessage::DeactivateSkill { ref name }) if name == "goal"
+        ));
+    }
+
+    #[test]
+    fn reserved_verb_still_rejected_with_args() {
+        assert!(parse_skill_command("/mem accept").is_none());
     }
 }
