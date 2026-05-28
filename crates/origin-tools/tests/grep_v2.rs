@@ -1,5 +1,4 @@
 use origin_tools::builtins::grep_tool::{grep_v2, GrepArgs, OutputMode};
-use serde_json::Value;
 use std::fs;
 use tempfile::tempdir;
 

@@ -66,7 +66,7 @@ async fn loop_dispatches_tool_and_continues() {
     let tool_use = Block::ToolUse {
         id: "tu_1".into(),
         name: "Read".into(),
-        input_json: serde_json::to_vec(&serde_json::json!({"path": path_str.clone()})).expect("json"),
+        input_json: serde_json::to_vec(&serde_json::json!({"file_path": path_str.clone()})).expect("json"),
         cache_marker: None,
     };
     let final_text = Block::text("final");
@@ -106,7 +106,7 @@ async fn loop_caps_at_max_turns() {
     let make_tool_use = || Block::ToolUse {
         id: ulid::Ulid::new().to_string(),
         name: "Read".into(),
-        input_json: serde_json::to_vec(&serde_json::json!({"path": path_str.clone()})).expect("json"),
+        input_json: serde_json::to_vec(&serde_json::json!({"file_path": path_str.clone()})).expect("json"),
         cache_marker: None,
     };
     let mut responses = Vec::new();
@@ -153,7 +153,7 @@ async fn tool_result_goes_to_cas_and_block_carries_handle_only() {
     let tool_use = Block::ToolUse {
         id: "tu_cas".into(),
         name: "Read".into(),
-        input_json: serde_json::to_vec(&serde_json::json!({"path": path_str.clone()})).expect("json"),
+        input_json: serde_json::to_vec(&serde_json::json!({"file_path": path_str.clone()})).expect("json"),
         cache_marker: None,
     };
     let provider = ScriptedProvider::new(vec![
@@ -234,7 +234,7 @@ async fn dispatch_registers_pure_tool_handle_as_sticky_in_shared_plan() {
     let tool_use = Block::ToolUse {
         id: "tu_plan".into(),
         name: "Read".into(), // Read has SideEffects::Pure → Band::Sticky
-        input_json: serde_json::to_vec(&serde_json::json!({"path": path_str.clone()})).expect("json"),
+        input_json: serde_json::to_vec(&serde_json::json!({"file_path": path_str.clone()})).expect("json"),
         cache_marker: None,
     };
     let provider = ScriptedProvider::new(vec![

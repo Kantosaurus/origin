@@ -179,6 +179,43 @@ impl ResumeToken {
         std::fs::write(path, json)
     }
 
+    /// Load the single MAC-wrapped token at `<dir>/<session_id>.json`,
+    /// verifying its MAC. Returns `Ok(None)` if the file does not exist.
+    ///
+    /// # Errors
+    /// Propagates I/O errors, serde decode failures, missing-key, and
+    /// MAC mismatches — never silently skips a present-but-bad token.
+    pub fn load_one(dir: &Path, session_id: &str) -> std::io::Result<Option<Self>> {
+        let path = dir.join(format!("{session_id}.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path)?;
+        let wrapper: OnDisk = serde_json::from_slice(&bytes).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "resume token {} is not a valid MAC-wrapped envelope: {e}",
+                    path.display()
+                ),
+            )
+        })?;
+        let key = load_key_strict(dir)?;
+        let expected_hex = compute_mac_hex(&key, wrapper.payload.as_bytes());
+        let got_hex = wrapper.mac_hex.as_bytes();
+        let exp_hex = expected_hex.as_bytes();
+        let ok: bool = got_hex.len() == exp_hex.len() && bool::from(got_hex.ct_eq(exp_hex));
+        if !ok {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("MAC mismatch for {session_id}.json"),
+            ));
+        }
+        let token: Self = serde_json::from_str(&wrapper.payload)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Some(token))
+    }
+
     /// Read every `*.json` token under `dir`, verifying each MAC.
     /// Missing dir → empty vec. Missing `.mac-key` while token files
     /// exist → Err(NotFound). Tampered or unwrapped file → Err(InvalidData).
