@@ -6,6 +6,7 @@ pub const DEFAULT_TOKEN_BUDGET: u32 = 25_000;
 
 pub mod budget_writer;
 pub mod builtins;
+pub mod result_cas;
 pub mod dispatch;
 pub mod error;
 pub mod macros;
