@@ -1302,6 +1302,29 @@ async fn dispatch_tool(
                 .map(|v| serde_json::to_string(&v).unwrap())
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
+        "Diagnostics" => {
+            // Envelope-routed path uses ctx.ra (shared handle); this passthrough
+            // path constructs a per-call DaemonRa. Known limitation — Phase 8
+            // will wire the shared handle via dispatch_with_envelope.
+            // NOTE: per-call DaemonRa means RA is re-spawned every call.
+            let sev = match args.get("severity").and_then(Value::as_str).unwrap_or("any") {
+                "error" => origin_tools::ra_bridge::Severity::Error,
+                "warning" => origin_tools::ra_bridge::Severity::Warning,
+                "hint" => origin_tools::ra_bridge::Severity::Hint,
+                _ => origin_tools::ra_bridge::Severity::Any,
+            };
+            let dargs = origin_tools::builtins::diagnostics::DiagnosticsArgs {
+                path: args.get("path").and_then(Value::as_str).map(str::to_string),
+                severity: sev,
+            };
+            let ra = crate::ra_impl::DaemonRa::new(
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            );
+            origin_tools::builtins::diagnostics::diagnostics(dargs, &ra)
+                .await
+                .map(|v| serde_json::to_string(&v).unwrap())
+                .map_err(|e| LoopError::ToolFailure(e.message))
+        }
         "Recall" => {
             let store =
                 cas.ok_or_else(|| LoopError::ToolFailure("Recall requires CAS to be configured".into()))?;

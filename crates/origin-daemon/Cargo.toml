@@ -52,8 +52,10 @@ origin-plan             = { path = "../origin-plan" }
 origin-planner          = { path = "../origin-planner" }
 origin-swarm            = { path = "../origin-swarm" }
 origin-browser          = { path = "../origin-browser" }
+origin-lsp-client       = { path = "../origin-lsp-client" }
 ctrlc                   = "3"
 dirs                    = "5"
+which                   = "6"
 hyper                   = { workspace = true }
 hyper-util              = { version = "0.1", features = ["tokio"] }
 http-body-util          = "0.1"
