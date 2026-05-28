@@ -71,6 +71,15 @@ struct DaemonState {
 /// `spawn_on_worker` + `Handle::block_on`. SIGINT/SIGTERM trigger the
 /// shutdown signal; the full phased shutdown lands in P12.11.
 fn main() -> Result<()> {
+    // Before anything else: check for the `install-ra` subcommand.
+    // This runs synchronously and exits without starting the full daemon.
+    {
+        let mut args = std::env::args().skip(1).peekable();
+        if args.peek().is_some_and(|a| a == "install-ra") {
+            return install_ra();
+        }
+    }
+
     // Install the parquet-backed tracing layer. The guard holds the drain
     // thread alive for the lifetime of `main`; on shutdown it flushes any
     // buffered spans before exiting. We keep this on the OS main thread so
@@ -1642,6 +1651,101 @@ fn default_cas_root() -> String {
     let mut p = std::env::temp_dir();
     p.push("origin-cas");
     p.to_string_lossy().into_owned()
+}
+
+// ── install-ra subcommand ─────────────────────────────────────────────────────
+
+/// Download a rust-analyzer binary into `$ORIGIN_CACHE/bin` for the
+/// `Diagnostics` tool to use.
+///
+/// The downloaded file is the raw archive from the GitHub release
+/// (`*.gz` on Linux/macOS, `*.zip` on Windows). Automatic extraction is
+/// intentionally omitted for v2 simplicity — the user runs `gunzip` /
+/// `Expand-Archive` manually after download. A future v2.1 pass can add
+/// automatic decompression.
+fn install_ra() -> Result<()> {
+    let cache_dir = resolve_install_cache_dir()?;
+    let bin_dir = cache_dir.join("bin");
+    std::fs::create_dir_all(&bin_dir)
+        .map_err(|e| anyhow::anyhow!("create bin dir {}: {e}", bin_dir.display()))?;
+
+    let (url, file_name) = ra_release_url_for_platform();
+    if url.is_empty() {
+        return Err(anyhow::anyhow!("unsupported platform for install-ra"));
+    }
+    let target = bin_dir.join(file_name);
+    eprintln!("origin: downloading rust-analyzer from {url}");
+    let bytes = reqwest::blocking::get(url.as_str())
+        .map_err(|e| anyhow::anyhow!("download failed: {e}"))?
+        .bytes()
+        .map_err(|e| anyhow::anyhow!("read response: {e}"))?;
+    std::fs::write(&target, &bytes)
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", target.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&target)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&target, perms)
+            .map_err(|e| anyhow::anyhow!("chmod {}: {e}", target.display()))?;
+    }
+    eprintln!(
+        "origin: installed: {} — run gunzip/unzip to extract, then retry Diagnostics",
+        target.display()
+    );
+    Ok(())
+}
+
+fn resolve_install_cache_dir() -> Result<std::path::PathBuf> {
+    if let Ok(c) = std::env::var("ORIGIN_CACHE") {
+        return Ok(c.into());
+    }
+    #[cfg(windows)]
+    if let Ok(c) = std::env::var("LOCALAPPDATA") {
+        return Ok(std::path::PathBuf::from(c).join("origin"));
+    }
+    #[cfg(not(windows))]
+    if let Ok(c) = std::env::var("XDG_CACHE_HOME") {
+        return Ok(std::path::PathBuf::from(c).join("origin"));
+    }
+    Ok(dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("no home directory found"))?
+        .join(".cache")
+        .join("origin"))
+}
+
+/// Return `(download_url, archive_file_name)` for the current platform.
+/// Returns `("", "rust-analyzer")` on unsupported platforms.
+fn ra_release_url_for_platform() -> (String, &'static str) {
+    let base =
+        "https://github.com/rust-lang/rust-analyzer/releases/latest/download";
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    return (
+        format!("{base}/rust-analyzer-x86_64-unknown-linux-gnu.gz"),
+        "rust-analyzer.gz",
+    );
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    return (
+        format!("{base}/rust-analyzer-aarch64-unknown-linux-gnu.gz"),
+        "rust-analyzer.gz",
+    );
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    return (
+        format!("{base}/rust-analyzer-aarch64-apple-darwin.gz"),
+        "rust-analyzer.gz",
+    );
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    return (
+        format!("{base}/rust-analyzer-x86_64-apple-darwin.gz"),
+        "rust-analyzer.gz",
+    );
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    return (
+        format!("{base}/rust-analyzer-x86_64-pc-windows-msvc.zip"),
+        "rust-analyzer.zip",
+    );
+    #[allow(unreachable_code)]
+    (String::new(), "rust-analyzer")
 }
 
 /// Parse the optional `--metrics-bind <addr>` CLI flag, falling back to the
