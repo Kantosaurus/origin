@@ -12,6 +12,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::error::{ErrClass, ToolError};
+use crate::proc_supervisor::Supervisor;
 use crate::result_cas::{ref_token, ResultStore};
 use crate::SideEffects;
 
@@ -21,6 +22,8 @@ pub struct EnvelopeCtx {
     pub session_id: Option<Arc<str>>,
     /// Output-CAS store shared across all tool calls in the session.
     pub result_store: ResultStore,
+    /// Process supervisor for Bash v2 and Monitor.
+    pub supervisor: Supervisor,
 }
 
 /// Whether the envelope should attempt output-CAS dedup for this call.
