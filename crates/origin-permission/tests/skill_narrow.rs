@@ -10,6 +10,7 @@ const READ_META: ToolMeta = ToolMeta {
     side_effects: SideEffects::Pure,
     input_schema: "{}",
     sandbox_profile: SandboxProfile::ReadFs,
+    token_budget: origin_tools::DEFAULT_TOKEN_BUDGET,
 };
 
 const EDIT_META: ToolMeta = ToolMeta {
@@ -20,6 +21,7 @@ const EDIT_META: ToolMeta = ToolMeta {
     side_effects: SideEffects::Mutating,
     input_schema: "{}",
     sandbox_profile: SandboxProfile::WriteCwd,
+    token_budget: origin_tools::DEFAULT_TOKEN_BUDGET,
 };
 
 #[tokio::test]
