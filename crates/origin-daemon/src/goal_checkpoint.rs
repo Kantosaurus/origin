@@ -11,6 +11,29 @@
 //! When the session-checkpoint subsystem lands, fill in the three
 //! placeholder fields and remove this notice. The goal field's shape will
 //! not change.
+//!
+//! # Concurrent-writer hazard (future)
+//!
+//! Both `make_goal_checkpoint_token` (this module, writing a goal snapshot)
+//! and a future session-checkpoint writer (writing `cas_handle_root` /
+//! `pending_tool_calls` / `plan_seq`) will end up persisting to the SAME
+//! `<state_dir>/resume/<session_id>.json` file. Naive `save()` calls from
+//! both code paths will race and clobber each other's fields.
+//!
+//! Resolutions, in order of preference:
+//!
+//! 1. **Single unified writer.** Funnel both updates through one task that
+//!    owns the on-disk token; goal-iteration boundaries and session-turn
+//!    boundaries both send messages to it. Cleanest, no locks required.
+//! 2. **Fetch-modify-write under a file lock.** If a unified writer is
+//!    infeasible, each writer must `load_one` → mutate its own fields →
+//!    `save` while holding a per-session advisory file lock (`fs2::FileExt`
+//!    on unix, `LockFileEx` on windows). Pay attention to write-then-rename
+//!    semantics so a partial write never leaves a corrupted MAC envelope.
+//!
+//! Whichever path is chosen, ship it BEFORE the session-checkpoint
+//! subsystem lands or the first concurrent write will silently drop one
+//! subsystem's state on the floor.
 
 use origin_resume_token::ResumeToken;
 
@@ -51,12 +74,30 @@ pub fn make_goal_checkpoint_token(
             max_iter: g.max_iter,
             tokens_spent: g.tokens_spent,
             token_budget: g.token_budget,
-            started_at_unix: g
-                .started_at
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+            // `started_at` BEFORE the Unix epoch is only reachable from a
+            // misconfigured system clock (VM with bad RTC, CI image with
+            // year=1969, etc.). We clamp to 0 to avoid panicking, but a
+            // resumed daemon that subtracts a 0-seconds-since-epoch start
+            // from `now()` will compute wildly inflated elapsed-since-start
+            // metrics. Surface a warning so the operator sees it in the
+            // daemon log — silent clamping made this footgun invisible
+            // before.
+            started_at_unix: match g.started_at.duration_since(std::time::UNIX_EPOCH) {
+                Ok(d) => d.as_secs(),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "origin_daemon::goal_checkpoint",
+                        session_id = %session_id,
+                        ?err,
+                        "goal.started_at is before UNIX_EPOCH; clamping to 0. \
+                         Elapsed-since-start math on resume will be wrong; \
+                         check the system clock."
+                    );
+                    0
+                }
+            },
             status: g.status.clone().into(),
+            last_status_tag: g.last_status_tag.clone().map(Into::into),
         }),
     }
 }
@@ -91,5 +132,21 @@ mod tests {
         assert_eq!(snap.tokens_spent, 1_234);
         assert_eq!(snap.token_budget, 50_000);
         assert_eq!(snap.status, GoalStatusWire::Active);
+    }
+
+    // Bug #18: a pre-1970 system clock makes `duration_since(UNIX_EPOCH)` fail.
+    // We clamp to 0 to avoid panics, but the elapsed-since-start math becomes
+    // meaningless. The test pins the clamp behaviour (regression guard).
+    #[test]
+    fn pre_epoch_started_at_clamps_to_zero() {
+        use std::time::{Duration, SystemTime};
+        let mut g = GoalState::new("x".into(), None, None);
+        g.started_at = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+        let token = make_goal_checkpoint_token("s", 0, &Some(g));
+        let snap = token.goal.expect("goal snapshot present");
+        assert_eq!(
+            snap.started_at_unix, 0,
+            "pre-epoch started_at must clamp to 0 (never panic)"
+        );
     }
 }
