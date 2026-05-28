@@ -80,3 +80,32 @@ fn non_utf8_without_bom_errors() {
     let result = normalise_to_lf(bytes, &det);
     assert!(result.is_err());
 }
+
+use proptest::prelude::*;
+
+fn arb_eol() -> impl Strategy<Value = &'static [u8]> {
+    prop_oneof![
+        Just("\r\n".as_bytes()),
+        Just("\n".as_bytes()),
+        Just("\r".as_bytes()),
+    ]
+}
+
+fn arb_line_with_eol() -> impl Strategy<Value = Vec<u8>> {
+    ("[a-zA-Z]{1,8}", arb_eol()).prop_map(|(s, eol)| {
+        let mut v = s.into_bytes();
+        v.extend_from_slice(eol);
+        v
+    })
+}
+
+proptest! {
+    #[test]
+    fn round_trip_arbitrary_mixed_eol(lines in proptest::collection::vec(arb_line_with_eol(), 0..20)) {
+        let original: Vec<u8> = lines.into_iter().flatten().collect();
+        let det = detect(&original);
+        let text = normalise_to_lf(&original, &det).unwrap();
+        let back = denormalise(&text, &det);
+        prop_assert_eq!(back, original);
+    }
+}
