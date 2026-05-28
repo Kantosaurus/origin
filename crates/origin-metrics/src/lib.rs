@@ -63,14 +63,17 @@ struct FamilyHeader {
     family: &'static str,
 }
 
-/// Fast-encode index. Lookups are keyed by `(family, sorted-label-pairs)`
+/// Canonical key for [`FastIndex`] lookups: `(family, sorted-label-pairs)`
 /// where each pair is `(label-name, label-value)`. Using the full pair
 /// (not just names or just values) is what makes the key truly canonical:
 /// it correctly dedups identical (family, labels) registrations while
 /// keeping registrations that differ in either name or value distinct.
+type FastIndexKey = (&'static str, Vec<(&'static str, &'static str)>);
+
+/// Fast-encode index keyed by [`FastIndexKey`].
 #[derive(Default)]
 struct FastIndex {
-    by_key: HashMap<(&'static str, Vec<(&'static str, &'static str)>), usize>,
+    by_key: HashMap<FastIndexKey, usize>,
     rows: Vec<FastRow>,
 }
 

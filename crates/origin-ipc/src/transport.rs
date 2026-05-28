@@ -129,6 +129,11 @@ impl Connection {
 /// Returns [`io::ErrorKind::InvalidData`] for an unknown frame kind or a
 /// body-length field exceeding [`crate::frame::MAX_FRAME_BYTES`], or any
 /// underlying I/O error from the reader.
+// Generic over `R: AsyncRead + Unpin` without a `Send` bound by design — the
+// function is consumed by both the multi-thread runtime (Send readers) and by
+// in-memory single-thread tests using `tokio::io::DuplexStream`. Adding `Send`
+// would force every caller to use Send-bounded readers.
+#[allow(clippy::future_not_send)]
 pub async fn read_frame_from<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<(FrameKind, Vec<u8>)> {
     let mut header = [0_u8; HEADER_LEN];
     reader.read_exact(&mut header).await?;
@@ -169,7 +174,7 @@ mod tests {
 
     /// Build a raw frame header with the given body length. Body bytes are
     /// not sent — the reader should reject the header before any allocation.
-    fn malicious_header(body_len: u32) -> [u8; FRAME_HEADER_LEN] {
+    const fn malicious_header(body_len: u32) -> [u8; FRAME_HEADER_LEN] {
         let mut h = [0_u8; FRAME_HEADER_LEN];
         // magic = 0x4F524F4E "ORON" big-endian
         h[0] = 0x4F;

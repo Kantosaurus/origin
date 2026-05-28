@@ -136,7 +136,7 @@ impl Anthropic {
         }
     }
 
-    fn is_oauth(&self) -> bool {
+    const fn is_oauth(&self) -> bool {
         matches!(self.auth, AuthKind::OAuthBearer(_))
     }
 
@@ -343,8 +343,7 @@ fn message_to_wire<'a>(m: &'a Message, plan: Option<&Plan>, msg_idx: usize) -> w
     // Dynamic per-message markers (populated each turn by the agent loop).
     // Empty by default, so the read is cheap when no planner is wired.
     let dyn_msg_marker_here = plan
-        .map(|p| p.dynamic_message_markers().contains(&msg_idx))
-        .unwrap_or(false);
+        .is_some_and(|p| p.dynamic_message_markers().contains(&msg_idx));
     // When path 3 fires we need to land the marker on the *last emitting*
     // block. `Block::Thinking` is filtered out by `block_to_wire`, so we skip
     // it when picking the boundary block — otherwise a trailing thinking
@@ -534,22 +533,24 @@ fn load_oauth_metadata(session_id: &str) -> wire::WireMetadata {
     let (device_id, account_uuid) = std::fs::read_to_string(&claude_json)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .map(|v| {
-            let did = v.get("userID").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let auid = v
-                .get("oauthAccount")
-                .and_then(|o| o.get("accountUuid"))
-                .and_then(|x| x.as_str())
-                .unwrap_or("unknown-account")
-                .to_string();
-            (did, auid)
-        })
-        .unwrap_or_else(|| {
-            let did = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, session_id.as_bytes())
-                .simple()
-                .to_string();
-            (did, "unknown-account".to_string())
-        });
+        .map_or_else(
+            || {
+                let did = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, session_id.as_bytes())
+                    .simple()
+                    .to_string();
+                (did, "unknown-account".to_string())
+            },
+            |v| {
+                let did = v.get("userID").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let auid = v
+                    .get("oauthAccount")
+                    .and_then(|o| o.get("accountUuid"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("unknown-account")
+                    .to_string();
+                (did, auid)
+            },
+        );
 
     let user_id = serde_json::json!({
         "device_id": device_id,

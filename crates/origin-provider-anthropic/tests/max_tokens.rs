@@ -1,4 +1,4 @@
-//! Locks in the anthropic `max_tokens` ceiling at 16_384 (commit 78916ea).
+//! Locks in the anthropic `max_tokens` ceiling at `16_384` (commit 78916ea).
 //!
 //! Pair with `origin-provider-bedrock/tests/max_tokens.rs` so a future bump
 //! has to touch both crates in lockstep.

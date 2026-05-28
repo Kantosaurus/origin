@@ -309,7 +309,7 @@ mod tests {
     use crate::frame::MAX_FRAME_BYTES;
 
     /// Build a frame header with the given body length and kind=Request.
-    fn header_with_len(body_len: u32) -> [u8; HEADER_LEN] {
+    const fn header_with_len(body_len: u32) -> [u8; HEADER_LEN] {
         let mut h = [0_u8; HEADER_LEN];
         h[0] = 0x4F;
         h[1] = 0x52;

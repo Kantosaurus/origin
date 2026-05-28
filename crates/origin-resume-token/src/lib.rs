@@ -22,7 +22,7 @@
 //! round-trip, no formatter sensitivity. The key is a 32-byte file at
 //! `<dir>/.mac-key`, generated on first save via `getrandom`, chmod 0600
 //! on unix. On windows we cannot tighten the ACL via the stdlib alone
-//! (see save() for the gap note) so the directory itself must already be
+//! (see `save()` for the gap note) so the directory itself must already be
 //! user-private.
 //!
 //! No back-compat for the pre-MAC bare-JSON format: a load of an
@@ -122,7 +122,7 @@ fn load_or_create_key(dir: &Path) -> std::io::Result<[u8; KEY_LEN]> {
     }
 }
 
-/// Read the sidecar MAC key. Fails (NotFound) if missing — load paths
+/// Read the sidecar MAC key. Fails (`NotFound`) if missing — load paths
 /// must NOT auto-generate, because that would silently let a tampered
 /// token slide through after an attacker deletes the key.
 fn load_key_strict(dir: &Path) -> std::io::Result<[u8; KEY_LEN]> {
@@ -236,7 +236,7 @@ impl ResumeToken {
         // Pre-scan for token files. If none, the key file's absence is
         // irrelevant — return empty cleanly.
         let entries: Vec<_> = std::fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
             .collect();
         if entries.is_empty() {

@@ -118,13 +118,13 @@ fn clone_one_file(src: &Path, dst: &Path) -> Result<(), Error> {
     // Open the temp destination: writable, create-always so we own a
     // fresh file even if a previous run left an orphan temp behind.
     let dst_handle = open_write_create(&tmp)?;
-    let _dst_guard = HandleGuard(dst_handle);
+    let dst_guard = HandleGuard(dst_handle);
 
     if src_size == 0 {
         // Empty file: nothing to duplicate. The CreateFileW above
         // already produced a zero-length temp; drop the handle so the
         // rename can take it, then move into place.
-        drop(_dst_guard);
+        drop(dst_guard);
         return rename_replacing(&tmp, dst);
     }
 
@@ -175,7 +175,7 @@ fn clone_one_file(src: &Path, dst: &Path) -> Result<(), Error> {
         let win32 = hresult_to_win32(hr);
         // Drop the handle and remove the temp before reporting Unsupported
         // so we never leave an oversized orphan at the final path's sibling.
-        drop(_dst_guard);
+        drop(dst_guard);
         let _ = fs::remove_file(&tmp);
         if win32 == Some(ERROR_INVALID_FUNCTION.0) {
             return Err(Error::Unsupported(format!(
@@ -200,7 +200,7 @@ fn clone_one_file(src: &Path, dst: &Path) -> Result<(), Error> {
     // overwrite with CREATE_ALWAYS.
     if aligned_size != src_size {
         if let Err(e) = seek_set(dst_handle, src_size) {
-            drop(_dst_guard);
+            drop(dst_guard);
             let _ = fs::remove_file(&tmp);
             return Err(unsupported(format!(
                 "SetFilePointerEx({}, {src_size}): {e}",
@@ -208,7 +208,7 @@ fn clone_one_file(src: &Path, dst: &Path) -> Result<(), Error> {
             )));
         }
         if let Err(e) = set_eof(dst_handle) {
-            drop(_dst_guard);
+            drop(dst_guard);
             let _ = fs::remove_file(&tmp);
             return Err(unsupported(format!("SetEndOfFile-trim({}): {e}", tmp.display())));
         }
@@ -218,7 +218,7 @@ fn clone_one_file(src: &Path, dst: &Path) -> Result<(), Error> {
     // MOVEFILE_REPLACE_EXISTING needs no other handle holding write
     // access to the source name; closing here also flushes any pending
     // metadata on this handle.
-    drop(_dst_guard);
+    drop(dst_guard);
     rename_replacing(&tmp, dst)
 }
 
@@ -226,7 +226,7 @@ fn clone_one_file(src: &Path, dst: &Path) -> Result<(), Error> {
 /// same directory so `MoveFileExW` stays within a single volume (which
 /// is required for a rename instead of a copy+delete).
 fn temp_sibling(dst: &Path) -> std::path::PathBuf {
-    let parent = dst.parent().unwrap_or(Path::new("."));
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
     // Two nanos-precision tokens collide only on the same nanosecond
     // *and* same destination — vanishingly unlikely, and the temp is
     // opened with CREATE_ALWAYS which would overwrite anyway.
@@ -236,8 +236,7 @@ fn temp_sibling(dst: &Path) -> std::path::PathBuf {
         .unwrap_or(0);
     let file_name = dst
         .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| String::from("reflink"));
+        .map_or_else(|| String::from("reflink"), |s| s.to_string_lossy().into_owned());
     parent.join(format!(".{file_name}.reflink-tmp-{nanos}"))
 }
 
