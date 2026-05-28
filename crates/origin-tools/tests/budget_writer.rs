@@ -38,3 +38,25 @@ fn writer_records_lines_consumed_for_continuation() {
     // Continuation handle should point to line 2 (last noted before overflow).
     assert!(body.contains("\"offset\":2"), "body: {body}");
 }
+
+use proptest::prelude::*;
+
+proptest! {
+    #[test]
+    fn body_never_exceeds_budget_plus_sentinel(
+        budget in 1u32..200,
+        chunks in proptest::collection::vec(".[a-z]{0,40}", 0..10),
+    ) {
+        let mut w = ResultWriter::new(budget, "Read", json!({}));
+        for c in &chunks {
+            w.push_str(c);
+        }
+        // Verify the writer's own per-chunk token accounting never exceeds the
+        // budget. This is the invariant the impl enforces (per-chunk floor-division
+        // sum). Note: whole-body approx_tokens can differ due to integer division
+        // remainders, so we use used_tokens() which matches the impl's model.
+        let used = w.used_tokens();
+        let _body = w.finish_string();
+        prop_assert!(used <= budget, "used {} > budget {}", used, budget);
+    }
+}

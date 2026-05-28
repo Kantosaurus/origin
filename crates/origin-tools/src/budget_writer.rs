@@ -41,6 +41,12 @@ impl ResultWriter {
         }
     }
 
+    /// Returns the number of tokens consumed so far (per the impl's approximation).
+    #[must_use]
+    pub const fn used_tokens(&self) -> u32 {
+        self.used_tokens
+    }
+
     /// Mark that the next `push_str` corresponds to the record at `line_idx`.
     /// Used to compute the `offset` field of the continuation handle on overflow.
     pub fn note_line(&mut self, line_idx: u32) {
