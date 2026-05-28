@@ -503,6 +503,28 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
         "skill catalog loaded at startup"
     );
 
+    // Workflows catalog: loaded once at startup so every turn's system prompt
+    // can advertise them. Re-load on user edits happens via `ActivateWorkflow`'s
+    // existing on-demand load path; this snapshot is for advertising only.
+    let workflows_catalog: Arc<origin_daemon::workflows::WorkflowsFile> = {
+        let home = std::env::var_os("ORIGIN_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let path = home.join(".origin").join("workflows.toml");
+        match origin_daemon::workflows::load_from(&path) {
+            Ok(f) => Arc::new(f),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "workflows.toml load failed; running with empty workflows catalog");
+                Arc::new(origin_daemon::workflows::WorkflowsFile::default())
+            }
+        }
+    };
+    info!(
+        workflow_count = workflows_catalog.workflows.len(),
+        "workflows catalog loaded at startup"
+    );
+
     spawn_idle_consolidator(memory.as_ref());
 
     // P11.12: optional bounded-cardinality Prometheus `/metrics` endpoint.
@@ -556,6 +578,7 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
             Arc::clone(&proposal_registry),
             plan_bus.clone(),
             Arc::clone(&skill_catalog),
+            Arc::clone(&workflows_catalog),
             Arc::clone(&code_graph),
             Arc::clone(&mem_router),
             Arc::clone(&coordinator),
@@ -654,6 +677,7 @@ fn spawn_handler_task(
     proposal_registry: Arc<ProposalRegistry>,
     plan_bus: PlanBus,
     skill_catalog: Arc<SkillCatalog>,
+    workflows_catalog: Arc<origin_daemon::workflows::WorkflowsFile>,
     code_graph: Arc<tokio::sync::Mutex<CodeGraphIndex>>,
     mem_router: Arc<dyn origin_codegraph::ask::MemRouter>,
     coordinator: Arc<Coordinator>,
@@ -727,6 +751,7 @@ fn spawn_handler_task(
                         memory_handle.clone(),
                         Arc::clone(&proposal_registry),
                         Arc::clone(&skill_catalog),
+                        Arc::clone(&workflows_catalog),
                         Arc::clone(&active_skills),
                         Arc::clone(&code_graph),
                         Arc::clone(&mem_router),
@@ -1090,6 +1115,7 @@ async fn handle_request(
     memory_handle: Option<Arc<dyn MemoryHandleTrait>>,
     proposal_registry: Arc<ProposalRegistry>,
     skill_catalog: Arc<SkillCatalog>,
+    workflows_catalog: Arc<origin_daemon::workflows::WorkflowsFile>,
     active_skills: Arc<tokio::sync::Mutex<SkillRegistry>>,
     code_graph: Arc<tokio::sync::Mutex<CodeGraphIndex>>,
     mem_router: Arc<dyn origin_codegraph::ask::MemRouter>,
@@ -1190,6 +1216,7 @@ async fn handle_request(
                 snapshot_opt.map(Arc::new)
             },
             skill_catalog: Some(Arc::clone(&skill_catalog)),
+            workflows: Some(Arc::clone(&workflows_catalog)),
             memory_handle: memory_handle.clone(),
             coordinator: Some(Arc::clone(&coordinator)),
             plan: Some(plan.clone()),

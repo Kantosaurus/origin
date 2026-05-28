@@ -6,6 +6,7 @@ use crate::session::Session;
 use crate::session_store::SessionStore;
 use crate::skill_catalog::SkillCatalog;
 use crate::tool_use_parser::{ToolUseDelta, ToolUseParser};
+use crate::workflows::WorkflowsFile;
 use origin_cas::{Hash, Store};
 use origin_core::types::{Block, Message, Role};
 use origin_mem::{Injector, Proposer};
@@ -105,6 +106,11 @@ pub struct LoopOptions {
     /// activation state lives in `skills` above; this is the catalog of
     /// all loadable skills, separate from "currently active".
     pub skill_catalog: Option<Arc<SkillCatalog>>,
+    /// Daemon-wide workflow catalog, loaded once at startup from
+    /// `~/.origin/workflows.toml`. When `Some`, each turn's system prompt
+    /// includes an `Available workflows` block so the model can answer
+    /// "what workflows do you have?" without inventing them.
+    pub workflows: Option<Arc<WorkflowsFile>>,
     /// Optional memory-subsystem handle. When `Some`, `mem_search`,
     /// `mem_save`, and `mem_forget` dispatch to the live `MemoryStore` /
     /// HNSW index. When `None`, those tools return
@@ -144,6 +150,7 @@ impl Default for LoopOptions {
             proposal_registry: None,
             skills: None,
             skill_catalog: None,
+            workflows: None,
             memory_handle: None,
             coordinator: None,
             plan: None,
@@ -427,14 +434,51 @@ pub async fn run_loop(
         })
         .unwrap_or_default();
 
-    // Concatenate: catalog first (so it's stable across recall variation),
-    // then recall context.
-    let recalled_system = if catalog_block.is_empty() {
-        recall_block
-    } else if recall_block.is_empty() {
-        catalog_block
-    } else {
-        format!("{catalog_block}\n{recall_block}")
+    // Build the workflows block. Mirrors the skills catalog: one line per
+    // workflow so the model can answer "what workflows do you have?" without
+    // hallucinating from the tools list. Empty file → empty block.
+    let workflows_block = opts
+        .workflows
+        .as_ref()
+        .map(|file| {
+            use std::fmt::Write as _;
+            if file.workflows.is_empty() {
+                String::new()
+            } else {
+                let mut out =
+                    String::from("Available workflows (run via `/workflow <name>`):\n");
+                for wf in &file.workflows {
+                    match wf.description.as_deref() {
+                        Some(desc) => {
+                            let _ = writeln!(out, "  - {}: {}", wf.name, desc);
+                        }
+                        None => {
+                            let _ = writeln!(out, "  - {}", wf.name);
+                        }
+                    }
+                }
+                out
+            }
+        })
+        .unwrap_or_default();
+
+    // Assemble the final system prompt in this fixed order:
+    //   1. default-workflow directive (unless ORIGIN_DEFAULT_WORKFLOW=off)
+    //   2. skills catalog
+    //   3. workflows catalog
+    //   4. prompt recall context
+    //
+    // Each section is separated by a blank line. Empty sections are dropped
+    // rather than rendered as orphan blank lines.
+    let recalled_system = {
+        let directive = crate::default_workflow::directive();
+        let parts: [&str; 4] = [directive, &catalog_block, &workflows_block, &recall_block];
+        parts
+            .iter()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     };
 
     for turn in 1..=opts.max_turns {

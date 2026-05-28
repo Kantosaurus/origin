@@ -101,6 +101,7 @@ async fn memory_e2e_proposer_to_store_via_wiremock() {
         proposal_registry: None,
         skills: None,
         skill_catalog: None,
+        workflows: None,
         memory_handle: None,
         coordinator: None,
         plan: None,

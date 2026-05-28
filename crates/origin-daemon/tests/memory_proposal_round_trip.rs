@@ -104,6 +104,7 @@ async fn memory_proposed_round_trip_via_stub_provider() {
             proposal_registry: None,
             skills: None,
             skill_catalog: None,
+            workflows: None,
             memory_handle: None,
             coordinator: None,
             plan: None,
