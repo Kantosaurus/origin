@@ -1141,17 +1141,29 @@ async fn dispatch_tool(
             Ok(hits.join("\n"))
         }
         "Grep" => {
-            let pat = args
-                .get("pattern")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| LoopError::BadArgs("Grep: missing `pattern`".into()))?;
-            let root = args
-                .get("root")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| LoopError::BadArgs("Grep: missing `root`".into()))?;
-            let hits =
-                origin_tools::builtins::grep_tool::grep_tool(pat, root).map_err(LoopError::ToolFailure)?;
-            Ok(hits.join("\n"))
+            let mode = args.get("output_mode").and_then(Value::as_str).map(|s| match s {
+                "files_with_matches" => origin_tools::builtins::grep_tool::OutputMode::FilesWithMatches,
+                "content" => origin_tools::builtins::grep_tool::OutputMode::Content,
+                "count" => origin_tools::builtins::grep_tool::OutputMode::Count,
+                _ => origin_tools::builtins::grep_tool::OutputMode::FilesWithMatches,
+            });
+            let gargs = origin_tools::builtins::grep_tool::GrepArgs {
+                pattern: args.get("pattern").and_then(Value::as_str)
+                    .ok_or_else(|| LoopError::BadArgs("Grep: missing `pattern`".into()))?
+                    .to_string(),
+                path: args.get("path").and_then(Value::as_str).map(str::to_string),
+                glob: args.get("glob").and_then(Value::as_str).map(str::to_string),
+                r#type: args.get("type").and_then(Value::as_str).map(str::to_string),
+                output_mode: mode,
+                head_limit: args.get("head_limit").and_then(Value::as_u64).map(|n| n as u32),
+                before: args.get("before").and_then(Value::as_u64).map(|n| n as u32).unwrap_or(0),
+                after:  args.get("after").and_then(Value::as_u64).map(|n| n as u32).unwrap_or(0),
+                line_numbers: args.get("line_numbers").and_then(Value::as_bool).unwrap_or(false),
+                multiline: args.get("multiline").and_then(Value::as_bool).unwrap_or(false),
+            };
+            origin_tools::builtins::grep_tool::grep_v2(gargs)
+                .map(|v| serde_json::to_string(&v).unwrap())
+                .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "Edit" => {
             let args = origin_tools::builtins::edit::EditArgs {
