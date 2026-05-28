@@ -353,10 +353,25 @@ pub async fn run_loop(
     session.push(Message::new(Role::User).with_block(Block::text(user_text)));
 
     let tools_schema = registry_iter()
-        .map(|m| origin_provider::ToolSchema {
-            name: m.name.to_string(),
-            description: m.description.to_string(),
-            input_schema_json: m.input_schema.to_string(),
+        .map(|m| {
+            if m.hot {
+                // Full schema embed.
+                origin_provider::ToolSchema {
+                    name: m.name.to_string(),
+                    description: m.description.to_string(),
+                    input_schema_json: m.input_schema.to_string(),
+                }
+            } else {
+                // Deferred — name + 1-line description only; minimal input schema.
+                origin_provider::ToolSchema {
+                    name: m.name.to_string(),
+                    description: format!(
+                        "{} (deferred; call ToolSearch with select:{}, to fetch full schema)",
+                        m.description, m.name
+                    ),
+                    input_schema_json: r#"{"type":"object","properties":{}}"#.to_string(),
+                }
+            }
         })
         .collect::<Vec<_>>();
 
@@ -1322,6 +1337,22 @@ async fn dispatch_tool(
             );
             origin_tools::builtins::diagnostics::diagnostics(dargs, &ra)
                 .await
+                .map(|v| serde_json::to_string(&v).unwrap())
+                .map_err(|e| LoopError::ToolFailure(e.message))
+        }
+        "ToolSearch" => {
+            let sargs = origin_tools::builtins::tool_search::ToolSearchArgs {
+                query: args
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| LoopError::BadArgs("ToolSearch: missing `query`".into()))?
+                    .to_string(),
+                max_results: args
+                    .get("max_results")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as u32),
+            };
+            origin_tools::builtins::tool_search::tool_search(&sargs)
                 .map(|v| serde_json::to_string(&v).unwrap())
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }

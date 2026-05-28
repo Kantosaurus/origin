@@ -20,3 +20,4 @@ pub mod write;
 pub mod multi_edit;
 pub mod apply_patch;
 pub mod diagnostics;
+pub mod tool_search;
