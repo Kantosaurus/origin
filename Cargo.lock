@@ -3965,6 +3965,7 @@ dependencies = [
  "futures-util",
  "hostname",
  "origin-daemon",
+ "origin-goal",
  "origin-ipc",
  "origin-keyvault",
  "origin-migrate",

@@ -70,6 +70,24 @@ impl Spinner {
     }
 }
 
+/// How long the daemon may go without emitting a single stream event during an
+/// in-flight turn before the status line surfaces a stall warning. Deliberately
+/// generous: extended-thinking turns and long non-streaming tools can be quiet
+/// for a while, so this only fires on genuine, sustained silence.
+pub const STALL_WARN_AFTER: Duration = Duration::from_secs(60);
+
+/// Pure stall decision. Given how long the turn has been quiet (no new daemon
+/// events) and the warning threshold, return `Some(seconds_quiet)` to warn, or
+/// `None`. Kept free of `Instant` so it is deterministically testable.
+#[must_use]
+pub fn stall_seconds(quiet: Duration, threshold: Duration) -> Option<u64> {
+    if quiet >= threshold {
+        Some(quiet.as_secs())
+    } else {
+        None
+    }
+}
+
 #[derive(Debug)]
 pub struct App {
     pub scrollback: Vec<ScrollLine>,
@@ -86,6 +104,16 @@ pub struct App {
     /// `start.elapsed()` to `usage.elapsed` so seconds tick live during a
     /// turn without waiting for the final reply.
     pub turn_started: Option<Instant>,
+    /// Bug #4: one-line status indicator for the active goal. `Some(s)`
+    /// while a goal is running; `None` when cleared. Rendered above the
+    /// input card by `draw`.
+    pub goal_status: Option<String>,
+    /// Stall watchdog: `Some(seconds_quiet)` when the render heartbeat has seen
+    /// no daemon activity for [`STALL_WARN_AFTER`] during an in-flight turn.
+    /// `None` whenever the daemon is producing output or no turn is running.
+    /// Rendered as a high-visibility notice so a wedged daemon stops looking
+    /// like an indefinitely-spinning spinner.
+    pub stall_secs: Option<u64>,
 }
 
 const BANNER: &[&str] = &[
@@ -112,6 +140,8 @@ impl App {
             workflow: "Code".to_string(),
             spinner: Spinner::new(),
             turn_started: None,
+            goal_status: None,
+            stall_secs: None,
         }
     }
 
@@ -127,6 +157,26 @@ impl App {
         if let Some(start) = self.turn_started.take() {
             self.usage.elapsed += start.elapsed();
         }
+        // No turn in flight => no stall possible; clear any lingering notice.
+        self.stall_secs = None;
+    }
+
+    /// A cheap fingerprint of everything a daemon stream event can change
+    /// (scrollback rows, the in-flight assistant buffer, token counters). The
+    /// render heartbeat compares this across ticks: if it stays unchanged for
+    /// [`STALL_WARN_AFTER`] while a turn is active, the daemon has gone silent —
+    /// a possible stall. The animating spinner frame is intentionally excluded
+    /// so a silent-but-spinning UI still registers as "no activity".
+    #[must_use]
+    pub fn activity_signature(&self) -> u64 {
+        const P: u64 = 1_099_511_628_211; // FNV prime, used only for mixing
+        let mut s = self.scrollback.len() as u64;
+        s = s
+            .wrapping_mul(P)
+            .wrapping_add(self.current_assistant.as_ref().map_or(0, String::len) as u64);
+        s = s.wrapping_mul(P).wrapping_add(u64::from(self.usage.output_tokens));
+        s = s.wrapping_mul(P).wrapping_add(u64::from(self.usage.input_tokens));
+        s
     }
 
     /// Apply a streaming usage delta. Mirrors `record_usage` but takes no
@@ -253,6 +303,13 @@ impl App {
     pub fn add_colored_line(&mut self, text: String, fg: u32, bg: u32) {
         self.scrollback.push(ScrollLine::styled(text, fg, bg, false));
     }
+
+    /// Bug #4: update the one-line goal status indicator. `None` clears it
+    /// (rendered as no goal row above the input card).
+    pub fn set_goal_status_line(&mut self, status: Option<String>) {
+        self.goal_status = status;
+    }
+
 
     pub fn add_tool_line(&mut self, text: String) {
         self.scrollback
@@ -401,6 +458,50 @@ impl App {
                     theme::SURFACE_RAISED,
                     false,
                 );
+            }
+
+            // Bug #4: render the one-line goal-status indicator (when set)
+            // on the breathing-room row just above the input card. Centered
+            // inside the card width so it visually associates with the
+            // current operation rather than the scrollback above.
+            if let Some(ref status) = self.goal_status {
+                let status_row = at_bottom.saturating_sub(1);
+                if status_row < rows {
+                    let pad = cl.saturating_add(2);
+                    write_str_styled(
+                        main,
+                        status_row,
+                        pad,
+                        status,
+                        cr,
+                        theme::ACCENT,
+                        0,
+                        false,
+                    );
+                }
+            }
+
+            // Stall watchdog notice. When the render heartbeat has seen no
+            // daemon activity for `STALL_WARN_AFTER`, surface a high-visibility
+            // warning so a wedged daemon reads as "possibly stuck" instead of an
+            // indefinitely-spinning spinner. Takes the row the goal status would
+            // use — a stall is the more urgent signal.
+            if let Some(secs) = self.stall_secs {
+                let status_row = at_bottom.saturating_sub(1);
+                if status_row < rows {
+                    let msg =
+                        format!("\u{26A0} no daemon activity for {secs}s \u{2014} Ctrl+C to interrupt");
+                    write_str_styled(
+                        main,
+                        status_row,
+                        cl.saturating_add(2),
+                        &msg,
+                        cr,
+                        theme::RED,
+                        0,
+                        false,
+                    );
+                }
             }
 
             let r_top = row.saturating_add(2).min(at_bottom);
@@ -583,6 +684,19 @@ impl App {
                 }
             }
         }
+    }
+}
+
+// Bug #4: implement the `goal_render::GoalRender` sink directly on `App`
+// so `main.rs::call_daemon`'s event arm becomes a one-liner pass-through
+// instead of a duplicated match on every Goal* variant.
+impl crate::goal_render::GoalRender for App {
+    fn push_colored(&mut self, text: String, fg: u32, _bg: u32) {
+        self.scrollback.push(ScrollLine::styled(text, fg, 0, false));
+        self.scroll_offset = 0;
+    }
+    fn set_goal_status(&mut self, status: Option<String>) {
+        self.goal_status = status;
     }
 }
 
@@ -958,5 +1072,50 @@ mod tests {
     fn wrap_input_lines_empty() {
         let lines = wrap_input_lines("", 10);
         assert_eq!(lines, vec![""]);
+    }
+
+    #[test]
+    fn stall_seconds_none_below_threshold() {
+        assert_eq!(
+            stall_seconds(Duration::from_secs(59), Duration::from_secs(60)),
+            None
+        );
+    }
+
+    #[test]
+    fn stall_seconds_some_at_and_above_threshold() {
+        assert_eq!(
+            stall_seconds(Duration::from_secs(60), Duration::from_secs(60)),
+            Some(60)
+        );
+        assert_eq!(
+            stall_seconds(Duration::from_secs(125), Duration::from_secs(60)),
+            Some(125)
+        );
+    }
+
+    #[test]
+    fn activity_signature_changes_on_new_output() {
+        let mut app = App::new("anthropic", "m", Default::default());
+        let s0 = app.activity_signature();
+        app.add_colored_line("hello".to_string(), 0, 0);
+        assert_ne!(s0, app.activity_signature(), "new output must change the fingerprint");
+    }
+
+    #[test]
+    fn activity_signature_changes_on_token_usage() {
+        let mut app = App::new("anthropic", "m", Default::default());
+        let s0 = app.activity_signature();
+        app.record_usage_tokens(10, 5, 0, 0);
+        assert_ne!(s0, app.activity_signature(), "token deltas must change the fingerprint");
+    }
+
+    #[test]
+    fn stop_turn_timer_clears_stall_notice() {
+        let mut app = App::new("anthropic", "m", Default::default());
+        app.start_turn_timer();
+        app.stall_secs = Some(90);
+        app.stop_turn_timer();
+        assert_eq!(app.stall_secs, None, "ending a turn must clear the stall notice");
     }
 }

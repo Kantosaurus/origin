@@ -9,6 +9,7 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt as _;
 use origin_cli::cli_def::{Cli, Cmd, KeyringSub, PairSub, ProvidersSub, SessionsSub, TraceSub};
+use origin_cli::goal_render::render_goal_event;
 use origin_cli::input::{
     parse_mem_command, parse_model_command, parse_skill_command, parse_workflow_command, reduce, InputAction,
 };
@@ -255,21 +256,57 @@ async fn main() -> Result<()> {
         let a3 = app.clone();
         let h3 = handle.clone();
         spawn_in(TaskClass::Realtime, async move {
+            // Render heartbeat + stall watchdog. While a turn is active this
+            // ticks the spinner/elapsed clock independently of daemon events, so
+            // a hung daemon never looks like a dead screen. It also watches a
+            // cheap activity fingerprint: when it stops changing for
+            // `STALL_WARN_AFTER`, the daemon has gone silent and we raise a
+            // visible stall notice (so "wedged" no longer looks like "working").
+            let mut last_sig: u64 = 0;
+            let mut quiet_since: Option<std::time::Instant> = None;
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-                if a3.lock().spinner.active {
-                    h3.mark_dirty();
+                let mut a = a3.lock();
+                if !a.spinner.active {
+                    quiet_since = None;
+                    a.stall_secs = None;
+                    continue;
                 }
+                let sig = a.activity_signature();
+                if sig == last_sig {
+                    let since = *quiet_since.get_or_insert_with(std::time::Instant::now);
+                    a.stall_secs = origin_cli::tui::stall_seconds(
+                        since.elapsed(),
+                        origin_cli::tui::STALL_WARN_AFTER,
+                    );
+                } else {
+                    last_sig = sig;
+                    quiet_since = Some(std::time::Instant::now());
+                    a.stall_secs = None;
+                }
+                drop(a);
+                h3.mark_dirty();
             }
         });
     }
 
     // Auto-fire the pending discovery prompt now that the TUI is wired up.
     if let Some(text) = pending_prompt {
-        app.lock()
-            .add_line("system> ", "Running queued first-run discovery prompt\u{2026}");
+        {
+            let mut a = app.lock();
+            a.add_line("system> ", "Running queued first-run discovery prompt\u{2026}");
+            // Activate the spinner so the render heartbeat animates and the
+            // stall watchdog arms for this turn too — without this the
+            // first-run prompt ran with a frozen, un-animated status line.
+            a.spinner.start();
+        }
         handle.mark_dirty();
-        handle_submit(&app, &handle, &path, &mut model, &text, &session_id).await;
+        // No user interrupt channel for the auto-fire path — the user has
+        // not had a chance to press Ctrl+C yet (TUI is not yet driving the
+        // input loop). `None` keeps `call_daemon`'s select arm a no-op.
+        handle_submit(&app, &handle, &path, &mut model, &text, &session_id, None).await;
+        app.lock().spinner.stop();
+        handle.mark_dirty();
     }
 
     let result = run_event_loop(
@@ -301,6 +338,14 @@ async fn run_event_loop(
     plan_panel: Arc<Mutex<PlanPanelWiring>>,
 ) -> Result<()> {
     spawn_plan_subscription(path.to_string(), Arc::clone(&plan_panel), handle.clone());
+    // Bug #5: shared slot holding the current `call_daemon`'s interrupt
+    // sender. `Some(tx)` while a Prompt is in flight; `None` between
+    // prompts. Ctrl+C in the input loop drops a `()` into `tx` and the
+    // `call_daemon` `tokio::select!` writes `ClientMessage::Interrupt` to
+    // the daemon over the SAME connection serving the current prompt
+    // (required — the daemon's drive-goal-loop peek is per-connection).
+    let interrupt_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
     let mut input_stream = crossterm::event::EventStream::new();
     while let Some(maybe_ev) = input_stream.next().await {
         let event = maybe_ev?;
@@ -401,18 +446,39 @@ async fn run_event_loop(
 
             let action = {
                 let mut a = app.lock();
-                reduce(&mut a.input, ev)
+                // Bug #5: an operation is "in flight" when either the
+                // status-line spinner is active (a Prompt is mid-stream)
+                // or a goal indicator is visible. Either case means
+                // Ctrl+C should send Interrupt instead of quitting.
+                let op_in_flight = a.spinner.active || a.goal_status.is_some();
+                reduce(&mut a.input, ev, op_in_flight)
             };
             match action {
                 InputAction::Quit => break,
+                InputAction::Interrupt => {
+                    // Best-effort: drop a token into the current
+                    // call_daemon's interrupt channel. If no Prompt is in
+                    // flight the slot is `None` and the keystroke is a
+                    // no-op (the reducer should not even have produced
+                    // this variant in that case, but we guard anyway).
+                    if let Some(tx) = interrupt_tx.lock().await.as_ref() {
+                        let _ = tx.send(());
+                    }
+                    app.lock()
+                        .add_line("system> ", "interrupt sent (Ctrl+D to exit)");
+                    handle.mark_dirty();
+                }
                 InputAction::Submit(text) => {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                    *interrupt_tx.lock().await = Some(tx);
                     {
                         let mut a = app.lock();
                         a.recompute_suggestions();
                         a.spinner.start();
                     }
                     handle.mark_dirty();
-                    handle_submit(&app, &handle, path, model, &text, session_id).await;
+                    handle_submit(&app, &handle, path, model, &text, session_id, Some(rx)).await;
+                    *interrupt_tx.lock().await = None;
                     app.lock().spinner.stop();
                     handle.mark_dirty();
                 }
@@ -472,6 +538,11 @@ async fn handle_submit(
     model: &mut String,
     text: &str,
     session_id: &str,
+    // Bug #5: one-shot channel used by the input loop to forward a Ctrl+C
+    // hit while this Prompt is in flight. Only the Prompt path (the
+    // streaming branch) uses it — slash commands that round-trip in a
+    // single frame do not need to be interruptible.
+    interrupt_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
 ) {
     // `/model <name>` swaps the active model for subsequent prompts.
     // Client-side only: the daemon doesn't store an "active model" —
@@ -586,11 +657,22 @@ async fn handle_submit(
     let handle_for_usage = handle.clone();
     let app_for_backoff = Arc::clone(app);
     let handle_for_backoff = handle.clone();
+    let app_for_goal = Arc::clone(app);
+    let handle_for_goal = handle.clone();
     let reply = call_daemon(
         path,
         model,
         text,
         session_id,
+        interrupt_rx,
+        move |ev: &StreamEvent| {
+            // Bug #4: route Goal* events through the dedicated renderer so
+            // they no longer fall into call_daemon's `_ => {}` catch-all.
+            let mut a = app_for_goal.lock();
+            render_goal_event(&mut *a, ev);
+            drop(a);
+            handle_for_goal.mark_dirty();
+        },
         move |d| {
             app_for_delta.lock().append_to_current_assistant(d);
             handle_for_delta.mark_dirty();
@@ -711,11 +793,23 @@ async fn handle_submit(
     handle.mark_dirty();
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn call_daemon(
     path: &str,
     model: &str,
     user_text: &str,
     session_id: &str,
+    // Bug #5: one-shot channel surfacing user Ctrl+C while a Prompt is in
+    // flight. When a tick lands we write `ClientMessage::Interrupt` to
+    // the same connection serving the prompt — the daemon's
+    // drive-goal-loop peek is per-connection so a fresh socket would not
+    // do.
+    interrupt_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    // Bug #4: routes Goal* StreamEvent variants so the renderer can
+    // update the status indicator / push terminal notices. Called for
+    // EVERY Goal variant; non-Goal variants are dispatched in the match
+    // below as before.
+    mut on_goal: impl FnMut(&StreamEvent) + Send,
     mut on_delta: impl FnMut(&str) + Send,
     mut on_tool: impl FnMut(&str, &str, Vec<origin_daemon::protocol::DiffLine>) + Send,
     mut on_tool_chunk: impl FnMut(&str, &str) + Send,
@@ -736,8 +830,41 @@ async fn call_daemon(
     let frame = encode(1, FrameKind::Request, &body);
     client.write_raw(&frame).await?;
 
+    let mut interrupt_rx = interrupt_rx;
     loop {
-        let (kind, body) = client.read_frame().await?;
+        // Bug #5: select between the next inbound frame and an interrupt
+        // tick. On interrupt, send `ClientMessage::Interrupt` to the
+        // daemon on this SAME connection (per-connection-scoped — the
+        // daemon's drive_goal_loop peek can only see writes on the
+        // connection serving the goal).
+        let (kind, body) = {
+            // Construct the read future. When no interrupt channel is
+            // wired (auto-fire path), fall back to a straight await.
+            let read_fut = client.read_frame();
+            if let Some(rx) = interrupt_rx.as_mut() {
+                tokio::select! {
+                    res = read_fut => res?,
+                    maybe = rx.recv() => {
+                        if maybe.is_some() {
+                            // Encode and send Interrupt; then continue
+                            // the loop to read the daemon's response
+                            // (GoalCleared {UserSlash}, etc.).
+                            if let Ok(ib) = serde_json::to_vec(&ClientMessage::Interrupt) {
+                                let iframe = encode(1, FrameKind::Request, &ib);
+                                let _ = client.write_raw(&iframe).await;
+                            }
+                        }
+                        // Drop the channel so subsequent select! only
+                        // awaits the read side — one interrupt per
+                        // prompt is enough.
+                        interrupt_rx = None;
+                        continue;
+                    }
+                }
+            } else {
+                read_fut.await?
+            }
+        };
         // The daemon's error path (agent loop failures, provider errors)
         // writes plain UTF-8 into an `ErrorFrame`. Without this branch we'd
         // try to JSON-decode the text and surface serde's "expected value at
@@ -748,6 +875,20 @@ async fn call_daemon(
         // Try to decode as a StreamEvent first; if that fails, treat as the
         // terminal `PromptReply` Response frame.
         if let Ok(ev) = serde_json::from_slice::<StreamEvent>(&body) {
+            // Bug #4: route every Goal* variant through the dedicated
+            // renderer up front. The remaining match handles the
+            // non-Goal variants exactly as before.
+            if matches!(
+                ev,
+                StreamEvent::GoalActive { .. }
+                    | StreamEvent::GoalIteration { .. }
+                    | StreamEvent::GoalVerifying
+                    | StreamEvent::GoalCleared { .. }
+                    | StreamEvent::GoalInactive
+            ) {
+                on_goal(&ev);
+                continue;
+            }
             match ev {
                 StreamEvent::TextDelta { text } => on_delta(&text),
                 StreamEvent::ToolActivity {
@@ -883,71 +1024,124 @@ async fn send_skill_command(path: &str, msg: &ClientMessage) -> Result<String> {
     let body = serde_json::to_vec(msg)?;
     let frame = encode(1, FrameKind::Request, &body);
     client.write_raw(&frame).await?;
-    let resp = client.read_frame_body().await?;
-    let ev: StreamEvent = serde_json::from_slice(&resp).map_err(|e| anyhow::anyhow!("bad reply: {e}"))?;
-    match ev {
-        StreamEvent::SkillActive { name, allowed_tools } => {
-            if allowed_tools.is_empty() {
-                Ok(format!("skill `{name}` active (no narrowing)"))
-            } else {
+    // `/goal <cond>` and `/clear` can emit MULTIPLE event frames: the
+    // first GoalCleared (when replacing a prior goal or wiping the
+    // session), and then the new state event (GoalActive, GoalInactive,
+    // or the SkillActive for `/clear`). Read until we see a terminal
+    // event we can render — we never block forever because the daemon
+    // always emits at least one of these per request.
+    let mut last_intermediate: Option<String> = None;
+    loop {
+        let resp = client.read_frame_body().await?;
+        let ev: StreamEvent =
+            serde_json::from_slice(&resp).map_err(|e| anyhow::anyhow!("bad reply: {e}"))?;
+        // Bug #4 + #20: render Goal* outcomes inline so /goal-related
+        // slash commands surface the same colored notices the streaming
+        // path uses.
+        match &ev {
+            StreamEvent::GoalActive {
+                condition,
+                max_iter,
+                token_budget,
+            } => {
+                return Ok(format!(
+                    "goal active: {condition}  (max_iter={max_iter}, budget={token_budget})"
+                ));
+            }
+            StreamEvent::GoalInactive => {
+                return Ok("no active goal".to_string());
+            }
+            StreamEvent::GoalCleared {
+                reason,
+                iter,
+                tokens_spent,
+            } => {
+                // When this is the FIRST event of a `/goal <new>` reply,
+                // the daemon will follow up with a GoalActive — keep
+                // looping so the caller sees the new activation summary.
+                // When it's the only event (a bare-`/-goal` or a /clear
+                // with no follow-up), surface it as the final outcome.
+                let (msg, _fg) = origin_cli::goal_render::cleared_line(reason);
+                last_intermediate = Some(format!("{msg} (iter {iter}, {tokens_spent} tok)"));
+                continue;
+            }
+            _ => {}
+        }
+        // Terminal arms: each `return`s out of the loop.
+        let outcome: Result<String> = match ev {
+            StreamEvent::SkillActive { name, allowed_tools } => {
+                if allowed_tools.is_empty() {
+                    Ok(format!("skill `{name}` active (no narrowing)"))
+                } else {
+                    Ok(format!(
+                        "skill `{name}` active; allowed tools: {}",
+                        allowed_tools.join(", ")
+                    ))
+                }
+            }
+            StreamEvent::SkillError { message } => Err(anyhow::anyhow!("{message}")),
+            StreamEvent::AdminOk => {
+                // `/clear` arrives here after the GoalCleared (if any) was
+                // already absorbed into `last_intermediate`. Combine them
+                // into one line so the user sees both outcomes.
+                if let Some(prior) = last_intermediate.take() {
+                    Ok(format!("skill deactivated; {prior}"))
+                } else {
+                    Ok("skill deactivated".to_string())
+                }
+            }
+            StreamEvent::WorkflowActive { name, steps, skipped } => {
+                let main = if steps.is_empty() {
+                    format!("workflow `{name}` activated (no steps resolved)")
+                } else {
+                    format!("workflow `{name}` activated; skills: {}", steps.join(" → "))
+                };
+                if skipped.is_empty() {
+                    Ok(main)
+                } else {
+                    Ok(format!("{main}  (skipped: {})", skipped.join(", ")))
+                }
+            }
+            StreamEvent::WorkflowStepActive {
+                name,
+                step_index,
+                total_steps,
+                skill,
+                skipped,
+            } => {
+                let pos = step_index + 1;
+                let main = format!("workflow `{name}` step {pos}/{total_steps}: `{skill}` active");
+                if skipped.is_empty() {
+                    Ok(main)
+                } else {
+                    Ok(format!("{main}  (skipped: {})", skipped.join(", ")))
+                }
+            }
+            StreamEvent::WorkflowComplete { name, skipped } => {
+                if skipped.is_empty() {
+                    Ok(format!("workflow `{name}` complete"))
+                } else {
+                    Ok(format!(
+                        "workflow `{name}` complete  (skipped: {})",
+                        skipped.join(", ")
+                    ))
+                }
+            }
+            StreamEvent::WorkflowStepHeld {
+                name,
+                step_index,
+                total_steps,
+                skill,
+                message,
+            } => {
+                let pos = step_index + 1;
                 Ok(format!(
-                    "skill `{name}` active; allowed tools: {}",
-                    allowed_tools.join(", ")
+                    "workflow `{name}` step {pos}/{total_steps} held on `{skill}` — {message}; retry your prompt to resume"
                 ))
             }
-        }
-        StreamEvent::SkillError { message } => Err(anyhow::anyhow!("{message}")),
-        StreamEvent::AdminOk => Ok("skill deactivated".to_string()),
-        StreamEvent::WorkflowActive { name, steps, skipped } => {
-            let main = if steps.is_empty() {
-                format!("workflow `{name}` activated (no steps resolved)")
-            } else {
-                format!("workflow `{name}` activated; skills: {}", steps.join(" → "))
-            };
-            if skipped.is_empty() {
-                Ok(main)
-            } else {
-                Ok(format!("{main}  (skipped: {})", skipped.join(", ")))
-            }
-        }
-        StreamEvent::WorkflowStepActive {
-            name,
-            step_index,
-            total_steps,
-            skill,
-            skipped,
-        } => {
-            let pos = step_index + 1;
-            let main = format!("workflow `{name}` step {pos}/{total_steps}: `{skill}` active");
-            if skipped.is_empty() {
-                Ok(main)
-            } else {
-                Ok(format!("{main}  (skipped: {})", skipped.join(", ")))
-            }
-        }
-        StreamEvent::WorkflowComplete { name, skipped } => {
-            if skipped.is_empty() {
-                Ok(format!("workflow `{name}` complete"))
-            } else {
-                Ok(format!(
-                    "workflow `{name}` complete  (skipped: {})",
-                    skipped.join(", ")
-                ))
-            }
-        }
-        StreamEvent::WorkflowStepHeld {
-            name,
-            step_index,
-            total_steps,
-            skill,
-            message,
-        } => {
-            let pos = step_index + 1;
-            Ok(format!(
-                "workflow `{name}` step {pos}/{total_steps} held on `{skill}` — {message}; retry your prompt to resume"
-            ))
-        }
-        other => Err(anyhow::anyhow!("unexpected reply: {other:?}")),
+            other => Err(anyhow::anyhow!("unexpected reply: {other:?}")),
+        };
+        return outcome;
     }
 }
 

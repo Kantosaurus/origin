@@ -11,13 +11,37 @@ pub enum InputAction {
     Backspace,
     Submit(String),
     Quit,
+    /// User cancelled an in-flight operation (Ctrl+C while a goal is
+    /// active or a prompt is mid-stream). The CLI sends
+    /// [`origin_daemon::protocol::ClientMessage::Interrupt`] to the
+    /// daemon and stays running — distinct from `Quit` which exits the
+    /// process. See bug #5.
+    Interrupt,
     Noop,
 }
 
+/// Reduce a key event against the input buffer.
+///
+/// `op_in_flight` is the CLI's view of "is there something to interrupt":
+/// `true` while a goal is active or a prompt is mid-stream. Ctrl+C is
+/// remapped to [`InputAction::Interrupt`] when `op_in_flight` is `true`
+/// and falls back to [`InputAction::Quit`] otherwise. Ctrl+D and Esc
+/// remain quit-only — that gives the user an unambiguous exit even
+/// during a goal (bug #5).
 #[must_use]
-pub fn reduce(buffer: &mut String, ev: KeyEvent) -> InputAction {
+pub fn reduce(buffer: &mut String, ev: KeyEvent, op_in_flight: bool) -> InputAction {
     match (ev.code, ev.modifiers) {
-        (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => InputAction::Quit,
+        (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+            if op_in_flight {
+                InputAction::Interrupt
+            } else {
+                InputAction::Quit
+            }
+        }
+        // Ctrl+D always quits, regardless of operation state — gives the
+        // user a deterministic exit affordance even when Ctrl+C is rebound
+        // to Interrupt.
+        (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => InputAction::Quit,
         (KeyCode::Esc, _) => InputAction::Quit,
         (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => {
             buffer.push('\n');
@@ -221,7 +245,7 @@ mod tests {
     fn enter_submits_buffer() {
         let mut buf = "hello".to_string();
         assert_eq!(
-            reduce(&mut buf, k(KeyCode::Enter)),
+            reduce(&mut buf, k(KeyCode::Enter), false),
             InputAction::Submit("hello".into())
         );
         assert!(buf.is_empty());
@@ -230,28 +254,64 @@ mod tests {
     #[test]
     fn enter_on_empty_is_noop() {
         let mut buf = String::new();
-        assert_eq!(reduce(&mut buf, k(KeyCode::Enter)), InputAction::Noop);
+        assert_eq!(reduce(&mut buf, k(KeyCode::Enter), false), InputAction::Noop);
     }
 
     #[test]
     fn typing_appends_to_buffer() {
         let mut buf = "h".to_string();
-        assert_eq!(reduce(&mut buf, k(KeyCode::Char('i'))), InputAction::Insert('i'));
+        assert_eq!(
+            reduce(&mut buf, k(KeyCode::Char('i')), false),
+            InputAction::Insert('i')
+        );
         assert_eq!(buf, "hi");
     }
 
     #[test]
     fn backspace_pops() {
         let mut buf = "hi".to_string();
-        assert_eq!(reduce(&mut buf, k(KeyCode::Backspace)), InputAction::Backspace);
+        assert_eq!(
+            reduce(&mut buf, k(KeyCode::Backspace), false),
+            InputAction::Backspace
+        );
         assert_eq!(buf, "h");
     }
 
     #[test]
-    fn ctrl_c_quits() {
+    fn ctrl_c_quits_when_no_operation_in_flight() {
         let mut buf = String::new();
         let ev = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(reduce(&mut buf, ev), InputAction::Quit);
+        assert_eq!(reduce(&mut buf, ev, false), InputAction::Quit);
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_when_operation_in_flight() {
+        // Bug #5: Ctrl+C must NOT quit the process when a goal is active or
+        // a prompt is mid-stream. It must send Interrupt to the daemon so
+        // the user can cancel the current operation without losing the
+        // session.
+        let mut buf = String::new();
+        let ev = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(reduce(&mut buf, ev, true), InputAction::Interrupt);
+    }
+
+    #[test]
+    fn ctrl_d_always_quits_even_mid_operation() {
+        // The exit affordance must remain reachable even when Ctrl+C is
+        // rebound to Interrupt during an in-flight operation.
+        let mut buf = String::new();
+        let ev = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(reduce(&mut buf, ev, false), InputAction::Quit);
+        assert_eq!(reduce(&mut buf, ev, true), InputAction::Quit);
+    }
+
+    #[test]
+    fn esc_quits_even_mid_operation() {
+        // Esc is the second deterministic exit path. We deliberately do not
+        // remap it — Esc-to-cancel makes editor-history navigation
+        // ambiguous; keep it as the quit hammer.
+        let mut buf = String::new();
+        assert_eq!(reduce(&mut buf, k(KeyCode::Esc), true), InputAction::Quit);
     }
 
     #[test]

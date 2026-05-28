@@ -9,6 +9,7 @@ pub mod cli_def;
 pub mod config;
 pub mod editor;
 pub mod first_run_prompt;
+pub mod goal_render;
 pub mod headless;
 pub mod import;
 pub mod init;

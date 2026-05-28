@@ -44,6 +44,7 @@ origin-provider = { path = "../origin-provider" }
 origin-keyvault = { path = "../origin-keyvault" }
 origin-skills   = { path = "../origin-skills" }
 origin-tools    = { path = "../origin-tools" }
+origin-goal     = { path = "../origin-goal" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 which = "6"
 rand = "0.8"
