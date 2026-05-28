@@ -4060,6 +4060,7 @@ dependencies = [
  "origin-core",
  "origin-ipc",
  "origin-keyvault",
+ "origin-lsp-client",
  "origin-mem",
  "origin-metrics",
  "origin-permission",
@@ -4098,6 +4099,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+ "which",
  "wiremock",
 ]
 
