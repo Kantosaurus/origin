@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::error::{ErrClass, ToolError};
 use crate::proc_supervisor::Supervisor;
+use crate::ra_bridge::DiagnosticsHandle;
 use crate::result_cas::{ref_token, ResultStore};
 use crate::SideEffects;
 
@@ -24,6 +25,10 @@ pub struct EnvelopeCtx {
     pub result_store: ResultStore,
     /// Process supervisor for Bash v2 and Monitor.
     pub supervisor: Supervisor,
+    /// Optional rust-analyzer bridge. `None` when RA is not configured or
+    /// not yet resolved. Per-call construction is used in Phase 6 (deferred
+    /// from Phase 2 envelope plumbing); Phase 8 will wire the shared handle.
+    pub ra: Option<Arc<dyn DiagnosticsHandle>>,
 }
 
 /// Whether the envelope should attempt output-CAS dedup for this call.
