@@ -32,6 +32,7 @@ async fn mcp_proxy_invocation_runs_through_dyntool() {
             side_effects: SideEffects::Pure,
             input_schema: "{\"type\":\"object\"}",
             sandbox_profile: SandboxProfile::Inherit,
+            token_budget: origin_tools::DEFAULT_TOKEN_BUDGET,
         },
         "echo".to_string(),
     );
@@ -70,6 +71,7 @@ async fn mcp_proxy_rejects_args_violating_input_schema() {
             side_effects: SideEffects::Pure,
             input_schema: "{\"type\":\"object\"}",
             sandbox_profile: SandboxProfile::Inherit,
+            token_budget: origin_tools::DEFAULT_TOKEN_BUDGET,
         },
         "echo".to_string(),
     )
@@ -114,6 +116,7 @@ async fn mcp_proxy_accepts_args_matching_input_schema() {
             side_effects: SideEffects::Pure,
             input_schema: "{\"type\":\"object\"}",
             sandbox_profile: SandboxProfile::Inherit,
+            token_budget: origin_tools::DEFAULT_TOKEN_BUDGET,
         },
         "echo".to_string(),
     )
