@@ -11,6 +11,7 @@ pub mod error;
 pub mod macros;
 pub mod registry;
 pub mod text_fmt;
+pub mod tool_envelope;
 
 pub use error::{ErrClass, ToolError};
 
