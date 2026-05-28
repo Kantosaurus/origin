@@ -7,7 +7,7 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
@@ -58,7 +58,9 @@ impl Drop for LayerGuard {
 /// Returns [`RingError`] if the ring cannot be opened.
 pub fn init<P: AsRef<Path>>(dir: P) -> Result<LayerGuard, RingError> {
     use tracing_subscriber::layer::SubscriberExt as _;
-    let ring = Ring::open(dir, 64 * 1024 * 1024)?;
+    use tracing_subscriber::Layer as _;
+    let trace_dir = dir.as_ref().to_path_buf();
+    let ring = Ring::open(&trace_dir, 64 * 1024 * 1024)?;
     let (tx, rx) = sync_channel::<SpanRow>(4096);
     let active = Arc::new(AtomicBool::new(true));
     let drain_active = Arc::clone(&active);
@@ -92,7 +94,26 @@ pub fn init<P: AsRef<Path>>(dir: P) -> Result<LayerGuard, RingError> {
         tx,
         active: Arc::clone(&active),
     };
-    let subscriber = tracing_subscriber::registry().with(layer);
+
+    // Human-readable text log written to a tailable file alongside the parquet
+    // ring (`<data>/origin/logs/daemon.log`). Best-effort: the parquet layer is
+    // installed regardless. This is what an operator tails when the daemon
+    // looks wedged — the parquet ring is postmortem-only and not human-readable,
+    // and without this layer `info!`/`warn!`/`error!` events go nowhere at all.
+    // Verbosity follows ORIGIN_LOG, then RUST_LOG, defaulting to `info`.
+    let fmt_layer = open_log_file(&trace_dir).map(|file| {
+        let writer = FileWriter(Arc::new(std::sync::Mutex::new(file)));
+        let filter = tracing_subscriber::EnvFilter::try_from_env("ORIGIN_LOG")
+            .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_target(true)
+            .with_writer(writer)
+            .with_filter(filter)
+    });
+
+    let subscriber = tracing_subscriber::registry().with(layer).with(fmt_layer);
     // `set_global_default` may error if a subscriber is already installed
     // (e.g. in tests). For init we tolerate it: tests use the test-local
     // subscriber, but the layer's writes still flow via the explicit Ring.
@@ -101,6 +122,53 @@ pub fn init<P: AsRef<Path>>(dir: P) -> Result<LayerGuard, RingError> {
         join: Some(join),
         active,
     })
+}
+
+/// Directory for the human-readable daemon log: a `logs` sibling of the trace
+/// dir (`<data>/origin/trace` -> `<data>/origin/logs`).
+fn daemon_log_dir(trace_dir: &Path) -> PathBuf {
+    trace_dir
+        .parent()
+        .map_or_else(|| trace_dir.join("logs"), |parent| parent.join("logs"))
+}
+
+/// Open (truncating) `<logs>/daemon.log`. Best-effort: returns `None` if the
+/// directory or file cannot be created, so the text log stays optional and
+/// never blocks daemon startup.
+fn open_log_file(trace_dir: &Path) -> Option<std::fs::File> {
+    let dir = daemon_log_dir(trace_dir);
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(dir.join("daemon.log"))
+        .ok()
+}
+
+/// `MakeWriter` over a shared, mutex-guarded log file. `fmt` writes one whole
+/// formatted record per event, so per-write locking is cheap enough here.
+#[derive(Clone)]
+struct FileWriter(Arc<std::sync::Mutex<std::fs::File>>);
+
+struct FileWriterGuard(Arc<std::sync::Mutex<std::fs::File>>);
+
+impl std::io::Write for FileWriterGuard {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut f = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        f.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut f = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        f.flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FileWriter {
+    type Writer = FileWriterGuard;
+    fn make_writer(&'a self) -> Self::Writer {
+        FileWriterGuard(Arc::clone(&self.0))
+    }
 }
 
 impl<S> tracing_subscriber::Layer<S> for Layer
@@ -285,5 +353,21 @@ mod intern_tests {
         let a = leak_str(String::from("origin-trace-bug2-test-0"));
         let b = leak_str(String::from("origin-trace-bug2-test-0"));
         assert!(std::ptr::eq(a, b), "intern must dedup repeated strings");
+    }
+}
+
+#[cfg(test)]
+mod log_path_tests {
+    use super::daemon_log_dir;
+    use std::path::Path;
+
+    #[test]
+    fn daemon_log_dir_is_logs_sibling_of_trace() {
+        let trace = Path::new("/data/origin/trace");
+        let logs = daemon_log_dir(trace);
+        // Cross-platform: assert structure (name + parent) rather than a
+        // separator-specific string so the test holds on Windows and Unix.
+        assert_eq!(logs.file_name().and_then(|s| s.to_str()), Some("logs"));
+        assert_eq!(logs.parent(), trace.parent());
     }
 }
