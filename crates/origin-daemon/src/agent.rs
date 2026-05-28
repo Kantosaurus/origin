@@ -139,7 +139,10 @@ pub struct LoopOptions {
     /// Shape is `Arc<Mutex<Option<_>>>` (not `Option<Arc<Mutex<_>>>`) so the
     /// driver can install or remove the goal without rebuilding the
     /// per-request `LoopOptions`. Defaults to an empty slot (no active
-    /// goal); set via [`LoopOptions::with_goal`].
+    /// goal). Set directly via struct literal at the per-request
+    /// `LoopOptions` build site in `main.rs`. (The historical
+    /// `LoopOptions::with_goal` builder was removed in the Bug-#22 cleanup
+    /// — it had no production callers.)
     pub goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
 }
 
@@ -216,18 +219,6 @@ impl LoopOptions {
         self
     }
 
-    /// Attach a per-connection goal slot. The slot is shared with the
-    /// driver in `main.rs`; mutations made by the driver between
-    /// `run_loop` calls are visible on the next call's
-    /// `<origin-goal>` block render.
-    #[must_use]
-    pub fn with_goal(
-        mut self,
-        goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
-    ) -> Self {
-        self.goal = goal;
-        self
-    }
 }
 
 /// Deliverer that writes a summary to the `SQLite` `messages.summary` column via

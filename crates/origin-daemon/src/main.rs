@@ -715,6 +715,14 @@ fn spawn_handler_task(
         // peek-and-drop implementation silently discarded.
         let pending_message: Arc<tokio::sync::Mutex<Option<ClientMessage>>> =
             Arc::new(tokio::sync::Mutex::new(None));
+        // Bug #8: the most recent session id seen on this connection. The
+        // Prompt handler updates it after binding a session; the `/goal`
+        // activation handler reads it so it can write a checkpoint
+        // immediately on activation rather than waiting for the first
+        // iteration to complete (which is the window a crash could lose
+        // the goal in).
+        let last_known_session_id: Arc<tokio::sync::Mutex<Option<String>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
 
         loop {
             // Step 1: drain any pushed-back message left by the goal driver
@@ -792,6 +800,7 @@ fn spawn_handler_task(
                         wire_plan.clone(),
                         Arc::clone(&active_goal),
                         Arc::clone(&pending_message),
+                        Arc::clone(&last_known_session_id),
                         verifier,
                         req,
                     )
@@ -887,6 +896,8 @@ fn spawn_handler_task(
                         handle_goal_activation(
                             &conn_clone,
                             Arc::clone(&active_goal),
+                            Arc::clone(&session_store),
+                            Arc::clone(&last_known_session_id),
                             args.as_deref(),
                         )
                         .await;
@@ -1041,6 +1052,40 @@ fn spawn_handler_task(
                             tokens_spent: prior.tokens_spent,
                         };
                         drop(slot);
+                        // Bug #17: write a terminal-status checkpoint so a
+                        // crash between cancellation and the next user
+                        // Prompt cannot resurrect a goal the user just
+                        // killed.
+                        let sid_opt = last_known_session_id.lock().await.clone();
+                        if let Some(sid) = sid_opt {
+                            let snap = origin_goal::GoalSnapshot {
+                                condition: prior.condition.clone(),
+                                iter: prior.iter,
+                                max_iter: prior.max_iter,
+                                tokens_spent: prior.tokens_spent,
+                                token_budget: prior.token_budget,
+                                started_at_unix: prior
+                                    .started_at
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
+                                status: origin_goal::GoalStatusWire::Cleared {
+                                    by: origin_goal::ClearReasonWire::UserSlash,
+                                },
+                                last_status_tag: prior.last_status_tag.clone().map(Into::into),
+                            };
+                            let token = origin_resume_token::ResumeToken {
+                                session_id: sid,
+                                last_turn: 0,
+                                cas_handle_root: [0u8; 32],
+                                pending_tool_calls: Vec::new(),
+                                plan_seq: 0,
+                                goal: Some(snap),
+                            };
+                            if let Err(e) = session_store.save_resume_token(&token) {
+                                warn!(error = %e, "goal interrupt: terminal save failed");
+                            }
+                        }
                         let _ = write_event(&conn, &ev).await;
                     }
                 }
@@ -1087,7 +1132,7 @@ async fn handle_resume_request(
     // next `Prompt` resumes the driver loop; we deliberately do NOT
     // auto-iterate on resume per §5 of the spec.
     if let Some(snapshot) = token.goal.as_ref() {
-        use origin_goal::{GoalSnapshot, GoalStatusWire};
+        use origin_goal::{GoalSnapshot, GoalStatusWire, TagOutcome, TagOutcomeWire};
         let GoalSnapshot {
             condition,
             iter,
@@ -1096,10 +1141,23 @@ async fn handle_resume_request(
             token_budget,
             started_at_unix,
             status,
+            last_status_tag,
         } = snapshot.clone();
         if matches!(status, GoalStatusWire::Active | GoalStatusWire::Verifying) {
             let started_at = std::time::UNIX_EPOCH
                 + std::time::Duration::from_secs(started_at_unix);
+            // Bug #9: preserve `last_status_tag` across resume so a
+            // `Verifying` resume gets a fresh verifier call on the next
+            // tick (the driver dispatches on `Met` and re-invokes the
+            // verifier rather than blindly clearing).
+            let restored_tag: Option<TagOutcome> = last_status_tag.map(|w| match w {
+                TagOutcomeWire::Met => TagOutcome::Met,
+                TagOutcomeWire::InProgress { what_remains } => {
+                    TagOutcome::InProgress { what_remains }
+                }
+                TagOutcomeWire::Blocked { why } => TagOutcome::Blocked { why },
+                TagOutcomeWire::Missing => TagOutcome::Missing,
+            });
             let restored = origin_goal::GoalState {
                 condition: condition.clone(),
                 status: origin_goal::GoalStatus::Active,
@@ -1108,7 +1166,14 @@ async fn handle_resume_request(
                 tokens_spent,
                 token_budget,
                 started_at,
-                last_status_tag: None,
+                // Bug #25: monotonic counterpart unknown on resume; the
+                // wall-clock origin in `started_at` is what we have.
+                // `Instant::now()` is the safe default — any elapsed-since-
+                // start math computed from this Instant will measure time
+                // since RESUME, not since original goal activation.
+                started_at_instant: std::time::Instant::now(),
+                last_status_tag: restored_tag,
+                consecutive_rejections: 0,
             };
             *active_goal.lock().await = Some(restored);
             let ev = StreamEvent::GoalActive {
@@ -1262,6 +1327,7 @@ async fn handle_request(
     plan: origin_planner::Plan,
     active_goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
     pending_message: Arc<tokio::sync::Mutex<Option<ClientMessage>>>,
+    last_known_session_id: Arc<tokio::sync::Mutex<Option<String>>>,
     verifier: Arc<dyn origin_goal::verifier::Verifier>,
     req: PromptRequest,
 ) -> PromptOutcome {
@@ -1284,6 +1350,10 @@ async fn handle_request(
     } else {
         Session::new(provider.name(), &req.model)
     };
+    // Bug #8: stash the session id so a later `/goal` activation on this
+    // connection can checkpoint without waiting for the first iteration
+    // to complete.
+    *last_known_session_id.lock().await = Some(session.id.clone());
     let (tx_sub, mut rx_sub) = mpsc::channel::<Subscriber>(1);
     let conn_for_relay = Arc::clone(conn);
     let relay_handle: tokio::task::JoinHandle<()> = spawn_in(TaskClass::Realtime, async move {
@@ -1439,6 +1509,8 @@ async fn handle_request(
 async fn handle_goal_activation(
     conn: &SharedConnection,
     active_goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
+    session_store: Arc<SessionStore>,
+    last_known_session_id: Arc<tokio::sync::Mutex<Option<String>>>,
     raw_args: Option<&str>,
 ) {
     let Some(raw) = raw_args else {
@@ -1486,6 +1558,29 @@ async fn handle_goal_activation(
             drop(slot);
             let body = serde_json::to_vec(&active).unwrap_or_default();
             let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
+            // Bug #8: persist the activation immediately so a crash
+            // between `/goal foo` and the first iteration cannot lose the
+            // goal. We need a session_id; use the most recent one this
+            // connection's Prompt handler stashed. If activation happened
+            // BEFORE any Prompt (no session bound yet), we log a warn and
+            // skip the checkpoint — the limitation is documented.
+            let sid_opt = last_known_session_id.lock().await.clone();
+            if let Some(sid) = sid_opt {
+                use origin_daemon::goal_checkpoint::make_goal_checkpoint_token;
+                let token = {
+                    let guard = active_goal.lock().await;
+                    make_goal_checkpoint_token(&sid, 0, &guard)
+                };
+                if let Err(e) = session_store.save_resume_token(&token) {
+                    warn!(error = %e, "goal activation: checkpoint save failed");
+                }
+            } else {
+                warn!(
+                    "goal activation: no session bound to this connection yet; \
+                     skipping immediate checkpoint. A crash before the first \
+                     Prompt will lose this goal."
+                );
+            }
         }
         Err(e) => {
             let ev = StreamEvent::SkillError {
@@ -1542,7 +1637,7 @@ async fn drive_goal_loop(
     event_tx: tokio::sync::mpsc::Sender<StreamEvent>,
 ) -> Result<origin_daemon::agent::LoopSummary, origin_daemon::agent::LoopError> {
     use origin_daemon::goal_checkpoint::make_goal_checkpoint_token;
-    use origin_daemon::goal_driver::{drive, DriverDecision};
+    use origin_daemon::goal_driver::DriverDecision;
     // Local closure: build a ResumeToken from the current goal state and
     // persist it. Best-effort — a write failure should not interrupt the
     // iteration. `session.messages.len()` is the highest persisted-or-
@@ -1567,9 +1662,17 @@ async fn drive_goal_loop(
     };
     let mut next_text = initial_user_text;
     let mut last_summary: Option<origin_daemon::agent::LoopSummary> = None;
+    // Bug #7: on the first iteration, if the cap fires we still need to
+    // give the user's original prompt a normal turn (without the goal
+    // block in the system prompt, since the goal is now cleared). We
+    // track whether we're on the first iteration so the cap-clear branch
+    // can fall through into one more `run_loop` call instead of bailing
+    // with a synthetic empty summary.
+    let mut is_first_iter = true;
     loop {
         // Top-of-iteration cap check: if a goal exists and is already over
         // budget / max-iter, skip the provider call entirely and clear.
+        let mut cap_cleared_on_first_iter = false;
         {
             let mut slot = active_goal.lock().await;
             if let Some(g) = slot.as_mut() {
@@ -1593,6 +1696,7 @@ async fn drive_goal_loop(
                             .map(|d| d.as_secs())
                             .unwrap_or(0),
                         status: origin_goal::GoalStatusWire::Cleared { by: wire.clone() },
+                        last_status_tag: g.last_status_tag.clone().map(Into::into),
                     };
                     *slot = None;
                     drop(slot);
@@ -1616,19 +1720,39 @@ async fn drive_goal_loop(
                             tokens_spent,
                         })
                         .await;
-                    // We always need a summary to return; if the very first
-                    // user prompt cap-checks immediately, return a synthetic
-                    // empty summary so the caller can still write a reply
-                    // frame. In practice this only fires if a resumed goal
-                    // is already at the cap.
-                    return Ok(last_summary.unwrap_or(origin_daemon::agent::LoopSummary {
-                        assistant_text: String::new(),
-                        turns: 0,
-                        input_tokens: 0,
-                        output_tokens: 0,
-                    }));
+                    // Bug #7: if this is the FIRST iteration (the user just
+                    // sent a Prompt and we haven't called run_loop yet),
+                    // fall through to give their prompt one normal turn —
+                    // the goal slot is now None so the system prompt won't
+                    // include the goal block. Otherwise we'd silently drop
+                    // the user's input.
+                    if is_first_iter {
+                        cap_cleared_on_first_iter = true;
+                    } else {
+                        // Mid-loop cap: return whatever summary we have.
+                        return Ok(last_summary.unwrap_or(origin_daemon::agent::LoopSummary {
+                            assistant_text: String::new(),
+                            turns: 0,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                        }));
+                    }
                 }
             }
+        }
+        // Bug #7: if the cap fired on the first iteration, run the user's
+        // prompt once with no active goal, then return. This guarantees the
+        // user's prompt is never silently dropped.
+        if cap_cleared_on_first_iter {
+            let summary = origin_daemon::agent::run_loop(
+                session,
+                &next_text,
+                provider,
+                &AlwaysAllow,
+                opts,
+            )
+            .await?;
+            return Ok(summary);
         }
 
         let summary = origin_daemon::agent::run_loop(
@@ -1639,6 +1763,7 @@ async fn drive_goal_loop(
             opts,
         )
         .await?;
+        is_first_iter = false;
 
         // If no goal is active, we're done after one turn.
         let goal_active = active_goal.lock().await.is_some();
@@ -1647,10 +1772,19 @@ async fn drive_goal_loop(
         }
 
         // Parse the final assistant turn's tag, record this iteration's
-        // spend + tag, then dispatch via `drive`.
+        // spend + tag, then dispatch via `drive_decision`.
+        //
+        // Bug #6: we previously held `active_goal.lock().await` across the
+        // verifier's network round-trip. That serialized every other
+        // mutation of the goal slot — including the system-prompt block
+        // render in `agent.rs:553` and the outer `Interrupt` handler.
+        //
+        // Fix: snapshot inputs and emit `GoalVerifying` under a SHORT
+        // lock, drop the lock before calling `drive_decision` (which
+        // awaits the verifier), then re-acquire only to apply mutations.
         let last_text = last_assistant_text(session);
         let tag = origin_goal::parse_tag(&last_text);
-        let decision = {
+        let inputs = {
             let mut slot = active_goal.lock().await;
             let Some(g) = slot.as_mut() else {
                 // Goal cleared by another path (e.g. /-goal) while we were
@@ -1663,7 +1797,22 @@ async fn drive_goal_loop(
             if matches!(g.last_status_tag, Some(origin_goal::TagOutcome::Met)) {
                 let _ = event_tx.send(StreamEvent::GoalVerifying).await;
             }
-            drive(g, &last_text, verifier).await
+            origin_daemon::goal_driver::DriverInputs::snapshot(g)
+        };
+        // Lock is DROPPED here — the verifier's network round-trip in
+        // `drive_decision` runs without serializing the slot.
+        let outcome = origin_daemon::goal_driver::drive_decision(
+            inputs,
+            &last_text,
+            verifier,
+        )
+        .await;
+        let decision = {
+            let mut slot = active_goal.lock().await;
+            let Some(g) = slot.as_mut() else {
+                return Ok(summary);
+            };
+            origin_daemon::goal_driver::apply_outcome(g, outcome)
         };
         last_summary = Some(summary);
 
@@ -1712,6 +1861,22 @@ async fn drive_goal_loop(
                                 from_legacy_prompt_request(&pending_body).ok()
                             });
                     let is_interrupt = matches!(parsed, Some(ClientMessage::Interrupt));
+                    // Bug #12: if the peeked frame couldn't be decoded as
+                    // any known message, write an ErrorFrame to the client
+                    // so the user sees that their malformed prompt was
+                    // dropped (mirrors the outer-loop decode path at
+                    // main.rs:744-750). Without this the daemon would
+                    // silently swallow the body and emit only GoalCleared.
+                    if parsed.is_none() {
+                        let _ = conn
+                            .lock()
+                            .await
+                            .write_frame(
+                                FrameKind::ErrorFrame,
+                                b"bad request: malformed mid-goal frame; dropped",
+                            )
+                            .await;
+                    }
                     // Clear the active goal before yielding control. The
                     // outer loop sees a stable `None` slot when it picks
                     // up the pushed-back message. Build a terminal
@@ -1749,6 +1914,7 @@ async fn drive_goal_loop(
                                 status: origin_goal::GoalStatusWire::Cleared {
                                     by: origin_goal::ClearReasonWire::UserSlash,
                                 },
+                                last_status_tag: p.last_status_tag.clone().map(Into::into),
                             }),
                         };
                         if let Err(e) = session_store.save_resume_token(&token) {
@@ -1811,6 +1977,7 @@ async fn drive_goal_loop(
                                     .map(|d| d.as_secs())
                                     .unwrap_or(0),
                                 status: origin_goal::GoalStatusWire::Cleared { by: reason.clone() },
+                                last_status_tag: g.last_status_tag.clone().map(Into::into),
                             }),
                         }
                     })
