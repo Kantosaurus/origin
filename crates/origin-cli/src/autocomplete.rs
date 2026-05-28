@@ -44,19 +44,14 @@ pub fn complete(buffer: &mut String, sources: &CompletionSources) -> CompletionR
         // Strip trailing `}` if present so we match against bare names.
         let partial = partial.strip_suffix('}').unwrap_or(partial);
         let partial = partial.to_string();
-        return complete_with(
-            buffer,
-            &partial,
-            &sources.workflows,
-            |full| format!("{{workflow:{full}}}"),
-        );
+        return complete_with(buffer, &partial, &sources.workflows, |full| {
+            format!("{{workflow:{full}}}")
+        });
     }
     // Skill shapes — `/-<name>` (deactivate) or `/<name>` (activate).
     if let Some(partial) = buffer.strip_prefix("/-") {
         let partial = partial.to_string();
-        return complete_with(buffer, &partial, &sources.skills, |full| {
-            format!("/-{full}")
-        });
+        return complete_with(buffer, &partial, &sources.skills, |full| format!("/-{full}"));
     }
     if let Some(partial) = buffer.strip_prefix('/') {
         // Whitespace inside the partial means it's not a slash command.
@@ -79,10 +74,7 @@ fn complete_with(
     candidates: &[String],
     wrap: impl Fn(&str) -> String,
 ) -> CompletionResult {
-    let matches: Vec<&String> = candidates
-        .iter()
-        .filter(|c| c.starts_with(partial))
-        .collect();
+    let matches: Vec<&String> = candidates.iter().filter(|c| c.starts_with(partial)).collect();
     match matches.len() {
         0 => CompletionResult::NoMatch,
         1 => {

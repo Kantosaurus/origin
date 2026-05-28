@@ -41,11 +41,21 @@ pub enum SearchError {
 }
 
 #[derive(Serialize)]
-struct ReqBody<'a> { api_key: &'a str, query: &'a str, max_results: usize }
+struct ReqBody<'a> {
+    api_key: &'a str,
+    query: &'a str,
+    max_results: usize,
+}
 #[derive(Deserialize)]
-struct RawResp { results: Vec<RawHit> }
+struct RawResp {
+    results: Vec<RawHit>,
+}
 #[derive(Deserialize)]
-struct RawHit { title: String, url: String, content: String }
+struct RawHit {
+    title: String,
+    url: String,
+    content: String,
+}
 
 /// Resolve the Tavily API key from the vault, falling back to env.
 ///
@@ -90,13 +100,23 @@ pub async fn search_with_endpoint(
     let client = reqwest::Client::new();
     let resp = client
         .post(endpoint)
-        .json(&ReqBody { api_key: &opts.api_key, query, max_results: opts.count })
+        .json(&ReqBody {
+            api_key: &opts.api_key,
+            query,
+            max_results: opts.count,
+        })
         .send()
         .await?;
     let raw: RawResp = resp.json().await.map_err(|e| SearchError::Parse(e.to_string()))?;
-    Ok(raw.results.into_iter().map(|h| SearchHit {
-        title: h.title, url: h.url, snippet: h.content,
-    }).collect())
+    Ok(raw
+        .results
+        .into_iter()
+        .map(|h| SearchHit {
+            title: h.title,
+            url: h.url,
+            snippet: h.content,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -145,6 +165,9 @@ mod tests {
         assert!(matches!(err, SearchError::NoApiKey), "got {err:?}");
         // Message should guide the user to the fix.
         let msg = format!("{err}");
-        assert!(msg.contains("tavily:default") || msg.contains("origin init"), "got {msg}");
+        assert!(
+            msg.contains("tavily:default") || msg.contains("origin init"),
+            "got {msg}"
+        );
     }
 }

@@ -77,10 +77,7 @@ async fn run_device_flow(
     let scopes: Vec<&str> = spec.scopes.iter().map(AsRef::as_ref).collect();
     let scope_str = scopes.join(" ");
 
-    let mut form: Vec<(&str, &str)> = vec![
-        ("client_id", spec.client_id.as_ref()),
-        ("scope", &scope_str),
-    ];
+    let mut form: Vec<(&str, &str)> = vec![("client_id", spec.client_id.as_ref()), ("scope", &scope_str)];
     let challenge_str;
     if let Some(ref p) = pkce {
         challenge_str = p.challenge().to_string();
@@ -337,8 +334,7 @@ async fn exchange_and_persist(
     // with a 400 "Invalid request format" (Anthropic's API error envelope, not
     // an OAuth error). Route it through the Anthropic-specific JSON exchange.
     if provider_id == "anthropic-oauth" {
-        return exchange_anthropic_and_persist(provider_id, account, spec, vault, pkce, code, state)
-            .await;
+        return exchange_anthropic_and_persist(provider_id, account, spec, vault, pkce, code, state).await;
     }
     let oauth = OAuthClient::new(provider_id, spec.token_url.as_ref(), spec.client_id.as_ref());
     let req = AuthCodeRequest::new(code, pkce.verifier(), spec.redirect_uri.as_ref());
@@ -390,17 +386,14 @@ async fn exchange_anthropic_and_persist(
         .await
         .map_err(|e| anyhow!("oauth POST {}: {e}", spec.token_url))?;
     let status = resp.status();
-    let body_text = resp
-        .text()
-        .await
-        .map_err(|e| anyhow!("oauth read body: {e}"))?;
+    let body_text = resp.text().await.map_err(|e| anyhow!("oauth read body: {e}"))?;
     if !status.is_success() {
         return Err(anyhow!(
             "token exchange failed: oauth token endpoint returned {status}: {body_text}"
         ));
     }
-    let tok: TokenResp = serde_json::from_str(&body_text)
-        .map_err(|e| anyhow!("parse token response: {e}"))?;
+    let tok: TokenResp =
+        serde_json::from_str(&body_text).map_err(|e| anyhow!("parse token response: {e}"))?;
     let expires_at = now_epoch_secs().saturating_add(tok.expires_in);
     persist_tokens(
         vault,

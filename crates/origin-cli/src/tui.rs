@@ -32,8 +32,8 @@ impl ScrollLine {
 }
 
 const SPINNER_FRAMES: &[char] = &[
-    '\u{280B}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283C}', '\u{2834}', '\u{2826}',
-    '\u{2827}', '\u{2807}', '\u{280F}',
+    '\u{280B}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283C}', '\u{2834}', '\u{2826}', '\u{2827}',
+    '\u{2807}', '\u{280F}',
 ];
 const SPINNER_INTERVAL_MS: u64 = 80;
 
@@ -99,11 +99,7 @@ const BANNER: &[&str] = &[
 
 impl App {
     #[must_use]
-    pub fn new(
-        provider: &'static str,
-        model: impl Into<String>,
-        sources: CompletionSources,
-    ) -> Self {
+    pub fn new(provider: &'static str, model: impl Into<String>, sources: CompletionSources) -> Self {
         Self {
             scrollback: Vec::new(),
             input: String::new(),
@@ -145,8 +141,7 @@ impl App {
     ) {
         self.usage.input_tokens = self.usage.input_tokens.saturating_add(input_tokens);
         self.usage.output_tokens = self.usage.output_tokens.saturating_add(output_tokens);
-        self.usage.cache_read_input_tokens =
-            self.usage.cache_read_input_tokens.saturating_add(cache_read);
+        self.usage.cache_read_input_tokens = self.usage.cache_read_input_tokens.saturating_add(cache_read);
         self.usage.cache_creation_input_tokens =
             self.usage.cache_creation_input_tokens.saturating_add(cache_write);
     }
@@ -224,12 +219,8 @@ impl App {
                 ));
             }
             "system> " => {
-                self.scrollback.push(ScrollLine::styled(
-                    format!("  {body}"),
-                    theme::MUTED,
-                    0,
-                    false,
-                ));
+                self.scrollback
+                    .push(ScrollLine::styled(format!("  {body}"), theme::MUTED, 0, false));
             }
             "ok> " => {
                 self.scrollback.push(ScrollLine::styled(
@@ -248,28 +239,19 @@ impl App {
                 ));
             }
             "tab> " => {
-                self.scrollback.push(ScrollLine::styled(
-                    format!("    {body}"),
-                    theme::MUTED,
-                    0,
-                    false,
-                ));
+                self.scrollback
+                    .push(ScrollLine::styled(format!("    {body}"), theme::MUTED, 0, false));
             }
             _ => {
-                self.scrollback.push(ScrollLine::styled(
-                    format!("  {body}"),
-                    theme::BODY,
-                    0,
-                    false,
-                ));
+                self.scrollback
+                    .push(ScrollLine::styled(format!("  {body}"), theme::BODY, 0, false));
             }
         }
         self.scroll_offset = 0;
     }
 
     pub fn add_colored_line(&mut self, text: String, fg: u32, bg: u32) {
-        self.scrollback
-            .push(ScrollLine::styled(text, fg, bg, false));
+        self.scrollback.push(ScrollLine::styled(text, fg, bg, false));
     }
 
     pub fn add_tool_line(&mut self, text: String) {
@@ -313,12 +295,8 @@ impl App {
                         ));
                     } else {
                         let (fg, bold) = md_line_style(line);
-                        self.scrollback.push(ScrollLine::styled(
-                            format!("  {line}"),
-                            fg,
-                            0,
-                            bold,
-                        ));
+                        self.scrollback
+                            .push(ScrollLine::styled(format!("  {line}"), fg, 0, bold));
                     }
                 }
                 // Trailing blank line so the next user turn (or the input
@@ -339,8 +317,7 @@ impl App {
     ) {
         self.usage.input_tokens = self.usage.input_tokens.saturating_add(input_tokens);
         self.usage.output_tokens = self.usage.output_tokens.saturating_add(output_tokens);
-        self.usage.cache_read_input_tokens =
-            self.usage.cache_read_input_tokens.saturating_add(cache_read);
+        self.usage.cache_read_input_tokens = self.usage.cache_read_input_tokens.saturating_add(cache_read);
         self.usage.cache_creation_input_tokens =
             self.usage.cache_creation_input_tokens.saturating_add(cache_write);
         self.usage.elapsed += elapsed;
@@ -382,7 +359,11 @@ impl App {
 
             for entry in &self.scrollback {
                 wrap_into(
-                    &entry.text, entry.fg, entry.bg, entry.bold, cols_usize,
+                    &entry.text,
+                    entry.fg,
+                    entry.bg,
+                    entry.bold,
+                    cols_usize,
                     &mut visual_lines,
                 );
             }
@@ -411,8 +392,14 @@ impl App {
                 let indicator = format!(" \u{2191} {offset} more ");
                 let start_col = cols.saturating_sub(indicator.len() as u16 + 1);
                 write_str_styled(
-                    main, 0, start_col, &indicator, cols,
-                    theme::ACCENT, theme::SURFACE_RAISED, false,
+                    main,
+                    0,
+                    start_col,
+                    &indicator,
+                    cols,
+                    theme::ACCENT,
+                    theme::SURFACE_RAISED,
+                    false,
                 );
             }
 
@@ -426,7 +413,8 @@ impl App {
                 }
                 if cl < cols {
                     main.put(
-                        r, cl,
+                        r,
+                        cl,
                         Cell::new('\u{2503}', theme::ACCENT, theme::SURFACE_RAISED, Attr::PLAIN),
                     );
                 }
@@ -435,8 +423,14 @@ impl App {
             if self.input.is_empty() && self.current_assistant.is_none() {
                 if r_top < rows {
                     write_str_styled(
-                        main, r_top, cs, "Ask anything...", cr,
-                        theme::MUTED, theme::SURFACE_RAISED, false,
+                        main,
+                        r_top,
+                        cs,
+                        "Ask anything...",
+                        cr,
+                        theme::MUTED,
+                        theme::SURFACE_RAISED,
+                        false,
                     );
                 }
             } else if !self.input.is_empty() {
@@ -446,15 +440,18 @@ impl App {
                     if r >= r_status || r >= rows {
                         break;
                     }
-                    write_str_styled(
-                        main, r, cs, line, cr, theme::BRIGHT,
-                        theme::SURFACE_RAISED, false,
-                    );
+                    write_str_styled(main, r, cs, line, cr, theme::BRIGHT, theme::SURFACE_RAISED, false);
                     if vis_start + i == wrapped.len() - 1 && !self.suggestions.ghost.is_empty() {
                         let gc = cs + char_display_width(line);
                         write_str_styled(
-                            main, r, gc, &self.suggestions.ghost, cr,
-                            theme::DIM, theme::SURFACE_RAISED, false,
+                            main,
+                            r,
+                            gc,
+                            &self.suggestions.ghost,
+                            cr,
+                            theme::DIM,
+                            theme::SURFACE_RAISED,
+                            false,
                         );
                     }
                 }
@@ -488,15 +485,22 @@ impl App {
                     )
                 };
                 write_str_styled(
-                    main, r_status, cs, &status, cr,
-                    theme::DIM, theme::SURFACE_RAISED, false,
+                    main,
+                    r_status,
+                    cs,
+                    &status,
+                    cr,
+                    theme::DIM,
+                    theme::SURFACE_RAISED,
+                    false,
                 );
                 if let Some(sc) = prefix {
                     if let Some(pos) = status.find(sc) {
                         let c = cs + pos as u16;
                         if c < cr {
                             main.put(
-                                r_status, c,
+                                r_status,
+                                c,
                                 Cell::new(sc, theme::ACCENT, theme::SURFACE_RAISED, Attr::PLAIN),
                             );
                         }
@@ -507,7 +511,8 @@ impl App {
                     let c = cs + wf_offset + i as u16;
                     if c < cr {
                         main.put(
-                            r_status, c,
+                            r_status,
+                            c,
                             Cell::new(ch, theme::ACCENT, theme::SURFACE_RAISED, Attr::BOLD),
                         );
                     }
@@ -516,10 +521,7 @@ impl App {
 
             if r_cap < rows {
                 if cl < cols {
-                    main.put(
-                        r_cap, cl,
-                        Cell::new('\u{2579}', theme::ACCENT, 0, Attr::PLAIN),
-                    );
+                    main.put(r_cap, cl, Cell::new('\u{2579}', theme::ACCENT, 0, Attr::PLAIN));
                 }
                 let hint_parts: &[(&str, u32)] = &[
                     ("shift+enter", theme::BODY),
@@ -529,8 +531,7 @@ impl App {
                     ("ctrl+c", theme::BODY),
                     (" quit", theme::MUTED),
                 ];
-                let total_hw: u16 =
-                    hint_parts.iter().map(|(s, _)| char_display_width(s)).sum();
+                let total_hw: u16 = hint_parts.iter().map(|(s, _)| char_display_width(s)).sum();
                 let mut hc = cr.saturating_sub(total_hw);
                 for (text, fg) in hint_parts {
                     let tw = char_display_width(text);
@@ -562,8 +563,14 @@ impl App {
                     write_str_styled(main, r, ps, ind, cr, ind_fg, theme::SURFACE_RAISED, false);
                     let ind_w = char_display_width(ind);
                     write_str_styled(
-                        main, r, ps + ind_w, candidate, cr, txt_fg,
-                        theme::SURFACE_RAISED, false,
+                        main,
+                        r,
+                        ps + ind_w,
+                        candidate,
+                        cr,
+                        txt_fg,
+                        theme::SURFACE_RAISED,
+                        false,
                     );
                 }
             }
@@ -586,11 +593,7 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
 
     for r in 0..rows {
         for c in 0..cols {
-            side.put(
-                r,
-                c,
-                Cell::new(' ', 0, theme::PANEL_BG, Attr::PLAIN),
-            );
+            side.put(r, c, Cell::new(' ', 0, theme::PANEL_BG, Attr::PLAIN));
         }
     }
 
@@ -604,7 +607,16 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
 
     if plan_lines.is_empty() {
         let label = " Plan";
-        write_str_styled(side, 0, 1, label, cols.saturating_sub(1), theme::MUTED, theme::PANEL_BG, false);
+        write_str_styled(
+            side,
+            0,
+            1,
+            label,
+            cols.saturating_sub(1),
+            theme::MUTED,
+            theme::PANEL_BG,
+            false,
+        );
         return;
     }
 
@@ -755,8 +767,7 @@ fn render_md_line(
             }
         }
         if chars[i] == '`' && !(i + 1 < len && chars[i + 1] == '`') {
-            if let Some(end) = chars[i + 1..].iter().position(|&c| c == '`').map(|p| i + 1 + p)
-            {
+            if let Some(end) = chars[i + 1..].iter().position(|&c| c == '`').map(|p| i + 1 + p) {
                 i += 1;
                 while i < end && col < max_cols {
                     let w = UnicodeWidthChar::width(chars[i]).unwrap_or(1) as u16;
@@ -821,14 +832,7 @@ struct VisualLine<'a> {
     bold: bool,
 }
 
-fn wrap_into<'a>(
-    text: &'a str,
-    fg: u32,
-    bg: u32,
-    bold: bool,
-    cols: usize,
-    out: &mut Vec<VisualLine<'a>>,
-) {
+fn wrap_into<'a>(text: &'a str, fg: u32, bg: u32, bold: bool, cols: usize, out: &mut Vec<VisualLine<'a>>) {
     for sub in text.split('\n') {
         if cols == 0 {
             continue;

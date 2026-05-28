@@ -18,7 +18,8 @@ async fn fetch_extracts_main_content_as_markdown() {
         let body = "<html><head><title>Hi</title></head><body><article><h1>Hi</h1><p>World.</p></article></body></html>";
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(), body
+            body.len(),
+            body
         );
         sock.write_all(resp.as_bytes()).await.unwrap();
     });

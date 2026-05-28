@@ -113,8 +113,8 @@ async fn parallel_tool_calls_carry_index_prefix() {
     while let Some(ev) = sub.next().await.expect("recv") {
         match ev.kind() {
             TokenKind::ToolUseStart => {
-                let (idx, id, name) =
-                    decode_tool_use_start(ev.payload()).expect("ToolUseStart must carry LE index + id\\0name");
+                let (idx, id, name) = decode_tool_use_start(ev.payload())
+                    .expect("ToolUseStart must carry LE index + id\\0name");
                 starts.push((idx, id, name));
             }
             TokenKind::ToolUseDelta => {

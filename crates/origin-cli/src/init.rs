@@ -104,7 +104,12 @@ pub async fn run_with<R: BufRead + Send, W: Write + Send>(
 
     let primary = configure_role(&mut r, &mut w, &cat, vault, probe, Role::Primary).await?;
 
-    let backup = if yes_no(&mut r, &mut w, "Configure a backup provider/model? [y/N]: ", false)? {
+    let backup = if yes_no(
+        &mut r,
+        &mut w,
+        "Configure a backup provider/model? [y/N]: ",
+        false,
+    )? {
         Some(configure_role(&mut r, &mut w, &cat, vault, probe, Role::Backup).await?)
     } else {
         None
@@ -131,7 +136,12 @@ pub async fn run_with<R: BufRead + Send, W: Write + Send>(
     {
         use crate::ansi;
         writeln!(w)?;
-        writeln!(w, "  {} Saved to {}", ansi::green("\u{2714}"), ansi::muted(&cfg_path.display().to_string()))?;
+        writeln!(
+            w,
+            "  {} Saved to {}",
+            ansi::green("\u{2714}"),
+            ansi::muted(&cfg_path.display().to_string())
+        )?;
         writeln!(
             w,
             "  {}",
@@ -165,7 +175,12 @@ pub async fn configure_tavily<R: BufRead + Send, W: Write + Send>(
             "  {}",
             ansi::muted("WebSearch uses Tavily. Grab a free key in under a minute:")
         )?;
-        writeln!(w, "  {} Visit {} and sign up", ansi::muted("1."), ansi::accent("https://tavily.com/"))?;
+        writeln!(
+            w,
+            "  {} Visit {} and sign up",
+            ansi::muted("1."),
+            ansi::accent("https://tavily.com/")
+        )?;
         writeln!(w, "  {} Free tier: ~1,000 searches/month", ansi::muted("2."))?;
         writeln!(w, "  {} Copy the API key from your dashboard", ansi::muted("3."))?;
         writeln!(w)?;
@@ -185,7 +200,10 @@ pub async fn configure_tavily<R: BufRead + Send, W: Write + Send>(
         .set("tavily", "default", Secret::new(key))
         .await
         .map_err(|e| anyhow!("vault set tavily: {e}"))?;
-    writeln!(w, "  Saved to vault under tavily:default. WebSearch will pick it up automatically.")?;
+    writeln!(
+        w,
+        "  Saved to vault under tavily:default. WebSearch will pick it up automatically."
+    )?;
     Ok(())
 }
 
@@ -219,7 +237,11 @@ async fn configure_role<R: BufRead + Send, W: Write + Send>(
     probe: &dyn ConnectivityProbe,
     role: Role,
 ) -> Result<RoleConfig> {
-    writeln!(w, "  {}", crate::ansi::heading(&format!("{} provider", role.label())))?;
+    writeln!(
+        w,
+        "  {}",
+        crate::ansi::heading(&format!("{} provider", role.label()))
+    )?;
     writeln!(w)?;
     let entry = pick_provider(r, w, cat)?;
     let account = "default".to_string();
@@ -269,11 +291,7 @@ async fn configure_role<R: BufRead + Send, W: Write + Send>(
 /// escape hatch that defers to [`Catalog::lookup`] — so even custom entries
 /// added via `~/.origin/providers.toml` are reachable (the catalog the
 /// caller passes in is the merged one).
-fn pick_provider<R: BufRead, W: Write>(
-    r: &mut R,
-    w: &mut W,
-    cat: &Catalog,
-) -> Result<ProviderEntry> {
+fn pick_provider<R: BufRead, W: Write>(r: &mut R, w: &mut W, cat: &Catalog) -> Result<ProviderEntry> {
     let entries: Vec<&ProviderEntry> = cat.entries().iter().collect();
     writeln!(w, "Available providers:")?;
     let mut prev_wire: Option<WireFormat> = None;
@@ -357,10 +375,7 @@ async fn capture_credentials<R: BufRead + Send, W: Write + Send>(
             Ok(())
         }
         AuthScheme::OAuth(_) => {
-            writeln!(
-                w,
-                "  This provider uses OAuth. Starting the authorization flow…"
-            )?;
+            writeln!(w, "  This provider uses OAuth. Starting the authorization flow…")?;
             crate::keyring_login::run(&entry.id, account).await
         }
         AuthScheme::SigV4 { service } => {
@@ -548,12 +563,7 @@ fn read_line<R: BufRead>(r: &mut R) -> Result<String> {
     Ok(buf)
 }
 
-fn yes_no<R: BufRead, W: Write>(
-    r: &mut R,
-    w: &mut W,
-    prompt: &str,
-    default_yes: bool,
-) -> Result<bool> {
+fn yes_no<R: BufRead, W: Write>(r: &mut R, w: &mut W, prompt: &str, default_yes: bool) -> Result<bool> {
     loop {
         write!(w, "{prompt}")?;
         w.flush()?;
@@ -623,10 +633,7 @@ mod tests {
         let mut output: Vec<u8> = Vec::new();
 
         let vault = KeyVault::in_memory();
-        let probe = MockProbe::ok_with_models(vec![
-            "claude-sonnet-4-6".into(),
-            "claude-opus-4-7".into(),
-        ]);
+        let probe = MockProbe::ok_with_models(vec!["claude-sonnet-4-6".into(), "claude-opus-4-7".into()]);
         run_with(input, &mut output, &vault, &cfg_path, &probe)
             .await
             .expect("run_with ok");
@@ -657,12 +664,7 @@ mod tests {
         }
         #[async_trait]
         impl ConnectivityProbe for FlipProbe {
-            async fn probe(
-                &self,
-                _entry: &ProviderEntry,
-                _vault: &KeyVault,
-                _account: &str,
-            ) -> ProbeResult {
+            async fn probe(&self, _entry: &ProviderEntry, _vault: &KeyVault, _account: &str) -> ProbeResult {
                 let n = self.call_count.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
                     ProbeResult {
@@ -687,9 +689,7 @@ mod tests {
 
         // Script: anthropic -> bad key -> retry y -> good key ->
         // accept default model -> n -> n.
-        let script = format!(
-            "{anthropic_idx}\nbad-key\ny\ngood-key\n\nn\nn\n"
-        );
+        let script = format!("{anthropic_idx}\nbad-key\ny\ngood-key\n\nn\nn\n");
         let input = std::io::Cursor::new(script.into_bytes());
         let mut output: Vec<u8> = Vec::new();
 
@@ -722,9 +722,7 @@ mod tests {
         let other_idx = cat.entries().len() + 1;
         // Script: choose "Other" -> type "deepseek" -> paste key ->
         // probe ok -> accept default -> n -> n.
-        let script = format!(
-            "{other_idx}\ndeepseek\nsk-deepseek-test\n\nn\nn\n"
-        );
+        let script = format!("{other_idx}\ndeepseek\nsk-deepseek-test\n\nn\nn\n");
         let input = std::io::Cursor::new(script.into_bytes());
         let mut output: Vec<u8> = Vec::new();
 
@@ -810,7 +808,10 @@ mod tests {
         let out = String::from_utf8(output).expect("utf8");
         // Saved-confirmation message mentions the vault path the WebSearch
         // tool now resolves against.
-        assert!(out.contains("tavily:default"), "saved confirmation missing: {out}");
+        assert!(
+            out.contains("tavily:default"),
+            "saved confirmation missing: {out}"
+        );
     }
 
     #[tokio::test]

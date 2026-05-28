@@ -56,7 +56,11 @@ pub fn prompt_arrow() -> String {
 }
 
 pub fn highlight_row(s: &str) -> String {
-    format!("{}{}{BOLD}{s}{RESET}", rgb_bg(theme::SURFACE), rgb_fg(theme::BRIGHT))
+    format!(
+        "{}{}{BOLD}{s}{RESET}",
+        rgb_bg(theme::SURFACE),
+        rgb_fg(theme::BRIGHT)
+    )
 }
 
 pub fn section_rule(width: usize) -> String {

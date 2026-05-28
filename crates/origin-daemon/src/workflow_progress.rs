@@ -212,8 +212,7 @@ mod tests {
         write_skill(dir.path(), "beta");
         let cat = SkillCatalog::load_from(dir.path()).expect("cat");
         let workflow = wf("a-b", &["alpha", "beta"]);
-        let StartOutcome::Stepped { mut progress, .. } = WorkflowProgress::start(&workflow, &cat)
-        else {
+        let StartOutcome::Stepped { mut progress, .. } = WorkflowProgress::start(&workflow, &cat) else {
             panic!("start");
         };
         match progress.advance(&cat) {
@@ -238,8 +237,7 @@ mod tests {
         write_skill(dir.path(), "alpha");
         let cat = SkillCatalog::load_from(dir.path()).expect("cat");
         let workflow = wf("one-step", &["alpha"]);
-        let StartOutcome::Stepped { mut progress, .. } = WorkflowProgress::start(&workflow, &cat)
-        else {
+        let StartOutcome::Stepped { mut progress, .. } = WorkflowProgress::start(&workflow, &cat) else {
             panic!("start");
         };
         match progress.advance(&cat) {
@@ -261,14 +259,11 @@ mod tests {
         write_skill(dir.path(), "gamma");
         let cat = SkillCatalog::load_from(dir.path()).expect("cat");
         let workflow = wf("a-g-g", &["alpha", "ghost", "gamma"]);
-        let StartOutcome::Stepped { mut progress, .. } = WorkflowProgress::start(&workflow, &cat)
-        else {
+        let StartOutcome::Stepped { mut progress, .. } = WorkflowProgress::start(&workflow, &cat) else {
             panic!("start");
         };
         match progress.advance(&cat) {
-            AdvanceOutcome::Stepped {
-                front, skipped, ..
-            } => {
+            AdvanceOutcome::Stepped { front, skipped, .. } => {
                 assert_eq!(front.name, "gamma");
                 assert_eq!(skipped, vec!["ghost"]);
             }

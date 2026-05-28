@@ -24,7 +24,10 @@ impl DiagnosticsHandle for FakeRa {
 async fn empty_diagnostics_returns_empty_array() {
     let h = FakeRa::default();
     let out = diagnostics(
-        DiagnosticsArgs { path: None, severity: Severity::Any },
+        DiagnosticsArgs {
+            path: None,
+            severity: Severity::Any,
+        },
         &h as &dyn DiagnosticsHandle,
     )
     .await
@@ -44,7 +47,10 @@ async fn populated_diagnostics_round_trip() {
         code: None,
     });
     let out = diagnostics(
-        DiagnosticsArgs { path: None, severity: Severity::Any },
+        DiagnosticsArgs {
+            path: None,
+            severity: Severity::Any,
+        },
         &h as &dyn DiagnosticsHandle,
     )
     .await

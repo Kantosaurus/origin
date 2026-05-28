@@ -4,6 +4,7 @@ use crate::proposal_registry::ProposalRegistry;
 use crate::protocol::StreamEvent;
 use crate::session::Session;
 use crate::session_store::SessionStore;
+use crate::skill_catalog::SkillCatalog;
 use crate::tool_use_parser::{ToolUseDelta, ToolUseParser};
 use origin_cas::{Hash, Store};
 use origin_core::types::{Block, Message, Role};
@@ -13,9 +14,8 @@ use origin_provider::{ChatRequest, Provider};
 use origin_runtime::{spawn_in, TaskClass};
 use origin_sidecar::{ExtractDeliverer, Sidecar, SummaryDeliverer};
 use origin_skills::SkillRegistry;
-use crate::skill_catalog::SkillCatalog;
-use origin_tools::{registry_iter, SideEffects, ToolMeta};
 use origin_tools::dispatch::MemoryHandle;
+use origin_tools::{registry_iter, SideEffects, ToolMeta};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -412,9 +412,8 @@ pub async fn run_loop(
                     .as_ref()
                     .map(|reg| reg.iter_active().map(|s| s.name.clone()).collect())
                     .unwrap_or_default();
-                let mut out = String::from(
-                    "Available skills (activate via `/<name>`, deactivate via `/-<name>`):\n",
-                );
+                let mut out =
+                    String::from("Available skills (activate via `/<name>`, deactivate via `/-<name>`):\n");
                 for s in cat.iter() {
                     let marker = if active_names.contains(&s.front.name) {
                         "*"
@@ -474,8 +473,9 @@ pub async fn run_loop(
                         // Exponential floor: 2, 4, 8 … so we don't hammer a
                         // server whose `retry-after: 1` is too optimistic.
                         let exp_floor = 1u32 << (attempt + 1);
-                        let sleep_secs =
-                            retry_after_secs.max(exp_floor).clamp(1, MAX_RATE_LIMIT_SLEEP_SECS);
+                        let sleep_secs = retry_after_secs
+                            .max(exp_floor)
+                            .clamp(1, MAX_RATE_LIMIT_SLEEP_SECS);
                         tracing::warn!(
                             attempt,
                             sleep_secs,
@@ -936,9 +936,7 @@ fn apply_turn_cache_markers(messages: &mut [Message], plan: Option<&origin_plann
     // Single source of truth: the latest `MAX_CACHE_MARKERS` turn boundaries.
     // Empty session ⇒ no markers and the dynamic list is cleared so a previous
     // turn's stale state never leaks into the wire.
-    let start = turn_boundaries
-        .len()
-        .saturating_sub(MAX_CACHE_MARKERS);
+    let start = turn_boundaries.len().saturating_sub(MAX_CACHE_MARKERS);
     let chosen: Vec<(usize, usize)> = turn_boundaries[start..].to_vec();
 
     // Clear every existing block-level cache_marker across the session before
@@ -1053,8 +1051,7 @@ mod cache_marker_tests {
         }
 
         let block_marked = block_marked_message_indices(&msgs);
-        let dyn_marked: HashSet<usize> =
-            plan.dynamic_message_markers().into_iter().collect();
+        let dyn_marked: HashSet<usize> = plan.dynamic_message_markers().into_iter().collect();
 
         assert_eq!(
             block_marked, dyn_marked,
@@ -1082,8 +1079,7 @@ mod cache_marker_tests {
                 apply_turn_cache_markers(&mut msgs, Some(&plan));
             }
             let block_marked = block_marked_message_indices(&msgs);
-            let dyn_marked: HashSet<usize> =
-                plan.dynamic_message_markers().into_iter().collect();
+            let dyn_marked: HashSet<usize> = plan.dynamic_message_markers().into_iter().collect();
             assert_eq!(
                 block_marked, dyn_marked,
                 "divergence at n_turns={n_turns}: block={block_marked:?}, dyn={dyn_marked:?}"
@@ -1137,19 +1133,22 @@ async fn dispatch_tool(
     match meta.name {
         "Read" => {
             let args = origin_tools::builtins::read::ReadArgs {
-                file_path: args.get("file_path").and_then(Value::as_str)
+                file_path: args
+                    .get("file_path")
+                    .and_then(Value::as_str)
                     .ok_or_else(|| LoopError::BadArgs("Read: missing `file_path`".into()))?
                     .to_string(),
                 offset: args.get("offset").and_then(Value::as_u64).map(|n| n as u32),
-                limit:  args.get("limit").and_then(Value::as_u64).map(|n| n as u32),
-                as_:    args.get("as").and_then(Value::as_str).map(str::to_string),
+                limit: args.get("limit").and_then(Value::as_u64).map(|n| n as u32),
+                as_: args.get("as").and_then(Value::as_str).map(str::to_string),
             };
-            origin_tools::builtins::read::read_v2(args)
-                .map_err(|e| LoopError::ToolFailure(e.message))
+            origin_tools::builtins::read::read_v2(args).map_err(|e| LoopError::ToolFailure(e.message))
         }
         "Glob" => {
             let gargs = origin_tools::builtins::glob_tool::GlobArgs {
-                pattern: args.get("pattern").and_then(Value::as_str)
+                pattern: args
+                    .get("pattern")
+                    .and_then(Value::as_str)
                     .ok_or_else(|| LoopError::BadArgs("Glob: missing `pattern`".into()))?
                     .to_string(),
                 path: args.get("path").and_then(Value::as_str).map(str::to_string),
@@ -1167,7 +1166,9 @@ async fn dispatch_tool(
                 _ => origin_tools::builtins::grep_tool::OutputMode::FilesWithMatches,
             });
             let gargs = origin_tools::builtins::grep_tool::GrepArgs {
-                pattern: args.get("pattern").and_then(Value::as_str)
+                pattern: args
+                    .get("pattern")
+                    .and_then(Value::as_str)
                     .ok_or_else(|| LoopError::BadArgs("Grep: missing `pattern`".into()))?
                     .to_string(),
                 path: args.get("path").and_then(Value::as_str).map(str::to_string),
@@ -1175,8 +1176,16 @@ async fn dispatch_tool(
                 r#type: args.get("type").and_then(Value::as_str).map(str::to_string),
                 output_mode: mode,
                 head_limit: args.get("head_limit").and_then(Value::as_u64).map(|n| n as u32),
-                before: args.get("before").and_then(Value::as_u64).map(|n| n as u32).unwrap_or(0),
-                after:  args.get("after").and_then(Value::as_u64).map(|n| n as u32).unwrap_or(0),
+                before: args
+                    .get("before")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as u32)
+                    .unwrap_or(0),
+                after: args
+                    .get("after")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as u32)
+                    .unwrap_or(0),
                 line_numbers: args.get("line_numbers").and_then(Value::as_bool).unwrap_or(false),
                 multiline: args.get("multiline").and_then(Value::as_bool).unwrap_or(false),
             };
@@ -1186,13 +1195,19 @@ async fn dispatch_tool(
         }
         "Edit" => {
             let args = origin_tools::builtins::edit::EditArgs {
-                file_path: args.get("file_path").and_then(Value::as_str)
+                file_path: args
+                    .get("file_path")
+                    .and_then(Value::as_str)
                     .ok_or_else(|| LoopError::BadArgs("Edit: missing `file_path`".into()))?
                     .to_string(),
-                old_string: args.get("old_string").and_then(Value::as_str)
+                old_string: args
+                    .get("old_string")
+                    .and_then(Value::as_str)
                     .ok_or_else(|| LoopError::BadArgs("Edit: missing `old_string`".into()))?
                     .to_string(),
-                new_string: args.get("new_string").and_then(Value::as_str)
+                new_string: args
+                    .get("new_string")
+                    .and_then(Value::as_str)
                     .ok_or_else(|| LoopError::BadArgs("Edit: missing `new_string`".into()))?
                     .to_string(),
                 replace_all: args.get("replace_all").and_then(Value::as_bool).unwrap_or(false),
@@ -1202,16 +1217,27 @@ async fn dispatch_tool(
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "MultiEdit" => {
-            let edits_v = args.get("edits").and_then(Value::as_array)
+            let edits_v = args
+                .get("edits")
+                .and_then(Value::as_array)
                 .ok_or_else(|| LoopError::BadArgs("MultiEdit: missing `edits`".into()))?;
-            let edits = edits_v.iter().map(|e| {
-                let o = e.get("old").and_then(Value::as_str).unwrap_or("");
-                let n = e.get("new").and_then(Value::as_str).unwrap_or("");
-                let r = e.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
-                origin_tools::builtins::multi_edit::EditOp { old: o.into(), new: n.into(), replace_all: r }
-            }).collect();
+            let edits = edits_v
+                .iter()
+                .map(|e| {
+                    let o = e.get("old").and_then(Value::as_str).unwrap_or("");
+                    let n = e.get("new").and_then(Value::as_str).unwrap_or("");
+                    let r = e.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+                    origin_tools::builtins::multi_edit::EditOp {
+                        old: o.into(),
+                        new: n.into(),
+                        replace_all: r,
+                    }
+                })
+                .collect();
             let margs = origin_tools::builtins::multi_edit::MultiEditArgs {
-                file_path: args.get("file_path").and_then(Value::as_str)
+                file_path: args
+                    .get("file_path")
+                    .and_then(Value::as_str)
                     .ok_or_else(|| LoopError::BadArgs("MultiEdit: missing `file_path`".into()))?
                     .to_string(),
                 edits,
@@ -1222,7 +1248,9 @@ async fn dispatch_tool(
         }
         "ApplyPatch" => {
             let pargs = origin_tools::builtins::apply_patch::ApplyPatchArgs {
-                patch: args.get("patch").and_then(Value::as_str)
+                patch: args
+                    .get("patch")
+                    .and_then(Value::as_str)
                     .ok_or_else(|| LoopError::BadArgs("ApplyPatch: missing `patch`".into()))?
                     .to_string(),
             };
@@ -1235,10 +1263,14 @@ async fn dispatch_tool(
             // Production callers pass the session's guard via dispatch_with_envelope;
             // this passthrough path is used only by tests that bypass the envelope.
             let args = origin_tools::builtins::write::WriteArgs {
-                file_path: args.get("file_path").and_then(Value::as_str)
+                file_path: args
+                    .get("file_path")
+                    .and_then(Value::as_str)
                     .ok_or_else(|| LoopError::BadArgs("Write: missing `file_path`".into()))?
                     .to_string(),
-                content: args.get("content").and_then(Value::as_str)
+                content: args
+                    .get("content")
+                    .and_then(Value::as_str)
                     .ok_or_else(|| LoopError::BadArgs("Write: missing `content`".into()))?
                     .to_string(),
                 force: args.get("force").and_then(Value::as_bool).unwrap_or(false),
@@ -1293,19 +1325,13 @@ async fn dispatch_tool(
                     .and_then(Value::as_u64)
                     .map(|n| n as u32)
                     .ok_or_else(|| LoopError::BadArgs("Monitor: missing `pid`".into()))?,
-                since_byte: args
-                    .get("since_byte")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
+                since_byte: args.get("since_byte").and_then(Value::as_u64).unwrap_or(0),
                 max_bytes: args
                     .get("max_bytes")
                     .and_then(Value::as_u64)
                     .map(|n| n as u32)
                     .unwrap_or(4096),
-                wait: args
-                    .get("wait")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
+                wait: args.get("wait").and_then(Value::as_bool).unwrap_or(false),
             };
             // Envelope-routed path uses ctx.supervisor; this passthrough
             // makes a stub supervisor that always returns unknown_pid.
@@ -1347,10 +1373,7 @@ async fn dispatch_tool(
                     .and_then(Value::as_str)
                     .ok_or_else(|| LoopError::BadArgs("ToolSearch: missing `query`".into()))?
                     .to_string(),
-                max_results: args
-                    .get("max_results")
-                    .and_then(Value::as_u64)
-                    .map(|n| n as u32),
+                max_results: args.get("max_results").and_then(Value::as_u64).map(|n| n as u32),
             };
             origin_tools::builtins::tool_search::tool_search(&sargs)
                 .map(|v| serde_json::to_string(&v).unwrap())
@@ -1401,29 +1424,21 @@ async fn dispatch_tool(
                 "path" => Query::Path {
                     from: parse_id(&q_args["from"], "args.from")?,
                     to: parse_id(&q_args["to"], "args.to")?,
-                    max_hops: usize::try_from(q_args["max_hops"].as_u64().unwrap_or(8))
-                        .unwrap_or(usize::MAX),
+                    max_hops: usize::try_from(q_args["max_hops"].as_u64().unwrap_or(8)).unwrap_or(usize::MAX),
                 },
                 "neighbors" => Query::Neighbors {
                     node: parse_id(&q_args["node"], "args.node")?,
-                    depth: usize::try_from(q_args["depth"].as_u64().unwrap_or(1))
-                        .unwrap_or(usize::MAX),
+                    depth: usize::try_from(q_args["depth"].as_u64().unwrap_or(1)).unwrap_or(usize::MAX),
                 },
                 "communities" => Query::Communities,
                 "god_nodes" => Query::GodNodes {
-                    top_per_partition: usize::try_from(
-                        q_args["top_per_partition"].as_u64().unwrap_or(3),
-                    )
-                    .unwrap_or(usize::MAX),
+                    top_per_partition: usize::try_from(q_args["top_per_partition"].as_u64().unwrap_or(3))
+                        .unwrap_or(usize::MAX),
                 },
                 "recent_changes" => Query::RecentChanges {
                     since_ms: q_args["since_ms"].as_i64().unwrap_or(0),
                 },
-                other => {
-                    return Err(LoopError::BadArgs(format!(
-                        "graph_query: unknown kind `{other}`"
-                    )))
-                }
+                other => return Err(LoopError::BadArgs(format!("graph_query: unknown kind `{other}`"))),
             };
             let result = {
                 let idx = idx_arc.lock().await;
@@ -1452,10 +1467,8 @@ async fn dispatch_tool(
             };
             let from = parse_hex_id("from")?;
             let to = parse_hex_id("to")?;
-            let max_hops = usize::try_from(
-                args.get("max_hops").and_then(Value::as_u64).unwrap_or(8),
-            )
-            .unwrap_or(usize::MAX);
+            let max_hops = usize::try_from(args.get("max_hops").and_then(Value::as_u64).unwrap_or(8))
+                .unwrap_or(usize::MAX);
             let result = {
                 let idx = idx_arc.lock().await;
                 origin_tools::builtins::graph_path::graph_path_tool(&idx, from, to, max_hops)
@@ -1475,11 +1488,7 @@ async fn dispatch_tool(
                 .get("community_id")
                 .and_then(Value::as_i64)
                 .map(|cid| cid.to_string())
-                .or_else(|| {
-                    args.get("node")
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string)
-                })
+                .or_else(|| args.get("node").and_then(Value::as_str).map(ToString::to_string))
                 .unwrap_or_default();
             // graph_summarize_tool always returns QueryResult::Empty at P7.8.
             {
@@ -1499,11 +1508,7 @@ async fn dispatch_tool(
             let paths: Vec<PathBuf> = args
                 .get("paths")
                 .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(PathBuf::from))
-                        .collect()
-                })
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(PathBuf::from)).collect())
                 .unwrap_or_default();
             // Lock, mutate, then release before returning — don't hold across any await.
             let report = {
@@ -1539,29 +1544,24 @@ async fn dispatch_tool(
                     .as_str()
                     .ok_or_else(|| LoopError::BadArgs(format!("graph_explain.{field}: not a string")))?;
                 let mut buf = [0u8; 32];
-                hex::decode_to_slice(s, &mut buf).map_err(|e| {
-                    LoopError::BadArgs(format!("graph_explain.{field}: bad hex: {e}"))
-                })?;
+                hex::decode_to_slice(s, &mut buf)
+                    .map_err(|e| LoopError::BadArgs(format!("graph_explain.{field}: bad hex: {e}")))?;
                 Ok(EntityId(buf))
             };
             let q = match kind {
                 "path" => Query::Path {
                     from: parse_id(&q_args["from"], "args.from")?,
                     to: parse_id(&q_args["to"], "args.to")?,
-                    max_hops: usize::try_from(q_args["max_hops"].as_u64().unwrap_or(8))
-                        .unwrap_or(usize::MAX),
+                    max_hops: usize::try_from(q_args["max_hops"].as_u64().unwrap_or(8)).unwrap_or(usize::MAX),
                 },
                 "neighbors" => Query::Neighbors {
                     node: parse_id(&q_args["node"], "args.node")?,
-                    depth: usize::try_from(q_args["depth"].as_u64().unwrap_or(1))
-                        .unwrap_or(usize::MAX),
+                    depth: usize::try_from(q_args["depth"].as_u64().unwrap_or(1)).unwrap_or(usize::MAX),
                 },
                 "communities" => Query::Communities,
                 "god_nodes" => Query::GodNodes {
-                    top_per_partition: usize::try_from(
-                        q_args["top_per_partition"].as_u64().unwrap_or(3),
-                    )
-                    .unwrap_or(usize::MAX),
+                    top_per_partition: usize::try_from(q_args["top_per_partition"].as_u64().unwrap_or(3))
+                        .unwrap_or(usize::MAX),
                 },
                 "recent_changes" => Query::RecentChanges {
                     since_ms: q_args["since_ms"].as_i64().unwrap_or(0),
@@ -1618,8 +1618,7 @@ async fn dispatch_tool(
         "ask" => {
             let idx_arc = code_graph.ok_or_else(|| {
                 LoopError::ToolFailure(
-                    "ask: code-graph subsystem not yet wired (CodeGraphIndex not in LoopOptions)."
-                        .into(),
+                    "ask: code-graph subsystem not yet wired (CodeGraphIndex not in LoopOptions).".into(),
                 )
             })?;
             let query = args
@@ -1628,8 +1627,7 @@ async fn dispatch_tool(
                 .ok_or_else(|| LoopError::BadArgs("ask: missing `query`".into()))?;
             // Use provided MemRouter or fall back to the NullMemRouter.
             let null_router = origin_codegraph::ask::NullMemRouter;
-            let router: &dyn origin_codegraph::ask::MemRouter =
-                mem_router.unwrap_or(&null_router);
+            let router: &dyn origin_codegraph::ask::MemRouter = mem_router.unwrap_or(&null_router);
             let result = {
                 let idx = idx_arc.lock().await;
                 origin_tools::builtins::ask::ask_tool(&idx, router, query)
@@ -1671,13 +1669,12 @@ async fn dispatch_tool(
                 .get("query")
                 .and_then(Value::as_str)
                 .ok_or_else(|| LoopError::BadArgs("WebSearch: missing `query`".into()))?;
-            let count = usize::try_from(args.get("count").and_then(Value::as_u64).unwrap_or(10))
-                .unwrap_or(10);
+            let count =
+                usize::try_from(args.get("count").and_then(Value::as_u64).unwrap_or(10)).unwrap_or(10);
             let hits = origin_tools::builtins::web_search::web_search(query, count)
                 .await
                 .map_err(LoopError::ToolFailure)?;
-            serde_json::to_string(&hits)
-                .map_err(|e| LoopError::ToolFailure(format!("WebSearch: json: {e}")))
+            serde_json::to_string(&hits).map_err(|e| LoopError::ToolFailure(format!("WebSearch: json: {e}")))
         }
         // ── Browser (stateful; lazy process-global router) ──
         //
@@ -1706,23 +1703,19 @@ async fn dispatch_tool(
                     .await
                     .map_err(|e| LoopError::ToolFailure(format!("Browser: {e}")))?
             };
-            serde_json::to_string(&resp)
-                .map_err(|e| LoopError::ToolFailure(format!("Browser: json: {e}")))
+            serde_json::to_string(&resp).map_err(|e| LoopError::ToolFailure(format!("Browser: json: {e}")))
         }
         // ── Task ──
         // Requires an `origin_swarm::Coordinator` threaded through `LoopOptions`.
         "Task" => {
-            let coord = coordinator.ok_or_else(|| {
-                LoopError::ToolFailure("Task subsystem not configured".into())
-            })?;
+            let coord =
+                coordinator.ok_or_else(|| LoopError::ToolFailure("Task subsystem not configured".into()))?;
             let input: origin_tools::builtins::task::TaskInput =
-                serde_json::from_value(args.clone())
-                    .map_err(|e| LoopError::BadArgs(format!("Task: {e}")))?;
+                serde_json::from_value(args.clone()).map_err(|e| LoopError::BadArgs(format!("Task: {e}")))?;
             let output = origin_tools::builtins::task::task_tool(coord, input)
                 .await
                 .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
-            serde_json::to_string(&output)
-                .map_err(|e| LoopError::ToolFailure(format!("Task: json: {e}")))
+            serde_json::to_string(&output).map_err(|e| LoopError::ToolFailure(format!("Task: json: {e}")))
         }
         other => Err(LoopError::UnknownTool(other.into())),
     }
@@ -1931,17 +1924,10 @@ fn tool_activity_summary(name: &str, args: &Value) -> String {
             .unwrap_or("")
             .to_string(),
         "Bash" => {
-            let cmd = args
-                .get("command")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
             cmd.chars().take(80).collect()
         }
-        "WebFetch" => args
-            .get("url")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
+        "WebFetch" => args.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
         _ => {
             let s = args.to_string();
             s.chars().take(60).collect()
@@ -1976,9 +1962,7 @@ fn tool_diff_lines(name: &str, args: &Value) -> Vec<crate::protocol::DiffLine> {
                     oi += 1;
                     ni += 1;
                 } else {
-                    while oi < max_old
-                        && (ni >= max_new || !new_lines[ni..].contains(&old_lines[oi]))
-                    {
+                    while oi < max_old && (ni >= max_new || !new_lines[ni..].contains(&old_lines[oi])) {
                         old_i += 1;
                         out.push(DiffLine {
                             kind: "-".to_string(),
@@ -1987,9 +1971,7 @@ fn tool_diff_lines(name: &str, args: &Value) -> Vec<crate::protocol::DiffLine> {
                         });
                         oi += 1;
                     }
-                    while ni < max_new
-                        && (oi >= max_old || !old_lines[oi..].contains(&new_lines[ni]))
-                    {
+                    while ni < max_new && (oi >= max_old || !old_lines[oi..].contains(&new_lines[ni])) {
                         new_i += 1;
                         out.push(DiffLine {
                             kind: "+".to_string(),
@@ -2202,10 +2184,7 @@ async fn drain_subscriber_into_response(
                     }
                     index_to_id.insert(index, id.to_owned());
                 } else {
-                    tracing::warn!(
-                        bytes = ev.payload().len(),
-                        "malformed ToolUseStart payload"
-                    );
+                    tracing::warn!(bytes = ev.payload().len(), "malformed ToolUseStart payload");
                 }
             }
             origin_stream::TokenKind::ToolUseDelta => {
@@ -2369,19 +2348,25 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_explain")
             .expect("graph_explain registered");
         let args = serde_json::json!({"kind": "communities"});
-        let out = dispatch_tool(meta, &args, None, None, None, None, None).await.expect("communities dispatch");
+        let out = dispatch_tool(meta, &args, None, None, None, None, None)
+            .await
+            .expect("communities dispatch");
         assert_eq!(out, "all detected communities");
 
         let args = serde_json::json!({
             "kind": "recent_changes",
             "args": {"since_ms": 1_700_000_000_000_i64}
         });
-        let out = dispatch_tool(meta, &args, None, None, None, None, None).await.expect("recent_changes dispatch");
+        let out = dispatch_tool(meta, &args, None, None, None, None, None)
+            .await
+            .expect("recent_changes dispatch");
         assert!(out.contains("1700000000000"), "got: {out}");
 
         // Unknown kind surfaces as BadArgs, not ToolFailure or UnknownTool.
         let args = serde_json::json!({"kind": "bogus"});
-        let err = dispatch_tool(meta, &args, None, None, None, None, None).await.expect_err("bogus must fail");
+        let err = dispatch_tool(meta, &args, None, None, None, None, None)
+            .await
+            .expect_err("bogus must fail");
         assert!(matches!(err, LoopError::BadArgs(_)));
     }
 
@@ -2404,7 +2389,9 @@ mod dispatch_table_tests {
             let meta = registry_iter()
                 .find(|m| m.name == name)
                 .unwrap_or_else(|| panic!("{name} not registered"));
-            let err = dispatch_tool(meta, &args, None, None, None, None, None).await.expect_err(name);
+            let err = dispatch_tool(meta, &args, None, None, None, None, None)
+                .await
+                .expect_err(name);
             match err {
                 LoopError::ToolFailure(msg) => {
                     assert!(
@@ -2447,9 +2434,7 @@ mod dispatch_table_tests {
     #[tokio::test]
     async fn ask_classifies_pure_code_query() {
         let (code_graph, _tmp) = make_empty_code_graph();
-        let meta = registry_iter()
-            .find(|m| m.name == "ask")
-            .expect("ask registered");
+        let meta = registry_iter().find(|m| m.name == "ask").expect("ask registered");
         let args = serde_json::json!({"query": "what calls foo"});
         let null_router = origin_codegraph::ask::NullMemRouter;
         let out = dispatch_tool(
@@ -2655,10 +2640,7 @@ mod dispatch_table_tests {
         // Build in-memory backing stores.
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("plan.db");
-        let sql = Arc::new(
-            origin_store::Store::open(db_path.to_str().expect("utf8"))
-                .expect("sql open"),
-        );
+        let sql = Arc::new(origin_store::Store::open(db_path.to_str().expect("utf8")).expect("sql open"));
         let cas_root = tmp.path().join("cas");
         let cas = Arc::new(
             origin_cas::Store::open(origin_cas::StoreConfig {
@@ -2673,8 +2655,7 @@ mod dispatch_table_tests {
         // Construct Plan / PlanStore / PlanHandle / Coordinator.
         let plan = Arc::new(tokio::sync::Mutex::new(origin_plan::Plan::new()));
         let plan_store = Arc::new(
-            origin_plan::PlanStore::open(Arc::clone(&sql), Arc::clone(&cas))
-                .expect("plan store open"),
+            origin_plan::PlanStore::open(Arc::clone(&sql), Arc::clone(&cas)).expect("plan store open"),
         );
         let plan_handle = origin_swarm::PlanHandle::new(plan, plan_store);
         let coordinator = Arc::new(origin_swarm::Coordinator::new(plan_handle, "test-ring"));
@@ -2692,11 +2673,13 @@ mod dispatch_table_tests {
             .expect("Task with coordinator must succeed");
 
         // Assert the output is valid JSON with the expected shape.
-        let v: serde_json::Value =
-            serde_json::from_str(&out).expect("TaskOutput must be valid JSON");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("TaskOutput must be valid JSON");
         assert!(v.get("status").is_some(), "TaskOutput must have `status`");
         assert!(v.get("summary").is_some(), "TaskOutput must have `summary`");
-        assert!(v.get("files_touched").is_some(), "TaskOutput must have `files_touched`");
+        assert!(
+            v.get("files_touched").is_some(),
+            "TaskOutput must have `files_touched`"
+        );
         assert!(v.get("follow_ups").is_some(), "TaskOutput must have `follow_ups`");
     }
 

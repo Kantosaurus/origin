@@ -6,8 +6,7 @@
 use crate::frontmatter::{parse_frontmatter, ParsedSkill};
 use crate::loader::{Skill, SkillHash};
 
-static EMBEDDED: include_dir::Dir<'_> =
-    include_dir::include_dir!("$CARGO_MANIFEST_DIR/embedded/superpowers");
+static EMBEDDED: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/embedded/superpowers");
 
 /// Walk the embedded `superpowers/` tree and return every `SKILL.md` parsed
 /// into a [`Skill`].

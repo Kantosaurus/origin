@@ -9,7 +9,9 @@ fn returns_line_numbered_chunks() {
     fs::write(&p, "first\nsecond\nthird\n").unwrap();
     let out = read_v2(ReadArgs {
         file_path: p.to_string_lossy().into_owned(),
-        offset: None, limit: None, as_: None,
+        offset: None,
+        limit: None,
+        as_: None,
     })
     .unwrap();
     assert!(out.contains("     1\tfirst"));
@@ -25,7 +27,9 @@ fn respects_offset_and_limit() {
     fs::write(&p, body).unwrap();
     let out = read_v2(ReadArgs {
         file_path: p.to_string_lossy().into_owned(),
-        offset: Some(10), limit: Some(5), as_: None,
+        offset: Some(10),
+        limit: Some(5),
+        as_: None,
     })
     .unwrap();
     assert!(out.contains("    11\tline 11"));
@@ -41,7 +45,9 @@ fn default_limit_is_1000() {
     fs::write(&p, body).unwrap();
     let out = read_v2(ReadArgs {
         file_path: p.to_string_lossy().into_owned(),
-        offset: None, limit: None, as_: None,
+        offset: None,
+        limit: None,
+        as_: None,
     })
     .unwrap();
     assert!(out.contains("\tL1000"));
@@ -52,7 +58,9 @@ fn default_limit_is_1000() {
 fn errors_on_missing_file() {
     let err = read_v2(ReadArgs {
         file_path: "/no/such/file".into(),
-        offset: None, limit: None, as_: None,
+        offset: None,
+        limit: None,
+        as_: None,
     })
     .unwrap_err();
     assert_eq!(err.class, origin_tools::ErrClass::Io);
@@ -81,7 +89,9 @@ fn refuses_to_follow_symlink() {
 
     let err = read_v2(ReadArgs {
         file_path: link.to_string_lossy().into_owned(),
-        offset: None, limit: None, as_: None,
+        offset: None,
+        limit: None,
+        as_: None,
     })
     .expect_err("must refuse to read through symlink");
     assert_eq!(err.class, origin_tools::ErrClass::Validation);

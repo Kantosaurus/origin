@@ -10,8 +10,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScree
 use futures_util::StreamExt as _;
 use origin_cli::cli_def::{Cli, Cmd, KeyringSub, PairSub, ProvidersSub, SessionsSub, TraceSub};
 use origin_cli::input::{
-    parse_mem_command, parse_model_command, parse_skill_command, parse_workflow_command, reduce,
-    InputAction,
+    parse_mem_command, parse_model_command, parse_skill_command, parse_workflow_command, reduce, InputAction,
 };
 use origin_cli::plan_panel_wiring::Wiring as PlanPanelWiring;
 use origin_cli::tui::App;
@@ -164,11 +163,15 @@ async fn main() -> Result<()> {
     // session). The provider/account pair is also forwarded to the daemon
     // when we auto-spawn it — the daemon itself only reads ORIGIN_PROVIDER /
     // ORIGIN_ACCOUNT, not config.toml, so we have to hand it the answer.
-    let (default_provider, default_account, default_model) = origin_cli::config::load()
-        .ok()
-        .flatten()
-        .map_or_else(
-            || ("anthropic".to_string(), "default".to_string(), "claude-opus-4-7".to_string()),
+    let (default_provider, default_account, default_model) =
+        origin_cli::config::load().ok().flatten().map_or_else(
+            || {
+                (
+                    "anthropic".to_string(),
+                    "default".to_string(),
+                    "claude-opus-4-7".to_string(),
+                )
+            },
             |c| (c.primary.provider, c.primary.account, c.primary.model),
         );
 
@@ -269,7 +272,17 @@ async fn main() -> Result<()> {
         handle_submit(&app, &handle, &path, &mut model, &text, &session_id).await;
     }
 
-    let result = run_event_loop(app, composer, widget, handle, &path, &mut model, &session_id, plan_panel).await;
+    let result = run_event_loop(
+        app,
+        composer,
+        widget,
+        handle,
+        &path,
+        &mut model,
+        &session_id,
+        plan_panel,
+    )
+    .await;
 
     render_task.abort();
     disable_raw_mode()?;
@@ -479,8 +492,7 @@ async fn handle_submit(
             drop(a);
         } else {
             let _ = rest; // unused when usage hint fires; matches `/account`'s shape
-            app.lock()
-                .add_line("error> ", "usage: /model <name>");
+            app.lock().add_line("error> ", "usage: /model <name>");
         }
         handle.mark_dirty();
         return;
@@ -661,9 +673,7 @@ async fn handle_submit(
             use origin_cli::theme;
             let mut a = app_for_backoff.lock();
             a.add_colored_line(
-                format!(
-                    "    rate limited - retrying in {secs}s (attempt {attempt}/{max_attempts})"
-                ),
+                format!("    rate limited - retrying in {secs}s (attempt {attempt}/{max_attempts})"),
                 theme::MUTED,
                 0,
             );
@@ -733,10 +743,7 @@ async fn call_daemon(
         // try to JSON-decode the text and surface serde's "expected value at
         // line 1 column 1" instead of the actual failure reason.
         if matches!(kind, FrameKind::ErrorFrame) {
-            return Err(anyhow::anyhow!(
-                "{}",
-                String::from_utf8_lossy(&body)
-            ));
+            return Err(anyhow::anyhow!("{}", String::from_utf8_lossy(&body)));
         }
         // Try to decode as a StreamEvent first; if that fails, treat as the
         // terminal `PromptReply` Response frame.
@@ -877,8 +884,7 @@ async fn send_skill_command(path: &str, msg: &ClientMessage) -> Result<String> {
     let frame = encode(1, FrameKind::Request, &body);
     client.write_raw(&frame).await?;
     let resp = client.read_frame_body().await?;
-    let ev: StreamEvent = serde_json::from_slice(&resp)
-        .map_err(|e| anyhow::anyhow!("bad reply: {e}"))?;
+    let ev: StreamEvent = serde_json::from_slice(&resp).map_err(|e| anyhow::anyhow!("bad reply: {e}"))?;
     match ev {
         StreamEvent::SkillActive { name, allowed_tools } => {
             if allowed_tools.is_empty() {
@@ -896,10 +902,7 @@ async fn send_skill_command(path: &str, msg: &ClientMessage) -> Result<String> {
             let main = if steps.is_empty() {
                 format!("workflow `{name}` activated (no steps resolved)")
             } else {
-                format!(
-                    "workflow `{name}` activated; skills: {}",
-                    steps.join(" → ")
-                )
+                format!("workflow `{name}` activated; skills: {}", steps.join(" → "))
             };
             if skipped.is_empty() {
                 Ok(main)
@@ -1057,9 +1060,12 @@ async fn daemon_reachable(path: &str) -> bool {
 
 /// Resolve the daemon binary: sibling of current exe, or fall back to PATH.
 fn resolve_daemon_binary() -> Result<(std::ffi::OsString, Option<std::path::PathBuf>)> {
-    let daemon_name = if cfg!(windows) { "origin-daemon.exe" } else { "origin-daemon" };
-    let exe = std::env::current_exe()
-        .map_err(|e| anyhow::anyhow!("could not resolve current exe: {e}"))?;
+    let daemon_name = if cfg!(windows) {
+        "origin-daemon.exe"
+    } else {
+        "origin-daemon"
+    };
+    let exe = std::env::current_exe().map_err(|e| anyhow::anyhow!("could not resolve current exe: {e}"))?;
     let sibling = exe.parent().map(|p| p.join(daemon_name));
     let cmd_path: std::ffi::OsString = match &sibling {
         Some(p) if p.exists() => p.clone().into_os_string(),
@@ -1080,12 +1086,8 @@ fn daemon_binary_is_newer(binary: &std::ffi::OsStr) -> bool {
         Some(p) => p,
         None => return false,
     };
-    let bin_mtime = std::fs::metadata(binary)
-        .and_then(|m| m.modified())
-        .ok();
-    let stamp_mtime = std::fs::metadata(&stamp)
-        .and_then(|m| m.modified())
-        .ok();
+    let bin_mtime = std::fs::metadata(binary).and_then(|m| m.modified()).ok();
+    let stamp_mtime = std::fs::metadata(&stamp).and_then(|m| m.modified()).ok();
     match (bin_mtime, stamp_mtime) {
         (Some(bin), Some(stamp)) => bin > stamp,
         (Some(_), None) => true,
@@ -1155,7 +1157,11 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
         .map(|h| h.join(".origin").join("daemon.log"))
         .and_then(|p| {
             p.parent().map(std::fs::create_dir_all).transpose().ok()?;
-            std::fs::OpenOptions::new().create(true).append(true).open(&p).ok()
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&p)
+                .ok()
         })
         .map_or_else(std::process::Stdio::null, std::process::Stdio::from);
 

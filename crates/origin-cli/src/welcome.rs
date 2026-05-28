@@ -61,7 +61,13 @@ pub fn run() -> Result<()> {
         .iter()
         .map(|(rel, label)| (home.join(rel), (*label).to_string()))
         .collect();
-    run_with(stdin.lock(), stdout.lock(), &sources, &skills_dst, &workflows_path)
+    run_with(
+        stdin.lock(),
+        stdout.lock(),
+        &sources,
+        &skills_dst,
+        &workflows_path,
+    )
 }
 
 /// Drive every screen with explicit paths so tests don't need to mutate
@@ -104,9 +110,7 @@ pub fn run_with<R: BufRead, W: Write>(
     // non-standard locations on its first chat. `origin-cli` can't drive
     // the LLM during init (daemon isn't running), so we queue the work
     // here and let `main.rs` auto-fire it on next TUI start.
-    let pending = workflows_path
-        .parent()
-        .map(|p| p.join("pending-prompt.txt"));
+    let pending = workflows_path.parent().map(|p| p.join("pending-prompt.txt"));
     if let Some(p) = pending {
         if let Err(e) = crate::first_run_prompt::seed_to(&p) {
             writeln!(&mut w, "warning: could not seed first-run prompt: {e}")?;
@@ -153,7 +157,12 @@ fn screen_toolbox<R: BufRead, W: Write>(r: &mut R, w: &mut W) -> Result<()> {
     writeln!(w)?;
     for t in &tools {
         let desc = truncate(t.description, 60);
-        writeln!(w, "    {}  {}", ansi::accent(&format!("{:<16}", t.name)), ansi::muted(&desc))?;
+        writeln!(
+            w,
+            "    {}  {}",
+            ansi::accent(&format!("{:<16}", t.name)),
+            ansi::muted(&desc)
+        )?;
     }
     writeln!(w)?;
     writeln!(
@@ -168,11 +177,7 @@ fn screen_toolbox<R: BufRead, W: Write>(r: &mut R, w: &mut W) -> Result<()> {
 // Screen 2: Skill Repository
 // ---------------------------------------------------------------------------
 
-fn screen_skill_repository<R: BufRead, W: Write>(
-    r: &mut R,
-    w: &mut W,
-    skills_dst: &Path,
-) -> Result<()> {
+fn screen_skill_repository<R: BufRead, W: Write>(r: &mut R, w: &mut W, skills_dst: &Path) -> Result<()> {
     use crate::ansi;
     writeln!(w)?;
     writeln!(w, "  {}  {}", ansi::step_number(2, 4), ansi::heading("skills"))?;
@@ -182,12 +187,20 @@ fn screen_skill_repository<R: BufRead, W: Write>(
         "  {}",
         ansi::muted("Markdown files with YAML frontmatter that teach the agent procedures.")
     )?;
-    writeln!(w, "  {}  {}", ansi::muted("Repository:"), ansi::accent(&skills_dst.display().to_string()))?;
+    writeln!(
+        w,
+        "  {}  {}",
+        ansi::muted("Repository:"),
+        ansi::accent(&skills_dst.display().to_string())
+    )?;
 
     let existing = count_skills(skills_dst);
     if existing > 0 {
-        writeln!(w, "  {}",
-            ansi::muted(&format!("{existing} skill(s) already installed.")))?;
+        writeln!(
+            w,
+            "  {}",
+            ansi::muted(&format!("{existing} skill(s) already installed."))
+        )?;
     }
 
     writeln!(w)?;
@@ -203,22 +216,27 @@ fn screen_skill_repository<R: BufRead, W: Write>(
 // Screen 3: Port skills
 // ---------------------------------------------------------------------------
 
-fn screen_port_skills<W: Write>(
-    w: &mut W,
-    sources: &[(PathBuf, String)],
-    skills_dst: &Path,
-) -> Result<()> {
+fn screen_port_skills<W: Write>(w: &mut W, sources: &[(PathBuf, String)], skills_dst: &Path) -> Result<()> {
     use crate::ansi;
     writeln!(w)?;
-    writeln!(w, "  {}  {}", ansi::step_number(3, 4), ansi::heading("import skills"))?;
+    writeln!(
+        w,
+        "  {}  {}",
+        ansi::step_number(3, 4),
+        ansi::heading("import skills")
+    )?;
     writeln!(w)?;
     for (path, label) in sources {
-        writeln!(w, "    {}  {}", ansi::accent(&format!("{label:<18}")), ansi::muted(&path.display().to_string()))?;
+        writeln!(
+            w,
+            "    {}  {}",
+            ansi::accent(&format!("{label:<18}")),
+            ansi::muted(&path.display().to_string())
+        )?;
     }
     writeln!(w)?;
 
-    let toolbox: std::collections::HashSet<String> =
-        registry_iter().map(|t| t.name.to_string()).collect();
+    let toolbox: std::collections::HashSet<String> = registry_iter().map(|t| t.name.to_string()).collect();
 
     let mut totals = ImportReport::default();
     let mut all_imported: Vec<Skill> = Vec::new();
@@ -235,8 +253,7 @@ fn screen_port_skills<W: Write>(
                     report.imported, report.skipped_duplicate, report.rejected,
                 )?;
                 totals.imported = totals.imported.saturating_add(report.imported);
-                totals.skipped_duplicate =
-                    totals.skipped_duplicate.saturating_add(report.skipped_duplicate);
+                totals.skipped_duplicate = totals.skipped_duplicate.saturating_add(report.skipped_duplicate);
                 totals.rejected = totals.rejected.saturating_add(report.rejected);
             }
             Err(e) => {
@@ -306,11 +323,7 @@ fn screen_port_skills<W: Write>(
 // Screen 4: Workflows
 // ---------------------------------------------------------------------------
 
-fn screen_workflows<R: BufRead, W: Write>(
-    r: &mut R,
-    w: &mut W,
-    workflows_path: &Path,
-) -> Result<()> {
+fn screen_workflows<R: BufRead, W: Write>(r: &mut R, w: &mut W, workflows_path: &Path) -> Result<()> {
     use crate::ansi;
     writeln!(w)?;
     writeln!(w, "  {}  {}", ansi::step_number(4, 4), ansi::heading("workflows"))?;
@@ -324,20 +337,38 @@ fn screen_workflows<R: BufRead, W: Write>(
     writeln!(w, "    {}", ansi::muted("[[workflows]]"))?;
     writeln!(w, "    {}", ansi::muted("name = \"frontend-design\""))?;
     writeln!(w, "    {}", ansi::muted("steps = ["))?;
-    writeln!(w, "      {}", ansi::muted("{ skill = \"frontend-design:frontend-design\" },"))?;
-    writeln!(w, "      {}", ansi::muted("{ skill = \"impeccable\", args = \"teach\" },"))?;
+    writeln!(
+        w,
+        "      {}",
+        ansi::muted("{ skill = \"frontend-design:frontend-design\" },")
+    )?;
+    writeln!(
+        w,
+        "      {}",
+        ansi::muted("{ skill = \"impeccable\", args = \"teach\" },")
+    )?;
     writeln!(w, "    {}", ansi::muted("]"))?;
     writeln!(w)?;
 
     match workflows::seed_if_missing(workflows_path) {
-        Ok(true) => writeln!(w, "  {} Seeded {}", ansi::green("\u{2714}"), ansi::muted(&workflows_path.display().to_string()))?,
+        Ok(true) => writeln!(
+            w,
+            "  {} Seeded {}",
+            ansi::green("\u{2714}"),
+            ansi::muted(&workflows_path.display().to_string())
+        )?,
         Ok(false) => writeln!(
             w,
             "  {} {}",
             ansi::muted("\u{2500}"),
             ansi::muted(&format!("{} already exists", workflows_path.display())),
         )?,
-        Err(e) => writeln!(w, "  {} {}", ansi::red("\u{2718}"), ansi::red(&format!("could not seed: {e}")))?,
+        Err(e) => writeln!(
+            w,
+            "  {} {}",
+            ansi::red("\u{2718}"),
+            ansi::red(&format!("could not seed: {e}"))
+        )?,
     }
 
     press_enter(r, w, "  Press Enter to finish setup.")
@@ -365,12 +396,7 @@ fn press_enter<R: BufRead, W: Write>(r: &mut R, w: &mut W, prompt: &str) -> Resu
     Ok(())
 }
 
-fn yes_no<R: BufRead, W: Write>(
-    r: &mut R,
-    w: &mut W,
-    prompt: &str,
-    default_yes: bool,
-) -> Result<bool> {
+fn yes_no<R: BufRead, W: Write>(r: &mut R, w: &mut W, prompt: &str, default_yes: bool) -> Result<bool> {
     loop {
         write!(w, "{prompt}")?;
         w.flush()?;
@@ -479,7 +505,10 @@ mod tests {
             out.contains("NotARealTool"),
             "missing-tool warning not surfaced:\n{out}"
         );
-        assert!(out.contains("frontend-design"), "workflows screen not shown:\n{out}");
+        assert!(
+            out.contains("frontend-design"),
+            "workflows screen not shown:\n{out}"
+        );
     }
 
     #[test]

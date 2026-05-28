@@ -42,17 +42,24 @@ pub fn glob_v2(args: GlobArgs) -> Result<Value, ToolError> {
     let mut file_entries: Vec<(String, SystemTime)> = Vec::new();
     for raw_entry in walker {
         let Ok(entry) = raw_entry else { continue };
-        if !entry.file_type().is_some_and(|t| t.is_file()) { continue; }
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
         // Match relative path against the pattern so "*.rs" works correctly.
-        let rel = entry.path()
-            .strip_prefix(&root)
-            .unwrap_or_else(|_| entry.path());
-        if !glob_set.is_match(rel) { continue; }
-        let mtime = entry.metadata().ok().and_then(|m| m.modified().ok()).unwrap_or(SystemTime::UNIX_EPOCH);
+        let rel = entry.path().strip_prefix(&root).unwrap_or_else(|_| entry.path());
+        if !glob_set.is_match(rel) {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
         file_entries.push((entry.path().display().to_string(), mtime));
     }
     file_entries.sort_by(|a, b| b.1.cmp(&a.1));
-    let arr: Vec<Value> = file_entries.into_iter()
+    let arr: Vec<Value> = file_entries
+        .into_iter()
         .take(head_limit)
         .map(|(p, _)| Value::String(p))
         .collect();

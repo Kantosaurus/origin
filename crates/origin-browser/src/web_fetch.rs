@@ -69,5 +69,9 @@ pub async fn fetch(url: &str, opts: FetchOptions) -> Result<FetchResult, FetchEr
     let product = readability::extractor::extract(&mut html.as_bytes(), &parsed_url)
         .map_err(|e| FetchError::Readability(e.to_string()))?;
     let markdown = html2md::parse_html(&product.content);
-    Ok(FetchResult { final_url, content_type, markdown })
+    Ok(FetchResult {
+        final_url,
+        content_type,
+        markdown,
+    })
 }

@@ -219,13 +219,9 @@ impl ResumeToken {
             // both sides are 64 lowercase ASCII chars by construction.
             let got_hex = wrapper.mac_hex.as_bytes();
             let exp_hex = expected_hex.as_bytes();
-            let ok: bool =
-                got_hex.len() == exp_hex.len() && bool::from(got_hex.ct_eq(exp_hex));
+            let ok: bool = got_hex.len() == exp_hex.len() && bool::from(got_hex.ct_eq(exp_hex));
             if !ok {
-                let filename = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("<unknown>");
+                let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("<unknown>");
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("MAC mismatch for {filename}"),
@@ -290,14 +286,12 @@ mod tests {
         let raw = std::fs::read(&file).expect("read");
         let mut wrapper: OnDisk = serde_json::from_slice(&raw).expect("parse wrapper");
         // wrapper.payload is the inner JSON; mutate cas_handle_root[0].
-        let mut inner: serde_json::Value =
-            serde_json::from_str(&wrapper.payload).expect("parse inner");
+        let mut inner: serde_json::Value = serde_json::from_str(&wrapper.payload).expect("parse inner");
         let arr = inner["cas_handle_root"].as_array_mut().expect("arr");
         let old = arr[0].as_u64().unwrap_or(0);
         arr[0] = serde_json::Value::from(old ^ 0xFF);
         wrapper.payload = serde_json::to_string(&inner).expect("reser");
-        std::fs::write(&file, serde_json::to_vec_pretty(&wrapper).expect("ser"))
-            .expect("write");
+        std::fs::write(&file, serde_json::to_vec_pretty(&wrapper).expect("ser")).expect("write");
 
         let err = ResumeToken::load_all(tmp.path()).expect_err("must reject");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);

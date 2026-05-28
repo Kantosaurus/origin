@@ -58,7 +58,15 @@ where
     F: FnOnce(Value) -> Fut + Send,
     Fut: Future<Output = Result<Value, ToolError>> + Send,
 {
-    run(ctx, tool_name, SideEffects::Pure, EnvelopeMode::CasOptOut, args, tool_fn).await
+    run(
+        ctx,
+        tool_name,
+        SideEffects::Pure,
+        EnvelopeMode::CasOptOut,
+        args,
+        tool_fn,
+    )
+    .await
 }
 
 /// Full envelope: runs `tool_fn`, then for non-mutating CAS-eligible tools,
@@ -90,9 +98,8 @@ where
         return Ok(value);
     }
 
-    let body_str = serde_json::to_string(&value).map_err(|e| {
-        ToolError::new(ErrClass::Validation, "serialise", e.to_string())
-    })?;
+    let body_str = serde_json::to_string(&value)
+        .map_err(|e| ToolError::new(ErrClass::Validation, "serialise", e.to_string()))?;
     let body_bytes = body_str.as_bytes();
     let hash = blake3::hash(body_bytes);
 

@@ -302,7 +302,9 @@ pub enum StreamEvent {
     },
     /// Negative ack for [`ClientMessage::ActivateSkill`] — typically the
     /// requested skill is not in the daemon's catalog.
-    SkillError { message: String },
+    SkillError {
+        message: String,
+    },
     /// Ack for a successful [`ClientMessage::ActivateWorkflow`]. `steps` is
     /// the ordered list of skill names that were activated; `skipped` lists
     /// any steps whose skills weren't found in the catalog. Both are surfaced

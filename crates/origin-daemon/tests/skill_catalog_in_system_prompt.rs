@@ -38,9 +38,7 @@ fn write_skill(dir: &std::path::Path, name: &str, desc: &str) {
     std::fs::create_dir_all(&skill_dir).expect("mkdir");
     std::fs::write(
         skill_dir.join("SKILL.md"),
-        format!(
-            "---\nname: {name}\ndescription: {desc}\nallowed-tools: [\"Read\"]\n---\nbody\n"
-        ),
+        format!("---\nname: {name}\ndescription: {desc}\nallowed-tools: [\"Read\"]\n---\nbody\n"),
     )
     .expect("write");
 }
@@ -69,7 +67,10 @@ async fn system_prompt_lists_each_skill_in_catalog() {
     assert_eq!(systems.len(), 1);
     let sys = &systems[0];
     assert!(sys.contains("alpha"), "system prompt missing alpha:\n{sys}");
-    assert!(sys.contains("Does alpha things"), "alpha description missing:\n{sys}");
+    assert!(
+        sys.contains("Does alpha things"),
+        "alpha description missing:\n{sys}"
+    );
     assert!(sys.contains("beta"), "system prompt missing beta:\n{sys}");
 }
 

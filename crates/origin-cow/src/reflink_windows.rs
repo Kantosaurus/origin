@@ -33,8 +33,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_FUNCTION, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFileSizeEx, MoveFileExW, SetEndOfFile, SetFilePointerEx, CREATE_ALWAYS,
-    FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_WRITE,
-    FILE_SHARE_READ, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
+    FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
 };
 use windows::Win32::System::Ioctl::{DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE};
 use windows::Win32::System::IO::DeviceIoControl;
@@ -158,8 +158,7 @@ fn clone_one_file(src: &Path, dst: &Path) -> Result<(), Error> {
             dst_handle,
             FSCTL_DUPLICATE_EXTENTS_TO_FILE,
             Some(std::ptr::from_ref(&data).cast::<core::ffi::c_void>()),
-            u32::try_from(std::mem::size_of::<DUPLICATE_EXTENTS_DATA>())
-                .unwrap_or(u32::MAX),
+            u32::try_from(std::mem::size_of::<DUPLICATE_EXTENTS_DATA>()).unwrap_or(u32::MAX),
             None,
             0,
             Some(&mut bytes_returned),
@@ -211,10 +210,7 @@ fn clone_one_file(src: &Path, dst: &Path) -> Result<(), Error> {
         if let Err(e) = set_eof(dst_handle) {
             drop(_dst_guard);
             let _ = fs::remove_file(&tmp);
-            return Err(unsupported(format!(
-                "SetEndOfFile-trim({}): {e}",
-                tmp.display()
-            )));
+            return Err(unsupported(format!("SetEndOfFile-trim({}): {e}", tmp.display())));
         }
     }
 
@@ -289,7 +285,12 @@ fn open_read(path: &Path) -> Result<HANDLE, Error> {
             HANDLE::default(),
         )
     };
-    r.map_err(|e| Error::Io(std::io::Error::other(format!("CreateFileW(read, {}): {e}", path.display()))))
+    r.map_err(|e| {
+        Error::Io(std::io::Error::other(format!(
+            "CreateFileW(read, {}): {e}",
+            path.display()
+        )))
+    })
 }
 
 /// Open a fresh writable file with the access rights required by
@@ -313,7 +314,12 @@ fn open_write_create(path: &Path) -> Result<HANDLE, Error> {
             HANDLE::default(),
         )
     };
-    r.map_err(|e| Error::Io(std::io::Error::other(format!("CreateFileW(write, {}): {e}", path.display()))))
+    r.map_err(|e| {
+        Error::Io(std::io::Error::other(format!(
+            "CreateFileW(write, {}): {e}",
+            path.display()
+        )))
+    })
 }
 
 fn set_file_size(handle: HANDLE, size: i64) -> windows::core::Result<()> {
@@ -375,4 +381,3 @@ impl Drop for HandleGuard {
         }
     }
 }
-

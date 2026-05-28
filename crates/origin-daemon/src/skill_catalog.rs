@@ -80,10 +80,13 @@ mod tests {
     fn write_skill(dir: &Path, name: &str, allowed: &[&str]) {
         let skill_dir = dir.join(name);
         std::fs::create_dir_all(&skill_dir).expect("mkdir");
-        let allowed = allowed.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", ");
-        let body = format!(
-            "---\nname: {name}\ndescription: test skill\nallowed-tools: [{allowed}]\n---\nbody\n"
-        );
+        let allowed = allowed
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body =
+            format!("---\nname: {name}\ndescription: test skill\nallowed-tools: [{allowed}]\n---\nbody\n");
         std::fs::write(skill_dir.join("SKILL.md"), body).expect("write");
     }
 
@@ -94,7 +97,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cat = SkillCatalog::load_from(&dir.path().join("nope")).expect("ok");
         assert!(cat.find("brainstorming").is_some(), "embedded skills must appear");
-        assert!(cat.len() >= 14, "expected >=14 embedded skills, got {}", cat.len());
+        assert!(
+            cat.len() >= 14,
+            "expected >=14 embedded skills, got {}",
+            cat.len()
+        );
     }
 
     #[test]
@@ -105,9 +112,16 @@ mod tests {
         let cat = SkillCatalog::load_from(dir.path()).expect("ok");
         assert!(cat.find("foo").is_some());
         assert!(cat.find("bar").is_some());
-        assert!(cat.find("brainstorming").is_some(), "embedded skill still present");
+        assert!(
+            cat.find("brainstorming").is_some(),
+            "embedded skill still present"
+        );
         assert!(cat.find("missing").is_none());
-        assert!(cat.len() >= 16, "expected >=16 (14 embedded + 2 user), got {}", cat.len());
+        assert!(
+            cat.len() >= 16,
+            "expected >=16 (14 embedded + 2 user), got {}",
+            cat.len()
+        );
     }
 
     #[test]

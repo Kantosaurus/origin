@@ -41,7 +41,10 @@ impl std::fmt::Debug for DaemonRa {
 impl DaemonRa {
     #[must_use]
     pub fn new(workspace_root: PathBuf) -> Self {
-        Self { workspace_root, client: OnceCell::new() }
+        Self {
+            workspace_root,
+            client: OnceCell::new(),
+        }
     }
 
     async fn client(&self) -> Option<&Arc<LspClient>> {
@@ -70,44 +73,37 @@ fn resolve_ra() -> Option<String> {
     // Tier 2: $ORIGIN_CACHE/bin/rust-analyzer.
     let cache = std::env::var("ORIGIN_CACHE")
         .ok()
-        .or_else(|| {
-            std::env::var("LOCALAPPDATA")
-                .ok()
-                .map(|p| format!("{p}\\origin"))
-        })
+        .or_else(|| std::env::var("LOCALAPPDATA").ok().map(|p| format!("{p}\\origin")))
         .or_else(|| {
             std::env::var("XDG_CACHE_HOME")
                 .ok()
                 .map(|p| format!("{p}/origin"))
         })
         .or_else(|| {
-            dirs::home_dir()
-                .map(|h| h.join(".cache").join("origin").to_string_lossy().into_owned())
+            dirs::home_dir().map(|h| h.join(".cache").join("origin").to_string_lossy().into_owned())
         })?;
     #[cfg(windows)]
     let bin = format!("{cache}\\bin\\rust-analyzer.exe");
     #[cfg(not(windows))]
     let bin = format!("{cache}/bin/rust-analyzer");
-    if std::path::Path::new(&bin).exists() { Some(bin) } else { None }
+    if std::path::Path::new(&bin).exists() {
+        Some(bin)
+    } else {
+        None
+    }
 }
 
 #[async_trait]
 impl DiagnosticsHandle for DaemonRa {
-    async fn diagnostics(
-        &self,
-        path: Option<&Path>,
-        _sev: Severity,
-    ) -> Result<Vec<RaDiagnostic>, ToolError> {
+    async fn diagnostics(&self, path: Option<&Path>, _sev: Severity) -> Result<Vec<RaDiagnostic>, ToolError> {
         let Some(c) = self.client().await else {
-            return Err(
-                ToolError::new(
-                    ErrClass::Subsystem,
-                    "ra_unavailable",
-                    "rust-analyzer not found on PATH or in $ORIGIN_CACHE/bin \
+            return Err(ToolError::new(
+                ErrClass::Subsystem,
+                "ra_unavailable",
+                "rust-analyzer not found on PATH or in $ORIGIN_CACHE/bin \
                      (install with: origin daemon install-ra, then gunzip/unzip the archive)",
-                )
-                .hint("run `origin daemon install-ra` to fetch the binary"),
-            );
+            )
+            .hint("run `origin daemon install-ra` to fetch the binary"));
         };
         let raw = c.diagnostics(path).await;
         Ok(raw

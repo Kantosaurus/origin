@@ -50,14 +50,21 @@ impl LspClient {
     /// `LspError::Spawn` if the binary cannot be started, `Protocol` if init fails.
     pub async fn spawn(binary: &str, workspace_root: &Path) -> Result<Self, LspError> {
         let mut cmd = Command::new(binary);
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         let mut child = cmd.spawn().map_err(|e| LspError::Spawn(e.to_string()))?;
-        let stdin = child.stdin.take().ok_or_else(|| LspError::Spawn("no stdin".into()))?;
-        let stdout = child.stdout.take().ok_or_else(|| LspError::Spawn("no stdout".into()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| LspError::Spawn("no stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| LspError::Spawn("no stdout".into()))?;
 
         let stdin = Arc::new(Mutex::new(stdin));
-        let diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> = Arc::new(RwLock::new(HashMap::new()));
 
         // Reader loop.
         let diags_clone = diags.clone();
@@ -83,19 +90,18 @@ impl LspClient {
         let initd = json!({"jsonrpc": "2.0", "method": "initialized", "params": {}});
         write_frame(stdin.clone(), &initd).await?;
 
-        Ok(Self { _child: child, stdin, diags })
+        Ok(Self {
+            _child: child,
+            stdin,
+            diags,
+        })
     }
 
     /// Notify the server about a file the client has open.
     ///
     /// # Errors
     /// Returns `LspError::Io` if the write fails.
-    pub async fn did_open(
-        &self,
-        path: &Path,
-        language_id: &str,
-        text: &str,
-    ) -> Result<(), LspError> {
+    pub async fn did_open(&self, path: &Path, language_id: &str, text: &str) -> Result<(), LspError> {
         let uri = format!("file://{}", path.display().to_string().replace('\\', "/"));
         let msg = json!({
             "jsonrpc": "2.0",
@@ -152,10 +158,7 @@ async fn write_frame(stdin: Arc<Mutex<ChildStdin>>, msg: &Value) -> Result<(), L
 }
 
 /// Background task that reads frames from the server and updates the diagnostics map.
-async fn reader_loop(
-    stdout: ChildStdout,
-    diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>>,
-) {
+async fn reader_loop(stdout: ChildStdout, diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>>) {
     let mut reader = BufReader::new(stdout);
     loop {
         let mut header = String::new();
@@ -184,18 +187,13 @@ async fn reader_loop(
         let Ok(v) = serde_json::from_slice::<Value>(&body) else {
             continue;
         };
-        if v.get("method").and_then(Value::as_str)
-            == Some("textDocument/publishDiagnostics")
-        {
+        if v.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics") {
             handle_diagnostics(&v, &diags).await;
         }
     }
 }
 
-async fn handle_diagnostics(
-    v: &Value,
-    diags: &Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>>,
-) {
+async fn handle_diagnostics(v: &Value, diags: &Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>>) {
     let Some(params) = v.get("params") else { return };
     let Some(uri) = params.get("uri").and_then(Value::as_str) else {
         return;
@@ -218,21 +216,21 @@ async fn handle_diagnostics(
                     .unwrap_or(0),
             )
             .unwrap_or(u32::MAX);
-            let severity = u8::try_from(
-                d.get("severity").and_then(Value::as_u64).unwrap_or(2),
-            )
-            .unwrap_or(2);
-            let message = d
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let severity = u8::try_from(d.get("severity").and_then(Value::as_u64).unwrap_or(2)).unwrap_or(2);
+            let message = d.get("message").and_then(Value::as_str).unwrap_or("").to_string();
             let code = d.get("code").and_then(|c| {
                 c.as_str()
                     .map(str::to_string)
                     .or_else(|| c.as_i64().map(|n| n.to_string()))
             });
-            out.push(Diagnostic { file: path.clone(), line, col, severity, message, code });
+            out.push(Diagnostic {
+                file: path.clone(),
+                line,
+                col,
+                severity,
+                message,
+                code,
+            });
         }
     }
     diags.write().await.insert(path, out);

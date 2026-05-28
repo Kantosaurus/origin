@@ -24,9 +24,8 @@ pub struct EditArgs {
 #[allow(clippy::module_name_repetitions)]
 #[allow(clippy::needless_pass_by_value)]
 pub fn edit_v2(args: EditArgs) -> Result<Value, ToolError> {
-    let bytes = std::fs::read(&args.file_path).map_err(|e| {
-        ToolError::new(ErrClass::Io, "not_found", format!("{}: {e}", args.file_path))
-    })?;
+    let bytes = std::fs::read(&args.file_path)
+        .map_err(|e| ToolError::new(ErrClass::Io, "not_found", format!("{}: {e}", args.file_path)))?;
     let det = text_fmt::detect(&bytes);
     let text = text_fmt::normalise_to_lf(&bytes, &det)?;
 
@@ -47,7 +46,10 @@ pub fn edit_v2(args: EditArgs) -> Result<Value, ToolError> {
             return Err(ToolError::new(
                 ErrClass::Edit,
                 "ambiguous",
-                format!("'{}' appears {n} times; pass replace_all=true or widen the needle", args.old_string),
+                format!(
+                    "'{}' appears {n} times; pass replace_all=true or widen the needle",
+                    args.old_string
+                ),
             )
             .recoverable(true));
         }
@@ -63,7 +65,9 @@ pub fn edit_v2(args: EditArgs) -> Result<Value, ToolError> {
 }
 
 fn build_hunk(before: &str, old: &str, new: &str) -> Value {
-    let line = before.lines().enumerate()
+    let line = before
+        .lines()
+        .enumerate()
         .find(|(_, l)| l.contains(old))
         .map_or(0, |(i, _)| i + 1);
     json!({ "before": old, "after": new, "line": line })

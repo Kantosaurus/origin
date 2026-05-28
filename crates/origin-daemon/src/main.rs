@@ -6,11 +6,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use origin_cas::Store;
+use origin_codegraph::ask::NullMemRouter;
+use origin_codegraph::index::CodeGraphIndex;
 use origin_core::types::Role;
 use origin_daemon::agent::{run_loop, LoopOptions, SessionStoreSummaryDeliverer};
-use origin_tools::dispatch::MemoryHandle as MemoryHandleTrait;
-use origin_skills::SkillRegistry;
-use origin_swarm::Coordinator;
 use origin_daemon::auth::BearerStore;
 use origin_daemon::config::bearer_ttl_secs;
 use origin_daemon::memory_wiring::MemoryWiring;
@@ -36,10 +35,11 @@ use origin_provider::Provider;
 use origin_provider_anthropic::Anthropic;
 use origin_runtime::{spawn_in, TaskClass};
 use origin_sidecar::{Sidecar, SidecarConfig, SidecarJob};
-use origin_codegraph::ask::NullMemRouter;
-use origin_codegraph::index::CodeGraphIndex;
+use origin_skills::SkillRegistry;
 use origin_store::Store as SqlStore;
 use origin_stream::Subscriber;
+use origin_swarm::Coordinator;
+use origin_tools::dispatch::MemoryHandle as MemoryHandleTrait;
 use parking_lot::RwLock as PlRwLock;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{error, info, warn};
@@ -398,7 +398,10 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
                 })
                 .expect("fallback codegraph cas");
                 let fallback_sql = SqlStore::open(&db_path).expect("fallback codegraph sql");
-                Arc::new(tokio::sync::Mutex::new(CodeGraphIndex::new(fallback_cas, fallback_sql)))
+                Arc::new(tokio::sync::Mutex::new(CodeGraphIndex::new(
+                    fallback_cas,
+                    fallback_sql,
+                )))
             }
             (_, Err(e)) => {
                 warn!(error = %e, "code-graph: SQL open failed; graph tools disabled");
@@ -412,7 +415,10 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
                 })
                 .expect("fallback codegraph cas");
                 let fallback_sql = SqlStore::open(&db_path).expect("fallback codegraph sql");
-                Arc::new(tokio::sync::Mutex::new(CodeGraphIndex::new(fallback_cas, fallback_sql)))
+                Arc::new(tokio::sync::Mutex::new(CodeGraphIndex::new(
+                    fallback_cas,
+                    fallback_sql,
+                )))
             }
         }
     };
@@ -817,42 +823,33 @@ fn spawn_handler_task(
                             guard.activate(front);
                             // After activation, the intersection always exists (we just pushed a skill).
                             // Sort for stable wire output so clients see a deterministic order.
-                            guard.allowed_tools().map(|set| {
-                                let mut v: Vec<String> = set.into_iter().collect();
-                                v.sort();
-                                v
-                            }).unwrap_or_default()
+                            guard
+                                .allowed_tools()
+                                .map(|set| {
+                                    let mut v: Vec<String> = set.into_iter().collect();
+                                    v.sort();
+                                    v
+                                })
+                                .unwrap_or_default()
                         };
                         let ev = StreamEvent::SkillActive {
                             name: name.clone(),
                             allowed_tools,
                         };
                         let body = serde_json::to_vec(&ev).unwrap_or_default();
-                        let _ = conn_clone
-                            .lock()
-                            .await
-                            .write_frame(FrameKind::Event, &body)
-                            .await;
+                        let _ = conn_clone.lock().await.write_frame(FrameKind::Event, &body).await;
                     } else {
                         let ev = StreamEvent::SkillError {
                             message: format!("no such skill: {name}"),
                         };
                         let body = serde_json::to_vec(&ev).unwrap_or_default();
-                        let _ = conn_clone
-                            .lock()
-                            .await
-                            .write_frame(FrameKind::Event, &body)
-                            .await;
+                        let _ = conn_clone.lock().await.write_frame(FrameKind::Event, &body).await;
                     }
                 }
                 ClientMessage::DeactivateSkill { name } => {
                     active_skills.lock().await.deactivate(&name);
                     let body = serde_json::to_vec(&StreamEvent::AdminOk).unwrap_or_default();
-                    let _ = conn
-                        .lock()
-                        .await
-                        .write_frame(FrameKind::Event, &body)
-                        .await;
+                    let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
                 }
                 ClientMessage::ActivateWorkflow { name } => {
                     use origin_daemon::workflow_progress::{StartOutcome, WorkflowProgress};
@@ -894,7 +891,11 @@ fn spawn_handler_task(
                         }
                     }
                     let ev = match WorkflowProgress::start(wf, skill_catalog.as_ref()) {
-                        StartOutcome::Stepped { progress, front, skipped } => {
+                        StartOutcome::Stepped {
+                            progress,
+                            front,
+                            skipped,
+                        } => {
                             active_skills.lock().await.activate(front);
                             let step_index = u32::try_from(progress.current_step_index).unwrap_or(u32::MAX);
                             let total_steps = u32::try_from(progress.total_steps).unwrap_or(u32::MAX);
@@ -908,13 +909,11 @@ fn spawn_handler_task(
                                 skipped,
                             }
                         }
-                        StartOutcome::NoResolvableSteps { skipped } => {
-                            StreamEvent::WorkflowActive {
-                                name: name.clone(),
-                                steps: Vec::new(),
-                                skipped,
-                            }
-                        }
+                        StartOutcome::NoResolvableSteps { skipped } => StreamEvent::WorkflowActive {
+                            name: name.clone(),
+                            steps: Vec::new(),
+                            skipped,
+                        },
                     };
                     let body = serde_json::to_vec(&ev).unwrap_or_default();
                     let _ = conn_clone.lock().await.write_frame(FrameKind::Event, &body).await;
@@ -1261,9 +1260,7 @@ async fn handle_request(
 /// need to restart from step 0.
 async fn advance_workflow(
     conn: &SharedConnection,
-    active_workflow: Arc<
-        tokio::sync::Mutex<Option<origin_daemon::workflow_progress::WorkflowProgress>>,
-    >,
+    active_workflow: Arc<tokio::sync::Mutex<Option<origin_daemon::workflow_progress::WorkflowProgress>>>,
     active_skills: Arc<tokio::sync::Mutex<SkillRegistry>>,
     skill_catalog: Arc<origin_daemon::skill_catalog::SkillCatalog>,
 ) {
@@ -1320,9 +1317,7 @@ async fn advance_workflow(
 /// workflow is active.
 async fn hold_workflow(
     conn: &SharedConnection,
-    active_workflow: Arc<
-        tokio::sync::Mutex<Option<origin_daemon::workflow_progress::WorkflowProgress>>,
-    >,
+    active_workflow: Arc<tokio::sync::Mutex<Option<origin_daemon::workflow_progress::WorkflowProgress>>>,
     message: &str,
 ) {
     let snapshot = {
@@ -1679,8 +1674,7 @@ fn install_ra() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("download failed: {e}"))?
         .bytes()
         .map_err(|e| anyhow::anyhow!("read response: {e}"))?;
-    std::fs::write(&target, &bytes)
-        .map_err(|e| anyhow::anyhow!("write {}: {e}", target.display()))?;
+    std::fs::write(&target, &bytes).map_err(|e| anyhow::anyhow!("write {}: {e}", target.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1717,8 +1711,7 @@ fn resolve_install_cache_dir() -> Result<std::path::PathBuf> {
 /// Return `(download_url, archive_file_name)` for the current platform.
 /// Returns `("", "rust-analyzer")` on unsupported platforms.
 fn ra_release_url_for_platform() -> (String, &'static str) {
-    let base =
-        "https://github.com/rust-lang/rust-analyzer/releases/latest/download";
+    let base = "https://github.com/rust-lang/rust-analyzer/releases/latest/download";
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     return (
         format!("{base}/rust-analyzer-x86_64-unknown-linux-gnu.gz"),

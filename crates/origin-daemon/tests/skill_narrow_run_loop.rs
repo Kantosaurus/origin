@@ -51,8 +51,7 @@ async fn skill_narrowing_denies_tool_in_run_loop() {
     let tool_use = Block::ToolUse {
         id: "tu_1".into(),
         name: "Bash".into(),
-        input_json: serde_json::to_vec(&serde_json::json!({"command": "echo hi"}))
-            .expect("json"),
+        input_json: serde_json::to_vec(&serde_json::json!({"command": "echo hi"})).expect("json"),
         cache_marker: None,
     };
     let provider = ScriptedProvider {
@@ -86,8 +85,7 @@ async fn no_skills_option_preserves_default_behavior() {
     let tool_use = Block::ToolUse {
         id: "tu_1".into(),
         name: "Read".into(),
-        input_json: serde_json::to_vec(&serde_json::json!({"path": path_str.clone()}))
-            .expect("json"),
+        input_json: serde_json::to_vec(&serde_json::json!({"path": path_str.clone()})).expect("json"),
         cache_marker: None,
     };
     let final_text = Block::text("done");

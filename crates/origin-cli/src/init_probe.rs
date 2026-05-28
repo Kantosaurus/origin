@@ -166,7 +166,9 @@ impl ConnectivityProbe for LiveProbe {
             Ok(r) => r,
             Err(e) => {
                 return ProbeResult {
-                    outcome: ProbeOutcome::Unreachable { detail: e.to_string() },
+                    outcome: ProbeOutcome::Unreachable {
+                        detail: e.to_string(),
+                    },
                     models: Vec::new(),
                 };
             }
@@ -270,13 +272,11 @@ fn parse_models(wire: WireFormat, body: &str) -> Vec<String> {
             .map(|arr| {
                 arr.iter()
                     .filter_map(|m| {
-                        m.get("name")
-                            .and_then(|x| x.as_str())
-                            .map(|s| {
-                                // Ollama returns `llama3.2:latest`; the
-                                // tag prefix before `:` is what users type.
-                                s.split(':').next().unwrap_or(s).to_string()
-                            })
+                        m.get("name").and_then(|x| x.as_str()).map(|s| {
+                            // Ollama returns `llama3.2:latest`; the
+                            // tag prefix before `:` is what users type.
+                            s.split(':').next().unwrap_or(s).to_string()
+                        })
                     })
                     .collect()
             })
@@ -373,10 +373,7 @@ mod tests {
     #[test]
     fn openai_path_derivation() {
         assert_eq!(openai_models_path("/v1/chat/completions"), "/v1/models");
-        assert_eq!(
-            openai_models_path("/api/v1/chat/completions"),
-            "/api/v1/models"
-        );
+        assert_eq!(openai_models_path("/api/v1/chat/completions"), "/api/v1/models");
         assert_eq!(
             openai_models_path("/inference/v1/chat/completions"),
             "/inference/v1/models"
@@ -430,10 +427,7 @@ mod tests {
     #[test]
     fn outcome_is_passing_covers_skipped_and_ok() {
         assert!(ProbeOutcome::Ok.is_passing());
-        assert!(ProbeOutcome::Skipped {
-            reason: "x".into(),
-        }
-        .is_passing());
+        assert!(ProbeOutcome::Skipped { reason: "x".into() }.is_passing());
         assert!(!ProbeOutcome::AuthFailed {
             status: 401,
             detail: "x".into(),

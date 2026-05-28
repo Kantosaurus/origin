@@ -314,7 +314,10 @@ pub fn wrap_with_cursor(buffer: &str, width: usize, cursor: usize) -> Layout {
 
         if ch == '\n' {
             // Hard break: emit current line up to `i`, advance past `\n`.
-            lines.push(VisualLine { byte_start: line_start, byte_end: i });
+            lines.push(VisualLine {
+                byte_start: line_start,
+                byte_end: i,
+            });
             line_start = i + ch_len;
             col_w = 0;
             i += ch_len;
@@ -324,7 +327,10 @@ pub fn wrap_with_cursor(buffer: &str, width: usize, cursor: usize) -> Layout {
         let w = UnicodeWidthChar::width(ch).unwrap_or(1);
         if width > 0 && col_w + w > width && line_start < i {
             // Soft wrap before this char.
-            lines.push(VisualLine { byte_start: line_start, byte_end: i });
+            lines.push(VisualLine {
+                byte_start: line_start,
+                byte_end: i,
+            });
             line_start = i;
             col_w = 0;
             // Re-place the cursor on the new line if it landed exactly
@@ -337,7 +343,10 @@ pub fn wrap_with_cursor(buffer: &str, width: usize, cursor: usize) -> Layout {
     }
 
     // Tail: emit the final visual line.
-    lines.push(VisualLine { byte_start: line_start, byte_end: bytes.len() });
+    lines.push(VisualLine {
+        byte_start: line_start,
+        byte_end: bytes.len(),
+    });
 
     // Handle the cursor when it lies at end-of-buffer.
     if !cursor_placed {
@@ -347,10 +356,17 @@ pub fn wrap_with_cursor(buffer: &str, width: usize, cursor: usize) -> Layout {
 
     // Always at least one line — even for empty buffer.
     if lines.is_empty() {
-        lines.push(VisualLine { byte_start: 0, byte_end: 0 });
+        lines.push(VisualLine {
+            byte_start: 0,
+            byte_end: 0,
+        });
     }
 
-    Layout { lines, cursor_row, cursor_col }
+    Layout {
+        lines,
+        cursor_row,
+        cursor_col,
+    }
 }
 
 /// Display width (in cells) of `s`, summing unicode-width per char.
@@ -456,8 +472,20 @@ mod tests {
         // "abc\ndef" with cursor at byte 5 (between 'd' and 'e').
         let l = wrap_with_cursor("abc\ndef", 80, 5);
         assert_eq!(l.lines.len(), 2);
-        assert_eq!(l.lines[0], VisualLine { byte_start: 0, byte_end: 3 });
-        assert_eq!(l.lines[1], VisualLine { byte_start: 4, byte_end: 7 });
+        assert_eq!(
+            l.lines[0],
+            VisualLine {
+                byte_start: 0,
+                byte_end: 3
+            }
+        );
+        assert_eq!(
+            l.lines[1],
+            VisualLine {
+                byte_start: 4,
+                byte_end: 7
+            }
+        );
         assert_eq!(l.cursor_row, 1);
         assert_eq!(l.cursor_col, 1);
     }
@@ -467,8 +495,20 @@ mod tests {
         let l = wrap_with_cursor("abcdefghij", 5, 7);
         assert_eq!(l.lines.len(), 2);
         // First five chars on row 0, rest on row 1.
-        assert_eq!(l.lines[0], VisualLine { byte_start: 0, byte_end: 5 });
-        assert_eq!(l.lines[1], VisualLine { byte_start: 5, byte_end: 10 });
+        assert_eq!(
+            l.lines[0],
+            VisualLine {
+                byte_start: 0,
+                byte_end: 5
+            }
+        );
+        assert_eq!(
+            l.lines[1],
+            VisualLine {
+                byte_start: 5,
+                byte_end: 10
+            }
+        );
         assert_eq!(l.cursor_row, 1);
         assert_eq!(l.cursor_col, 2);
     }

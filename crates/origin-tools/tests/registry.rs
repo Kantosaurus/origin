@@ -47,8 +47,17 @@ fn hot_set_contains_exactly_the_11() {
         .map(|m| m.name)
         .collect();
     let mut expected = vec![
-        "Read", "Edit", "Write", "Grep", "Glob", "Bash",
-        "MultiEdit", "ApplyPatch", "Monitor", "Diagnostics", "ToolSearch",
+        "Read",
+        "Edit",
+        "Write",
+        "Grep",
+        "Glob",
+        "Bash",
+        "MultiEdit",
+        "ApplyPatch",
+        "Monitor",
+        "Diagnostics",
+        "ToolSearch",
     ];
     let mut got: Vec<&str> = hot.clone();
     got.sort_unstable();
