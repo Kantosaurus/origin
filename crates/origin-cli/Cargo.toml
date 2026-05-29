@@ -50,7 +50,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 which = "8"
 rand = "0.8"
 urlencoding = "2"
-toml = "0.9"
+toml = "0.8"
 async-trait = "0.1"
 tracing = { workspace = true }
 
