@@ -1,5 +1,6 @@
 [package]
 name = "origin-metrics"
+description = "Bounded-cardinality counters with a Prometheus text encoder"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

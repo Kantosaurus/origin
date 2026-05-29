@@ -1,5 +1,6 @@
 [package]
 name = "origin-mem"
+description = "Conversation memory with ONNX MiniLM embeddings, HNSW search, and temporal-decay re-ranking"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "origin-provider-ollama"
+description = "Ollama provider for origin with NDJSON streaming chat"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "origin-runtime"
+description = "Task-class budgeting with per-class semaphores and a spawn_in helper"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

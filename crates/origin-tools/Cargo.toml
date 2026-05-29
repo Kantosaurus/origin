@@ -1,5 +1,6 @@
 [package]
 name = "origin-tools"
+description = "Tool registry, macros, and builtin tools for origin"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

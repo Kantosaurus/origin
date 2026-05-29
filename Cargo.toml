@@ -8,7 +8,8 @@ version = "0.0.1"
 edition = "2021"
 rust-version = "1.83"
 license = "Apache-2.0"
-repository = "https://github.com/wooainsley/origin"
+repository = "https://github.com/Kantosaurus/origin"
+homepage = "https://github.com/Kantosaurus/origin"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"  # overridden in cas/tui/ipc

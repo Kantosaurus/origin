@@ -1,5 +1,6 @@
 [package]
 name = "origin-provider"
+description = "Provider trait with canonical request/response/usage/error types for origin"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

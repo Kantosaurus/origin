@@ -13,6 +13,7 @@ jobs:
   build:
     name: build / ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -33,11 +34,12 @@ jobs:
           - target: aarch64-pc-windows-msvc
             os: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.83.0
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
+          toolchain: 1.83.0
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install cross (aarch64 Linux only)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cargo install cross --locked
@@ -70,7 +72,7 @@ jobs:
           if [[ "${{ matrix.target }}" == *windows* ]]; then ext=".exe"; fi
           cp "target/${{ matrix.target }}/release/origin$ext" "dist/origin-${{ matrix.target }}$ext"
       - name: Cosign keyless sign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Sign
         shell: bash
         env:
@@ -80,10 +82,10 @@ jobs:
             cosign sign-blob --bundle "$f.sig" "$f"
           done
       - name: SLSA provenance attestation
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
         with:
           subject-path: "dist/*"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.target }}
           path: dist/*
@@ -91,8 +93,14 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: 1.83.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
       - name: Flatten
@@ -110,10 +118,39 @@ jobs:
               *) sha256sum "$f" ;;
             esac
           done | tee SHA256SUMS
+      - name: Stamp packaging templates (Homebrew / winget / AUR)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # Build a {target -> sha256} manifest from the staged binaries, then
+          # stamp the packaging templates so the formulae/manifests carry real
+          # download URLs + checksums for this release.
+          python3 - <<'PY'
+          import hashlib, glob, json
+          m = {}
+          for f in glob.glob('out/origin-*'):
+              if f.endswith('.sig'):
+                  continue
+              name = f.rsplit('/', 1)[-1][len('origin-'):]
+              if name.endswith('.exe'):
+                  name = name[:-4]
+              with open(f, 'rb') as fh:
+                  m[name] = hashlib.sha256(fh.read()).hexdigest()
+          with open('manifest.json', 'w') as fh:
+              json.dump(m, fh, indent=2)
+          print(json.dumps(m, indent=2))
+          PY
+          cargo run -p xtask --locked -- release \
+            --version "$version" \
+            --manifest manifest.json \
+            --out out/packaging
       - name: GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: out/*
+          files: |
+            out/origin-*
+            out/SHA256SUMS
+            out/packaging/*
           generate_release_notes: true
           prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') }}
 
@@ -121,18 +158,19 @@ jobs:
     name: npm publish
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Skip on forks (no NPM_TOKEN) and when no token is configured.
     if: ${{ github.repository == 'Kantosaurus/origin' }}
     permissions:
       contents: read
       id-token: write # required for `npm publish --provenance`
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
       - name: Collect binaries

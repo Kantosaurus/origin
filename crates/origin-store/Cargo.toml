@@ -1,5 +1,6 @@
 [package]
 name = "origin-store"
+description = "SQLite-backed store for origin with embedded refinery migrations"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

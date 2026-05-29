@@ -12,7 +12,9 @@
     "bin/",
     "lib/",
     "install.js",
-    "README.md"
+    "README.md",
+    "LICENSE",
+    "NOTICE"
   ],
   "engines": {
     "node": ">=18"

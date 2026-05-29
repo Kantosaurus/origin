@@ -1,0 +1,24 @@
+# Code owners for origin. These owners are automatically requested for review.
+# See https://docs.github.com/articles/about-code-owners
+#
+# Pair this with a branch-protection rule on `dev` that requires review from
+# Code Owners so the routing below is actually enforced.
+
+# Default owner for everything in the repo.
+*                           @Kantosaurus
+
+# Security-sensitive subsystems — the IPC transport, content-addressed store,
+# credential/key handling, sandboxing, and the permission engine.
+/crates/origin-ipc/         @Kantosaurus
+/crates/origin-cas/         @Kantosaurus
+/crates/origin-keyvault/    @Kantosaurus
+/crates/origin-sandbox/     @Kantosaurus
+/crates/origin-permission/  @Kantosaurus
+/crates/origin-tui/         @Kantosaurus
+
+# Release, CI, supply-chain, and packaging surface.
+/.github/                   @Kantosaurus
+/packaging/                 @Kantosaurus
+/xtask/                     @Kantosaurus
+/deny.toml                  @Kantosaurus
+/SECURITY.md                @Kantosaurus

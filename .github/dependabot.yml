@@ -1,0 +1,35 @@
+version: 2
+updates:
+  # Rust workspace dependencies.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Fuzz crate is excluded from the workspace, so it needs its own entry.
+  - package-ecosystem: cargo
+    directory: "/crates/origin-daemon/fuzz"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # GitHub Actions — keeps SHA-pinned actions current (and updates the version
+  # comment alongside the SHA).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+
+  # npm distribution package.
+  - package-ecosystem: npm
+    directory: "/packaging/npm"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

@@ -1,0 +1,38 @@
+name: Supply chain
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+  schedule:
+    - cron: '0 7 * * *'   # daily at 07:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: 1.83.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      # Hard gates: RUSTSEC advisories, dependency bans (rustls-only TLS), and
+      # the crates.io-only source allow-list.
+      - name: cargo-deny — advisories, bans, sources
+        run: cargo deny check advisories bans sources
+      # License policy is advisory until the allow-list is tuned against the
+      # full dependency graph; then drop continue-on-error to make it a gate.
+      - name: cargo-deny — licenses (non-blocking)
+        continue-on-error: true
+        run: cargo deny check licenses

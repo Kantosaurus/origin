@@ -1,5 +1,6 @@
 [package]
 name = "origin-cas"
+description = "Content-addressed store with FastCDC chunking, mmap pack files, and three-tier storage"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

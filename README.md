@@ -17,7 +17,7 @@ as Claude Code, jcode, and opencode — but it treats four performance KPIs as
 latency, steady RSS, and cache hit rate. It draws *attributes* from those
 harnesses; every signature subsystem uses an original mechanism.
 
-It's a Cargo workspace of 30+ crates with a clean split: **`origin-daemon`** hosts
+It's a Cargo workspace of 40+ crates with a clean split: **`origin-daemon`** hosts
 sessions, **`origin-cli`** is a thin client, and they talk only through
 **`origin-ipc`**.
 
@@ -78,7 +78,7 @@ Other channels:
 ```sh
 cargo binstall origin-cli            # prebuilt binary via cargo-binstall
 cargo install --path crates/origin-cli   # build + install from source
-brew install origin                  # Homebrew (tap), see packaging/homebrew
+brew install Kantosaurus/tap/origin  # Homebrew tap, see packaging/homebrew
 ```
 
 For a from-source developer build, see the [Quickstart](#quickstart) below.
@@ -112,7 +112,9 @@ idempotent (content-hash dedupe — safe to re-run). See the full
 
 ## Documentation
 
-The book lives in [`docs/site/`](docs/site/src/SUMMARY.md) (mdBook) and covers
+The rendered handbook is published at **<https://Kantosaurus.github.io/origin/>**
+(built from `dev` by the [`docs`](.github/workflows/docs.yml) workflow). The
+source lives in [`docs/site/`](docs/site/src/SUMMARY.md) (mdBook) and covers
 [architecture](docs/site/src/architecture.md), [providers](docs/site/src/providers.md),
 [skills](docs/site/src/skills.md), [hooks](docs/site/src/hooks.md),
 [MCP](docs/site/src/mcp.md), [migration](docs/site/src/migration.md), the
@@ -121,7 +123,7 @@ The book lives in [`docs/site/`](docs/site/src/SUMMARY.md) (mdBook) and covers
 ## Repository layout
 
 ```
-crates/            30+ workspace crates
+crates/            40+ workspace crates
   origin-daemon/   session host: agent loop, goal driver, provider wiring
   origin-cli/      thin client + TUI
   origin-ipc/      the only daemon <-> CLI channel (rkyv frames)
@@ -137,8 +139,7 @@ xtask/             release stamping, manpages, repo automation
 
 Contributions are welcome. Please read **[CONTRIBUTING.md](CONTRIBUTING.md)** for the
 dev setup and the quality gates (`cargo fmt`, `cargo clippy -D warnings` with
-`pedantic`/`nursery`, `cargo test`, MSRV 1.83, no new `unsafe`), and our
-**[Code of Conduct](CODE_OF_CONDUCT.md)**. The project follows a
+`pedantic`/`nursery`, `cargo test`, MSRV 1.83, no new `unsafe`). The project follows a
 brainstorm → plan → TDD → verify workflow that is baked into the daemon's default
 system prompt.
 

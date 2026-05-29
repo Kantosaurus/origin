@@ -1,5 +1,6 @@
 [package]
 name = "origin-provider-github"
+description = "GitHub Models provider for origin with vault-sourced OAuth tokens"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

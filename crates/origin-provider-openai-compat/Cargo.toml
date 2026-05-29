@@ -1,5 +1,6 @@
 [package]
 name = "origin-provider-openai-compat"
+description = "Generic OpenAI Chat-Completions wire client for OpenAI-shape providers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

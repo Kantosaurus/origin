@@ -6,8 +6,7 @@ get a pull request merged.
 
 By contributing, you agree that your contributions are licensed under the
 project's [Apache License 2.0](LICENSE) (inbound = outbound, per Apache-2.0 §5).
-There is **no CLA**. All participants are expected to follow the
-[Code of Conduct](CODE_OF_CONDUCT.md).
+There is **no CLA**.
 
 ---
 

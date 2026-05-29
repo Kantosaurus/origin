@@ -1,5 +1,6 @@
 [package]
 name = "origin-mcp"
+description = "Model Context Protocol client with stdio/HTTP-SSE transports and OAuth"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "origin-browser"
+description = "Dual-backend browser router with one-shot WebFetch and Tavily WebSearch"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

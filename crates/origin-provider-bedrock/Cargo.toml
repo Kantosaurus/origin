@@ -1,5 +1,6 @@
 [package]
 name = "origin-provider-bedrock"
+description = "SigV4-signed AWS Bedrock provider for origin (Anthropic InvokeModel)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

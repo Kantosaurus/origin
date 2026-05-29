@@ -1,5 +1,7 @@
 [package]
 name = "origin-bench"
+description = "Benchmark harness comparing origin against other coding-agent CLIs"
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

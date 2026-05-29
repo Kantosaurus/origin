@@ -9,8 +9,8 @@ src = "src"
 [output.html]
 default-theme = "navy"
 preferred-dark-theme = "navy"
-git-repository-url = "https://github.com/wooainsley/origin"
-edit-url-template = "https://github.com/wooainsley/origin/edit/dev/docs/site/{path}"
+git-repository-url = "https://github.com/Kantosaurus/origin"
+edit-url-template = "https://github.com/Kantosaurus/origin/edit/dev/docs/site/{path}"
 
 [output.html.fold]
 enable = true

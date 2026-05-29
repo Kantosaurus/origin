@@ -1,5 +1,6 @@
 [package]
 name = "origin-permission"
+description = "Tier-based permission engine with a pluggable prompter"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

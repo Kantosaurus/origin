@@ -1,5 +1,6 @@
 [package]
 name = "origin-sandbox"
+description = "Per-tool sandbox profiles for Linux, macOS, and Windows"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

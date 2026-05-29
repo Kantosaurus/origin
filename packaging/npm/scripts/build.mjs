@@ -30,6 +30,7 @@ const require = createRequire(import.meta.url);
 const { TARGETS, assetName, binName, PKG_PREFIX } = require('../lib/platform.js');
 
 const NPM_DIR = path.resolve(fileURLToPath(import.meta.url), '..', '..'); // packaging/npm
+const ROOT = path.resolve(NPM_DIR, '..', '..'); // repo root (holds LICENSE + NOTICE)
 const REPO_URL = 'git+https://github.com/Kantosaurus/origin.git';
 const HOMEPAGE = 'https://github.com/Kantosaurus/origin#readme';
 const LICENSE = 'Apache-2.0';
@@ -125,6 +126,8 @@ function buildPlatformPackage(out, version, binariesDir, key, target) {
       `This is an internal platform package for [\`${PKG_PREFIX}\`](https://www.npmjs.com/package/${PKG_PREFIX}). ` +
       `Install \`${PKG_PREFIX}\` instead:\n\n\`\`\`sh\nnpm install -g ${PKG_PREFIX}\n\`\`\`\n`
   );
+  // Apache-2.0 §4(a): ship the license text with every distributed package.
+  copyFile(path.join(ROOT, 'LICENSE'), path.join(dir, 'LICENSE'));
   console.log(`[build] ${target.pkg}@${version}  <- ${assetName(target)}`);
   return target.pkg;
 }
@@ -153,6 +156,9 @@ function buildMainPackage(out, version, builtPkgs) {
   // npm regenerates its own .cmd/.ps1 shims, so a POSIX mode is harmless there.
   fs.chmodSync(path.join(dir, 'bin', 'origin.js'), 0o755);
   copyFile(path.join(NPM_DIR, 'README.md'), path.join(dir, 'README.md'));
+  // Apache-2.0 §4(a) + §4(d): ship LICENSE and NOTICE with the published tarball.
+  copyFile(path.join(ROOT, 'LICENSE'), path.join(dir, 'LICENSE'));
+  copyFile(path.join(ROOT, 'NOTICE'), path.join(dir, 'NOTICE'));
 
   const optionalDependencies = {};
   for (const name of builtPkgs) optionalDependencies[name] = version;

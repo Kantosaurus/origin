@@ -3,9 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "license": "Apache-2.0",
   "bin": { "cloak-cli": "./cloak-cli.mjs" },
   "dependencies": {
-    "cloak-browser": "github:CloakHQ/CloakBrowser#main",
+    "cloak-browser": "github:CloakHQ/CloakBrowser#14ec2ebf5f952b3dcc8ee019965cc48cbf7ccf53",
     "playwright-core": "^1.45.0"
   },
   "engines": { "node": ">=18" }

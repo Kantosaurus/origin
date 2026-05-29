@@ -1,5 +1,6 @@
 [package]
 name = "origin-supervisor"
+description = "Restarts origin-daemon on crash and resumes sessions across restarts"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

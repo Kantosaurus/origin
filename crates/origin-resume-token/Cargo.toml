@@ -1,5 +1,6 @@
 [package]
 name = "origin-resume-token"
+description = "MAC-authenticated session resume token shared by the daemon and supervisor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

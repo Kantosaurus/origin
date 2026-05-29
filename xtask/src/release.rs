@@ -29,11 +29,11 @@ pub fn stamp(version: &str, manifest: &Path, out_dir: &Path) -> anyhow::Result<(
             )
             .replace(
                 "{{SHA256_LINUX_ARM}}",
-                m["aarch64-unknown-linux-musl"].as_str().unwrap_or(""),
+                m["aarch64-unknown-linux-gnu"].as_str().unwrap_or(""),
             )
             .replace(
                 "{{SHA256_LINUX_X64}}",
-                m["x86_64-unknown-linux-musl"].as_str().unwrap_or(""),
+                m["x86_64-unknown-linux-gnu"].as_str().unwrap_or(""),
             )
             .replace(
                 "{{SHA256_WIN_X64}}",
@@ -60,7 +60,7 @@ mod tests {
         let manifest = dir.path().join("m.json");
         fs::write(
             &manifest,
-            r#"{"x86_64-unknown-linux-musl":"deadbeef","x86_64-apple-darwin":"feedface","aarch64-apple-darwin":"feedfade","aarch64-unknown-linux-musl":"feedfacf","x86_64-pc-windows-msvc":"feedfad0","aarch64-pc-windows-msvc":"feedfad1"}"#,
+            r#"{"x86_64-unknown-linux-gnu":"deadbeef","x86_64-apple-darwin":"feedface","aarch64-apple-darwin":"feedfade","aarch64-unknown-linux-gnu":"feedfacf","x86_64-pc-windows-msvc":"feedfad0","aarch64-pc-windows-msvc":"feedfad1"}"#,
         )
         .expect("write manifest");
         let out = dir.path().join("out");

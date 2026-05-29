@@ -1,5 +1,6 @@
 [package]
 name = "origin-stream"
+description = "Single-producer multi-consumer byte ring with per-subscriber read cursors"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

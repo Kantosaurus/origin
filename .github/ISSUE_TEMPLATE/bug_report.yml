@@ -1,0 +1,62 @@
+name: Bug report
+description: Report a defect in origin (not a security vulnerability — see SECURITY.md)
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please **do not** report security
+        vulnerabilities here — use private reporting per
+        [SECURITY.md](https://github.com/Kantosaurus/origin/security/advisories/new).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+      placeholder: When I run `origin ...`, I expected X but got Y.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps, plus any sample input/config needed to observe it.
+      placeholder: |
+        1. `origin ...`
+        2. ...
+        3. See error
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: origin version
+      description: Output of `origin --version`.
+      placeholder: "origin 0.0.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other (note in description)
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Provider in use (if relevant)
+      placeholder: "anthropic / openai / gemini / ollama / ..."
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: >
+        The daemon writes a human-readable log to `<data-dir>/origin/logs/daemon.log`
+        (e.g. `%LOCALAPPDATA%\origin\logs\daemon.log` on Windows). Paste the
+        relevant excerpt. This is automatically formatted as a code block.
+      render: shell

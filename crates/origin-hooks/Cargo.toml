@@ -1,5 +1,6 @@
 [package]
 name = "origin-hooks"
+description = "Pre-spawned shell pool and typed lifecycle event dispatch"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

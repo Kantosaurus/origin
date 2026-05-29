@@ -1,5 +1,6 @@
 [package]
 name = "origin-plan"
+description = "CRDT op-log and deterministic fold for the shared swarm plan"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -11,6 +11,17 @@ versions correspond to phase milestones from the implementation plan.
 - **`origin-browser` crate (new)**: dual-backend browser tool. `BrowserRouter` runs `agent-browser` as primary; on bot-detection (Cloudflare, reCAPTCHA, hCaptcha, PerimeterX, DataDome, Incapsula, Kasada, 4xx) transparently replays the verb against the vendored `CloakBrowser` sidecar and sticks to Cloak after two consecutive successes per session. Includes pure-Rust `WebFetch` (reqwest + readability + html2md) and `WebSearch` via Tavily (`TAVILY_API_KEY`).
 - **Vendored CloakBrowser sidecar** (`vendor/cloak-browser/`): Node ≥18 stdio-JSON CLI (`cloak-cli.mjs`) wire-compatible with `agent-browser`'s snapshot/ref protocol so the router can swap backends mid-session.
 - **`origin-tools` builtins**: `WebFetch`, `WebSearch`, `Browser` (all `Tier::RequiresPermission`).
+- **Crate metadata**: every workspace crate now carries a `description` for crates.io; internal crates (`origin-bench`) marked `publish = false`; workspace `homepage` set.
+- **Supply-chain CI** (`.github/workflows/audit.yml`): `cargo deny` gates RUSTSEC advisories, dependency bans (rustls-only TLS), and a crates.io-only source allow-list, on push/PR and a daily schedule. New root `deny.toml`.
+- **Community health**: issue templates (`bug_report`, `feature_request`, `config`), `PULL_REQUEST_TEMPLATE.md`, `CODEOWNERS`, `.github/dependabot.yml` (cargo + github-actions + npm), and a root `.editorconfig`.
+- **Coverage**: `ci.yml` now runs `cargo llvm-cov` and uploads an `lcov` artifact; added a stable-toolchain test lane alongside MSRV.
+
+### Changed
+- **Canonical repo owner** normalized to `Kantosaurus/origin` across `Cargo.toml`, packaging templates (Homebrew/winget/AUR), the docs site, and quickstart (was inconsistently `wooainsley/origin`).
+- **Linux packaging** now targets glibc/gnu (matching the release build) instead of musl in the Homebrew/AUR templates and the `xtask release` stamper.
+- **CI hardening**: all GitHub Actions pinned to commit SHAs; least-privilege `permissions:`, `concurrency`, and `timeout-minutes` on every workflow; `--locked` builds/tests; docs site now deploys from `dev`. Added the `tool_use_parser` fuzz target to the nightly matrix.
+- **npm packages** now ship `LICENSE` (and `NOTICE` in the main package) per Apache-2.0 §4; the vendored CloakBrowser sidecar is pinned to an immutable commit and documents its third-party deps (`vendor/cloak-browser/THIRD_PARTY.md`).
+- **Docs**: the SDK guide's "Minimal Rust client" now reflects the real `origin-ipc` frame API instead of an unimplemented facade.
 
 ## 1.0.0 — 2026-06-17
 
@@ -20,7 +31,7 @@ versions correspond to phase milestones from the implementation plan.
 - **Migration** (`origin-migrate`, `origin import`): adapters for Claude Code (jsonl + SKILL.md), jcode (rusqlite reader), opencode (storage/*.json); idempotent content-hash dedupe via new `Store::{contains,insert}_migrated_{session,skill}` + V6 SQLite migration; `--dry-run` / `--apply` / `--json` modes.
 - **Benchmarks** (`origin-bench`): 8-task fixed set, origin + generic subprocess runners, Markdown + JSON reports.
 - **Docs site** (`docs/site/`): 11-chapter mdBook (intro/quickstart/architecture/configuration/providers/skills/hooks/mcp/migration/sdk/troubleshooting); `origin --tutorial` 7-step guided tour; clap_mangen manpages via `xtask manpages`.
-- **Release engineering** (`.github/workflows/release.yml`): 6-target matrix build (musl x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64/aarch64) with cosign keyless signing + SLSA build-provenance attestation; packaging templates for Homebrew (`packaging/homebrew/origin.rb.tmpl`), winget, AUR, cargo-binstall metadata; `xtask release` stamps `{{VERSION}}` + `{{SHA256_*}}` placeholders.
+- **Release engineering** (`.github/workflows/release.yml`): 6-target matrix build (glibc/gnu x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64/aarch64) with cosign keyless signing + SLSA build-provenance attestation; packaging templates for Homebrew (`packaging/homebrew/origin.rb.tmpl`), winget, AUR, cargo-binstall metadata; `xtask release` stamps `{{VERSION}}` + `{{SHA256_*}}` placeholders.
 
 ### Gates
 - Perf gate workflow asserts read-only task `wall_ms` worst ≤ 80 ms.

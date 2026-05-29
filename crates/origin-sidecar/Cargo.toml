@@ -1,5 +1,6 @@
 [package]
 name = "origin-sidecar"
+description = "Always-on small-model worker with a bounded queue and pooled workers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

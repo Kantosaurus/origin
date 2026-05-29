@@ -1,5 +1,6 @@
 [package]
 name = "origin-core"
+description = "Core message types, IR, and provider capabilities for origin"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -18,10 +18,10 @@ Other channels:
 
 ```bash
 # Homebrew (macOS / Linux)
-brew install wooainsley/tap/origin
+brew install Kantosaurus/tap/origin
 
 # winget (Windows)
-winget install Origin.Origin
+winget install Kantosaurus.origin
 
 # AUR (Arch)
 yay -S origin-bin
@@ -30,7 +30,7 @@ yay -S origin-bin
 A from-source build also works, but expects Rust 1.83 (the workspace MSRV):
 
 ```bash
-git clone https://github.com/wooainsley/origin
+git clone https://github.com/Kantosaurus/origin
 cd origin
 cargo install --path crates/origin-cli --locked
 ```

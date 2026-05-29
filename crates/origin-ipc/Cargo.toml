@@ -1,5 +1,6 @@
 [package]
 name = "origin-ipc"
+description = "Framed local-socket and QUIC/TLS IPC transports for origin"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

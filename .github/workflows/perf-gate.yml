@@ -4,17 +4,27 @@ on:
     branches: [dev, main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   perf:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.83.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: 1.83.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Build release
-        run: cargo build --release -p origin-cli -p origin-daemon
+        run: cargo build --release --locked -p origin-cli -p origin-daemon
       - name: Cold-start benchmark
-        run: cargo run --release -p origin-bench -- run-origin --tasks bench/tasks > result.json
+        run: cargo run --release --locked -p origin-bench -- run-origin --tasks bench/tasks > result.json
       - name: Assert perf gates
         run: |
           python - <<'PY'

@@ -1,5 +1,6 @@
 [package]
 name = "origin-keyvault"
+description = "Cross-platform secret storage with a uniform async facade over per-OS keystores"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

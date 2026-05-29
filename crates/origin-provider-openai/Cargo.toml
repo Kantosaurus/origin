@@ -1,5 +1,6 @@
 [package]
 name = "origin-provider-openai"
+description = "OpenAI chat-completions provider for origin"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

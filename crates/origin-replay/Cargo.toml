@@ -1,5 +1,6 @@
 [package]
 name = "origin-replay"
+description = "Deterministic record-and-replay for origin sessions"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

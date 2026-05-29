@@ -1,5 +1,6 @@
 [package]
 name = "origin-tui"
+description = "Custom cell-grid terminal renderer with SIMD damage diffing and ANSI emit"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

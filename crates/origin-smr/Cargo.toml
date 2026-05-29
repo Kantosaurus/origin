@@ -1,5 +1,6 @@
 [package]
 name = "origin-smr"
+description = "Single-producer/single-consumer shared-memory ring for swarm event fanout"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

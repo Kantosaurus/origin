@@ -55,64 +55,62 @@ without back-pressuring the main loop.
 
 ## Minimal Rust client
 
-`origin-ipc::Connection` is the canonical entry point. It handles transport
-selection (socket / pipe / QUIC), version handshake, and request-ID
-multiplexing.
+Today `origin-ipc` exposes a **frame-level** API. The building blocks are:
+
+- `origin_ipc::transport::{Connector, Connection}` — connect to the daemon's
+  local socket / named pipe and read/write framed messages.
+- `origin_ipc::quic::{QuicConnector, QuicConnection}` — the same framing over
+  QUIC + mutual TLS for remote clients.
+- `origin_ipc::frame::{encode, validate, FrameKind}` — the length-prefixed
+  framing. `FrameKind` is `Request | Response | Event | ErrorFrame`; bodies are
+  `rkyv`-archived protocol messages.
+
+A client connects, writes a `Request` frame, and reads `Response`/`Event`
+frames until the turn completes. The daemon discovers its socket from
+`ORIGIN_SOCK` (falling back to a per-platform default), so a client reads the
+same variable:
 
 ```rust
-use origin_ipc::{Connection, Request, Event};
-use origin_core::{Message, Role, Block};
+use origin_ipc::frame::{encode, FrameKind};
+use origin_ipc::transport::Connector;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Auto-detects ORIGIN_SOCK or the default platform path.
-    let conn = Connection::connect_default().await?;
+    // Same path the daemon binds: ORIGIN_SOCK, else the platform default.
+    let path = std::env::var("ORIGIN_SOCK")?;
+    let mut conn = Connector::connect(&path).await?;
 
-    // Open a fresh session.
-    let session = conn
-        .send(Request::OpenSession {
-            model: Some("anthropic:claude-opus-4-7".into()),
-            ..Default::default()
-        })
-        .await?
-        .into_session()?;
+    // `body` is an rkyv-archived request message (an "open session" / "prompt"
+    // verb from the surface above). `encode(request_id, kind, body)` prepends
+    // the framing header; request_id lets you correlate the Response.
+    let body: &[u8] = /* rkyv-archived request bytes */ b"";
+    conn.write_raw(&encode(1, FrameKind::Request, body)).await?;
 
-    // Subscribe to the event stream before sending the prompt so we don't
-    // miss the streamed assistant blocks.
-    let mut events = conn.subscribe(session.id).await?;
-
-    conn.send(Request::Prompt {
-        session: session.id,
-        message: Message {
-            role: Role::User,
-            blocks: vec![Block::text("List the workspace crates.")],
-        },
-    })
-    .await?;
-
-    while let Some(event) = events.next().await? {
-        match event {
-            Event::AssistantBlock(block) => print!("{}", block.as_text()),
-            Event::ToolUse(tu)           => eprintln!("→ tool: {}", tu.name),
-            Event::TurnComplete { .. }   => break,
-            Event::PermissionAsk(ask)    => {
-                // Side-panel-style async prompt; auto-allow in this demo.
-                conn.send(Request::ApprovePermission(ask.id)).await?;
+    // Read frames until the turn ends. Events stream incrementally; the final
+    // Response (or an ErrorFrame) closes the request.
+    loop {
+        let (kind, payload) = conn.read_frame().await?;
+        match kind {
+            FrameKind::Event => { /* decode + render the streamed block */ }
+            FrameKind::Response => break, // turn complete
+            FrameKind::ErrorFrame => {
+                anyhow::bail!("daemon error: {}", String::from_utf8_lossy(&payload));
             }
-            _ => {}
+            FrameKind::Request => {} // clients don't receive requests
         }
     }
-
-    conn.send(Request::CloseSession(session.id)).await?;
     Ok(())
 }
 ```
 
-The same `Connection` type powers the TUI in `origin-cli`, the headless
-`origin run` subcommand, and the future desktop frontend. Tool-result blobs
-arrive as `Event::ToolResult { handle, .. }`; call `conn.fetch(handle)` to
-mmap the pack file and get back a `&[u8]` slice without touching userspace
-copies on the daemon side.
+The CLI's headless path (`origin run`) and the TUI both drive the daemon
+through exactly this transport — see `crates/origin-cli/tests/headless_stream.rs`
+for a worked example that stands up a fake daemon and exchanges frames.
+
+> **Planned:** an ergonomic typed client — `Connection::connect_default()`
+> plus `Request` / `Event` enums and a `subscribe()` stream that hide the frame
+> encoding and request-ID multiplexing — is on the roadmap but **not yet
+> implemented**. Until it lands, build against the frame-level API above.
 
 For debugging IPC traffic see [Troubleshooting](troubleshooting.md) — the
 trace parquet ring records every frame and replays into `origin-replay`

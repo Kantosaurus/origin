@@ -1,5 +1,6 @@
 [package]
 name = "origin-goal"
+description = "Goal driver with persistent completion conditions and an inline self-tag protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

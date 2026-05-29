@@ -1,5 +1,6 @@
 [package]
 name = "origin-migrate"
+description = "Migrate sessions, skills, and memories from other harnesses into origin"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

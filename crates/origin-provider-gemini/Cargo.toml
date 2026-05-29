@@ -1,5 +1,6 @@
 [package]
 name = "origin-provider-gemini"
+description = "Google Gemini generateContent provider for origin, with SSE streaming"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

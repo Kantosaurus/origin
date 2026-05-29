@@ -1,5 +1,6 @@
 [package]
 name = "origin-provider-anthropic"
+description = "Anthropic Messages API provider for origin"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

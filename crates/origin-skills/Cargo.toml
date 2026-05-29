@@ -1,5 +1,6 @@
 [package]
 name = "origin-skills"
+description = "Skills loader with embedding upsert and allowed-tools narrowing"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

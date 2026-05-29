@@ -1,5 +1,6 @@
 [package]
 name = "origin-codegraph"
+description = "Native code knowledge graph with tree-sitter extraction and SQLite index"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

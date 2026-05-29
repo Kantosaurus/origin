@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Ainsley Woo and the origin contributors.
+// Bundles third-party code at install time — see THIRD_PARTY.md.
+//
 // Stdio-JSON sidecar for CloakBrowser.
 // Reads one JSON verb per line from stdin, writes one JSON response per line
 // to stdout. Wire-compatible with the agent-browser snapshot/ref protocol so

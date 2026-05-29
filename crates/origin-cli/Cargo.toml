@@ -1,5 +1,6 @@
 [package]
 name = "origin-cli"
+description = "Terminal UI and CLI for the origin agent runtime"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

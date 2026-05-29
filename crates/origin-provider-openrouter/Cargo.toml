@@ -1,5 +1,6 @@
 [package]
 name = "origin-provider-openrouter"
+description = "OpenRouter provider for origin, built on the OpenAI-compatible API"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

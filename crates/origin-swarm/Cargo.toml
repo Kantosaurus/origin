@@ -1,5 +1,6 @@
 [package]
 name = "origin-swarm"
+description = "Coordinator/worker protocol with credit-channel backpressure and completion reports"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "origin-daemon"
+description = "Daemon hosting origin session, agent, and protocol services"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,25 +1,25 @@
 class Origin < Formula
   desc "Performance-first agentic coding harness"
-  homepage "https://github.com/wooainsley/origin"
+  homepage "https://github.com/Kantosaurus/origin"
   version "{{VERSION}}"
   license "Apache-2.0"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/wooainsley/origin/releases/download/v{{VERSION}}/origin-aarch64-apple-darwin"
+      url "https://github.com/Kantosaurus/origin/releases/download/v{{VERSION}}/origin-aarch64-apple-darwin"
       sha256 "{{SHA256_MAC_ARM}}"
     else
-      url "https://github.com/wooainsley/origin/releases/download/v{{VERSION}}/origin-x86_64-apple-darwin"
+      url "https://github.com/Kantosaurus/origin/releases/download/v{{VERSION}}/origin-x86_64-apple-darwin"
       sha256 "{{SHA256_MAC_X64}}"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
-      url "https://github.com/wooainsley/origin/releases/download/v{{VERSION}}/origin-aarch64-unknown-linux-musl"
+      url "https://github.com/Kantosaurus/origin/releases/download/v{{VERSION}}/origin-aarch64-unknown-linux-gnu"
       sha256 "{{SHA256_LINUX_ARM}}"
     else
-      url "https://github.com/wooainsley/origin/releases/download/v{{VERSION}}/origin-x86_64-unknown-linux-musl"
+      url "https://github.com/Kantosaurus/origin/releases/download/v{{VERSION}}/origin-x86_64-unknown-linux-gnu"
       sha256 "{{SHA256_LINUX_X64}}"
     end
   end

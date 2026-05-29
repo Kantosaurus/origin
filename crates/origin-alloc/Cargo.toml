@@ -1,5 +1,6 @@
 [package]
 name = "origin-alloc"
+description = "Per-component allocator arenas with a no-op default and opt-in jemalloc backend"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
