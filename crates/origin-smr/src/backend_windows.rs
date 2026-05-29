@@ -24,6 +24,8 @@ fn wide(name: &str) -> Vec<u16> {
 }
 
 /// Open (or create) a shared mapping. Caller upholds the SPSC contract.
+// By-value `RingConfig` mirrors the unix backend; this path only reads fields.
+#[allow(clippy::needless_pass_by_value)]
 pub fn open(cfg: RingConfig) -> Result<Ring, RingError> {
     if cfg.capacity_bytes < MIN_CAPACITY {
         return Err(RingError::CreationFailed(format!(

@@ -3,7 +3,9 @@
 //! Uses `shm_open` + `ftruncate` + `mmap`. Names are transformed to
 //! start with `/` per POSIX shm convention.
 
+use core::ffi::c_void;
 use core::num::NonZeroUsize;
+use core::ptr::NonNull;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use nix::fcntl::OFlag;
@@ -25,6 +27,10 @@ fn posix_name(name: &str) -> String {
 
 /// Open (or create) a POSIX shared mapping. Caller upholds the SPSC
 /// contract.
+// Takes `RingConfig` by value to mirror the Windows backend's signature (the
+// `Ring::open` dispatcher hands the owned config to whichever backend is
+// compiled in); this path only reads its fields.
+#[allow(clippy::needless_pass_by_value)]
 pub fn open(cfg: RingConfig) -> Result<Ring, RingError> {
     if cfg.capacity_bytes < MIN_CAPACITY {
         return Err(RingError::CreationFailed(format!(
@@ -61,7 +67,7 @@ pub fn open(cfg: RingConfig) -> Result<Ring, RingError> {
             length,
             ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
             MapFlags::MAP_SHARED,
-            Some(&fd),
+            &fd,
             0,
         );
     }
@@ -73,7 +79,9 @@ pub fn open(cfg: RingConfig) -> Result<Ring, RingError> {
     let _ = fd.as_raw_fd();
     drop(fd);
 
-    let raw_ptr = ptr as *mut u8;
+    // nix 0.29 `mmap` returns `NonNull<c_void>`; project it to the byte
+    // pointer the ring works in.
+    let raw_ptr = ptr.as_ptr().cast::<u8>();
     if cfg.create {
         // SAFETY: just-truncated mapping of `cap >= MIN_CAPACITY`
         // bytes; zeroing the first 128 cursor bytes is in-bounds.
@@ -102,10 +110,14 @@ impl Drop for Mapping {
             NonZeroUsize::MIN,
             |n| n,
         );
-        // SAFETY: `ptr` was returned by `mmap` for this mapping with
-        // exactly `capacity` bytes; `munmap` consumes it once.
-        unsafe {
-            let _ = munmap(self.ptr.cast(), length.get());
+        // nix 0.29 `munmap` takes `NonNull<c_void>`. `self.ptr` came from
+        // `mmap` (non-null by construction), so this `new` never yields None.
+        if let Some(addr) = NonNull::new(self.ptr.cast::<c_void>()) {
+            // SAFETY: `addr` was returned by `mmap` for this mapping with
+            // exactly `capacity` bytes; `munmap` consumes it once.
+            unsafe {
+                let _ = munmap(addr, length.get());
+            }
         }
         if self.owns_name {
             let _ = shm_unlink(self.raw_name.as_str());
