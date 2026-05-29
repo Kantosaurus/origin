@@ -49,12 +49,11 @@ async fn three_in_progress_then_met_with_verifier_confirm() {
     assert_eq!(provider.main_remaining(), 0);
     // Exactly one verifier call (only on the `met` claim).
     assert_eq!(provider.verifier_remaining(), 0);
-    let verifier_calls = provider
-        .captured()
-        .into_iter()
-        .filter(|r| r.is_verifier)
-        .count();
-    assert_eq!(verifier_calls, 1, "verifier should run exactly once on the met claim");
+    let verifier_calls = provider.captured().into_iter().filter(|r| r.is_verifier).count();
+    assert_eq!(
+        verifier_calls, 1,
+        "verifier should run exactly once on the met claim"
+    );
 
     // 3 in_progress turns produced 3 GoalIteration events; the 4th turn went
     // straight to verify → cleared.

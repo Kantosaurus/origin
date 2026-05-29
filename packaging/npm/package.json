@@ -1,5 +1,7 @@
 {
-  "name": "originx",
+  "name": "@kantosaurus/origin",
+  "//name": "scripts/build.mjs sets name from PKG_PREFIX (lib/platform.js, default @kantosaurus/origin) at publish time; keep this in sync for local `npm pack`/readers.",
+  "//version": "Placeholder. scripts/build.mjs --version stamps the real version (in lockstep with the Cargo workspace tag) at publish time; this committed value is never what ships.",
   "version": "0.0.1",
   "description": "Origin — a fast, terminal-native AI coding agent. Install globally and run `origin` to launch the TUI.",
   "bin": {
@@ -20,12 +22,12 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "originx-linux-x64": "0.0.1",
-    "originx-linux-arm64": "0.0.1",
-    "originx-darwin-x64": "0.0.1",
-    "originx-darwin-arm64": "0.0.1",
-    "originx-win32-x64": "0.0.1",
-    "originx-win32-arm64": "0.0.1"
+    "@kantosaurus/origin-linux-x64": "0.0.1",
+    "@kantosaurus/origin-linux-arm64": "0.0.1",
+    "@kantosaurus/origin-darwin-x64": "0.0.1",
+    "@kantosaurus/origin-darwin-arm64": "0.0.1",
+    "@kantosaurus/origin-win32-x64": "0.0.1",
+    "@kantosaurus/origin-win32-arm64": "0.0.1"
   },
   "keywords": [
     "origin",

@@ -150,13 +150,10 @@ pub fn parse_skill_command(line: &str) -> Option<ClientMessage> {
     }
 
     // Split into `name_token` and `args` on the first whitespace.
-    let (name_token, args_str) = match rest.find(char::is_whitespace) {
-        Some(idx) => {
-            let (n, a) = rest.split_at(idx);
-            (n, a.trim_start())
-        }
-        None => (rest, ""),
-    };
+    let (name_token, args_str) = rest.find(char::is_whitespace).map_or((rest, ""), |idx| {
+        let (n, a) = rest.split_at(idx);
+        (n, a.trim_start())
+    });
     if name_token.is_empty() {
         return None;
     }

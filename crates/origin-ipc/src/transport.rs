@@ -196,7 +196,10 @@ pub async fn read_frame_buffered<R: AsyncRead + Unpin>(
     reader: &mut R,
     rx_buf: &mut Vec<u8>,
 ) -> io::Result<(FrameKind, Vec<u8>)> {
-    let mut tmp = [0_u8; 65536];
+    // Heap scratch buffer: a 64KB stack array here would live in this future
+    // across the awaits below, bloating every frame-read future (a stack-overflow
+    // hazard). Vec keeps one-read-per-syscall throughput; the future holds a ptr.
+    let mut tmp = vec![0_u8; 65536];
 
     // 1) Ensure the fixed-size header is buffered.
     while rx_buf.len() < HEADER_LEN {
@@ -212,7 +215,8 @@ pub async fn read_frame_buffered<R: AsyncRead + Unpin>(
 
     // 2) Parse the header WITHOUT consuming it, so a cancellation before the
     //    body is fully read resumes cleanly. Mirrors `read_frame_from`.
-    let kind = match rx_buf[4] {
+    let kind_byte = rx_buf[4];
+    let kind = match kind_byte {
         1 => FrameKind::Request,
         2 => FrameKind::Response,
         3 => FrameKind::Event,
@@ -339,6 +343,9 @@ mod tests {
             .expect("resumed read returns the whole frame");
         assert!(matches!(kind, FrameKind::Request));
         assert_eq!(got, body, "body must round-trip across the cancelled peek");
-        assert!(rx_buf.is_empty(), "buffer fully drained after consuming the frame");
+        assert!(
+            rx_buf.is_empty(),
+            "buffer fully drained after consuming the frame"
+        );
     }
 }

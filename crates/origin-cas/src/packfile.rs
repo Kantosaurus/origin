@@ -183,10 +183,7 @@ impl PackReader {
         for _ in 0..entries {
             // Checked add: a corrupt `index_offset` near usize::MAX must not
             // wrap past the bounds check into an out-of-bounds slice panic.
-            if cursor
-                .checked_add(entry_size)
-                .is_none_or(|end| end > map.len())
-            {
+            if cursor.checked_add(entry_size).is_none_or(|end| end > map.len()) {
                 return Err(PackError::Truncated);
             }
             let mut h = [0u8; 32];

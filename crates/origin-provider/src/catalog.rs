@@ -106,8 +106,8 @@ impl Catalog {
         // catalog and earlier custom entries, so a collision anywhere leaves the
         // catalog completely unchanged (atomic all-or-nothing merge).
         for (i, entry) in custom.iter().enumerate() {
-            let collides = self.entries.iter().any(|e| e.id == entry.id)
-                || custom[..i].iter().any(|e| e.id == entry.id);
+            let collides =
+                self.entries.iter().any(|e| e.id == entry.id) || custom[..i].iter().any(|e| e.id == entry.id);
             if collides {
                 return Err(CatalogError::IdCollision(entry.id.to_string()));
             }
