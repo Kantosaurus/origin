@@ -9,7 +9,7 @@
 //! piece of logic the daemon's `ActivateSkill { name: "goal", args }` arm
 //! performs (see `crates/origin-daemon/src/main.rs`).
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::panic, clippy::doc_markdown)]
 
 use origin_daemon::protocol::StreamEvent;
 use origin_goal::{parse_goal_args, GoalState};

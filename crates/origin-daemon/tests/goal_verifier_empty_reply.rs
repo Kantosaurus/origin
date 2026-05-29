@@ -8,6 +8,8 @@
 
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::panic)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::needless_collect)]
 
 use origin_daemon::protocol::StreamEvent;
 use origin_goal::GoalState;

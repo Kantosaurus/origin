@@ -11,7 +11,7 @@
 //! prompt and the model would invent capabilities and workflows from the
 //! tool list alone.
 
-#![allow(clippy::panic)]
+#![allow(clippy::panic, clippy::unwrap_used, clippy::doc_markdown)]
 
 use async_trait::async_trait;
 use origin_core::types::{Block, Message, Role};

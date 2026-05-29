@@ -5,7 +5,13 @@
 //! diagnostic; this test asserts a warn-level log is emitted that names the
 //! orphan index so the loss is at least observable in operator logs.
 
-#![allow(clippy::panic)]
+#![allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::doc_markdown,
+    clippy::module_name_repetitions,
+    clippy::use_self
+)]
 
 use async_trait::async_trait;
 use origin_daemon::agent::{run_loop, LoopOptions};

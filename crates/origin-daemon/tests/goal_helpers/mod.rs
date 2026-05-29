@@ -35,6 +35,13 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::panic)]
 #![allow(clippy::missing_const_for_fn)]
+#![allow(clippy::redundant_clone)]
+#![allow(clippy::needless_collect)]
+#![allow(clippy::unnecessary_join)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::significant_drop_tightening)]
+#![allow(clippy::match_like_matches_macro)]
+#![allow(clippy::equatable_if_let)]
 
 use async_trait::async_trait;
 use origin_core::types::{Block, Message, Role};

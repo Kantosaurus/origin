@@ -10,7 +10,12 @@
 //! bare-goal branch (which we mirror as `bare_goal_event_for`) chooses
 //! `GoalInactive` when the slot is empty.
 
-#![allow(clippy::panic)]
+#![allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::doc_markdown,
+    clippy::option_if_let_else
+)]
 
 use origin_daemon::protocol::StreamEvent;
 use origin_goal::GoalState;

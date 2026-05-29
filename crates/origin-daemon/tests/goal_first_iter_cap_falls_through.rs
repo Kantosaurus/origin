@@ -22,6 +22,7 @@
 
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::panic)]
+#![allow(clippy::doc_markdown)]
 
 use origin_goal::{ClearReason, GoalState};
 

@@ -4,6 +4,7 @@
 
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::panic)]
+#![allow(clippy::doc_markdown)]
 
 use origin_daemon::goal_checkpoint::make_goal_checkpoint_token;
 use origin_daemon::session_store::SessionStore;
