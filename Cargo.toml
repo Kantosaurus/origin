@@ -44,7 +44,7 @@ landlock = "0.4"
 tikv-jemallocator = { version = "0.6", default-features = false, features = ["background_threads"] }
 tikv-jemalloc-ctl = { version = "0.6", default-features = false }
 tokio-uring = "0.5"
-nix = { version = "0.29", default-features = false, features = ["signal", "process"] }
+nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
 # P13 QUIC + mutual-TLS remote IPC transport
 quinn          = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring", "log"] }
 rustls         = { version = "0.23", default-features = false, features = ["ring", "std"] }
