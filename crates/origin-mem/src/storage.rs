@@ -615,6 +615,11 @@ fn map_ref_err_to_sql(e: origin_cas::RefError) -> rusqlite::Error {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::no_effect_underscore_binding,
+    clippy::doc_markdown
+)]
 mod tag_resolution_contract {
     //! Compile-time + runtime contract checks for [`resolve_tags`].
     //!
