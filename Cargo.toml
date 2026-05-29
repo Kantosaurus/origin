@@ -61,7 +61,10 @@ rusqlite     = { version = "0.32", default-features = false, features = ["bundle
 clap_mangen  = "0.2"
 # P15 — embedded skills + browser/web tools
 include_dir  = "0.7"
-readability  = "0.3"
+# default features pull in reqwest 0.11 (native-tls -> openssl-sys), which breaks
+# the musl/cross release build and contradicts our rustls-only TLS policy. We
+# only use `readability::extractor::extract`, which needs no network feature.
+readability  = { version = "0.3", default-features = false }
 html2md      = "0.2"
 # tool-suite-v2 additions
 encoding_rs  = "0.8"
