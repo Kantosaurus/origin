@@ -96,9 +96,7 @@ function npm(args, timeoutMs) {
   }).trim();
 }
 
-// Is this package installed into npm's GLOBAL prefix? We only auto-update
-// global installs; a project-local dependency is owned by that project's
-// package.json and must not be mutated behind its back.
+// Is this package installed into npm's GLOBAL prefix?
 function isGlobalInstall() {
   if (process.env.ORIGINX_FORCE_GLOBAL === '1') return true; // test hook
   try {
@@ -118,6 +116,30 @@ function isGlobalInstall() {
     log(`isGlobalInstall: npm root -g failed: ${e.message}`);
     return false;
   }
+}
+
+// For a project-local install, resolve the project root (the directory whose
+// `node_modules` contains us) so we can run `npm install` there. Returns null
+// for layouts where a plain `npm install` would be wrong or unsafe:
+//   - scoped/hoisted nesting where our parent isn't literally `node_modules`
+//   - a project dir that is ITSELF inside another `node_modules` (pnpm virtual
+//     store, hoisted transitive dep) — updating there would corrupt the store
+//   - no package.json at the resolved root (not a real project)
+// This intentionally covers only the clean `<project>/node_modules/originx`
+// case; exotic layouts fall through to "skip" rather than risk damage.
+function localProjectDir() {
+  if (process.env.ORIGINX_FORCE_PROJECT_DIR) return process.env.ORIGINX_FORCE_PROJECT_DIR; // test hook
+  const pkgDir = path.resolve(__dirname, '..'); // .../node_modules/originx
+  const parent = path.dirname(pkgDir); // expected: .../node_modules
+  if (path.basename(parent) !== 'node_modules') return null;
+  const proj = path.dirname(parent);
+  if (proj.split(path.sep).includes('node_modules')) return null; // nested store
+  try {
+    if (!fs.existsSync(path.join(proj, 'package.json'))) return null;
+  } catch {
+    return null;
+  }
+  return proj;
 }
 
 // Acquire an exclusive lock via atomic mkdir. A stale lock (>1h, presumed dead
@@ -218,24 +240,40 @@ function runCheck(current) {
   if (!semverGt(latest, current)) {
     return; // already current (or ahead, e.g. a prerelease)
   }
-  if (!isGlobalInstall()) {
-    log(`update ${current} -> ${latest} available but install is not global; skipping`);
-    return;
+
+  // Pick the install command for how THIS copy is installed:
+  //   global -> `npm install -g originx@latest`
+  //   local  -> `npm install originx@latest --no-save` in the project root.
+  //             --no-save updates the working copy without rewriting the
+  //             project's declared dependency in package.json (a clean
+  //             `npm ci` would later restore the pinned version).
+  const spec = `${PKG_NAME}@${latest}`;
+  let mode;
+  let cwd;
+  let args;
+  if (isGlobalInstall()) {
+    mode = 'global';
+    args = ['install', '-g', spec];
+  } else {
+    const proj = localProjectDir();
+    if (!proj) {
+      log(`update ${current} -> ${latest} available but install layout not recognized; skipping`);
+      return;
+    }
+    mode = 'local';
+    cwd = proj;
+    args = ['install', spec, '--no-save'];
   }
 
-  const spec = `${PKG_NAME}@${latest}`;
   try {
     if (process.env.ORIGINX_UPDATE_DRY_RUN === '1') {
-      log(`[dry-run] would run: npm install -g ${spec}`);
+      log(`[dry-run] would run (${mode}${cwd ? ` @ ${cwd}` : ''}): npm ${args.join(' ')}`);
     } else {
-      log(`updating ${current} -> ${latest}: npm install -g ${spec}`);
+      log(`updating ${current} -> ${latest} (${mode}): npm ${args.join(' ')}`);
       // Long timeout: a fresh binary download can take a while.
-      execFileSync(NPM, ['install', '-g', spec], {
-        stdio: 'ignore',
-        timeout: 10 * 60 * 1000,
-        windowsHide: true,
-        shell: IS_WIN,
-      });
+      const opts = { stdio: 'ignore', timeout: 10 * 60 * 1000, windowsHide: true, shell: IS_WIN };
+      if (cwd) opts.cwd = cwd;
+      execFileSync(NPM, args, opts);
     }
     // Announce on next launch.
     writeJson(markerFile(), { version: latest, ts: Date.now() });
@@ -258,4 +296,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { semverGt, isGlobalInstall, main };
+module.exports = { semverGt, isGlobalInstall, localProjectDir, main };

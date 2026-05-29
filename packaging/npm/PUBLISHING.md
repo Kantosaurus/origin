@@ -71,10 +71,15 @@ placeholder; `build.mjs --version` is authoritative at publish time.
 ## Auto-update and dist-tags
 
 Installed clients auto-update by following the **`latest`** dist-tag (the
-launcher runs `npm view originx@latest version` in the background once a day and
-`npm install -g` when it sees a newer version). Consequences for releasing:
+launcher runs `npm view originx@latest version` in the background once a day and,
+when it sees a newer version, `npm install -g originx@latest` for a global
+install or `npm install originx@latest --no-save` in the project root for a
+local one). Consequences for releasing:
 
-- Publishing `X.Y.Z` to `latest` rolls it out to all global installs within ~24h.
+- Publishing `X.Y.Z` to `latest` rolls it out to all global installs within ~24h,
+  and to local installs the next time `origin` is launched from that project
+  (the `--no-save` refresh updates the working copy without touching the
+  project's declared dependency range).
 - Prereleases (`-rc`/`-beta`/`-alpha`) auto-publish to the **`next`** tag, so
   they never become `latest` and never auto-update stable users. The client's
   version comparison also refuses to move a stable install onto a prerelease.

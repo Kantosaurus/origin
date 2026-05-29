@@ -48,12 +48,18 @@ the background (at most once per day, never blocking startup) and, when a newer
 version is published, installs it via npm. The update applies the next time you
 run `origin`, which announces it once (`origin: updated to vX.Y.Z`).
 
-- Auto-update applies to **global installs** (`npm i -g`) only; a project-local
-  dependency is left for that project to manage.
+- **Global installs** (`npm i -g`): updated with `npm install -g originx@latest`.
+- **Local installs** (a project dependency): updated with
+  `npm install originx@latest --no-save` in the project root — this refreshes the
+  working copy in `node_modules` **without** rewriting the version your
+  `package.json` declares, so your committed dependency range is never touched. A
+  clean `npm ci` later restores the pinned version. (Skipped for exotic layouts
+  such as a pnpm virtual store, where a plain `npm install` would be unsafe.)
 - It uses npm (registry integrity, no extra tooling), not the binary's built-in
   cosign-verified self-updater — that would require the `cosign` CLI most npm
   machines lack.
-- Update on demand anytime: `npm update -g originx`.
+- Update on demand anytime: `npm update -g originx` (or `npm update originx` in a
+  project).
 
 Disable it with `ORIGINX_NO_UPDATE=1`.
 

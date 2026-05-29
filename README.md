@@ -69,8 +69,9 @@ origin                   # launches the TUI
 > The npm package is named **`originx`** (the name `origin` was already taken on
 > npm); the installed command is always **`origin`**. npm pulls a single small
 > prebuilt binary for your platform, with a GitHub-release download fallback.
-> It **auto-updates by default** (background npm check, once/day; disable with
-> `ORIGINX_NO_UPDATE=1`). See [`packaging/npm/`](packaging/npm/README.md) for details.
+> It **auto-updates by default** (background npm check once/day, for both global
+> and project-local installs; disable with `ORIGINX_NO_UPDATE=1`). See
+> [`packaging/npm/`](packaging/npm/README.md) for details.
 
 Other channels:
 
