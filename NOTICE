@@ -1,0 +1,13 @@
+origin
+Copyright 2026 Ainsley Woo and the origin contributors
+
+This product includes software developed as part of the origin project
+(https://github.com/Kantosaurus/origin).
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file for
+the full license text.
+
+This project draws design attributes from prior agentic coding harnesses
+(Claude Code, jcode, opencode); every signature subsystem uses an original
+mechanism. Third-party dependencies are distributed under their own licenses;
+see each crate's metadata and `Cargo.lock` for details.
