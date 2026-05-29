@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use origin_tools::builtins::write::{write_v2, WriteArgs, WriteGuard};
 use std::fs;
 use tempfile::tempdir;

@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use origin_tools::builtins::glob_tool::{glob_v2, GlobArgs};
 use std::fs;
 use std::time::Duration;

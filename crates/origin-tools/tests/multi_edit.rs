@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use origin_tools::builtins::multi_edit::{multi_edit, EditOp, MultiEditArgs};
 use std::fs;
 use tempfile::tempdir;

@@ -1,5 +1,7 @@
 //! Canary suite for the CRLF Edit failure class.
 
+#![allow(clippy::unwrap_used)]
+
 use origin_tools::builtins::edit::{edit_v2, EditArgs};
 use std::fs;
 use tempfile::tempdir;

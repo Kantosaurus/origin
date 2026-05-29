@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use origin_tools::builtins::apply_patch::{apply_patch, ApplyPatchArgs};
 use std::fs;
 use tempfile::tempdir;

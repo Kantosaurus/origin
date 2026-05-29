@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use origin_tools::proc_supervisor::{SpawnOpts, Supervisor};
 use std::time::Duration;
 

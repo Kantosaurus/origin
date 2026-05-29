@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use origin_tools::tool_envelope::{run_passthrough, EnvelopeCtx};
 use serde_json::json;
 

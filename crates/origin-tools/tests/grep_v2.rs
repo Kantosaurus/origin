@@ -1,3 +1,8 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::case_sensitive_file_extension_comparisons
+)]
+
 use origin_tools::builtins::grep_tool::{grep_v2, GrepArgs, OutputMode};
 use std::fs;
 use tempfile::tempdir;

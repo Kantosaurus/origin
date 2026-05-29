@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::bool_assert_comparison)]
+
 use origin_tools::tool_envelope::{run, EnvelopeCtx, EnvelopeMode};
 use origin_tools::SideEffects;
 use serde_json::json;

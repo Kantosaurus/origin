@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use origin_tools::builtins::bash::{bash_v2, BashArgs};
 use origin_tools::proc_supervisor::Supervisor;
 use std::time::Duration;

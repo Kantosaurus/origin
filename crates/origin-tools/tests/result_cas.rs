@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use origin_tools::result_cas::{ref_token, ResultStore};
 use serde_json::json;
 

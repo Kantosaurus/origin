@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::format_collect, clippy::panic)]
+
 use origin_tools::builtins::read::{read_v2, ReadArgs};
 use std::fs;
 use tempfile::tempdir;

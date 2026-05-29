@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use origin_tools::builtins::diagnostics::{diagnostics, DiagnosticsArgs};
 use origin_tools::ra_bridge::{DiagnosticsHandle, RaDiagnostic, Severity};
 use std::path::Path;

@@ -6,6 +6,8 @@
 //! We don't need a full validator here — we just need to refuse any subtree
 //! where `items` is a JSON array instead of an object/bool.
 
+#![allow(clippy::unwrap_used, clippy::panic)]
+
 use serde_json::Value;
 
 fn walk_for_array_items(v: &Value, path: &str, failures: &mut Vec<String>) {

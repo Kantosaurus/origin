@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::bool_assert_comparison)]
+
 use origin_tools::builtins::edit::{edit_v2, EditArgs};
 use std::fs;
 use tempfile::tempdir;
