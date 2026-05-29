@@ -792,18 +792,15 @@ pub async fn run_loop(
         // Dispatch each tool_use sequentially.
         let mut tool_results: Vec<Block> = Vec::with_capacity(tool_uses.len());
         for (id, name, input_bytes) in tool_uses {
-            let meta = match registry_iter().find(|m| m.name == name) {
-                Some(m) => m,
-                None => {
-                    tracing::warn!(tool = %name, "unknown tool; returning error to model");
-                    tool_results.push(Block::ToolResult {
-                        tool_use_id: id,
-                        handle: None,
-                        inline: Some(format!("Error: unknown tool `{name}`").into_bytes()),
-                        cache_marker: None,
-                    });
-                    continue;
-                }
+            let Some(meta) = registry_iter().find(|m| m.name == name) else {
+                tracing::warn!(tool = %name, "unknown tool; returning error to model");
+                tool_results.push(Block::ToolResult {
+                    tool_use_id: id,
+                    handle: None,
+                    inline: Some(format!("Error: unknown tool `{name}`").into_bytes()),
+                    cache_marker: None,
+                });
+                continue;
             };
             let args: Value = match serde_json::from_slice(&input_bytes) {
                 Ok(v) => v,
@@ -1114,7 +1111,7 @@ fn apply_turn_cache_markers(messages: &mut [Message], plan: Option<&origin_plann
     // outside the latest-N window are unmarked here. Without this pass, stale
     // markers from earlier calls would accumulate past the ceiling.
     for msg in messages.iter_mut() {
-        for b in msg.blocks.iter_mut() {
+        for b in &mut msg.blocks {
             clear_block_cache_marker(b);
         }
     }
@@ -1308,8 +1305,8 @@ async fn dispatch_tool(
                     .and_then(Value::as_str)
                     .ok_or_else(|| LoopError::BadArgs("Read: missing `file_path`".into()))?
                     .to_string(),
-                offset: args.get("offset").and_then(Value::as_u64).map(|n| n as u32),
-                limit: args.get("limit").and_then(Value::as_u64).map(|n| n as u32),
+                offset: args.get("offset").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
+                limit: args.get("limit").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
                 as_: args.get("as").and_then(Value::as_str).map(str::to_string),
             };
             origin_tools::builtins::read::read_v2(args).map_err(|e| LoopError::ToolFailure(e.message))
@@ -1322,17 +1319,17 @@ async fn dispatch_tool(
                     .ok_or_else(|| LoopError::BadArgs("Glob: missing `pattern`".into()))?
                     .to_string(),
                 path: args.get("path").and_then(Value::as_str).map(str::to_string),
-                head_limit: args.get("head_limit").and_then(Value::as_u64).map(|n| n as u32),
+                head_limit: args.get("head_limit").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
             };
             origin_tools::builtins::glob_tool::glob_v2(gargs)
-                .map(|v| serde_json::to_string(&v).unwrap())
+                .map(|v| serde_json::to_string(&v).expect("BUG: GlobResult always serializes"))
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "Grep" => {
             let mode = args.get("output_mode").and_then(Value::as_str).map(|s| match s {
-                "files_with_matches" => origin_tools::builtins::grep_tool::OutputMode::FilesWithMatches,
                 "content" => origin_tools::builtins::grep_tool::OutputMode::Content,
                 "count" => origin_tools::builtins::grep_tool::OutputMode::Count,
+                // "files_with_matches" and any unknown value fall back to FilesWithMatches.
                 _ => origin_tools::builtins::grep_tool::OutputMode::FilesWithMatches,
             });
             let gargs = origin_tools::builtins::grep_tool::GrepArgs {
@@ -1345,22 +1342,22 @@ async fn dispatch_tool(
                 glob: args.get("glob").and_then(Value::as_str).map(str::to_string),
                 r#type: args.get("type").and_then(Value::as_str).map(str::to_string),
                 output_mode: mode,
-                head_limit: args.get("head_limit").and_then(Value::as_u64).map(|n| n as u32),
+                head_limit: args.get("head_limit").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
                 before: args
                     .get("before")
                     .and_then(Value::as_u64)
-                    .map(|n| n as u32)
+                    .and_then(|n| u32::try_from(n).ok())
                     .unwrap_or(0),
                 after: args
                     .get("after")
                     .and_then(Value::as_u64)
-                    .map(|n| n as u32)
+                    .and_then(|n| u32::try_from(n).ok())
                     .unwrap_or(0),
                 line_numbers: args.get("line_numbers").and_then(Value::as_bool).unwrap_or(false),
                 multiline: args.get("multiline").and_then(Value::as_bool).unwrap_or(false),
             };
             origin_tools::builtins::grep_tool::grep_v2(gargs)
-                .map(|v| serde_json::to_string(&v).unwrap())
+                .map(|v| serde_json::to_string(&v).expect("BUG: GrepResult always serializes"))
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "Edit" => {
@@ -1383,7 +1380,7 @@ async fn dispatch_tool(
                 replace_all: args.get("replace_all").and_then(Value::as_bool).unwrap_or(false),
             };
             origin_tools::builtins::edit::edit_v2(args)
-                .map(|v| serde_json::to_string(&v).unwrap())
+                .map(|v| serde_json::to_string(&v).expect("BUG: EditResult always serializes"))
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "MultiEdit" => {
@@ -1413,7 +1410,7 @@ async fn dispatch_tool(
                 edits,
             };
             origin_tools::builtins::multi_edit::multi_edit(&margs)
-                .map(|v| serde_json::to_string(&v).unwrap())
+                .map(|v| serde_json::to_string(&v).expect("BUG: MultiEditResult always serializes"))
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "ApplyPatch" => {
@@ -1425,7 +1422,7 @@ async fn dispatch_tool(
                     .to_string(),
             };
             origin_tools::builtins::apply_patch::apply_patch(&pargs)
-                .map(|v| serde_json::to_string(&v).unwrap())
+                .map(|v| serde_json::to_string(&v).expect("BUG: ApplyPatchResult always serializes"))
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "Write" => {
@@ -1456,7 +1453,7 @@ async fn dispatch_tool(
                     .and_then(Value::as_str)
                     .ok_or_else(|| LoopError::BadArgs("Bash: missing `command`".into()))?
                     .to_string(),
-                timeout: args.get("timeout").and_then(Value::as_u64).map(|n| n as u32),
+                timeout: args.get("timeout").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
                 cwd: args.get("cwd").and_then(Value::as_str).map(str::to_string),
                 env: args
                     .get("env")
@@ -1485,7 +1482,7 @@ async fn dispatch_tool(
             let sup = origin_tools::proc_supervisor::Supervisor::new();
             origin_tools::builtins::bash::bash_v2(bargs, &sup)
                 .await
-                .map(|v| serde_json::to_string(&v).unwrap())
+                .map(|v| serde_json::to_string(&v).expect("BUG: BashResult always serializes"))
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "Monitor" => {
@@ -1493,13 +1490,13 @@ async fn dispatch_tool(
                 pid: args
                     .get("pid")
                     .and_then(Value::as_u64)
-                    .map(|n| n as u32)
-                    .ok_or_else(|| LoopError::BadArgs("Monitor: missing `pid`".into()))?,
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| LoopError::BadArgs("Monitor: missing or out-of-range `pid`".into()))?,
                 since_byte: args.get("since_byte").and_then(Value::as_u64).unwrap_or(0),
                 max_bytes: args
                     .get("max_bytes")
                     .and_then(Value::as_u64)
-                    .map(|n| n as u32)
+                    .and_then(|n| u32::try_from(n).ok())
                     .unwrap_or(4096),
                 wait: args.get("wait").and_then(Value::as_bool).unwrap_or(false),
             };
@@ -1510,7 +1507,7 @@ async fn dispatch_tool(
             let sup = origin_tools::proc_supervisor::Supervisor::new();
             origin_tools::builtins::monitor::monitor(margs, &sup)
                 .await
-                .map(|v| serde_json::to_string(&v).unwrap())
+                .map(|v| serde_json::to_string(&v).expect("BUG: MonitorResult always serializes"))
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "Diagnostics" => {
@@ -1533,7 +1530,7 @@ async fn dispatch_tool(
             );
             origin_tools::builtins::diagnostics::diagnostics(dargs, &ra)
                 .await
-                .map(|v| serde_json::to_string(&v).unwrap())
+                .map(|v| serde_json::to_string(&v).expect("BUG: DiagnosticsResult always serializes"))
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "ToolSearch" => {
@@ -1543,10 +1540,10 @@ async fn dispatch_tool(
                     .and_then(Value::as_str)
                     .ok_or_else(|| LoopError::BadArgs("ToolSearch: missing `query`".into()))?
                     .to_string(),
-                max_results: args.get("max_results").and_then(Value::as_u64).map(|n| n as u32),
+                max_results: args.get("max_results").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
             };
             origin_tools::builtins::tool_search::tool_search(&sargs)
-                .map(|v| serde_json::to_string(&v).unwrap())
+                .map(|v| serde_json::to_string(&v).expect("BUG: ToolSearchResult always serializes"))
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "Recall" => {
@@ -1946,7 +1943,7 @@ async fn run_bash_streaming(
             .and_then(Value::as_str)
             .ok_or_else(|| "Bash: missing `command`".to_string())?
             .to_string(),
-        timeout: args.get("timeout").and_then(Value::as_u64).map(|n| n as u32),
+        timeout: args.get("timeout").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
         cwd: args.get("cwd").and_then(Value::as_str).map(str::to_string),
         env: args
             .get("env")
@@ -2002,7 +1999,9 @@ async fn run_bash_streaming(
         }
     }
 
-    Ok(serde_json::to_string(&result).unwrap().into_bytes())
+    Ok(serde_json::to_string(&result)
+        .expect("BUG: bash result Value always serializes")
+        .into_bytes())
 }
 
 /// Build a bounded preview of a tool's result bytes for live display in the
@@ -2122,7 +2121,9 @@ fn tool_diff_lines(name: &str, args: &Value) -> Vec<crate::protocol::DiffLine> {
                 .enumerate()
                 .map(|(i, line)| DiffLine {
                     kind: "+".to_string(),
-                    line_no: (i + 1) as u32,
+                    // Line counts beyond u32::MAX (~4B lines) are not realistic for any file
+                    // we'd diff; saturate rather than panic if we ever see one.
+                    line_no: u32::try_from(i + 1).unwrap_or(u32::MAX),
                     text: line.to_string(),
                 })
                 .collect()
@@ -2151,14 +2152,12 @@ fn diff_lines_lcs(old: &[&str], new: &[&str]) -> Vec<crate::protocol::DiffLine> 
 
     if n.saturating_mul(m) > MAX_DIFF_CELLS {
         let mut out = Vec::with_capacity(n + m);
-        let mut old_no = 0u32;
-        for line in old {
-            old_no += 1;
+        for (i, line) in old.iter().enumerate() {
+            let old_no = u32::try_from(i + 1).unwrap_or(u32::MAX);
             out.push(DiffLine { kind: "-".to_string(), line_no: old_no, text: (*line).to_string() });
         }
-        let mut new_no = 0u32;
-        for line in new {
-            new_no += 1;
+        for (i, line) in new.iter().enumerate() {
+            let new_no = u32::try_from(i + 1).unwrap_or(u32::MAX);
             out.push(DiffLine { kind: "+".to_string(), line_no: new_no, text: (*line).to_string() });
         }
         return out;
@@ -2381,29 +2380,29 @@ fn decode_tool_use_start(payload: &[u8]) -> Option<(u32, &str, &str)> {
 /// Returns `None` on any size mismatch so the caller cleanly skips malformed
 /// payloads instead of panicking. Replaces a string of `try_into().expect("4 bytes")`
 /// calls whose safety was load-bearing on the outer `p.len() == 16` guard.
-fn decode_usage_payload(p: &[u8]) -> Option<origin_provider::Usage> {
+fn decode_usage_payload(payload: &[u8]) -> Option<origin_provider::Usage> {
     // The single fallible step: assert the whole payload is exactly 16 bytes.
     // After that, the four 4-byte sub-arrays come from `let-else` slice
     // conversions that re-check locally — no `expect` and no panic risk if
     // the outer length guard is ever refactored away.
-    let arr: &[u8; 16] = p.try_into().ok()?;
-    let Ok(a) = <[u8; 4]>::try_from(&arr[0..4]) else {
+    let arr: &[u8; 16] = payload.try_into().ok()?;
+    let Ok(input_bytes) = <[u8; 4]>::try_from(&arr[0..4]) else {
         return None;
     };
-    let Ok(b) = <[u8; 4]>::try_from(&arr[4..8]) else {
+    let Ok(output_bytes) = <[u8; 4]>::try_from(&arr[4..8]) else {
         return None;
     };
-    let Ok(c) = <[u8; 4]>::try_from(&arr[8..12]) else {
+    let Ok(cache_read_bytes) = <[u8; 4]>::try_from(&arr[8..12]) else {
         return None;
     };
-    let Ok(d) = <[u8; 4]>::try_from(&arr[12..16]) else {
+    let Ok(cache_creation_bytes) = <[u8; 4]>::try_from(&arr[12..16]) else {
         return None;
     };
     Some(origin_provider::Usage {
-        input_tokens: u32::from_be_bytes(a),
-        output_tokens: u32::from_be_bytes(b),
-        cache_read_input_tokens: u32::from_be_bytes(c),
-        cache_creation_input_tokens: u32::from_be_bytes(d),
+        input_tokens: u32::from_be_bytes(input_bytes),
+        output_tokens: u32::from_be_bytes(output_bytes),
+        cache_read_input_tokens: u32::from_be_bytes(cache_read_bytes),
+        cache_creation_input_tokens: u32::from_be_bytes(cache_creation_bytes),
     })
 }
 

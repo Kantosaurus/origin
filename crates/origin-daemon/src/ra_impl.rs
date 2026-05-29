@@ -52,10 +52,10 @@ impl DaemonRa {
             .client
             .get_or_init(|| async {
                 let bin = resolve_ra()?;
-                match LspClient::spawn(&bin, &self.workspace_root).await {
-                    Ok(c) => Some(Arc::new(c)),
-                    Err(_) => None,
-                }
+                LspClient::spawn(&bin, &self.workspace_root)
+                    .await
+                    .ok()
+                    .map(Arc::new)
             })
             .await;
         c.as_ref()
