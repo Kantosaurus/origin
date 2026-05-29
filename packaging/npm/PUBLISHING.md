@@ -26,11 +26,44 @@ tag:
 
 Requirements:
 
-- A repository secret **`NPM_TOKEN`** (an npm automation token with publish
-  rights to `originx` and the `originx-*` packages).
-- The first publish of each package name must be done by an account that owns
-  the name. Run the manual flow once (below) to claim the names, then CI takes
-  over.
+- A repository secret **`NPM_TOKEN`**. It MUST be a **Granular Access Token**
+  with **read/write** package permission and the **"bypass two-factor
+  authentication"** capability. A *classic automation* token is **not** enough
+  when the account enforces 2FA for writes: the publish reaches the registry and
+  even signs provenance, then fails with
+  `E403 … Two-factor authentication or granular access token with bypass 2fa
+  enabled is required to publish packages`. (Alternatively, lower the npm
+  account's 2FA level to *Authorization only* so a classic automation token may
+  publish — less secure; the GAT is preferred.)
+- For the **first** publish the `originx*` names don't exist yet, so the token
+  cannot be scoped to them — grant it **All packages** read/write (or org-wide),
+  then optionally re-scope to `originx` / `originx-*` once they exist.
+- npm may also reject `originx` as *too similar* to the existing `origin`
+  package. If a retry fails with a similarity `E403` (a *different* message from
+  the 2FA one above), publish the scoped family `@kantosaurus/origin` by setting
+  **`ORIGIN_NPM_PREFIX=@kantosaurus/origin`** for the publish (the `npm publish`
+  job carries a commented env line for exactly this). `build.mjs` reads it, names
+  the main package and the six platform packages accordingly, and bakes the
+  prefix into the shipped launcher so binary resolution matches. The installed
+  command stays `origin`. **Caveat:** this mechanism lives in the code as of the
+  commit that added it, so it only applies to a tag built from that commit or
+  later — re-running an *older* tag's failed job (e.g. `v0.0.1`) uses that tag's
+  frozen scripts and ignores the variable; cut a fresh tag to switch names. (The
+  bundled npm README still says `originx`; update it if the scoped name sticks.)
+
+### Re-running after a failed publish
+
+The npm step reads `NPM_TOKEN` at run time, so after fixing the token you can
+re-publish the **same** tag without cutting a new one:
+
+```sh
+gh run rerun <run-id> --failed   # re-runs only the failed npm-publish job
+```
+
+The platform packages publish before the main package. If a run published some
+but not all of them, bump the version (a new tag) rather than re-running —
+re-publishing an existing `name@version` fails with `E409`. (`build.mjs` could
+be made idempotent by skipping versions already on the registry; not yet done.)
 
 ## Manual
 
