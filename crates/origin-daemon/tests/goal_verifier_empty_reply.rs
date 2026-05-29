@@ -22,16 +22,12 @@ use goal_helpers::{run_driver_loop_with_state, ScriptedProvider};
 async fn malformed_verifier_reply_does_not_confirm_as_met() {
     let provider = ScriptedProvider::new()
         // Turn 1: main model claims met.
-        .with_main_reply(
-            "all done\n<goal-status state=\"met\"><reason>done</reason></goal-status>",
-        )
+        .with_main_reply("all done\n<goal-status state=\"met\"><reason>done</reason></goal-status>")
         // Verifier returns garbage with no VERDICT: line. parse_verdict
         // returns Malformed; the driver MUST treat this as NotMet, not Met.
         .with_verifier_reply("I don't know.")
         // Turn 2: model addresses the gap and claims met legitimately.
-        .with_main_reply(
-            "really done now\n<goal-status state=\"met\"><reason>green</reason></goal-status>",
-        )
+        .with_main_reply("really done now\n<goal-status state=\"met\"><reason>green</reason></goal-status>")
         // Verifier confirms.
         .with_verifier_reply("VERDICT: met");
 

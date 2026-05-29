@@ -64,16 +64,16 @@ The fastest way to get the `origin` command on your `PATH` — no Rust toolchain
 required:
 
 ```sh
-npm install -g originx   # ships a prebuilt binary; the command is `origin`
-origin                   # launches the TUI
+npm install -g @kantosaurus/origin   # ships a prebuilt binary; the command is `origin`
+origin                               # launches the TUI
 ```
 
-> The npm package is named **`originx`** (the name `origin` was already taken on
-> npm); the installed command is always **`origin`**. npm pulls a single small
-> prebuilt binary for your platform, with a GitHub-release download fallback.
-> It **auto-updates by default** (background npm check once/day, for both global
-> and project-local installs; disable with `ORIGINX_NO_UPDATE=1`). See
-> [`packaging/npm/`](packaging/npm/README.md) for details.
+> The npm package is **`@kantosaurus/origin`** (scoped — the unscoped name was
+> unavailable); the installed command is always **`origin`**. npm pulls a single
+> small prebuilt binary for your platform, with a GitHub-release download
+> fallback. It **auto-updates by default** (background npm check once/day, for
+> both global and project-local installs; disable with `ORIGINX_NO_UPDATE=1`).
+> See [`packaging/npm/`](packaging/npm/README.md) for details.
 
 Other channels:
 
@@ -133,7 +133,7 @@ crates/            40+ workspace crates
   origin-codegraph/ code graph + retrieval
   origin-provider* / origin-mem / origin-skills / origin-tools / origin-trace ...
 docs/              mdBook site, design specs & plans, security reviews
-packaging/         npm (originx) / Homebrew / winget / AUR / binstall
+packaging/         npm (@kantosaurus/origin) / Homebrew / winget / AUR / binstall
 xtask/             release stamping, manpages, repo automation
 ```
 

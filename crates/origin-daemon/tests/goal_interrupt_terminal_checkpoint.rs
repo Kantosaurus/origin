@@ -29,7 +29,9 @@ fn interrupt_arm_writes_terminal_cleared_snapshot() {
         tokens_spent: 1_234,
         token_budget: 200_000,
         started_at_unix: 1_716_000_000,
-        status: GoalStatusWire::Cleared { by: ClearReasonWire::UserSlash },
+        status: GoalStatusWire::Cleared {
+            by: ClearReasonWire::UserSlash,
+        },
         last_status_tag: None,
     };
     let token = ResumeToken {
@@ -56,7 +58,9 @@ fn interrupt_arm_writes_terminal_cleared_snapshot() {
     // whole point of bug #17. `handle_resume_request` already filters
     // out terminal statuses so a Cleared snapshot doesn't get re-hydrated.
     match snap.status {
-        GoalStatusWire::Cleared { by: ClearReasonWire::UserSlash } => {}
+        GoalStatusWire::Cleared {
+            by: ClearReasonWire::UserSlash,
+        } => {}
         other => panic!("expected Cleared {{ UserSlash }}, got {other:?}"),
     }
 }

@@ -118,7 +118,9 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 
 /// Build a [`CompletionSources`] by reading the embedded `superpowers/`
 /// skill catalog merged with any user overrides in `~/.origin/skills/`
-/// (every `<dir>/SKILL.md`), plus `~/.origin/workflows.toml` for workflows.
+/// (every `<dir>/SKILL.md`).
+///
+/// Also reads `~/.origin/workflows.toml` for workflows.
 ///
 /// Failures degrade to empty lists so a missing directory or corrupt file
 /// doesn't break Tab.

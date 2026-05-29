@@ -12,8 +12,8 @@
 use crate::protocol::StreamEvent;
 use origin_goal::verifier::{Verdict, Verifier, VerifierError};
 use origin_goal::{
-    state::MAX_CONSECUTIVE_VERIFIER_REJECTIONS, ClearReason, ClearReasonWire, GoalState,
-    TagOutcome, TagOutcomeWire,
+    state::MAX_CONSECUTIVE_VERIFIER_REJECTIONS, ClearReason, ClearReasonWire, GoalState, TagOutcome,
+    TagOutcomeWire,
 };
 
 /// What the connection task should do after handling the driver's decision.
@@ -100,10 +100,7 @@ pub async fn drive_decision(
     last_turn_text: &str,
     verifier: &dyn Verifier,
 ) -> DecisionOutcome {
-    let tag = inputs
-        .last_status_tag
-        .clone()
-        .unwrap_or(TagOutcome::Missing);
+    let tag = inputs.last_status_tag.clone().unwrap_or(TagOutcome::Missing);
     match tag {
         TagOutcome::Met => {
             let truncated = truncate_for_verifier(last_turn_text);
@@ -167,9 +164,7 @@ pub async fn drive_decision(
                             decision: cleared_from_inputs(
                                 &inputs,
                                 0,
-                                ClearReason::VerifierRejected(
-                                    "verifier returned unparseable output".into(),
-                                ),
+                                ClearReason::VerifierRejected("verifier returned unparseable output".into()),
                             ),
                             set_consecutive_rejections: Some(next),
                             ..DecisionOutcome::default()
@@ -193,11 +188,7 @@ pub async fn drive_decision(
                     // Fail open — trust the main model's `met` claim rather
                     // than burn more budget on a verifier we can't reach.
                     DecisionOutcome {
-                        decision: cleared_from_inputs(
-                            &inputs,
-                            0,
-                            ClearReason::VerifierUnavailable,
-                        ),
+                        decision: cleared_from_inputs(&inputs, 0, ClearReason::VerifierUnavailable),
                         ..DecisionOutcome::default()
                     }
                 }
@@ -258,11 +249,7 @@ pub async fn drive_decision(
 ///
 /// Bug #11: after the verifier returns `Met`, the caller's `cap_check`
 /// fires once more — handled in `apply_outcome`.
-pub async fn drive(
-    state: &mut GoalState,
-    last_turn_text: &str,
-    verifier: &dyn Verifier,
-) -> DriverDecision {
+pub async fn drive(state: &mut GoalState, last_turn_text: &str, verifier: &dyn Verifier) -> DriverDecision {
     let inputs = DriverInputs::snapshot(state);
     let outcome = drive_decision(inputs, last_turn_text, verifier).await;
     apply_outcome(state, outcome)
@@ -310,19 +297,13 @@ pub fn apply_outcome(state: &mut GoalState, outcome: DecisionOutcome) -> DriverD
             iter_event: StreamEvent::GoalIteration {
                 iter: state.iter,
                 tokens_spent: state.tokens_spent,
-                last_tag: TagOutcomeWire::from(
-                    state.last_status_tag.clone().unwrap_or(TagOutcome::Missing),
-                ),
+                last_tag: TagOutcomeWire::from(state.last_status_tag.clone().unwrap_or(TagOutcome::Missing)),
             },
         },
     }
 }
 
-fn cleared_from_inputs(
-    inputs: &DriverInputs,
-    extra_tokens: u64,
-    reason: ClearReason,
-) -> DriverDecision {
+fn cleared_from_inputs(inputs: &DriverInputs, extra_tokens: u64, reason: ClearReason) -> DriverDecision {
     DriverDecision::Cleared {
         reason: reason.into(),
         iter: inputs.iter,
@@ -334,12 +315,7 @@ fn iterate_from_inputs(inputs: &DriverInputs, extra_tokens: u64, prompt: String)
     let iter_event = StreamEvent::GoalIteration {
         iter: inputs.iter,
         tokens_spent: inputs.tokens_spent.saturating_add(extra_tokens),
-        last_tag: TagOutcomeWire::from(
-            inputs
-                .last_status_tag
-                .clone()
-                .unwrap_or(TagOutcome::Missing),
-        ),
+        last_tag: TagOutcomeWire::from(inputs.last_status_tag.clone().unwrap_or(TagOutcome::Missing)),
     };
     DriverDecision::Iterate {
         synthesized_prompt: prompt,
@@ -408,8 +384,7 @@ mod tests {
             _condition: &str,
             _last_turn: &str,
         ) -> Result<(Verdict, u64, u64), VerifierError> {
-            self.call_count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut replies = self.replies.lock().unwrap();
             assert!(!replies.is_empty(), "mock verifier over-consumed");
             replies.remove(0)
@@ -575,7 +550,9 @@ mod tests {
         let v = MockVerifier::new(vec![Ok((Verdict::Met, 40, 20))]);
         let d = drive(&mut g, "done", &v).await;
         match d {
-            DriverDecision::Cleared { reason, tokens_spent, .. } => {
+            DriverDecision::Cleared {
+                reason, tokens_spent, ..
+            } => {
                 assert!(
                     matches!(reason, ClearReasonWire::BudgetExhausted),
                     "expected BudgetExhausted, got {reason:?}"
@@ -596,16 +573,16 @@ mod tests {
         let v = MockVerifier::new(vec![Err(VerifierError::Malformed("garbage".into()))]);
         let d = drive(&mut g, "done", &v).await;
         match d {
-            DriverDecision::Iterate { synthesized_prompt, .. } => {
+            DriverDecision::Iterate {
+                synthesized_prompt, ..
+            } => {
                 assert!(
                     synthesized_prompt.contains("unparseable"),
                     "expected the synthesized prompt to mention unparseable; got: {synthesized_prompt:?}"
                 );
             }
             DriverDecision::Cleared { reason, .. } => {
-                panic!(
-                    "malformed verifier output must NOT clear as Met or Unavailable; got {reason:?}"
-                );
+                panic!("malformed verifier output must NOT clear as Met or Unavailable; got {reason:?}");
             }
         }
         assert_eq!(v.call_count(), 1);
@@ -689,7 +666,9 @@ mod tests {
 
     #[test]
     fn truncate_for_verifier_keeps_tail_when_over_limit() {
-        let s: String = std::iter::repeat('a').take(VERIFIER_INPUT_MAX_CHARS + 100).collect();
+        let s: String = std::iter::repeat('a')
+            .take(VERIFIER_INPUT_MAX_CHARS + 100)
+            .collect();
         let out = truncate_for_verifier(&s);
         assert_eq!(out.len(), VERIFIER_INPUT_MAX_CHARS);
     }
