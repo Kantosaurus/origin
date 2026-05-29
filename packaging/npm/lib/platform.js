@@ -16,13 +16,17 @@
 // installed onto PATH is always `origin` regardless of this (see the main
 // package's `bin` field).
 //
-// Overridable at PUBLISH time via `ORIGIN_NPM_PREFIX` so a publish blocked by
-// npm's name-similarity filter can switch to the scoped `@kantosaurus/origin`
-// family without hand-editing names across files. `scripts/build.mjs` reads
-// this value when assembling, then bakes the *resolved* literal into the
+// The default is the SCOPED family `@kantosaurus/origin`: the unscoped
+// `originx*` names tripped npm's spam-detection filter mid-publish (see
+// PUBLISHING.md), and scoped names live under the account namespace where that
+// filter does not apply.
+//
+// Overridable at PUBLISH time via `ORIGIN_NPM_PREFIX` (e.g. back to a future
+// unscoped name) without hand-editing names across files. `scripts/build.mjs`
+// reads this value when assembling, then bakes the *resolved* literal into the
 // published copy of this file — so an end user's environment can never alter
 // which package the launcher resolves the binary from.
-const PKG_PREFIX = process.env.ORIGIN_NPM_PREFIX || 'originx';
+const PKG_PREFIX = process.env.ORIGIN_NPM_PREFIX || '@kantosaurus/origin';
 
 // GitHub repository that hosts the release artifacts. Must match the Rust
 // updater's RELEASES_REPO and the git remote.
