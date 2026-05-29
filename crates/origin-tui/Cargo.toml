@@ -26,7 +26,7 @@ thiserror = "1"
 wide = "0.7"
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
 unicode-segmentation = "1"
-unicode-width = "0.1"
+unicode-width = "0.2"
 lru = "0.12"
 fxhash = "0.2"
 origin-metrics = { path = "../origin-metrics" }
