@@ -200,14 +200,14 @@ fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
 ///
 /// # Errors
 /// [`UpdateError::UnsupportedPlatform`] when the host doesn't match one of
-/// the six published targets (`x86_64`/`aarch64` cross `linux-musl` /
+/// the six published targets (`x86_64`/`aarch64` cross `linux-gnu` /
 /// `apple-darwin` / `pc-windows-msvc`).
 pub fn current_target_asset_name() -> Result<String, UpdateError> {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     let (triple, ext) = match (os, arch) {
-        ("linux", "x86_64") => ("x86_64-unknown-linux-musl", ""),
-        ("linux", "aarch64") => ("aarch64-unknown-linux-musl", ""),
+        ("linux", "x86_64") => ("x86_64-unknown-linux-gnu", ""),
+        ("linux", "aarch64") => ("aarch64-unknown-linux-gnu", ""),
         ("macos", "x86_64") => ("x86_64-apple-darwin", ""),
         ("macos", "aarch64") => ("aarch64-apple-darwin", ""),
         ("windows", "x86_64") => ("x86_64-pc-windows-msvc", ".exe"),

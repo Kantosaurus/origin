@@ -17,9 +17,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-musl
+          # glibc (gnu), not musl: ONNX Runtime (ort, via origin-mem) ships no
+          # musl build and can't compile in the musl cross container. gnu links
+          # glibc and runs on all mainstream Linux distros (not Alpine/static).
+          - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-          - target: aarch64-unknown-linux-musl
+          - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
           - target: x86_64-apple-darwin
             os: macos-latest
@@ -35,8 +38,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Install cross (linux only)
-        if: contains(matrix.target, 'linux')
+      - name: Install cross (aarch64 Linux only)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cargo install cross --locked
       - name: Build
         shell: bash
@@ -52,7 +55,9 @@ jobs:
           CARGO_PROFILE_RELEASE_OPT_LEVEL: z
           CARGO_PROFILE_RELEASE_STRIP: symbols
         run: |
-          if [[ "${{ matrix.target }}" == *linux* ]]; then
+          # aarch64 Linux is cross-compiled with `cross`; x86_64 Linux builds
+          # natively on the ubuntu runner; macOS/Windows build natively too.
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
             cross build -p origin-cli --release --target ${{ matrix.target }}
           else
             cargo build -p origin-cli --release --target ${{ matrix.target }}

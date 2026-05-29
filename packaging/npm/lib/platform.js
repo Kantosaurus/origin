@@ -24,8 +24,8 @@ const RELEASES_REPO = 'Kantosaurus/origin';
 //   pkg    : per-platform optionalDependency carrying that one binary
 //   ext    : executable extension ("" on unix, ".exe" on windows)
 const TARGETS = {
-  'linux x64': { triple: 'x86_64-unknown-linux-musl', pkg: `${PKG_PREFIX}-linux-x64`, ext: '' },
-  'linux arm64': { triple: 'aarch64-unknown-linux-musl', pkg: `${PKG_PREFIX}-linux-arm64`, ext: '' },
+  'linux x64': { triple: 'x86_64-unknown-linux-gnu', pkg: `${PKG_PREFIX}-linux-x64`, ext: '' },
+  'linux arm64': { triple: 'aarch64-unknown-linux-gnu', pkg: `${PKG_PREFIX}-linux-arm64`, ext: '' },
   'darwin x64': { triple: 'x86_64-apple-darwin', pkg: `${PKG_PREFIX}-darwin-x64`, ext: '' },
   'darwin arm64': { triple: 'aarch64-apple-darwin', pkg: `${PKG_PREFIX}-darwin-arm64`, ext: '' },
   'win32 x64': { triple: 'x86_64-pc-windows-msvc', pkg: `${PKG_PREFIX}-win32-x64`, ext: '.exe' },

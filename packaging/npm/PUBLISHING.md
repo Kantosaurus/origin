@@ -90,7 +90,7 @@ local one). Consequences for releasing:
 
 ```sh
 # Assemble into dist/ using a locally built binary:
-mkdir -p /tmp/ob && cp target/debug/origin /tmp/ob/origin-x86_64-unknown-linux-musl
+mkdir -p /tmp/ob && cp target/debug/origin /tmp/ob/origin-x86_64-unknown-linux-gnu
 node packaging/npm/scripts/build.mjs --version 0.0.1 --binaries /tmp/ob
 
 # Pack + install both tarballs into a throwaway project:
