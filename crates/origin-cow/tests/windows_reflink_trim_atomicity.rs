@@ -16,7 +16,12 @@
 //! so we skip cleanly rather than pretend to pass.
 
 #![cfg(target_os = "windows")]
-#![allow(clippy::unwrap_used, clippy::panic, clippy::doc_markdown)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::doc_markdown,
+    clippy::cast_possible_truncation
+)]
 
 use std::fs;
 use std::path::PathBuf;
