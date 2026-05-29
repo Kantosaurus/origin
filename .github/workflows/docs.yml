@@ -21,12 +21,16 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          # Tooling job: use stable so `cargo install mdbook` (latest) works.
-          # The repo's MSRV (1.83) is gated by the CI workflow, not here.
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install mdbook
-        run: cargo install mdbook --locked
+        # Pin to the last 0.4.x that builds on the repo MSRV (1.83). Although the
+        # step requests `stable` above, the root rust-toolchain.toml pins 1.83 and
+        # takes precedence in this working directory, so an unpinned
+        # `cargo install mdbook` pulls a release that needs rustc >= 1.88 (e.g.
+        # 0.5.x, edition2024) and fails. Pinning keeps the install on a 1.83-safe
+        # version; bump it when the workspace MSRV moves.
+        run: cargo install mdbook --locked --version 0.4.40
       - name: Build site
         run: mdbook build docs/site
       - name: Build manpages
