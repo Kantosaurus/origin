@@ -56,6 +56,32 @@ sessions, **`origin-cli`** is a thin client, and they talk only through
 
 A fuller pitch and head-to-head comparison live in [`docs/why-origin.md`](docs/why-origin.md).
 
+## Install
+
+The fastest way to get the `origin` command on your `PATH` — no Rust toolchain
+required:
+
+```sh
+npm install -g originx   # ships a prebuilt binary; the command is `origin`
+origin                   # launches the TUI
+```
+
+> The npm package is named **`originx`** (the name `origin` was already taken on
+> npm); the installed command is always **`origin`**. npm pulls a single small
+> prebuilt binary for your platform, with a GitHub-release download fallback.
+> It **auto-updates by default** (background npm check, once/day; disable with
+> `ORIGINX_NO_UPDATE=1`). See [`packaging/npm/`](packaging/npm/README.md) for details.
+
+Other channels:
+
+```sh
+cargo binstall origin-cli            # prebuilt binary via cargo-binstall
+cargo install --path crates/origin-cli   # build + install from source
+brew install origin                  # Homebrew (tap), see packaging/homebrew
+```
+
+For a from-source developer build, see the [Quickstart](#quickstart) below.
+
 ## Quickstart
 
 **Prerequisites**
@@ -102,7 +128,7 @@ crates/            30+ workspace crates
   origin-codegraph/ code graph + retrieval
   origin-provider* / origin-mem / origin-skills / origin-tools / origin-trace ...
 docs/              mdBook site, design specs & plans, security reviews
-packaging/         Homebrew / winget / AUR / binstall templates
+packaging/         npm (originx) / Homebrew / winget / AUR / binstall
 xtask/             release stamping, manpages, repo automation
 ```
 

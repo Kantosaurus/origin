@@ -1,0 +1,6 @@
+# Assembled output of scripts/build.mjs — never committed.
+dist/
+# Staged binary from the runtime fallback downloader (only appears in installed
+# copies, but ignore it here too for safety).
+vendor/
+*.tgz

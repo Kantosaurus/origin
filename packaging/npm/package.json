@@ -1,0 +1,46 @@
+{
+  "name": "originx",
+  "version": "0.0.1",
+  "description": "Origin — a fast, terminal-native AI coding agent. Install globally and run `origin` to launch the TUI.",
+  "bin": {
+    "origin": "bin/origin.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "install.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "originx-linux-x64": "0.0.1",
+    "originx-linux-arm64": "0.0.1",
+    "originx-darwin-x64": "0.0.1",
+    "originx-darwin-arm64": "0.0.1",
+    "originx-win32-x64": "0.0.1",
+    "originx-win32-arm64": "0.0.1"
+  },
+  "keywords": [
+    "origin",
+    "tui",
+    "ai",
+    "agent",
+    "coding-agent",
+    "cli",
+    "terminal"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kantosaurus/origin.git"
+  },
+  "homepage": "https://github.com/Kantosaurus/origin#readme",
+  "bugs": {
+    "url": "https://github.com/Kantosaurus/origin/issues"
+  }
+}
