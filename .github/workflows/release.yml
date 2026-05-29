@@ -72,7 +72,7 @@ jobs:
           if [[ "${{ matrix.target }}" == *windows* ]]; then ext=".exe"; fi
           cp "target/${{ matrix.target }}/release/origin$ext" "dist/origin-${{ matrix.target }}$ext"
       - name: Cosign keyless sign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Sign
         shell: bash
         env:
