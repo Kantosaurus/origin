@@ -333,10 +333,15 @@ pub fn wrap_with_cursor(buffer: &str, width: usize, cursor: usize) -> Layout {
             });
             line_start = i;
             col_w = 0;
-            // Re-place the cursor on the new line if it landed exactly
-            // at the wrap point. (cursor == i is handled above on the
-            // next iteration, but cursor_placed may already be true at
-            // an earlier position — leave as is.)
+            // If the cursor sits exactly at this wrap byte, the top-of-loop
+            // block placed it at the end of the line we just pushed. It really
+            // belongs at column 0 of the new line — re-place it. (`cursor == i`
+            // is false when cursor_placed came from an earlier position, so this
+            // only fires for a cursor at the boundary.)
+            if cursor_placed && cursor == i {
+                cursor_row = lines.len();
+                cursor_col = 0;
+            }
         }
         col_w += w;
         i += ch_len;
@@ -511,6 +516,16 @@ mod tests {
         );
         assert_eq!(l.cursor_row, 1);
         assert_eq!(l.cursor_col, 2);
+    }
+
+    #[test]
+    fn wrap_cursor_exactly_at_boundary_lands_on_new_line() {
+        // Cursor at byte 5 sits exactly at the soft-wrap point. It must render
+        // at the start of the second visual line, not the end of the first.
+        let l = wrap_with_cursor("abcdefghij", 5, 5);
+        assert_eq!(l.lines.len(), 2);
+        assert_eq!(l.cursor_row, 1);
+        assert_eq!(l.cursor_col, 0);
     }
 
     #[test]

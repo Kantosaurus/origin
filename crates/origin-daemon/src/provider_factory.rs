@@ -262,11 +262,11 @@ impl ProviderFactory {
     ) -> Result<Arc<dyn Provider>, FactoryError> {
         use origin_provider::catalog::WireFormat;
         use origin_provider_openai_compat::{OpenAiCompat, OpenAiCompatConfig};
-        // Leak the id to obtain a &'static str for Provider::name(). One leak per
-        // provider construction is acceptable for a daemon's lifetime; the
-        // alternative (changing the trait signature) is a much bigger refactor.
-        #[allow(clippy::box_collection)]
-        let name: &'static str = Box::leak(entry.id.to_string().into_boxed_str());
+        // Obtain a `&'static str` for `Provider::name()`. Interned so each
+        // distinct provider id is leaked at most once — repeated SwitchAccount
+        // calls reuse the cached pointer instead of leaking a fresh string per
+        // build (total leaked memory is bounded by the finite catalog id set).
+        let name: &'static str = intern_provider_name(entry.id.as_ref());
         match entry.wire {
             WireFormat::OpenAIChat => {
                 let cfg = OpenAiCompatConfig {
@@ -399,6 +399,23 @@ impl ProviderFactory {
             WireFormat::GitHubCopilot => Err(FactoryError::UnknownProvider("github-copilot".into())),
         }
     }
+}
+
+/// Intern a provider id into a process-static `&'static str`, leaking each
+/// distinct id at most once. Bounds the leak to the finite catalog regardless
+/// of how many provider rebuilds (account switches) occur.
+fn intern_provider_name(id: &str) -> &'static str {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+    static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+    let map = NAMES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(&existing) = guard.get(id) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(id.to_string().into_boxed_str());
+    guard.insert(id.to_string(), leaked);
+    leaked
 }
 
 async fn render_base_url(

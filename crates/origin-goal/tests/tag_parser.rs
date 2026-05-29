@@ -45,6 +45,16 @@ fn multiple_tags_last_wins() {
     assert_eq!(parse_tag(s), TagOutcome::Met);
 }
 
+// A trailing tag with an unknown state must override an earlier valid tag
+// (rightmost well-formed tag is authoritative), not silently fall back to it.
+#[test]
+fn trailing_unknown_tag_overrides_earlier_valid() {
+    let s = "<goal-status state=\"met\"><reason>x</reason></goal-status> \
+             later \
+             <goal-status state=\"banana\"><reason>y</reason></goal-status>";
+    assert_eq!(parse_tag(s), TagOutcome::Missing);
+}
+
 #[test]
 fn state_attr_case_insensitive() {
     let s = "<goal-status state=\"MET\"></goal-status>";

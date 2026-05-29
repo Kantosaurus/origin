@@ -469,18 +469,57 @@ async fn run_event_loop(
                     handle.mark_dirty();
                 }
                 InputAction::Submit(text) => {
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-                    *interrupt_tx.lock().await = Some(tx);
-                    {
-                        let mut a = app.lock();
-                        a.recompute_suggestions();
-                        a.spinner.start();
+                    if is_slash_command(&text) {
+                        // Slash commands are fast (local, or a single one-shot IPC
+                        // round-trip) and may mutate `model`; run them inline.
+                        handle_submit(&app, &handle, path, model, &text, session_id, None).await;
+                        app.lock().recompute_suggestions();
+                        handle.mark_dirty();
+                    } else if interrupt_tx.lock().await.is_some() {
+                        // A prompt turn is already streaming on this connection;
+                        // don't start a second concurrent turn on the same session.
+                        app.lock().add_line(
+                            "system> ",
+                            "a turn is already running (Ctrl+C to interrupt it)",
+                        );
+                        handle.mark_dirty();
+                    } else {
+                        // A prompt turn can stream for a long time (agentic goal
+                        // loops back off up to 60s per iteration). Spawn it so the
+                        // event loop keeps polling input and can deliver a Ctrl+C
+                        // Interrupt into `interrupt_tx` while the turn is live —
+                        // awaiting inline (the old behaviour) blocked the loop and
+                        // made Ctrl+C dead until the turn ended.
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                        *interrupt_tx.lock().await = Some(tx);
+                        {
+                            let mut a = app.lock();
+                            a.recompute_suggestions();
+                            a.spinner.start();
+                        }
+                        handle.mark_dirty();
+                        let app_for_turn = Arc::clone(&app);
+                        let handle_for_turn = handle.clone();
+                        let interrupt_for_turn = Arc::clone(&interrupt_tx);
+                        let path_for_turn = path.to_string();
+                        let model_for_turn = model.clone();
+                        let session_for_turn = session_id.to_string();
+                        spawn_in(TaskClass::Realtime, async move {
+                            handle_prompt_turn(
+                                &app_for_turn,
+                                &handle_for_turn,
+                                &path_for_turn,
+                                &model_for_turn,
+                                &text,
+                                &session_for_turn,
+                                Some(rx),
+                            )
+                            .await;
+                            *interrupt_for_turn.lock().await = None;
+                            app_for_turn.lock().spinner.stop();
+                            handle_for_turn.mark_dirty();
+                        });
                     }
-                    handle.mark_dirty();
-                    handle_submit(&app, &handle, path, model, &text, session_id, Some(rx)).await;
-                    *interrupt_tx.lock().await = None;
-                    app.lock().spinner.stop();
-                    handle.mark_dirty();
                 }
                 InputAction::Insert(_) | InputAction::Backspace | InputAction::Newline => {
                     app.lock().recompute_suggestions();
@@ -528,6 +567,18 @@ fn spawn_plan_subscription(path: String, wiring: Arc<Mutex<PlanPanelWiring>>, re
             }
         }
     });
+}
+
+/// True if `text` is a slash/command that `handle_submit` dispatches inline
+/// (and which may mutate `model`), rather than an assistant prompt. Mirrors the
+/// detection order in `handle_submit`; an unrecognized `/foo` is NOT a command
+/// here (it is sent to the daemon as a prompt, matching `handle_submit`).
+fn is_slash_command(text: &str) -> bool {
+    slash_model_args(text).is_some()
+        || slash_account_args(text).is_some()
+        || parse_mem_command(text).is_some()
+        || parse_skill_command(text).is_some()
+        || parse_workflow_command(text).is_some()
 }
 
 #[allow(clippy::too_many_lines)] // Single linear dispatch over many slash commands; splitting hurts readability.
@@ -636,6 +687,24 @@ async fn handle_submit(
         handle.mark_dirty();
         return;
     }
+
+    handle_prompt_turn(app, handle, path, model.as_str(), text, session_id, interrupt_rx).await;
+}
+
+/// Run one assistant prompt turn: echo the user line, stream the daemon's
+/// response into the app, and surface any memory proposals. Reads `model` but
+/// never mutates it, so the input loop can spawn this onto its own task (so a
+/// long-running turn does not block Ctrl+C / interrupt handling).
+#[allow(clippy::too_many_lines)]
+async fn handle_prompt_turn(
+    app: &SharedApp,
+    handle: &Handle,
+    path: &str,
+    model: &str,
+    text: &str,
+    session_id: &str,
+    interrupt_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+) {
     {
         let mut a = app.lock();
         a.add_line("you> ", text);

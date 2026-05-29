@@ -30,6 +30,8 @@ pub enum PoolError {
     StdinClosed,
     #[error("stdout closed unexpectedly")]
     StdoutClosed,
+    #[error("worker emitted bytes past the response terminator")]
+    FramingViolation,
 }
 
 struct Worker {
@@ -77,6 +79,14 @@ impl Worker {
         }
         // Strip trailing terminator.
         buf.pop();
+        // Framing contract: exactly one terminator per response. Any bytes
+        // already buffered past the terminator mean the worker over-produced and
+        // the stream is desynchronised — those bytes would be mis-read as the
+        // head of the NEXT response. Fail so the pool respawns this worker
+        // rather than serving stale/leftover bytes to the next caller.
+        if !self.stdout.buffer().is_empty() {
+            return Err(PoolError::FramingViolation);
+        }
         Ok(buf)
     }
 
@@ -133,7 +143,9 @@ impl ShellPool {
         match slot.as_mut() {
             Some(w) => match w.dispatch(script).await {
                 Ok(b) => Ok(b),
-                Err(PoolError::StdoutClosed) => {
+                // A dead worker (StdoutClosed) or a desynchronised one
+                // (FramingViolation) is replaced and the dispatch retried once.
+                Err(PoolError::StdoutClosed | PoolError::FramingViolation) => {
                     // Respawn and retry once.
                     *slot = Some(Worker::spawn(&self.spec)?);
                     self.spawn_count.fetch_add(1, Ordering::Relaxed);

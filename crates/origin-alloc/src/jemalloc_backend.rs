@@ -49,19 +49,26 @@ fn ensure_arena(id: ArenaId) -> u32 {
 }
 
 pub fn bind_thread_arena(id: ArenaId) -> Option<u32> {
-    let prev = THREAD_ARENA.with(std::cell::Cell::get);
+    // Capture jemalloc's REAL current `thread.arena` (not the thread-local
+    // cache, which is `None` until the first bind). This guarantees `prev` is a
+    // concrete index, so `restore_thread_arena` can always re-pin the thread to
+    // a real arena instead of leaving it stuck on the custom one — the previous
+    // `None` path never unbound, leaking the binding for the thread's lifetime.
+    let prev = get_thread_arena_raw();
     let new = ensure_arena(id);
     set_thread_arena_raw(new);
     THREAD_ARENA.with(|c| c.set(Some(new)));
-    prev
+    Some(prev)
 }
 
 pub fn restore_thread_arena(prev: Option<u32>) {
+    // `bind_thread_arena` always returns `Some(real_index)`, so this restores
+    // the thread to its prior arena. The `None` arm is a defensive no-op (it can
+    // only occur if a caller fabricates `None`); we deliberately do NOT leave a
+    // stale custom binding in place.
     if let Some(idx) = prev {
         set_thread_arena_raw(idx);
         THREAD_ARENA.with(|c| c.set(Some(idx)));
-    } else {
-        THREAD_ARENA.with(|c| c.set(None));
     }
 }
 
@@ -79,6 +86,26 @@ fn set_thread_arena_raw(idx: u32) {
         );
         assert_eq!(ret, 0, "jemalloc thread.arena set failed: {ret}");
     }
+}
+
+/// Read the calling thread's current jemalloc `thread.arena` index.
+fn get_thread_arena_raw() -> u32 {
+    let name = c"thread.arena";
+    let mut value: u32 = 0;
+    let mut len: libc::size_t = std::mem::size_of::<u32>();
+    // SAFETY: jemalloc FFI; reads the calling thread's current arena index into
+    // `value` (jemalloc assigns one on demand if the thread has none yet).
+    unsafe {
+        let ret = tikv_jemalloc_sys::mallctl(
+            name.as_ptr().cast(),
+            std::ptr::from_mut::<u32>(&mut value).cast(),
+            std::ptr::from_mut::<libc::size_t>(&mut len),
+            std::ptr::null_mut(),
+            0,
+        );
+        assert_eq!(ret, 0, "jemalloc thread.arena get failed: {ret}");
+    }
+    value
 }
 
 pub fn reset_arena(id: ArenaId) -> Result<(), super::AllocError> {

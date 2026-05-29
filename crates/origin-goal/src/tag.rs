@@ -25,9 +25,11 @@ pub fn parse_tag(text: &str) -> TagOutcome {
         let close = attrs_end + close_rel;
         let inner = &text[attrs_end + 1..close];
         cursor = close + "</goal-status>".len();
-        if let Some(outcome) = build_outcome(attrs, inner) {
-            last = outcome;
-        }
+        // The rightmost well-formed tag is authoritative. A trailing tag with an
+        // unknown state must override any earlier valid outcome (yielding
+        // Missing) rather than silently falling back to the stale earlier tag —
+        // the model's *latest* emitted status is what counts.
+        last = build_outcome(attrs, inner).unwrap_or(TagOutcome::Missing);
     }
     last
 }

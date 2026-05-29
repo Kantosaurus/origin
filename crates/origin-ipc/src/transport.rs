@@ -27,6 +27,12 @@ pub struct Connector;
 #[allow(clippy::module_name_repetitions)]
 pub struct Connection {
     inner: IpcStream,
+    /// Receive accumulator for cancellation-safe framing. Bytes read from the
+    /// transport are appended here and only drained once a whole frame is
+    /// buffered, so a `read_frame` future dropped mid-frame (e.g. a
+    /// zero-timeout peek) leaves the partial bytes intact for the next call
+    /// instead of consuming-and-losing them and desynchronising the stream.
+    rx_buf: Vec<u8>,
 }
 
 impl Listener {
@@ -52,7 +58,10 @@ impl Listener {
     /// Propagates I/O errors from the underlying transport.
     pub async fn accept(&self) -> io::Result<Connection> {
         let inner = self.inner.accept().await?;
-        Ok(Connection { inner })
+        Ok(Connection {
+            inner,
+            rx_buf: Vec::new(),
+        })
     }
 }
 
@@ -66,7 +75,10 @@ impl Connector {
             .to_fs_name::<GenericFilePath>()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let inner = IpcStream::connect(name).await?;
-        Ok(Connection { inner })
+        Ok(Connection {
+            inner,
+            rx_buf: Vec::new(),
+        })
     }
 }
 
@@ -91,7 +103,7 @@ impl Connection {
     /// don't match, the length field is malformed, or the kind byte is
     /// unknown.
     pub async fn read_frame(&mut self) -> io::Result<(FrameKind, Vec<u8>)> {
-        read_frame_from(&mut self.inner).await
+        read_frame_buffered(&mut self.inner, &mut self.rx_buf).await
     }
 
     /// Write a frame with `kind` and `body`. `request_id` is zero — the
@@ -166,6 +178,79 @@ pub async fn read_frame_from<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result
     Ok((kind, body))
 }
 
+/// Cancellation-safe variant of [`read_frame_from`]: accumulates bytes in the
+/// caller-owned `rx_buf` and only consumes a frame once it is fully buffered.
+///
+/// Each `read` is individually cancellation-safe (a cancelled read consumes
+/// nothing from the transport), and completed reads are appended to `rx_buf`
+/// before the next await. If the returned future is dropped mid-frame (e.g. a
+/// zero-timeout peek), the partial bytes survive in `rx_buf` and the next call
+/// resumes — the stream never desynchronises.
+///
+/// # Errors
+/// Same as [`read_frame_from`]: `UnexpectedEof` on close mid-frame, and
+/// `InvalidData` for an unknown kind or an over-cap body length.
+#[allow(clippy::future_not_send)]
+pub async fn read_frame_buffered<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    rx_buf: &mut Vec<u8>,
+) -> io::Result<(FrameKind, Vec<u8>)> {
+    let mut tmp = [0_u8; 65536];
+
+    // 1) Ensure the fixed-size header is buffered.
+    while rx_buf.len() < HEADER_LEN {
+        let n = reader.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed mid-frame (header)",
+            ));
+        }
+        rx_buf.extend_from_slice(&tmp[..n]);
+    }
+
+    // 2) Parse the header WITHOUT consuming it, so a cancellation before the
+    //    body is fully read resumes cleanly. Mirrors `read_frame_from`.
+    let kind = match rx_buf[4] {
+        1 => FrameKind::Request,
+        2 => FrameKind::Response,
+        3 => FrameKind::Event,
+        4 => FrameKind::ErrorFrame,
+        x => {
+            rx_buf.drain(..HEADER_LEN); // drop bad header so we don't loop on it
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown frame kind: {x}"),
+            ));
+        }
+    };
+    let len = u32::from_be_bytes([rx_buf[13], rx_buf[14], rx_buf[15], rx_buf[16]]) as usize;
+    if len > MAX_FRAME_BYTES {
+        rx_buf.drain(..HEADER_LEN);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame too large: {len} bytes (cap {MAX_FRAME_BYTES})"),
+        ));
+    }
+
+    // 3) Ensure the whole frame is buffered, then consume exactly it. Any
+    //    bytes read past this frame stay in `rx_buf` for the next call.
+    let total = HEADER_LEN + len;
+    while rx_buf.len() < total {
+        let n = reader.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed mid-frame (body)",
+            ));
+        }
+        rx_buf.extend_from_slice(&tmp[..n]);
+    }
+    let body = rx_buf[HEADER_LEN..total].to_vec();
+    rx_buf.drain(..total);
+    Ok((kind, body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +305,39 @@ mod tests {
             msg.contains("frame too large"),
             "expected 'frame too large' in error message, got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn read_frame_buffered_is_cancellation_safe() {
+        use std::time::Duration;
+        // A frame split across two writes: a peek that gives up before the whole
+        // frame arrives must NOT consume-and-lose the partial bytes (which the
+        // old read_exact path did, desynchronising the stream).
+        let body = b"hello world payload".to_vec();
+        let frame = encode(0, FrameKind::Request, &body);
+        let split = HEADER_LEN + 4; // header + first 4 body bytes
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let mut rx_buf: Vec<u8> = Vec::new();
+
+        client.write_all(&frame[..split]).await.expect("write part 1");
+        client.flush().await.expect("flush 1");
+
+        let peek = tokio::time::timeout(
+            Duration::from_millis(50),
+            read_frame_buffered(&mut server, &mut rx_buf),
+        )
+        .await;
+        assert!(peek.is_err(), "peek should time out on the incomplete frame");
+        assert!(!rx_buf.is_empty(), "partial bytes must be retained for resume");
+
+        client.write_all(&frame[split..]).await.expect("write part 2");
+        client.flush().await.expect("flush 2");
+
+        let (kind, got) = read_frame_buffered(&mut server, &mut rx_buf)
+            .await
+            .expect("resumed read returns the whole frame");
+        assert!(matches!(kind, FrameKind::Request));
+        assert_eq!(got, body, "body must round-trip across the cancelled peek");
+        assert!(rx_buf.is_empty(), "buffer fully drained after consuming the frame");
     }
 }
