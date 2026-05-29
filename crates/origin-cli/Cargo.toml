@@ -47,7 +47,7 @@ origin-skills   = { path = "../origin-skills" }
 origin-tools    = { path = "../origin-tools" }
 origin-goal     = { path = "../origin-goal" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-which = "6"
+which = "8"
 rand = "0.8"
 urlencoding = "2"
 toml = "0.9"
