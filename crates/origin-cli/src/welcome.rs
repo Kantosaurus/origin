@@ -162,7 +162,7 @@ fn screen_toolbox<R: BufRead, W: Write>(r: &mut R, w: &mut W) -> Result<()> {
             w,
             "    {}  {}",
             ansi::accent(&format!("{:<16}", t.name)),
-            ansi::muted(&desc)
+            ansi::muted(desc)
         )?;
     }
     writeln!(w)?;

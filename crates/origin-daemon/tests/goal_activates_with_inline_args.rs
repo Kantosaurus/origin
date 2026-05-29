@@ -30,7 +30,11 @@ fn activate(args: &str) -> StreamEvent {
 fn goal_activate_emits_goal_active_with_defaults() {
     let ev = activate("fix the failing tests");
     match ev {
-        StreamEvent::GoalActive { condition, max_iter, token_budget } => {
+        StreamEvent::GoalActive {
+            condition,
+            max_iter,
+            token_budget,
+        } => {
             assert_eq!(condition, "fix the failing tests");
             assert_eq!(max_iter, 20);
             assert_eq!(token_budget, 200_000);
@@ -43,7 +47,11 @@ fn goal_activate_emits_goal_active_with_defaults() {
 fn goal_activate_with_flags_uses_overrides() {
     let ev = activate("--max-iter=5 --budget=50k fix tests");
     match ev {
-        StreamEvent::GoalActive { condition, max_iter, token_budget } => {
+        StreamEvent::GoalActive {
+            condition,
+            max_iter,
+            token_budget,
+        } => {
             assert_eq!(condition, "fix tests");
             assert_eq!(max_iter, 5);
             assert_eq!(token_budget, 50_000);

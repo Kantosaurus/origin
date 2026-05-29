@@ -393,11 +393,9 @@ impl Store {
 
 /// Sum the byte lengths of a pending batch, saturating on overflow.
 fn sum_lens(pending: &[(Hash, Vec<u8>)]) -> u64 {
-    pending
-        .iter()
-        .fold(0_u64, |acc, (_, v)| {
-            acc.saturating_add(u64::try_from(v.len()).unwrap_or(u64::MAX))
-        })
+    pending.iter().fold(0_u64, |acc, (_, v)| {
+        acc.saturating_add(u64::try_from(v.len()).unwrap_or(u64::MAX))
+    })
 }
 
 fn scan_dir(dir: &std::path::Path) -> Result<(Vec<PackReader>, HashMap<Hash, usize>), StoreError> {

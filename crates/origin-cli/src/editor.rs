@@ -289,6 +289,12 @@ pub struct Layout {
 ///   When the cursor sits exactly at a wrap or newline boundary, it
 ///   prefers the next line (so pressing `End` then typing extends the
 ///   freshly-wrapped row).
+///
+/// # Panics
+///
+/// Panics if `buffer` is not valid UTF-8 at an internal slice boundary
+/// (unreachable for a well-formed `&str`, whose byte offsets always fall
+/// on char boundaries).
 #[must_use]
 pub fn wrap_with_cursor(buffer: &str, width: usize, cursor: usize) -> Layout {
     let mut lines: Vec<VisualLine> = Vec::new();

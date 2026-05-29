@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
+use origin_cli::autocomplete::CompletionSources;
 use origin_cli::tui::App;
 use origin_tui::composer::Composer;
 use origin_tui::stream_widget::{Rect, StreamWidget};
 
 #[test]
 fn empty_app_draws_status_only() {
-    let mut app = App::new("anthropic", "claude-opus-4-7".to_string(), Default::default());
+    let mut app = App::new(
+        "anthropic",
+        "claude-opus-4-7".to_string(),
+        CompletionSources::default(),
+    );
     app.add_line("", "hello");
     let mut composer = Composer::new(40, 10);
     let mut widget = StreamWidget::new(Rect {
@@ -22,7 +27,11 @@ fn empty_app_draws_status_only() {
 
 #[test]
 fn live_assistant_buffer_renders_in_main() {
-    let mut app = App::new("anthropic", "claude-opus-4-7".to_string(), Default::default());
+    let mut app = App::new(
+        "anthropic",
+        "claude-opus-4-7".to_string(),
+        CompletionSources::default(),
+    );
     app.start_assistant_turn();
     app.append_to_current_assistant("hello world");
     let mut composer = Composer::new(40, 10);
@@ -50,7 +59,11 @@ fn live_assistant_buffer_renders_in_main() {
 /// card.
 #[test]
 fn scrollback_does_not_lose_lines_behind_input_card() {
-    let mut app = App::new("anthropic", "claude-opus-4-7".to_string(), Default::default());
+    let mut app = App::new(
+        "anthropic",
+        "claude-opus-4-7".to_string(),
+        CompletionSources::default(),
+    );
     for i in 0..50 {
         app.add_line("", &format!("line-{i:02}"));
     }
@@ -118,7 +131,10 @@ fn scrollback_does_not_lose_lines_behind_input_card() {
         );
     }
     // The latest visible line should be the very last one pushed (line-49).
-    let last = *visible_line_nums.last().unwrap();
+    // Non-empty: the `len() >= 2` assert above guarantees a last element.
+    let last = *visible_line_nums
+        .last()
+        .expect("visible_line_nums is non-empty (asserted len >= 2 above)");
     assert_eq!(
         last, 49,
         "expected the latest scrollback line (line-49) to be visible, got line-{last:02}.\n\nDump:\n{dump}"

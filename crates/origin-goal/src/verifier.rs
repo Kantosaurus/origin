@@ -31,11 +31,7 @@ pub trait Verifier: Send + Sync {
     ///
     /// Returns `(Verdict, input_tokens, output_tokens)` so the driver can
     /// charge the verifier's spend against the goal's token budget.
-    async fn verify(
-        &self,
-        condition: &str,
-        last_turn: &str,
-    ) -> Result<(Verdict, u64, u64), VerifierError>;
+    async fn verify(&self, condition: &str, last_turn: &str) -> Result<(Verdict, u64, u64), VerifierError>;
 }
 
 /// Parse a verdict from a raw Haiku response.
@@ -57,7 +53,9 @@ pub trait Verifier: Send + Sync {
 pub fn parse_verdict(raw: &str) -> Result<Verdict, VerifierError> {
     for line in raw.lines() {
         let line = line.trim();
-        let Some(rest) = line.strip_prefix("VERDICT:") else { continue };
+        let Some(rest) = line.strip_prefix("VERDICT:") else {
+            continue;
+        };
         let rest = rest.trim();
         if let Some(reason) = rest.strip_prefix("not_met") {
             let reason = reason
