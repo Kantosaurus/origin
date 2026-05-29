@@ -14,16 +14,29 @@ status checks — answer or act immediately.
 
 For everything else, follow this orchestration without being asked:
 
-1. /brainstorming first. Clarify scope, constraints, and design. During this \
-   phase, dispatch Task subagents in parallel that use WebFetch and WebSearch \
-   for any external references, library docs, API shapes, or unknowns. Only \
-   stop to ask the user when a decision genuinely requires their input.
+1. /goal first. Pin the concrete outcome the user wants from this session: \
+   what 'done' looks like, the success criterion, and any hard constraints. \
+   This phase is owned by a dedicated /goal subagent; your job as orchestrator \
+   is to invoke it and respect its output. The /goal phase MUST be \
+   interactive — drive it with AskUserQuestion, presenting 2-4 mutually- \
+   exclusive options per turn (one question at a time), not open-ended prose \
+   prompts. Only fall back to open prose when no option set can capture the \
+   choice.
 
-2. /writing-plans next. Produce a step-by-step implementation plan with exact \
+2. /brainstorming next. With the goal pinned, explore HOW to reach it: \
+   surface 2-3 viable approaches, name the trade-offs, recommend one. This \
+   phase MUST also be interactive — every choice point is an AskUserQuestion \
+   with 2-4 mutually-exclusive options, not an open-ended question. During \
+   this phase, dispatch Task subagents in parallel that use WebFetch and \
+   WebSearch for any external references, library docs, API shapes, or \
+   unknowns. Only stop to ask the user when a decision genuinely requires \
+   their input — and when you do, ask it as a multiple-choice question.
+
+3. /writing-plans next. Produce a step-by-step implementation plan with exact \
    file paths, full code per step, and the verification command per step. \
    Save it under docs/superpowers/plans/. Get user approval before executing.
 
-3. /dispatching-parallel-agents to execute. Spawn one Task subagent per \
+4. /dispatching-parallel-agents to execute. Spawn one Task subagent per \
    independent unit of work. Every subagent MUST:
      a. /test-driven-development — write the failing test first, run it and \
         confirm RED, implement the minimum, run and confirm GREEN
@@ -57,6 +70,7 @@ mod tests {
     fn directive_contains_workflow_phases() {
         let d = DEFAULT_WORKFLOW;
         for phase in [
+            "/goal",
             "/brainstorming",
             "/writing-plans",
             "/dispatching-parallel-agents",
@@ -64,6 +78,7 @@ mod tests {
             "/verification-before-completion",
             "WebFetch",
             "WebSearch",
+            "AskUserQuestion",
         ] {
             assert!(d.contains(phase), "DEFAULT_WORKFLOW missing `{phase}`");
         }
