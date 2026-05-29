@@ -170,10 +170,7 @@ fn compute_mac_hex(key: &[u8; KEY_LEN], payload: &[u8]) -> String {
 fn validate_session_id(session_id: &str) -> std::io::Result<()> {
     use std::path::Component;
     let mut comps = Path::new(session_id).components();
-    let single_normal = matches!(
-        (comps.next(), comps.next()),
-        (Some(Component::Normal(_)), None)
-    );
+    let single_normal = matches!((comps.next(), comps.next()), (Some(Component::Normal(_)), None));
     if single_normal {
         Ok(())
     } else {

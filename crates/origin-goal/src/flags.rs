@@ -104,7 +104,11 @@ pub fn parse_goal_args(raw: &str) -> Result<GoalArgs, FlagParseError> {
     if condition.len() > MAX_CONDITION_LEN {
         return Err(FlagParseError::ConditionTooLong);
     }
-    Ok(GoalArgs { condition, max_iter, token_budget })
+    Ok(GoalArgs {
+        condition,
+        max_iter,
+        token_budget,
+    })
 }
 
 fn parse_budget(s: &str) -> Option<u64> {

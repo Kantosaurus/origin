@@ -9,7 +9,7 @@ pub mod tag;
 pub mod verifier;
 pub mod wire;
 
+pub use flags::{parse_goal_args, FlagParseError, GoalArgs};
 pub use state::{ClearReason, GoalState, GoalStatus, TagOutcome};
 pub use tag::parse_tag;
-pub use flags::{parse_goal_args, GoalArgs, FlagParseError};
 pub use wire::{ClearReasonWire, GoalSnapshot, GoalStatusWire, TagOutcomeWire};

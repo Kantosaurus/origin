@@ -14,7 +14,9 @@ fn parses_in_progress_with_reason() {
     let s = "<goal-status state=\"in_progress\"><reason>still 3 tests failing</reason></goal-status>";
     assert_eq!(
         parse_tag(s),
-        TagOutcome::InProgress { what_remains: "still 3 tests failing".to_string() }
+        TagOutcome::InProgress {
+            what_remains: "still 3 tests failing".to_string()
+        }
     );
 }
 
@@ -23,13 +25,18 @@ fn parses_blocked_with_reason() {
     let s = "<goal-status state=\"blocked\"><reason>need DB password</reason></goal-status>";
     assert_eq!(
         parse_tag(s),
-        TagOutcome::Blocked { why: "need DB password".to_string() }
+        TagOutcome::Blocked {
+            why: "need DB password".to_string()
+        }
     );
 }
 
 #[test]
 fn missing_tag_yields_missing() {
-    assert_eq!(parse_tag("plain assistant reply with no tag"), TagOutcome::Missing);
+    assert_eq!(
+        parse_tag("plain assistant reply with no tag"),
+        TagOutcome::Missing
+    );
 }
 
 #[test]
@@ -67,7 +74,9 @@ fn whitespace_in_attributes_ok() {
     let s = "<goal-status   state = \"in_progress\" ><reason>x</reason></goal-status>";
     assert_eq!(
         parse_tag(s),
-        TagOutcome::InProgress { what_remains: "x".to_string() }
+        TagOutcome::InProgress {
+            what_remains: "x".to_string()
+        }
     );
 }
 
@@ -76,7 +85,9 @@ fn empty_reason_ok() {
     let s = "<goal-status state=\"in_progress\"></goal-status>";
     assert_eq!(
         parse_tag(s),
-        TagOutcome::InProgress { what_remains: String::new() }
+        TagOutcome::InProgress {
+            what_remains: String::new()
+        }
     );
 }
 
