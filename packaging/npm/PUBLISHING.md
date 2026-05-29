@@ -40,9 +40,16 @@ Requirements:
   then optionally re-scope to `originx` / `originx-*` once they exist.
 - npm may also reject `originx` as *too similar* to the existing `origin`
   package. If a retry fails with a similarity `E403` (a *different* message from
-  the 2FA one above), switch to the scoped name `@kantosaurus/origin` — set
-  `PKG_PREFIX` in `packaging/npm/lib/platform.js` and `name` in
-  `packaging/npm/package.json`; the installed command stays `origin`.
+  the 2FA one above), publish the scoped family `@kantosaurus/origin` by setting
+  **`ORIGIN_NPM_PREFIX=@kantosaurus/origin`** for the publish (the `npm publish`
+  job carries a commented env line for exactly this). `build.mjs` reads it, names
+  the main package and the six platform packages accordingly, and bakes the
+  prefix into the shipped launcher so binary resolution matches. The installed
+  command stays `origin`. **Caveat:** this mechanism lives in the code as of the
+  commit that added it, so it only applies to a tag built from that commit or
+  later — re-running an *older* tag's failed job (e.g. `v0.0.1`) uses that tag's
+  frozen scripts and ignores the variable; cut a fresh tag to switch names. (The
+  bundled npm README still says `originx`; update it if the scoped name sticks.)
 
 ### Re-running after a failed publish
 
