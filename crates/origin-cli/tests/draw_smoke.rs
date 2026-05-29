@@ -118,7 +118,10 @@ fn scrollback_does_not_lose_lines_behind_input_card() {
         );
     }
     // The latest visible line should be the very last one pushed (line-49).
-    let last = *visible_line_nums.last().unwrap();
+    // Non-empty: the `len() >= 2` assert above guarantees a last element.
+    let last = *visible_line_nums
+        .last()
+        .expect("visible_line_nums is non-empty (asserted len >= 2 above)");
     assert_eq!(
         last, 49,
         "expected the latest scrollback line (line-49) to be visible, got line-{last:02}.\n\nDump:\n{dump}"

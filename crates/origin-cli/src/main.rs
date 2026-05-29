@@ -37,11 +37,45 @@ type SharedApp = Arc<Mutex<App>>;
 type SharedComposer = Arc<Mutex<Composer>>;
 type SharedWidget = Arc<Mutex<StreamWidget>>;
 
+/// Stack size for the thread that drives the async entrypoint.
+///
+/// The TUI's top-level future is a single large state machine — many
+/// un-boxed nested async fns inlined into one (updater→reqwest, daemon
+/// auto-spawn, and the event loop's prompt-turn → `call_daemon` chain).
+/// `block_on` materializes that whole future on the stack *before* polling
+/// it, and in a debug build it exceeds Windows' default 1 MiB main-thread
+/// stack — overflowing before `main` does any work (`STATUS_STACK_OVERFLOW`,
+/// 0xC000_00FD), even for `--version`. Linux's 8 MiB default main stack hides
+/// this, so it only bit Windows. We drive the runtime on a dedicated thread
+/// with a generous stack (2× Linux's default) so every platform behaves
+/// identically — the same reason `origin-daemon` hand-rolls its entrypoint
+/// instead of using `#[tokio::main]`.
+const RUNTIME_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    let worker = std::thread::Builder::new()
+        .name("origin-rt".to_string())
+        .stack_size(RUNTIME_STACK_SIZE)
+        .spawn(|| {
+            // `flavor = "current_thread"` + `enable_all()` reproduces the
+            // exact runtime the `#[tokio::main(flavor = "current_thread")]`
+            // attribute built before — net + time drivers on, single thread.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| anyhow::anyhow!("build tokio runtime: {e}"))?;
+            rt.block_on(run())
+        })
+        .map_err(|e| anyhow::anyhow!("spawn runtime thread: {e}"))?;
+    worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("runtime thread panicked"))?
+}
+
 // CLI subcommand dispatch is intentionally inlined here; splitting it into
 // per-subcommand entry helpers is a follow-up polish item.
 #[allow(clippy::too_many_lines)]
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+async fn run() -> Result<()> {
     // Auto-update — synchronous. The flow is:
     //   1. Swap in any binary staged from a prior run (rename `.new` over exe).
     //   2. Check the GitHub releases API for a newer tag. If newer, download
