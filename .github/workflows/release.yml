@@ -196,12 +196,9 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: "true"
-          # Fallback: if npm rejects `originx` as too similar to the existing
-          # `origin` package, uncomment to publish the scoped family instead
-          # (installed command stays `origin`). Effective only on a tag built
-          # from code carrying the ORIGIN_NPM_PREFIX mechanism — re-running an
-          # older tag's failed job uses that tag's frozen scripts.
-          # ORIGIN_NPM_PREFIX: "@kantosaurus/origin"
+          # Package family defaults to the scoped `@kantosaurus/origin`
+          # (lib/platform.js); the unscoped `originx*` names tripped npm spam
+          # detection. Set ORIGIN_NPM_PREFIX here only to override that default.
         run: |
           node packaging/npm/scripts/build.mjs \
             --version "${{ steps.ver.outputs.version }}" \
