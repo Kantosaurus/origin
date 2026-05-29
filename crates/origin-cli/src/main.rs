@@ -45,7 +45,7 @@ type SharedWidget = Arc<Mutex<StreamWidget>>;
 /// `block_on` materializes that whole future on the stack *before* polling
 /// it, and in a debug build it exceeds Windows' default 1 MiB main-thread
 /// stack — overflowing before `main` does any work (`STATUS_STACK_OVERFLOW`,
-/// 0xC000_00FD), even for `--version`. Linux's 8 MiB default main stack hides
+/// `0xC000_00FD`), even for `--version`. Linux's 8 MiB default main stack hides
 /// this, so it only bit Windows. We drive the runtime on a dedicated thread
 /// with a generous stack (2× Linux's default) so every platform behaves
 /// identically — the same reason `origin-daemon` hand-rolls its entrypoint
@@ -72,17 +72,16 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("runtime thread panicked"))?
 }
 
-// CLI subcommand dispatch is intentionally inlined here; splitting it into
-// per-subcommand entry helpers is a follow-up polish item.
-#[allow(clippy::too_many_lines)]
-async fn run() -> Result<()> {
-    // Auto-update — synchronous. The flow is:
-    //   1. Swap in any binary staged from a prior run (rename `.new` over exe).
-    //   2. Check the GitHub releases API for a newer tag. If newer, download
-    //      + cosign-verify + stage as `<exe>.new` BEFORE proceeding.
-    //   3. If we just staged a new binary, swap it in and re-exec with the
-    //      same argv so the user's command runs on the new code path.
-    // Failures along the way fall through to running the current binary.
+/// Synchronous auto-update step run before any subcommand dispatch. The flow is:
+///   1. Swap in any binary staged from a prior run (rename `.new` over exe).
+///   2. Check the GitHub releases API for a newer tag. If newer, download
+///      + cosign-verify + stage as `<exe>.new` BEFORE proceeding.
+///   3. If we just staged a new binary, swap it in and re-exec with the
+///      same argv so the user's command runs on the new code path.
+///
+/// Failures along the way fall through to running the current binary. A
+/// successful re-exec calls `std::process::exit` and never returns.
+async fn run_self_update() -> Result<()> {
     match origin_cli::updater::apply_staged_if_present() {
         Ok(true) => eprintln!("Applied staged update from previous run."),
         Ok(false) => {}
@@ -106,6 +105,78 @@ async fn run() -> Result<()> {
         Ok(false) => {}
         Err(e) => tracing::warn!("updater: check_and_stage_blocking failed: {e}"),
     }
+    Ok(())
+}
+
+/// Dispatch a top-level subcommand. Returns `Some(result)` for every
+/// subcommand (each terminates the program with its own result), mirroring
+/// the `return` arms this replaced. The TUI entry path is reached when
+/// `Cli::cmd` is `None`, so this is only called with a concrete `Cmd`.
+async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
+    Some(match cmd {
+        Cmd::Trace {
+            sub: TraceSub::Query(q),
+        } => origin_cli::trace_cmd::invoke(q).map_err(|e| anyhow::anyhow!("{e}")),
+        Cmd::Pair { sub } => match sub {
+            PairSub::Start { ttl_secs } => pair_start(ttl_secs).await,
+            PairSub::Redeem { url, code, device_id } => pair_redeem(&url, &code, device_id).await,
+        },
+        Cmd::Run {
+            text,
+            json,
+            remote,
+            bearer,
+            model,
+        } => origin_cli::headless::run(text, json, remote, bearer, model).await,
+        Cmd::Usage => origin_cli::admin::usage().await,
+        Cmd::Sessions { sub } => origin_cli::admin::sessions(sub_to_action(sub)).await,
+        Cmd::Keyring { sub } => {
+            // Login drives an interactive OAuth flow and must be handled
+            // before converting to KeyringAction (which doesn't have a Login
+            // variant — Login bypasses the daemon IPC path entirely).
+            if let KeyringSub::Login { provider, account } = sub {
+                origin_cli::keyring_login::run(&provider, &account).await
+            } else {
+                origin_cli::admin::keyring(sub_to_action_kr(sub)).await
+            }
+        }
+        Cmd::Providers { sub } => match sub {
+            ProvidersSub::Ls => {
+                origin_cli::providers::ls();
+                Ok(())
+            }
+            ProvidersSub::Describe { id } => {
+                origin_cli::providers::describe(&id);
+                Ok(())
+            }
+        },
+        Cmd::Init => origin_cli::init::run().await,
+        Cmd::Import(a) => import_subcommand(&a),
+    })
+}
+
+/// Handle `origin import`: run the import and print a JSON or human summary.
+fn import_subcommand(a: &origin_cli::import::ImportArgs) -> Result<()> {
+    let r = origin_cli::import::run_import(a).map_err(anyhow::Error::from)?;
+    if a.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "sessions_inserted": r.sessions_inserted,
+                "skills_inserted": r.skills_inserted,
+            })
+        );
+    } else {
+        println!(
+            "Imported {} sessions, {} skills.",
+            r.sessions_inserted, r.skills_inserted
+        );
+    }
+    Ok(())
+}
+
+async fn run() -> Result<()> {
+    run_self_update().await?;
 
     // Dispatch a subcommand if one was given, otherwise fall through to the
     // TUI entry path (preserves the existing env-driven invocation).
@@ -116,72 +187,10 @@ async fn run() -> Result<()> {
         origin_cli::tutorial::run(stdin.lock(), stdout.lock())?;
         return Ok(());
     }
-    match cli.cmd {
-        Some(Cmd::Trace {
-            sub: TraceSub::Query(q),
-        }) => {
-            return origin_cli::trace_cmd::invoke(q).map_err(|e| anyhow::anyhow!("{e}"));
+    if let Some(cmd) = cli.cmd {
+        if let Some(res) = dispatch_subcommand(cmd).await {
+            return res;
         }
-        Some(Cmd::Pair { sub }) => {
-            return match sub {
-                PairSub::Start { ttl_secs } => pair_start(ttl_secs).await,
-                PairSub::Redeem { url, code, device_id } => pair_redeem(&url, &code, device_id).await,
-            };
-        }
-        Some(Cmd::Run {
-            text,
-            json,
-            remote,
-            bearer,
-            model,
-        }) => {
-            return origin_cli::headless::run(text, json, remote, bearer, model).await;
-        }
-        Some(Cmd::Usage) => return origin_cli::admin::usage().await,
-        Some(Cmd::Sessions { sub }) => return origin_cli::admin::sessions(sub_to_action(sub)).await,
-        Some(Cmd::Keyring { sub }) => {
-            // Login drives an interactive OAuth flow and must be handled
-            // before converting to KeyringAction (which doesn't have a Login
-            // variant — Login bypasses the daemon IPC path entirely).
-            if let KeyringSub::Login { provider, account } = sub {
-                return origin_cli::keyring_login::run(&provider, &account).await;
-            }
-            return origin_cli::admin::keyring(sub_to_action_kr(sub)).await;
-        }
-        Some(Cmd::Providers { sub }) => {
-            return match sub {
-                ProvidersSub::Ls => {
-                    origin_cli::providers::ls();
-                    Ok(())
-                }
-                ProvidersSub::Describe { id } => {
-                    origin_cli::providers::describe(&id);
-                    Ok(())
-                }
-            };
-        }
-        Some(Cmd::Init) => {
-            return origin_cli::init::run().await;
-        }
-        Some(Cmd::Import(a)) => {
-            let r = origin_cli::import::run_import(&a).map_err(anyhow::Error::from)?;
-            if a.json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "sessions_inserted": r.sessions_inserted,
-                        "skills_inserted": r.skills_inserted,
-                    })
-                );
-            } else {
-                println!(
-                    "Imported {} sessions, {} skills.",
-                    r.sessions_inserted, r.skills_inserted
-                );
-            }
-            return Ok(());
-        }
-        None => {}
     }
 
     // First-run onboarding: if ~/.origin/config.toml does not exist, run the
@@ -224,6 +233,45 @@ async fn run() -> Result<()> {
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
 
+    let (composer, widget, app) = setup_tui(default_provider, &model);
+
+    // First-run discovery: if `origin init`'s welcome flow queued a pending
+    // prompt, fire it as the user's first turn and remove the file so it
+    // never auto-fires twice. Errors are non-fatal — the user can always
+    // type a prompt manually.
+    let pending_prompt = origin_cli::first_run_prompt::path()
+        .ok()
+        .and_then(|p| origin_cli::first_run_prompt::drain(&p).ok().flatten());
+
+    let plan_panel: Arc<Mutex<PlanPanelWiring>> = Arc::new(Mutex::new(PlanPanelWiring::new()));
+
+    let scheduler = Scheduler::new(Duration::from_millis(6));
+    let handle = scheduler.handle();
+    handle.mark_dirty();
+
+    // `composer`/`widget` are not used after the render task takes them, so
+    // move them in directly; `app`/`plan_panel`/`handle` are still needed
+    // below, so those are cloned.
+    let render_task = spawn_render_task(scheduler, composer, app.clone(), widget, plan_panel.clone());
+
+    spawn_stall_watchdog(app.clone(), handle.clone());
+
+    // Auto-fire the pending discovery prompt now that the TUI is wired up.
+    fire_pending_prompt(pending_prompt, &app, &handle, &path, &mut model, &session_id).await;
+
+    let result = run_event_loop(app, handle, &path, &mut model, &session_id, plan_panel).await;
+
+    render_task.abort();
+    disable_raw_mode()?;
+    execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+    result
+}
+
+/// Build the shared TUI state: the composer (full-screen grid), the stream
+/// widget (main scrollback region), and the `App`. Reads the current terminal
+/// size and pushes the startup banner. The caller is responsible for having
+/// already entered raw mode / the alternate screen.
+fn setup_tui(default_provider: String, model: &str) -> (SharedComposer, SharedWidget, SharedApp) {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let main_cols = cols.saturating_sub(20);
     let main_rows = rows.saturating_sub(3);
@@ -241,131 +289,115 @@ async fn run() -> Result<()> {
     // path to satisfying the lifetime without touching the wider App API.
     let provider_static: &'static str = Box::leak(default_provider.into_boxed_str());
     let sources = origin_cli::autocomplete::load_sources();
-    let app: SharedApp = Arc::new(Mutex::new(App::new(provider_static, model.clone(), sources)));
+    let app: SharedApp = Arc::new(Mutex::new(App::new(provider_static, model.to_string(), sources)));
     app.lock().push_banner(cols, rows);
+    (composer, widget, app)
+}
 
-    // First-run discovery: if `origin init`'s welcome flow queued a pending
-    // prompt, fire it as the user's first turn and remove the file so it
-    // never auto-fires twice. Errors are non-fatal — the user can always
-    // type a prompt manually.
-    let pending_prompt = origin_cli::first_run_prompt::path()
-        .ok()
-        .and_then(|p| origin_cli::first_run_prompt::drain(&p).ok().flatten());
-
-    let plan_panel: Arc<Mutex<PlanPanelWiring>> = Arc::new(Mutex::new(PlanPanelWiring::new()));
-
-    let scheduler = Scheduler::new(Duration::from_millis(6));
-    let handle = scheduler.handle();
-    handle.mark_dirty();
-
-    let render_task = {
-        let c2 = composer.clone();
-        let a2 = app.clone();
-        let w2 = widget.clone();
-        let pp2 = plan_panel.clone();
-        spawn_in(TaskClass::Realtime, async move {
-            scheduler
-                .run(move || {
-                    let bytes = {
-                        let mut c = c2.lock();
-                        let mut w = w2.lock();
-                        a2.lock().draw(&mut c, &mut w);
-                        if c.side_visible() {
-                            let pp = pp2.lock();
-                            let lines = pp.render();
-                            origin_cli::tui::draw_side(c.side_grid(), &lines);
-                        }
-                        c.frame()
-                    };
-                    if !bytes.is_empty() {
-                        use std::io::Write as _;
-                        let _ = std::io::stdout().write_all(&bytes);
-                        let _ = std::io::stdout().flush();
+/// Spawn the coalescing render task. It owns `scheduler` and drives one draw
+/// per dirty tick: composing the main grid + optional side panel into a frame
+/// and flushing it to stdout. Returns the task handle so the caller can
+/// `abort()` it during teardown.
+fn spawn_render_task(
+    scheduler: Scheduler,
+    composer: SharedComposer,
+    app: SharedApp,
+    widget: SharedWidget,
+    plan_panel: Arc<Mutex<PlanPanelWiring>>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_in(TaskClass::Realtime, async move {
+        scheduler
+            .run(move || {
+                let bytes = {
+                    let mut c = composer.lock();
+                    let mut w = widget.lock();
+                    app.lock().draw(&mut c, &mut w);
+                    if c.side_visible() {
+                        // Hold the plan-panel guard only for `render()` (it
+                        // drops at the end of this statement, before draw_side)
+                        // to keep lock contention off the hot render path.
+                        let lines = plan_panel.lock().render();
+                        origin_cli::tui::draw_side(c.side_grid(), &lines);
                     }
-                })
-                .await;
-        })
-    };
-
-    {
-        let a3 = app.clone();
-        let h3 = handle.clone();
-        spawn_in(TaskClass::Realtime, async move {
-            // Render heartbeat + stall watchdog. While a turn is active this
-            // ticks the spinner/elapsed clock independently of daemon events, so
-            // a hung daemon never looks like a dead screen. It also watches a
-            // cheap activity fingerprint: when it stops changing for
-            // `STALL_WARN_AFTER`, the daemon has gone silent and we raise a
-            // visible stall notice (so "wedged" no longer looks like "working").
-            let mut last_sig: u64 = 0;
-            let mut quiet_since: Option<std::time::Instant> = None;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-                let mut a = a3.lock();
-                if !a.spinner.active {
-                    quiet_since = None;
-                    a.stall_secs = None;
-                    continue;
+                    c.frame()
+                };
+                if !bytes.is_empty() {
+                    use std::io::Write as _;
+                    let _ = std::io::stdout().write_all(&bytes);
+                    let _ = std::io::stdout().flush();
                 }
-                let sig = a.activity_signature();
-                if sig == last_sig {
-                    let since = *quiet_since.get_or_insert_with(std::time::Instant::now);
-                    a.stall_secs = origin_cli::tui::stall_seconds(
-                        since.elapsed(),
-                        origin_cli::tui::STALL_WARN_AFTER,
-                    );
-                } else {
-                    last_sig = sig;
-                    quiet_since = Some(std::time::Instant::now());
-                    a.stall_secs = None;
-                }
-                drop(a);
-                h3.mark_dirty();
-            }
-        });
-    }
+            })
+            .await;
+    })
+}
 
-    // Auto-fire the pending discovery prompt now that the TUI is wired up.
-    if let Some(text) = pending_prompt {
-        {
+/// Spawn the render heartbeat + stall watchdog. While a turn is active this
+/// ticks the spinner/elapsed clock independently of daemon events, so a hung
+/// daemon never looks like a dead screen. It also watches a cheap activity
+/// fingerprint: when it stops changing for `STALL_WARN_AFTER`, the daemon has
+/// gone silent and we raise a visible stall notice (so "wedged" no longer
+/// looks like "working"). The task runs for the life of the process; the
+/// handle is intentionally dropped.
+fn spawn_stall_watchdog(app: SharedApp, handle: Handle) {
+    spawn_in(TaskClass::Realtime, async move {
+        let mut last_sig: u64 = 0;
+        let mut quiet_since: Option<std::time::Instant> = None;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             let mut a = app.lock();
-            a.add_line("system> ", "Running queued first-run discovery prompt\u{2026}");
-            // Activate the spinner so the render heartbeat animates and the
-            // stall watchdog arms for this turn too — without this the
-            // first-run prompt ran with a frozen, un-animated status line.
-            a.spinner.start();
+            if !a.spinner.active {
+                quiet_since = None;
+                a.stall_secs = None;
+                continue;
+            }
+            let sig = a.activity_signature();
+            if sig == last_sig {
+                let since = *quiet_since.get_or_insert_with(std::time::Instant::now);
+                a.stall_secs =
+                    origin_cli::tui::stall_seconds(since.elapsed(), origin_cli::tui::STALL_WARN_AFTER);
+            } else {
+                last_sig = sig;
+                quiet_since = Some(std::time::Instant::now());
+                a.stall_secs = None;
+            }
+            drop(a);
+            handle.mark_dirty();
         }
-        handle.mark_dirty();
-        // No user interrupt channel for the auto-fire path — the user has
-        // not had a chance to press Ctrl+C yet (TUI is not yet driving the
-        // input loop). `None` keeps `call_daemon`'s select arm a no-op.
-        handle_submit(&app, &handle, &path, &mut model, &text, &session_id, None).await;
-        app.lock().spinner.stop();
-        handle.mark_dirty();
+    });
+}
+
+/// Auto-fire the queued first-run discovery prompt, if any, now that the TUI
+/// is wired up. A `None` prompt is a no-op.
+async fn fire_pending_prompt(
+    pending_prompt: Option<String>,
+    app: &SharedApp,
+    handle: &Handle,
+    path: &str,
+    model: &mut String,
+    session_id: &str,
+) {
+    let Some(text) = pending_prompt else {
+        return;
+    };
+    {
+        let mut a = app.lock();
+        a.add_line("system> ", "Running queued first-run discovery prompt\u{2026}");
+        // Activate the spinner so the render heartbeat animates and the
+        // stall watchdog arms for this turn too — without this the
+        // first-run prompt ran with a frozen, un-animated status line.
+        a.spinner.start();
     }
-
-    let result = run_event_loop(
-        app,
-        composer,
-        widget,
-        handle,
-        &path,
-        &mut model,
-        &session_id,
-        plan_panel,
-    )
-    .await;
-
-    render_task.abort();
-    disable_raw_mode()?;
-    execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
-    result
+    handle.mark_dirty();
+    // No user interrupt channel for the auto-fire path — the user has
+    // not had a chance to press Ctrl+C yet (TUI is not yet driving the
+    // input loop). `None` keeps `call_daemon`'s select arm a no-op.
+    handle_submit(app, handle, path, model, &text, session_id, None).await;
+    app.lock().spinner.stop();
+    handle.mark_dirty();
 }
 
 async fn run_event_loop(
     app: SharedApp,
-    _composer: SharedComposer,
-    _widget: SharedWidget,
     handle: Handle,
     path: &str,
     model: &mut String,
@@ -402,171 +434,239 @@ async fn run_event_loop(
             continue;
         }
         if let crossterm::event::Event::Key(ev) = event {
-            // crossterm on Windows reports both Press and Release for every
-            // keystroke; without this filter, every character would land in
-            // the buffer twice. Allow Repeat so autorepeat still works.
-            if !matches!(
-                ev.kind,
-                crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
-            ) {
-                continue;
-            }
-            // Scrollback navigation — intercept before the buffer reducer.
-            match ev.code {
-                crossterm::event::KeyCode::PageUp => {
-                    app.lock().scroll_up(10);
-                    handle.mark_dirty();
-                    continue;
-                }
-                crossterm::event::KeyCode::PageDown => {
-                    app.lock().scroll_down(10);
-                    handle.mark_dirty();
-                    continue;
-                }
-                crossterm::event::KeyCode::Up
-                    if ev.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) =>
-                {
-                    app.lock().scroll_up(3);
-                    handle.mark_dirty();
-                    continue;
-                }
-                crossterm::event::KeyCode::Down
-                    if ev.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) =>
-                {
-                    app.lock().scroll_down(3);
-                    handle.mark_dirty();
-                    continue;
-                }
-                crossterm::event::KeyCode::End => {
-                    app.lock().scroll_to_bottom();
-                    handle.mark_dirty();
-                    continue;
-                }
-                // Unshifted Up/Down navigate the suggestion popup when it
-                // is open. With no popup these keys are no-ops (history
-                // navigation isn't implemented yet); the SHIFT variants
-                // above still drive scrollback.
-                crossterm::event::KeyCode::Up => {
-                    let mut a = app.lock();
-                    if !a.suggestions.candidates.is_empty() {
-                        origin_cli::suggestions::select_prev(&mut a.suggestions);
-                        drop(a);
-                        handle.mark_dirty();
-                        continue;
-                    }
-                }
-                crossterm::event::KeyCode::Down => {
-                    let mut a = app.lock();
-                    if !a.suggestions.candidates.is_empty() {
-                        origin_cli::suggestions::select_next(&mut a.suggestions);
-                        drop(a);
-                        handle.mark_dirty();
-                        continue;
-                    }
-                }
-                _ => {}
-            }
-
-            if matches!(ev.code, crossterm::event::KeyCode::Tab) {
-                let mut a = app.lock();
-                if !a.suggestions.candidates.is_empty() {
-                    let suggestions = a.suggestions.clone();
-                    origin_cli::suggestions::accept_selected(&suggestions, &mut a.input);
-                    a.recompute_suggestions();
-                }
-                drop(a);
-                handle.mark_dirty();
-                continue;
-            }
-
-            let action = {
-                let mut a = app.lock();
-                // Bug #5: an operation is "in flight" when either the
-                // status-line spinner is active (a Prompt is mid-stream)
-                // or a goal indicator is visible. Either case means
-                // Ctrl+C should send Interrupt instead of quitting.
-                let op_in_flight = a.spinner.active || a.goal_status.is_some();
-                reduce(&mut a.input, ev, op_in_flight)
-            };
-            match action {
-                InputAction::Quit => break,
-                InputAction::Interrupt => {
-                    // Best-effort: drop a token into the current
-                    // call_daemon's interrupt channel. If no Prompt is in
-                    // flight the slot is `None` and the keystroke is a
-                    // no-op (the reducer should not even have produced
-                    // this variant in that case, but we guard anyway).
-                    if let Some(tx) = interrupt_tx.lock().await.as_ref() {
-                        let _ = tx.send(());
-                    }
-                    app.lock()
-                        .add_line("system> ", "interrupt sent (Ctrl+D to exit)");
-                    handle.mark_dirty();
-                }
-                InputAction::Submit(text) => {
-                    if is_slash_command(&text) {
-                        // Slash commands are fast (local, or a single one-shot IPC
-                        // round-trip) and may mutate `model`; run them inline.
-                        handle_submit(&app, &handle, path, model, &text, session_id, None).await;
-                        app.lock().recompute_suggestions();
-                        handle.mark_dirty();
-                    } else if interrupt_tx.lock().await.is_some() {
-                        // A prompt turn is already streaming on this connection;
-                        // don't start a second concurrent turn on the same session.
-                        app.lock().add_line(
-                            "system> ",
-                            "a turn is already running (Ctrl+C to interrupt it)",
-                        );
-                        handle.mark_dirty();
-                    } else {
-                        // A prompt turn can stream for a long time (agentic goal
-                        // loops back off up to 60s per iteration). Spawn it so the
-                        // event loop keeps polling input and can deliver a Ctrl+C
-                        // Interrupt into `interrupt_tx` while the turn is live —
-                        // awaiting inline (the old behaviour) blocked the loop and
-                        // made Ctrl+C dead until the turn ended.
-                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-                        *interrupt_tx.lock().await = Some(tx);
-                        {
-                            let mut a = app.lock();
-                            a.recompute_suggestions();
-                            a.spinner.start();
-                        }
-                        handle.mark_dirty();
-                        let app_for_turn = Arc::clone(&app);
-                        let handle_for_turn = handle.clone();
-                        let interrupt_for_turn = Arc::clone(&interrupt_tx);
-                        let path_for_turn = path.to_string();
-                        let model_for_turn = model.clone();
-                        let session_for_turn = session_id.to_string();
-                        spawn_in(TaskClass::Realtime, async move {
-                            handle_prompt_turn(
-                                &app_for_turn,
-                                &handle_for_turn,
-                                &path_for_turn,
-                                &model_for_turn,
-                                &text,
-                                &session_for_turn,
-                                Some(rx),
-                            )
-                            .await;
-                            *interrupt_for_turn.lock().await = None;
-                            app_for_turn.lock().spinner.stop();
-                            handle_for_turn.mark_dirty();
-                        });
-                    }
-                }
-                InputAction::Insert(_) | InputAction::Backspace | InputAction::Newline => {
-                    app.lock().recompute_suggestions();
-                    handle.mark_dirty();
-                }
-                _ => {
-                    handle.mark_dirty();
-                }
+            match handle_key_event(ev, &app, &handle, &interrupt_tx, path, model, session_id).await {
+                KeyOutcome::Continue => continue,
+                KeyOutcome::Break => break,
             }
         }
     }
     Ok(())
+}
+
+/// Outcome of handling a single key event: either keep polling the input
+/// stream or break out of the event loop (process exit path).
+enum KeyOutcome {
+    Continue,
+    Break,
+}
+
+/// Handle one decoded key event. Returns [`KeyOutcome::Break`] only for the
+/// quit path; every other branch returns [`KeyOutcome::Continue`], matching
+/// the `continue`/fall-through behaviour of the original inline `match`.
+async fn handle_key_event(
+    ev: crossterm::event::KeyEvent,
+    app: &SharedApp,
+    handle: &Handle,
+    interrupt_tx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>>,
+    path: &str,
+    model: &mut String,
+    session_id: &str,
+) -> KeyOutcome {
+    // crossterm on Windows reports both Press and Release for every
+    // keystroke; without this filter, every character would land in
+    // the buffer twice. Allow Repeat so autorepeat still works.
+    if !matches!(
+        ev.kind,
+        crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
+    ) {
+        return KeyOutcome::Continue;
+    }
+    // Scrollback navigation — intercept before the buffer reducer. Returns
+    // `Some` when the key was a navigation key we fully handled.
+    if let Some(outcome) = handle_scrollback_key(ev, app, handle) {
+        return outcome;
+    }
+
+    if matches!(ev.code, crossterm::event::KeyCode::Tab) {
+        let mut a = app.lock();
+        if !a.suggestions.candidates.is_empty() {
+            let suggestions = a.suggestions.clone();
+            origin_cli::suggestions::accept_selected(&suggestions, &mut a.input);
+            a.recompute_suggestions();
+        }
+        drop(a);
+        handle.mark_dirty();
+        return KeyOutcome::Continue;
+    }
+
+    let action = {
+        let mut a = app.lock();
+        // Bug #5: an operation is "in flight" when either the
+        // status-line spinner is active (a Prompt is mid-stream)
+        // or a goal indicator is visible. Either case means
+        // Ctrl+C should send Interrupt instead of quitting.
+        let op_in_flight = a.spinner.active || a.goal_status.is_some();
+        reduce(&mut a.input, ev, op_in_flight)
+    };
+    handle_input_action(action, app, handle, interrupt_tx, path, model, session_id).await
+}
+
+/// Intercept scrollback/suggestion navigation keys before the buffer reducer.
+/// Returns `Some(KeyOutcome::Continue)` when the key was fully handled here;
+/// `None` when it should fall through to the input reducer (an unhandled key,
+/// or an unshifted Up/Down with no open suggestion popup).
+fn handle_scrollback_key(
+    ev: crossterm::event::KeyEvent,
+    app: &SharedApp,
+    handle: &Handle,
+) -> Option<KeyOutcome> {
+    match ev.code {
+        crossterm::event::KeyCode::PageUp => {
+            app.lock().scroll_up(10);
+            handle.mark_dirty();
+            Some(KeyOutcome::Continue)
+        }
+        crossterm::event::KeyCode::PageDown => {
+            app.lock().scroll_down(10);
+            handle.mark_dirty();
+            Some(KeyOutcome::Continue)
+        }
+        crossterm::event::KeyCode::Up if ev.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) => {
+            app.lock().scroll_up(3);
+            handle.mark_dirty();
+            Some(KeyOutcome::Continue)
+        }
+        crossterm::event::KeyCode::Down if ev.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) => {
+            app.lock().scroll_down(3);
+            handle.mark_dirty();
+            Some(KeyOutcome::Continue)
+        }
+        crossterm::event::KeyCode::End => {
+            app.lock().scroll_to_bottom();
+            handle.mark_dirty();
+            Some(KeyOutcome::Continue)
+        }
+        // Unshifted Up/Down navigate the suggestion popup when it
+        // is open. With no popup these keys are no-ops (history
+        // navigation isn't implemented yet); the SHIFT variants
+        // above still drive scrollback.
+        crossterm::event::KeyCode::Up => {
+            let mut a = app.lock();
+            if a.suggestions.candidates.is_empty() {
+                return None;
+            }
+            origin_cli::suggestions::select_prev(&mut a.suggestions);
+            drop(a);
+            handle.mark_dirty();
+            Some(KeyOutcome::Continue)
+        }
+        crossterm::event::KeyCode::Down => {
+            let mut a = app.lock();
+            if a.suggestions.candidates.is_empty() {
+                return None;
+            }
+            origin_cli::suggestions::select_next(&mut a.suggestions);
+            drop(a);
+            handle.mark_dirty();
+            Some(KeyOutcome::Continue)
+        }
+        _ => None,
+    }
+}
+
+/// Apply a reduced [`InputAction`] to the TUI. Returns [`KeyOutcome::Break`]
+/// for `Quit`; all other actions return [`KeyOutcome::Continue`].
+async fn handle_input_action(
+    action: InputAction,
+    app: &SharedApp,
+    handle: &Handle,
+    interrupt_tx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>>,
+    path: &str,
+    model: &mut String,
+    session_id: &str,
+) -> KeyOutcome {
+    match action {
+        InputAction::Quit => return KeyOutcome::Break,
+        InputAction::Interrupt => {
+            // Best-effort: drop a token into the current call_daemon's
+            // interrupt channel. If no Prompt is in flight the slot is
+            // `None` and the keystroke is a no-op (the reducer should not
+            // even have produced this variant in that case, but we guard
+            // anyway). Clone the sender out of the guard in a tight scope
+            // so the lock is dropped before `send()` rather than held
+            // across the await-free send (significant_drop_in_scrutinee).
+            let tx = interrupt_tx.lock().await.clone();
+            if let Some(tx) = tx {
+                let _ = tx.send(());
+            }
+            app.lock().add_line("system> ", "interrupt sent (Ctrl+D to exit)");
+            handle.mark_dirty();
+        }
+        InputAction::Submit(text) => {
+            if is_slash_command(&text) {
+                // Slash commands are fast (local, or a single one-shot IPC
+                // round-trip) and may mutate `model`; run them inline.
+                handle_submit(app, handle, path, model, &text, session_id, None).await;
+                app.lock().recompute_suggestions();
+                handle.mark_dirty();
+            } else if interrupt_tx.lock().await.is_some() {
+                // A prompt turn is already streaming on this connection;
+                // don't start a second concurrent turn on the same session.
+                app.lock()
+                    .add_line("system> ", "a turn is already running (Ctrl+C to interrupt it)");
+                handle.mark_dirty();
+            } else {
+                spawn_prompt_turn(text, app, handle, interrupt_tx, path, model, session_id).await;
+            }
+        }
+        InputAction::Insert(_) | InputAction::Backspace | InputAction::Newline => {
+            app.lock().recompute_suggestions();
+            handle.mark_dirty();
+        }
+        InputAction::Noop => {
+            handle.mark_dirty();
+        }
+    }
+    KeyOutcome::Continue
+}
+
+/// Start a streaming prompt turn on its own task so the event loop keeps
+/// polling input and can deliver a Ctrl+C interrupt while the turn is live.
+/// Installs the interrupt sender into `interrupt_tx` and clears it (plus the
+/// spinner) when the turn completes.
+async fn spawn_prompt_turn(
+    text: String,
+    app: &SharedApp,
+    handle: &Handle,
+    interrupt_tx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>>,
+    path: &str,
+    model: &str,
+    session_id: &str,
+) {
+    // A prompt turn can stream for a long time (agentic goal loops back off
+    // up to 60s per iteration). Spawn it so the event loop keeps polling
+    // input and can deliver a Ctrl+C Interrupt into `interrupt_tx` while the
+    // turn is live — awaiting inline (the old behaviour) blocked the loop and
+    // made Ctrl+C dead until the turn ended.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    *interrupt_tx.lock().await = Some(tx);
+    {
+        let mut a = app.lock();
+        a.recompute_suggestions();
+        a.spinner.start();
+    }
+    handle.mark_dirty();
+    let app_for_turn = Arc::clone(app);
+    let handle_for_turn = handle.clone();
+    let interrupt_for_turn = Arc::clone(interrupt_tx);
+    let path_for_turn = path.to_string();
+    let model_for_turn = model.to_string();
+    let session_for_turn = session_id.to_string();
+    spawn_in(TaskClass::Realtime, async move {
+        handle_prompt_turn(
+            &app_for_turn,
+            &handle_for_turn,
+            &path_for_turn,
+            &model_for_turn,
+            &text,
+            &session_for_turn,
+            Some(rx),
+        )
+        .await;
+        *interrupt_for_turn.lock().await = None;
+        app_for_turn.lock().spinner.stop();
+        handle_for_turn.mark_dirty();
+    });
 }
 
 /// Open a dedicated long-lived IPC connection, send
@@ -806,6 +906,10 @@ async fn handle_prompt_turn(
                 a.add_colored_line(text, fg, bg);
             }
             a.start_assistant_turn();
+            // Drop the App guard before signalling the renderer so the lock
+            // is not held across mark_dirty (significant_drop_tightening),
+            // matching the other stream callbacks in this call.
+            drop(a);
             handle_for_tool.mark_dirty();
         },
         move |_tool: &str, content: &str| {
@@ -897,7 +1001,10 @@ async fn handle_prompt_turn(
     handle.mark_dirty();
 }
 
-#[allow(clippy::too_many_arguments)]
+// `redundant_pub_crate`: the `tokio::select!` below expands to `pub(crate)`
+// helper items; in this bin crate (a private-module root) that trips the lint —
+// a known macro false positive, not author-written `pub(crate)` visibility.
+#[allow(clippy::too_many_arguments, clippy::redundant_pub_crate)]
 async fn call_daemon(
     path: &str,
     model: &str,
@@ -1137,8 +1244,7 @@ async fn send_skill_command(path: &str, msg: &ClientMessage) -> Result<String> {
     let mut last_intermediate: Option<String> = None;
     loop {
         let resp = client.read_frame_body().await?;
-        let ev: StreamEvent =
-            serde_json::from_slice(&resp).map_err(|e| anyhow::anyhow!("bad reply: {e}"))?;
+        let ev: StreamEvent = serde_json::from_slice(&resp).map_err(|e| anyhow::anyhow!("bad reply: {e}"))?;
         // Bug #4 + #20: render Goal* outcomes inline so /goal-related
         // slash commands surface the same colored notices the streaming
         // path uses.
@@ -1171,81 +1277,87 @@ async fn send_skill_command(path: &str, msg: &ClientMessage) -> Result<String> {
             }
             _ => {}
         }
-        // Terminal arms: each `return`s out of the loop.
-        let outcome: Result<String> = match ev {
-            StreamEvent::SkillActive { name, allowed_tools } => {
-                if allowed_tools.is_empty() {
-                    Ok(format!("skill `{name}` active (no narrowing)"))
-                } else {
-                    Ok(format!(
-                        "skill `{name}` active; allowed tools: {}",
-                        allowed_tools.join(", ")
-                    ))
-                }
-            }
-            StreamEvent::SkillError { message } => Err(anyhow::anyhow!("{message}")),
-            StreamEvent::AdminOk => {
-                // `/clear` arrives here after the GoalCleared (if any) was
-                // already absorbed into `last_intermediate`. Combine them
-                // into one line so the user sees both outcomes.
-                if let Some(prior) = last_intermediate.take() {
-                    Ok(format!("skill deactivated; {prior}"))
-                } else {
-                    Ok("skill deactivated".to_string())
-                }
-            }
-            StreamEvent::WorkflowActive { name, steps, skipped } => {
-                let main = if steps.is_empty() {
-                    format!("workflow `{name}` activated (no steps resolved)")
-                } else {
-                    format!("workflow `{name}` activated; skills: {}", steps.join(" → "))
-                };
-                if skipped.is_empty() {
-                    Ok(main)
-                } else {
-                    Ok(format!("{main}  (skipped: {})", skipped.join(", ")))
-                }
-            }
-            StreamEvent::WorkflowStepActive {
-                name,
-                step_index,
-                total_steps,
-                skill,
-                skipped,
-            } => {
-                let pos = step_index + 1;
-                let main = format!("workflow `{name}` step {pos}/{total_steps}: `{skill}` active");
-                if skipped.is_empty() {
-                    Ok(main)
-                } else {
-                    Ok(format!("{main}  (skipped: {})", skipped.join(", ")))
-                }
-            }
-            StreamEvent::WorkflowComplete { name, skipped } => {
-                if skipped.is_empty() {
-                    Ok(format!("workflow `{name}` complete"))
-                } else {
-                    Ok(format!(
-                        "workflow `{name}` complete  (skipped: {})",
-                        skipped.join(", ")
-                    ))
-                }
-            }
-            StreamEvent::WorkflowStepHeld {
-                name,
-                step_index,
-                total_steps,
-                skill,
-                message,
-            } => {
-                let pos = step_index + 1;
+        // Terminal arms: delegate to the outcome mapper, which returns the
+        // final summary/error string for this reply.
+        return skill_command_outcome(ev, &mut last_intermediate);
+    }
+}
+
+/// Map a terminal skill/workflow [`StreamEvent`] to the one-line summary (or
+/// error) that [`send_skill_command`] returns. `last_intermediate` carries a
+/// prior `GoalCleared` line that `/clear` (`AdminOk`) folds into its message.
+fn skill_command_outcome(ev: StreamEvent, last_intermediate: &mut Option<String>) -> Result<String> {
+    match ev {
+        StreamEvent::SkillActive { name, allowed_tools } => {
+            if allowed_tools.is_empty() {
+                Ok(format!("skill `{name}` active (no narrowing)"))
+            } else {
                 Ok(format!(
-                    "workflow `{name}` step {pos}/{total_steps} held on `{skill}` — {message}; retry your prompt to resume"
+                    "skill `{name}` active; allowed tools: {}",
+                    allowed_tools.join(", ")
                 ))
             }
-            other => Err(anyhow::anyhow!("unexpected reply: {other:?}")),
-        };
-        return outcome;
+        }
+        StreamEvent::SkillError { message } => Err(anyhow::anyhow!("{message}")),
+        StreamEvent::AdminOk => {
+            // `/clear` arrives here after the GoalCleared (if any) was
+            // already absorbed into `last_intermediate`. Combine them
+            // into one line so the user sees both outcomes.
+            last_intermediate.take().map_or_else(
+                || Ok("skill deactivated".to_string()),
+                |prior| Ok(format!("skill deactivated; {prior}")),
+            )
+        }
+        StreamEvent::WorkflowActive { name, steps, skipped } => {
+            let main = if steps.is_empty() {
+                format!("workflow `{name}` activated (no steps resolved)")
+            } else {
+                format!("workflow `{name}` activated; skills: {}", steps.join(" → "))
+            };
+            if skipped.is_empty() {
+                Ok(main)
+            } else {
+                Ok(format!("{main}  (skipped: {})", skipped.join(", ")))
+            }
+        }
+        StreamEvent::WorkflowStepActive {
+            name,
+            step_index,
+            total_steps,
+            skill,
+            skipped,
+        } => {
+            let pos = step_index + 1;
+            let main = format!("workflow `{name}` step {pos}/{total_steps}: `{skill}` active");
+            if skipped.is_empty() {
+                Ok(main)
+            } else {
+                Ok(format!("{main}  (skipped: {})", skipped.join(", ")))
+            }
+        }
+        StreamEvent::WorkflowComplete { name, skipped } => {
+            if skipped.is_empty() {
+                Ok(format!("workflow `{name}` complete"))
+            } else {
+                Ok(format!(
+                    "workflow `{name}` complete  (skipped: {})",
+                    skipped.join(", ")
+                ))
+            }
+        }
+        StreamEvent::WorkflowStepHeld {
+            name,
+            step_index,
+            total_steps,
+            skill,
+            message,
+        } => {
+            let pos = step_index + 1;
+            Ok(format!(
+                "workflow `{name}` step {pos}/{total_steps} held on `{skill}` — {message}; retry your prompt to resume"
+            ))
+        }
+        other => Err(anyhow::anyhow!("unexpected reply: {other:?}")),
     }
 }
 
@@ -1380,9 +1492,8 @@ fn daemon_stamp_path() -> Option<std::path::PathBuf> {
 /// Returns `true` when the daemon binary on disk is newer than the last spawn
 /// recorded in `~/.origin/daemon.stamp`.
 fn daemon_binary_is_newer(binary: &std::ffi::OsStr) -> bool {
-    let stamp = match daemon_stamp_path() {
-        Some(p) => p,
-        None => return false,
+    let Some(stamp) = daemon_stamp_path() else {
+        return false;
     };
     let bin_mtime = std::fs::metadata(binary).and_then(|m| m.modified()).ok();
     let stamp_mtime = std::fs::metadata(&stamp).and_then(|m| m.modified()).ok();
@@ -1422,6 +1533,10 @@ fn kill_stale_daemon() {
             .status();
     }
 }
+
+/// How long [`ensure_daemon_running`] waits for a freshly spawned daemon to
+/// bind the IPC path before giving up.
+const STARTUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Make sure `origin-daemon` is listening on `path`. If a fresh probe fails,
 /// resolve a daemon binary (sibling of the current exe, or `origin-daemon` on
@@ -1487,8 +1602,7 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
     let child = command.spawn().map_err(|e| {
         let searched = sibling
             .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<no exe dir>".to_string());
+            .map_or_else(|| "<no exe dir>".to_string(), |p| p.display().to_string());
         anyhow::anyhow!(
             "could not spawn origin-daemon: {e}\n\
              searched: {searched}, then PATH for `origin-daemon`\n\
@@ -1499,7 +1613,6 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
     drop(child);
     touch_daemon_stamp();
 
-    const STARTUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
     let deadline = std::time::Instant::now() + STARTUP_DEADLINE;
     while std::time::Instant::now() < deadline {
         if daemon_reachable(path).await {

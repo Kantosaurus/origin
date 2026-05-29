@@ -24,38 +24,47 @@ const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 
+#[must_use]
 pub fn accent(s: &str) -> String {
     format!("{}{s}{RESET}", rgb_fg(theme::ACCENT))
 }
 
+#[must_use]
 pub fn bright(s: &str) -> String {
     format!("{}{BOLD}{s}{RESET}", rgb_fg(theme::BRIGHT))
 }
 
+#[must_use]
 pub fn muted(s: &str) -> String {
     format!("{}{DIM}{s}{RESET}", rgb_fg(theme::MUTED))
 }
 
+#[must_use]
 pub fn green(s: &str) -> String {
     format!("{}{s}{RESET}", rgb_fg(theme::GREEN))
 }
 
+#[must_use]
 pub fn red(s: &str) -> String {
     format!("{}{s}{RESET}", rgb_fg(theme::RED))
 }
 
+#[must_use]
 pub fn yellow(s: &str) -> String {
     format!("{}{s}{RESET}", rgb_fg(theme::YELLOW))
 }
 
+#[must_use]
 pub fn heading(s: &str) -> String {
     format!("{}{BOLD}{s}{RESET}", rgb_fg(theme::ACCENT))
 }
 
+#[must_use]
 pub fn prompt_arrow() -> String {
     format!("{}{BOLD}\u{276F}{RESET}", rgb_fg(theme::ACCENT))
 }
 
+#[must_use]
 pub fn highlight_row(s: &str) -> String {
     format!(
         "{}{}{BOLD}{s}{RESET}",
@@ -64,11 +73,13 @@ pub fn highlight_row(s: &str) -> String {
     )
 }
 
+#[must_use]
 pub fn section_rule(width: usize) -> String {
     let line: String = "\u{2500}".repeat(width);
     format!("{}{line}{RESET}", rgb_fg(theme::BORDER))
 }
 
+#[must_use]
 pub fn step_number(n: usize, total: usize) -> String {
     format!("{}{DIM}[{n}/{total}]{RESET}", rgb_fg(theme::MUTED))
 }

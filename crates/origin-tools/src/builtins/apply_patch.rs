@@ -154,7 +154,9 @@ fn apply_one_hunk(text: &str, h: &Hunk, offset: isize) -> Result<(String, isize)
     }
     // start index in CURRENT (working) coordinates; isize so a negative result
     // from an out-of-range hunk start is rejected rather than wrapping.
-    let base = h.old_start.saturating_sub(1) as isize + offset;
+    let base = isize::try_from(h.old_start.saturating_sub(1))
+        .unwrap_or(isize::MAX)
+        .saturating_add(offset);
     let start_idx = usize::try_from(base).map_err(|_| {
         ToolError::new(
             ErrClass::Edit,
@@ -200,7 +202,8 @@ fn apply_one_hunk(text: &str, h: &Hunk, offset: isize) -> Result<(String, isize)
     if text.ends_with('\n') {
         joined.push('\n');
     }
-    let delta = new_block.len() as isize - old_block.len() as isize;
+    let delta = isize::try_from(new_block.len()).unwrap_or(isize::MAX)
+        - isize::try_from(old_block.len()).unwrap_or(isize::MAX);
     Ok((joined, delta))
 }
 

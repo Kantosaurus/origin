@@ -82,7 +82,7 @@ jobs:
             cosign sign-blob --bundle "$f.sig" "$f"
           done
       - name: SLSA provenance attestation
-        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: "dist/*"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -100,7 +100,7 @@ jobs:
         with:
           toolchain: 1.83.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
       - name: Flatten
@@ -154,7 +154,7 @@ jobs:
             -exec cp {} out/sbom/ \;
           ls -la out/sbom || true
       - name: GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           files: |
             out/origin-*
@@ -176,11 +176,11 @@ jobs:
       id-token: write # required for `npm publish --provenance`
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
       - name: Collect binaries
@@ -196,6 +196,9 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: "true"
+          # Package family defaults to the scoped `@kantosaurus/origin`
+          # (lib/platform.js); the unscoped `originx*` names tripped npm spam
+          # detection. Set ORIGIN_NPM_PREFIX here only to override that default.
         run: |
           node packaging/npm/scripts/build.mjs \
             --version "${{ steps.ver.outputs.version }}" \
