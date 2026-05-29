@@ -26,11 +26,37 @@ tag:
 
 Requirements:
 
-- A repository secret **`NPM_TOKEN`** (an npm automation token with publish
-  rights to `originx` and the `originx-*` packages).
-- The first publish of each package name must be done by an account that owns
-  the name. Run the manual flow once (below) to claim the names, then CI takes
-  over.
+- A repository secret **`NPM_TOKEN`**. It MUST be a **Granular Access Token**
+  with **read/write** package permission and the **"bypass two-factor
+  authentication"** capability. A *classic automation* token is **not** enough
+  when the account enforces 2FA for writes: the publish reaches the registry and
+  even signs provenance, then fails with
+  `E403 … Two-factor authentication or granular access token with bypass 2fa
+  enabled is required to publish packages`. (Alternatively, lower the npm
+  account's 2FA level to *Authorization only* so a classic automation token may
+  publish — less secure; the GAT is preferred.)
+- For the **first** publish the `originx*` names don't exist yet, so the token
+  cannot be scoped to them — grant it **All packages** read/write (or org-wide),
+  then optionally re-scope to `originx` / `originx-*` once they exist.
+- npm may also reject `originx` as *too similar* to the existing `origin`
+  package. If a retry fails with a similarity `E403` (a *different* message from
+  the 2FA one above), switch to the scoped name `@kantosaurus/origin` — set
+  `PKG_PREFIX` in `packaging/npm/lib/platform.js` and `name` in
+  `packaging/npm/package.json`; the installed command stays `origin`.
+
+### Re-running after a failed publish
+
+The npm step reads `NPM_TOKEN` at run time, so after fixing the token you can
+re-publish the **same** tag without cutting a new one:
+
+```sh
+gh run rerun <run-id> --failed   # re-runs only the failed npm-publish job
+```
+
+The platform packages publish before the main package. If a run published some
+but not all of them, bump the version (a new tag) rather than re-running —
+re-publishing an existing `name@version` fails with `E409`. (`build.mjs` could
+be made idempotent by skipping versions already on the registry; not yet done.)
 
 ## Manual
 

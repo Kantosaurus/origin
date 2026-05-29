@@ -164,6 +164,12 @@ function buildMainPackage(out, version, builtPkgs) {
   for (const name of builtPkgs) optionalDependencies[name] = version;
 
   const base = JSON.parse(fs.readFileSync(path.join(NPM_DIR, 'package.json'), 'utf8'));
+  // Drop `//`-prefixed comment keys (JSON has no comments; the committed
+  // manifest uses them to document maintainer intent) so they never ship in
+  // the published tarball.
+  for (const k of Object.keys(base)) {
+    if (k.startsWith('//')) delete base[k];
+  }
   writeJson(path.join(dir, 'package.json'), {
     ...base,
     version,
