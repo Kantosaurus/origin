@@ -11,19 +11,34 @@ fn parses_met() {
 #[test]
 fn parses_not_met_with_em_dash() {
     let v = parse_verdict("VERDICT: not_met — tests still failing").unwrap();
-    assert_eq!(v, Verdict::NotMet { reason: "tests still failing".into() });
+    assert_eq!(
+        v,
+        Verdict::NotMet {
+            reason: "tests still failing".into()
+        }
+    );
 }
 
 #[test]
 fn parses_not_met_with_ascii_dash() {
     let v = parse_verdict("VERDICT: not_met - missing migration").unwrap();
-    assert_eq!(v, Verdict::NotMet { reason: "missing migration".into() });
+    assert_eq!(
+        v,
+        Verdict::NotMet {
+            reason: "missing migration".into()
+        }
+    );
 }
 
 #[test]
 fn parses_not_met_no_separator() {
     let v = parse_verdict("VERDICT: not_met tests red").unwrap();
-    assert_eq!(v, Verdict::NotMet { reason: "tests red".into() });
+    assert_eq!(
+        v,
+        Verdict::NotMet {
+            reason: "tests red".into()
+        }
+    );
 }
 
 #[test]
@@ -34,7 +49,10 @@ fn ignores_preamble_lines() {
 
 #[test]
 fn malformed_when_no_verdict_line() {
-    matches!(parse_verdict("VERDICT_OF_THE_PEOPLE"), Err(VerifierError::Malformed(_)));
+    matches!(
+        parse_verdict("VERDICT_OF_THE_PEOPLE"),
+        Err(VerifierError::Malformed(_))
+    );
 }
 
 #[test]

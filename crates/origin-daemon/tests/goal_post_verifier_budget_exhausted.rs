@@ -44,9 +44,9 @@ async fn verifier_met_but_over_budget_clears_as_budget_exhausted() {
                 "expected tokens_spent >= budget (100); got {tokens_spent}"
             );
         }
-        ClearReasonWire::Met { .. } => panic!(
-            "BUG #11 regression: Met returned despite over-budget. tokens_spent={tokens_spent}"
-        ),
+        ClearReasonWire::Met { .. } => {
+            panic!("BUG #11 regression: Met returned despite over-budget. tokens_spent={tokens_spent}")
+        }
         other => panic!("expected BudgetExhausted, got {other:?}"),
     }
 }

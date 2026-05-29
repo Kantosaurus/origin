@@ -32,14 +32,8 @@ const VERIFIER_SYSTEM: &str = "You verify whether a stated goal has been met bas
 
 #[async_trait]
 impl Verifier for AnthropicHaikuVerifier {
-    async fn verify(
-        &self,
-        condition: &str,
-        last_turn: &str,
-    ) -> Result<(Verdict, u64, u64), VerifierError> {
-        let user_text = format!(
-            "Goal: {condition}\nAssistant's claim of completion: {last_turn}"
-        );
+    async fn verify(&self, condition: &str, last_turn: &str) -> Result<(Verdict, u64, u64), VerifierError> {
+        let user_text = format!("Goal: {condition}\nAssistant's claim of completion: {last_turn}");
         let req = ChatRequest {
             system: VERIFIER_SYSTEM.to_string(),
             messages: vec![Message::new(Role::User).with_block(Block::text(user_text))],
