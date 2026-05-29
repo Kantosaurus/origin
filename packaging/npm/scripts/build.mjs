@@ -155,6 +155,23 @@ function buildMainPackage(out, version, builtPkgs) {
   // The launcher is a POSIX-mode JS shim; always mark it executable. On Windows
   // npm regenerates its own .cmd/.ps1 shims, so a POSIX mode is harmless there.
   fs.chmodSync(path.join(dir, 'bin', 'origin.js'), 0o755);
+
+  // Bake the resolved package-family prefix into the SHIPPED platform.js as a
+  // literal, so the published launcher resolves its binary by a fixed name and
+  // never reads an end user's ORIGIN_NPM_PREFIX. (We honor that env var only
+  // here, at build time.) Guarded: a future rename of this line fails the build
+  // loudly rather than silently shipping an env-dependent runtime.
+  const shippedPlatform = path.join(dir, 'lib', 'platform.js');
+  const platformSrc = fs.readFileSync(shippedPlatform, 'utf8');
+  const PREFIX_LINE = /^const PKG_PREFIX = .*$/m;
+  if (!PREFIX_LINE.test(platformSrc)) {
+    throw new Error(`buildMainPackage: PKG_PREFIX line not found to bake in ${shippedPlatform}`);
+  }
+  fs.writeFileSync(
+    shippedPlatform,
+    platformSrc.replace(PREFIX_LINE, `const PKG_PREFIX = ${JSON.stringify(PKG_PREFIX)};`)
+  );
+
   copyFile(path.join(NPM_DIR, 'README.md'), path.join(dir, 'README.md'));
   // Apache-2.0 §4(a) + §4(d): ship LICENSE and NOTICE with the published tarball.
   copyFile(path.join(ROOT, 'LICENSE'), path.join(dir, 'LICENSE'));
@@ -164,8 +181,17 @@ function buildMainPackage(out, version, builtPkgs) {
   for (const name of builtPkgs) optionalDependencies[name] = version;
 
   const base = JSON.parse(fs.readFileSync(path.join(NPM_DIR, 'package.json'), 'utf8'));
+  // Drop `//`-prefixed comment keys (JSON has no comments; the committed
+  // manifest uses them to document maintainer intent) so they never ship in
+  // the published tarball.
+  for (const k of Object.keys(base)) {
+    if (k.startsWith('//')) delete base[k];
+  }
   writeJson(path.join(dir, 'package.json'), {
     ...base,
+    // Follow PKG_PREFIX so an ORIGIN_NPM_PREFIX override renames the main
+    // package too (not just the platform packages + optionalDependencies).
+    name: PKG_PREFIX,
     version,
     optionalDependencies,
   });

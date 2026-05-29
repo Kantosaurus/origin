@@ -11,9 +11,18 @@
 // All three must agree on the target triples and the `origin-<triple>[.exe]`
 // asset naming, or the download fallback / in-binary updater break.
 
-// The npm package family name. The *command* installed onto PATH is always
-// `origin` regardless of this (see the main package's `bin` field).
-const PKG_PREFIX = 'originx';
+// The npm package family name: the main package's name, and the prefix of the
+// six per-platform packages (`${PKG_PREFIX}-<plat>-<arch>`). The *command*
+// installed onto PATH is always `origin` regardless of this (see the main
+// package's `bin` field).
+//
+// Overridable at PUBLISH time via `ORIGIN_NPM_PREFIX` so a publish blocked by
+// npm's name-similarity filter can switch to the scoped `@kantosaurus/origin`
+// family without hand-editing names across files. `scripts/build.mjs` reads
+// this value when assembling, then bakes the *resolved* literal into the
+// published copy of this file — so an end user's environment can never alter
+// which package the launcher resolves the binary from.
+const PKG_PREFIX = process.env.ORIGIN_NPM_PREFIX || 'originx';
 
 // GitHub repository that hosts the release artifacts. Must match the Rust
 // updater's RELEASES_REPO and the git remote.
