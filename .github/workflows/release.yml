@@ -41,9 +41,14 @@ jobs:
       - name: Build
         shell: bash
         env:
+          # NOTE: panic=abort is intentionally NOT set. It cannot be used here:
+          # a crate in the graph (html2md) links the unwind panic runtime, and
+          # forcing abort via the profile fails with "the linked panic runtime
+          # `panic_unwind` is not compiled with this crate's panic strategy
+          # `abort`" on every target (rebuilding std with abort needs nightly
+          # -Z build-std). LTO + opt-level=z + strip provide the size win.
           CARGO_PROFILE_RELEASE_LTO: fat
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
-          CARGO_PROFILE_RELEASE_PANIC: abort
           CARGO_PROFILE_RELEASE_OPT_LEVEL: z
           CARGO_PROFILE_RELEASE_STRIP: symbols
         run: |
