@@ -98,6 +98,24 @@ draft PR early to align on approach before investing in the full implementation.
 
 ---
 
+## Branching & releases
+
+origin uses a two-branch flow:
+
+- **`dev`** — the default integration/staging branch. All PRs target `dev`, and
+  it's where features land and are exercised by CI before release.
+- **`main`** — the release branch that delivers packages. It is never committed
+  to directly; it only advances by merging `dev` once it's stable.
+
+**Cutting a release:** merge `dev` → `main`, then push a `vX.Y.Z` tag on `main`.
+That tag triggers the [`release`](.github/workflows/release.yml) workflow, which
+builds, signs (cosign + SLSA provenance), and publishes the binaries, the npm
+package, and the Homebrew/winget/AUR manifests. Use a `-rc`/`-beta` suffix
+(e.g. `v0.1.0-rc.1`) for prereleases — those publish under the npm `next` tag and
+never become `latest`.
+
+---
+
 ## Reporting bugs & requesting features
 
 - **Bugs / features:** open an issue using the templates in
