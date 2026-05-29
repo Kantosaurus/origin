@@ -1,5 +1,6 @@
 {
   "name": "originx",
+  "//version": "Placeholder. scripts/build.mjs --version stamps the real version (in lockstep with the Cargo workspace tag) at publish time; this committed value is never what ships.",
   "version": "0.0.1",
   "description": "Origin — a fast, terminal-native AI coding agent. Install globally and run `origin` to launch the TUI.",
   "bin": {
