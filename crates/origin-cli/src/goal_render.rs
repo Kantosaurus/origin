@@ -43,9 +43,7 @@ pub trait GoalRender {
 /// `◎ goal · iter <i>/<max> · <tokens_spent>/<token_budget> tok`.
 #[must_use]
 pub fn status_line(iter: u32, max_iter: u32, tokens_spent: u64, token_budget: u64) -> String {
-    format!(
-        "\u{25CE} goal \u{00B7} iter {iter}/{max_iter} \u{00B7} {tokens_spent}/{token_budget} tok"
-    )
+    format!("\u{25CE} goal \u{00B7} iter {iter}/{max_iter} \u{00B7} {tokens_spent}/{token_budget} tok")
 }
 
 /// Spec §1 verifying indicator:
@@ -73,9 +71,7 @@ pub fn cleared_line(reason: &ClearReasonWire) -> (String, u32) {
         ClearReasonWire::UserClearAll => ("session cleared".to_string(), theme::YELLOW),
         ClearReasonWire::MaxIter => ("max iterations reached".to_string(), theme::YELLOW),
         ClearReasonWire::BudgetExhausted => ("token budget reached".to_string(), theme::YELLOW),
-        ClearReasonWire::VerifierRejected { why } => {
-            (format!("verifier kept rejecting: {why}"), theme::RED)
-        }
+        ClearReasonWire::VerifierRejected { why } => (format!("verifier kept rejecting: {why}"), theme::RED),
         ClearReasonWire::VerifierUnavailable => (
             "verifier unavailable; trusting main model".to_string(),
             theme::YELLOW,
@@ -85,6 +81,7 @@ pub fn cleared_line(reason: &ClearReasonWire) -> (String, u32) {
 }
 
 /// Render a `StreamEvent` if it is a `Goal*` variant, mutating `app`.
+///
 /// Returns `true` when the event was a Goal variant (and thus handled
 /// here), `false` for any other variant — the caller should continue
 /// its existing dispatch in that case.
@@ -98,11 +95,7 @@ pub fn render_goal_event<R: GoalRender>(app: &mut R, ev: &StreamEvent) -> bool {
             max_iter,
             token_budget,
         } => {
-            app.push_colored(
-                format!("  \u{25CE} goal active: {condition}"),
-                theme::ACCENT,
-                0,
-            );
+            app.push_colored(format!("  \u{25CE} goal active: {condition}"), theme::ACCENT, 0);
             app.set_goal_status(Some(status_line(0, *max_iter, 0, *token_budget)));
             true
         }
@@ -122,18 +115,12 @@ pub fn render_goal_event<R: GoalRender>(app: &mut R, ev: &StreamEvent) -> bool {
             )));
             // Blocker notice (one-line).
             if let TagOutcomeWire::Blocked { why } = last_tag {
-                app.push_colored(
-                    format!("  \u{26A0} goal blocked: {why}"),
-                    theme::YELLOW,
-                    0,
-                );
+                app.push_colored(format!("  \u{26A0} goal blocked: {why}"), theme::YELLOW, 0);
             }
             true
         }
         StreamEvent::GoalVerifying => {
-            app.set_goal_status(Some(
-                "\u{25CE} goal \u{00B7} verifying...".to_string(),
-            ));
+            app.set_goal_status(Some("\u{25CE} goal \u{00B7} verifying...".to_string()));
             true
         }
         StreamEvent::GoalCleared {
@@ -153,11 +140,7 @@ pub fn render_goal_event<R: GoalRender>(app: &mut R, ev: &StreamEvent) -> bool {
             true
         }
         StreamEvent::GoalInactive => {
-            app.push_colored(
-                "  no active goal".to_string(),
-                theme::MUTED,
-                0,
-            );
+            app.push_colored("  no active goal".to_string(), theme::MUTED, 0);
             true
         }
         _ => false,
@@ -374,7 +357,8 @@ mod tests {
         assert_eq!(app.lines.len(), 1);
         assert!(app.lines[0].0.contains("no active goal"));
         assert_ne!(
-            app.lines[0].1, theme::RED,
+            app.lines[0].1,
+            theme::RED,
             "GoalInactive must not render in error/red"
         );
     }
@@ -382,12 +366,7 @@ mod tests {
     #[test]
     fn non_goal_event_returns_false_unhandled() {
         let mut app = FakeApp::default();
-        let handled = render_goal_event(
-            &mut app,
-            &StreamEvent::TextDelta {
-                text: "hi".into(),
-            },
-        );
+        let handled = render_goal_event(&mut app, &StreamEvent::TextDelta { text: "hi".into() });
         assert!(!handled, "non-Goal events must fall through to existing dispatch");
         assert!(app.lines.is_empty());
         assert_eq!(app.status_updates, 0);

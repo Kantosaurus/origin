@@ -219,7 +219,6 @@ impl LoopOptions {
         self.skills = Some(skills);
         self
     }
-
 }
 
 /// Deliverer that writes a summary to the `SQLite` `messages.summary` column via
@@ -718,8 +717,7 @@ pub async fn run_loop(
         // already folded into `input_tokens` by the provider impls, so we
         // only need the two top-level fields here.
         total_input_tokens = total_input_tokens.saturating_add(u64::from(resp.usage.input_tokens));
-        total_output_tokens =
-            total_output_tokens.saturating_add(u64::from(resp.usage.output_tokens));
+        total_output_tokens = total_output_tokens.saturating_add(u64::from(resp.usage.output_tokens));
 
         session.push(resp.assistant.clone());
 
@@ -1138,7 +1136,7 @@ fn apply_turn_cache_markers(messages: &mut [Message], plan: Option<&origin_plann
 }
 
 #[cfg(test)]
-fn block_cache_marker_set(b: &Block) -> bool {
+const fn block_cache_marker_set(b: &Block) -> bool {
     match b {
         Block::Text { cache_marker, .. }
         | Block::ToolUse { cache_marker, .. }
@@ -1309,8 +1307,14 @@ async fn dispatch_tool(
                     .and_then(Value::as_str)
                     .ok_or_else(|| LoopError::BadArgs("Read: missing `file_path`".into()))?
                     .to_string(),
-                offset: args.get("offset").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
-                limit: args.get("limit").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
+                offset: args
+                    .get("offset")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok()),
+                limit: args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok()),
                 as_: args.get("as").and_then(Value::as_str).map(str::to_string),
             };
             origin_tools::builtins::read::read_v2(args).map_err(|e| LoopError::ToolFailure(e.message))
@@ -1323,7 +1327,10 @@ async fn dispatch_tool(
                     .ok_or_else(|| LoopError::BadArgs("Glob: missing `pattern`".into()))?
                     .to_string(),
                 path: args.get("path").and_then(Value::as_str).map(str::to_string),
-                head_limit: args.get("head_limit").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
+                head_limit: args
+                    .get("head_limit")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok()),
             };
             origin_tools::builtins::glob_tool::glob_v2(gargs)
                 .map(|v| serde_json::to_string(&v).expect("BUG: GlobResult always serializes"))
@@ -1346,7 +1353,10 @@ async fn dispatch_tool(
                 glob: args.get("glob").and_then(Value::as_str).map(str::to_string),
                 r#type: args.get("type").and_then(Value::as_str).map(str::to_string),
                 output_mode: mode,
-                head_limit: args.get("head_limit").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
+                head_limit: args
+                    .get("head_limit")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok()),
                 before: args
                     .get("before")
                     .and_then(Value::as_u64)
@@ -1457,7 +1467,10 @@ async fn dispatch_tool(
                     .and_then(Value::as_str)
                     .ok_or_else(|| LoopError::BadArgs("Bash: missing `command`".into()))?
                     .to_string(),
-                timeout: args.get("timeout").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
+                timeout: args
+                    .get("timeout")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok()),
                 cwd: args.get("cwd").and_then(Value::as_str).map(str::to_string),
                 env: args
                     .get("env")
@@ -1544,7 +1557,10 @@ async fn dispatch_tool(
                     .and_then(Value::as_str)
                     .ok_or_else(|| LoopError::BadArgs("ToolSearch: missing `query`".into()))?
                     .to_string(),
-                max_results: args.get("max_results").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
+                max_results: args
+                    .get("max_results")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok()),
             };
             origin_tools::builtins::tool_search::tool_search(&sargs)
                 .map(|v| serde_json::to_string(&v).expect("BUG: ToolSearchResult always serializes"))
@@ -1947,7 +1963,10 @@ async fn run_bash_streaming(
             .and_then(Value::as_str)
             .ok_or_else(|| "Bash: missing `command`".to_string())?
             .to_string(),
-        timeout: args.get("timeout").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
+        timeout: args
+            .get("timeout")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok()),
         cwd: args.get("cwd").and_then(Value::as_str).map(str::to_string),
         env: args
             .get("env")
@@ -2158,11 +2177,19 @@ fn diff_lines_lcs(old: &[&str], new: &[&str]) -> Vec<crate::protocol::DiffLine> 
         let mut out = Vec::with_capacity(n + m);
         for (i, line) in old.iter().enumerate() {
             let old_no = u32::try_from(i + 1).unwrap_or(u32::MAX);
-            out.push(DiffLine { kind: "-".to_string(), line_no: old_no, text: (*line).to_string() });
+            out.push(DiffLine {
+                kind: "-".to_string(),
+                line_no: old_no,
+                text: (*line).to_string(),
+            });
         }
         for (i, line) in new.iter().enumerate() {
             let new_no = u32::try_from(i + 1).unwrap_or(u32::MAX);
-            out.push(DiffLine { kind: "+".to_string(), line_no: new_no, text: (*line).to_string() });
+            out.push(DiffLine {
+                kind: "+".to_string(),
+                line_no: new_no,
+                text: (*line).to_string(),
+            });
         }
         return out;
     }
@@ -2189,27 +2216,47 @@ fn diff_lines_lcs(old: &[&str], new: &[&str]) -> Vec<crate::protocol::DiffLine> 
         if old[i] == new[j] {
             old_no += 1;
             new_no += 1;
-            out.push(DiffLine { kind: " ".to_string(), line_no: new_no, text: new[j].to_string() });
+            out.push(DiffLine {
+                kind: " ".to_string(),
+                line_no: new_no,
+                text: new[j].to_string(),
+            });
             i += 1;
             j += 1;
         } else if dp[i + 1][j] >= dp[i][j + 1] {
             old_no += 1;
-            out.push(DiffLine { kind: "-".to_string(), line_no: old_no, text: old[i].to_string() });
+            out.push(DiffLine {
+                kind: "-".to_string(),
+                line_no: old_no,
+                text: old[i].to_string(),
+            });
             i += 1;
         } else {
             new_no += 1;
-            out.push(DiffLine { kind: "+".to_string(), line_no: new_no, text: new[j].to_string() });
+            out.push(DiffLine {
+                kind: "+".to_string(),
+                line_no: new_no,
+                text: new[j].to_string(),
+            });
             j += 1;
         }
     }
     while i < n {
         old_no += 1;
-        out.push(DiffLine { kind: "-".to_string(), line_no: old_no, text: old[i].to_string() });
+        out.push(DiffLine {
+            kind: "-".to_string(),
+            line_no: old_no,
+            text: old[i].to_string(),
+        });
         i += 1;
     }
     while j < m {
         new_no += 1;
-        out.push(DiffLine { kind: "+".to_string(), line_no: new_no, text: new[j].to_string() });
+        out.push(DiffLine {
+            kind: "+".to_string(),
+            line_no: new_no,
+            text: new[j].to_string(),
+        });
         j += 1;
     }
     out
@@ -2271,29 +2318,40 @@ mod diff_line_tests {
         let args = serde_json::json!({ "old_string": "A\nB", "new_string": "B\nA" });
         let diff = tool_diff_lines("Edit", &args);
         let context = diff.iter().filter(|d| d.kind == " ").count();
-        assert_eq!(context, 1, "minimal diff should keep the common line as context: {diff:?}");
+        assert_eq!(
+            context, 1,
+            "minimal diff should keep the common line as context: {diff:?}"
+        );
     }
 
     #[test]
     fn edit_diff_reconstructs_both_sides() {
         // The fundamental diff invariant across a representative mix.
         let cases = [
-            ("A\nB\nC", "A\nB\nC"),       // identical
-            ("A\nB\nC", "A\nX\nC"),       // substitution
-            ("A", "A\nB"),               // pure insert
-            ("A\nB", "A"),               // pure delete
-            ("A\nB", "B\nA"),            // swap
-            ("", "A\nB"),                // empty old
-            ("A\nB", ""),                // empty new
-            ("a\nb\nc\nd", "b\nd\ne"),    // mixed
+            ("A\nB\nC", "A\nB\nC"),    // identical
+            ("A\nB\nC", "A\nX\nC"),    // substitution
+            ("A", "A\nB"),             // pure insert
+            ("A\nB", "A"),             // pure delete
+            ("A\nB", "B\nA"),          // swap
+            ("", "A\nB"),              // empty old
+            ("A\nB", ""),              // empty new
+            ("a\nb\nc\nd", "b\nd\ne"), // mixed
         ];
         for (old, new) in cases {
             let args = serde_json::json!({ "old_string": old, "new_string": new });
             let diff = tool_diff_lines("Edit", &args);
             let old_lines: Vec<String> = old.lines().map(str::to_string).collect();
             let new_lines: Vec<String> = new.lines().map(str::to_string).collect();
-            assert_eq!(reconstruct(&diff, "-"), old_lines, "old side mismatch for {old:?}->{new:?}");
-            assert_eq!(reconstruct(&diff, "+"), new_lines, "new side mismatch for {old:?}->{new:?}");
+            assert_eq!(
+                reconstruct(&diff, "-"),
+                old_lines,
+                "old side mismatch for {old:?}->{new:?}"
+            );
+            assert_eq!(
+                reconstruct(&diff, "+"),
+                new_lines,
+                "new side mismatch for {old:?}->{new:?}"
+            );
         }
     }
 }
@@ -3018,7 +3076,7 @@ mod dispatch_table_tests {
 
     /// Round-trip a 16-byte BE-encoded payload through [`decode_usage_payload`]
     /// to lock down the byte layout: 4× u32 BE in field order
-    /// (input, output, cache_read, cache_creation).
+    /// (input, output, `cache_read`, `cache_creation`).
     #[test]
     fn decode_usage_payload_parses_canonical_16_byte_layout() {
         let mut p = [0u8; 16];

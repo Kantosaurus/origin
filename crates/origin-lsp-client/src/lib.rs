@@ -160,6 +160,9 @@ async fn write_frame(stdin: Arc<Mutex<ChildStdin>>, msg: &Value) -> Result<(), L
 
 /// Background task that reads frames from the server and updates the diagnostics map.
 async fn reader_loop(stdout: ChildStdout, diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>>) {
+    // Cap the server-declared body size so a malformed/hostile language
+    // server cannot drive an unbounded `vec![0u8; len]` allocation (OOM).
+    const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
     let mut reader = BufReader::new(stdout);
     loop {
         let mut header = String::new();
@@ -181,9 +184,6 @@ async fn reader_loop(stdout: ChildStdout, diags: Arc<RwLock<HashMap<PathBuf, Vec
         let Some(len) = content_length else {
             continue;
         };
-        // Cap the server-declared body size so a malformed/hostile language
-        // server cannot drive an unbounded `vec![0u8; len]` allocation (OOM).
-        const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
         if len > MAX_BODY_BYTES {
             return;
         }

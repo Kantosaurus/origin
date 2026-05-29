@@ -343,8 +343,7 @@ fn message_to_wire<'a>(m: &'a Message, plan: Option<&Plan>, msg_idx: usize) -> w
     let marker_indices: &[usize] = plan.map_or(&[], Plan::marker_indices);
     // Dynamic per-message markers (populated each turn by the agent loop).
     // Empty by default, so the read is cheap when no planner is wired.
-    let dyn_msg_marker_here = plan
-        .is_some_and(|p| p.dynamic_message_markers().contains(&msg_idx));
+    let dyn_msg_marker_here = plan.is_some_and(|p| p.dynamic_message_markers().contains(&msg_idx));
     // When path 3 fires we need to land the marker on the *last emitting*
     // block. `Block::Thinking` is filtered out by `block_to_wire`, so we skip
     // it when picking the boundary block — otherwise a trailing thinking

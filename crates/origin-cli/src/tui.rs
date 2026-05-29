@@ -27,9 +27,19 @@ pub struct ScrollLine {
 }
 
 impl ScrollLine {
-    fn styled(text: String, fg: u32, bg: u32, bold: bool) -> Self {
+    const fn styled(text: String, fg: u32, bg: u32, bold: bool) -> Self {
         Self { text, fg, bg, bold }
     }
+}
+
+/// Foreground/background/bold triple for a single styled-text write. Bundled so
+/// [`write_str_styled`] takes one style parameter instead of three positional
+/// color/flag arguments.
+#[derive(Clone, Copy)]
+struct Style {
+    fg: u32,
+    bg: u32,
+    bold: bool,
 }
 
 const SPINNER_FRAMES: &[char] = &[
@@ -37,6 +47,12 @@ const SPINNER_FRAMES: &[char] = &[
     '\u{2807}', '\u{280F}',
 ];
 const SPINNER_INTERVAL_MS: u64 = 80;
+
+/// Reserve a single row of breathing room below the scrollback so the last line
+/// of output never sits flush against the input card. `finalize_assistant_turn`
+/// also appends a trailing blank line after each LLM message, giving 2 rows of
+/// separation for persistent content while only costing 1 visible row.
+const INPUT_GAP_ROWS: u16 = 1;
 
 #[derive(Debug)]
 pub struct Spinner {
@@ -65,21 +81,24 @@ impl Spinner {
         if !self.active {
             return ' ';
         }
-        let elapsed = self.start.elapsed().as_millis() as u64;
+        let elapsed = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
         let idx = (elapsed / SPINNER_INTERVAL_MS) as usize % SPINNER_FRAMES.len();
         SPINNER_FRAMES[idx]
     }
 }
 
 /// How long the daemon may go without emitting a single stream event during an
-/// in-flight turn before the status line surfaces a stall warning. Deliberately
-/// generous: extended-thinking turns and long non-streaming tools can be quiet
-/// for a while, so this only fires on genuine, sustained silence.
+/// in-flight turn before the status line surfaces a stall warning.
+///
+/// Deliberately generous: extended-thinking turns and long non-streaming tools
+/// can be quiet for a while, so this only fires on genuine, sustained silence.
 pub const STALL_WARN_AFTER: Duration = Duration::from_secs(60);
 
-/// Pure stall decision. Given how long the turn has been quiet (no new daemon
-/// events) and the warning threshold, return `Some(seconds_quiet)` to warn, or
-/// `None`. Kept free of `Instant` so it is deterministically testable.
+/// Pure stall decision.
+///
+/// Given how long the turn has been quiet (no new daemon events) and the
+/// warning threshold, return `Some(seconds_quiet)` to warn, or `None`. Kept
+/// free of `Instant` so it is deterministically testable.
 #[must_use]
 pub fn stall_seconds(quiet: Duration, threshold: Duration) -> Option<u64> {
     if quiet >= threshold {
@@ -175,7 +194,9 @@ impl App {
         s = s
             .wrapping_mul(P)
             .wrapping_add(self.current_assistant.as_ref().map_or(0, String::len) as u64);
-        s = s.wrapping_mul(P).wrapping_add(u64::from(self.usage.output_tokens));
+        s = s
+            .wrapping_mul(P)
+            .wrapping_add(u64::from(self.usage.output_tokens));
         s = s.wrapping_mul(P).wrapping_add(u64::from(self.usage.input_tokens));
         s
     }
@@ -311,7 +332,6 @@ impl App {
         self.goal_status = status;
     }
 
-
     pub fn add_tool_line(&mut self, text: String) {
         self.scrollback
             .push(ScrollLine::styled(text, theme::TOOL, 0, false));
@@ -400,16 +420,10 @@ impl App {
             let text_w = cr.saturating_sub(cs) as usize;
 
             let wrapped = wrap_input_lines(&self.input, text_w);
-            let line_count = (wrapped.len() as u16).min(6);
+            let line_count = clamp_u16(wrapped.len()).min(6);
             let card_h = line_count + 1;
             let card_total = card_h + 2;
             let at_bottom = rows.saturating_sub(card_total);
-            // Reserve a single row of breathing room below the scrollback so
-            // the last line of output never sits flush against the input
-            // card. `finalize_assistant_turn` also appends a trailing blank
-            // line after each LLM message, giving 2 rows of separation for
-            // persistent content while only costing 1 visible row.
-            const INPUT_GAP_ROWS: u16 = 1;
             let scrollback_limit = at_bottom.saturating_sub(INPUT_GAP_ROWS) as usize;
 
             let cols_usize = cols as usize;
@@ -446,251 +460,371 @@ impl App {
                 row = row.saturating_add(1);
             }
 
-            if offset > 0 {
-                let indicator = format!(" \u{2191} {offset} more ");
-                // Position by DISPLAY width, not byte length: the `\u{2191}` (↑)
-                // arrow is 3 UTF-8 bytes but one terminal column, so `.len()`
-                // would push the indicator two columns too far left.
-                let indicator_w: usize = indicator
-                    .chars()
-                    .map(|c| UnicodeWidthChar::width(c).unwrap_or(1))
-                    .sum();
-                let start_col = cols.saturating_sub(indicator_w as u16 + 1);
-                write_str_styled(
-                    main,
-                    0,
-                    start_col,
-                    &indicator,
-                    cols,
-                    theme::ACCENT,
-                    theme::SURFACE_RAISED,
-                    false,
-                );
-            }
-
-            // Bug #4: render the one-line goal-status indicator (when set)
-            // on the breathing-room row just above the input card. Centered
-            // inside the card width so it visually associates with the
-            // current operation rather than the scrollback above.
-            if let Some(ref status) = self.goal_status {
-                let status_row = at_bottom.saturating_sub(1);
-                if status_row < rows {
-                    let pad = cl.saturating_add(2);
-                    write_str_styled(
-                        main,
-                        status_row,
-                        pad,
-                        status,
-                        cr,
-                        theme::ACCENT,
-                        0,
-                        false,
-                    );
-                }
-            }
-
-            // Stall watchdog notice. When the render heartbeat has seen no
-            // daemon activity for `STALL_WARN_AFTER`, surface a high-visibility
-            // warning so a wedged daemon reads as "possibly stuck" instead of an
-            // indefinitely-spinning spinner. Takes the row the goal status would
-            // use — a stall is the more urgent signal.
-            if let Some(secs) = self.stall_secs {
-                let status_row = at_bottom.saturating_sub(1);
-                if status_row < rows {
-                    let msg =
-                        format!("\u{26A0} no daemon activity for {secs}s \u{2014} Ctrl+C to interrupt");
-                    write_str_styled(
-                        main,
-                        status_row,
-                        cl.saturating_add(2),
-                        &msg,
-                        cr,
-                        theme::RED,
-                        0,
-                        false,
-                    );
-                }
-            }
-
             let r_top = row.saturating_add(2).min(at_bottom);
             let r_status = r_top + line_count;
             let r_cap = r_status + 1;
+            let layout = CardLayout {
+                cols,
+                rows,
+                cl,
+                cr,
+                cs,
+                at_bottom,
+                r_top,
+                r_status,
+                r_cap,
+            };
 
-            for r in r_top..=r_status.min(rows.saturating_sub(1)) {
-                for c in cl..cr.min(cols) {
-                    main.put(r, c, Cell::new(' ', 0, theme::SURFACE_RAISED, Attr::PLAIN));
-                }
-                if cl < cols {
-                    main.put(
-                        r,
-                        cl,
-                        Cell::new('\u{2503}', theme::ACCENT, theme::SURFACE_RAISED, Attr::PLAIN),
-                    );
-                }
-            }
+            draw_scroll_indicator(main, &layout, offset);
+            self.draw_notices(main, &layout);
+            draw_input_card_bg(main, &layout);
+            self.draw_input_text(main, &layout, &wrapped);
+            self.draw_status_line(main, &layout);
+            draw_keybind_hint(main, &layout);
+            self.draw_suggestions_popup(main, &layout);
+        }
+        clear_prompt_grid(composer.prompt_grid());
+    }
 
-            if self.input.is_empty() && self.current_assistant.is_none() {
-                if r_top < rows {
-                    write_str_styled(
-                        main,
-                        r_top,
-                        cs,
-                        "Ask anything...",
-                        cr,
-                        theme::MUTED,
-                        theme::SURFACE_RAISED,
-                        false,
-                    );
-                }
-            } else if !self.input.is_empty() {
-                let vis_start = if wrapped.len() > 6 { wrapped.len() - 6 } else { 0 };
-                for (i, line) in wrapped[vis_start..].iter().enumerate() {
-                    let r = r_top + i as u16;
-                    if r >= r_status || r >= rows {
-                        break;
-                    }
-                    write_str_styled(main, r, cs, line, cr, theme::BRIGHT, theme::SURFACE_RAISED, false);
-                    if vis_start + i == wrapped.len() - 1 && !self.suggestions.ghost.is_empty() {
-                        let gc = cs + char_display_width(line);
-                        write_str_styled(
-                            main,
-                            r,
-                            gc,
-                            &self.suggestions.ghost,
-                            cr,
-                            theme::DIM,
-                            theme::SURFACE_RAISED,
-                            false,
-                        );
-                    }
-                }
-            }
-
-            if r_status < rows {
-                let cost = crate::status::cost_usd(&self.usage);
-                let live_elapsed = self
-                    .turn_started
-                    .map_or(self.usage.elapsed, |t| self.usage.elapsed + t.elapsed());
-                let secs = live_elapsed.as_secs_f64();
-                let tok_in = format_tokens(self.usage.input_tokens);
-                let tok_out = format_tokens(self.usage.output_tokens);
-
-                let (prefix, status) = if self.spinner.active {
-                    let sc = self.spinner.frame_char();
-                    (
-                        Some(sc),
-                        format!(
-                            "{sc} {} \u{00B7} {} \u{00B7} {tok_in}\u{2191} {tok_out}\u{2193} \u{00B7} ${cost:.3} \u{00B7} {secs:.1}s",
-                            self.workflow, self.usage.model,
-                        ),
-                    )
-                } else {
-                    (
-                        None,
-                        format!(
-                            "{} \u{00B7} {} \u{00B7} {tok_in}\u{2191} {tok_out}\u{2193} \u{00B7} ${cost:.3} \u{00B7} {secs:.1}s",
-                            self.workflow, self.usage.model,
-                        ),
-                    )
-                };
+    /// Render the goal-status indicator and stall-watchdog notice on the
+    /// breathing-room row just above the input card. The stall notice (when
+    /// active) overpaints the goal status — a stall is the more urgent signal.
+    fn draw_notices(&self, main: &mut Grid, layout: &CardLayout) {
+        // Bug #4: render the one-line goal-status indicator (when set)
+        // on the breathing-room row just above the input card. Centered
+        // inside the card width so it visually associates with the
+        // current operation rather than the scrollback above.
+        if let Some(ref status) = self.goal_status {
+            let status_row = layout.at_bottom.saturating_sub(1);
+            if status_row < layout.rows {
+                let pad = layout.cl.saturating_add(2);
                 write_str_styled(
                     main,
-                    r_status,
-                    cs,
-                    &status,
-                    cr,
-                    theme::DIM,
-                    theme::SURFACE_RAISED,
-                    false,
+                    status_row,
+                    pad,
+                    status,
+                    layout.cr,
+                    Style {
+                        fg: theme::ACCENT,
+                        bg: 0,
+                        bold: false,
+                    },
                 );
-                if let Some(sc) = prefix {
-                    if let Some(pos) = status.find(sc) {
-                        let c = cs + pos as u16;
-                        if c < cr {
-                            main.put(
-                                r_status,
-                                c,
-                                Cell::new(sc, theme::ACCENT, theme::SURFACE_RAISED, Attr::PLAIN),
-                            );
-                        }
-                    }
-                }
-                let wf_offset = if prefix.is_some() { 2u16 } else { 0u16 };
-                for (i, ch) in self.workflow.chars().enumerate() {
-                    let c = cs + wf_offset + i as u16;
-                    if c < cr {
-                        main.put(
-                            r_status,
-                            c,
-                            Cell::new(ch, theme::ACCENT, theme::SURFACE_RAISED, Attr::BOLD),
-                        );
-                    }
-                }
             }
+        }
 
-            if r_cap < rows {
-                if cl < cols {
-                    main.put(r_cap, cl, Cell::new('\u{2579}', theme::ACCENT, 0, Attr::PLAIN));
-                }
-                let hint_parts: &[(&str, u32)] = &[
-                    ("shift+enter", theme::BODY),
-                    (" newline  ", theme::MUTED),
-                    ("tab", theme::BODY),
-                    (" skills  ", theme::MUTED),
-                    ("ctrl+c", theme::BODY),
-                    (" quit", theme::MUTED),
-                ];
-                let total_hw: u16 = hint_parts.iter().map(|(s, _)| char_display_width(s)).sum();
-                let mut hc = cr.saturating_sub(total_hw);
-                for (text, fg) in hint_parts {
-                    let tw = char_display_width(text);
-                    write_str_styled(main, r_cap, hc, text, hc + tw, *fg, 0, false);
-                    hc += tw;
-                }
+        // Stall watchdog notice. When the render heartbeat has seen no
+        // daemon activity for `STALL_WARN_AFTER`, surface a high-visibility
+        // warning so a wedged daemon reads as "possibly stuck" instead of an
+        // indefinitely-spinning spinner. Takes the row the goal status would
+        // use — a stall is the more urgent signal.
+        if let Some(secs) = self.stall_secs {
+            let status_row = layout.at_bottom.saturating_sub(1);
+            if status_row < layout.rows {
+                let msg = format!("\u{26A0} no daemon activity for {secs}s \u{2014} Ctrl+C to interrupt");
+                write_str_styled(
+                    main,
+                    status_row,
+                    layout.cl.saturating_add(2),
+                    &msg,
+                    layout.cr,
+                    Style {
+                        fg: theme::RED,
+                        bg: 0,
+                        bold: false,
+                    },
+                );
             }
+        }
+    }
 
-            if !self.suggestions.candidates.is_empty() {
-                let count = self.suggestions.candidates.len().min(6) as u16;
-                let popup_bottom = r_top.saturating_sub(1);
-                let popup_top = popup_bottom.saturating_sub(count);
-                let selected = self.suggestions.selected;
-                for (i, candidate) in self.suggestions.candidates.iter().take(6).enumerate() {
-                    let r = popup_top + i as u16;
-                    if r >= popup_bottom || r >= rows {
-                        break;
-                    }
-                    for c in cl..cr.min(cols) {
-                        main.put(r, c, Cell::new(' ', 0, theme::SURFACE_RAISED, Attr::PLAIN));
-                    }
-                    let (ind_fg, txt_fg) = if i == selected {
-                        (theme::ACCENT, theme::BODY)
-                    } else {
-                        (theme::MUTED, theme::MUTED)
-                    };
-                    let ind = if i == selected { " \u{25B8} " } else { "   " };
-                    let ps = cl + 1;
-                    write_str_styled(main, r, ps, ind, cr, ind_fg, theme::SURFACE_RAISED, false);
-                    let ind_w = char_display_width(ind);
+    /// Render the input card's text: the muted placeholder when empty, or the
+    /// (last six) wrapped input lines plus the ghost-suggestion completion.
+    fn draw_input_text(&self, main: &mut Grid, layout: &CardLayout, wrapped: &[&str]) {
+        if self.input.is_empty() && self.current_assistant.is_none() {
+            if layout.r_top < layout.rows {
+                write_str_styled(
+                    main,
+                    layout.r_top,
+                    layout.cs,
+                    "Ask anything...",
+                    layout.cr,
+                    Style {
+                        fg: theme::MUTED,
+                        bg: theme::SURFACE_RAISED,
+                        bold: false,
+                    },
+                );
+            }
+        } else if !self.input.is_empty() {
+            let vis_start = if wrapped.len() > 6 { wrapped.len() - 6 } else { 0 };
+            for (i, line) in wrapped[vis_start..].iter().enumerate() {
+                let r = layout.r_top + clamp_u16(i);
+                if r >= layout.r_status || r >= layout.rows {
+                    break;
+                }
+                write_str_styled(
+                    main,
+                    r,
+                    layout.cs,
+                    line,
+                    layout.cr,
+                    Style {
+                        fg: theme::BRIGHT,
+                        bg: theme::SURFACE_RAISED,
+                        bold: false,
+                    },
+                );
+                if vis_start + i == wrapped.len() - 1 && !self.suggestions.ghost.is_empty() {
+                    let gc = layout.cs + char_display_width(line);
                     write_str_styled(
                         main,
                         r,
-                        ps + ind_w,
-                        candidate,
-                        cr,
-                        txt_fg,
-                        theme::SURFACE_RAISED,
-                        false,
+                        gc,
+                        &self.suggestions.ghost,
+                        layout.cr,
+                        Style {
+                            fg: theme::DIM,
+                            bg: theme::SURFACE_RAISED,
+                            bold: false,
+                        },
                     );
                 }
             }
         }
-        {
-            let prompt = composer.prompt_grid();
-            for r in 0..prompt.rows() {
-                for c in 0..prompt.cols() {
-                    prompt.put(r, c, Cell::new(' ', 0, theme::SURFACE, Attr::PLAIN));
+    }
+
+    /// Render the status line: spinner frame, workflow name, model, token
+    /// counts, cost, and elapsed seconds, with the spinner glyph and workflow
+    /// label overpainted in their accent colors.
+    fn draw_status_line(&self, main: &mut Grid, layout: &CardLayout) {
+        if layout.r_status < layout.rows {
+            let cost = crate::status::cost_usd(&self.usage);
+            let live_elapsed = self
+                .turn_started
+                .map_or(self.usage.elapsed, |t| self.usage.elapsed + t.elapsed());
+            let secs = live_elapsed.as_secs_f64();
+            let tok_in = format_tokens(self.usage.input_tokens);
+            let tok_out = format_tokens(self.usage.output_tokens);
+
+            let (prefix, status) = if self.spinner.active {
+                let sc = self.spinner.frame_char();
+                (
+                    Some(sc),
+                    format!(
+                        "{sc} {} \u{00B7} {} \u{00B7} {tok_in}\u{2191} {tok_out}\u{2193} \u{00B7} ${cost:.3} \u{00B7} {secs:.1}s",
+                        self.workflow, self.usage.model,
+                    ),
+                )
+            } else {
+                (
+                    None,
+                    format!(
+                        "{} \u{00B7} {} \u{00B7} {tok_in}\u{2191} {tok_out}\u{2193} \u{00B7} ${cost:.3} \u{00B7} {secs:.1}s",
+                        self.workflow, self.usage.model,
+                    ),
+                )
+            };
+            write_str_styled(
+                main,
+                layout.r_status,
+                layout.cs,
+                &status,
+                layout.cr,
+                Style {
+                    fg: theme::DIM,
+                    bg: theme::SURFACE_RAISED,
+                    bold: false,
+                },
+            );
+            if let Some(sc) = prefix {
+                if let Some(pos) = status.find(sc) {
+                    let c = layout.cs + clamp_u16(pos);
+                    if c < layout.cr {
+                        main.put(
+                            layout.r_status,
+                            c,
+                            Cell::new(sc, theme::ACCENT, theme::SURFACE_RAISED, Attr::PLAIN),
+                        );
+                    }
                 }
             }
+            let wf_offset = if prefix.is_some() { 2u16 } else { 0u16 };
+            for (i, ch) in self.workflow.chars().enumerate() {
+                let c = layout.cs + wf_offset + clamp_u16(i);
+                if c < layout.cr {
+                    main.put(
+                        layout.r_status,
+                        c,
+                        Cell::new(ch, theme::ACCENT, theme::SURFACE_RAISED, Attr::BOLD),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Render the autocomplete suggestions popup directly above the input card,
+    /// showing up to six candidates with the selected row highlighted.
+    fn draw_suggestions_popup(&self, main: &mut Grid, layout: &CardLayout) {
+        if !self.suggestions.candidates.is_empty() {
+            let count = clamp_u16(self.suggestions.candidates.len().min(6));
+            let popup_bottom = layout.r_top.saturating_sub(1);
+            let popup_top = popup_bottom.saturating_sub(count);
+            let selected = self.suggestions.selected;
+            for (i, candidate) in self.suggestions.candidates.iter().take(6).enumerate() {
+                let r = popup_top + clamp_u16(i);
+                if r >= popup_bottom || r >= layout.rows {
+                    break;
+                }
+                for c in layout.cl..layout.cr.min(layout.cols) {
+                    main.put(r, c, Cell::new(' ', 0, theme::SURFACE_RAISED, Attr::PLAIN));
+                }
+                let (ind_fg, txt_fg) = if i == selected {
+                    (theme::ACCENT, theme::BODY)
+                } else {
+                    (theme::MUTED, theme::MUTED)
+                };
+                let ind = if i == selected { " \u{25B8} " } else { "   " };
+                let ps = layout.cl + 1;
+                write_str_styled(
+                    main,
+                    r,
+                    ps,
+                    ind,
+                    layout.cr,
+                    Style {
+                        fg: ind_fg,
+                        bg: theme::SURFACE_RAISED,
+                        bold: false,
+                    },
+                );
+                let ind_w = char_display_width(ind);
+                write_str_styled(
+                    main,
+                    r,
+                    ps + ind_w,
+                    candidate,
+                    layout.cr,
+                    Style {
+                        fg: txt_fg,
+                        bg: theme::SURFACE_RAISED,
+                        bold: false,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Shared input-card geometry computed once in [`App::draw`] and threaded into
+/// each card-rendering helper, so they take a single `&CardLayout` instead of a
+/// long list of positional `u16` coordinates.
+struct CardLayout {
+    cols: u16,
+    rows: u16,
+    cl: u16,
+    cr: u16,
+    cs: u16,
+    at_bottom: u16,
+    r_top: u16,
+    r_status: u16,
+    r_cap: u16,
+}
+
+/// Render the "N more" scrollback indicator in the top-right corner when the
+/// viewport is scrolled up.
+fn draw_scroll_indicator(main: &mut Grid, layout: &CardLayout, offset: usize) {
+    if offset > 0 {
+        let indicator = format!(" \u{2191} {offset} more ");
+        // Position by DISPLAY width, not byte length: the `\u{2191}` (↑)
+        // arrow is 3 UTF-8 bytes but one terminal column, so `.len()`
+        // would push the indicator two columns too far left.
+        let indicator_w: usize = indicator
+            .chars()
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(1))
+            .sum();
+        let start_col = layout
+            .cols
+            .saturating_sub(clamp_u16(indicator_w).saturating_add(1));
+        write_str_styled(
+            main,
+            0,
+            start_col,
+            &indicator,
+            layout.cols,
+            Style {
+                fg: theme::ACCENT,
+                bg: theme::SURFACE_RAISED,
+                bold: false,
+            },
+        );
+    }
+}
+
+/// Paint the raised-surface background of the input card and its left accent
+/// rule, spanning the card rows.
+fn draw_input_card_bg(main: &mut Grid, layout: &CardLayout) {
+    for r in layout.r_top..=layout.r_status.min(layout.rows.saturating_sub(1)) {
+        for c in layout.cl..layout.cr.min(layout.cols) {
+            main.put(r, c, Cell::new(' ', 0, theme::SURFACE_RAISED, Attr::PLAIN));
+        }
+        if layout.cl < layout.cols {
+            main.put(
+                r,
+                layout.cl,
+                Cell::new('\u{2503}', theme::ACCENT, theme::SURFACE_RAISED, Attr::PLAIN),
+            );
+        }
+    }
+}
+
+/// Render the keybind hint line beneath the input card (and the card's bottom
+/// accent corner), right-aligned within the card width.
+fn draw_keybind_hint(main: &mut Grid, layout: &CardLayout) {
+    if layout.r_cap < layout.rows {
+        if layout.cl < layout.cols {
+            main.put(
+                layout.r_cap,
+                layout.cl,
+                Cell::new('\u{2579}', theme::ACCENT, 0, Attr::PLAIN),
+            );
+        }
+        let hint_parts: &[(&str, u32)] = &[
+            ("shift+enter", theme::BODY),
+            (" newline  ", theme::MUTED),
+            ("tab", theme::BODY),
+            (" skills  ", theme::MUTED),
+            ("ctrl+c", theme::BODY),
+            (" quit", theme::MUTED),
+        ];
+        let total_hw: u16 = hint_parts.iter().map(|(s, _)| char_display_width(s)).sum();
+        let mut hc = layout.cr.saturating_sub(total_hw);
+        for (text, fg) in hint_parts {
+            let tw = char_display_width(text);
+            write_str_styled(
+                main,
+                layout.r_cap,
+                hc,
+                text,
+                hc + tw,
+                Style {
+                    fg: *fg,
+                    bg: 0,
+                    bold: false,
+                },
+            );
+            hc += tw;
+        }
+    }
+}
+
+/// Clear the (unused) prompt grid to the base surface color. The composer keeps
+/// a second grid for a separate prompt region; the TUI renders everything into
+/// the main grid, so this just blanks it each frame.
+fn clear_prompt_grid(prompt: &mut Grid) {
+    for r in 0..prompt.rows() {
+        for c in 0..prompt.cols() {
+            prompt.put(r, c, Cell::new(' ', 0, theme::SURFACE, Attr::PLAIN));
         }
     }
 }
@@ -735,9 +869,11 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
             1,
             label,
             cols.saturating_sub(1),
-            theme::MUTED,
-            theme::PANEL_BG,
-            false,
+            Style {
+                fg: theme::MUTED,
+                bg: theme::PANEL_BG,
+                bold: false,
+            },
         );
         return;
     }
@@ -749,9 +885,11 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
         1,
         header,
         cols.saturating_sub(1),
-        theme::PANEL_HEADER,
-        theme::PANEL_BG,
-        true,
+        Style {
+            fg: theme::PANEL_HEADER,
+            bg: theme::PANEL_BG,
+            bold: true,
+        },
     );
 
     for c in 1..cols {
@@ -790,18 +928,31 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
             4,
             &pl.content,
             cols.saturating_sub(4),
-            theme::BODY,
-            theme::PANEL_BG,
-            false,
+            Style {
+                fg: theme::BODY,
+                bg: theme::PANEL_BG,
+                bold: false,
+            },
         );
         row += 1;
     }
 }
 
+/// Display width of a single char in terminal cells (`0`-width control chars
+/// count as 1). Bounded to `u16`; no real glyph width approaches the clamp.
+fn char_cell_width(c: char) -> u16 {
+    u16::try_from(UnicodeWidthChar::width(c).unwrap_or(1)).unwrap_or(1)
+}
+
+/// Saturating `usize -> u16` for terminal geometry (rows/cols/indices). The
+/// clamp is unreachable for real terminals but keeps the conversion both
+/// panic-free and free of `cast_possible_truncation`.
+fn clamp_u16(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
 fn char_display_width(s: &str) -> u16 {
-    s.chars()
-        .map(|c| UnicodeWidthChar::width(c).unwrap_or(1) as u16)
-        .sum()
+    s.chars().map(char_cell_width).sum()
 }
 
 fn wrap_input_lines(text: &str, width: usize) -> Vec<&str> {
@@ -848,8 +999,6 @@ fn md_line_style(line: &str) -> (u32, bool) {
         (theme::MUTED, false)
     } else if trimmed.starts_with("> ") {
         (theme::ACCENT_DIM, false)
-    } else if trimmed.starts_with("| ") || trimmed.starts_with("|---") || trimmed.starts_with("|:") {
-        (theme::BODY, false)
     } else {
         (theme::BODY, false)
     }
@@ -876,7 +1025,7 @@ fn render_md_line(
             if let Some(end) = close {
                 i += 2;
                 while i < end && col < max_cols {
-                    let w = UnicodeWidthChar::width(chars[i]).unwrap_or(1) as u16;
+                    let w = char_cell_width(chars[i]);
                     if col + w > max_cols {
                         break;
                     }
@@ -892,7 +1041,7 @@ fn render_md_line(
             if let Some(end) = chars[i + 1..].iter().position(|&c| c == '`').map(|p| i + 1 + p) {
                 i += 1;
                 while i < end && col < max_cols {
-                    let w = UnicodeWidthChar::width(chars[i]).unwrap_or(1) as u16;
+                    let w = char_cell_width(chars[i]);
                     if col + w > max_cols {
                         break;
                     }
@@ -909,7 +1058,7 @@ fn render_md_line(
             }
         }
 
-        let w = UnicodeWidthChar::width(chars[i]).unwrap_or(1) as u16;
+        let w = char_cell_width(chars[i]);
         if col + w > max_cols {
             break;
         }
@@ -926,7 +1075,7 @@ fn render_md_line(
     }
 }
 
-fn find_closing(chars: &[char], start: usize, c1: char, c2: char) -> Option<usize> {
+const fn find_closing(chars: &[char], start: usize, c1: char, c2: char) -> Option<usize> {
     let mut j = start;
     while j + 1 < chars.len() {
         if chars[j] == c1 && chars[j + 1] == c2 {
@@ -939,9 +1088,9 @@ fn find_closing(chars: &[char], start: usize, c1: char, c2: char) -> Option<usiz
 
 fn format_tokens(n: u32) -> String {
     if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
+        format!("{:.1}M", f64::from(n) / 1_000_000.0)
     } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
+        format!("{:.1}k", f64::from(n) / 1_000.0)
     } else {
         n.to_string()
     }
@@ -1001,29 +1150,20 @@ fn wrap_into<'a>(text: &'a str, fg: u32, bg: u32, bold: bool, cols: usize, out: 
     }
 }
 
-fn write_str_styled(
-    grid: &mut Grid,
-    row: u16,
-    col: u16,
-    s: &str,
-    max_cols: u16,
-    fg: u32,
-    bg: u32,
-    bold: bool,
-) {
-    let attr = if bold { Attr::BOLD } else { Attr::PLAIN };
+fn write_str_styled(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16, style: Style) {
+    let attr = if style.bold { Attr::BOLD } else { Attr::PLAIN };
     let mut c = col;
     for ch in s.chars() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(1) as u16;
+        let w = char_cell_width(ch);
         if c + w > max_cols {
             break;
         }
-        grid.put(row, c, Cell::new(ch, fg, bg, attr));
+        grid.put(row, c, Cell::new(ch, style.fg, style.bg, attr));
         c += w;
     }
-    if bg != 0 {
+    if style.bg != 0 {
         while c < max_cols {
-            grid.put(row, c, Cell::new(' ', 0, bg, Attr::PLAIN));
+            grid.put(row, c, Cell::new(' ', 0, style.bg, Attr::PLAIN));
             c += 1;
         }
     }
@@ -1035,7 +1175,7 @@ mod tests {
 
     #[test]
     fn set_model_updates_usage_snapshot() {
-        let mut app = App::new("anthropic", "claude-opus-4-7", Default::default());
+        let mut app = App::new("anthropic", "claude-opus-4-7", CompletionSources::default());
         assert_eq!(app.usage.model, "claude-opus-4-7");
         app.set_model("claude-sonnet-4-6");
         assert_eq!(app.usage.model, "claude-sonnet-4-6");
@@ -1043,7 +1183,7 @@ mod tests {
 
     #[test]
     fn set_model_does_not_reset_token_counters() {
-        let mut app = App::new("anthropic", "claude-opus-4-7", Default::default());
+        let mut app = App::new("anthropic", "claude-opus-4-7", CompletionSources::default());
         app.record_usage(100, 50, 0, 0, std::time::Duration::from_millis(200));
         app.set_model("claude-sonnet-4-6");
         assert_eq!(app.usage.input_tokens, 100);
@@ -1104,23 +1244,31 @@ mod tests {
 
     #[test]
     fn activity_signature_changes_on_new_output() {
-        let mut app = App::new("anthropic", "m", Default::default());
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
         let s0 = app.activity_signature();
         app.add_colored_line("hello".to_string(), 0, 0);
-        assert_ne!(s0, app.activity_signature(), "new output must change the fingerprint");
+        assert_ne!(
+            s0,
+            app.activity_signature(),
+            "new output must change the fingerprint"
+        );
     }
 
     #[test]
     fn activity_signature_changes_on_token_usage() {
-        let mut app = App::new("anthropic", "m", Default::default());
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
         let s0 = app.activity_signature();
         app.record_usage_tokens(10, 5, 0, 0);
-        assert_ne!(s0, app.activity_signature(), "token deltas must change the fingerprint");
+        assert_ne!(
+            s0,
+            app.activity_signature(),
+            "token deltas must change the fingerprint"
+        );
     }
 
     #[test]
     fn stop_turn_timer_clears_stall_notice() {
-        let mut app = App::new("anthropic", "m", Default::default());
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
         app.start_turn_timer();
         app.stall_secs = Some(90);
         app.stop_turn_timer();

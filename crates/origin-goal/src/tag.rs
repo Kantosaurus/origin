@@ -19,10 +19,14 @@ pub fn parse_tag(text: &str) -> TagOutcome {
     let mut cursor = 0;
     while let Some(open_rel) = text[cursor..].find("<goal-status") {
         let open = cursor + open_rel;
-        let Some(tag_close_rel) = text[open..].find('>') else { break };
+        let Some(tag_close_rel) = text[open..].find('>') else {
+            break;
+        };
         let attrs_end = open + tag_close_rel;
         let attrs = &text[open + "<goal-status".len()..attrs_end];
-        let Some(close_rel) = text[attrs_end..].find("</goal-status>") else { break };
+        let Some(close_rel) = text[attrs_end..].find("</goal-status>") else {
+            break;
+        };
         let close = attrs_end + close_rel;
         let inner = &text[attrs_end + 1..close];
         cursor = close + "</goal-status>".len();
@@ -60,17 +64,26 @@ fn extract_state(attrs: &str) -> Option<&str> {
     let mut i = 0;
     while i + 5 <= bytes.len() {
         let prefix_ok = &bytes[i..i + 5] == b"state";
-        let left_boundary_ok =
-            i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\r' | b'\n');
-        let right_boundary_ok = i + 5 == bytes.len()
-            || matches!(bytes[i + 5], b'=' | b' ' | b'\t' | b'\r' | b'\n');
+        let left_boundary_ok = i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\r' | b'\n');
+        let right_boundary_ok =
+            i + 5 == bytes.len() || matches!(bytes[i + 5], b'=' | b' ' | b'\t' | b'\r' | b'\n');
         if prefix_ok && left_boundary_ok && right_boundary_ok {
             let mut j = i + 5;
-            while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') { j += 1; }
-            if j >= bytes.len() || bytes[j] != b'=' { i += 1; continue; }
+            while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
+                j += 1;
+            }
+            if j >= bytes.len() || bytes[j] != b'=' {
+                i += 1;
+                continue;
+            }
             j += 1;
-            while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') { j += 1; }
-            if j >= bytes.len() || bytes[j] != b'"' { i += 1; continue; }
+            while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
+                j += 1;
+            }
+            if j >= bytes.len() || bytes[j] != b'"' {
+                i += 1;
+                continue;
+            }
             let val_start = j + 1;
             let val_end = val_start + attrs[val_start..].find('"')?;
             return Some(&attrs[val_start..val_end]);
@@ -81,8 +94,12 @@ fn extract_state(attrs: &str) -> Option<&str> {
 }
 
 fn extract_reason(inner: &str) -> String {
-    let Some(open) = inner.find("<reason>") else { return String::new() };
+    let Some(open) = inner.find("<reason>") else {
+        return String::new();
+    };
     let after_open = open + "<reason>".len();
-    let Some(close_rel) = inner[after_open..].find("</reason>") else { return String::new() };
+    let Some(close_rel) = inner[after_open..].find("</reason>") else {
+        return String::new();
+    };
     inner[after_open..after_open + close_rel].trim().to_string()
 }
