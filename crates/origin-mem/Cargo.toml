@@ -18,7 +18,7 @@ workspace = true
 # hermetic — ort-sys fetches a vendored ORT binary at build time, no PATH
 # dance, no manual install. Phase 12 (multi-runtime + arenas) can switch
 # back to `load-dynamic` when we own the loader policy ourselves.
-ort         = { version = "2.0.0-rc.4", default-features = false, features = ["ndarray", "download-binaries", "copy-dylibs"] }
+ort         = { version = "2.0.0-rc.12", default-features = false, features = ["ndarray", "download-binaries", "copy-dylibs"] }
 ndarray     = "0.15"
 tokenizers  = { version = "0.20", default-features = false, features = ["onig"] }
 hnsw_rs     = "0.3"
