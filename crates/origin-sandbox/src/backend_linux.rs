@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Linux backend: landlock + seccomp BPF + rlimit (CPU/RAM caps).
 //!
 //! The filter is constructed in the parent and installed inside the forked

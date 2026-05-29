@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::unwrap_used, clippy::bool_assert_comparison)]
 
 use origin_tools::tool_envelope::{run, EnvelopeCtx, EnvelopeMode};

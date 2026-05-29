@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! PKCE verifier/challenge property tests (RFC 7636).
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Persistent `MemoryStore`: `SQLite` rows + CAS body blobs.
 //!
 //! Memories are stored with their quantised vector inline (centroid + 384 i8

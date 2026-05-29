@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_mem::index::{MemIndex, MetaRow, SearchOpts};
 use origin_mem::EMBED_DIM;
 use std::collections::HashMap;

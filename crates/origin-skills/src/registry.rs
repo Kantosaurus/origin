@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Active-skill stack + allowed-tools intersection mask.
 
 use crate::frontmatter::SkillFrontmatter;

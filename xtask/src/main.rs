@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `xtask` — workspace developer-tools binary.
 //!
 //! Hosts the `lint-secrets` subcommand (enforces the `Secret<T>` redaction

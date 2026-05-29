@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! P11.11 — parquet pushdown reader for the trace ring.
 
 use origin_trace::query::QueryArgs;

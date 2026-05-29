@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Default-workflow directive prepended to every system prompt.
 //!
 //! Origin tells the model to follow a brainstorm → plan → dispatch flow for
@@ -34,7 +35,7 @@ For everything else, follow this orchestration without being asked:
 
 3. /writing-plans next. Produce a step-by-step implementation plan with exact \
    file paths, full code per step, and the verification command per step. \
-   Save it under docs/superpowers/plans/. Get user approval before executing.
+   Save it under docs/plans/. Get user approval before executing.
 
 4. /dispatching-parallel-agents to execute. Spawn one Task subagent per \
    independent unit of work. Every subagent MUST:

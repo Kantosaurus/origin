@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! P6.9 — end-to-end test: daemon wires the memory subsystem and a
 //! `MemoryDecision::Edit` round-trip persists into `MemoryStore`.
 //!

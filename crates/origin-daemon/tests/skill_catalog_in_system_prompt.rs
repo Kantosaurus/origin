@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Confirms the agent's system prompt includes a one-liner per skill in
 //! the daemon's catalog.
 

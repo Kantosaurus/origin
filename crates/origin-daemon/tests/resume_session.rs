@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `ClientMessage::ResumeSession` no longer returns a stub `AdminOk`. It
 //! reads the persisted message log + any supervisor-checkpointed
 //! [`ResumeToken`] and replies with [`StreamEvent::SessionResumed`].

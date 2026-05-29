@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bug #20: bare `/goal` with no active goal must emit a benign
 //! `GoalInactive` info event rather than overloading `SkillError` (which the
 //! CLI renders with error styling).

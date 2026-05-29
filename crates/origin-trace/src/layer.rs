@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `tracing` Layer that feeds the parquet ring via a SPSC channel.
 //!
 //! The layer captures `on_close` events. Each close becomes one [`SpanRow`].

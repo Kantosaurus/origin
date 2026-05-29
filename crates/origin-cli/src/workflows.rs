@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Workflows: declarative chains of skills the agent runs in sequence.
 //!
 //! A workflow is a named list of steps; each step names a skill (and

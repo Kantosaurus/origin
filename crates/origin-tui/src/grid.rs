@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Packed 16-byte `Cell` + row-major `Grid` with `resize` / `put` / `get` /
 //! `diff`-friendly raw byte access via `as_bytes`.
 //!

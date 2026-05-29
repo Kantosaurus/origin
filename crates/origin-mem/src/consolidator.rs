@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Idle consolidation pass: cosine-similarity clustering → Supersedes proposals
 //! + lexical contradiction heuristic.
 //!

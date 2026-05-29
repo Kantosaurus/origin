@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! End-to-end wiring check: an active `SkillRegistry` on `LoopOptions` must
 //! cause `run_loop` to deny a tool that falls outside the intersected
 //! `allowed-tools` mask.

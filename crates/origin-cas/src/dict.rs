@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Learned-dictionary zstd compression (N3.2).
 
 use std::path::Path;

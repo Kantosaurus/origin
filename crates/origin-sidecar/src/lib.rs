@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-sidecar` — always-on small-model worker (N2.5).
 
 pub mod extract;

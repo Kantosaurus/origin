@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Token-aware result builder. Every tool produces its serialised result
 //! through `ResultWriter`, which enforces a per-call token budget and emits
 //! a structured continuation handle on overflow.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Parse the argument string passed alongside `/goal`.
 //!
 //! Grammar: `(--key=value )* <condition...>`. The first token that doesn't

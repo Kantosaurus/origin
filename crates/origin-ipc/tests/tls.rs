@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_ipc::tls::{generate_self_signed, sha256_fingerprint_hex};
 
 #[test]

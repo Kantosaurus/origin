@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_cas::{chunks, Hash};
 
 /// Deterministic pseudo-random byte sequence via a Wang-hash style mixer.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_codegraph::community::{communities, GraphInput, PageRankOpts};
 use origin_codegraph::extract::EdgeKind;
 use origin_codegraph::record::Confidence;

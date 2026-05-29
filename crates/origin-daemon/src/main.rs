@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};

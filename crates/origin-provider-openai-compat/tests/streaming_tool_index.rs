@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Verifies that the openai-compat SSE → ring adapter propagates each
 //! tool_call's `index` into the ring payload, matching the wire shape the
 //! Anthropic provider emits (see `origin-provider-anthropic/src/streaming.rs`)

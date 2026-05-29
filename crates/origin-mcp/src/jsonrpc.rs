@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Minimal JSON-RPC 2.0 framing for MCP.
 
 use serde::{Deserialize, Serialize};

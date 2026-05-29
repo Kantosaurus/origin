@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-tui` — custom cell-grid renderer (replaces Ratatui in Phase 4).
 //!
 //! Phase 4 deliverables: `Cell`, `Grid`, SIMD damage diff (`damage::diff`),

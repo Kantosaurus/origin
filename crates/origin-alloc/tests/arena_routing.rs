@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Routing test — every `ArenaId` resolves to a distinct backend arena handle,
 //! and `with_arena(id, |scope| …)` returns the same `id` back via `scope.id()`.
 

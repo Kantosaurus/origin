@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bot-detection signal classifier.
 //!
 //! Pure: takes a `SnapshotResp`, returns a `Verdict`. Add new signatures as

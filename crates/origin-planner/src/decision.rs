@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `WireDecision` — per-block inline-vs-reference rule for handle substitution
 //! in the message-to-wire encoder (N2.4 step 2).
 

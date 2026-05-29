@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Memory subsystem wiring for the daemon (P6.9).
 //!
 //! `MemoryWiring` bundles the `MemoryStore`, `Embedder` (optional — degrades

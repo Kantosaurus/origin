@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Framed IPC transports for origin: local socket / named pipe, and QUIC + mTLS.
+//!
+//! [`frame`] is the length-prefixed wire format (`FrameKind` + `rkyv` body);
+//! [`transport`] is the local-socket / named-pipe `Connection`; [`quic`] and
+//! [`tls`] carry the same frames over QUIC with mutual TLS for remote clients.
+
 pub mod frame;
 pub mod quic;
 pub mod tls;

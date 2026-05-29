@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-skills` — Skills loader, embedding upsert, and allowed-tools narrowing.
 //!
 //! Modules land per-task across P10.1–P10.4; this `lib.rs` collects them.

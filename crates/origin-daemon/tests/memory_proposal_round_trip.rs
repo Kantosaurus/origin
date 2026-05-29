@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! P6.7 — round-trip test: daemon emits `MemoryProposed` after a turn and
 //! accepts a `ClientMessage::MemoryDecision` over the same connection.
 

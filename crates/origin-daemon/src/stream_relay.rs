@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bridge a per-request `Ring` to an `origin-ipc` connection as JSON-encoded
 //! `Event` frames.
 

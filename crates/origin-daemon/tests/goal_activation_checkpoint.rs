@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bug #8 integration: an activated goal must be checkpointed
 //! immediately, not just after the first iteration completes. We exercise
 //! the building blocks `handle_goal_activation` uses internally:

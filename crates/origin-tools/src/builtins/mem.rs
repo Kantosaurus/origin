@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Memory tools — `mem_search`, `mem_save`, `mem_forget`.
 //!
 //! Each tool is registered via [`crate::origin_tool!`] and exposes a public

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_mcp::{JsonRpcId, JsonRpcRequest, JsonRpcResponse};
 use serde_json::json;
 

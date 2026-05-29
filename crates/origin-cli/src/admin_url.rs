@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Parser for `origin://host:port#fingerprint` URLs used by the
 //! remote-IPC pairing flow (P13.2.4).
 //!

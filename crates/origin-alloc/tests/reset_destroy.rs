@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! jemalloc-only — reset releases resident bytes; destroy invalidates the arena.
 //!
 //! These tests touch global jemalloc state, so they run on a single thread.

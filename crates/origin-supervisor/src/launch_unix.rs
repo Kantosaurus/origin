@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! POSIX child-launch.
 
 use std::path::Path;

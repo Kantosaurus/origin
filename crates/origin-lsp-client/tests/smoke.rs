@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // This test requires `rust-analyzer` on PATH; gated behind RUN_RA env var
 // so the default `cargo test` workflow does not require the binary.
 #![allow(clippy::unwrap_used)]

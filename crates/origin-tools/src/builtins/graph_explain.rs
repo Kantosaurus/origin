@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `graph_explain` — produce a deterministic natural-language description
 //! of a typed [`Query`].
 

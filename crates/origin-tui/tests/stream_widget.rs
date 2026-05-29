@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_stream::{TokenEvent, TokenKind};
 use origin_tui::stream_widget::{Rect, StreamWidget};
 use origin_tui::{Cell, Grid};

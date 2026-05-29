@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! SIMD damage diff over packed `Cell` grids (N8.1).
 //!
 //! Two-pass per row: 32-byte SIMD coarse scan flips the row into a fine

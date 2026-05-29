@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Step-by-step workflow execution state. Tracks which step of a
 //! user-defined workflow is currently in effect so the daemon can gate
 //! activation of the next step on completion of the current one's turn.

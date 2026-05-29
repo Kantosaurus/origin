@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `DiagnosticsHandle` impl wrapping `origin-lsp-client::LspClient` and
 //! resolving rust-analyzer per the two-tier policy in the spec.
 //!

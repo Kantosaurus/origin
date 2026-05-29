@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! FastCDC content-defined chunker. ~16 KiB average chunk size.
 //!
 //! Why FastCDC: a small edit (one byte inserted) shifts only the chunk that

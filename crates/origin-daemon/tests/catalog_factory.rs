@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! End-to-end: catalog row → `ProviderFactory` → wiremock → real chat response.
 
 #![allow(clippy::unwrap_used)]

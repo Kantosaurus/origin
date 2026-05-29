@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! After Phase 11 handle-substitution, cache markers may appear on any
 //! message, not just `msg_idx == 0`. Confirm `encode_request_for_test`
 //! emits `cache_control` on the marker block regardless of message position.

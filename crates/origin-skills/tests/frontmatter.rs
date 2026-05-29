@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_skills::{parse_frontmatter, FrontmatterError};
 
 const GOOD: &str = "---\nname: testing-basics\ndescription: How to write tests.\nallowed-tools: [Read, Bash]\n---\nBody text after frontmatter.\n";

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin init` — first-time setup flow.
 //!
 //! Greets the user, walks them through picking a primary provider (out of

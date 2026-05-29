@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Content-addressed hash type backed by blake3.
 
 use core::fmt;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Subprocess client for the `agent-browser` CLI.
 //!
 //! Speaks stdio-JSON. One verb in, one response out. Long-lived per session.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bulk-gate — fairness watcher that wakes parked Bulk tasks whenever the
 //! Critical semaphore drops to zero permits in flight.
 

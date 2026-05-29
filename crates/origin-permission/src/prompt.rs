@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Prompter` trait + test prompters.
 //!
 //! Production prompter lives in the TUI client (introduced in P1.11) and is

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_provider_anthropic::streaming::parse_chunk_for_test;
 
 #[test]

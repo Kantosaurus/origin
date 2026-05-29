@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Cache-line-separated cursor pair stored at the head of the shared
 //! mmap.
 //!

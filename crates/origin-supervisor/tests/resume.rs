@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Open a session, take a turn, SIGKILL the daemon; next daemon's
 //! `list_sessions` includes the same session at the same turn.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::unwrap_used, clippy::format_collect, clippy::panic)]
 
 use origin_tools::builtins::read::{read_v2, ReadArgs};

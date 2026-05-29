@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::panic)]
 
 use origin_hooks::{parse_hook_stdout, HookOverride, LifecycleEvent, ToolPhase};

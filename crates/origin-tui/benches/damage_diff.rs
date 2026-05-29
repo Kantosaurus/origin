@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use origin_tui::damage::diff;
 use origin_tui::{Cell, Grid};

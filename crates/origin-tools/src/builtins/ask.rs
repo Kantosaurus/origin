@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `ask` — free-text question; classifier routes to code-graph, memory, or both.
 
 use origin_codegraph::ask::{classify, AskResult, MemRouter, Route};

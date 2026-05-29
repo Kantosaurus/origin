@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_cli::tui::App;
 use origin_tui::composer::Composer;
 use origin_tui::stream_widget::{Rect, StreamWidget};

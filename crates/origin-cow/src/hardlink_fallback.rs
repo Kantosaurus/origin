@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Cross-platform eager-copy fallback used by
 //! [`Strategy::HardlinkOverlay`](crate::Strategy::HardlinkOverlay).
 //!

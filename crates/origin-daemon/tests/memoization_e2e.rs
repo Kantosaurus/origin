@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Read` the same path twice in one session — second call must be served
 //! from the cache and the result body must contain "(cached from turn ".
 #![allow(clippy::panic)]

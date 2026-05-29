@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Provider trait + canonical request/response/usage/error types.
 //!
 //! Each `Provider` implementation translates the canonical types to its wire

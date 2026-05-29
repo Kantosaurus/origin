@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_skills::{load_skills_dir, Skill};
 use std::fs;
 use tempfile::tempdir;

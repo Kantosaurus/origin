@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+//! `SQLite`-backed persistent store for origin, with embedded schema migrations.
+//!
+//! [`Store`] opens (or creates) a `SQLite` database and runs any pending
+//! `refinery` migrations (embedded from `src/migrations`) on open. Failures
+//! surface as [`StoreError`].
+
 use std::path::Path;
 use std::sync::Mutex;
 

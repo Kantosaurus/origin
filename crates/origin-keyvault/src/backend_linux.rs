@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Linux backend — talks to the freedesktop Secret Service (gnome-keyring,
 //! KWallet, etc.) over D-Bus.
 //!

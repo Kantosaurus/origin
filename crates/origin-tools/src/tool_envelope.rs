@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Tool envelope — orchestration layer between `dispatch_tool` and the
 //! per-tool function.
 //!

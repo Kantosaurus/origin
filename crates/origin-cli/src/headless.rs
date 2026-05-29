@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Headless one-shot (`origin run`). Connects to the daemon, sends a
 //! single Prompt, drains the stream, exits. No Ratatui renderer.
 

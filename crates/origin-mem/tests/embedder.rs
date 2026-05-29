@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_mem::{Embedder, EMBED_DIM};
 
 const STUB_PATH: &str = "tests/fixtures/stub_minilm.onnx";

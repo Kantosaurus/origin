@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `CachePlanner::plan` — sort sections into Frozen→Sticky→Sliding→Volatile
 //! and emit marker positions at every adjacent-band boundary.
 #![allow(clippy::module_name_repetitions)]

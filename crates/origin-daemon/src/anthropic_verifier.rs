@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Concrete `Verifier` impl backed by a `Provider` (typically the
 //! Anthropic Haiku model).
 //!

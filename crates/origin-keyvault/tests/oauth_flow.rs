@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! End-to-end OAuth flow: auth-code exchange + refresh rotation against a
 //! mocked token endpoint (`wiremock`).
 

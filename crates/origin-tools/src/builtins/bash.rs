@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Bash` v2 — timeout, cwd, env, `run_in_background`. Backed by `proc_supervisor`.
 
 use std::time::Duration;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! User-level config at `~/.origin/config.toml`.
 //!
 //! Persists the role → (provider, account, model) mapping captured by the

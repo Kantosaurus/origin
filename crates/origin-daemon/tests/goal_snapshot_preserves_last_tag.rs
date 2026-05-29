@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bug #9 integration: GoalSnapshot must preserve `last_status_tag` so
 //! a `Verifying` resume after a crash carries forward the `Met` claim
 //! and the driver can re-run the verifier on the next tick.

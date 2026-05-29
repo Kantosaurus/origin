@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_tui::ansi::emit;
 use origin_tui::damage::Run;
 use origin_tui::{Attr, Cell, Grid};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Two opens of the same recorded bundle must produce byte-identical entry
 //! payloads; the virtual clock replays samples in stable order.
 

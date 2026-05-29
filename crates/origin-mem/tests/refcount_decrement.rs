@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! When a memory record is dropped, `MemoryStore` must decrement the refcount
 //! of every CAS handle the record referenced so GC can reclaim the shards.
 //!

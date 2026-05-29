@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Daemon-side workflow loader.
 //!
 //! Mirrors the on-disk shape produced by

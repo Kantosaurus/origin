@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Protocol-level tests for the swarm coordinator (P9.6, N7.4, N7.5).
 //!
 //! Two scenarios are covered:

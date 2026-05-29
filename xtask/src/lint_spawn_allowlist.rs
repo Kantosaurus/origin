@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Per-file allowlist for the `tokio::spawn` ban.
 //!
 //! Entries are workspace-relative paths. A path is allowed if it matches

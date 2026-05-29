@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `PrefixLedger` inheritance tests (P9.7, N7.1).
 //!
 //! Two scenarios:

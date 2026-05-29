@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Embedded superpowers skill bodies. Walked at runtime by `load_embedded`.
 //!
 //! Built-time inclusion means the binary ships with every skill; users do not

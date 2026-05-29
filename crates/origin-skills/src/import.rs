@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! First-run import from `~/.claude/skills/` into `~/.origin/skills/`.
 //!
 //! N9.6 — dedupe by body hash; defer to the caller-provided `confirm` for

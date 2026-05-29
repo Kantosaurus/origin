@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 3 checkpoint bench.
 //!
 //! Runs a fixed 20-turn synthetic workload twice (cold + warm). The

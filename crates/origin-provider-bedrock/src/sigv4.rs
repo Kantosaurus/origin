@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `SigV4` request signing for AWS Bedrock `InvokeModel`.
 //!
 //! Wraps `aws-sigv4` to produce the small bundle of additional headers

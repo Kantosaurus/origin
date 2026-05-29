@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Property test for `origin-plan` fold determinism (P9.1).
 //!
 //! The CRDT correctness invariant: any permutation of the op-log must fold to

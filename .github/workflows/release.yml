@@ -144,6 +144,15 @@ jobs:
             --version "$version" \
             --manifest manifest.json \
             --out out/packaging
+      - name: Generate SBOM (CycloneDX)
+        continue-on-error: true   # supplementary — never block a release
+        run: |
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --all --format json
+          mkdir -p out/sbom
+          find . -name '*.cdx.json' -not -path './target/*' -not -path './out/*' \
+            -exec cp {} out/sbom/ \;
+          ls -la out/sbom || true
       - name: GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
@@ -151,6 +160,7 @@ jobs:
             out/origin-*
             out/SHA256SUMS
             out/packaging/*
+            out/sbom/*
           generate_release_notes: true
           prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') }}
 

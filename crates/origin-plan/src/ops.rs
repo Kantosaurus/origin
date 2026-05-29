@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Op-log alphabet for the shared plan CRDT (P9.1).
 //!
 //! Every op is wrapped in an [`OpEnvelope`] carrying the producing

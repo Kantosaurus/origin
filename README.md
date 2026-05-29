@@ -1,10 +1,14 @@
 <div align="center">
 
+<img src="assets/logo.svg" alt="origin" width="320">
+
 # origin
 
 **A Rust-native agentic coding harness — a CLI plus a supervised daemon that runs LLM-driven coding sessions locally.**
 
 [![CI](https://github.com/Kantosaurus/origin/actions/workflows/ci.yml/badge.svg)](https://github.com/Kantosaurus/origin/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/Kantosaurus/origin/branch/dev/graph/badge.svg)](https://codecov.io/gh/Kantosaurus/origin)
+[![Scorecard](https://api.securityscorecards.dev/projects/github.com/Kantosaurus/origin/badge)](https://scorecard.dev/viewer/?uri=github.com/Kantosaurus/origin)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/rustc-1.83+-blue.svg)
 ![unsafe: forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)
@@ -24,7 +28,7 @@ sessions, **`origin-cli`** is a thin client, and they talk only through
 > **Status:** pre-1.0 (`0.0.1`). The core — content-addressed storage, archived
 > IR, the two-runtime daemon, planner, provider catalog, KeyVault, sandboxing,
 > and deterministic replay — is landed and gated. Some subsystems are "real but
-> young"; see [`docs/why-origin.md`](docs/why-origin.md) for an honest accounting.
+> young."
 
 ## Why origin
 
@@ -53,8 +57,6 @@ sessions, **`origin-cli`** is a thin client, and they talk only through
 - **Remote IPC via QUIC + mTLS**, **deterministic replay** (`.origin-replay`
   bundles), and **zero `unsafe` in surface crates** (forbidden workspace-wide,
   audited exceptions in `cas`/`tui`/`ipc`).
-
-A fuller pitch and head-to-head comparison live in [`docs/why-origin.md`](docs/why-origin.md).
 
 ## Install
 
@@ -139,7 +141,8 @@ xtask/             release stamping, manpages, repo automation
 
 Contributions are welcome. Please read **[CONTRIBUTING.md](CONTRIBUTING.md)** for the
 dev setup and the quality gates (`cargo fmt`, `cargo clippy -D warnings` with
-`pedantic`/`nursery`, `cargo test`, MSRV 1.83, no new `unsafe`). The project follows a
+`pedantic`/`nursery`, `cargo test`, MSRV 1.83, no new `unsafe`), and our
+**[Code of Conduct](CODE_OF_CONDUCT.md)**. The project follows a
 brainstorm → plan → TDD → verify workflow that is baked into the daemon's default
 system prompt.
 

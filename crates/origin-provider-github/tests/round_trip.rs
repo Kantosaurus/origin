@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Round-trip wiremock test: the GitHub Models provider reads its bearer
 //! token from the vault on every call, hits `POST /inference/chat/completions`,
 //! and decodes an OpenAI-shape response into canonical [`Block::Text`].

@@ -1,6 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Goal driver: persistent completion conditions with inline self-tag protocol.
-//!
-//! See `docs/superpowers/specs/2026-05-28-goal-skill-design.md`.
 
 #![forbid(unsafe_code)]
 

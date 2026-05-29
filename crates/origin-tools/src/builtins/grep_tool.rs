@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Grep` v2 — `files_with_matches` default, `head_limit`, type/glob, context lines.
 
 use crate::error::{ErrClass, ToolError};

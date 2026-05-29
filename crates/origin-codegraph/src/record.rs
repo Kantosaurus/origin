@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! CAS-archived records for code-graph nodes and edges (P7.3).
 //!
 //! `CodeNodeRecord` is the in-memory shape used by callers when inserting

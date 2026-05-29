@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! QUIC + rustls remote IPC transport.
 //!
 //! Mirrors the `read_frame` / `write_frame` / `write_raw` surface of

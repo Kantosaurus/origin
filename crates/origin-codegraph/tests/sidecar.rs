@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_codegraph::record::Confidence;
 use origin_codegraph::sidecar::{ExtractJob, LopdfTextSidecar, NoopSidecar, Sidecar};
 use std::path::PathBuf;

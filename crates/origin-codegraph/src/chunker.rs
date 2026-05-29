@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `FastCDC` chunker biased toward tree-sitter AST node boundaries.
 //!
 //! The vanilla `FastCDC` cut score is `(hash & mask) == mask`. We extend it

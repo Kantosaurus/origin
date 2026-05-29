@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Private wire JSON types for the `OpenAI` Chat Completions API.
 //!
 //! The `Wire` prefix on every type disambiguates these internal serialisation

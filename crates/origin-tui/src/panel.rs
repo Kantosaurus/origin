@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Side panel event queue + permission decision UI.
 
 use std::collections::VecDeque;

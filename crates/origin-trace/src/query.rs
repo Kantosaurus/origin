@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! P11.11 — parquet reader with pushdown predicates on `kind` and `error_kind`.
 //!
 //! Walks every `.parquet` file under `args.dir`, decodes each `RecordBatch`,

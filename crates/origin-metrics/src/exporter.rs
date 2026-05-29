@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Optional OpenTelemetry OTLP exporter. Gated behind the `otel` cargo feature.
 //!
 //! The body is intentionally minimal at P11.12; richer integration lands

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Helper for the `/clear`-clears-active-goal coupling (bug #10).
 //!
 //! The bare `clear` skill is a documentation skill — activating it does

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Compile-time grep — no raw `tokio::spawn` calls remain in the daemon's
 //! src directory. The `xtask lint-spawn` covers this too, but a unit-style
 //! test catches it in `cargo test` before xtask runs.

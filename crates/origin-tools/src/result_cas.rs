@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Session-scoped output-content-addressed store.
 //!
 //! The envelope hashes each non-mutating tool result and stores the bytes

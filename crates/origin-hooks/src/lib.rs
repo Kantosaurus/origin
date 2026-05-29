@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-hooks` — pre-spawned shell pool + typed lifecycle event dispatch.
 //!
 //! Modules land in P10.5 (`shellpool`) and P10.6 (`event` + `dispatch`).

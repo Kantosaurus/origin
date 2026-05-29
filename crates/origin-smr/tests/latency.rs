@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Latency smoke test for the SPSC ring.
 //!
 //! Informational benchmark with a generous 1 ms per-iter ceiling so it

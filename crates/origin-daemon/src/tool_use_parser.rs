@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Incremental SAX-style JSON parser for `tool_use` input objects (N2.2).
 //!
 //! Consumes fragments of a streaming JSON object (the assistant's

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_migrate::opencode::OpencodeSource;
 use origin_migrate::source::Source;
 use std::path::PathBuf;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Language` enum + tree-sitter parser bindings.
 
 use thiserror::Error;

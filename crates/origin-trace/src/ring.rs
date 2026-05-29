@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Per-day parquet ring writer with 64 MiB rotation.
 
 #![allow(clippy::needless_pass_by_value)]

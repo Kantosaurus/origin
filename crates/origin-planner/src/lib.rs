@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-planner` — predictive prompt-cache prefix planner.
 //!
 //! Phase 3 deliverables: `Band`, `PrefixLedger`, `CachePlanner`, `WireDecision`.

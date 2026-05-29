@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Composer-driven TUI app state and draw routine.
 //!
 //! Features: unicode-width-aware wrapping, keyboard scrollback,

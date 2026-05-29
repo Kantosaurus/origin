@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `SwarmError` — coordinator/worker error surface (P9.6).
 //!
 //! Wraps the lower-level error types so call sites can `?` through `apply`,

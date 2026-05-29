@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Verifies the bedrock provider asks for the same `max_tokens` ceiling as the
 //! sibling `origin-provider-anthropic` crate. Bumped in commit 78916ea from
 //! 4096 → `16_384`; bedrock serves the same Claude models, so it must match.

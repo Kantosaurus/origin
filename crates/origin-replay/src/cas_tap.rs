@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Tap point for CAS writes. The CAS layer calls `on_write(handle_hex, size)`
 //! after a blob is durably stored so the recorder can fingerprint the run.
 

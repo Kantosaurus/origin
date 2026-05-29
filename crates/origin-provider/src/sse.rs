@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Shared SSE pump for provider crates.
 //!
 //! Wraps a `reqwest::Response` byte stream into an event stream yielding

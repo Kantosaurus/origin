@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Plan side-panel wiring for the cli.
 //!
 //! Wire shape (P9.9 → P10):

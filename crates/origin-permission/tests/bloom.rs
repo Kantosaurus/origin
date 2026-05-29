@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_permission::bloom::BloomPreCheck;
 use origin_permission::rules::Rule;
 

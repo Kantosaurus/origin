@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `run_loop` retries `ProviderError::RateLimit` with backoff instead of
 //! killing the turn. These tests exercise both the recovery path (a few
 //! 429s then a real response succeeds) and the give-up path (a provider

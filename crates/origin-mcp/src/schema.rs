@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Validate MCP `tools/call` arguments against the tool's registered
 //! `input_schema` before the request is sent. Compiled schemas live in a
 //! per-server cache keyed by tool name.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Input event handling (key reducer).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

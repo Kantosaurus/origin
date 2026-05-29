@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Integration test T16: verifier rejection resumes iteration with the
 //! verifier's reason injected into the next user prompt.
 //!

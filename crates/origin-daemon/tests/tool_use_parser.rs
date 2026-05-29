@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_daemon::tool_use_parser::{ToolUseDelta, ToolUseParser};
 
 #[test]

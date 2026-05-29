@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `OpenRouter` provider — thin wrapper around `origin-provider-openai-compat`.
 
 use origin_provider_openai_compat::{OpenAiCompat, OpenAiCompatConfig, StaticBearer};

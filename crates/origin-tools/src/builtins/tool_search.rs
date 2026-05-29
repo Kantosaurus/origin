@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `ToolSearch` — fetch full schemas for deferred tools on demand.
 
 use crate::error::ToolError;

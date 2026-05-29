@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin import` — migrate sessions/skills from another harness.
 //!
 //! Wraps the `origin-migrate` source adapters. When `--apply` is set the

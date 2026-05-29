@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-alloc` — per-component allocator arenas with a no-op default and an
 //! opt-in jemalloc backend.
 

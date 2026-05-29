@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Stdio JSON-RPC transport over a spawned child process.
 
 use crate::transport::{Transport, TransportError};

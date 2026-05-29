@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `cargo bench -p origin-metrics --bench encode -- --quick`
 //!
 //! Threshold: encode 1000-series snapshot in <= 200 us.

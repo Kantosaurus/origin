@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! OAuth 2.0 helpers — PKCE generator + auth-code exchange + refresh
 //! rotation, with tokens persisted through [`crate::KeyVault`].
 //!

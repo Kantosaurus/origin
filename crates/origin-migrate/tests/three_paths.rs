@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! GA criterion 5: three migration paths (claude-code / jcode / opencode)
 //! each yield a non-empty `MigrateBundle` on the bundled fixtures.
 

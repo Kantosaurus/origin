@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use origin_cli::tui::App;
 use origin_stream::{TokenEvent, TokenKind};

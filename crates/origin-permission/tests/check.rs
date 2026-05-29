@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_permission::prompt::{AlwaysAllow, AlwaysDeny};
 use origin_permission::{check, Outcome};
 use origin_tools::{SandboxProfile, SideEffects, Tier, ToolMeta, Urgency};

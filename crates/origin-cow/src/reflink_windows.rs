@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Windows reflink driver — `FSCTL_DUPLICATE_EXTENTS_TO_FILE` for `ReFS` / Dev Drive.
 //!
 //! UNTESTED ON THIS HOST: implementation compiles but requires a `ReFS` or

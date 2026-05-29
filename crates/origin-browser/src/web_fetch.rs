@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `WebFetch`: GET a URL, run readability over the HTML, return markdown.
 //!
 //! Pure Rust path — no subprocess required. Used for one-shot reader-mode

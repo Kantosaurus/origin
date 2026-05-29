@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bearer-token authorization store for P13.2 remote IPC.
 //!
 //! Mirrors the in-memory bearer index from [`crate::pairing`] in a form

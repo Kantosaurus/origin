@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Summary-backed compaction (P5.4).
 
 use origin_core::types::{Block, Message};

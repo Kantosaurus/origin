@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `?metrics` panel widget (P11.12).
 //!
 //! Renders an [`origin_metrics::Metrics`] snapshot as a column-aligned

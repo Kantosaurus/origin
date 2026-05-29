@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! EOL / encoding / BOM detection and normalisation.
 //!
 //! Every file-touching tool reads bytes, calls [`detect`] once to capture

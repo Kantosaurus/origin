@@ -1,0 +1,16 @@
+PackageIdentifier: Kantosaurus.origin
+PackageVersion: "{{VERSION}}"
+# origin ships as a single standalone binary, so it is a "portable" installer:
+# winget places it on PATH and aliases it as `origin`.
+InstallerType: portable
+Commands:
+  - origin
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/Kantosaurus/origin/releases/download/v{{VERSION}}/origin-x86_64-pc-windows-msvc.exe
+    InstallerSha256: "{{SHA256_WIN_X64}}"
+  - Architecture: arm64
+    InstallerUrl: https://github.com/Kantosaurus/origin/releases/download/v{{VERSION}}/origin-aarch64-pc-windows-msvc.exe
+    InstallerSha256: "{{SHA256_WIN_ARM}}"
+ManifestType: installer
+ManifestVersion: 1.6.0

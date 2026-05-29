@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Clap command definitions for the `origin` binary.
 //!
 //! These live in the library so that introspection tools (notably

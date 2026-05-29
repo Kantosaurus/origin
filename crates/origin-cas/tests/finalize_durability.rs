@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Regression test for the `PackBuilder::finalize` durability fix.
 //!
 //! The fix adds a `sync_all()` after the buffered-writer flush in

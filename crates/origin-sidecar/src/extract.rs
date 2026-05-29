@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Tool-output structure extraction (N2.5.c).
 
 use origin_cas::{Hash, Store};

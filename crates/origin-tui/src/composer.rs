@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Composer` — a three-pane layout (main, side, prompt) backed by six
 //! `Grid`s: one live and one scratch per pane, enabling SIMD damage diff via
 //! `damage::diff` + `ansi::emit` on each frame.

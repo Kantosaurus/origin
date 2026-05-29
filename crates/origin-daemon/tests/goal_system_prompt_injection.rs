@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! End-to-end check that an active `/goal` actually causes `run_loop` to
 //! emit the `<origin-goal>` block in the assembled system prompt of every
 //! provider call. This is the regression net the Wave-4 harness couldn't

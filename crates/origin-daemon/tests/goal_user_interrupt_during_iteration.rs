@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Integration test T15: user interrupt during iteration.
 //!
 //! The real daemon's mid-iteration interrupt path lives in

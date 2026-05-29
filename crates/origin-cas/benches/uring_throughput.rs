@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Throughput benchmark — sequential write + read of 64 MiB through the uring
 //! path. We do not depend on criterion to keep the bench harness light.
 

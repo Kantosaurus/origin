@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Workspace clone isolation contract.
 //!
 //! The fundamental invariant of `origin-cow` is that writes to a clone

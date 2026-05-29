@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Incremental rebuild driver: input = changed paths, output = `RebuildReport`.
 //!
 //! P10 will split `nodes_added` vs `nodes_updated` (the upsert is currently

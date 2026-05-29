@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Task class taxonomy.
 
 /// Coarse priority/budget bucket for every spawned task in the daemon.

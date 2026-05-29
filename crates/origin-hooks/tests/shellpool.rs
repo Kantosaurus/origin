@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_hooks::{ShellPool, ShellSpec};
 
 fn default_spec() -> ShellSpec {

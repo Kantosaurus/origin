@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Goal state machine.
 //!
 //! The driver lives in `origin-daemon`; this crate only carries the types

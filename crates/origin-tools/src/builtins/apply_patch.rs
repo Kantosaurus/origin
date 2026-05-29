@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `ApplyPatch` — apply a unified diff atomically across files.
 //!
 //! v2 supports the common subset of unified diff:

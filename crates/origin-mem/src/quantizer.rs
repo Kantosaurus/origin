@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Int8 quantizer with 256 per-cluster centroid offsets.
 //!
 //! Each vector is stored as `(centroid_id, deltas)` where each delta is the

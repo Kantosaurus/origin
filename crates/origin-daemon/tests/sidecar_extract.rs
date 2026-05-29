@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #[test]
 fn extract_threshold_is_16kb() {
     assert_eq!(origin_sidecar::extract::EXTRACT_THRESHOLD_BYTES, 16 * 1024);

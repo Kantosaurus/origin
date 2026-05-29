@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::module_name_repetitions)]
 // Public surface intentionally mirrors module names — `WorkerSpec`, `CompletionReport`, etc. are documented vocab callers expect.
 #![allow(clippy::future_not_send)] // Channels are generic over `T`; users are responsible for picking `Send` payloads.

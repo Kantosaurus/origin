@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bug #11 integration: verifier spend that pushes us past budget must
 //! clear as BudgetExhausted, not Met. Without the post-charge cap_check
 //! the user could be charged for an "successful" goal that actually blew

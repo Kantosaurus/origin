@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Process-singleton runtime registry — per-class semaphores + bulk gate.
 
 use crate::class::TaskClass;

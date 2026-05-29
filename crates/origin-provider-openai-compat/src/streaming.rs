@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `OpenAI` SSE → `TokenEvent` adapter.
 //!
 //! Consumes the shared `origin_provider::sse::from_reqwest` event stream and

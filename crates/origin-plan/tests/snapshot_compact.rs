@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Snapshot-compaction tests for `origin-plan` (P9.3, N7.7).
 //!
 //! `PlanStore::write_snapshot` is required to:

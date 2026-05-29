@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Regression tests for two bugs flagged in the P2.10 code-quality review:
 //!
 //! - Bug 1: `agent::run_loop` hangs forever when `provider.chat_stream` returns

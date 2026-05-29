@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_daemon::shutdown::{CooperativeShutdown, ShutdownPhase, ShutdownReport};
 use std::time::Duration;
 use tokio::sync::mpsc;

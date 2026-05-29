@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! IPC request/response shapes for daemon ↔ client.
 
 use std::path::PathBuf;

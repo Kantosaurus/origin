@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CacheKind {
     None,

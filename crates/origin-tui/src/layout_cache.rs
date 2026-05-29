@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! CAS-backed per-turn layout cache (P4.8).
 
 use origin_cas::{Hash, Store, StoreError};

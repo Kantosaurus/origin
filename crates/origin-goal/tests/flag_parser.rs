@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::unwrap_used)]
 
 use origin_goal::{parse_goal_args, FlagParseError};

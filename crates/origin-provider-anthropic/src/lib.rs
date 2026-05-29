@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Anthropic Messages API provider (non-streaming, API key auth).
 //!
 //! Streaming support arrives in Phase 2 (origin spec N4.4).

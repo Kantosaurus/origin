@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-trace` — structured tracing spans written to a per-day parquet ring.
 //!
 //! The crate exposes (1) a `tracing::Subscriber`-compatible layer that turns

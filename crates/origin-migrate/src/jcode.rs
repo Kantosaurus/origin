@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use crate::source::{ImportedMessage, ImportedSession, MigrateBundle, Source, SourceError};
 use rusqlite::Connection;
 use std::path::Path;

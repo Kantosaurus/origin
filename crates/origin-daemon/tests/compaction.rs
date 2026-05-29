@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_core::types::{Block, Message, Role};
 use origin_daemon::compactor::{compact, CompactionInput, COMPACT_OLDEST_N_TURNS, DEFAULT_SOFT_CAP_BYTES};
 

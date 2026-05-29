@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `PlanHandle` — Arc-wrapped fold + persistence + broadcast (P9.6).
 //!
 //! The swarm crate is the first consumer of the plan op log, so the handle

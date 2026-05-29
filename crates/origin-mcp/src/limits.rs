@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Inbound MCP response size cap. Enforced at the transport layer so a
 //! pathological server can't OOM the daemon before JSON-RPC parsing.
 

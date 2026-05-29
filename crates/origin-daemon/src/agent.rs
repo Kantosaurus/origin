@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Agent loop: prompt → provider → tool dispatch → repeat → final text.
 
 use crate::proposal_registry::ProposalRegistry;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Ollama provider (non-streaming + NDJSON streaming).
 //!
 //! Implements `origin_provider::Provider` against a local Ollama daemon's

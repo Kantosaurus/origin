@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Phased cooperative shutdown — N8.10 — for `origin-daemon`.
 //!
 //! Each phase has its own budget timer. A stuck phase force-advances and the

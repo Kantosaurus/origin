@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Smoke test — supervisor restarts a SIGKILL'd daemon within 2 s.
 //!
 //! Strategy: build a fake-daemon shell stub at runtime that just sleeps; SIGKILL

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Credit-budgeted MPSC channel (N7.4).
 //!
 //! A `CreditChannel<T>` pairs a `tokio::sync::Semaphore` (the credit pool)

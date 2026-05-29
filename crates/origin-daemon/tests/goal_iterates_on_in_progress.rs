@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Integration test T12: driver iterates on `in_progress`, calls verifier on
 //! `met`, clears on verifier confirmation.
 //!

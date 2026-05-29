@@ -1,0 +1,28 @@
+# https://reuse.software/ — declares copyright/licensing for files that don't
+# carry an inline SPDX header. Rust sources (`**/*.rs`) carry inline
+# `// SPDX-License-Identifier: Apache-2.0` headers instead and are not listed here.
+version = 1
+
+[[annotations]]
+path = [
+  "**/*.toml",
+  "**/*.md",
+  "**/*.yml",
+  "**/*.yaml",
+  "**/*.json",
+  "**/*.mjs",
+  "**/*.js",
+  "**/*.svg",
+  "bench/**",
+  "docs/**",
+  ".github/**",
+  "packaging/**",
+  "rust-toolchain.toml",
+  "clippy.toml",
+  ".editorconfig",
+  "LICENSE",
+  "NOTICE",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Ainsley Woo and the origin contributors"
+SPDX-License-Identifier = "Apache-2.0"

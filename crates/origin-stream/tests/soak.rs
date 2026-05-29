@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_stream::{Ring, TokenEvent, TokenKind};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

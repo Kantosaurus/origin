@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Windows backend: AppContainer SID + restricted Job Object.
 //!
 //! On Windows the cap layer must run *after* `CreateProcess` because the

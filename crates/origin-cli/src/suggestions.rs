@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Live suggestion engine for the TUI input buffer.
 //!
 //! Computes ranked candidates on every keystroke when the **trailing

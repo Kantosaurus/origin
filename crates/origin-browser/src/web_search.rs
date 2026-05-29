@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `WebSearch` via Tavily.
 //!
 //! Tavily was chosen over Brave/SerpAPI for LLM-friendly snippets and a

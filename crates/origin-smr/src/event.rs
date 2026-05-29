@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `SwarmEvent` — rkyv-archived shared-memory event record.
 //!
 //! Per Phase 9 plan P9.4 / N7.2 the SPSC ring stores rkyv-archived

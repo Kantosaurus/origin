@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Shared NDJSON line splitter for provider crates.
 //!
 //! Wraps a `reqwest::Response` byte stream into a stream of UTF-8 lines

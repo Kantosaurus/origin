@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bridge from `origin_keyvault::KeyVault` to `HttpTransport`'s bearer slot.
 //!
 //! Tokens are stored under `(provider="mcp-<server>", account="<id>/oauth")`,

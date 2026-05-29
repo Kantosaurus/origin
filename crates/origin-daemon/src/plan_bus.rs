@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Daemon-wide plan-op broadcast bus (P9.9 → P10 follow-up).
 //!
 //! The swarm `PlanHandle` already exposes a per-handle `tokio::sync::broadcast`

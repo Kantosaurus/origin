@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Worker abstraction (P9.6).
 //!
 //! A `WorkerFn` is a `Pin<Box<dyn Future<...>>>`-returning closure. The

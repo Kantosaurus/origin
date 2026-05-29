@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `PrefixSnapshot` — coordinator's Frozen+Sticky band assignments,
 //! handed to each worker so its first request reuses the parent's
 //! `CachePlanner` prefix bytes (N7.1, P9.7).

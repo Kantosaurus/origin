@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::unwrap_used, clippy::string_lit_as_bytes)]
 
 use origin_tools::text_fmt::{denormalise, detect, normalise_to_lf, Bom, Encoding, Eol};

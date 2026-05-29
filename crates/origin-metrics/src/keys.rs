@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bounded-cardinality label keyspace.
 //!
 //! We enforce a static allowlist of (provider, tool, result) tuples that count

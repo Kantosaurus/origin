@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Replay loaded resume tokens to the next daemon over IPC.
 //!
 //! On supervisor startup (or after a restart), the supervisor loads any

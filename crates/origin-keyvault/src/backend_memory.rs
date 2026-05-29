@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! In-process memory backend.
 //!
 //! Used for tests, CI, and any environment where the user opts out of the

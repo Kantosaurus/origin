@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Integration tests for the CAS-backed code-graph index (P7.3).
 
 use origin_cas::{Store as CasStore, StoreConfig};

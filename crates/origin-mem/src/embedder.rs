@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! ONNX `MiniLM` wrapper. Loads a sentence-transformer ONNX graph and exposes
 //! `embed(text) -> [f32; 384]`. CPU execution provider only.
 

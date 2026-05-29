@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Process supervisor: owns long-running children, exposes a byte-offset
 //! ring-buffer per process for the `Monitor` tool to tail.
 

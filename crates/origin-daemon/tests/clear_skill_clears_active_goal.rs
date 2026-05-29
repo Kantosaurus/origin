@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bug #10: `/clear` (the `clear` skill activation) must also clear an
 //! active goal, emitting `GoalCleared { UserClearAll }`. Without the
 //! coupling, a user who runs `/goal foo` and then `/clear` ends up with

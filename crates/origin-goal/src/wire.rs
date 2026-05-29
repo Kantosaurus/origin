@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Wire-shape types shared between the protocol (origin-daemon) and the
 //! resume token (origin-resume-token). Kept in this crate so both consumers
 //! depend on `origin-goal` rather than each other.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Three-tier content-addressed store.
 //!
 //! - **Hot:** in-memory LRU of `Vec<u8>`. Bounded by `hot_capacity` entries.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! No-op backend used when the `jemalloc` cargo feature is off. Every
 //! `bind_thread_arena` is recorded for the routing test but no real allocator
 //! state changes.

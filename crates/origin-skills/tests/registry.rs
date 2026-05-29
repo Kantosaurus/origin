@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_skills::{SkillFrontmatter, SkillRegistry};
 
 #[test]

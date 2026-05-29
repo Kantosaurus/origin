@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! MCP tool proxy — implements [`origin_tools::DynTool`] via an [`McpClient`].
 //!
 //! The proxy is what the daemon's tool dispatcher walks over when it sees an MCP

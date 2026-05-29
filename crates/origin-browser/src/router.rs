@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Primary/fallback browser router.
 //!
 //! Policy: try `agent-browser` first. If the classifier flags the response as

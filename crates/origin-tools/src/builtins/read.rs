@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Read` v2 — line-numbered chunks with offset/limit, image/PDF dispatch.
 
 use crate::error::{ErrClass, ToolError};

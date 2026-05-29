@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="360" height="96" viewBox="0 0 360 96" role="img" aria-label="origin">
+  <title>origin</title>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="56" font-weight="650">
+    <text x="6" y="66" fill="#3FB950">&#8250;</text>
+    <text x="54" y="66" fill="#2F81F7">origin</text>
+    <rect x="300" y="28" width="26" height="46" rx="4" fill="#3FB950">
+      <animate attributeName="opacity" values="1;1;0;0;1" keyTimes="0;0.5;0.5;0.9;1" dur="1.2s" repeatCount="indefinite"/>
+    </rect>
+  </g>
+</svg>

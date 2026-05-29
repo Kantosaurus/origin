@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Two-runtime launcher — control core + worker pool.
 //!
 //! The control core runs on its own named OS thread (`origin-ctrl`) and

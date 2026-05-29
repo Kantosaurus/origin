@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-keyvault` — cross-platform secret storage with a uniform async
 //! façade.
 //!

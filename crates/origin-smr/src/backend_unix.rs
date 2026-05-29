@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! POSIX shared-memory backend (Linux + macOS).
 //!
 //! Uses `shm_open` + `ftruncate` + `mmap`. Names are transformed to

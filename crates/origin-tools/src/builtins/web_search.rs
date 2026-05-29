@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `WebSearch` tool — Tavily-backed search.
 
 use crate::{SideEffects, Tier, Urgency};

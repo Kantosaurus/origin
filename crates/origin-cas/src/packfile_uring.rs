@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `tokio-uring`-backed pack-file read path.
 //!
 //! Index walk reuses the existing mmap-resident `PackReader::find(hash)` and

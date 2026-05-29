@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Linux-only — write a pack with the std writer and read entries back with
 //! the uring reader.
 

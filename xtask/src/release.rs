@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use std::fs;
 use std::path::Path;
 
@@ -12,7 +13,9 @@ pub fn stamp(version: &str, manifest: &Path, out_dir: &Path) -> anyhow::Result<(
     fs::create_dir_all(out_dir)?;
     for tmpl in [
         "homebrew/origin.rb",
-        "winget/manifests/origin.yaml",
+        "winget/manifests/Kantosaurus.origin.yaml",
+        "winget/manifests/Kantosaurus.origin.installer.yaml",
+        "winget/manifests/Kantosaurus.origin.locale.en-US.yaml",
         "aur/PKGBUILD",
     ] {
         let src = Path::new("packaging").join(format!("{tmpl}.tmpl"));

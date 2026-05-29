@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! In-process catalog of skills the daemon loaded from `~/.origin/skills/`.
 //!
 //! The daemon loads the catalog once at startup and holds it in an `Arc`

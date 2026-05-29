@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Goal driver — after every `run_loop` return, decide whether to verify,
 //! iterate, or clear the active goal. Per-connection.
 //!

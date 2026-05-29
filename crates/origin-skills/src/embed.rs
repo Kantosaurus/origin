@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Embed skill bodies into `origin_mem::MemIndex` with kind = `Skill`.
 //!
 //! N9.4 — bodies are content-addressed (skill body lives in CAS via `body_hash`);

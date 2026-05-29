@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_codegraph::index::EntityId;
 use origin_codegraph::query::Query;
 use origin_tools::builtins::graph_explain::graph_explain_tool;

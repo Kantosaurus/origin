@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The four prefix bands the `CachePlanner` sorts sections into.
 
 /// Ordering used when building the request.

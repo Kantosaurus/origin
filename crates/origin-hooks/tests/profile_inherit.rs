@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! P11.6 — `LifecycleEvent::PreTool` / `PostTool` carry the triggering
 //! tool's sandbox `ProfileOrdinal`. Hook scripts receive the ordinal in
 //! the event payload and can short-circuit when policy disagrees.

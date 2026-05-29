@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Grapheme-width LRU cache (N8.4).
 
 use lru::LruCache;

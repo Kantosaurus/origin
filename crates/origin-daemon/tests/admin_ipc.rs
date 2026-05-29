@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! P13.4.2 — IPC envelope additions for the admin surface:
 //! `ListSessions`, `RemoveSession`, `ResumeSession`, `GetUsage`,
 //! `KeyringAdd` / `KeyringList` / `KeyringRemove`, and the matching

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_mem::consolidator::Consolidator;
 use origin_mem::index::MemIndex;
 use origin_mem::quantizer::Quantizer;

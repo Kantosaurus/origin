@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! P11.5 — every `ToolMeta` carries a `sandbox_profile` ordinal. Builtins
 //! that exec untrusted binaries opt into stricter profiles.
 

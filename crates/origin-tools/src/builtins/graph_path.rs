@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `graph_path` — shortest-path query between two code entities.
 
 use origin_codegraph::index::{CodeGraphIndex, EntityId};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Status line: live token + cost accounting.
 //!
 //! Pricing is per-model, per-1M-tokens, from a small in-source lookup table.

@@ -6,7 +6,8 @@ get a pull request merged.
 
 By contributing, you agree that your contributions are licensed under the
 project's [Apache License 2.0](LICENSE) (inbound = outbound, per Apache-2.0 §5).
-There is **no CLA**.
+There is **no CLA**. All participants are expected to follow the
+[Code of Conduct](CODE_OF_CONDUCT.md).
 
 ---
 
@@ -66,13 +67,11 @@ benchmarks in `origin-bench` and call out any regression in the PR.
 ## How we work: brainstorm → plan → TDD → verify
 
 origin ships an opinionated baseline workflow (it's literally in the daemon's
-default system prompt — see [`docs/why-origin.md`](docs/why-origin.md)). We ask
-contributors to follow the same discipline:
+default system prompt). We ask contributors to follow the same discipline:
 
 1. **Brainstorm / clarify scope** before writing code, especially for features.
-2. **Write a plan** for multi-step work; non-trivial designs live in
-   [`docs/superpowers/plans/`](docs/superpowers/plans/) and specs in
-   [`docs/superpowers/specs/`](docs/superpowers/specs/).
+2. **Write a plan** for multi-step work; capture non-trivial designs and specs
+   in the pull request description or a linked tracking issue.
 3. **Test-driven development.** Write a failing test first, watch it fail for the
    right reason, then make it pass. Bug fixes **must** include a regression test
    that fails without the fix.

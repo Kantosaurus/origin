@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_tools::budget_writer::{approx_tokens, ResultWriter};
 use serde_json::json;
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Per-platform CPU/RAM cap helpers. Linux + macOS bodies use `setrlimit` via
 //! `pre_exec`; Windows quotas are attached via the Job Object in
 //! `backend_windows.rs`. Non-supported targets get a no-op so the crate still

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Seeded RNG hooked through the recorder.
 
 #![allow(clippy::module_name_repetitions)]

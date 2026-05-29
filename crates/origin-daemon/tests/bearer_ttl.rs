@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `bearer_ttl_secs` defaults to one day, but operators can tighten or
 //! extend remote-session lifetimes via `ORIGIN_BEARER_TTL_SECS`.
 

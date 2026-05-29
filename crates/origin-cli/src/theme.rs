@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Origin TUI color palette — "Burnished Copper" identity v2.
 //!
 //! Refined palette inspired by opencode's deep blacks and jcode's clean

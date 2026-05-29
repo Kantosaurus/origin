@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Spin a fake daemon on a temp socket, send 3 events + final reply,
 //! and assert the CLI's JSON-Lines stream matches a golden sequence.
 

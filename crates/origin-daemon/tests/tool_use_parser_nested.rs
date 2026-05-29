@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! When tool input JSON contains a string with `{` / `]` inside it, the
 //! current parser miscounts depth. Make it string-state aware.
 use origin_daemon::tool_use_parser::feed_for_test;

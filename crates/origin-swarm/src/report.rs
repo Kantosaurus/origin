@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `CompletionReport` — the structured handoff from a worker back to its
 //! coordinator (N7.5, P9.6).
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::panic)]
 
 use origin_core::types::{Block, Message, Role};

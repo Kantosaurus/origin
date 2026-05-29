@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_daemon::pairing::Pairing;
 use origin_daemon::protocol::{ClientMessage, StreamEvent};
 use std::time::Duration;

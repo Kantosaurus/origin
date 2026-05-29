@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Real macOS keychain integration test for the Phase 11 `list()` enumeration.
 //!
 //! Compiles + runs ONLY on macOS hosts (and CI macOS runners). The Phase 11

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! End-to-end: activating a skill via the protocol must mutate the
 //! per-connection registry, and the daemon must reply with `SkillActive`.
 

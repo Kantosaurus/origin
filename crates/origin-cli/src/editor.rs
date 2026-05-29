@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Cursor-aware input editor + per-session prompt history.
 //!
 //! This module owns the user's in-flight prompt text and the cursor

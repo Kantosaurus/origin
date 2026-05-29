@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Clone-strategy discriminant and host-preference detection.
 //!
 //! Strategy detection is deliberately coarse: we report the host's

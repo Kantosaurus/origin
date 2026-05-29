@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `GitHub Models` provider (non-streaming) — `OpenAI`-shape body with an
 //! OAuth bearer token sourced from [`origin_keyvault::KeyVault`] on every
 //! call.

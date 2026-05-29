@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Admin subcommand handlers (P13.4): `origin usage`, `origin sessions`,
 //! `origin keyring`.
 //!

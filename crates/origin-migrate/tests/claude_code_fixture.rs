@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_migrate::claude_code::ClaudeCodeSource;
 use origin_migrate::source::Source;
 use std::path::PathBuf;

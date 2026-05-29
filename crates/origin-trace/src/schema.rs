@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Arrow schema for a single span row.
 
 use std::sync::Arc;

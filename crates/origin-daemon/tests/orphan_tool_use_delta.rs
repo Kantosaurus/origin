@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Regression tests for the silent-drop bug in `drain_subscriber_into_response`:
 //! when a `ToolUseDelta` arrives for an index that was never `ToolUseStart`ed
 //! (e.g. because the start payload was malformed and warn-without-inserted),

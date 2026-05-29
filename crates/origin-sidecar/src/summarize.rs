@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Eager turn summarization (N2.5.a).
 
 use origin_core::types::{Block, Message};

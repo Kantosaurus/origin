@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Turn-end memory extraction. Scans assistant + user messages for patterns
 //! worth remembering and emits [`MemoryProposal`] candidates.
 //!

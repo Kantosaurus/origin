@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Walk a tree-sitter tree → `CodeNode` records.
 //!
 //! Edges land in P7.3; this module emits nodes only.

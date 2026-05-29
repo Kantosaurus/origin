@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Phase callbacks installed via [`CooperativeShutdown::on`] run in N8.10
 //! order, and a callback that observes its phase fires exactly once. Pairs
 //! with `shutdown_phases.rs` (which exercises the test-mode no-op driver).

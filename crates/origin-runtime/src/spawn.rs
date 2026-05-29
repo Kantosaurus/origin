@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `spawn_in(class, fut)` — the only sanctioned way to spawn an async task in
 //! `origin-daemon`. Every call acquires a per-class permit before polling the
 //! inner future.

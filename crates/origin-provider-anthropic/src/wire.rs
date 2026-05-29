@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Private wire JSON types for the Anthropic Messages API.
 //!
 //! The `Wire` prefix on every type is intentional: it disambiguates these

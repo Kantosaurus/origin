@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::panic)]
 use origin_cas::{Store, StoreConfig};
 use origin_mcp::cas_handoff::{cas_handoff_if_large, HandoffOutcome};

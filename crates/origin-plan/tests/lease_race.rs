@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Per-step lease-token tests for `origin-plan` (P9.2, N7.6 step 2).
 //!
 //! Lease tokens are CRDT-style ops with the same `(lamport, actor)` total

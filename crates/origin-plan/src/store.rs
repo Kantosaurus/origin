@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::module_name_repetitions)]
 //! `SQLite` + CAS persistence facade for the plan op-log (P9.3, N7.7).
 //!

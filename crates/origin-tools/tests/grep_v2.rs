@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![allow(
     clippy::unwrap_used,
     clippy::case_sensitive_file_extension_comparisons

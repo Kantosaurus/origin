@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! P9.8 — `Task` builtin tool: dispatch a worker, await `CompletionReport`,
 //! inline the actionable view.
 //!

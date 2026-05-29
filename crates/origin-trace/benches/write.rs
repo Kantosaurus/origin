@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `cargo bench -p origin-trace --bench write -- --quick`
 //!
 //! Threshold: > 100k spans / sec on a single thread, single core.

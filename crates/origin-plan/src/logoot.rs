@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // `LogootKey` is the canonical name in the Logoot literature; we keep the
 // repetition with the module name for discoverability rather than renaming.
 #![allow(clippy::module_name_repetitions)]

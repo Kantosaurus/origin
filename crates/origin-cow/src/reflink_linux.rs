@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Linux reflink driver — `FICLONE` ioctl.
 //!
 //! On Btrfs / XFS-cow / Bcachefs the `FICLONE` ioctl (`0x40049409`)

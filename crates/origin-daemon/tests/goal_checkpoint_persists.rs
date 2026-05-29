@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Integration test: goal-aware `ResumeToken` checkpoint round-trip.
 //!
 //! `drive_goal_loop` calls `make_goal_checkpoint_token` after every

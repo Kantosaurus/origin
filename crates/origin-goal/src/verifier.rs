@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Verifier trait + plain-text verdict parser.
 //!
 //! The concrete Anthropic-Haiku implementation lives in the daemon to keep

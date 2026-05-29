@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Post-init walkthrough: Toolbox → Skill Repository → port skills → Workflows.
 //!
 //! Runs after `init.rs` has saved `~/.origin/config.toml`. Each screen is a

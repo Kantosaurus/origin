@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_permission::prompt::Prompter;
 use origin_tools::{SandboxProfile, SideEffects, Tier, ToolMeta, Urgency};
 use origin_tui::{PanelEvent, PermissionOutcome, SidePanelPrompter};

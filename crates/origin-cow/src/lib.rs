@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Workspace copy-on-write clones with a platform-reflink fast path and a
 //! cross-platform eager-copy fallback.
 //!

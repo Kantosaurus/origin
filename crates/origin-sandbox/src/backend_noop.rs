@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! No-op backend; logs at `tracing::warn!` so operators spot accidental opt-out.
 
 use crate::{SandboxError, SandboxProfile};

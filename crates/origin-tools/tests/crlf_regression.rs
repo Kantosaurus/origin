@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Canary suite for the CRLF Edit failure class.
 
 #![allow(clippy::unwrap_used)]

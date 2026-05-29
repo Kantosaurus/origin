@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Typed lifecycle events + hook stdout override schema.
 //!
 //! Events serialize to JSON for hook stdin; hook stdout JSON is parsed back

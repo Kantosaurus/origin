@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Recall` — inflate a CAS handle into the message stream (N5.5).
 
 use origin_cas::{Hash, Store};

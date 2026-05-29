@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-smr` — Shared-Memory Ring (SPSC) for swarm fanout (N7.2).
 //!
 //! A single-producer / single-consumer byte ring backed by POSIX

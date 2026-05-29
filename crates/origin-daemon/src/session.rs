@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Session` — in-memory message log + metadata.
 //!
 //! Persistence (P1.12) wraps this with `SQLite` writes per turn.

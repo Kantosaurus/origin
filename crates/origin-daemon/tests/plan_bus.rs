@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `PlanBus` — daemon-wide broadcast of plan `OpEnvelope`s to subscribed
 //! IPC clients. The CLI's `plan_panel_wiring` is fed from this stream.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Migrate sessions/skills/memories from other harnesses into `origin`.
 //! See spec §11 Phase 14 — "Migration tools".
 

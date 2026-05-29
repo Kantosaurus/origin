@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_browser::detectors::{classify, Verdict};
 use origin_browser::protocol::SnapshotResp;
 

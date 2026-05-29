@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_tools::Tier;
 use origin_tui::panel::{Panel, PanelEvent, PermissionOutcome};
 

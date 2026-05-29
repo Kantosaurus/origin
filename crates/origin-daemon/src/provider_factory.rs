@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `ProviderFactory` — builds an [`Arc<dyn Provider>`] for a given
 //! [`ProviderId`] + account by reading the matching credential from a
 //! [`KeyVault`].

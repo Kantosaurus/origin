@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `OpenAI` provider — thin wrapper around `origin-provider-openai-compat`.
 
 /// Re-export of the shared OpenAI-shape SSE parser. Exposed so consumers

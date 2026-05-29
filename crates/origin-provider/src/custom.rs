@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Loads user-defined provider entries from a TOML file.
 
 use std::borrow::Cow;

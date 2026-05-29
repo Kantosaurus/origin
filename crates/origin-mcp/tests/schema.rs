@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! P11.8 — JSON-Schema validation for MCP `tools/call` arguments.
 
 use origin_mcp::schema::{SchemaCache, ValidationError};

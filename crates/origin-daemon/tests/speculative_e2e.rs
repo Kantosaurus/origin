@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_daemon::tool_use_parser::ToolUseParser;
 use origin_stream::{Ring, TokenEvent, TokenKind};
 use std::sync::atomic::{AtomicU32, Ordering};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! AWS Bedrock provider — `SigV4`-signed `InvokeModel` against an Anthropic-shape body.
 //!
 //! `POST {endpoint}/model/{model_id}/invoke` with the Anthropic

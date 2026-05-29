@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Structured tool error taxonomy.
 //!
 //! Every tool returns a [`ToolError`] instead of a free-form `String`; the

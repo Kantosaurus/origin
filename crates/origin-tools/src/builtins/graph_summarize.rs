@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `graph_summarize` — placeholder until Phase 5's sidecar lands.
 //!
 //! P7.8 returns [`QueryResult::Empty`] so the tool's registration is observable

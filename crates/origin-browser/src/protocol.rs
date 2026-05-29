@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Stdio-JSON verb protocol shared by `agent-browser` and `CloakBrowser` backends.
 //!
 //! Wire format: one JSON object per line in each direction.

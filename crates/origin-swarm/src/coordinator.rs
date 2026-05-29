@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Coordinator` — owns workers, dispatches them, awaits their reports
 //! (P9.6).
 //!

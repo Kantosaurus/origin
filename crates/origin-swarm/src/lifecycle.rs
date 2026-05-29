@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Per-worker `Lifecycle` state plus a `tokio::sync::watch` shim (P9.6).
 //!
 //! The coordinator publishes lifecycle transitions through the `Sender`; any

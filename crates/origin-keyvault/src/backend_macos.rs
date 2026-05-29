@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! macOS backend — wraps the Security framework's generic password APIs.
 //!
 //! Service name is namespaced as `origin/{provider}`; the account string

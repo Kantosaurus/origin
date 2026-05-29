@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Stable enumeration of per-component allocator arenas.
 
 /// Identifies a logical allocator arena. The backend (jemalloc or no-op) is

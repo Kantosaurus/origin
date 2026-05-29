@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_skills::{first_run_import, ImportDecision, ImportReport};
 use std::fs;
 use tempfile::tempdir;

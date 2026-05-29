@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Louvain (modularity-greedy) clustering with a Leiden-style refinement
 //! pass that splits disconnected communities, followed by flow-weighted
 //! `PageRank` per cluster (P7.5, N6.9).

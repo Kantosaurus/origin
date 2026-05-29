@@ -22,6 +22,11 @@ versions correspond to phase milestones from the implementation plan.
 - **CI hardening**: all GitHub Actions pinned to commit SHAs; least-privilege `permissions:`, `concurrency`, and `timeout-minutes` on every workflow; `--locked` builds/tests; docs site now deploys from `dev`. Added the `tool_use_parser` fuzz target to the nightly matrix.
 - **npm packages** now ship `LICENSE` (and `NOTICE` in the main package) per Apache-2.0 §4; the vendored CloakBrowser sidecar is pinned to an immutable commit and documents its third-party deps (`vendor/cloak-browser/THIRD_PARTY.md`).
 - **Docs**: the SDK guide's "Minimal Rust client" now reflects the real `origin-ipc` frame API instead of an unimplemented facade.
+- **SPDX headers** added to all first-party `.rs` files; `REUSE.toml` + `LICENSES/Apache-2.0.txt` for REUSE compliance.
+- **Community/security**: `GOVERNANCE.md`, `ROADMAP.md`, `SUPPORT.md`, an OpenSSF Scorecard workflow, Codecov upload, and an SBOM step on release; committed fuzz seed corpora for all six targets; winget manifests split into version/installer/locale.
+
+### Removed
+- Internal `docs/superpowers/` planning and spec docs, and `docs/why-origin.md`, are no longer published in the repository; references to them were removed.
 
 ## 1.0.0 — 2026-06-17
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Goal-aware [`ResumeToken`] checkpoint writer.
 //!
 //! TODO(P14): `cas_handle_root`, `pending_tool_calls`, and `plan_seq` are

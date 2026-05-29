@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Glob` v2 — gitignore-aware, mtime-sorted, head-limited.
 
 use crate::error::{ErrClass, ToolError};

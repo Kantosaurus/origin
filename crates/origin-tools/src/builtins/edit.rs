@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Edit` v2 — find-and-replace with CRLF safety, hunk return, `replace_all`.
 
 use crate::error::{ErrClass, ToolError};

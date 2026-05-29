@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Manpage generation via `clap_mangen` (P14.D.4).
 //!
 //! Renders `origin.1` plus one `<sub>.1` per registered subcommand into the

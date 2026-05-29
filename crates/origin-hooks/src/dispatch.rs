@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! End-to-end dispatch: emit a [`LifecycleEvent`] JSON line to a hook script
 //! via [`ShellPool::dispatch`], then parse stdout back into a [`HookOverride`].
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Internal `Backend` trait shared by every per-OS implementation.
 //!
 //! Implementations are crate-private. The public surface is the

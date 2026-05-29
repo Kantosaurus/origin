@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! End-to-end test for the Phase 11 Windows ReFS reflink path.
 //!
 //! Compiles only on Windows. **Runs** only when `ORIGIN_REFS_TEST_DIR` is

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `MS_PER_DAY` is exported as a crate-public constant so daemon/admin
 //! code can reference the same value `Consolidator`/`Injector` use for
 //! age-based scoring.

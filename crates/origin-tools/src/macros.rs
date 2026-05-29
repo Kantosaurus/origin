@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin_tool!` macro — registers a tool's metadata into the inventory.
 
 #[macro_export]

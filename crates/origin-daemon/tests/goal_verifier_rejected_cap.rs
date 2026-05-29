@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bug #15 integration: after MAX_CONSECUTIVE_VERIFIER_REJECTIONS the
 //! driver gives up and emits Cleared { VerifierRejected(..) }. Without
 //! this cap a bogus main model that keeps claiming `met` against a

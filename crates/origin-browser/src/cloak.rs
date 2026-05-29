@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Subprocess client for the vendored `CloakBrowser` sidecar.
 //!
 //! Resolves the sidecar via `ORIGIN_CLOAK_DIR` env var, or falls back to

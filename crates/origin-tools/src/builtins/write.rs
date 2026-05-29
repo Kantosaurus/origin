@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Write` v2 — atomic write, read-before-write guard, EOL preservation.
 
 use std::collections::HashSet;

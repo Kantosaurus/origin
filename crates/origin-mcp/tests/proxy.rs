@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_mcp::{McpClient, McpToolProxy, SchemaCache, Transport, TransportError};
 use origin_tools::{DynTool, SandboxProfile, SideEffects, Tier, ToolMeta, Urgency};
 use serde_json::{json, Value};

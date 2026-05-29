@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-daemon` library entry — exposes session/agent/protocol modules for
 //! the binary and for integration tests.
 

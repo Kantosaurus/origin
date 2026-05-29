@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Static catalog of supported LLM providers.
 
 use std::borrow::Cow;

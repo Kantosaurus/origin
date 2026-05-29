@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! SQLite-backed session persistence (inline blobs for P1; CAS handles arrive in P2).
 
 use std::path::{Path, PathBuf};

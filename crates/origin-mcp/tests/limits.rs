@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_mcp::limits::{enforce_cap, MAX_RESPONSE_BYTES};
 use origin_mcp::TransportError;
 

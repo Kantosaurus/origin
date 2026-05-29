@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_provider_anthropic::streaming::parse_into_ring;
 use origin_stream::{Ring, TokenKind};
 use std::path::PathBuf;

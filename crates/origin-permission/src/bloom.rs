@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Small growable bloom over the rule set (N9.2).
 //!
 //! Used as a pre-check before the rule walk: if the bloom says "absent" we

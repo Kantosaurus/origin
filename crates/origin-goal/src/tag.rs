@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Parse `<goal-status>` tags emitted by the main model.
 //!
 //! Tolerant by design: case-insensitive `state=`, whitespace allowed

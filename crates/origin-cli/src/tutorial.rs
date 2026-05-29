@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin --tutorial` — a 7-step guided tour of origin's core surfaces.
 //!
 //! The data table ([`steps`]) is decoupled from the runner ([`run`]) so the

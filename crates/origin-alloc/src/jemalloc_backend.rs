@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! jemalloc backend — one MALLCTL arena per `ArenaId`. Created lazily on first
 //! use; reset / destroy operate on the backing jemalloc arena.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! HNSW approximate-nearest-neighbour index with temporal-decay re-ranking.
 //!
 //! Wraps [`hnsw_rs::hnsw::Hnsw`] with a `DistDot` metric (returns `1 - dot`

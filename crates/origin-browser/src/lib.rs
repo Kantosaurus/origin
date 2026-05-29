@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-browser`: dual-backend browser routing + `WebFetch` + `WebSearch`.
 //!
 //! Public surface is the three top-level entry points:

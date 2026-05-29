@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_tui::damage::{diff, Run};
 use origin_tui::{Cell, Grid};
 

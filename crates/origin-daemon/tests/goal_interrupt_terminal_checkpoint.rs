@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bug #17 integration: when the outer-loop Interrupt arm clears a goal,
 //! it must write a terminal-status checkpoint so a crash between
 //! cancellation and the next user Prompt cannot resurrect the killed

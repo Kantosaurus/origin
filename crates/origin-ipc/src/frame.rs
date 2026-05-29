@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use bytes::{BufMut, BytesMut};
 use thiserror::Error;
 

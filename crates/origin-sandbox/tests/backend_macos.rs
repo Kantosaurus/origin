@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![cfg(all(target_os = "macos", feature = "macos", not(feature = "no-sandbox")))]
 
 use origin_sandbox::{apply, SandboxProfile};

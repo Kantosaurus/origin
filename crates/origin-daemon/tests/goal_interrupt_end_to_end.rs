@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! End-to-end check for the `ClientMessage::Interrupt` variant landed in
 //! commit 1aa2f62: when a user interrupt arrives mid-iteration, the
 //! driver clears the active goal with `GoalCleared { UserSlash }` on the

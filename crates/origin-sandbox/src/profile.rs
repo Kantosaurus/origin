@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Sandbox profile enum + stable wire ordinals.
 //!
 //! Ordinals are part of the public ABI: they are carried on

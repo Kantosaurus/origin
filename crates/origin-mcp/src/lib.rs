@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-mcp` — Model Context Protocol client. Phase 10 ships JSON-RPC +
 //! stdio + HTTP/SSE transports + tool registry integration + OAuth.
 

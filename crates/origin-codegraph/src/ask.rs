@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Sub-millisecond classifier + `MemRouter` trait (Phase 6 will implement).
 //!
 //! The router is intentionally lexical-only: zero LLM hops, two precompiled

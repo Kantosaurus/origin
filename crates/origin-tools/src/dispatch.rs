@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Shared dispatch + per-session memoization (N5.4) and memory-tool support types.
 //!
 //! - `Cache` / `NormalizedInput` / `CacheHit`: the agent looks up

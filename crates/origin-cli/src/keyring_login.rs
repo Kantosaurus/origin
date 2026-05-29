@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin keyring login <provider> [account]` — drives OAuth flows from the
 //! builtin provider catalog.
 //!

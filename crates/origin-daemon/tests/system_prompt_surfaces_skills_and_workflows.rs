@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Regression: the agent's system prompt must surface enough doctrine for
 //! the model to answer "what skills do you have?" and "what workflows do
 //! you have?" without hallucinating.

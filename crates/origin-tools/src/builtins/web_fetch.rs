@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `WebFetch` tool — GET a URL and return reader-mode markdown.
 
 use crate::{SideEffects, Tier, Urgency};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::module_name_repetitions)]
 
 //! `PrefixLedger` — per-section stability scoring.

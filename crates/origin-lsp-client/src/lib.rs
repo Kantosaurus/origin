@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Minimal stdio JSON-RPC client for Language Servers.
 //!
 //! Implements only the subset needed by `Diagnostics`:

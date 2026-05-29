@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Wrap an `origin-provider` HTTP layer so every request and streamed chunk
 //! is fed into a Recorder; in replay mode the same layer serves chunks from
 //! a Bundle instead of the network.

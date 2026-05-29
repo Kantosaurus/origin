@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Context injection: embed a user prompt, search the memory index, and format
 //! matching memories into a `<context>` block for the system-prompt Sticky band.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_cas::{dict, Store, StoreConfig};
 use std::sync::Arc;
 use tempfile::tempdir;

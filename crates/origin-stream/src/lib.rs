@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-stream` — single-producer multi-consumer byte ring.
 //!
 //! Mechanism N2.1: one append-only `Bytes` buffer + an atomic write cursor;

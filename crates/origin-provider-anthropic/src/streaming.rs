@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! SSE → `TokenEvent` adapter.
 //!
 //! Reads an Anthropic `text/event-stream` body byte stream and writes

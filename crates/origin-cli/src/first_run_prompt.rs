@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! First-run pending-prompt seed.
 //!
 //! `origin init`'s post-config walkthrough writes a markdown prompt to

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::module_name_repetitions)]
 //! Per-step lease tokens (P9.2, N7.6 step 2).
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Round-trip tests for the SPSC shared-memory ring.
 //!
 //! Per Phase 9 plan P9.4: one event in, one event out; alternating

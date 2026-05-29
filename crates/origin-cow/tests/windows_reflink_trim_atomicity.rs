@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Regression test for the Windows reflink trim race.
 //!
 //! Before the fix, `clone_one_file` opened the destination at its final

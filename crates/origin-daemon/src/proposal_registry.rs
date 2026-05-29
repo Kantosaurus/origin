@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Daemon-wide registry of pending memory proposals.
 //!
 //! [`StreamEvent::MemoryProposed`](crate::protocol::StreamEvent::MemoryProposed)

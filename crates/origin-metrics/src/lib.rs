@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bounded-cardinality counters + Prometheus text encoder.
 //!
 //! This crate provides a small, allocation-light wrapper around the

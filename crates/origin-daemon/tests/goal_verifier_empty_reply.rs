@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bug #3 integration: an empty/malformed Haiku reply must NOT silently
 //! confirm the goal as Met. The driver should treat malformed output as
 //! a retry (NotMet { unparseable }) instead of fail-open.

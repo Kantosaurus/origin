@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Thin re-export of [`origin_resume_token::ResumeToken`] for ergonomic
 //! `origin_supervisor::resume_token::ResumeToken` paths.
 //!

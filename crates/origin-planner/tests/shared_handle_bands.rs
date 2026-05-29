@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Phase 11 N4.3 sharing contract: a `Plan` clone shares its handle→band
 //! map with the original. This is the foundation that lets the daemon's
 //! tool-result dispatch path register handles that the provider's wire

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Walks the workspace AST, flags any `#[derive(Debug)]` struct whose field
 //! name matches `(?i)(key|token|password|auth|secret|credential)` unless the
 //! field type contains `Secret<…>` or the field has a `#[redact]` attribute.

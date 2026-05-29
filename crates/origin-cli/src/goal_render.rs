@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Rendering of `StreamEvent::Goal*` variants into the TUI scrollback.
 //!
 //! Bug #4: the CLI's `call_daemon` event loop had no arms for `GoalActive`,

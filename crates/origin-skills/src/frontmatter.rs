@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Parse the YAML frontmatter at the head of a `SKILL.md`.
 
 use serde::Deserialize;

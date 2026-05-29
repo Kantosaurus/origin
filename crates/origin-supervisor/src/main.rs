@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-supervisor` — restarts `origin-daemon` on crash; coordinates session
 //! resume tokens across the restart.
 

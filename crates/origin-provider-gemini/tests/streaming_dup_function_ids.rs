@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Verifies that two `functionCall` parts with the same `name` in one Gemini
 //! response receive distinct synthesized IDs. Prior to the fix, both calls
 //! would surface as `call_<name>`, collapsing them in the daemon's per-id

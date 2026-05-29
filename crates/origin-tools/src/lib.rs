@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Tool registry + macros + builtin tools.
 
 /// Default per-tool token budget for serialised results. Tools may override

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use origin_core::types::{Block, Message, Role};
 use origin_daemon::compactor::{compact, CompactionInput, DEFAULT_SOFT_CAP_BYTES};

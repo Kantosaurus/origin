@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `StreamWidget` — reads `TokenEvent` payloads and lays graphemes into a Grid (N8.3).
 
 use crate::grid::{Cell, Grid};

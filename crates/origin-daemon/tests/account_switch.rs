@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! P8.9 — `ProviderFactory` builds the right provider for each
 //! `ProviderId`, and the `ClientMessage`/`StreamEvent::ProviderActive`
 //! protocol additions round-trip through JSON cleanly.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Lint: ban `tokio::spawn` / `tokio::task::spawn` / `tokio::task::spawn_blocking`
 //! outside the sanctioned `origin-runtime::spawn_in` site (+ allowlist).
 

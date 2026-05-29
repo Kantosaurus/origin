@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bug #7 contract test: when a goal is restored already at-or-past the
 //! cap and the user sends a fresh Prompt, the daemon's `drive_goal_loop`
 //! must (a) emit `GoalCleared { MaxIter }` AND (b) still let the user's

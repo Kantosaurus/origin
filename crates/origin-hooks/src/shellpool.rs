@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Pre-spawned shell pool. Each pool member is a long-lived
 //! `tokio::process::Child` with piped stdin + stdout. Dispatch writes a
 //! script to stdin and reads until the configured terminator byte on stdout.

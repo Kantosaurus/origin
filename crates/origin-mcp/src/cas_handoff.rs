@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! CAS hand-off for large MCP tool results.
 //!
 //! Results above the threshold are stored as a single CAS entry; the proxy then

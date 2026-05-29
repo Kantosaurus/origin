@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-plan` — CRDT op log + fold for the shared swarm plan (Phase 9.1).
 //!
 //! ## Surface

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-supervisor` library surface — exposes the resume-token replay
 //! helpers so the supervisor binary and integration tests can share them
 //! without duplicating the wire format.

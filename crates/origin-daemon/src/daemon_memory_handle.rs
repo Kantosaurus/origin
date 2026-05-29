@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `DaemonMemoryHandle` — re-exports the daemon's concrete [`MemoryHandle`].
 //!
 //! Implementation so callers can refer to it by the canonical name expected by

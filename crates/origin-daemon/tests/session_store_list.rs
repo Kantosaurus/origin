@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_daemon::session::Session;
 use origin_daemon::session_store::SessionStore;
 use tempfile::TempDir;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Task` builtin — dispatch a sub-agent worker via `origin-swarm`,
 //! await its [`CompletionReport`](origin_swarm::CompletionReport), and inline
 //! the actionable view (P9.8, N7.5).

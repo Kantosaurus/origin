@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! SPSC byte ring + rkyv framing.
 //!
 //! Frame layout: `[u32 little-endian length][rkyv bytes]`. The 4-byte

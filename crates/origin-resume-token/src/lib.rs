@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Leaf crate carrying the cross-process [`ResumeToken`] shape.
 //!
 //! Both `origin-daemon` (writer) and `origin-supervisor` (replayer) depend

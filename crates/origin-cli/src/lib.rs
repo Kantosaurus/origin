@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-cli` library entry — exposes input/screen/tui modules for the
 //! binary and for unit tests.
 

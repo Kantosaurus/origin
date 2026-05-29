@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use async_trait::async_trait;
 use origin_cas::{Hash, Store, StoreConfig};
 use origin_core::types::{Message, Role};

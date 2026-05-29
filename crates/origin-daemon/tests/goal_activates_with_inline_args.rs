@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Integration test T11: `/goal <args>` parser + initial `GoalState`
 //! together produce the right activation payload.
 //!

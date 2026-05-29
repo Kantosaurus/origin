@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Verify that `Critical` and `Realtime` futures execute on differently-named
 //! OS threads — control-core futures land on `origin-ctrl`, worker-pool
 //! futures land on tokio's default `tokio-runtime-worker-N` (or our named

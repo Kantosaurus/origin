@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Pluggable bearer-token source for the OpenAI-compat client.
 //!
 //! Synchronous API-key lookups use `StaticBearer` / `StaticHeader`; OAuth

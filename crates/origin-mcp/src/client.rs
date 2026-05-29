@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `McpClient` — handshake, `list_tools`, `call_tool`.
 
 use crate::jsonrpc::{JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse};

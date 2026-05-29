@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `SidePanelPrompter` — implements `origin_permission::prompt::Prompter` by
 //! routing permission asks through the side-panel event queue.
 

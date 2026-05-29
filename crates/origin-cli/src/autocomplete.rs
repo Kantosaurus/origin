@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Pure Tab-completion logic for the TUI input buffer.
 //!
 //! Detects the shape of the partial token in the buffer and rewrites the

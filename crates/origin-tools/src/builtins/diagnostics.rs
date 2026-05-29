@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Diagnostics` — query LSP diagnostics from the warm rust-analyzer.
 //!
 //! Requires a `DiagnosticsHandle` provided by the daemon (see `ra_impl.rs`).

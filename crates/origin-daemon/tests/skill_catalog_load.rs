@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Integration test: `SkillCatalog` loads from a real directory layout.
 
 use origin_daemon::skill_catalog::SkillCatalog;

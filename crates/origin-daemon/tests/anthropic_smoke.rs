@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Live smoke test against Anthropic. Skipped unless `ANTHROPIC_API_KEY` is set.
 
 use origin_core::types::{Block, Message, Role};

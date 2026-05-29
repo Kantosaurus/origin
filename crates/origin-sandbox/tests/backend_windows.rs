@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! P11.4 — Windows backend (AppContainer + restricted Job Object).
 //!
 //! On Windows the CPU/RAM cap layer must run *after* `CreateProcess`. The

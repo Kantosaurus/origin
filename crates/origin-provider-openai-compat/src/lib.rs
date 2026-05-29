@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Generic `OpenAI` Chat-Completions wire client.
 //!
 //! Parameterised over base URL, chat path, auth header, and extra headers so

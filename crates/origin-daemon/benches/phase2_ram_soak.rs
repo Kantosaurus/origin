@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Soak bench: synthesise a 1000-message session using a fake provider, all
 //! tool outputs land in CAS, the ring is reused. Assert peak RSS stays under
 //! 200 MiB above baseline (process RSS minus mmap pack-file pages we don't

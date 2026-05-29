@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Windows child-launch — child wrapped in a Job Object so the supervisor's
 //! own exit terminates the daemon (full Job-object association deferred to a
 //! follow-up; P12 ships the restart-on-exit loop).

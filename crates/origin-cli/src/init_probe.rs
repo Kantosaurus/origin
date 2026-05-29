@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Connectivity probe used by `origin init` after credentials are captured.
 //!
 //! The probe doubles as both an auth-works check and a model-list discovery:

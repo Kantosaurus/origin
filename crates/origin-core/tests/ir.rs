@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_core::ir::{CacheKind, ProviderCaps};
 
 #[allow(clippy::assertions_on_constants)]

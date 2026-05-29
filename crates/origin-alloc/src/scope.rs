@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! RAII guard that pins the current thread to an `ArenaId` for the duration of
 //! a closure. Re-entrant: nested scopes restore the previous binding on drop.
 

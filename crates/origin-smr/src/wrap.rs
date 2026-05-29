@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Wrap-around byte copy helpers for the ring's payload region.
 //!
 //! Factored out of `ring.rs` so the framing logic there stays under

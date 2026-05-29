@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Lamport-clock primitives used to totally order op-log events.
 //!
 //! A [`Lamport`] is a monotonic 64-bit logical timestamp. An [`ActorId`] is the

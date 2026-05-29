@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! P11.11 — `origin trace query` subcommand.
 //!
 //! Wraps `origin_trace::query::run` with a clap-derived arg struct and a

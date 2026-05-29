@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Pairing state machine for P13 remote-IPC bring-up.
 //!
 //! The daemon generates short-lived 6-digit numeric codes that a remote

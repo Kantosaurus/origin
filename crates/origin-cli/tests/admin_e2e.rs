@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! P13.4.4 — end-to-end smoke for the `origin sessions ls` admin path
 //! against a stand-in daemon. The fake daemon binds the same
 //! local-socket transport the real daemon uses, accepts the

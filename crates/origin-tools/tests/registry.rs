@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_tools::{registry_iter, SideEffects, Tier, ToolMeta, Urgency};
 
 // Register a tiny test tool using the macro.

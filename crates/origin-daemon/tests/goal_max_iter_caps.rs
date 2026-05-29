@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Integration test T13: when the model never reports `met`, the driver
 //! must stop at exactly `max_iter` provider calls and emit `GoalCleared {
 //! MaxIter }`.

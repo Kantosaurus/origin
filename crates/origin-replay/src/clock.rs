@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Virtual clock — replay mode reads timestamps from a recorded stream so
 //! `now()` is byte-deterministic.
 

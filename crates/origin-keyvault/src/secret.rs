@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Secret<T>` — a guard wrapper that zeroizes on drop and redacts in `Debug`.
 //!
 //! `Secret` is intentionally minimal:

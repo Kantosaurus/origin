@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `MultiEdit` — apply a list of edit operations to one file, atomically.
 
 use crate::error::{ErrClass, ToolError};

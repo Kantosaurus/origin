@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `TokenEvent` — rkyv-archived discriminated record.
 //!
 //! Per spec N4.4 the ring stores rkyv-archived `TokenEvent` records so the

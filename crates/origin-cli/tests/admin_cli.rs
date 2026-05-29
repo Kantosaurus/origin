@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! P13.4.3 — `origin sessions`, `origin usage`, `origin keyring` are
 //! reachable from the binary and surface clap-style `--help` output.
 

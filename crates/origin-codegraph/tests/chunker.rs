@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_codegraph::{chunker, Language};
 
 /// Generate a synthetic Rust file with `n` simple functions named `fn_0`, `fn_1`, ...

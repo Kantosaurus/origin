@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Emit `cursor-position + SGR + glyph` byte sequences for a damage-run set.
 
 use crate::damage::Run;

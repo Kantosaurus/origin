@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
 use sha2::{Digest, Sha256};
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Materialised plan state — the result of folding the op log.
 //!
 //! [`Plan`] is the post-fold view: a flat map of [`StepId`] → [`Step`] plus a

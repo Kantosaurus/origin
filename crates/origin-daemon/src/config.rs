@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Daemon-wide configuration knobs sourced from env vars.
 //!
 //! Each accessor here is a small free function so it can be unit-tested

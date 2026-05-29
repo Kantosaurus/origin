@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Fully-automatic GitHub-release auto-updater for the `origin` binary.
 //!
 //! Every invocation of the CLI:

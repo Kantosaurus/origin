@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-sandbox` — per-tool sandbox profiles for Linux, macOS, and Windows.
 //!
 //! The crate exposes a single [`apply`] entry point that mutates a

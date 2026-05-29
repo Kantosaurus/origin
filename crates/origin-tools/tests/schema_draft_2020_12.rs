@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Guard against pre-draft-2020-12 forms in any registered tool's
 //! `input_schema`. The Anthropic API rejects tool schemas that don't match
 //! draft 2020-12, and the most common offender is the legacy `items: [...]`

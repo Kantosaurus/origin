@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Sidecar` trait + reference implementations (P7.4, N6.8).
 //!
 //! Phase 5 will ship a real LLM-backed sidecar. P7.4 only defines the

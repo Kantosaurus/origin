@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Minimal `post-commit` hook installer.
 //!
 //! P10 will generalize hooks; P7.8 installs a one-shot script that calls the

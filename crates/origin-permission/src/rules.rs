@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! User-configured permission rules (P10.12).
 
 #[derive(Debug, Clone)]

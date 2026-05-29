@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Sidecar runtime: bounded mpsc queue + N worker tasks (N2.5).
 
 use std::sync::Arc;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Gemini provider (non-streaming + SSE streaming).
 //!
 //! Implements `origin_provider::Provider` against Google's Generative Language

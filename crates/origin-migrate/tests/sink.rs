@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_migrate::sink::apply_with_store;
 use origin_migrate::source::{ImportedMessage, ImportedSession, ImportedSkill, MigrateBundle};
 use origin_store::Store;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Plan side-panel widget tests (P9.9).
 //!
 //! Asserts:

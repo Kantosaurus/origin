@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! CAS-backed code-graph index (P7.3, N6.7).
 //!
 //! Nodes and edges live as small `SQLite` rows that point at CAS-stored

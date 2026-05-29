@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Shared `OpenAI`-shape tool-call mapping.
 //!
 //! Several providers (`OpenAI` itself, plus `OpenAI`-compatible gateways) emit

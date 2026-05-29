@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Static catalog rows — one per supported provider.
 
 use crate::catalog::{AuthScheme, Capabilities, OAuthSpec, ProviderEntry, WireFormat};

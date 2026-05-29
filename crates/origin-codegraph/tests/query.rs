@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Integration tests for the typed query DSL (P7.6 N6.10).
 
 #![allow(clippy::panic)] // test-only: unexpected variant signals a bug

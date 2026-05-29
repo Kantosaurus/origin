@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_cas::{Store, StoreConfig};
 use origin_core::types::{Block, Message, Role};
 use origin_planner::{Band, CachePlanner, PrefixLedger, Section, SectionId};

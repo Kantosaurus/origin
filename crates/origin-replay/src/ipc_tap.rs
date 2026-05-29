@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Tap point for IPC frames. The daemon/client wire reader+writer call
 //! `inbound`/`outbound` after a frame is fully assembled, so the recorder
 //! sees byte-identical wire payloads.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Op-log → [`Plan`] fold (P9.1).
 //!
 //! `fold` is the canonical CRDT projection. It is **commutative under

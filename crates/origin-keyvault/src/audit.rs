@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `KeyVault` audit log: 30-day rotating ring, 8 MiB pages, JSON-Lines on disk.
 //!
 //! Records **what** key was touched (provider + account + action + timestamp),

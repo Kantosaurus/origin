@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin providers …` subcommand handlers.
 
 use origin_provider::catalog::{AuthScheme, Catalog};

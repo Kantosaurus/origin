@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Deterministic record-and-replay for `origin` sessions.
 //!
 //! See spec §10C N10.7-N10.8.

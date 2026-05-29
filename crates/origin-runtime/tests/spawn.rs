@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `spawn_in` returns a `JoinHandle` whose future executes; each class is
 //! tracked by a distinct semaphore.
 

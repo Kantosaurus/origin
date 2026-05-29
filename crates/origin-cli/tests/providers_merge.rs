@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Regression coverage for the bug fixed in 1b49d96:
 //! `origin providers ls` and `origin providers describe` must merge entries
 //! from `~/.origin/providers.toml` on top of the builtin catalog, just like

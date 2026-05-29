@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Monitor` tool — tail a supervisor process's output by byte offset.
 
 use std::time::Duration;

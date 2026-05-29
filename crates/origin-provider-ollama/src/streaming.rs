@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Ollama NDJSON → `TokenEvent` adapter.
 //!
 //! Consumes the shared `origin_provider::ndjson::from_reqwest` line stream and

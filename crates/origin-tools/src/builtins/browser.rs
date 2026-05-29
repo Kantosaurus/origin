@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Browser` tool — dual-backend browser with transparent agent-detection fallback.
 
 use crate::{SideEffects, Tier, Urgency};

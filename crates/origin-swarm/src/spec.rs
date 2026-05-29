@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Worker specifications, budgets, and small structured records (P9.6).
 //!
 //! These types are the input/output shapes the coordinator uses when launching

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Trait the envelope passes into the `Diagnostics` tool. Implemented daemon-side
 //! by `origin-daemon::ra_impl::DaemonRa` (wraps `origin-lsp-client::LspClient`).
 //!

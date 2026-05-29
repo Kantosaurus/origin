@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-codegraph` — native code knowledge graph (Phase 7).
 //!
 //! Modules land per-task across P7.1–P7.8; this lib.rs collects them.

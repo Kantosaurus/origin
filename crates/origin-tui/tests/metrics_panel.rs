@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_metrics::Metrics;
 use origin_tui::widgets::metrics::MetricsWidget;
 use origin_tui::{Panel, PanelEvent, PanelState};

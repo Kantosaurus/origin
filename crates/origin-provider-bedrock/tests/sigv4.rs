@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_core::types::{Block, Message, Role};
 use origin_provider::{ChatRequest, Provider};
 use origin_provider_bedrock::Bedrock;

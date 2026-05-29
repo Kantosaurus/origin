@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! HTTP POST + (optional) SSE event-stream transport.
 //!
 //! - Synchronous request/response: POST `<base>` with JSON body, parse the JSON

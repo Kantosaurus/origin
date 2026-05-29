@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Shared harness for goal-driver integration tests (T12-T16, plus the
 //! Phase-9 follow-up suite added on top).
 //!

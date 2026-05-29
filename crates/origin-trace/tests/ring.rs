@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::needless_collect)]
 
 use origin_trace::{Ring, SpanRow};

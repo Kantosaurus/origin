@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! macOS reflink driver — `clonefile(2)`.
 //!
 //! APFS supports cheap copy-on-write clones via the `clonefile` syscall.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-mem` — conversation memory: ONNX `MiniLM` embeddings + int8 quantization
 //! + HNSW + temporal-decay re-rank, with bodies in CAS and edges in `SQLite`.
 

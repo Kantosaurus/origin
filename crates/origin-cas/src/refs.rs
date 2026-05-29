@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Refcount table for CAS shards.
 //!
 //! The actual SQLite schema lives in `origin-store` migrations (V2). This

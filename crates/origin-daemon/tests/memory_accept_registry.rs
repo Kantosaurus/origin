@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `MemoryDecision::Accept` resolves through the daemon-wide
 //! [`ProposalRegistry`] (P6.7 follow-up — closes the "Accept-without-body"
 //! gap that previously forced the wire shape to use `Edit { body, tags }`).

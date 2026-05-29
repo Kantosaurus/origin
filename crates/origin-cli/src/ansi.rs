@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! ANSI escape helpers for pre-TUI terminal output (onboarding, init).
 //!
 //! These use the same RGB values as `theme.rs` so the onboarding screens

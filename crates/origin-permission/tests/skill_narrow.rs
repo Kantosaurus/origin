@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_permission::{check_with_skills, prompt::AlwaysAllow, Outcome};
 use origin_skills::SkillRegistry;
 use origin_tools::{SandboxProfile, SideEffects, Tier, ToolMeta, Urgency};

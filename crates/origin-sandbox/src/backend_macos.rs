@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! macOS backend: `sandbox-exec` profile.
 //!
 //! Renders an SBPL profile string per profile variant and re-points the

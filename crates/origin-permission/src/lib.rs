@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Permission engine: tier-based check with a pluggable `Prompter`.
 //!
 //! `AutoAllowed` tools bypass the prompter; `RequiresPermission` tools ask.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Transport abstraction. Stdio + HTTP/SSE both implement this.
 
 use async_trait::async_trait;

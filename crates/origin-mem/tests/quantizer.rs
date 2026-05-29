@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_mem::quantizer::{Quantizer, NUM_CENTROIDS};
 use origin_mem::EMBED_DIM;
 use rand::Rng;

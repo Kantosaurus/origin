@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Walk `~/.origin/skills/<name>/SKILL.md`, parse each, hash the body.
 
 use crate::frontmatter::{parse_frontmatter, FrontmatterError, ParsedSkill};

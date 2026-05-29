@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Typed query DSL — no NL, no in-tool LLM hop (P7.6 N6.10).
 //!
 //! Callers compose a [`Query`] enum value and hand it to [`dispatch`]; the

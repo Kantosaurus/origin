@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::single_char_pattern)] // test asserts use exact `"$"` from the P2.11 spec
 
 use origin_cli::status::{render_line, UsageSnapshot};

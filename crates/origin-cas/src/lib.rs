@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `origin-cas` — content-addressed store.
 //!
 //! Phase 2 deliverables: Hash, FastCDC chunker, mmap pack files, three-tier

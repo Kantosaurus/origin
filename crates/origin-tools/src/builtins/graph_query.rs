@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `graph_query` — typed code-graph query, dispatched against the live index.
 
 use origin_codegraph::index::CodeGraphIndex;

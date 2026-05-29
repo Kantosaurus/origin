@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_cas::{Store, StoreConfig};
 use origin_codegraph::rebuild::rebuild_paths;
 use origin_codegraph::Language;

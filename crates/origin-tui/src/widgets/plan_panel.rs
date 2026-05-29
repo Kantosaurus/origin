@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Plan side panel (P9.9).
 //!
 //! `PlanPanel` is a pure-data widget: it owns an in-memory `Vec<OpEnvelope>`,

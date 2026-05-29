@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `graph_rebuild` — rebuild the code graph over a path set (mutating).
 
 use std::path::PathBuf;

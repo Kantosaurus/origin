@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Recorder trait: every non-deterministic boundary writes one frame per event.
 
 #![allow(clippy::module_name_repetitions)]

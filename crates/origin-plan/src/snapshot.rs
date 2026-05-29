@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Snapshot compaction primitives (P9.3, N7.7).
 //!
 //! A [`Snapshot`] is the persistence-layer fast-forward record for a swarm

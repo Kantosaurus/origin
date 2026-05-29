@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Frame coalescing scheduler (N8.2).
 
 use std::sync::atomic::{AtomicBool, Ordering};

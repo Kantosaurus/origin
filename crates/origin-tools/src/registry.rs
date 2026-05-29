@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Compile-time tool registry backed by the `inventory` crate.
 //!
 //! Each `origin_tool!` invocation submits a `ToolMeta` into the inventory.

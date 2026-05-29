@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 use origin_migrate::jcode::JcodeSource;
 use origin_migrate::source::Source;
 use rusqlite::Connection;
