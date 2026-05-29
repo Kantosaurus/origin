@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 origin-core = { path = "../origin-core" }
 origin-stream = { path = "../origin-stream" }
+origin-cas = { path = "../origin-cas" }
 origin-replay = { path = "../origin-replay", optional = true }
 async-stream = "0.3"
 async-trait = "0.1"

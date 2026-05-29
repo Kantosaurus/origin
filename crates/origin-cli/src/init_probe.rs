@@ -313,7 +313,14 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        // Back off to the largest char boundary <= max so we never slice in the
+        // middle of a multi-byte UTF-8 sequence (this runs on server-controlled
+        // HTTP error bodies, which may be non-ASCII).
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
     }
 }
 

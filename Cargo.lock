@@ -4168,6 +4168,7 @@ dependencies = [
  "async-trait",
  "eventsource-stream",
  "futures-util",
+ "origin-cas",
  "origin-core",
  "origin-replay",
  "origin-stream",
@@ -4217,6 +4218,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sigv4",
  "http 1.4.0",
+ "origin-cas",
  "origin-core",
  "origin-provider",
  "origin-stream",
@@ -4233,6 +4235,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "futures-util",
+ "origin-cas",
  "origin-core",
  "origin-provider",
  "origin-stream",
@@ -4297,6 +4300,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "futures-util",
+ "origin-cas",
  "origin-core",
  "origin-provider",
  "origin-stream",

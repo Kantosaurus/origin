@@ -29,6 +29,7 @@ pub struct OpenAiCompatConfig {
 pub struct OpenAiCompat {
     cfg: OpenAiCompatConfig,
     client: reqwest::Client,
+    cas: Option<Arc<origin_cas::Store>>,
 }
 
 impl OpenAiCompat {
@@ -37,7 +38,18 @@ impl OpenAiCompat {
         Self {
             cfg,
             client: reqwest::Client::new(),
+            cas: None,
         }
+    }
+
+    /// Attach the content-addressed store so handle-backed `ToolResult` blocks
+    /// (produced by the daemon whenever a CAS is configured) are inflated to
+    /// inline bytes before wire encoding. Without this, follow-up turns send
+    /// empty tool results and the agentic loop silently breaks.
+    #[must_use]
+    pub fn with_cas(mut self, cas: Arc<origin_cas::Store>) -> Self {
+        self.cas = Some(cas);
+        self
     }
 }
 
@@ -48,6 +60,8 @@ impl Provider for OpenAiCompat {
     }
 
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError> {
+        let messages = origin_provider::inflate_tool_result_handles(&req.messages, self.cas.as_ref())?;
+        let req = ChatRequest { messages, ..req };
         let body = wire::encode_request(&req, false);
         let url = format!(
             "{}{}",
@@ -81,6 +95,8 @@ impl Provider for OpenAiCompat {
     }
 
     async fn chat_stream(&self, req: ChatRequest, ring: &origin_stream::Ring) -> Result<(), ProviderError> {
+        let messages = origin_provider::inflate_tool_result_handles(&req.messages, self.cas.as_ref())?;
+        let req = ChatRequest { messages, ..req };
         let body = wire::encode_request(&req, true);
         let url = format!(
             "{}{}",

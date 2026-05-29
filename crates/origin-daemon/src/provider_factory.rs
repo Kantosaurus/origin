@@ -282,7 +282,13 @@ impl ProviderFactory {
                     auth: token,
                     extra_headers: openai_extra_headers(entry.id.as_ref()),
                 };
-                Ok(Arc::new(OpenAiCompat::new(cfg)))
+                let mut p = OpenAiCompat::new(cfg);
+                if let Some(cas) = self.cas.clone() {
+                    // Inflate handle-backed tool results before wire encoding;
+                    // the daemon stores every tool result as a CAS handle.
+                    p = p.with_cas(cas);
+                }
+                Ok(Arc::new(p))
             }
             WireFormat::Anthropic => {
                 use origin_provider::catalog::AuthScheme;
@@ -346,6 +352,10 @@ impl ProviderFactory {
                         ))
                     }
                 };
+                let p = match self.cas.clone() {
+                    Some(cas) => p.with_cas(cas),
+                    None => p,
+                };
                 Ok(Arc::new(p))
             }
             #[cfg(not(feature = "gemini"))]
@@ -359,13 +369,17 @@ impl ProviderFactory {
                     .map_err(|e| FactoryError::from_vault(e, entry.id.as_ref(), account))?;
                 let creds: BedrockCreds = serde_json::from_str(secret.expose())
                     .map_err(|e| FactoryError::CredentialParse(e.to_string()))?;
-                Ok(Arc::new(origin_provider_bedrock::Bedrock::new(
+                let mut p = origin_provider_bedrock::Bedrock::new(
                     creds.endpoint(),
                     creds.region.clone(),
                     creds.model_id(),
                     creds.access.clone(),
                     creds.secret,
-                )))
+                );
+                if let Some(cas) = self.cas.clone() {
+                    p = p.with_cas(cas);
+                }
+                Ok(Arc::new(p))
             }
             #[cfg(not(feature = "bedrock"))]
             WireFormat::Bedrock => Err(FactoryError::UnknownProvider("bedrock".into())),

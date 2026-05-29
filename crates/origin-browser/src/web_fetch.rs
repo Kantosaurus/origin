@@ -52,7 +52,7 @@ pub async fn fetch(url: &str, opts: FetchOptions) -> Result<FetchResult, FetchEr
         .timeout(opts.timeout)
         .user_agent(&opts.user_agent)
         .build()?;
-    let resp = client.get(url).send().await?;
+    let mut resp = client.get(url).send().await?;
     let final_url = resp.url().to_string();
     let content_type = resp
         .headers()
@@ -60,9 +60,15 @@ pub async fn fetch(url: &str, opts: FetchOptions) -> Result<FetchResult, FetchEr
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string();
-    let bytes = resp.bytes().await?;
-    if bytes.len() > opts.max_bytes {
-        return Err(FetchError::TooLarge(bytes.len(), opts.max_bytes));
+    // Enforce `max_bytes` while streaming so an oversized (or chunked,
+    // unknown-length) response can't be fully buffered into memory before the
+    // size check — that defeats the limit and is a memory-DoS vector.
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if bytes.len() + chunk.len() > opts.max_bytes {
+            return Err(FetchError::TooLarge(bytes.len() + chunk.len(), opts.max_bytes));
+        }
+        bytes.extend_from_slice(&chunk);
     }
     let html = String::from_utf8_lossy(&bytes).into_owned();
     let parsed_url = url::Url::parse(&final_url)?;

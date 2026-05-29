@@ -37,6 +37,7 @@ pub enum ClearReasonWire {
     VerifierRejected { why: String },
     Met { reason: String },
     VerifierUnavailable,
+    Blocked { why: String },
 }
 
 impl From<ClearReason> for ClearReasonWire {
@@ -49,6 +50,7 @@ impl From<ClearReason> for ClearReasonWire {
             ClearReason::VerifierRejected(why) => Self::VerifierRejected { why },
             ClearReason::Met { reason } => Self::Met { reason },
             ClearReason::VerifierUnavailable => Self::VerifierUnavailable,
+            ClearReason::Blocked { why } => Self::Blocked { why },
         }
     }
 }

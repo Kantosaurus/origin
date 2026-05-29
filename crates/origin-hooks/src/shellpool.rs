@@ -68,10 +68,15 @@ impl Worker {
         if n == 0 {
             return Err(PoolError::StdoutClosed);
         }
-        // Strip trailing terminator.
-        if buf.last() == Some(&self.spec.read_terminator) {
-            buf.pop();
+        // `read_until` also returns on EOF. If the last byte is NOT the
+        // terminator, the worker closed stdout mid-response: `buf` is a
+        // truncated/partial reply, so surface an error instead of handing back
+        // partial bytes as if they were a complete response.
+        if buf.last() != Some(&self.spec.read_terminator) {
+            return Err(PoolError::StdoutClosed);
         }
+        // Strip trailing terminator.
+        buf.pop();
         Ok(buf)
     }
 

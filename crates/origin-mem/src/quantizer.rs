@@ -81,7 +81,18 @@ impl Quantizer {
         let mut rng = ChaCha8Rng::seed_from_u64(rng_seed);
         let centroids = kmeans_plus_plus_init(training, &mut rng);
         let mut centroids = lloyd(centroids, training)?;
-        // Global scale from max |delta| across all training vectors.
+        // Normalise centroids to unit sphere so cosine == dot for queries.
+        for c in centroids.iter_mut() {
+            let norm: f32 = c.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+            for x in c.iter_mut() {
+                *x /= norm;
+            }
+        }
+        // Global scale from max |delta| across all training vectors, computed
+        // AGAINST THE NORMALISED CENTROIDS. Quantization at query time stores
+        // residuals against these normalised centroids, so the scale must be
+        // sized from those same residuals — computing it before normalisation
+        // undersizes `scale`, clipping/saturating real deltas to ±127.
         let mut max_abs: f32 = 0.0;
         for v in training {
             let cid = nearest_centroid(&centroids, v);
@@ -90,13 +101,6 @@ impl Quantizer {
             }
         }
         let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
-        // Normalise centroids to unit sphere so cosine == dot for queries.
-        for c in centroids.iter_mut() {
-            let norm: f32 = c.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
-            for x in c.iter_mut() {
-                *x /= norm;
-            }
-        }
         Ok(Self { centroids, scale })
     }
 

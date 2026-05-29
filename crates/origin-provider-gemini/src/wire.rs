@@ -213,7 +213,25 @@ fn encode_message_into<'a>(m: &'a Message, out: &mut Vec<WireContent<'a>>) {
                     tool_use_id, inline, ..
                 } = b
                 {
-                    let name = tool_use_id.strip_prefix("call_").unwrap_or(tool_use_id);
+                    // Recover the function name from the synthesized id. The
+                    // non-streaming path mints `call_<name>`; the streaming path
+                    // mints `call_<name>_<idx>` (the index disambiguates parallel
+                    // calls). Strip the `call_` prefix, then a trailing `_<idx>`
+                    // ONLY when it is all digits, so function names that contain
+                    // underscores (e.g. `fs_read`) are preserved. Gemini matches
+                    // function responses by name, so this must equal the original
+                    // `functionCall.name` or the turn is rejected.
+                    let stripped = tool_use_id.strip_prefix("call_").unwrap_or(tool_use_id);
+                    let name = match stripped.rsplit_once('_') {
+                        Some((head, tail))
+                            if !head.is_empty()
+                                && !tail.is_empty()
+                                && tail.bytes().all(|b| b.is_ascii_digit()) =>
+                        {
+                            head
+                        }
+                        _ => stripped,
+                    };
                     let response: Value = inline
                         .as_deref()
                         .and_then(|v| serde_json::from_slice::<Value>(v).ok())

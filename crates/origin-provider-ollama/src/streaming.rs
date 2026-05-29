@@ -41,10 +41,13 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
         }
 
         if frame.done {
-            ring.publish(&TokenEvent::new(TokenKind::TurnEnd, Vec::new()))
-                .map_err(|e| ProviderError::Api(e.to_string()))?;
+            // Publish Usage BEFORE TurnEnd: the daemon's drain loop terminates
+            // on TurnEnd, so a Usage emitted afterwards is dropped and the
+            // turn's token counts are lost.
             let payload = encode_usage(frame.prompt_eval_count, frame.eval_count);
             ring.publish(&TokenEvent::new(TokenKind::Usage, payload))
+                .map_err(|e| ProviderError::Api(e.to_string()))?;
+            ring.publish(&TokenEvent::new(TokenKind::TurnEnd, Vec::new()))
                 .map_err(|e| ProviderError::Api(e.to_string()))?;
             break;
         }

@@ -204,6 +204,12 @@ impl AuditRing {
                 out.push(serde_json::from_str(&line)?);
             }
         }
+        // Filenames are sorted lexicographically above, which misorders
+        // intra-day rotated pages (e.g. `…​.10` before `…​.2`). Sort the merged
+        // events by their own timestamp so the result is truly chronological
+        // regardless of the page-file naming/rotation scheme. Stable sort keeps
+        // same-millisecond events in their original (append) order.
+        out.sort_by_key(|e: &AuditEvent| e.ts_ms);
         Ok(out)
     }
 }

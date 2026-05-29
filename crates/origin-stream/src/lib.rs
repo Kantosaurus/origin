@@ -173,6 +173,15 @@ impl Subscriber {
                 return Ok(Some(ev));
             }
             if self.ring.inner.closed.load(Ordering::Acquire) {
+                // Re-check the write cursor before declaring end-of-stream: a
+                // record may have been published immediately before the close.
+                // The Acquire load of `closed` synchronizes-with the producer's
+                // Release stores, so a fresh write_cursor load here observes any
+                // record written before the close. The initial check at the top
+                // of the loop could have read a stale (pre-publish) cursor.
+                if self.ring.inner.write_cursor.load(Ordering::Acquire) > self.read_cursor {
+                    continue;
+                }
                 return Ok(None);
             }
             let notified = self.ring.inner.notify.notified();

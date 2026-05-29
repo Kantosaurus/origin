@@ -218,9 +218,10 @@ async fn supervise(
 ) {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    let mut readers = Vec::new();
     if let Some(out) = stdout {
         let t = table.clone();
-        tokio::spawn(async move {
+        readers.push(tokio::spawn(async move {
             let mut reader = BufReader::new(out).lines();
             while let Ok(Some(line)) = reader.next_line().await {
                 let mut g = unlock(t.lock());
@@ -229,11 +230,11 @@ async fn supervise(
                     s.append(b"\n");
                 }
             }
-        });
+        }));
     }
     if let Some(err) = stderr {
         let t = table.clone();
-        tokio::spawn(async move {
+        readers.push(tokio::spawn(async move {
             let mut reader = BufReader::new(err).lines();
             while let Ok(Some(line)) = reader.next_line().await {
                 let mut g = unlock(t.lock());
@@ -243,32 +244,35 @@ async fn supervise(
                     s.append(b"\n");
                 }
             }
-        });
+        }));
     }
-    let exit = if let Some(d) = timeout {
+    let terminal_status = if let Some(d) = timeout {
         match tokio::time::timeout(d, child.wait()).await {
-            Ok(Ok(status)) => Ok(status),
-            Ok(Err(e)) => Err(e),
+            Ok(Ok(status)) => ProcStatus::Exited(status.code().unwrap_or(-1)),
+            Ok(Err(_e)) => ProcStatus::Exited(-1),
             Err(_elapsed) => {
                 let _ = child.kill().await;
-                {
-                    let mut g = unlock(table.lock());
-                    if let Some(s) = g.get_mut(&pid) {
-                        s.status = ProcStatus::TimedOut;
-                    }
-                }
-                return;
+                ProcStatus::TimedOut
             }
         }
     } else {
-        child.wait().await
+        match child.wait().await {
+            Ok(status) => ProcStatus::Exited(status.code().unwrap_or(-1)),
+            Err(_e) => ProcStatus::Exited(-1),
+        }
     };
+    // The child has exited (or been killed), so its pipe write-ends are closed
+    // and the reader tasks will hit EOF. Wait for them to finish so every byte
+    // is appended to the ring buffer BEFORE we flip the status to terminal —
+    // otherwise a foreground reader observing the terminal status could return
+    // before in-flight output is captured.
+    for r in readers {
+        let _ = r.await;
+    }
     let mut g = unlock(table.lock());
     if let Some(s) = g.get_mut(&pid) {
         if !s.status.is_terminal() {
-            s.status = exit.map_or(ProcStatus::Exited(-1), |status| {
-                ProcStatus::Exited(status.code().unwrap_or(-1))
-            });
+            s.status = terminal_status;
         }
     }
 }

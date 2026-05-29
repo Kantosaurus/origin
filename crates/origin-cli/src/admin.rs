@@ -159,7 +159,10 @@ fn read_secret(arg: String) -> Result<String> {
         use std::io::Read as _;
         let mut buf = String::new();
         std::io::stdin().read_to_string(&mut buf)?;
-        Ok(buf.trim_end_matches('\n').to_string())
+        // Strip a trailing CR as well as LF so secrets piped on Windows (CRLF
+        // line endings) don't keep an invisible `\r`, which would corrupt the
+        // stored credential and cause auth failures.
+        Ok(buf.trim_end_matches(['\r', '\n']).to_string())
     } else {
         Ok(arg)
     }

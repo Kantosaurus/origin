@@ -273,10 +273,13 @@ fn modularity(adj: &Adj, comm: &HashMap<u64, u64>) -> f64 {
             let kv = strength.get(&v).copied().unwrap_or(0.0);
             q += a_uv - (ku * kv) / two_m;
         }
-        // Include self-loop term k_u * k_u / 2m if u in its own comm
-        // (we already cover (u,v) pairs above; A_uu is 0 since we skip
-        // self-loops in `build_adjacency`).
+        // Diagonal (i == j) term of the modularity sum. A node is always in its
+        // own community, and the inner loop above only visits u's neighbours —
+        // never the (u, u) pair — so the null-model contribution `-k_u^2/2m`
+        // (with A_uu = 0, since `build_adjacency` skips self-loops) would be
+        // dropped, systematically overestimating Q. Add it explicitly.
         let _ = cu;
+        q -= (ku * ku) / two_m;
     }
     q / two_m
 }

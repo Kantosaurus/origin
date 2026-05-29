@@ -83,6 +83,41 @@ fn non_utf8_without_bom_errors() {
     assert!(result.is_err());
 }
 
+#[test]
+fn round_trip_non_ascii_utf8_lf_is_byte_preserving() {
+    // Regression: the old UTF-8 branch did `out.push(b as char)`, lifting each
+    // byte as Latin-1, which mojibaked every multi-byte char on read AND
+    // silently corrupted files on edit. Pure-LF non-ASCII content must decode
+    // verbatim and round-trip byte-for-byte.
+    for original in [
+        "café\nrésumé\n".as_bytes().to_vec(),
+        "日本語テスト\n".as_bytes().to_vec(),
+        "emoji 😀🎉 done\n".as_bytes().to_vec(),
+    ] {
+        let det = detect(&original);
+        let text = normalise_to_lf(&original, &det).unwrap();
+        assert_eq!(
+            text.as_bytes(),
+            &original[..],
+            "non-ASCII UTF-8 must decode without mojibake"
+        );
+        let back = denormalise(&text, &det);
+        assert_eq!(back, original, "non-ASCII content must round-trip byte-for-byte");
+    }
+}
+
+#[test]
+fn round_trip_non_ascii_utf8_crlf() {
+    // Folds CRLF -> LF at the char level (not byte level) and restores CRLF,
+    // all while preserving the multi-byte `é` bytes intact.
+    let original = "café\r\nrésumé\r\n".as_bytes();
+    let det = detect(original);
+    let text = normalise_to_lf(original, &det).unwrap();
+    assert_eq!(text, "café\nrésumé\n");
+    let back = denormalise(&text, &det);
+    assert_eq!(back, original);
+}
+
 use proptest::prelude::*;
 
 fn arb_eol() -> impl Strategy<Value = &'static [u8]> {

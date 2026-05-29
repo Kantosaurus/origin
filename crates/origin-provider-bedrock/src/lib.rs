@@ -14,6 +14,7 @@ use origin_provider::{ChatRequest, ChatResponse, Provider, ProviderError, Usage}
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Arc;
 
 const ANTHROPIC_VERSION: &str = "bedrock-2023-05-31";
 const DEFAULT_MAX_TOKENS: u32 = 16_384;
@@ -26,6 +27,7 @@ pub struct Bedrock {
     access_key: String,
     secret_key: String,
     client: reqwest::Client,
+    cas: Option<Arc<origin_cas::Store>>,
 }
 
 impl Bedrock {
@@ -45,7 +47,18 @@ impl Bedrock {
             access_key: access_key.into(),
             secret_key: secret_key.into(),
             client: reqwest::Client::new(),
+            cas: None,
         }
+    }
+
+    /// Attach the content-addressed store so handle-backed `ToolResult` blocks
+    /// are inflated to inline bytes before wire encoding. Without this, the
+    /// daemon's handle-backed tool results encode as empty content and the
+    /// model never sees what its tools returned.
+    #[must_use]
+    pub fn with_cas(mut self, cas: Arc<origin_cas::Store>) -> Self {
+        self.cas = Some(cas);
+        self
     }
 }
 
@@ -56,6 +69,8 @@ impl Provider for Bedrock {
     }
 
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError> {
+        let messages = origin_provider::inflate_tool_result_handles(&req.messages, self.cas.as_ref())?;
+        let req = ChatRequest { messages, ..req };
         let url = format!("{}/model/{}/invoke", self.endpoint, self.model_id);
         let body = encode_request(&req);
         let body_bytes = serde_json::to_vec(&body).map_err(|e| ProviderError::Api(format!("encode: {e}")))?;
@@ -159,6 +174,16 @@ struct WireRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<&'a str>,
     messages: Vec<WireMessage<'a>>,
+    // Omit when empty so non-tool requests stay byte-identical to before.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<WireTool<'a>>,
+}
+
+#[derive(Serialize)]
+struct WireTool<'a> {
+    name: &'a str,
+    description: &'a str,
+    input_schema: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -218,6 +243,19 @@ fn encode_request(req: &ChatRequest) -> WireRequest<'_> {
     for m in &req.messages {
         encode_message_into(m, &mut messages);
     }
+    // Anthropic-on-Bedrock requires the tool schemas in the top-level `tools`
+    // array; without them the model is never told tools exist (so it cannot
+    // emit tool_use), and a history containing tool_use/tool_result blocks is
+    // rejected with a 400 for referencing undeclared tools.
+    let tools = req
+        .tools
+        .iter()
+        .map(|t| WireTool {
+            name: &t.name,
+            description: &t.description,
+            input_schema: serde_json::from_str(&t.input_schema_json).unwrap_or_else(|_| json!({})),
+        })
+        .collect();
     WireRequest {
         anthropic_version: ANTHROPIC_VERSION,
         max_tokens: DEFAULT_MAX_TOKENS,
@@ -227,6 +265,7 @@ fn encode_request(req: &ChatRequest) -> WireRequest<'_> {
             Some(req.system.as_str())
         },
         messages,
+        tools,
     }
 }
 

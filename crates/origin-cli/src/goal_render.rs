@@ -79,6 +79,7 @@ pub fn cleared_line(reason: &ClearReasonWire) -> (String, u32) {
             "verifier unavailable; trusting main model".to_string(),
             theme::YELLOW,
         ),
+        ClearReasonWire::Blocked { why } => (format!("blocked: {why}"), theme::YELLOW),
     }
 }
 

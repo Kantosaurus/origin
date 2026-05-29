@@ -66,6 +66,12 @@ struct Inner {
 /// Three-tier content-addressed store: Hot (LRU) → Warm (mmap) → Cold (zstd).
 pub struct Store {
     inner: Mutex<Inner>,
+    /// Serializes pack-file flushes (warm seal + cold demote). Held for the
+    /// whole take→write→install sequence so pack-index/filename allocation is
+    /// atomic with file creation; without it two concurrent flushes can pick
+    /// the same `wNNNNNNNN.pack` / `cNNNNNNNN.pack` name and collide. Always
+    /// acquired BEFORE `inner` (never the reverse) to avoid deadlock.
+    flush: Mutex<()>,
 }
 
 impl Store {
@@ -97,6 +103,7 @@ impl Store {
                 cold_index,
                 active_dict: None,
             }),
+            flush: Mutex::new(()),
         })
     }
 
@@ -107,52 +114,85 @@ impl Store {
     /// Propagates I/O errors from a warm-pack flush if eviction triggers one.
     pub fn put(&self, bytes: &[u8]) -> Result<Hash, StoreError> {
         let h = Hash::of(bytes);
-        let mut inner = self.inner.lock();
+        let need_flush = {
+            let mut inner = self.inner.lock();
 
-        if inner.hot.contains(&h)
-            || inner.warm_index.contains_key(&h)
-            || inner.cold_index.contains_key(&h)
-            || inner.warm_pending.iter().any(|(ph, _)| *ph == h)
-        {
-            return Ok(h);
-        }
+            if inner.hot.contains(&h)
+                || inner.warm_index.contains_key(&h)
+                || inner.cold_index.contains_key(&h)
+                || inner.warm_pending.iter().any(|(ph, _)| *ph == h)
+            {
+                return Ok(h);
+            }
 
-        let need_flush = if let Some((evicted_hash, evicted_bytes)) = inner.hot.push(h, bytes.to_vec()) {
-            // `push` returns `Some((k, v))` for the entry pushed out by capacity.
-            // It can also return the same key we just inserted if the cache was
-            // full and the new key replaced something — in either case, route
-            // the evicted payload to the warm pending batch.
-            if evicted_hash != h {
-                // usize -> u64 is infallible on every target we care about
-                // (32/64-bit). Use `try_from` for portability rather than `as`.
-                let len = u64::try_from(evicted_bytes.len()).unwrap_or(u64::MAX);
-                inner.warm_bytes = inner.warm_bytes.saturating_add(len);
-                inner.warm_pending.push((evicted_hash, evicted_bytes));
-                inner.warm_bytes >= inner.cfg.warm_pack_target_bytes
+            if let Some((evicted_hash, evicted_bytes)) = inner.hot.push(h, bytes.to_vec()) {
+                // `push` returns `Some((k, v))` for the entry pushed out by
+                // capacity. It can also return the same key we just inserted if
+                // the cache was full and the new key replaced something — in
+                // either case, route the evicted payload to the warm batch.
+                if evicted_hash != h {
+                    // usize -> u64 is infallible on every target we care about
+                    // (32/64-bit). Use `try_from` for portability rather than `as`.
+                    let len = u64::try_from(evicted_bytes.len()).unwrap_or(u64::MAX);
+                    inner.warm_bytes = inner.warm_bytes.saturating_add(len);
+                    inner.warm_pending.push((evicted_hash, evicted_bytes));
+                    inner.warm_bytes >= inner.cfg.warm_pack_target_bytes
+                } else {
+                    false
+                }
             } else {
                 false
             }
-        } else {
-            false
         };
         if need_flush {
-            // Pull pack path + payloads out under the lock, then RELEASE the
-            // parking_lot guard before invoking the (possibly uring-backed)
-            // writer. We re-acquire the lock to record the new pack reader.
+            self.seal_warm_pack()?;
+        }
+        Ok(h)
+    }
+
+    /// Seal the current pending warm batch into a fresh warm pack. No-op if the
+    /// batch is empty. Serialized by `self.flush` so the pack index/filename is
+    /// allocated atomically with file creation (no two flushes can pick the same
+    /// name), and the taken batch is restored to `warm_pending` on failure so a
+    /// recoverable I/O error never silently discards already-`put` data.
+    fn seal_warm_pack(&self) -> Result<(), StoreError> {
+        let _flush = self.flush.lock();
+        let (next_idx, path, pending) = {
+            let mut inner = self.inner.lock();
+            if inner.warm_pending.is_empty() {
+                return Ok(());
+            }
             let next_idx = inner.warm_packs.len();
             let path = inner.cfg.root.join("warm").join(format!("w{next_idx:08}.pack"));
             let pending = std::mem::take(&mut inner.warm_pending);
-            drop(inner);
+            (next_idx, path, pending)
+        };
+        let write_res: Result<PackReader, StoreError> = (|| {
             write_pack(&path, &pending)?;
-            let r = PackReader::open(&path)?;
-            let mut inner = self.inner.lock();
-            for (ph, _) in &pending {
-                inner.warm_index.insert(*ph, next_idx);
+            Ok(PackReader::open(&path)?)
+        })();
+        let mut inner = self.inner.lock();
+        match write_res {
+            Ok(r) => {
+                for (ph, _) in &pending {
+                    inner.warm_index.insert(*ph, next_idx);
+                }
+                inner.warm_packs.push(r);
+                // Other puts may have appended to the batch while we wrote;
+                // recompute rather than assuming the batch is now empty.
+                inner.warm_bytes = sum_lens(&inner.warm_pending);
+                Ok(())
             }
-            inner.warm_packs.push(r);
-            inner.warm_bytes = 0;
+            Err(e) => {
+                // Restore the taken batch (ahead of anything appended meanwhile)
+                // so the data survives in RAM for a later flush attempt.
+                let mut restored = pending;
+                restored.append(&mut inner.warm_pending);
+                inner.warm_pending = restored;
+                inner.warm_bytes = sum_lens(&inner.warm_pending);
+                Err(e)
+            }
         }
-        Ok(h)
     }
 
     /// Read bytes by handle. Walks Hot → Warm-pending → Warm → Cold.
@@ -212,24 +252,7 @@ impl Store {
     /// # Errors
     /// Propagates I/O errors from the pack write.
     pub fn flush_warm_pending(&self) -> Result<(), StoreError> {
-        let mut inner = self.inner.lock();
-        if inner.warm_pending.is_empty() {
-            return Ok(());
-        }
-        let next_idx = inner.warm_packs.len();
-        let path = inner.cfg.root.join("warm").join(format!("w{next_idx:08}.pack"));
-        let pending = std::mem::take(&mut inner.warm_pending);
-        // Release the lock while doing the (possibly uring-backed) write.
-        drop(inner);
-        write_pack(&path, &pending)?;
-        let r = PackReader::open(&path)?;
-        let mut inner = self.inner.lock();
-        for (ph, _) in &pending {
-            inner.warm_index.insert(*ph, next_idx);
-        }
-        inner.warm_packs.push(r);
-        inner.warm_bytes = 0;
-        Ok(())
+        self.seal_warm_pack()
     }
 
     /// Force `h` to migrate Hot/Warm-pending/Warm → Cold (zstd-compressed pack).
@@ -238,6 +261,11 @@ impl Store {
     /// # Errors
     /// Propagates I/O and zstd errors.
     pub fn demote_to_cold(&self, h: Hash) -> Result<(), StoreError> {
+        // Serialize with warm seals and other demotes so the cold pack index /
+        // filename (`cNNNNNNNN.pack`) is allocated atomically with creation,
+        // preventing two concurrent demotes from colliding on the same name.
+        // Acquired before `inner`, matching `seal_warm_pack`'s lock order.
+        let _flush = self.flush.lock();
         let mut inner = self.inner.lock();
         if inner.cold_index.contains_key(&h) {
             return Ok(());
@@ -360,6 +388,15 @@ impl Store {
         let cur = self.inner.lock().active_dict.as_ref().map_or(0, |(v, _)| v.0);
         crate::dict::DictVersion(cur + 1)
     }
+}
+
+/// Sum the byte lengths of a pending batch, saturating on overflow.
+fn sum_lens(pending: &[(Hash, Vec<u8>)]) -> u64 {
+    pending
+        .iter()
+        .fold(0_u64, |acc, (_, v)| {
+            acc.saturating_add(u64::try_from(v.len()).unwrap_or(u64::MAX))
+        })
 }
 
 fn scan_dir(dir: &std::path::Path) -> Result<(Vec<PackReader>, HashMap<Hash, usize>), StoreError> {

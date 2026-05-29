@@ -754,16 +754,19 @@ pub async fn run_loop(
             // registry's counter so per-prompt scans share the global id-space
             // (no collisions across sessions or concurrent prompt requests).
             if let Some(proposer) = &opts.proposer {
-                let mut local_id = opts
-                    .proposal_registry
-                    .as_ref()
-                    .map_or(session.next_proposal_id, |r| r.current_id());
-                let proposals = proposer.scan(user_text, &text, &mut local_id);
-                if let Some(registry) = &opts.proposal_registry {
-                    registry.advance_to(local_id);
+                // Allocate the proposal-id range atomically: hold the registry
+                // counter across the scan so two concurrent prompt requests can
+                // never start from the same base id and mint colliding ids (a
+                // collision would make `record` overwrite one proposal and a
+                // later MemoryDecision resolve the wrong body/tags).
+                let proposals = if let Some(registry) = &opts.proposal_registry {
+                    registry.with_id_counter(|id| proposer.scan(user_text, &text, id))
                 } else {
+                    let mut local_id = session.next_proposal_id;
+                    let p = proposer.scan(user_text, &text, &mut local_id);
                     session.next_proposal_id = local_id;
-                }
+                    p
+                };
                 for p in proposals {
                     if let Some(registry) = &opts.proposal_registry {
                         registry.record(p.proposal_id, p.body.clone(), p.suggested_tags.clone());
@@ -2546,7 +2549,24 @@ async fn drain_subscriber_into_response(
             }
             origin_stream::TokenKind::Usage => {
                 if let Some(parsed) = decode_usage_payload(ev.payload()) {
-                    usage = parsed;
+                    // Merge field-wise rather than overwrite: providers split
+                    // usage across events (e.g. Anthropic reports input/cache in
+                    // `message_start` with output=0, then output in
+                    // `message_delta` with input/cache=0). A wholesale assignment
+                    // would let the later event zero the earlier counts. Keep the
+                    // last non-zero value seen for each field.
+                    if parsed.input_tokens != 0 {
+                        usage.input_tokens = parsed.input_tokens;
+                    }
+                    if parsed.output_tokens != 0 {
+                        usage.output_tokens = parsed.output_tokens;
+                    }
+                    if parsed.cache_read_input_tokens != 0 {
+                        usage.cache_read_input_tokens = parsed.cache_read_input_tokens;
+                    }
+                    if parsed.cache_creation_input_tokens != 0 {
+                        usage.cache_creation_input_tokens = parsed.cache_creation_input_tokens;
+                    }
                 }
             }
             origin_stream::TokenKind::TurnEnd => break,

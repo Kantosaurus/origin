@@ -8,6 +8,25 @@ use crate::registry::{note_critical_acquire, note_critical_release, registry};
 use std::future::Future;
 use tokio::task::JoinHandle;
 
+/// RAII pairing for the Critical busy-counter. Acquiring on construction and
+/// releasing on `Drop` guarantees the release runs on every exit path —
+/// normal return, panic unwind, or task cancellation (future dropped mid-await)
+/// — so the counter can never leak and permanently park `Bulk` tasks.
+struct CriticalGuard;
+
+impl CriticalGuard {
+    fn new() -> Self {
+        note_critical_acquire();
+        Self
+    }
+}
+
+impl Drop for CriticalGuard {
+    fn drop(&mut self) {
+        note_critical_release();
+    }
+}
+
 /// Spawn `fut` onto the current Tokio runtime under the given class.
 ///
 /// # Panics
@@ -22,17 +41,13 @@ where
     let sema = std::sync::Arc::clone(&reg.sema[class as usize]);
     tokio::spawn(async move {
         let _permit = sema.acquire_owned().await.expect("semaphore closed");
-        if matches!(class, TaskClass::Critical) {
-            note_critical_acquire();
-        }
+        // Held for the rest of the task; releases the Critical busy-counter on
+        // Drop regardless of how the task ends (return / panic / cancellation).
+        let _critical = matches!(class, TaskClass::Critical).then(CriticalGuard::new);
         if matches!(class, TaskClass::Bulk) {
             // Park while any Critical task holds a permit — centralised in BulkGate.
             BulkGate::current().wait_until_idle().await;
         }
-        let out = fut.await;
-        if matches!(class, TaskClass::Critical) {
-            note_critical_release();
-        }
-        out
+        fut.await
     })
 }

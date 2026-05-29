@@ -1,5 +1,6 @@
 // This test requires `rust-analyzer` on PATH; gated behind RUN_RA env var
 // so the default `cargo test` workflow does not require the binary.
+#![allow(clippy::unwrap_used)]
 
 #[tokio::test]
 async fn ra_handshake_publishes_no_diags_for_empty_workspace() {

@@ -101,12 +101,17 @@ impl Catalog {
     /// Returns [`CatalogError::IdCollision`] if any custom entry id matches an
     /// existing builtin entry id.
     pub fn merge_custom(&mut self, custom: Vec<ProviderEntry>) -> Result<(), CatalogError> {
-        for entry in custom {
-            if self.entries.iter().any(|e| e.id == entry.id) {
+        // Validate every entry BEFORE mutating, against both the existing
+        // catalog and earlier custom entries, so a collision anywhere leaves the
+        // catalog completely unchanged (atomic all-or-nothing merge).
+        for (i, entry) in custom.iter().enumerate() {
+            let collides = self.entries.iter().any(|e| e.id == entry.id)
+                || custom[..i].iter().any(|e| e.id == entry.id);
+            if collides {
                 return Err(CatalogError::IdCollision(entry.id.to_string()));
             }
-            self.entries.push(entry);
         }
+        self.entries.extend(custom);
         Ok(())
     }
 

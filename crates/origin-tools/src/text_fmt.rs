@@ -139,42 +139,43 @@ pub fn normalise_to_lf(bytes: &[u8], det: &Detected) -> Result<String, ToolError
                     format!("not valid UTF-8 at byte {}: {e}", e.valid_up_to()),
                 )
             })?;
-            let mut out = String::with_capacity(text.len());
-            let bytes = text.as_bytes();
-            let mut i = 0;
-            while i < bytes.len() {
-                match bytes[i] {
-                    b'\r' if i + 1 < bytes.len() && bytes[i + 1] == b'\n' => {
-                        out.push('\n');
-                        i += 2;
-                    }
-                    b'\r' => {
-                        out.push('\n');
-                        i += 1;
-                    }
-                    b => {
-                        out.push(b as char);
-                        i += 1;
-                    }
-                }
-            }
-            Ok(out)
+            Ok(fold_eols_to_lf(text))
         }
         Encoding::Utf16Le => {
             let (cow, _, had_errors) = encoding_rs::UTF_16LE.decode(body);
             if had_errors {
                 return Err(ToolError::new(ErrClass::Io, "encoding", "invalid UTF-16 LE"));
             }
-            Ok(cow.into_owned())
+            Ok(fold_eols_to_lf(&cow))
         }
         Encoding::Utf16Be => {
             let (cow, _, had_errors) = encoding_rs::UTF_16BE.decode(body);
             if had_errors {
                 return Err(ToolError::new(ErrClass::Io, "encoding", "invalid UTF-16 BE"));
             }
-            Ok(cow.into_owned())
+            Ok(fold_eols_to_lf(&cow))
         }
     }
+}
+
+/// Fold every `\r\n` and bare `\r` to a single `\n`, preserving all other
+/// characters verbatim. Operates at the `char` level so multi-byte UTF-8 /
+/// UTF-16 scalar values are never split or reinterpreted.
+fn fold_eols_to_lf(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Re-encode text back to the file's original byte convention.

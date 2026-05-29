@@ -183,7 +183,15 @@ impl ToolUseParser {
                 self.state = State::InString;
             }
             State::InNumber => match b {
-                b',' => self.emit_field(out),
+                b',' => {
+                    // The comma both terminates the number AND separates fields.
+                    // `emit_field` leaves us in `AfterValue`, which would then
+                    // wait for ANOTHER comma — but this one is already consumed,
+                    // so every following field would be silently dropped. Go
+                    // straight to `BeforeKey` to parse the next field's key.
+                    self.emit_field(out);
+                    self.state = State::BeforeKey;
+                }
                 b'}' => {
                     self.emit_field(out);
                     self.finish_object(out);

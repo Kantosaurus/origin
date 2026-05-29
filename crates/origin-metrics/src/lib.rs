@@ -395,7 +395,21 @@ impl Snapshot {
 /// `IntCounterVec::with_label_values` shortcut returns the same counter on
 /// repeat calls.
 fn intern_label(s: &str) -> &'static str {
-    Box::leak(s.to_string().into_boxed_str())
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+    // Memoize so a repeated label value (e.g. the same model string seen on
+    // every request) reuses one leaked allocation instead of leaking a fresh
+    // one per call. Without this the leak grows with the number of CALLS, not
+    // the number of distinct values as the doc comment assumes.
+    static INTERNED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let set = INTERNED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = set.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(&existing) = guard.get(s) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
+    guard.insert(leaked);
+    leaked
 }
 
 /// Re-parse a `{k1="v1",k2="v2"}` segment back into pairs. Empty segments

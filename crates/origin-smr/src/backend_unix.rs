@@ -50,9 +50,20 @@ pub fn open(cfg: RingConfig) -> Result<Ring, RingError> {
         .map_err(|e| RingError::CreationFailed(format!("shm_open({pname}): {e}")))?;
 
     if cfg.create {
-        let len_off =
-            i64::try_from(cap).map_err(|_| RingError::CreationFailed("capacity exceeds i64".into()))?;
-        ftruncate(&fd, len_off).map_err(|e| RingError::CreationFailed(format!("ftruncate: {e}")))?;
+        // On any failure after the O_CREAT|O_EXCL shm_open, unlink the freshly
+        // created name so it doesn't leak in the shm namespace (which would also
+        // make the next O_EXCL create fail with EEXIST).
+        let len_off = match i64::try_from(cap) {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = shm_unlink(pname.as_str());
+                return Err(RingError::CreationFailed("capacity exceeds i64".into()));
+            }
+        };
+        if let Err(e) = ftruncate(&fd, len_off) {
+            let _ = shm_unlink(pname.as_str());
+            return Err(RingError::CreationFailed(format!("ftruncate: {e}")));
+        }
     }
 
     let length = NonZeroUsize::new(cap).ok_or_else(|| RingError::CreationFailed("capacity is 0".into()))?;
@@ -71,7 +82,15 @@ pub fn open(cfg: RingConfig) -> Result<Ring, RingError> {
             0,
         );
     }
-    let ptr = mmap_result.map_err(|e| RingError::MmapFailed(format!("mmap: {e}")))?;
+    let ptr = match mmap_result {
+        Ok(p) => p,
+        Err(e) => {
+            if cfg.create {
+                let _ = shm_unlink(pname.as_str());
+            }
+            return Err(RingError::MmapFailed(format!("mmap: {e}")));
+        }
+    };
 
     // We no longer need the fd — the mapping itself keeps the shared
     // memory alive. Drop happens implicitly when `fd` goes out of

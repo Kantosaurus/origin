@@ -24,6 +24,17 @@ pub struct EditArgs {
 #[allow(clippy::module_name_repetitions)]
 #[allow(clippy::needless_pass_by_value)]
 pub fn edit_v2(args: EditArgs) -> Result<Value, ToolError> {
+    // An empty needle matches between every character; `str::replace("", ..)`
+    // would splice `new_string` at every position, corrupting the file.
+    if args.old_string.is_empty() {
+        return Err(ToolError::new(
+            ErrClass::Validation,
+            "empty_old_string",
+            "old_string must not be empty",
+        )
+        .recoverable(true)
+        .hint("provide the exact text to replace"));
+    }
     let bytes = std::fs::read(&args.file_path)
         .map_err(|e| ToolError::new(ErrClass::Io, "not_found", format!("{}: {e}", args.file_path)))?;
     let det = text_fmt::detect(&bytes);

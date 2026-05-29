@@ -84,9 +84,17 @@ pub fn reduce(buffer: &mut String, ev: KeyEvent, op_in_flight: bool) -> InputAct
 pub fn parse_mem_command(line: &str) -> Option<ClientMessage> {
     let trimmed = line.trim();
     let rest = trimmed.strip_prefix("/mem")?.trim_start();
-    let mut it = rest.splitn(3, char::is_whitespace);
-    let verb = it.next()?;
-    let id_tok = it.next()?;
+    // Tokenize by whitespace runs (not a single whitespace char): `splitn` on
+    // `char::is_whitespace` yields empty tokens when fields are separated by
+    // more than one space, so e.g. `/mem accept  1` would parse an empty id and
+    // silently fail. Split verb and id off the front, keeping the remainder
+    // (with its internal spacing) as the edit body.
+    let verb_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let verb = &rest[..verb_end];
+    let after_verb = rest[verb_end..].trim_start();
+    let id_end = after_verb.find(char::is_whitespace).unwrap_or(after_verb.len());
+    let id_tok = &after_verb[..id_end];
+    let body_rest = after_verb[id_end..].trim();
     let proposal_id: u32 = id_tok.parse().ok()?;
     match verb.to_ascii_lowercase().as_str() {
         "accept" => Some(ClientMessage::MemoryDecision {
@@ -98,14 +106,13 @@ pub fn parse_mem_command(line: &str) -> Option<ClientMessage> {
             action: MemoryAction::Reject,
         }),
         "edit" => {
-            let body = it.next()?.trim();
-            if body.is_empty() {
+            if body_rest.is_empty() {
                 return None;
             }
             Some(ClientMessage::MemoryDecision {
                 proposal_id,
                 action: MemoryAction::Edit {
-                    body: body.to_string(),
+                    body: body_rest.to_string(),
                     tags: Vec::new(),
                 },
             })

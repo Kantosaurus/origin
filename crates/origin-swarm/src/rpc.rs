@@ -76,11 +76,15 @@ impl PlanHandle {
     /// Broadcast send errors are silently ignored — a missing subscriber is
     /// not a fold-failure.
     pub async fn apply(&self, op: OpEnvelope) -> Result<(), SwarmError> {
-        // Build the new fold under the log lock, then drop the log guard
-        // before re-acquiring the plan lock — keeps the two mutexes from
-        // overlapping holds (Clippy `significant_drop_tightening`).
+        // Persist BEFORE mutating any in-memory state. Done under the log lock
+        // (a synchronous store call, no `.await` inside the guard) so persisted
+        // order and in-memory order stay consistent. If `append_op` fails, the
+        // `?` returns before the log push and the Plan overwrite, leaving the
+        // log, the shared Plan, and subscribers all untouched — no lost update,
+        // and no orphan op that would corrupt the next fold.
         let new_plan = {
             let mut log = self.log.lock().await;
+            self.store.append_op(&op).map_err(SwarmError::Plan)?;
             log.push(op.clone());
             // Re-fold the entire log into the canonical Plan. Cheap in
             // practice because P9.3 snapshot compaction GCs old ops.
@@ -90,7 +94,6 @@ impl PlanHandle {
             let mut guard = self.inner.lock().await;
             *guard = new_plan;
         }
-        self.store.append_op(&op).map_err(SwarmError::Plan)?;
         let _ = self.broadcast.send(op);
         Ok(())
     }

@@ -73,6 +73,25 @@ impl ProposalRegistry {
         }
     }
 
+    /// Run `f` with exclusive access to the id counter, advancing it by however
+    /// many ids `f` consumes. The registry mutex is held for the whole call so
+    /// the read → scan → advance sequence is atomic: concurrent prompt scans can
+    /// no longer start from the same base id and mint colliding proposal ids.
+    /// `f` must be synchronous and must not re-enter the registry (it does not).
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
+    #[allow(clippy::expect_used)]
+    pub fn with_id_counter<R>(&self, f: impl FnOnce(&mut u32) -> R) -> R {
+        let mut g = self.inner.lock().expect("proposal_registry mutex");
+        let mut id = g.next_id;
+        let r = f(&mut id);
+        if id > g.next_id {
+            g.next_id = id;
+        }
+        r
+    }
+
     /// Record a pending proposal so a future `Accept` can recover the
     /// `(body, tags)`. Overwrites any existing entry for the same id (last
     /// emitted wins; ids are monotonic so this only matters under explicit

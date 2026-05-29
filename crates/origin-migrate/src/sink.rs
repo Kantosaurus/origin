@@ -39,13 +39,16 @@ pub fn apply_with_store(store: &Store, b: &MigrateBundle) -> Result<ApplyReport,
     let mut r = ApplyReport::default();
 
     for s in &b.sessions {
+        // Length-frame every variable-length field so the hash input is an
+        // injective encoding of (source_id, messages). Concatenating with bare
+        // `:`/`\n` separators is ambiguous — e.g. (source_id="a", role="user")
+        // and (source_id="au", role="ser") both serialize to "auser:..." and
+        // collide, silently dropping one distinct session as a "duplicate".
         let mut hasher = blake3::Hasher::new();
-        hasher.update(s.source_id.as_bytes());
+        update_framed(&mut hasher, s.source_id.as_bytes());
         for m in &s.messages {
-            hasher.update(m.role.as_bytes());
-            hasher.update(b":");
-            hasher.update(m.body.as_bytes());
-            hasher.update(b"\n");
+            update_framed(&mut hasher, m.role.as_bytes());
+            update_framed(&mut hasher, m.body.as_bytes());
         }
         let key = hasher.finalize().to_hex().to_string();
 
@@ -59,7 +62,13 @@ pub fn apply_with_store(store: &Store, b: &MigrateBundle) -> Result<ApplyReport,
     }
 
     for k in &b.skills {
-        let key = blake3::hash(k.body.as_bytes()).to_hex().to_string();
+        // Key on (name, body): hashing the body alone makes two distinct skills
+        // with identical bodies but different names collide, silently dropping
+        // one as a duplicate. Length-frame both so the encoding is injective.
+        let mut hasher = blake3::Hasher::new();
+        update_framed(&mut hasher, k.name.as_bytes());
+        update_framed(&mut hasher, k.body.as_bytes());
+        let key = hasher.finalize().to_hex().to_string();
         if store.contains_migrated_skill(&key).map_err(io_err)? {
             r.skills_skipped_duplicate += 1;
             continue;
@@ -70,6 +79,14 @@ pub fn apply_with_store(store: &Store, b: &MigrateBundle) -> Result<ApplyReport,
     }
 
     Ok(r)
+}
+
+/// Feed `bytes` into `hasher` with a `u64` length prefix so a sequence of
+/// fields hashes as an injective (collision-free) encoding — no boundary
+/// between two fields can be confused for field content.
+fn update_framed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
 }
 
 fn io_err(e: impl std::fmt::Display) -> SourceError {

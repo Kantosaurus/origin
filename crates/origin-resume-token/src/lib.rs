@@ -158,6 +158,31 @@ fn compute_mac_hex(key: &[u8; KEY_LEN], payload: &[u8]) -> String {
     hex::encode(hash.as_bytes())
 }
 
+/// Reject any `session_id` that is not a single, normal path component.
+///
+/// `session_id` is attacker-influenced (it arrives over the wire inside a
+/// `ResumeToken`), and it is interpolated directly into a filename. Without
+/// this guard, `dir.join("../../evil")` escapes the resume directory, enabling
+/// an arbitrary-`.json`-file write (and a probe of arbitrary `.json` paths on
+/// load). Permit only a single `Normal` component — no separators, `..`, root,
+/// or drive prefix.
+fn validate_session_id(session_id: &str) -> std::io::Result<()> {
+    use std::path::Component;
+    let mut comps = Path::new(session_id).components();
+    let single_normal = matches!(
+        (comps.next(), comps.next()),
+        (Some(Component::Normal(_)), None)
+    );
+    if single_normal {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid session_id for resume-token path: {session_id:?}"),
+        ))
+    }
+}
+
 impl ResumeToken {
     /// Write to `<dir>/<session_id>.json` as a MAC-wrapped envelope.
     /// On first call into a fresh `dir`, a `.mac-key` sidecar is generated.
@@ -165,6 +190,7 @@ impl ResumeToken {
     /// # Errors
     /// Propagates I/O errors, serde failures, and `getrandom` failures.
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
+        validate_session_id(&self.session_id)?;
         std::fs::create_dir_all(dir)?;
         let key = load_or_create_key(dir)?;
 
@@ -191,6 +217,7 @@ impl ResumeToken {
     /// Propagates I/O errors, serde decode failures, missing-key, and
     /// MAC mismatches — never silently skips a present-but-bad token.
     pub fn load_one(dir: &Path, session_id: &str) -> std::io::Result<Option<Self>> {
+        validate_session_id(session_id)?;
         let path = dir.join(format!("{session_id}.json"));
         if !path.exists() {
             return Ok(None);

@@ -170,10 +170,22 @@ impl PackReader {
         // builders create disjoint files by name.
         let map = unsafe { Mmap::map(&file)? };
 
-        let mut index = HashMap::with_capacity(usize::try_from(entries).unwrap_or(0));
+        // Each index entry is 44 bytes (32 hash + 8 offset + 4 len), so the
+        // file can hold at most `map.len() / 44` of them. Clamp the preallocation
+        // to that ceiling so a corrupt/huge `entries` field cannot trigger an
+        // enormous (OOM) `HashMap` allocation before we even read the index.
+        let entry_size = 32 + 8 + 4;
+        let max_entries = map.len() / entry_size;
+        let cap = usize::try_from(entries).unwrap_or(usize::MAX).min(max_entries);
+        let mut index = HashMap::with_capacity(cap);
         let mut cursor = usize::try_from(index_offset).map_err(|_| PackError::Truncated)?;
         for _ in 0..entries {
-            if cursor + 32 + 8 + 4 > map.len() {
+            // Checked add: a corrupt `index_offset` near usize::MAX must not
+            // wrap past the bounds check into an out-of-bounds slice panic.
+            if cursor
+                .checked_add(entry_size)
+                .is_none_or(|end| end > map.len())
+            {
                 return Err(PackError::Truncated);
             }
             let mut h = [0u8; 32];
@@ -203,8 +215,11 @@ impl PackReader {
     #[must_use]
     pub fn read(&self, hash: Hash) -> Option<PackSlice<'_>> {
         let (off, len) = self.index.get(&hash).copied()?;
-        let start = usize::try_from(off).ok()? + 32 + 4; // skip embedded hash+len
-        let end = start + usize::try_from(len).ok()?;
+        // Use checked arithmetic throughout: `off`/`len` originate from the
+        // on-disk index and may be corrupt; an overflow must yield `None`, never
+        // wrap past the bounds check into an out-of-bounds slice panic.
+        let start = usize::try_from(off).ok()?.checked_add(32 + 4)?; // skip embedded hash+len
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
         if end > self.map.len() {
             return None;
         }

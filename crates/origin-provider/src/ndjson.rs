@@ -35,6 +35,12 @@ pub fn from_reqwest(resp: reqwest::Response) -> impl Stream<Item = Result<String
                 // Take bytes [0, nl) as the line; drop the trailing '\n'.
                 let mut line: Vec<u8> = buf.drain(..=nl).collect();
                 line.pop(); // remove '\n'
+                // Drop a trailing '\r' so CRLF-terminated streams yield clean
+                // lines; otherwise a blank "\r\n" line becomes "\r", which is
+                // non-empty and fails downstream JSON parsing.
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
                 if line.is_empty() {
                     continue;
                 }

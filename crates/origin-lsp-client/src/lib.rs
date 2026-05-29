@@ -180,6 +180,12 @@ async fn reader_loop(stdout: ChildStdout, diags: Arc<RwLock<HashMap<PathBuf, Vec
         let Some(len) = content_length else {
             continue;
         };
+        // Cap the server-declared body size so a malformed/hostile language
+        // server cannot drive an unbounded `vec![0u8; len]` allocation (OOM).
+        const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+        if len > MAX_BODY_BYTES {
+            return;
+        }
         let mut body = vec![0u8; len];
         if reader.read_exact(&mut body).await.is_err() {
             return;
@@ -193,14 +199,60 @@ async fn reader_loop(stdout: ChildStdout, diags: Arc<RwLock<HashMap<PathBuf, Vec
     }
 }
 
+/// Convert an LSP `file://` URI to a filesystem path that matches the keys the
+/// daemon queries with. Handles two things the naive `strip_prefix("file://")`
+/// got wrong:
+///   * percent-decoding (`%20` → space) so paths with spaces/special chars match;
+///   * the Windows drive form `file:///C:/x` → `/C:/x`, where the leading slash
+///     before the drive letter must be dropped (else the key never matches the
+///     native `C:\x` path).
+fn file_uri_to_path(uri: &str) -> PathBuf {
+    let rest = uri.strip_prefix("file://").unwrap_or(uri);
+    let decoded = percent_decode(rest);
+    #[cfg(windows)]
+    {
+        let b = decoded.as_bytes();
+        // "/C:/..." → "C:/..."
+        if b.len() >= 3 && b[0] == b'/' && b[2] == b':' && b[1].is_ascii_alphabetic() {
+            return PathBuf::from(&decoded[1..]);
+        }
+    }
+    PathBuf::from(decoded)
+}
+
+/// Minimal percent-decoder (`%XX` → byte). Leaves malformed escapes verbatim.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let hex = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 async fn handle_diagnostics(v: &Value, diags: &Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>>) {
     let Some(params) = v.get("params") else { return };
     let Some(uri) = params.get("uri").and_then(Value::as_str) else {
         return;
     };
-    let path = uri
-        .strip_prefix("file://")
-        .map_or_else(|| PathBuf::from(uri), PathBuf::from);
+    let path = file_uri_to_path(uri);
     let mut out = Vec::new();
     if let Some(arr) = params.get("diagnostics").and_then(Value::as_array) {
         for d in arr {

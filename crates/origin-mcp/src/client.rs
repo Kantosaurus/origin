@@ -28,7 +28,11 @@ pub struct McpTool {
     pub name: String,
     #[serde(default)]
     pub description: String,
-    #[serde(default = "default_schema")]
+    // The MCP wire protocol names this field `inputSchema` (camelCase). Without
+    // the rename, serde never matches it and every tool falls back to the empty
+    // default schema, so the model loses all MCP tool parameter information.
+    // `alias` keeps snake_case working for any non-conforming server/tests.
+    #[serde(rename = "inputSchema", alias = "input_schema", default = "default_schema")]
     pub input_schema: Value,
 }
 

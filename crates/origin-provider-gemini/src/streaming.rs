@@ -106,17 +106,30 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
                     }
                 }
                 if let Some(fc) = part.function_call {
+                    // The daemon decoder keys tool-call start/delta events on a
+                    // 4-byte LE index prefix (see decode_tool_use_start /
+                    // decode_tool_use_delta in origin-daemon). Use one stable
+                    // index per function_call so the start and its args delta
+                    // correlate; without the prefix the index is read from the
+                    // id/JSON bytes (garbage) and the delta orphans, silently
+                    // dropping the tool arguments.
+                    let idx = tool_call_idx;
+                    tool_call_idx = tool_call_idx.saturating_add(1);
                     if let Some(name) = fc.name.as_ref() {
-                        let id = format!("call_{name}_{tool_call_idx}");
-                        tool_call_idx = tool_call_idx.saturating_add(1);
-                        let payload = [id.as_bytes(), b"\0", name.as_bytes()].concat();
+                        let id = format!("call_{name}_{idx}");
+                        let mut payload = idx.to_le_bytes().to_vec();
+                        payload.extend_from_slice(id.as_bytes());
+                        payload.push(b'\0');
+                        payload.extend_from_slice(name.as_bytes());
                         ring.publish(&TokenEvent::new(TokenKind::ToolUseStart, payload))
                             .map_err(|e| ProviderError::Api(e.to_string()))?;
                     }
                     if let Some(args) = fc.args.as_ref() {
-                        let bytes = serde_json::to_vec(args)
+                        let json = serde_json::to_vec(args)
                             .map_err(|e| ProviderError::Api(format!("args json: {e}")))?;
-                        ring.publish(&TokenEvent::new(TokenKind::ToolUseDelta, bytes))
+                        let mut payload = idx.to_le_bytes().to_vec();
+                        payload.extend_from_slice(&json);
+                        ring.publish(&TokenEvent::new(TokenKind::ToolUseDelta, payload))
                             .map_err(|e| ProviderError::Api(e.to_string()))?;
                     }
                 }

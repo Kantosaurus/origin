@@ -13,6 +13,7 @@ workspace = true
 origin-core = { path = "../origin-core" }
 origin-provider = { path = "../origin-provider" }
 origin-stream = { path = "../origin-stream" }
+origin-cas = { path = "../origin-cas" }
 async-trait = "0.1"
 futures-util = "0.3"
 pin-utils = "0.1"

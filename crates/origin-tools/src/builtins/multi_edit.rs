@@ -28,6 +28,16 @@ pub fn multi_edit(args: &MultiEditArgs) -> Result<Value, ToolError> {
     let mut text = text_fmt::normalise_to_lf(&bytes, &det)?;
     let mut applied = 0u32;
     for op in &args.edits {
+        // An empty needle matches between every character; replacing it would
+        // splice `new` at every position and corrupt the file.
+        if op.old.is_empty() {
+            return Err(ToolError::new(
+                ErrClass::Validation,
+                "empty_old_string",
+                format!("edit {applied} of {}: old must not be empty", args.edits.len()),
+            )
+            .recoverable(true));
+        }
         let count = text.matches(op.old.as_str()).count();
         text = match count {
             0 => {

@@ -186,7 +186,13 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
                 ]),
                 redirect_uri: "http://localhost:1455/auth/callback".into(),
                 pkce: true,
-                device_flow: true,
+                // Auth-code + PKCE loopback flow (note the /oauth/authorize
+                // endpoint, localhost redirect_uri, and pkce above) — NOT a
+                // device-code flow. `true` would route login to the device-code
+                // branch, which POSTs a device grant to the auth-code endpoint
+                // and fails. Contrast github-copilot, whose authorize_url is a
+                // real /login/device/code endpoint.
+                device_flow: false,
             }),
             base_url: "https://chatgpt.com/backend-api/codex".into(),
             chat_path: "/responses".into(),

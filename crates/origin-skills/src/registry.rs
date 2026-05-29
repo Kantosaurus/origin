@@ -37,10 +37,15 @@ impl SkillRegistry {
     /// the default tier check). An empty set means *no tool is allowed*.
     #[must_use]
     pub fn allowed_tools(&self) -> Option<HashSet<String>> {
-        let mut iter = self.stack.iter();
-        let first = iter.next()?;
+        // A skill that declares no `allowed-tools` imposes NO narrowing — it
+        // must not collapse the intersection to the empty (deny-all) set. Only
+        // skills with a non-empty list contribute to the restriction; if none
+        // do, return `None` so the permission engine falls through to the
+        // default tier check.
+        let mut restricting = self.stack.iter().filter(|s| !s.allowed_tools.is_empty());
+        let first = restricting.next()?;
         let mut acc: HashSet<String> = first.allowed_tools.iter().cloned().collect();
-        for skill in iter {
+        for skill in restricting {
             let cur: HashSet<String> = skill.allowed_tools.iter().cloned().collect();
             acc = acc.intersection(&cur).cloned().collect();
         }

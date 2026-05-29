@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use origin_core::types::{Block, Message, Role};
 use origin_provider::{ChatRequest, ChatResponse, Provider, ProviderError, Usage};
 use reqwest::StatusCode;
+use std::sync::Arc;
 
 const DEFAULT_BASE: &str = "https://generativelanguage.googleapis.com";
 
@@ -32,6 +33,7 @@ pub struct Gemini {
     auth: AuthKind,
     base: String,
     client: reqwest::Client,
+    cas: Option<Arc<origin_cas::Store>>,
 }
 
 impl Gemini {
@@ -48,6 +50,7 @@ impl Gemini {
             auth: AuthKind::ApiKey(api_key.into()),
             base: base.trim_end_matches('/').to_string(),
             client: reqwest::Client::new(),
+            cas: None,
         }
     }
 
@@ -61,7 +64,18 @@ impl Gemini {
             auth: AuthKind::OAuthBearer(token.into()),
             base: DEFAULT_BASE.to_string(),
             client: reqwest::Client::new(),
+            cas: None,
         }
+    }
+
+    /// Attach the content-addressed store so handle-backed `ToolResult` blocks
+    /// are inflated to inline bytes before wire encoding. Without this, the
+    /// daemon's handle-backed tool results encode as empty `functionResponse`
+    /// content and the model never sees what its tools returned.
+    #[must_use]
+    pub fn with_cas(mut self, cas: Arc<origin_cas::Store>) -> Self {
+        self.cas = Some(cas);
+        self
     }
 
     fn url(&self, model: &str, action: &str, extra_query: &str) -> String {
@@ -102,6 +116,8 @@ impl Provider for Gemini {
     }
 
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError> {
+        let messages = origin_provider::inflate_tool_result_handles(&req.messages, self.cas.as_ref())?;
+        let req = ChatRequest { messages, ..req };
         let body = wire::encode_request(&req);
         let url = self.url(&req.model, "generateContent", "");
         let resp = self
@@ -123,6 +139,8 @@ impl Provider for Gemini {
     }
 
     async fn chat_stream(&self, req: ChatRequest, ring: &origin_stream::Ring) -> Result<(), ProviderError> {
+        let messages = origin_provider::inflate_tool_result_handles(&req.messages, self.cas.as_ref())?;
+        let req = ChatRequest { messages, ..req };
         let body = wire::encode_request(&req);
         let url = self.url(&req.model, "streamGenerateContent", "&alt=sse");
         let resp = self

@@ -132,6 +132,16 @@ impl MemoryHandle for MemoryDispatchHandle {
                     }
                 })
                 .collect();
+            // All naive matches share score 1.0 and `iter_all` yields records
+            // oldest-first, so a bare `truncate(k)` would keep the OLDEST k
+            // matches and silently drop newer ones. Order newest-first (smallest
+            // age) so truncation retains the most recent — and most relevant —
+            // matches.
+            hits.sort_by(|a, b| {
+                a.age_days
+                    .partial_cmp(&b.age_days)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             hits.truncate(k);
             Ok(hits)
         };

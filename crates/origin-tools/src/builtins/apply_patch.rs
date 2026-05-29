@@ -35,6 +35,11 @@ pub fn apply_patch(args: &ApplyPatchArgs) -> Result<Value, ToolError> {
     // Plan all writes first; only commit if every hunk applies cleanly.
     // Key: forward-slash path from diff header; value: (orig_bytes, det, working_text)
     let mut staged: HashMap<String, (Vec<u8>, Detected, String)> = HashMap::new();
+    // Per-file cumulative line delta applied by earlier hunks. Hunk `old_start`
+    // values are in original-file coordinates, but each hunk is applied to the
+    // working text already mutated by previous hunks on the same file, so later
+    // hunks must be shifted by the net lines inserted/removed so far.
+    let mut offsets: HashMap<String, isize> = HashMap::new();
     for h in &hunks {
         let entry = if let Some(e) = staged.get(&h.file) {
             e.2.clone()
@@ -48,7 +53,9 @@ pub fn apply_patch(args: &ApplyPatchArgs) -> Result<Value, ToolError> {
             staged.insert(h.file.clone(), (bytes, det, text.clone()));
             text
         };
-        let updated = apply_one_hunk(&entry, h)?;
+        let offset = *offsets.get(&h.file).unwrap_or(&0);
+        let (updated, delta) = apply_one_hunk(&entry, h, offset)?;
+        offsets.insert(h.file.clone(), offset + delta);
         if let Some(slot) = staged.get_mut(&h.file) {
             slot.2 = updated;
         }
@@ -120,7 +127,10 @@ fn parse_patch(patch: &str) -> Result<Vec<Hunk>, ToolError> {
     Ok(hunks)
 }
 
-fn apply_one_hunk(text: &str, h: &Hunk) -> Result<String, ToolError> {
+/// Apply one hunk to `text`. `offset` shifts the hunk's original-coordinate
+/// `old_start` to account for line insertions/removals by earlier hunks on the
+/// same file. Returns the rewritten text and the net line delta of this hunk.
+fn apply_one_hunk(text: &str, h: &Hunk, offset: isize) -> Result<(String, isize), ToolError> {
     let lines: Vec<&str> = text.lines().collect();
     // Build the "old block" from ' ' and '-' lines.
     let mut old_block: Vec<&str> = Vec::new();
@@ -141,8 +151,22 @@ fn apply_one_hunk(text: &str, h: &Hunk) -> Result<String, ToolError> {
             _ => {}
         }
     }
-    let start_idx = h.old_start.saturating_sub(1);
-    if start_idx + old_block.len() > lines.len() {
+    // start index in CURRENT (working) coordinates; isize so a negative result
+    // from an out-of-range hunk start is rejected rather than wrapping.
+    let base = h.old_start.saturating_sub(1) as isize + offset;
+    let start_idx = usize::try_from(base).map_err(|_| {
+        ToolError::new(
+            ErrClass::Edit,
+            "no_match",
+            format!("hunk @{} resolves before start of {}", h.old_start, h.file),
+        )
+    })?;
+    // Checked add so an attacker-controlled huge `old_start` cannot overflow
+    // and slip past the bounds check into an out-of-bounds index panic.
+    let past_eof = start_idx
+        .checked_add(old_block.len())
+        .is_none_or(|end| end > lines.len());
+    if past_eof {
         return Err(ToolError::new(
             ErrClass::Edit,
             "no_match",
@@ -165,7 +189,7 @@ fn apply_one_hunk(text: &str, h: &Hunk) -> Result<String, ToolError> {
     }
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     out.extend(lines[..start_idx].iter().map(|s| (*s).to_string()));
-    out.extend(new_block);
+    out.extend(new_block.iter().cloned());
     out.extend(
         lines[start_idx + old_block.len()..]
             .iter()
@@ -175,7 +199,8 @@ fn apply_one_hunk(text: &str, h: &Hunk) -> Result<String, ToolError> {
     if text.ends_with('\n') {
         joined.push('\n');
     }
-    Ok(joined)
+    let delta = new_block.len() as isize - old_block.len() as isize;
+    Ok((joined, delta))
 }
 
 fn atomic_write(path: &str, bytes: &[u8]) -> Result<(), ToolError> {

@@ -49,6 +49,17 @@ pub async fn bash_v2(args: BashArgs, sup: &Supervisor) -> Result<Value, ToolErro
         acc.push_str(&chunk.bytes);
         next = chunk.next_offset;
         if chunk.status.is_terminal() {
+            // The per-read cap (64 KiB) may leave buffered output behind; the
+            // process has terminated and its readers have been drained, so the
+            // ring will not grow further — read until it is empty.
+            loop {
+                let more = sup.read_since(pid, next, 64 * 1024)?;
+                if more.bytes.is_empty() {
+                    break;
+                }
+                acc.push_str(&more.bytes);
+                next = more.next_offset;
+            }
             let (status_str, exit_code) = match chunk.status {
                 ProcStatus::Exited(c) => ("exited", c),
                 ProcStatus::TimedOut => ("timed_out", -1),

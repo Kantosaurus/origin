@@ -232,16 +232,13 @@ pub async fn drive_decision(
             ..DecisionOutcome::default()
         },
         TagOutcome::Blocked { why } => DecisionOutcome {
-            decision: iterate_from_inputs(
-                &inputs,
-                0,
-                format!(
-                    "[goal-driver] Last turn reported the goal blocked: {why}. \
-                     Either resolve the blocker yourself, or if it truly requires the human, \
-                     restate the blocker clearly and end the turn — the driver will then \
-                     clear the goal so the user can respond."
-                ),
-            ),
+            // The model reported the goal blocked on something requiring the
+            // human. Clear the goal now so the loop stops and the user can
+            // respond to the restated blocker. Iterating instead (the previous
+            // behavior) just re-injects the same guidance every turn and spins
+            // until the max-iteration cap eventually trips — burning tokens on a
+            // block the driver cannot resolve autonomously.
+            decision: cleared_from_inputs(&inputs, 0, ClearReason::Blocked { why }),
             set_consecutive_rejections: Some(0),
             ..DecisionOutcome::default()
         },
@@ -459,7 +456,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocked_returns_iterate_with_resolve_or_restate_nudge() {
+    async fn blocked_clears_goal_with_blocked_reason() {
+        // A blocked goal requires the human, so the driver clears it (surfacing
+        // the blocker) rather than iterating — iterating would just spin,
+        // re-injecting the same nudge every turn until the max-iter cap trips.
         let mut g = fresh("x");
         g.last_status_tag = Some(TagOutcome::Blocked {
             why: "DB password unset".into(),
@@ -467,13 +467,11 @@ mod tests {
         let v = MockVerifier::new(Vec::new());
         let d = drive(&mut g, "", &v).await;
         match d {
-            DriverDecision::Iterate {
-                synthesized_prompt, ..
-            } => {
-                assert!(synthesized_prompt.contains("DB password unset"));
-                assert!(synthesized_prompt.contains("resolve the blocker"));
-            }
-            other => panic!("expected Iterate, got {other:?}"),
+            DriverDecision::Cleared { reason, .. } => match reason {
+                ClearReasonWire::Blocked { why } => assert_eq!(why, "DB password unset"),
+                other => panic!("expected Blocked reason, got {other:?}"),
+            },
+            other => panic!("expected Cleared, got {other:?}"),
         }
     }
 

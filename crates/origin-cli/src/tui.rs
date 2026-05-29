@@ -447,7 +447,14 @@ impl App {
 
             if offset > 0 {
                 let indicator = format!(" \u{2191} {offset} more ");
-                let start_col = cols.saturating_sub(indicator.len() as u16 + 1);
+                // Position by DISPLAY width, not byte length: the `\u{2191}` (↑)
+                // arrow is 3 UTF-8 bytes but one terminal column, so `.len()`
+                // would push the indicator two columns too far left.
+                let indicator_w: usize = indicator
+                    .chars()
+                    .map(|c| UnicodeWidthChar::width(c).unwrap_or(1))
+                    .sum();
+                let start_col = cols.saturating_sub(indicator_w as u16 + 1);
                 write_str_styled(
                     main,
                     0,

@@ -78,6 +78,52 @@ pub enum ProviderError {
     RateLimit { retry_after_secs: u32, message: String },
 }
 
+/// Inflate any CAS-handle-backed `ToolResult` blocks into inline bytes.
+///
+/// The daemon stores every tool result as a CAS handle (`handle: Some`,
+/// `inline: None`) whenever a CAS is configured (which is always in production).
+/// Each provider's wire encoder only understands inline content, so a provider
+/// must inflate handles back into bytes before encoding — otherwise the model
+/// receives empty tool results on every follow-up turn and the agentic loop
+/// silently breaks. The Anthropic provider does this with extra Plan-aware
+/// `Reference` downgrading; every other provider can use this plain helper.
+///
+/// Returns a cloned message vector with handles resolved. Mirrors the Anthropic
+/// provider's loud-failure contract: a handle with no CAS configured, or a CAS
+/// miss, is an error rather than a silently-empty result.
+///
+/// # Errors
+/// Returns [`ProviderError::Api`] if a handle is present but no CAS is
+/// configured, or if the CAS lookup fails or misses.
+pub fn inflate_tool_result_handles(
+    messages: &[Message],
+    cas: Option<&std::sync::Arc<origin_cas::Store>>,
+) -> Result<Vec<Message>, ProviderError> {
+    use origin_core::types::Block;
+    let mut out = Vec::with_capacity(messages.len());
+    for m in messages {
+        let mut nm = m.clone();
+        for b in &mut nm.blocks {
+            if let Block::ToolResult { handle, inline, .. } = b {
+                if inline.is_none() {
+                    if let Some(h) = handle.take() {
+                        let store = cas.ok_or_else(|| {
+                            ProviderError::Api("ToolResult handle present but no CAS configured".into())
+                        })?;
+                        let bytes = store
+                            .get(origin_cas::Hash::from_bytes(h))
+                            .map_err(|e| ProviderError::Api(format!("cas get: {e}")))?
+                            .ok_or_else(|| ProviderError::Api("cas miss for tool result handle".into()))?;
+                        *inline = Some(bytes);
+                    }
+                }
+            }
+        }
+        out.push(nm);
+    }
+    Ok(out)
+}
+
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;

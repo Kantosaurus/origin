@@ -86,9 +86,15 @@ impl SessionStore {
         let model = s.model.clone();
         let now = now_ms();
         self.inner.with_conn(|c| {
+            // UPSERT rather than INSERT OR REPLACE: REPLACE deletes the existing
+            // row before re-inserting, which resets `created_at` to now, wipes
+            // any `title`, and (with foreign_keys ON) risks cascading the delete
+            // to this session's messages. On conflict, update only the mutable
+            // provider/model and leave created_at, title, and child rows intact.
             c.execute(
-                "INSERT OR REPLACE INTO sessions (id, created_at, title, provider, model) \
-                 VALUES (?1, ?2, NULL, ?3, ?4)",
+                "INSERT INTO sessions (id, created_at, title, provider, model) \
+                 VALUES (?1, ?2, NULL, ?3, ?4) \
+                 ON CONFLICT(id) DO UPDATE SET provider = excluded.provider, model = excluded.model",
                 rusqlite::params![id, now, provider, model],
             )?;
             Ok(())

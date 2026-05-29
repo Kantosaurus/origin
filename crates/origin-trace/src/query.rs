@@ -137,6 +137,12 @@ pub fn run(args: &QueryArgs) -> Result<Vec<QueryRow>, QueryError> {
                         continue;
                     }
                 }
+                // Check the limit BEFORE pushing so `limit == 0` returns zero
+                // rows (the previous post-push check returned one row for a
+                // zero limit — an off-by-one). Correct for all limits > 0 too.
+                if out.len() >= args.limit {
+                    return Ok(out);
+                }
                 out.push(QueryRow {
                     ts_ns: ts_col.value(i),
                     span_id: span_col.value(i),
@@ -148,9 +154,6 @@ pub fn run(args: &QueryArgs) -> Result<Vec<QueryRow>, QueryError> {
                     error_kind: error_col.value(i).into(),
                     attrs_json: attrs_col.value(i).into(),
                 });
-                if out.len() >= args.limit {
-                    return Ok(out);
-                }
             }
         }
     }

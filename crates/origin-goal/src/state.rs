@@ -63,6 +63,10 @@ pub enum ClearReason {
     VerifierRejected(String),
     Met { reason: String },
     VerifierUnavailable,
+    /// The main model reported the goal blocked on something that requires the
+    /// human. The driver clears the goal so the loop stops and the user can
+    /// respond, instead of spinning on a block it cannot resolve autonomously.
+    Blocked { why: String },
 }
 
 impl GoalState {

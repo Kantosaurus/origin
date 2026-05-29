@@ -164,14 +164,17 @@ where
                 ring.publish(&TokenEvent::new(TokenKind::Usage, payload))?;
             }
             WireEvent::MessageDelta { delta, usage } => {
+                // Publish the final Usage BEFORE TurnEnd: the daemon's drain loop
+                // terminates on TurnEnd, so a Usage published afterwards would be
+                // dropped and the turn's output/cache tokens lost.
+                if let Some(u) = usage {
+                    let payload = encode_usage(&u);
+                    ring.publish(&TokenEvent::new(TokenKind::Usage, payload))?;
+                }
                 if let Some(d) = delta {
                     if d.stop_reason.is_some() {
                         ring.publish(&TokenEvent::new(TokenKind::TurnEnd, Vec::new()))?;
                     }
-                }
-                if let Some(u) = usage {
-                    let payload = encode_usage(&u);
-                    ring.publish(&TokenEvent::new(TokenKind::Usage, payload))?;
                 }
             }
             _ => {}
