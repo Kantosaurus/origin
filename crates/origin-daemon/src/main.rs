@@ -1527,6 +1527,11 @@ async fn handle_request(
             // system suffix in `req.system`; empty ⇒ no addendum (wire unchanged).
             read_only: req.read_only,
             // ^ gemini Plan Mode: deny-only read-only overlay for this turn.
+            router: origin_daemon::routing::global(),
+            // ^ aider/gemini/kilo/openclaude live model routing: process-wide
+            // router built once from `ORIGIN_ROUTER` (unset ⇒ None ⇒ each turn
+            // uses session.model, byte-identical). Per-turn phase selection +
+            // health/quota feedback live inside `run_loop`.
         };
         drive_goal_loop(
             conn,

@@ -471,6 +471,18 @@ pub struct LoopOptions {
     /// default) ⇒ no effect. Set from `PromptRequest.read_only`.
     /// *Closes: gemini Plan Mode (the policy-enforced read-only phase).*
     pub read_only: bool,
+    /// Optional live, per-turn model router. When `Some`, each turn classifies a
+    /// [`Phase`](origin_router::Phase) (turn 1 ⇒ Plan, later turns ⇒ Edit), asks
+    /// the router to pick a model, and — when the pick is on the **active**
+    /// provider — overrides that turn's `ChatRequest.model`. Latency / success
+    /// is folded back into the router's health after each turn, and a terminal
+    /// rate-limit marks the model exhausted so a `QuotaFallback` chain skips it
+    /// next time. `None` (the default everywhere) ⇒ every turn uses
+    /// `session.model`, byte-identical to before. Set from
+    /// [`crate::routing::global`] in `handle_request`.
+    /// *Closes: aider architect/editor; gemini phase-aware; kilo quota-fallback;
+    /// openclaude `SmartRouter` (the live agent-loop wire).*
+    pub router: Option<Arc<crate::routing::LiveRouter>>,
 }
 
 impl Default for LoopOptions {
@@ -501,6 +513,7 @@ impl Default for LoopOptions {
             attachments: Vec::new(),
             system_suffix: None,
             read_only: false,
+            router: None,
         }
     }
 }
@@ -958,10 +971,19 @@ pub async fn run_loop(
     let mut turn_mutated = false;
 
     for turn in 1..=opts.max_turns {
+        // Live per-turn model routing (origin-router). When a router is wired,
+        // it picks a model for this turn's phase (turn 1 ⇒ Plan, later ⇒ Edit);
+        // a cross-provider pick returns `None`, so we fall back to the session
+        // model. With no router (the default) this is exactly `session.model`.
+        let turn_model = opts
+            .router
+            .as_ref()
+            .and_then(|lr| lr.choose_model(turn, provider.name()))
+            .unwrap_or_else(|| session.model.clone());
         let req = ChatRequest {
             system: recalled_system.clone(),
             messages: session.snapshot(),
-            model: session.model.clone(),
+            model: turn_model.clone(),
             tools: tools_schema.clone(),
             effort: opts.effort,
             // Attach images/PDF only to the first turn's user message. On later
@@ -979,6 +1001,7 @@ pub async fn run_loop(
         // up to `MAX_RATE_LIMIT_SLEEP_SECS`, and cap attempts at
         // `MAX_PROVIDER_RETRIES`. `ChatRequest` is `Clone`, so we re-build
         // the wire request each attempt without re-snapshotting the session.
+        let provider_call_start = std::time::Instant::now();
         let (resp, mut speculative) = {
             let mut attempt: u32 = 0;
             loop {
@@ -1012,6 +1035,12 @@ pub async fn run_loop(
                             %message,
                             "provider rate-limited; backing off and retrying"
                         );
+                        // Live router (kilocode quota-fallback): a rate-limit
+                        // marks this model exhausted so a `QuotaFallback` chain
+                        // skips it next turn/prompt. A later success clears it.
+                        if let Some(lr) = &opts.router {
+                            lr.mark_exhausted(provider.name(), &turn_model);
+                        }
                         // Surface the backoff to the CLI so a 60s sleep
                         // doesn't look identical to a hang. `attempt` here is
                         // 0-indexed within the retry budget; we render it
@@ -1080,6 +1109,16 @@ pub async fn run_loop(
                 }
             }
         };
+
+        // Live router (openclaude SmartRouter / Scored EMA): fold this turn's
+        // provider latency + success into the router's health so future turns /
+        // prompts rank this model on measured signal. A success also clears any
+        // exhaustion flag (self-healing quota-fallback). No router ⇒ no-op.
+        if let Some(lr) = &opts.router {
+            let latency_ms =
+                u64::try_from(provider_call_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            lr.record(provider.name(), &turn_model, latency_ms, true);
+        }
 
         // Charge this turn's provider call against the cumulative counters
         // BEFORE pushing the assistant message. Cache reads/creation are

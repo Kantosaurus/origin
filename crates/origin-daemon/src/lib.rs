@@ -35,3 +35,4 @@ pub mod subsystems;
 pub mod scheduler;
 pub mod ambient;
 pub mod webhook;
+pub mod routing;
