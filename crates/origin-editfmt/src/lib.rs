@@ -35,6 +35,45 @@ impl fmt::Display for EditFormat {
     }
 }
 
+impl EditFormat {
+    /// One-line human label for the format, e.g. `"search/replace"`.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SearchReplace => "search/replace",
+            Self::DiffFenced => "fenced diff",
+            Self::WholeFile => "whole file",
+            Self::Udiff => "unified diff",
+        }
+    }
+
+    /// Short guidance describing how a model should emit edits in this format.
+    #[must_use]
+    pub const fn guidance(self) -> &'static str {
+        match self {
+            Self::SearchReplace => {
+                "give one or more blocks, each `<<<<<<< SEARCH` then the exact \
+                 lines to find, then `=======`, then the replacement lines, then \
+                 `>>>>>>> REPLACE`, with the file path on the line above the block"
+            }
+            Self::DiffFenced => {
+                "wrap the change in a fenced ```diff block containing \
+                 `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` markers, with the \
+                 file path just before the fence"
+            }
+            Self::WholeFile => {
+                "emit the entire updated file contents inside a fenced code block, \
+                 preceded by the file path; do not abbreviate or elide any lines"
+            }
+            Self::Udiff => {
+                "use unified-diff hunks: `--- a/path` and `+++ b/path` headers, then \
+                 `@@` hunk headers, with context lines unprefixed, removed lines \
+                 prefixed `-`, and added lines prefixed `+`"
+            }
+        }
+    }
+}
+
 /// A normalized edit: replace `before` with `after` inside `file`.
 ///
 /// For [`EditFormat::WholeFile`], `before` is empty and `after` holds
@@ -130,6 +169,24 @@ pub fn best_format_for(model: &str) -> EditFormat {
         return EditFormat::WholeFile;
     }
     EditFormat::SearchReplace
+}
+
+/// Builds an `<origin-edit-format>` system-prompt block tuned to `model`.
+///
+/// The chosen format is resolved via [`best_format_for`]. The returned
+/// string is safe to embed directly into a larger prompt: it has no
+/// trailing newline.
+#[must_use]
+pub fn system_block(model: &str) -> String {
+    let fmt = best_format_for(model);
+    format!(
+        "<origin-edit-format>\n\
+         When you must show a code edit in prose (outside the structured \
+         Edit/MultiEdit/ApplyPatch tools), prefer the {} format: {}\n\
+         </origin-edit-format>",
+        fmt.label(),
+        fmt.guidance(),
+    )
 }
 
 /// Optional filename hint preceding a search/replace block.
@@ -471,5 +528,35 @@ mod tests {
     fn display_renders_format_names() {
         assert_eq!(EditFormat::SearchReplace.to_string(), "search-replace");
         assert_eq!(EditFormat::Udiff.to_string(), "udiff");
+    }
+
+    #[test]
+    fn label_and_guidance_non_empty_for_all_variants() {
+        for fmt in [
+            EditFormat::SearchReplace,
+            EditFormat::DiffFenced,
+            EditFormat::WholeFile,
+            EditFormat::Udiff,
+        ] {
+            assert!(!fmt.label().is_empty(), "label empty for {fmt:?}");
+            assert!(!fmt.guidance().is_empty(), "guidance empty for {fmt:?}");
+        }
+    }
+
+    #[test]
+    fn system_block_for_claude_uses_search_replace() {
+        assert_eq!(best_format_for("claude-opus-4"), EditFormat::SearchReplace);
+        let block = system_block("claude-opus-4");
+        assert!(block.contains("search/replace"), "block: {block}");
+        assert!(block.starts_with("<origin-edit-format>"));
+        assert!(block.ends_with("</origin-edit-format>"));
+        assert!(!block.ends_with('\n'));
+    }
+
+    #[test]
+    fn system_block_for_gpt4_mentions_unified_diff() {
+        assert_eq!(best_format_for("gpt-4o"), EditFormat::Udiff);
+        let block = system_block("gpt-4o");
+        assert!(block.contains("unified diff"), "block: {block}");
     }
 }
