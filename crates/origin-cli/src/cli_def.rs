@@ -349,6 +349,16 @@ pub enum ProvidersSub {
         #[arg(long)]
         provider: Option<String>,
     },
+    /// Recommend the cheapest capable model from a candidate set, ranked by the
+    /// builtin pricing table, and optionally save the pick as a profile.
+    Recommend {
+        /// Candidate models to rank (`provider/model` or bare model id). When
+        /// omitted, a builtin set spanning the major families is ranked.
+        models: Vec<String>,
+        /// Persist the recommendation to `~/.origin/recommended.json`.
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 #[derive(Subcommand)]

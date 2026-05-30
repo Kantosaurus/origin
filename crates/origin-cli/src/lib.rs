@@ -38,6 +38,7 @@ pub mod input;
 pub mod keyring_login;
 pub mod plan_panel_wiring;
 pub mod providers;
+pub mod recommend;
 pub mod screen;
 pub mod status;
 pub mod suggestions;
