@@ -486,7 +486,14 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
                 }
             });
         }
-        Arc::new(Coordinator::new(plan_handle, "origin-daemon"))
+        // Install the REAL agent-loop worker (replacing the noop). Each `Task`
+        // dispatch now runs a bounded sub-agent against a snapshot of the active
+        // provider, with its tools narrowed to the worker's allow-list (minus
+        // `Task`). Worker bodies run in `TaskClass::Sidecar` (see Coordinator),
+        // so a parent awaiting a child never deadlocks the Critical pool.
+        let mut coord = Coordinator::new(plan_handle, "origin-daemon");
+        coord.set_default_worker(origin_daemon::swarm_worker::real_worker(Arc::clone(&active)));
+        Arc::new(coord)
     };
     info!("swarm coordinator ready");
 
