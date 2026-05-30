@@ -39,6 +39,7 @@ origin-permission       = { path = "../origin-permission" }
 origin-skills           = { path = "../origin-skills" }
 origin-store            = { path = "../origin-store" }
 origin-cas              = { path = "../origin-cas" }
+origin-cmdparse         = { path = "../origin-cmdparse" }
 origin-codegraph        = { path = "../origin-codegraph" }
 origin-stream           = { path = "../origin-stream" }
 origin-keyvault         = { path = "../origin-keyvault" }
@@ -50,11 +51,28 @@ origin-runtime          = { path = "../origin-runtime" }
 origin-alloc            = { path = "../origin-alloc" }
 origin-resume-token     = { path = "../origin-resume-token" }
 origin-goal             = { path = "../origin-goal" }
+origin-cost             = { path = "../origin-cost" }
+origin-export           = { path = "../origin-export" }
 origin-plan             = { path = "../origin-plan" }
 origin-planner          = { path = "../origin-planner" }
 origin-swarm            = { path = "../origin-swarm" }
 origin-browser          = { path = "../origin-browser" }
 origin-lsp-client       = { path = "../origin-lsp-client" }
+# Wave-1/2 subsystem crates wired into the daemon (all default-off / available).
+origin-vcs              = { path = "../origin-vcs" }
+origin-postedit         = { path = "../origin-postedit" }
+origin-policy           = { path = "../origin-policy" }
+origin-conseca          = { path = "../origin-conseca" }
+origin-telemetry        = { path = "../origin-telemetry" }
+origin-notify           = { path = "../origin-notify" }
+origin-oidc             = { path = "../origin-oidc" }
+origin-router           = { path = "../origin-router" }
+origin-repomap          = { path = "../origin-repomap" }
+origin-multimodal       = { path = "../origin-multimodal" }
+origin-lspfleet         = { path = "../origin-lspfleet" }
+origin-review           = { path = "../origin-review" }
+origin-schedule         = { path = "../origin-schedule" }
+origin-ambient          = { path = "../origin-ambient" }
 ctrlc                   = "3"
 dirs                    = "5"
 which                   = "8"

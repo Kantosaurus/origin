@@ -1,0 +1,97 @@
+# origin-mention — respond to `@origin <instruction>` in issue / PR comments.
+#
+# Mirrors claude-code's @claude Action and gemini-cli's run-gemini-cli: a human
+# leaves a comment that mentions the bot, the bot runs the headless agent
+# (`origin run "<prompt>"`) and posts the answer back as a comment.
+#
+# SECURITY: the comment body is fully untrusted. We NEVER interpolate it into a
+# shell command with `${{ ... }}`. Instead we pass it through the `env:` block so
+# the runner exposes it as an environment variable that the shell reads safely.
+name: origin-mention
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+# Least privilege: read the repo, write comments + labels on issues/PRs.
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+# One run per issue/PR thread; newer mentions cancel older in-flight runs.
+concurrency:
+  group: origin-mention-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  respond:
+    name: origin responds to @origin mention
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Guard: only run when the comment actually mentions @origin. Checking here
+    # (rather than only in a step) avoids spinning up the runner for noise.
+    if: contains(github.event.comment.body, '@origin')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install origin
+        # Prebuilt binary via the scoped npm package; the command is `origin`.
+        run: npm install -g @kantosaurus/origin
+
+      # Extract the instruction that follows the first `@origin` token. The raw
+      # comment is read from $COMMENT_BODY (set via env, never inlined) so a
+      # malicious body such as `@origin $(rm -rf /)` is treated as literal text.
+      - name: Extract instruction
+        id: extract
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          # Strip everything up to and including the first "@origin", trim space.
+          instruction="${COMMENT_BODY#*@origin}"
+          instruction="$(printf '%s' "$instruction" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          if [ -z "$instruction" ]; then
+            instruction="Summarize this issue or pull request and suggest next steps."
+          fi
+          # Persist the instruction to the step output via a heredoc-safe file.
+          {
+            echo 'instruction<<ORIGIN_EOF'
+            printf '%s\n' "$instruction"
+            echo 'ORIGIN_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run origin
+        id: run
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Untrusted instruction text, passed safely as an env var.
+          ORIGIN_INSTRUCTION: ${{ steps.extract.outputs.instruction }}
+        run: |
+          # Quote the env var, never the raw expression, so the shell never
+          # word-splits or evaluates user-controlled text.
+          set -o pipefail
+          origin run "$ORIGIN_INSTRUCTION" | tee origin-output.txt
+
+      - name: Post result comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # github.event.issue.number is set for issue comments; for PR review
+          # comments github.event.pull_request.number is set. `gh issue comment`
+          # and `gh pr comment` both accept a number and resolve the same thread.
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          {
+            echo "🤖 **origin** responded to your \`@origin\` mention:"
+            echo
+            cat origin-output.txt
+          } > comment-body.md
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file comment-body.md
+          else
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file comment-body.md
+          fi

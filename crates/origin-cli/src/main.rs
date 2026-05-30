@@ -10,6 +10,8 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt as _;
 use origin_cli::cli_def::{Cli, Cmd, KeyringSub, PairSub, ProvidersSub, SessionsSub, TraceSub};
+// Plugin subcommand is dispatched through `origin_cli::plugin::run`, which takes
+// the `PluginSub` directly.
 use origin_cli::goal_render::render_goal_event;
 use origin_cli::input::{
     parse_mem_command, parse_model_command, parse_skill_command, parse_workflow_command, reduce, InputAction,
@@ -112,6 +114,7 @@ async fn run_self_update() -> Result<()> {
 /// subcommand (each terminates the program with its own result), mirroring
 /// the `return` arms this replaced. The TUI entry path is reached when
 /// `Cli::cmd` is `None`, so this is only called with a concrete `Cmd`.
+#[allow(clippy::too_many_lines)] // Single linear dispatch over every subcommand; splitting hurts readability.
 async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
     Some(match cmd {
         Cmd::Trace {
@@ -127,8 +130,46 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
             remote,
             bearer,
             model,
-        } => origin_cli::headless::run(text, json, remote, bearer, model).await,
+            effort,
+            attach,
+            output_format,
+            json_schema,
+            root,
+        } => {
+            origin_cli::headless::run(origin_cli::headless::RunArgs {
+                text,
+                json,
+                remote,
+                bearer,
+                model,
+                effort,
+                attach,
+                output_format,
+                json_schema,
+                roots: root,
+            })
+            .await
+        }
+        Cmd::OidcExchange {
+            token_url,
+            subject_token,
+            audience,
+            workspace_id,
+            federation_rule_id,
+            json,
+        } => {
+            origin_cli::oidc::run(origin_cli::oidc::OidcArgs {
+                token_url,
+                subject_token,
+                audience,
+                workspace_id,
+                federation_rule_id,
+                json,
+            })
+            .await
+        }
         Cmd::Usage => origin_cli::admin::usage().await,
+        Cmd::Insights => origin_cli::insights::run().await,
         Cmd::Sessions { sub } => origin_cli::admin::sessions(sub_to_action(sub)).await,
         Cmd::Keyring { sub } => {
             // Login drives an interactive OAuth flow and must be handled
@@ -149,9 +190,41 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
                 origin_cli::providers::describe(&id);
                 Ok(())
             }
+            ProvidersSub::Refresh { provider } => {
+                origin_cli::providers::refresh(provider.as_deref());
+                Ok(())
+            }
         },
         Cmd::Init => origin_cli::init::run().await,
         Cmd::Import(a) => import_subcommand(&a),
+        Cmd::Doctor { json, privacy } => origin_cli::doctor::run(json, privacy).await,
+        Cmd::Mermaid { path } => origin_cli::mermaid::run(&path),
+        Cmd::Knowledge { sub } => origin_cli::knowledge::run(sub),
+        Cmd::Schedule { sub } => origin_cli::schedule::run(sub),
+        Cmd::Export {
+            session_id,
+            json,
+            out,
+        } => origin_cli::admin::export_session(session_id, json, out).await,
+        Cmd::Checkpoint { label } => origin_cli::vcs::checkpoint(label),
+        Cmd::Checkpoints => origin_cli::vcs::checkpoints(),
+        Cmd::Rewind { id, files_only } => origin_cli::vcs::rewind(&id, files_only),
+        Cmd::CheckpointDiff { id } => origin_cli::vcs::checkpoint_diff(&id),
+        Cmd::Scout { repo_url, cache } => origin_cli::scout::run(&repo_url, cache),
+        Cmd::Watch { root, ext } => origin_cli::watch::run(root, ext),
+        Cmd::CopyContext { instruction, files } => {
+            origin_cli::clipboard::copy_context(instruction, &files)
+        }
+        Cmd::ApplyClipboard => origin_cli::clipboard::apply_clipboard(),
+        Cmd::Dictate {
+            interleave,
+            lang,
+            device,
+        } => origin_cli::voice::run(interleave, lang, device),
+        Cmd::Search { query, engine } => origin_cli::search::run(&query, engine).await,
+        Cmd::Plugin { sub } => origin_cli::plugin::run(sub),
+        Cmd::Lsp { sub } => origin_cli::lsp::run(&sub),
+        Cmd::Ambient { sub } => origin_cli::ambient::run(&sub),
     })
 }
 
@@ -181,7 +254,24 @@ async fn run() -> Result<()> {
     // Dispatch a subcommand if one was given, otherwise fall through to the
     // TUI entry path (preserves the existing env-driven invocation).
     let cli = Cli::parse();
+    // Resolve the optional reasoning-effort flag (item H). Default-off: when
+    // `--effort` is unset this is `None` and nothing about the wire changes.
+    // A valid level becomes the session's starting effort token (seeded onto
+    // the App below and carried on every PromptRequest); `/effort`/`/fast`
+    // mutate it mid-session. An unknown value is a non-fatal warning.
+    let effort_seed: Option<String> = cli.effort.as_deref().and_then(|raw| {
+        origin_cli::effort::ReasoningEffort::parse_level(raw).map_or_else(
+            || {
+                eprintln!("warning: unknown --effort level `{raw}` (ignored)");
+                None
+            },
+            |level| Some(level.as_str().to_string()),
+        )
+    });
     if cli.tutorial {
+        // Localized welcome chrome (item A; origin-i18n locale from
+        // $LC_ALL/$LANG, English fallback).
+        println!("{}", origin_cli::locale::line("welcome"));
         let stdin = std::io::stdin();
         let stdout = std::io::stdout();
         origin_cli::tutorial::run(stdin.lock(), stdout.lock())?;
@@ -234,6 +324,14 @@ async fn run() -> Result<()> {
     execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
 
     let (composer, widget, app) = setup_tui(default_provider, &model);
+    // Seed the session reasoning-effort from the startup `--effort` flag.
+    if effort_seed.is_some() {
+        app.lock().effort = effort_seed;
+    }
+    // Seed extra workspace roots from the startup `--root` flags (cline multi-root).
+    if !cli.root.is_empty() {
+        app.lock().workspace_roots.clone_from(&cli.root);
+    }
 
     // First-run discovery: if `origin init`'s welcome flow queued a pending
     // prompt, fire it as the user's first turn and remove the file so it
@@ -264,6 +362,12 @@ async fn run() -> Result<()> {
     render_task.abort();
     disable_raw_mode()?;
     execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+    // Localized farewell on a clean TUI exit (item A; origin-i18n locale from
+    // $LC_ALL/$LANG, English fallback). Only on the Ok path so error output is
+    // unchanged.
+    if result.is_ok() {
+        println!("{}", origin_cli::locale::line("bye"));
+    }
     result
 }
 
@@ -754,6 +858,139 @@ async fn handle_submit(
         handle.mark_dirty();
         return;
     }
+    // `/effort <level>` and `/fast` set the session reasoning-effort token that
+    // every subsequent PromptRequest carries. Client-side only — like /model.
+    if let Some(parsed) = origin_cli::effort::parse_effort_command(text) {
+        {
+            let mut a = app.lock();
+            a.add_line("you> ", text);
+        }
+        handle.mark_dirty();
+        match parsed {
+            Some(level) => {
+                let token = level.as_str();
+                app.lock().effort = Some(token.to_string());
+                app.lock()
+                    .add_line("system> ", &format!("reasoning effort: {token}"));
+            }
+            None => app
+                .lock()
+                .add_line("error> ", "usage: /effort <fast|low|medium|high|max>"),
+        }
+        handle.mark_dirty();
+        return;
+    }
+    // `/output-style <default|explanatory|learning|concise>` sets the session
+    // output style; its system suffix is sent on every subsequent PromptRequest.
+    if let Some(arg) = text
+        .trim()
+        .strip_prefix("/output-style")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        {
+            let mut a = app.lock();
+            a.add_line("you> ", text);
+        }
+        handle.mark_dirty();
+        match origin_outputstyle::Style::from_str_opt(arg.trim()) {
+            Some(style) => {
+                app.lock().output_style = Some(style);
+                app.lock()
+                    .add_line("system> ", &format!("output style: {}", style.label()));
+            }
+            None => app.lock().add_line(
+                "error> ",
+                "usage: /output-style <default|explanatory|learning|concise>",
+            ),
+        }
+        handle.mark_dirty();
+        return;
+    }
+    // `/steer <text>` queues a steering hint (gemini model steering). The hint
+    // is merged ahead of the user's text on the next real prompt, without
+    // starting a turn itself.
+    if let Some(hint) = text
+        .trim()
+        .strip_prefix("/steer")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        .map(str::trim)
+    {
+        app.lock().add_line("you> ", text);
+        if hint.is_empty() {
+            app.lock()
+                .add_line("error> ", "usage: /steer <hint to inject into the next turn>");
+        } else {
+            let pending = {
+                let mut a = app.lock();
+                a.steering.push(hint);
+                a.steering.len()
+            };
+            app.lock()
+                .add_line("system> ", &format!("steering hint queued ({pending} pending)"));
+        }
+        handle.mark_dirty();
+        return;
+    }
+    // `/plan [on|off]` toggles read-only plan mode (gemini Plan Mode). With no
+    // argument it flips the current state; subsequent prompts run read-only
+    // (the daemon denies every mutating tool) until toggled off.
+    if let Some(arg) = text
+        .trim()
+        .strip_prefix("/plan")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        .map(str::trim)
+    {
+        app.lock().add_line("you> ", text);
+        let now_on = {
+            let mut a = app.lock();
+            a.plan_mode = match arg {
+                "on" => true,
+                "off" => false,
+                _ => !a.plan_mode,
+            };
+            a.plan_mode
+        };
+        let msg = if now_on {
+            "plan mode ON — mutating tools (Edit/Write/Bash/…) are disabled until /plan off"
+        } else {
+            "plan mode OFF — edits and commands re-enabled"
+        };
+        app.lock().add_line("system> ", msg);
+        handle.mark_dirty();
+        return;
+    }
+    // `/attach <path>` stages an image/PDF for the next prompt (interactive
+    // parity with headless `origin run --attach`). The file is classified and
+    // encoded CLI-side so the daemon never reads client paths.
+    if let Some(path_arg) = text
+        .trim()
+        .strip_prefix("/attach")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        .map(str::trim)
+    {
+        app.lock().add_line("you> ", text);
+        if path_arg.is_empty() {
+            app.lock()
+                .add_line("error> ", "usage: /attach <path-to-image-or-pdf>");
+        } else {
+            match attach_file(path_arg) {
+                Ok(block) => {
+                    let pending = {
+                        let mut a = app.lock();
+                        a.pending_attachments.push(block);
+                        a.pending_attachments.len()
+                    };
+                    app.lock().add_line(
+                        "system> ",
+                        &format!("attached `{path_arg}` ({pending} staged for next prompt)"),
+                    );
+                }
+                Err(e) => app.lock().add_line("error> ", &format!("attach failed: {e}")),
+            }
+        }
+        handle.mark_dirty();
+        return;
+    }
     if let Some(rest) = slash_account_args(text) {
         {
             let mut a = app.lock();
@@ -863,11 +1100,32 @@ async fn handle_prompt_turn(
     let handle_for_backoff = handle.clone();
     let app_for_goal = Arc::clone(app);
     let handle_for_goal = handle.clone();
+    // Snapshot the session effort level so this turn carries `/effort`/`/fast`.
+    let effort = app.lock().effort.clone();
+    // The active output style's system suffix rides in the `system` field.
+    let system_suffix = app
+        .lock()
+        .output_style
+        .map(|s| s.system_suffix().to_string())
+        .unwrap_or_default();
+    // Drain any `/steer` hints and merge them ahead of the user text (gemini
+    // model steering). Empty queue ⇒ `user_text == text` (byte-identical).
+    let user_text = origin_cli::steering::next_turn_prompt(&mut app.lock().steering, text);
+    let read_only = app.lock().plan_mode;
+    // Drain any `/attach`-staged attachments for this turn (empty ⇒ text-only).
+    let attachments = std::mem::take(&mut app.lock().pending_attachments);
+    // Session-wide multi-root list (from the startup `--root` flags).
+    let roots = app.lock().workspace_roots.clone();
     let reply = call_daemon(
         path,
         model,
-        text,
+        &user_text,
         session_id,
+        effort,
+        system_suffix,
+        read_only,
+        attachments,
+        roots,
         interrupt_rx,
         move |ev: &StreamEvent| {
             // Bug #4: route Goal* events through the dedicated renderer so
@@ -1001,6 +1259,13 @@ async fn handle_prompt_turn(
     handle.mark_dirty();
 }
 
+/// Read and classify+encode one file into a multimodal content block for the
+/// interactive `/attach` command (image → base64 image block; PDF → text).
+fn attach_file(path: &str) -> anyhow::Result<origin_multimodal::ContentBlock> {
+    let bytes = std::fs::read(path)?;
+    origin_multimodal::to_content_block(&bytes, Some(path)).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 // `redundant_pub_crate`: the `tokio::select!` below expands to `pub(crate)`
 // helper items; in this bin crate (a private-module root) that trips the lint —
 // a known macro false positive, not author-written `pub(crate)` visibility.
@@ -1010,6 +1275,16 @@ async fn call_daemon(
     model: &str,
     user_text: &str,
     session_id: &str,
+    // Session reasoning-effort token (`/effort`/`/fast`); `None` ⇒ wire unchanged.
+    effort: Option<String>,
+    // Active output-style system suffix (`/output-style`); empty ⇒ no addendum.
+    system_suffix: String,
+    // Read-only plan mode (`/plan`); when true the daemon denies mutating tools.
+    read_only: bool,
+    // `/attach`-staged multimodal attachments for this turn (empty ⇒ text-only).
+    attachments: Vec<origin_multimodal::ContentBlock>,
+    // Session-wide extra workspace roots (`--root`); empty ⇒ single-root.
+    roots: Vec<String>,
     // Bug #5: one-shot channel surfacing user Ctrl+C while a Prompt is in
     // flight. When a tick lands we write `ClientMessage::Interrupt` to
     // the same connection serving the prompt — the daemon's
@@ -1032,10 +1307,14 @@ async fn call_daemon(
     let start = std::time::Instant::now();
     let mut client = Connector::connect(path).await?;
     let msg = ClientMessage::prompt(PromptRequest {
-        system: String::new(),
+        system: system_suffix,
         model: model.to_string(),
         user_text: user_text.to_string(),
         session_id: Some(session_id.to_string()),
+        effort,
+        attachments,
+        read_only,
+        roots,
     });
     let body = serde_json::to_vec(&msg)?;
     let frame = encode(1, FrameKind::Request, &body);
@@ -1366,6 +1645,9 @@ fn sub_to_action(sub: SessionsSub) -> origin_cli::admin::SessionsAction {
         SessionsSub::Ls => origin_cli::admin::SessionsAction::Ls,
         SessionsSub::Resume { session_id } => origin_cli::admin::SessionsAction::Resume(session_id),
         SessionsSub::Rm { session_id } => origin_cli::admin::SessionsAction::Rm(session_id),
+        SessionsSub::Rewind { session_id, keep } => {
+            origin_cli::admin::SessionsAction::Rewind { session_id, keep }
+        }
     }
 }
 

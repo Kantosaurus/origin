@@ -24,6 +24,10 @@ pub struct WireRequest<'a> {
     /// `usage` SSE frame with token counts (otherwise omitted).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<WireStreamOptions>,
+    /// Reasoning-effort hint (`reasoning_effort` on the wire). `None` is omitted,
+    /// keeping the request byte-identical to the pre-effort behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<&'static str>,
 }
 
 /// `stream_options` block on the streaming request body.
@@ -146,6 +150,7 @@ pub fn encode_request(req: &ChatRequest, stream: bool) -> WireRequest<'_> {
         } else {
             None
         },
+        reasoning_effort: req.effort.map(origin_provider::ReasoningEffort::as_wire_str),
     }
 }
 

@@ -102,6 +102,8 @@ async fn parallel_tool_calls_carry_index_prefix() {
                     messages: vec![Message::new(Role::User).with_block(Block::text("hi"))],
                     model: "gpt-test".into(),
                     tools: vec![],
+                    effort: None,
+                    attachments: Vec::new(),
                 },
                 &r,
             )

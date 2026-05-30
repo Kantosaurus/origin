@@ -166,6 +166,24 @@ impl ProviderFactory {
         &self.catalog
     }
 
+    /// Route a phase to a model via an [`origin_router::Router`] (Task 6).
+    ///
+    /// This is an *available* helper — it does NOT change the default
+    /// single-model selection performed by [`ProviderFactory::build`]; callers
+    /// opt in explicitly. It wraps `origin_router` so the daemon can pick a
+    /// `ModelRef` for a `phase` from `candidates` under any [`origin_router::Strategy`].
+    /// Returns `None` when the strategy yields no model (e.g. an empty
+    /// quota-fallback chain or every candidate exhausted).
+    #[must_use]
+    pub fn route(
+        &self,
+        strategy: origin_router::Strategy,
+        phase: origin_router::Phase,
+        candidates: &[origin_router::ModelRef],
+    ) -> Option<origin_router::ModelRef> {
+        origin_router::Router::new(strategy).choose(phase, candidates)
+    }
+
     /// Build an [`Arc<dyn Provider>`] for the given catalog id + account.
     ///
     /// # Errors
@@ -481,5 +499,34 @@ mod tests {
             "google"
         );
         assert!(ProviderId::parse("totally-not-a-provider", &cat).is_none());
+    }
+
+    /// Task 6: the router helper is *available* and routes by phase without
+    /// touching the default `build()` selection path.
+    #[test]
+    fn route_helper_selects_by_phase() {
+        use origin_router::{ModelRef, Phase, Strategy};
+        let cat = Catalog::builtin();
+        let vault = KeyVault::in_memory();
+        let factory = ProviderFactory::new(vault, cat);
+
+        let architect = ModelRef::new("anthropic", "claude-opus-4");
+        let editor = ModelRef::new("anthropic", "claude-sonnet-4-6");
+        let strat = Strategy::ArchitectEditor {
+            architect: architect.clone(),
+            editor: editor.clone(),
+        };
+
+        assert_eq!(
+            factory.route(strat.clone(), Phase::Plan, &[]),
+            Some(architect)
+        );
+        assert_eq!(factory.route(strat, Phase::Edit, &[]), Some(editor));
+
+        // QuotaFallback with an empty chain yields no model.
+        assert_eq!(
+            factory.route(Strategy::QuotaFallback { chain: vec![] }, Phase::Edit, &[]),
+            None
+        );
     }
 }

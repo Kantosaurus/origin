@@ -3741,6 +3741,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-ambient"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "origin-bench"
 version = "0.0.1"
 dependencies = [
@@ -3795,6 +3803,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-cassette"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "origin-cli"
 version = "0.0.1"
 dependencies = [
@@ -3806,20 +3823,42 @@ dependencies = [
  "dirs",
  "futures-util",
  "hostname",
+ "jsonschema",
+ "origin-ambient",
+ "origin-clipboard",
+ "origin-cost",
  "origin-daemon",
+ "origin-doctor",
+ "origin-export",
  "origin-goal",
+ "origin-i18n",
  "origin-ipc",
  "origin-keyvault",
+ "origin-knowledge",
+ "origin-lspfleet",
+ "origin-mermaid",
  "origin-migrate",
+ "origin-modeldiscovery",
+ "origin-multimodal",
+ "origin-oidc",
+ "origin-outputstyle",
  "origin-plan",
+ "origin-plugin",
  "origin-provider",
  "origin-runtime",
+ "origin-schedule",
+ "origin-scout",
  "origin-skills",
+ "origin-steering",
  "origin-store",
  "origin-stream",
  "origin-tools",
  "origin-trace",
  "origin-tui",
+ "origin-vcs",
+ "origin-voice",
+ "origin-watch",
+ "origin-websearch",
  "parking_lot",
  "rand 0.8.6",
  "reqwest",
@@ -3836,6 +3875,20 @@ dependencies = [
  "url",
  "urlencoding",
  "which",
+]
+
+[[package]]
+name = "origin-clipboard"
+version = "0.0.1"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "origin-cmdparse"
+version = "0.0.1"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3863,6 +3916,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-conseca"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "origin-core"
 version = "0.0.1"
 dependencies = [
@@ -3870,6 +3932,13 @@ dependencies = [
  "rkyv",
  "thiserror 1.0.69",
  "ulid",
+]
+
+[[package]]
+name = "origin-cost"
+version = "0.0.1"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -3897,19 +3966,30 @@ dependencies = [
  "hyper",
  "hyper-util",
  "origin-alloc",
+ "origin-ambient",
  "origin-browser",
  "origin-cas",
+ "origin-cmdparse",
  "origin-codegraph",
+ "origin-conseca",
  "origin-core",
+ "origin-cost",
+ "origin-export",
  "origin-goal",
  "origin-ipc",
  "origin-keyvault",
  "origin-lsp-client",
+ "origin-lspfleet",
  "origin-mem",
  "origin-metrics",
+ "origin-multimodal",
+ "origin-notify",
+ "origin-oidc",
  "origin-permission",
  "origin-plan",
  "origin-planner",
+ "origin-policy",
+ "origin-postedit",
  "origin-provider",
  "origin-provider-anthropic",
  "origin-provider-bedrock",
@@ -3919,15 +3999,21 @@ dependencies = [
  "origin-provider-openai",
  "origin-provider-openai-compat",
  "origin-provider-openrouter",
+ "origin-repomap",
  "origin-resume-token",
+ "origin-review",
+ "origin-router",
  "origin-runtime",
+ "origin-schedule",
  "origin-sidecar",
  "origin-skills",
  "origin-store",
  "origin-stream",
  "origin-swarm",
+ "origin-telemetry",
  "origin-tools",
  "origin-trace",
+ "origin-vcs",
  "parking_lot",
  "proptest",
  "rand 0.8.6",
@@ -3946,6 +4032,31 @@ dependencies = [
  "ulid",
  "which",
  "wiremock",
+]
+
+[[package]]
+name = "origin-doctor"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "origin-editfmt"
+version = "0.0.1"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "origin-export"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3970,6 +4081,10 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
 ]
+
+[[package]]
+name = "origin-i18n"
+version = "0.0.1"
 
 [[package]]
 name = "origin-ipc"
@@ -4021,6 +4136,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-knowledge"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "origin-lsp-client"
 version = "0.0.1"
 dependencies = [
@@ -4030,6 +4154,10 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
 ]
+
+[[package]]
+name = "origin-lspfleet"
+version = "0.0.1"
 
 [[package]]
 name = "origin-mcp"
@@ -4080,6 +4208,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-mermaid"
+version = "0.0.1"
+
+[[package]]
 name = "origin-metrics"
 version = "0.0.1"
 dependencies = [
@@ -4107,6 +4239,53 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "walkdir",
+]
+
+[[package]]
+name = "origin-modeldiscovery"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "origin-multimodal"
+version = "0.0.1"
+dependencies = [
+ "image",
+ "pdf-extract",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "origin-notify"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "origin-oidc"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "origin-outputstyle"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -4144,6 +4323,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-plugin"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "thiserror 1.0.69",
+ "walkdir",
+]
+
+[[package]]
+name = "origin-policy"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "thiserror 1.0.69",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "origin-postedit"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "origin-provider"
 version = "0.0.1"
 dependencies = [
@@ -4153,6 +4359,7 @@ dependencies = [
  "futures-util",
  "origin-cas",
  "origin-core",
+ "origin-multimodal",
  "origin-replay",
  "origin-stream",
  "parking_lot",
@@ -4176,7 +4383,9 @@ dependencies = [
  "eventsource-stream",
  "futures-util",
  "origin-cas",
+ "origin-cassette",
  "origin-core",
+ "origin-multimodal",
  "origin-planner",
  "origin-provider",
  "origin-stream",
@@ -4285,7 +4494,9 @@ dependencies = [
  "futures-util",
  "origin-cas",
  "origin-core",
+ "origin-multimodal",
  "origin-provider",
+ "origin-shimquirks",
  "origin-stream",
  "pin-utils",
  "reqwest",
@@ -4327,6 +4538,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-repomap"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "origin-resume-token"
 version = "0.0.1"
 dependencies = [
@@ -4338,6 +4557,22 @@ dependencies = [
  "serde_json",
  "subtle",
  "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "origin-review"
+version = "0.0.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "origin-router"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 
@@ -4364,6 +4599,31 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "origin-schedule"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "origin-scout"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "origin-shimquirks"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -4405,6 +4665,13 @@ dependencies = [
  "rkyv",
  "thiserror 1.0.69",
  "windows 0.58.0",
+]
+
+[[package]]
+name = "origin-steering"
+version = "0.0.1"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -4465,6 +4732,15 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "ulid",
+]
+
+[[package]]
+name = "origin-telemetry"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -4542,6 +4818,41 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width 0.1.14",
  "wide",
+]
+
+[[package]]
+name = "origin-vcs"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "origin-voice"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "origin-watch"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "thiserror 1.0.69",
+ "walkdir",
+]
+
+[[package]]
+name = "origin-websearch"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

@@ -93,6 +93,7 @@ fn usage_report_event_carries_rows() {
             model: "claude-opus-4-7".into(),
             tokens_in: 100,
             tokens_out: 50,
+            cost_usd: 0.0,
         }],
     };
     let s = serde_json::to_string(&ev).expect("ser");

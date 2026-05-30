@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "origin-clipboard"
+description = "Copy/paste web-chat mode: format context to paste and parse pasted edits."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = "1"

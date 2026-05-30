@@ -270,6 +270,26 @@ impl SessionStore {
         })?;
         Ok(())
     }
+
+    /// Conversation rewind: keep the first `keep_turns` message rows of a
+    /// session (those with `turn_index < keep_turns`) and delete the rest,
+    /// rolling the transcript back to an earlier point. The session row itself
+    /// is preserved so the trimmed history can still be `resume`d. Returns the
+    /// number of message rows removed. Idempotent when `keep_turns` already
+    /// covers the whole transcript (removes nothing).
+    ///
+    /// # Errors
+    /// Propagates sqlite errors on write failure.
+    pub fn truncate_after(&self, session_id: &str, keep_turns: u32) -> Result<u32, SessionStoreError> {
+        let removed: usize = self.inner.with_conn(|c| {
+            let n = c.execute(
+                "DELETE FROM messages WHERE session_id = ?1 AND turn_index >= ?2",
+                rusqlite::params![session_id, keep_turns],
+            )?;
+            Ok(n)
+        })?;
+        Ok(u32::try_from(removed).unwrap_or(u32::MAX))
+    }
 }
 
 fn now_ms() -> i64 {
@@ -281,4 +301,39 @@ fn now_ms() -> i64 {
             i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Session, SessionStore};
+    use origin_core::types::{Block, Message, Role};
+
+    #[test]
+    fn truncate_after_keeps_first_n_turns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(dir.path().join("sessions.db")).expect("open");
+        let sid = "sess-rewind";
+        // Persist the parent session row first (messages FK → sessions.id).
+        store
+            .persist_session(&Session::new_with_id(sid.to_string(), "test-model".to_string()))
+            .expect("persist session");
+        for i in 0..5u32 {
+            let m = Message::new(Role::User).with_block(Block::text(format!("turn {i}")));
+            store.persist_message(sid, i, &m).expect("persist");
+        }
+        assert_eq!(store.load_messages(sid).expect("load").len(), 5);
+
+        // Keep the first 3 turns; the last 2 are removed.
+        let removed = store.truncate_after(sid, 3).expect("truncate");
+        assert_eq!(removed, 2);
+        assert_eq!(store.load_messages(sid).expect("load").len(), 3);
+
+        // Idempotent: keeping more turns than exist removes nothing.
+        assert_eq!(store.truncate_after(sid, 10).expect("truncate"), 0);
+        assert_eq!(store.load_messages(sid).expect("load").len(), 3);
+
+        // Keeping 0 turns clears the transcript.
+        assert_eq!(store.truncate_after(sid, 0).expect("truncate"), 3);
+        assert!(store.load_messages(sid).expect("load").is_empty());
+    }
 }

@@ -41,6 +41,8 @@ async fn calls_gemini_generate_content_endpoint() {
         messages: vec![Message::new(Role::User).with_block(Block::text("ping"))],
         model: "gemini-2.0-flash".into(),
         tools: vec![],
+        effort: None,
+        attachments: Vec::new(),
     };
     let resp = provider.chat(req).await.expect("gemini chat should succeed");
 
@@ -84,6 +86,8 @@ async fn auth_error_maps_to_provider_auth() {
             messages: vec![],
             model: "gemini-2.0-flash".into(),
             tools: vec![],
+            effort: None,
+            attachments: Vec::new(),
         })
         .await
         .expect_err("should fail with auth");

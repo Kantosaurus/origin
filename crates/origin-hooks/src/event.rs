@@ -42,6 +42,12 @@ pub enum LifecycleEvent {
     },
     SessionStart,
     SessionEnd,
+    /// Fired when a rendered assistant message is about to be displayed, so a
+    /// hook may transform or hide it (see `origin_outputstyle`).
+    MessageDisplay {
+        /// The message text about to be displayed.
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

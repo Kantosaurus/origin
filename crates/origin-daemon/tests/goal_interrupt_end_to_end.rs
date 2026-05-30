@@ -146,6 +146,7 @@ async fn non_interrupt_pushback_also_clears_and_preserves_message() {
                 model: "m".into(),
                 user_text: "after the goal".into(),
                 session_id: None,
+                ..Default::default()
             }));
         })
     });

@@ -217,6 +217,8 @@ impl Verifier for ScriptedVerifier<'_> {
             messages: vec![Message::new(Role::User).with_block(Block::text(user_text))],
             model: "claude-haiku-4-5".into(),
             tools: Vec::new(),
+            effort: None,
+            attachments: Vec::new(),
         };
         let resp = self
             .provider

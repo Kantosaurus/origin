@@ -39,6 +39,8 @@ impl Verifier for AnthropicHaikuVerifier {
             messages: vec![Message::new(Role::User).with_block(Block::text(user_text))],
             model: self.model.clone(),
             tools: Vec::new(),
+            effort: None,
+            attachments: Vec::new(),
         };
         let resp = self.provider.chat(req).await.map_err(|e| match e {
             origin_provider::ProviderError::RateLimit { .. } => VerifierError::RateLimit,

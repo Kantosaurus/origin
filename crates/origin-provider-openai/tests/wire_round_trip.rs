@@ -51,6 +51,8 @@ async fn calls_openai_chat_completions_endpoint() {
         messages: vec![Message::new(Role::User).with_block(Block::text("ping"))],
         model: "gpt-4o".into(),
         tools: vec![],
+        effort: None,
+        attachments: Vec::new(),
     };
     let resp = provider.chat(req).await.expect("openai chat should succeed");
 
@@ -93,6 +95,8 @@ async fn auth_error_maps_to_provider_auth() {
             messages: vec![],
             model: "gpt-4o".into(),
             tools: vec![],
+            effort: None,
+            attachments: Vec::new(),
         })
         .await
         .expect_err("should fail with auth");

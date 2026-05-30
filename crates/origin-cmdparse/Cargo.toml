@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "origin-cmdparse"
+description = "Bash command-line safety analysis that hardens the permission gate against known bypass classes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = "1"

@@ -13,8 +13,10 @@ workspace = true
 [dependencies]
 origin-core = { path = "../origin-core" }
 origin-provider = { path = "../origin-provider" }
+origin-shimquirks = { path = "../origin-shimquirks" }
 origin-stream = { path = "../origin-stream" }
 origin-cas = { path = "../origin-cas" }
+origin-multimodal = { path = "../origin-multimodal" }
 async-trait = "0.1"
 futures-util = "0.3"
 pin-utils = "0.1"
