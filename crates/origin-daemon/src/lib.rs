@@ -39,3 +39,4 @@ pub mod routing;
 pub mod overnight;
 pub mod hooks_runtime;
 pub mod swarm_worker;
+pub mod subagents_md;

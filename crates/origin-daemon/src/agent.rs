@@ -954,6 +954,11 @@ pub async fn run_loop(
     } else {
         String::new()
     };
+    // gemini Markdown-defined subagents: surface any `~/.origin/subagents/*.md`
+    // declarative sub-agents so the model can launch them via the Task tool
+    // (the real worker enforces their allow-list). Built once + cached; empty
+    // when there is no subagents dir ⇒ byte-identical system prompt.
+    let subagents_block = crate::subagents_md::global_block();
     // Optional output-style addendum (claude-code output styles). Default-off:
     // `None`/empty appends nothing, leaving the assembled prompt — and the
     // prompt-cache breakpoints — byte-identical to before.
@@ -962,7 +967,7 @@ pub async fn run_loop(
     // roots, tell the model it may read/edit across them. Empty ⇒ byte-identical.
     let roots_block = workspace_roots_block(&session.roots);
     let recalled_system = {
-        let parts: [&str; 10] = [
+        let parts: [&str; 11] = [
             &repo_map_block,
             identity_block,
             &directive_block,
@@ -973,6 +978,7 @@ pub async fn run_loop(
             &style_block,
             &roots_block,
             &edit_format_block,
+            subagents_block,
         ];
         parts
             .iter()
