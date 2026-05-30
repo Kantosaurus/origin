@@ -70,6 +70,10 @@ pub struct TaskInput {
     /// Optional budget override; defaults applied per field if omitted.
     #[serde(default)]
     pub budget: TaskBudget,
+    /// Optional model override for this sub-agent (per-agent routing). `None`
+    /// ⇒ the worker uses the daemon default model.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Actionable inlined view of the worker's [`CompletionReport`].
@@ -121,6 +125,7 @@ pub async fn task_tool(coord: &Coordinator, input: TaskInput) -> Result<TaskOutp
         },
         workspace: None,
         parent_actor: origin_plan::ActorId::new(0),
+        model: input.model,
     };
     let handle = coord.spawn(spec).await?;
     let report = coord.await_completion(&handle).await?;
@@ -145,7 +150,7 @@ crate::origin_tool! {
     tier: crate::Tier::RequiresPermission,
     urgency: crate::Urgency::Medium,
     side_effects: crate::SideEffects::Mutating,
-    input_schema: r#"{"type":"object","required":["goal","allowed_tools"],"properties":{"goal":{"type":"string"},"allowed_tools":{"type":"array","items":{"type":"string"}},"budget":{"type":"object"}}}"#,
+    input_schema: r#"{"type":"object","required":["goal","allowed_tools"],"properties":{"goal":{"type":"string"},"allowed_tools":{"type":"array","items":{"type":"string"}},"budget":{"type":"object"},"model":{"type":"string"}}}"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
     token_budget: crate::DEFAULT_TOKEN_BUDGET,
     hot: false,
