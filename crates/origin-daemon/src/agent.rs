@@ -728,6 +728,18 @@ pub async fn run_loop(
 
     session.push(Message::new(Role::User).with_block(Block::text(user_text)));
 
+    // Live lifecycle hooks (gemini): loaded once from ~/.origin/hooks.json.
+    // `None` (no config — the default) makes every fire below a no-op, so the
+    // agent loop is byte-identical. A configured PreTool hook can Deny a tool.
+    let hooks = crate::hooks_runtime::global().await;
+    if let Some(h) = &hooks {
+        let _ = h
+            .fire(&origin_hooks::LifecycleEvent::PrePrompt {
+                text: user_text.to_string(),
+            })
+            .await;
+    }
+
     let tools_schema = registry_iter()
         .map(|m| {
             if m.hot {
@@ -1202,6 +1214,14 @@ pub async fn run_loop(
                 }
             }
 
+            // gemini PostPrompt lifecycle hook (informational): the prompt is
+            // resolving with this assistant text. No hooks configured ⇒ skipped.
+            if let Some(h) = &hooks {
+                let _ = h
+                    .fire(&origin_hooks::LifecycleEvent::PostPrompt { text: text.clone() })
+                    .await;
+            }
+
             // End-of-turn side effects (Tasks 1, 4, 5). All are best-effort and
             // default-off (env-gated); none can fail the turn.
             run_turn_end_effects(
@@ -1284,6 +1304,23 @@ pub async fn run_loop(
             if decision.outcome == Outcome::Allow {
                 decision =
                     apply_read_only_overlay(decision, opts.read_only, meta.side_effects, meta.name);
+            }
+
+            // gemini PreTool lifecycle hook. Same deny-only contract as the
+            // overlays above: a configured hook may downgrade Allow→Deny, never
+            // widen. No hooks configured ⇒ skipped entirely.
+            if decision.outcome == Outcome::Allow {
+                if let Some(h) = &hooks {
+                    let ev = origin_hooks::LifecycleEvent::PreTool {
+                        tool: name.clone(),
+                        args_preview: preview.clone(),
+                        sandbox_ordinal: meta.sandbox_profile.ordinal(),
+                    };
+                    if let origin_hooks::HookOverride::Deny { reason } = h.fire(&ev).await {
+                        decision.outcome = Outcome::Deny;
+                        decision.reason = format!("hook denied: {reason}");
+                    }
+                }
             }
 
             if decision.outcome == Outcome::Deny {
@@ -1496,6 +1533,17 @@ pub async fn run_loop(
                     cache_marker: None,
                 }
             };
+            // gemini PostTool lifecycle hook (informational): fires after a tool
+            // completes successfully. No hooks configured ⇒ skipped.
+            if let Some(h) = &hooks {
+                let _ = h
+                    .fire(&origin_hooks::LifecycleEvent::PostTool {
+                        tool: name.clone(),
+                        phase: origin_hooks::ToolPhase::Ok,
+                        sandbox_ordinal: meta.sandbox_profile.ordinal(),
+                    })
+                    .await;
+            }
             tool_results.push(block);
         }
 
