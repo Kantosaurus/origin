@@ -550,6 +550,10 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     // so it runs through the exact same agent path as an interactive turn.
     origin_daemon::scheduler::maybe_spawn(path.clone());
     origin_daemon::ambient::maybe_spawn(path.clone());
+    // jcode Overnight mode (ORIGIN_OVERNIGHT=1); off by default. Runs an
+    // OvernightPlan to completion within a wall-clock window and persists a
+    // morning report to ~/.origin/overnight/ for `origin ambient report`.
+    origin_daemon::overnight::maybe_spawn(path.clone());
     // Authenticated HTTP webhook trigger source (ORIGIN_WEBHOOK + _TOKEN); off
     // by default. A POST fires its body as a prompt onto the live agent path.
     origin_daemon::webhook::maybe_spawn(path.clone());

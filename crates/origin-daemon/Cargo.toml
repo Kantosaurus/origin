@@ -73,6 +73,8 @@ origin-lspfleet         = { path = "../origin-lspfleet" }
 origin-review           = { path = "../origin-review" }
 origin-schedule         = { path = "../origin-schedule" }
 origin-ambient          = { path = "../origin-ambient" }
+origin-editfmt          = { path = "../origin-editfmt" }
+origin-hooks            = { path = "../origin-hooks" }
 ctrlc                   = "3"
 dirs                    = "5"
 which                   = "8"
