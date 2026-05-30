@@ -184,7 +184,13 @@ impl Coordinator {
         let last = Arc::clone(&self.last_completion);
         let lc_tx_for_spawn = lc_tx.clone();
         let per_worker_slot = Arc::clone(&report_slot);
-        spawn_in(TaskClass::Critical, async move {
+        // Worker bodies run in `Sidecar`, NOT `Critical`. A parent agent holds a
+        // `Critical` permit while it awaits a child (`Task` → `await_completion`);
+        // spawning the child in `Critical` too would deadlock once the fixed
+        // `Critical` pool is exhausted (parent waits for child, child waits for a
+        // permit the parent holds). `Sidecar` has an independent permit pool and
+        // is not gated on Critical-idle, breaking the circular wait.
+        spawn_in(TaskClass::Sidecar, async move {
             // We immediately publish `Running` so spawn callers can rely on
             // observing it (the test only awaits `Done` / `Failed`, but
             // future P9.8 paths need the transition to be observable).
