@@ -59,6 +59,11 @@ pub struct WorkerSpec {
     pub workspace: Option<PathBuf>,
     /// Parent actor id — used to thread Lamport ordering through worker ops.
     pub parent_actor: ActorId,
+    /// Optional per-worker model override (openclaude per-agent routing). `None`
+    /// ⇒ the worker uses the daemon default; `Some` routes this sub-agent to a
+    /// specific model (e.g. a cheap "explorer" vs an expensive "planner").
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// A follow-up task suggested by a worker on completion.

@@ -103,6 +103,7 @@ async fn worker_sees_inherited_ledger_in_context() {
         },
         workspace: None,
         parent_actor: ActorId::new(0),
+        model: None,
     };
 
     let handle = coord.spawn_with(spec, worker).await.expect("spawn");

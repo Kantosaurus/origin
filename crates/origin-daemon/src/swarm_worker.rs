@@ -74,7 +74,11 @@ async fn run_worker(
     ctx: WorkerContext,
 ) -> Result<CompletionReport, origin_swarm::SwarmError> {
     let provider = active.read().await.clone();
-    let model = std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".to_string());
+    // Per-agent routing (openclaude): use the worker's explicit model override
+    // when set, else the daemon default.
+    let model = ctx.spec.model.clone().unwrap_or_else(|| {
+        std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".to_string())
+    });
     let mut session = Session::new(provider.name(), &model);
 
     // Narrow the child's tools to its allow-list, and never `Task` (a child that
