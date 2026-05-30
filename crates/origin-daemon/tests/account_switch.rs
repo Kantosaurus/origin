@@ -69,6 +69,7 @@ fn client_message_prompt_round_trips() {
         model: "claude-opus-4-7".into(),
         user_text: "hello".into(),
         session_id: None,
+        ..Default::default()
     });
     let json = serde_json::to_string(&msg).expect("serialize prompt");
     // Internally-tagged: `kind` discriminator sits next to the flattened fields.
@@ -88,6 +89,7 @@ fn client_message_prompt_round_trips() {
         | ClientMessage::PairRedeem { .. }
         | ClientMessage::ListSessions
         | ClientMessage::RemoveSession { .. }
+        | ClientMessage::RewindSession { .. }
         | ClientMessage::ResumeSession { .. }
         | ClientMessage::GetUsage
         | ClientMessage::KeyringAdd { .. }
@@ -98,6 +100,7 @@ fn client_message_prompt_round_trips() {
         | ClientMessage::ActivateSkill { .. }
         | ClientMessage::DeactivateSkill { .. }
         | ClientMessage::ActivateWorkflow { .. }
+        | ClientMessage::ExportSession { .. }
         | ClientMessage::Interrupt => unreachable!("expected Prompt variant"),
     }
 }
@@ -124,6 +127,7 @@ fn client_message_switch_account_round_trips() {
         | ClientMessage::PairRedeem { .. }
         | ClientMessage::ListSessions
         | ClientMessage::RemoveSession { .. }
+        | ClientMessage::RewindSession { .. }
         | ClientMessage::ResumeSession { .. }
         | ClientMessage::GetUsage
         | ClientMessage::KeyringAdd { .. }
@@ -134,6 +138,7 @@ fn client_message_switch_account_round_trips() {
         | ClientMessage::ActivateSkill { .. }
         | ClientMessage::DeactivateSkill { .. }
         | ClientMessage::ActivateWorkflow { .. }
+        | ClientMessage::ExportSession { .. }
         | ClientMessage::Interrupt => unreachable!("expected SwitchAccount variant"),
     }
 }

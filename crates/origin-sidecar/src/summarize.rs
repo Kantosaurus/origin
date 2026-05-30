@@ -23,6 +23,8 @@ pub async fn run(
         messages: transcript.to_vec(),
         model: model.to_string(),
         tools: Vec::new(),
+        effort: None,
+        attachments: Vec::new(),
     };
     let summary = match provider.chat(req).await {
         Ok(resp) => first_text(&resp.assistant).unwrap_or_else(|| fallback(transcript)),

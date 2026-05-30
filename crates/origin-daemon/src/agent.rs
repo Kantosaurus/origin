@@ -25,6 +25,299 @@ use thiserror::Error;
 use tokio::task::spawn_blocking as sb;
 use tokio::task::JoinHandle;
 
+/// `GitRunner` implementation that shells out to the system `git` binary.
+///
+/// Used by the optional per-turn shadow-git checkpoint feature (Task 1). It is
+/// the only place in the daemon that drives [`origin_vcs::ShadowGit`]; all of
+/// its effects are best-effort and gated behind `ORIGIN_CHECKPOINTS=1`, so the
+/// default code path never constructs or invokes it.
+struct CmdGit;
+
+impl origin_vcs::GitRunner for CmdGit {
+    fn run(&self, args: &[&str]) -> Result<String, origin_vcs::VcsError> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .output()
+            .map_err(|e| origin_vcs::VcsError::Git(e.to_string()))?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        } else {
+            Err(origin_vcs::VcsError::Git(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ))
+        }
+    }
+}
+
+/// Best-effort per-turn shadow-git checkpoint. No-op unless
+/// `ORIGIN_CHECKPOINTS=1`. Every failure is swallowed — a checkpoint must
+/// never fail the turn that produced it. Default-off ⇒ byte-identical behavior.
+fn maybe_checkpoint_turn() {
+    if std::env::var("ORIGIN_CHECKPOINTS").as_deref() != Ok("1") {
+        return;
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let shadow_dir = cwd.join(".origin").join("shadow.git");
+    let shadow = shadow_dir.to_string_lossy().into_owned();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let runner = CmdGit;
+    let sg = origin_vcs::ShadowGit::new(&runner, shadow);
+    if let Err(e) = sg.snapshot("turn", now_ms) {
+        tracing::debug!(error = %e, "shadow-git checkpoint failed (ignored)");
+    }
+}
+
+/// DENY-ONLY governance overlay (Task 3).
+///
+/// Given a base `decision` that is already `Allow`, apply the optional
+/// [`origin_policy::PolicyEngine`] and [`origin_conseca::SecurityPolicy`] layers
+/// from `opts`. Either layer may downgrade the Allow to a Deny, but neither can
+/// widen anything — this function is only ever called on an `Allow`, and it
+/// returns either that same `Allow` or a fresh `Deny`. When both layers are
+/// `None` (the default at every construction site) it returns `decision`
+/// unchanged, so default behavior is byte-identical.
+fn apply_governance_overlay(
+    decision: origin_permission::Decision,
+    tool: &str,
+    opts: &LoopOptions,
+) -> origin_permission::Decision {
+    if let Some(policy) = opts.policy.as_ref() {
+        if !policy.is_tool_allowed(tool) {
+            return origin_permission::Decision {
+                outcome: Outcome::Deny,
+                reason: format!("policy: tool `{tool}` is not permitted by the governance layer"),
+            };
+        }
+    }
+    if let Some(conseca) = opts.conseca.as_ref() {
+        if !origin_conseca::check_tool(conseca, tool).is_allow() {
+            return origin_permission::Decision {
+                outcome: Outcome::Deny,
+                reason: format!("conseca: tool `{tool}` is denied by the per-prompt security policy"),
+            };
+        }
+    }
+    decision
+}
+
+/// DENY-ONLY bash command-safety overlay (cmdparse wiring).
+///
+/// Given a base `decision` that is already `Allow`, inspect a `Bash` tool's
+/// command string with [`origin_cmdparse::analyze`] and downgrade the `Allow`
+/// to a `Deny` when [`origin_cmdparse::worst`] classifies it as
+/// [`origin_cmdparse::Risk::Dangerous`]. Like [`apply_governance_overlay`],
+/// this can only ever turn an `Allow` into a `Deny`, never widen.
+///
+/// The whole overlay is gated behind the `ORIGIN_CMD_GUARD=1` environment
+/// variable and only applies to the `Bash` tool, so with the flag unset (the
+/// default) it returns `decision` unchanged and default behavior is
+/// byte-identical. `args` is the tool's parsed JSON arguments; the command is
+/// read from the `command` field (matching the `Bash` builtin's schema).
+fn apply_cmd_guard(
+    decision: origin_permission::Decision,
+    tool: &str,
+    args: &Value,
+) -> origin_permission::Decision {
+    if tool != "Bash" || std::env::var("ORIGIN_CMD_GUARD").as_deref() != Ok("1") {
+        return decision;
+    }
+    let Some(cmd) = args.get("command").and_then(Value::as_str) else {
+        return decision;
+    };
+    let analysis = origin_cmdparse::analyze(cmd);
+    if let origin_cmdparse::Risk::Dangerous(reason) = origin_cmdparse::worst(&analysis) {
+        return origin_permission::Decision {
+            outcome: Outcome::Deny,
+            reason: format!("cmd-guard: dangerous bash command blocked: {reason}"),
+        };
+    }
+    decision
+}
+
+/// Render a `<workspace-roots>` system-prompt block listing the additional
+/// workspace roots the agent may operate across (cline multi-root workspaces).
+/// Empty `roots` ⇒ empty string, leaving the assembled prompt byte-identical.
+fn workspace_roots_block(roots: &[std::path::PathBuf]) -> String {
+    if roots.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(
+        "<workspace-roots>\nYou are operating across multiple workspace roots. You may read and \
+         edit files under ANY of these directories (use absolute paths):\n",
+    );
+    for r in roots {
+        s.push_str("- ");
+        s.push_str(&r.display().to_string());
+        s.push('\n');
+    }
+    s.push_str("</workspace-roots>");
+    s
+}
+
+/// DENY-ONLY read-only "plan mode" overlay (gemini Plan Mode).
+///
+/// When `read_only` is set, any tool that is not `SideEffects::Pure` is
+/// downgraded from Allow to Deny so the design phase cannot mutate the
+/// workspace. Like the other overlays this can only narrow an Allow to a Deny,
+/// never widen a Deny; with `read_only == false` it is a no-op.
+fn apply_read_only_overlay(
+    decision: origin_permission::Decision,
+    read_only: bool,
+    side_effects: SideEffects,
+    tool: &str,
+) -> origin_permission::Decision {
+    if read_only && decision.outcome == Outcome::Allow && !matches!(side_effects, SideEffects::Pure) {
+        return origin_permission::Decision {
+            outcome: Outcome::Deny,
+            reason: format!(
+                "plan mode: tool `{tool}` is read-only-blocked (mutating tools are disabled in plan mode)"
+            ),
+        };
+    }
+    decision
+}
+
+/// Best-effort end-of-turn side effects (Tasks 1, 4, 5).
+///
+/// Each sub-step is independently env-gated and default-off:
+/// - `ORIGIN_CHECKPOINTS=1` ⇒ shadow-git snapshot, only if `mutated`.
+/// - `ORIGIN_TELEMETRY=1` ⇒ append one redacted JSONL `turn` event.
+/// - `ORIGIN_NOTIFY=1` ⇒ spawn a desktop completion notification.
+///
+/// With no env flags set (the default) this function does nothing observable,
+/// so default behavior and every existing test stay byte-identical.
+fn run_turn_end_effects(
+    mutated: bool,
+    provider: &str,
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) {
+    if mutated {
+        maybe_checkpoint_turn();
+    }
+    maybe_record_turn_telemetry(provider, model, input_tokens, output_tokens);
+    maybe_notify_completion();
+}
+
+/// Best-effort opt-in telemetry (Task 4). No-op unless `ORIGIN_TELEMETRY=1`
+/// (opt-in) and `DO_NOT_TRACK` is unset. When enabled, appends a single
+/// redacted JSONL `turn` event under `~/.origin/telemetry/turns.jsonl`. All
+/// failures are swallowed. Disabled-by-default ⇒ no events, no file.
+fn maybe_record_turn_telemetry(provider: &str, model: &str, input_tokens: u64, output_tokens: u64) {
+    use std::io::Write as _;
+    let do_not_track = std::env::var_os("DO_NOT_TRACK").is_some();
+    let opt_in = std::env::var("ORIGIN_TELEMETRY").as_deref() == Ok("1");
+    let cfg = origin_telemetry::Config::from_env(do_not_track, opt_in, 1.0);
+    let mut pipeline = origin_telemetry::Pipeline::new(cfg);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let mut event = origin_telemetry::Event::new("turn".to_string(), now_ms);
+    event.props = vec![
+        ("provider".to_string(), provider.to_string()),
+        ("model".to_string(), model.to_string()),
+        (
+            "tokens".to_string(),
+            (input_tokens.saturating_add(output_tokens)).to_string(),
+        ),
+    ];
+    pipeline.record(event);
+    let lines = pipeline.drain();
+    if lines.is_empty() {
+        return; // disabled or sampled out — never touch the filesystem.
+    }
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let dir = home.join(".origin").join("telemetry");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("turns.jsonl");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        for line in lines {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
+/// Best-effort desktop completion notification (Task 5). No-op unless
+/// `ORIGIN_NOTIFY=1`. Spawns the platform desktop-notification command and
+/// ignores every failure. Default-off ⇒ no spawn.
+fn maybe_notify_completion() {
+    if std::env::var("ORIGIN_NOTIFY").as_deref() != Ok("1") {
+        return;
+    }
+    let n = origin_notify::Notification::new("origin", "Turn complete", false);
+    let (program, cmd_args) = origin_notify::desktop_command(&n);
+    let _ = std::process::Command::new(program).args(cmd_args).spawn();
+}
+
+/// Best-effort post-edit auto-format (Task 2). No-op unless `ORIGIN_AUTOFORMAT=1`
+/// and [`origin_postedit::formatter_for`] maps `path` to a known formatter.
+/// When both hold, spawns `<formatter-argv...> <path>` and ignores every
+/// failure (a missing formatter binary must never fail the edit tool).
+/// Default-off ⇒ no spawn, behavior unchanged.
+fn maybe_autoformat(path: &str) {
+    if std::env::var("ORIGIN_AUTOFORMAT").as_deref() != Ok("1") {
+        return;
+    }
+    // Security (argv flag smuggling): a model-edited file path beginning with
+    // `-` could be parsed by the formatter as an option rather than a file.
+    // Refuse such paths outright; the `--` sentinel below is the second guard.
+    if path.starts_with('-') {
+        tracing::warn!(path, "skipping autoformat: path looks like a flag");
+        return;
+    }
+    let Some(cmd) = origin_postedit::formatter_for(path) else {
+        return;
+    };
+    // `cmd` may be a program plus flags, e.g. "ruff format"; split on
+    // whitespace so the program and its sub-args are passed correctly.
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    let Some((program, flags)) = tokens.split_first() else {
+        return;
+    };
+    let _ = std::process::Command::new(program)
+        .args(flags)
+        .arg("--") // end-of-options sentinel: everything after is a positional path
+        .arg(path)
+        .spawn();
+}
+
+/// Extract candidate target file paths from a patch body for auto-formatting.
+///
+/// Recognizes both unified-diff `+++ b/<path>` headers and the apply-patch
+/// `*** Update File: <path>` / `*** Add File: <path>` markers. Best-effort and
+/// lossy — anything not matched is simply skipped; the caller only uses the
+/// result to *offer* formatting under the `ORIGIN_AUTOFORMAT` gate.
+fn patch_target_paths(patch: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in patch.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("+++ ") {
+            let p = rest.trim().trim_start_matches("b/");
+            if !p.is_empty() && p != "/dev/null" {
+                out.push(p.to_string());
+            }
+        } else if let Some(rest) = trimmed
+            .strip_prefix("*** Update File: ")
+            .or_else(|| trimmed.strip_prefix("*** Add File: "))
+        {
+            let p = rest.trim();
+            if !p.is_empty() {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Maximum number of times `run_loop` retries a single turn's provider call
 /// after a `ProviderError::RateLimit`. After the cap is hit the error is
 /// propagated as a `LoopError::Provider` and the turn fails normally.
@@ -145,6 +438,39 @@ pub struct LoopOptions {
     /// `LoopOptions::with_goal` builder was removed in the Bug-#22 cleanup
     /// — it had no production callers.)
     pub goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
+    /// Optional governance policy engine (Task 3). When `Some`, a tool the
+    /// base permission check would *allow* is downgraded to Deny if
+    /// [`origin_policy::PolicyEngine::is_tool_allowed`] returns `false`. It
+    /// can never widen a Deny. `None` (the default everywhere) ⇒ no effect.
+    pub policy: Option<Arc<origin_policy::PolicyEngine>>,
+    /// Optional per-prompt `ConSeca` security policy (Task 3). Same deny-only
+    /// contract as `policy`: an Allow is downgraded to Deny when
+    /// [`origin_conseca::check_tool`] is not `Allow`. `None` ⇒ no effect.
+    pub conseca: Option<Arc<origin_conseca::SecurityPolicy>>,
+    /// Optional reasoning-effort hint for every turn of this loop. `None` (the
+    /// default) leaves each `ChatRequest.effort` as `None` ⇒ provider wire
+    /// byte-identical. Set from `PromptRequest.effort` in `handle_request`.
+    /// *Closes: claude-code `/effort`+`/fast` (the agent-loop wire).*
+    pub effort: Option<origin_provider::ReasoningEffort>,
+    /// Multimodal attachments to append to the FIRST user turn of this loop
+    /// (turn 1 only — later turns carry tool-results, not the user image).
+    /// Empty ⇒ text-only wire unchanged. Set from `PromptRequest.attachments`.
+    /// *Closes: aider/gemini/claude image+PDF input (the agent-loop wire).*
+    pub attachments: Vec<origin_multimodal::ContentBlock>,
+    /// Optional addendum appended to the assembled system prompt every turn.
+    /// Carries the active output-style's system suffix (Explanatory / Learning /
+    /// Concise). `None`/empty ⇒ the prompt — and thus the prompt-cache
+    /// breakpoints — are byte-identical to before. Set from the (otherwise
+    /// unused) `PromptRequest.system` field in `handle_request`.
+    /// *Closes: claude-code output styles (the system-prompt wire).*
+    pub system_suffix: Option<String>,
+    /// Read-only "plan mode" (gemini Plan Mode). When `true`, the per-tool
+    /// permission check downgrades any non-`Pure` tool (Edit/Write/Bash/…) from
+    /// Allow to Deny — a hard read-only design phase that cannot mutate the
+    /// workspace. Deny-only: it never widens an existing Deny. `false` (the
+    /// default) ⇒ no effect. Set from `PromptRequest.read_only`.
+    /// *Closes: gemini Plan Mode (the policy-enforced read-only phase).*
+    pub read_only: bool,
 }
 
 impl Default for LoopOptions {
@@ -169,6 +495,12 @@ impl Default for LoopOptions {
             coordinator: None,
             plan: None,
             goal: Arc::new(tokio::sync::Mutex::new(None)),
+            policy: None,
+            conseca: None,
+            effort: None,
+            attachments: Vec::new(),
+            system_suffix: None,
+            read_only: false,
         }
     }
 }
@@ -574,14 +906,37 @@ pub async fn run_loop(
             })
             .unwrap_or_default()
     };
+    // Item E (env `ORIGIN_REPOMAP=1`): when set, prepend a compact, token-budgeted
+    // `<repo-map>` block (aider-style personalized PageRank over a def/ref file
+    // graph) so the model gets repository structure up front. Default-off: with
+    // the flag unset this stays `String::new()` and the assembled prompt — and
+    // thus the prompt cache breakpoints — are byte-identical to before.
+    let repo_map_block = if std::env::var("ORIGIN_REPOMAP").as_deref() == Ok("1") {
+        std::env::current_dir()
+            .ok()
+            .and_then(|cwd| crate::subsystems::repo_map_block(&cwd))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    // Optional output-style addendum (claude-code output styles). Default-off:
+    // `None`/empty appends nothing, leaving the assembled prompt — and the
+    // prompt-cache breakpoints — byte-identical to before.
+    let style_block = opts.system_suffix.clone().unwrap_or_default();
+    // Multi-root workspace block (cline): when the session was opened with extra
+    // roots, tell the model it may read/edit across them. Empty ⇒ byte-identical.
+    let roots_block = workspace_roots_block(&session.roots);
     let recalled_system = {
-        let parts: [&str; 6] = [
+        let parts: [&str; 9] = [
+            &repo_map_block,
             identity_block,
             &directive_block,
             &catalog_block,
             &workflows_block,
             &recall_block_wrapped,
             &goal_block,
+            &style_block,
+            &roots_block,
         ];
         parts
             .iter()
@@ -597,12 +952,26 @@ pub async fn run_loop(
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
 
+    // Set once any mutating tool dispatches in this run_loop. Consumed only by
+    // the optional, default-off end-of-turn checkpoint (Task 1) so a clean
+    // read-only turn never triggers shadow-git work even when the flag is on.
+    let mut turn_mutated = false;
+
     for turn in 1..=opts.max_turns {
         let req = ChatRequest {
             system: recalled_system.clone(),
             messages: session.snapshot(),
             model: session.model.clone(),
             tools: tools_schema.clone(),
+            effort: opts.effort,
+            // Attach images/PDF only to the first turn's user message. On later
+            // turns the trailing message is a tool-result, so re-attaching would
+            // mis-place the block (and re-upload the bytes every turn).
+            attachments: if turn == 1 {
+                opts.attachments.clone()
+            } else {
+                Vec::new()
+            },
         };
 
         // Retry transient `ProviderError::RateLimit` here so a single 429
@@ -783,6 +1152,16 @@ pub async fn run_loop(
                 }
             }
 
+            // End-of-turn side effects (Tasks 1, 4, 5). All are best-effort and
+            // default-off (env-gated); none can fail the turn.
+            run_turn_end_effects(
+                turn_mutated,
+                provider.name(),
+                &session.model,
+                total_input_tokens,
+                total_output_tokens,
+            );
+
             return Ok(LoopSummary {
                 assistant_text: text,
                 turns: turn,
@@ -830,7 +1209,33 @@ pub async fn run_loop(
 
             // Permission check fires first — denied tools never use cached results.
             let skills: &SkillRegistry = opts.skills.as_deref().unwrap_or(&EMPTY_SKILLS);
-            let decision = check_with_skills(meta, &preview, prompter, skills).await;
+            let mut decision = check_with_skills(meta, &preview, prompter, skills).await;
+
+            // Task 3 — DENY-ONLY governance overlay. After the base check yields
+            // a decision, the optional policy/conseca layers may only *narrow*
+            // it: an Allow can be downgraded to Deny, but a Deny is never
+            // widened. When both are `None` (the default everywhere) this block
+            // is a no-op and the decision is byte-identical to today.
+            if decision.outcome == Outcome::Allow {
+                decision = apply_governance_overlay(decision, meta.name, opts);
+            }
+
+            // cmdparse bash-safety overlay. Same deny-only contract; only fires
+            // for `Bash` and only when `ORIGIN_CMD_GUARD=1` (default off ⇒ no
+            // behavior change). It can downgrade an Allow to Deny but never widen.
+            if decision.outcome == Outcome::Allow {
+                decision = apply_cmd_guard(decision, meta.name, &args);
+            }
+
+            // Read-only "plan mode" overlay (gemini Plan Mode). Same deny-only
+            // contract: when the session is read-only, any non-`Pure` tool is
+            // downgraded Allow→Deny so the design phase cannot mutate the
+            // workspace. `false` (the default) ⇒ no effect.
+            if decision.outcome == Outcome::Allow {
+                decision =
+                    apply_read_only_overlay(decision, opts.read_only, meta.side_effects, meta.name);
+            }
+
             if decision.outcome == Outcome::Deny {
                 // Drain any speculative slot to keep the registry clean.
                 let _ = speculative.take(&id).await;
@@ -840,6 +1245,12 @@ pub async fn run_loop(
                     "tool denied"
                 );
                 return Err(LoopError::Denied(name.clone()));
+            }
+
+            // Track mutations for the optional end-of-turn checkpoint (Task 1).
+            // Only mutating tools flip the flag; pure tools leave it untouched.
+            if matches!(meta.side_effects, SideEffects::Mutating) {
+                turn_mutated = true;
             }
 
             if let Some(tx) = &opts.event_tx {
@@ -1423,9 +1834,13 @@ async fn dispatch_tool(
                     .to_string(),
                 edits,
             };
-            origin_tools::builtins::multi_edit::multi_edit(&margs)
+            let res = origin_tools::builtins::multi_edit::multi_edit(&margs)
                 .map(|v| serde_json::to_string(&v).expect("BUG: MultiEditResult always serializes"))
-                .map_err(|e| LoopError::ToolFailure(e.message))
+                .map_err(|e| LoopError::ToolFailure(e.message));
+            if res.is_ok() {
+                maybe_autoformat(&margs.file_path);
+            }
+            res
         }
         "ApplyPatch" => {
             let pargs = origin_tools::builtins::apply_patch::ApplyPatchArgs {
@@ -1435,9 +1850,16 @@ async fn dispatch_tool(
                     .ok_or_else(|| LoopError::BadArgs("ApplyPatch: missing `patch`".into()))?
                     .to_string(),
             };
-            origin_tools::builtins::apply_patch::apply_patch(&pargs)
+            let fmt_paths = patch_target_paths(&pargs.patch);
+            let res = origin_tools::builtins::apply_patch::apply_patch(&pargs)
                 .map(|v| serde_json::to_string(&v).expect("BUG: ApplyPatchResult always serializes"))
-                .map_err(|e| LoopError::ToolFailure(e.message))
+                .map_err(|e| LoopError::ToolFailure(e.message));
+            if res.is_ok() {
+                for p in &fmt_paths {
+                    maybe_autoformat(p);
+                }
+            }
+            res
         }
         "Write" => {
             let guard = origin_tools::builtins::write::WriteGuard::default();
@@ -1456,9 +1878,14 @@ async fn dispatch_tool(
                     .to_string(),
                 force: args.get("force").and_then(Value::as_bool).unwrap_or(false),
             };
-            origin_tools::builtins::write::write_v2(args, &guard)
+            let fmt_path = args.file_path.clone();
+            let res = origin_tools::builtins::write::write_v2(args, &guard)
                 .map(|()| "write ok".to_string())
-                .map_err(|e| LoopError::ToolFailure(e.message))
+                .map_err(|e| LoopError::ToolFailure(e.message));
+            if res.is_ok() {
+                maybe_autoformat(&fmt_path);
+            }
+            res
         }
         "Bash" => {
             let bargs = origin_tools::builtins::bash::BashArgs {
@@ -3089,5 +3516,253 @@ mod dispatch_table_tests {
         assert_eq!(usage.output_tokens, 2_222);
         assert_eq!(usage.cache_read_input_tokens, 3_333);
         assert_eq!(usage.cache_creation_input_tokens, 4_444);
+    }
+}
+
+/// Tests for the additive, env-gated daemon wirings (Tasks 1-5). Each asserts
+/// the default (no env flag / `None` field) path leaves behavior unchanged.
+#[cfg(test)]
+mod wiring_tests {
+    use super::*;
+    use origin_permission::{Decision, Outcome};
+
+    /// Serializes tests that mutate the process-global `ORIGIN_CMD_GUARD` env
+    /// var. Without this, the parallel test runner can interleave a `set_var` in
+    /// one test with a `remove_var`/read in another, flaking the assertions.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Task 1: the checkpoint gate is OFF by default. With `ORIGIN_CHECKPOINTS`
+    /// unset, the gate reads false and `maybe_checkpoint_turn` performs no git
+    /// work (and must not panic).
+    #[test]
+    fn checkpoint_gate_off_by_default() {
+        let enabled = std::env::var("ORIGIN_CHECKPOINTS").as_deref() == Ok("1");
+        assert!(!enabled, "checkpoints must be opt-in via ORIGIN_CHECKPOINTS=1");
+        maybe_checkpoint_turn();
+    }
+
+    /// Task 2: the autoformat gate is OFF by default, and the formatter mapping
+    /// the gate consults resolves known extensions and skips unknown ones.
+    #[test]
+    fn autoformat_gate_off_by_default_and_mapping_is_correct() {
+        let enabled = std::env::var("ORIGIN_AUTOFORMAT").as_deref() == Ok("1");
+        assert!(!enabled, "autoformat must be opt-in via ORIGIN_AUTOFORMAT=1");
+        assert_eq!(origin_postedit::formatter_for("src/main.rs"), Some("rustfmt"));
+        assert_eq!(origin_postedit::formatter_for("README"), None);
+        // No-op with the gate off (no panic, no spawn).
+        maybe_autoformat("src/main.rs");
+    }
+
+    /// Task 2: patch target extraction handles both unified-diff and
+    /// apply-patch markers and skips `/dev/null`.
+    #[test]
+    fn patch_target_paths_extracts_both_formats() {
+        let patch = "*** Update File: src/a.rs\n+++ b/src/b.rs\n+++ /dev/null\n";
+        let paths = patch_target_paths(patch);
+        assert!(paths.contains(&"src/a.rs".to_string()));
+        assert!(paths.contains(&"src/b.rs".to_string()));
+        assert!(!paths.iter().any(|p| p == "/dev/null"));
+    }
+
+    /// Task 3(a): with both governance layers `None` (the default), an Allow is
+    /// returned unchanged (outcome stays Allow).
+    #[test]
+    fn governance_overlay_none_leaves_allow_unchanged() {
+        let opts = LoopOptions::default();
+        assert!(opts.policy.is_none() && opts.conseca.is_none());
+        let allow = Decision {
+            outcome: Outcome::Allow,
+            reason: "base allowed".into(),
+        };
+        let out = apply_governance_overlay(allow, "Edit", &opts);
+        assert_eq!(out.outcome, Outcome::Allow, "default (no overlay) must not change Allow");
+    }
+
+    /// Task 3(b): a policy that denies a tool downgrades a base Allow to Deny,
+    /// while leaving a non-denied tool as Allow.
+    #[test]
+    fn governance_overlay_policy_deny_downgrades_allow() {
+        let layer =
+            origin_policy::parse_layer("denied_tools = [\"Bash\"]", origin_policy::Tier::Admin)
+                .expect("valid layer");
+        let opts = LoopOptions {
+            policy: Some(Arc::new(origin_policy::PolicyEngine::new(vec![layer]))),
+            ..LoopOptions::default()
+        };
+
+        let allow = Decision {
+            outcome: Outcome::Allow,
+            reason: "base".into(),
+        };
+        let out = apply_governance_overlay(allow, "Bash", &opts);
+        assert_eq!(out.outcome, Outcome::Deny, "policy deny must downgrade Allow");
+
+        let allow2 = Decision {
+            outcome: Outcome::Allow,
+            reason: "base".into(),
+        };
+        let out2 = apply_governance_overlay(allow2, "Read", &opts);
+        assert_eq!(out2.outcome, Outcome::Allow, "non-denied tool stays Allow");
+    }
+
+    /// gemini Plan Mode: read-only mode denies mutating tools, allows Pure
+    /// tools, and is a no-op when `read_only == false`.
+    #[test]
+    fn read_only_overlay_blocks_mutating_allows_pure() {
+        let allow = || Decision {
+            outcome: Outcome::Allow,
+            reason: "base".into(),
+        };
+        // read_only off ⇒ no change even for a mutating tool.
+        assert_eq!(
+            apply_read_only_overlay(allow(), false, SideEffects::Mutating, "Edit").outcome,
+            Outcome::Allow,
+        );
+        // read_only on ⇒ mutating tool denied.
+        assert_eq!(
+            apply_read_only_overlay(allow(), true, SideEffects::Mutating, "Edit").outcome,
+            Outcome::Deny,
+        );
+        // read_only on ⇒ Pure tool still allowed.
+        assert_eq!(
+            apply_read_only_overlay(allow(), true, SideEffects::Pure, "Read").outcome,
+            Outcome::Allow,
+        );
+    }
+
+    /// cline multi-root: an empty root list renders nothing (byte-identical
+    /// prompt); a populated list renders a `<workspace-roots>` block listing
+    /// every root.
+    #[test]
+    fn workspace_roots_block_empty_and_populated() {
+        use std::path::PathBuf;
+        assert!(workspace_roots_block(&[]).is_empty());
+        let roots = [PathBuf::from("/a/repo1"), PathBuf::from("/b/repo2")];
+        let block = workspace_roots_block(&roots);
+        assert!(block.starts_with("<workspace-roots>"));
+        assert!(block.contains("/a/repo1"));
+        assert!(block.contains("/b/repo2"));
+        assert!(block.trim_end().ends_with("</workspace-roots>"));
+    }
+
+    /// Task 3(c): conseca downgrades an Allow when the tool is not allow-listed,
+    /// and the overlay is deny-only — a pre-existing Deny is never widened
+    /// because the call site only routes an Allow through the overlay.
+    #[test]
+    fn governance_overlay_conseca_deny_only() {
+        let policy = origin_conseca::SecurityPolicy {
+            allow_tools: vec!["Read".to_string()],
+            ..origin_conseca::SecurityPolicy::default()
+        };
+        let opts = LoopOptions {
+            conseca: Some(Arc::new(policy)),
+            ..LoopOptions::default()
+        };
+
+        // Bash is not allow-listed ⇒ conseca denies ⇒ Allow downgraded.
+        let allow = Decision {
+            outcome: Outcome::Allow,
+            reason: "base".into(),
+        };
+        assert_eq!(
+            apply_governance_overlay(allow, "Bash", &opts).outcome,
+            Outcome::Deny
+        );
+
+        // Read is allow-listed ⇒ stays Allow.
+        let allow2 = Decision {
+            outcome: Outcome::Allow,
+            reason: "base".into(),
+        };
+        assert_eq!(
+            apply_governance_overlay(allow2, "Read", &opts).outcome,
+            Outcome::Allow
+        );
+
+        // Deny-only invariant: a base Deny is never an Allow, so the call-site
+        // guard (`if outcome == Allow`) never routes it through the overlay and
+        // it can never be widened.
+        let base_deny = Decision {
+            outcome: Outcome::Deny,
+            reason: "base denied".into(),
+        };
+        assert_ne!(
+            base_deny.outcome,
+            Outcome::Allow,
+            "a base Deny is never routed through the overlay, so it can never widen"
+        );
+    }
+
+    /// Task 4: telemetry is disabled by default (no opt-in), so the pipeline
+    /// drains nothing and the helper writes no file.
+    #[test]
+    fn telemetry_disabled_by_default() {
+        let opt_in = std::env::var("ORIGIN_TELEMETRY").as_deref() == Ok("1");
+        assert!(!opt_in, "telemetry must be opt-in via ORIGIN_TELEMETRY=1");
+        let cfg = origin_telemetry::Config::from_env(false, false, 1.0);
+        assert!(!cfg.enabled);
+        let mut pipe = origin_telemetry::Pipeline::new(cfg);
+        pipe.record(origin_telemetry::Event::new("turn".to_string(), 0));
+        assert!(pipe.drain().is_empty(), "disabled pipeline emits no lines");
+        // No-op with the gate off.
+        maybe_record_turn_telemetry("anthropic", "claude-sonnet-4-6", 1, 2);
+    }
+
+    /// Task 5: the completion-notification gate is OFF by default.
+    #[test]
+    fn notify_gate_off_by_default() {
+        let enabled = std::env::var("ORIGIN_NOTIFY").as_deref() == Ok("1");
+        assert!(!enabled, "notifications must be opt-in via ORIGIN_NOTIFY=1");
+        maybe_notify_completion();
+    }
+
+    /// cmdparse cmd-guard: with `ORIGIN_CMD_GUARD` unset (the default) even a
+    /// catastrophic command is left as Allow — the overlay is fully off.
+    #[test]
+    fn cmd_guard_off_leaves_allow_unchanged() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("ORIGIN_CMD_GUARD");
+        let allow = Decision {
+            outcome: Outcome::Allow,
+            reason: "base".into(),
+        };
+        let args = serde_json::json!({ "command": "rm -rf ~" });
+        let out = apply_cmd_guard(allow, "Bash", &args);
+        assert_eq!(
+            out.outcome,
+            Outcome::Allow,
+            "cmd-guard must be a no-op when ORIGIN_CMD_GUARD is unset"
+        );
+    }
+
+    /// cmdparse cmd-guard: with the gate ON, `rm -rf ~` on `Bash` is downgraded
+    /// to Deny, a safe command stays Allow, and a non-Bash tool is untouched.
+    #[test]
+    fn cmd_guard_on_denies_dangerous_bash() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mk = || Decision {
+            outcome: Outcome::Allow,
+            reason: "base".into(),
+        };
+        let dangerous = serde_json::json!({ "command": "rm -rf ~" });
+        let safe = serde_json::json!({ "command": "ls -la" });
+
+        std::env::set_var("ORIGIN_CMD_GUARD", "1");
+        let denied = apply_cmd_guard(mk(), "Bash", &dangerous);
+        let allowed = apply_cmd_guard(mk(), "Bash", &safe);
+        let non_bash = apply_cmd_guard(mk(), "Read", &dangerous);
+        std::env::remove_var("ORIGIN_CMD_GUARD");
+
+        assert_eq!(
+            denied.outcome,
+            Outcome::Deny,
+            "dangerous bash must be denied when ORIGIN_CMD_GUARD=1"
+        );
+        assert_eq!(allowed.outcome, Outcome::Allow, "safe bash stays Allow");
+        assert_eq!(
+            non_bash.outcome,
+            Outcome::Allow,
+            "cmd-guard only inspects the Bash tool"
+        );
     }
 }

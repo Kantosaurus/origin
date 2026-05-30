@@ -39,6 +39,10 @@ pub struct WireRequest<'a> {
     pub tools: Vec<WireTool<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<WireMetadata>,
+    /// Reasoning-effort hint. `None` is omitted from the wire entirely, keeping
+    /// the request byte-identical to the pre-effort behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<&'static str>,
 }
 
 #[derive(Serialize)]

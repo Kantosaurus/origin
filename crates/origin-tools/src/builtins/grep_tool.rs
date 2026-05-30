@@ -69,6 +69,12 @@ pub fn grep_v2(args: GrepArgs) -> Result<Value, ToolError> {
         .multi_line(args.multiline)
         .build();
 
+    // Code-structure-aware grep (jcode agentgrep): when `ORIGIN_AGENTGREP=1`,
+    // each `content`-mode match is annotated with the nearest enclosing
+    // definition (`fn`/`def`/`class`/…) so the model gets structure, not just a
+    // raw line. Default-off ⇒ the result shape is byte-identical to before.
+    let agentgrep = std::env::var("ORIGIN_AGENTGREP").as_deref() == Ok("1");
+
     let mut match_results: Vec<Value> = Vec::new();
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     let mut files: BTreeSet<String> = BTreeSet::new();
@@ -99,8 +105,25 @@ pub fn grep_v2(args: GrepArgs) -> Result<Value, ToolError> {
         files.insert(path_display.clone());
         counts.insert(path_display.clone(), local_count);
         if matches!(mode, OutputMode::Content) {
+            // Read the whole file once (only when agentgrep is on) so each
+            // match can resolve its enclosing definition by a cheap backward scan.
+            let file_lines: Vec<String> = if agentgrep {
+                std::fs::read_to_string(&path)
+                    .map(|s| s.lines().map(str::to_string).collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             for (lnum, line) in local_lines {
-                match_results.push(json!({"file": path_display, "line": lnum, "text": line}));
+                let mut obj = json!({"file": path_display, "line": lnum, "text": line});
+                if agentgrep {
+                    if let Some(sym) = enclosing_symbol(&file_lines, lnum) {
+                        if let Some(map) = obj.as_object_mut() {
+                            map.insert("symbol".to_string(), Value::String(sym));
+                        }
+                    }
+                }
+                match_results.push(obj);
                 if match_results.len() >= head_limit {
                     break 'walk;
                 }
@@ -126,6 +149,37 @@ pub fn grep_v2(args: GrepArgs) -> Result<Value, ToolError> {
     Ok(out)
 }
 
+/// Definition leaders recognised by the agentgrep enclosing-symbol scan. Kept
+/// deliberately language-agnostic (Rust / Python / TS-JS / Go / C-family) so it
+/// works without a per-language parser; this is a heuristic, not tree-sitter.
+const DEF_LEADERS: &[&str] = &[
+    "fn ", "pub fn ", "async fn ", "pub async fn ", "def ", "async def ", "class ", "struct ",
+    "enum ", "trait ", "impl ", "interface ", "func ", "function ", "module ", "namespace ",
+    "type ", "const fn ", "pub const fn ", "public ", "private ", "protected ", "export function ",
+    "export default function ", "export class ", "export const ",
+];
+
+/// Resolve the nearest enclosing definition for a 1-based match line by scanning
+/// backwards for the first line whose trimmed text starts with a known
+/// definition leader. Returns the trimmed definition line (bounded length), or
+/// `None` when no definition precedes the match.
+fn enclosing_symbol(lines: &[String], match_line_1based: u64) -> Option<String> {
+    if lines.is_empty() || match_line_1based == 0 {
+        return None;
+    }
+    // Convert to a 0-based index, clamped to the file length.
+    let match_idx = usize::try_from(match_line_1based).unwrap_or(usize::MAX);
+    let start = match_idx.min(lines.len()).saturating_sub(1);
+    for idx in (0..=start).rev() {
+        let trimmed = lines[idx].trim_start();
+        if DEF_LEADERS.iter().any(|lead| trimmed.starts_with(lead)) {
+            let sym: String = trimmed.trim_end().chars().take(120).collect();
+            return Some(sym);
+        }
+    }
+    None
+}
+
 crate::origin_tool! {
     name: "Grep",
     description: "Recursive regex search. Modes: files_with_matches (default), content, count. Supports glob/type filters and context lines.",
@@ -148,4 +202,43 @@ crate::origin_tool! {
         },
         "required": ["pattern"]
     }"#,
+}
+
+#[cfg(test)]
+mod agentgrep_tests {
+    use super::enclosing_symbol;
+
+    fn lines(src: &str) -> Vec<String> {
+        src.lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn finds_nearest_preceding_rust_fn() {
+        let src = "mod a {\n    pub fn target() {\n        let x = 1;\n        do_thing(x);\n    }\n}\n";
+        // The match for `do_thing` is on line 4 (1-based).
+        let sym = enclosing_symbol(&lines(src), 4).expect("symbol");
+        assert_eq!(sym, "pub fn target() {");
+    }
+
+    #[test]
+    fn finds_python_def() {
+        let src = "class C:\n    def method(self):\n        return compute()\n";
+        let sym = enclosing_symbol(&lines(src), 3).expect("symbol");
+        assert_eq!(sym, "def method(self):");
+    }
+
+    #[test]
+    fn none_when_no_definition_precedes() {
+        let src = "let x = 1;\nlet y = 2;\n";
+        assert!(enclosing_symbol(&lines(src), 2).is_none());
+    }
+
+    #[test]
+    fn out_of_range_line_is_safe() {
+        let src = "fn a() {}\n";
+        // Asking past the end of the file must not panic.
+        assert!(enclosing_symbol(&lines(src), 999).is_some());
+        assert!(enclosing_symbol(&[], 1).is_none());
+        assert!(enclosing_symbol(&lines(src), 0).is_none());
+    }
 }

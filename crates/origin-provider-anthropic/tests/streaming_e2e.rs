@@ -36,6 +36,8 @@ async fn anthropic_streams_text_then_turn_end() {
                 messages: vec![Message::new(Role::User).with_block(Block::text("hi"))],
                 model: "claude-test".into(),
                 tools: vec![],
+                effort: None,
+                attachments: Vec::new(),
             },
             &r,
         )
@@ -86,6 +88,8 @@ async fn anthropic_stream_429_returns_rate_limit_error() {
                 messages: vec![Message::new(Role::User).with_block(Block::text("hi"))],
                 model: "claude-test".into(),
                 tools: vec![],
+                effort: None,
+                attachments: Vec::new(),
             },
             &ring,
         )
@@ -122,6 +126,8 @@ async fn anthropic_stream_401_returns_auth_error() {
                 messages: vec![Message::new(Role::User).with_block(Block::text("hi"))],
                 model: "claude-test".into(),
                 tools: vec![],
+                effort: None,
+                attachments: Vec::new(),
             },
             &ring,
         )

@@ -16,6 +16,8 @@ origin-planner = { path = "../origin-planner" }
 origin-provider = { path = "../origin-provider" }
 origin-stream = { path = "../origin-stream" }
 origin-cas = { path = "../origin-cas" }
+origin-cassette = { path = "../origin-cassette" }
+origin-multimodal = { path = "../origin-multimodal" }
 async-trait = "0.1"
 eventsource-stream = "0.2"
 futures-util = "0.3"

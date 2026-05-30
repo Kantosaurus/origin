@@ -32,6 +32,8 @@ anyhow = "1"
 crossterm = { version = "0.28", features = ["event-stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+jsonschema = { workspace = true }
+origin-oidc = { path = "../origin-oidc" }
 unicode-segmentation = "1"
 unicode-width = "0.2"
 futures-util = "0.3"
@@ -46,7 +48,27 @@ origin-keyvault = { path = "../origin-keyvault" }
 origin-skills   = { path = "../origin-skills" }
 origin-tools    = { path = "../origin-tools" }
 origin-goal     = { path = "../origin-goal" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+origin-cost     = { path = "../origin-cost" }
+origin-doctor   = { path = "../origin-doctor" }
+origin-mermaid  = { path = "../origin-mermaid" }
+origin-knowledge = { path = "../origin-knowledge" }
+origin-schedule = { path = "../origin-schedule" }
+origin-export   = { path = "../origin-export" }
+origin-i18n     = { path = "../origin-i18n" }
+origin-vcs      = { path = "../origin-vcs" }
+origin-scout    = { path = "../origin-scout" }
+origin-watch    = { path = "../origin-watch" }
+origin-clipboard = { path = "../origin-clipboard" }
+origin-voice    = { path = "../origin-voice" }
+origin-websearch = { path = "../origin-websearch" }
+origin-plugin   = { path = "../origin-plugin" }
+origin-modeldiscovery = { path = "../origin-modeldiscovery" }
+origin-outputstyle = { path = "../origin-outputstyle" }
+origin-steering = { path = "../origin-steering" }
+origin-lspfleet = { path = "../origin-lspfleet" }
+origin-ambient  = { path = "../origin-ambient" }
+origin-multimodal = { path = "../origin-multimodal" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 which = "8"
 rand = "0.8"
 urlencoding = "2"

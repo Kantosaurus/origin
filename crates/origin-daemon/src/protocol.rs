@@ -7,13 +7,38 @@ use origin_plan::OpEnvelope;
 use origin_resume_token::ResumeToken;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct PromptRequest {
     pub system: String,
     pub model: String,
     pub user_text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Optional reasoning-effort level for this turn, as a canonical wire token
+    /// (`fast`/`low`/`medium`/`high`/`max`). `None` (the default) leaves the
+    /// provider wire byte-identical to the pre-effort behavior. The daemon maps
+    /// this to [`origin_provider::ReasoningEffort`] when building the
+    /// `ChatRequest`. *Closes: claude-code `/effort`+`/fast`.*
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Multimodal attachments (images / extracted PDF text) to append to the
+    /// FIRST user turn. Empty by default ⇒ text-only wire unchanged. The CLI
+    /// encodes each file via `origin_multimodal::to_content_block` so the
+    /// daemon never reads client-side paths itself. *Closes: aider images;
+    /// gemini PDF/sketch; claude multimodal input.*
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<origin_multimodal::ContentBlock>,
+    /// Read-only "plan mode": when `true`, the daemon downgrades every mutating
+    /// tool to Deny for this turn so the model can only read/plan, never edit or
+    /// run commands. `false` (the default) ⇒ unchanged. *Closes: gemini Plan
+    /// Mode (policy-enforced read-only design phase).*
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+    /// Additional workspace roots the agent may operate across (cline multi-root
+    /// workspaces). Empty (the default) ⇒ single-root behaviour, wire unchanged.
+    /// Surfaced to the model via a `<workspace-roots>` system-prompt block.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<String>,
 }
 
 /// Request to rebuild the code graph over a set of paths.
@@ -79,6 +104,13 @@ pub enum ClientMessage {
     /// daemon replies with [`StreamEvent::AdminOk`] on success or
     /// [`StreamEvent::AdminError`] on failure.
     RemoveSession { session_id: String },
+    /// Conversation rewind: keep the first `keep_turns` message rows of
+    /// `session_id` and delete the rest, rolling the transcript back to an
+    /// earlier point (the session row is preserved so it can still be resumed).
+    /// The daemon replies with [`StreamEvent::AdminOk`] on success or
+    /// [`StreamEvent::AdminError`] on failure. *Closes: gemini `/rewind` chat
+    /// revert (the transcript half; file revert is `origin rewind`).*
+    RewindSession { session_id: String, keep_turns: u32 },
     /// P13.4.2: resume a previously persisted session. The daemon
     /// counts the persisted message rows for `session_id`, reads any
     /// checkpointed [`ResumeToken`] from the `resume/` directory, and
@@ -135,6 +167,11 @@ pub enum ClientMessage {
     /// a [`StreamEvent::PlanOp`] event frame. The subscription terminates
     /// when the connection closes.
     SubscribePlan,
+    /// Export a persisted session transcript. `format` is `"md"` (Markdown)
+    /// or `"json"`. The daemon loads the message log, renders it via
+    /// `origin_export`, and replies with [`StreamEvent::SessionExport`], or
+    /// [`StreamEvent::AdminError`] if the session does not exist.
+    ExportSession { session_id: String, format: String },
     /// User-issued cancel. Clears any in-flight goal iteration. The outer
     /// message loop continues running afterward — the connection stays open.
     ///
@@ -281,6 +318,9 @@ pub enum StreamEvent {
         provider: String,
         accounts: Vec<String>,
     },
+    /// Response to [`ClientMessage::ExportSession`]: the rendered transcript
+    /// (Markdown or JSON depending on the requested format).
+    SessionExport { content: String },
     /// P13.4.2: positive acknowledgement for admin mutations that have no
     /// payload of their own (`RemoveSession`, `KeyringAdd`, …).
     AdminOk,
@@ -432,6 +472,10 @@ pub struct UsageRow {
     pub model: String,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// Estimated USD cost for this (provider, model) row under the centralized
+    /// [`origin_cost`] pricing table. `0.0` when the model is unpriced.
+    #[serde(default)]
+    pub cost_usd: f64,
 }
 
 /// Outbound responses the daemon sends back to a client (or the supervisor).

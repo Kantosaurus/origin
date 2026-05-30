@@ -48,6 +48,8 @@ async fn openai_streams_text_then_turn_end() {
                 messages: vec![Message::new(Role::User).with_block(Block::text("hi"))],
                 model: "gpt-4o".into(),
                 tools: vec![],
+                effort: None,
+                attachments: Vec::new(),
             },
             &r,
         )

@@ -543,6 +543,17 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     let listener = Listener::bind(&path).await?;
     info!(path = %path, "origin-daemon listening");
 
+    // Default-off autonomous background loops (items J + K). Each is gated on
+    // its own env var (`ORIGIN_SCHEDULER=1` / `ORIGIN_AMBIENT=1`); when unset
+    // these spawn nothing. When set, a fired trigger / selected ambient task
+    // connects back to the socket we just bound and submits a real `Prompt`,
+    // so it runs through the exact same agent path as an interactive turn.
+    origin_daemon::scheduler::maybe_spawn(path.clone());
+    origin_daemon::ambient::maybe_spawn(path.clone());
+    // Authenticated HTTP webhook trigger source (ORIGIN_WEBHOOK + _TOKEN); off
+    // by default. A POST fires its body as a prompt onto the live agent path.
+    origin_daemon::webhook::maybe_spawn(path.clone());
+
     // Populate the shared `DaemonState` so the cooperative shutdown driver
     // can bind real per-phase callbacks. We do this AFTER each subsystem is
     // up so an early shutdown signal doesn't grab half-initialized handles.
@@ -1141,7 +1152,9 @@ fn spawn_handler_task(
                 }
                 admin @ (ClientMessage::ListSessions
                 | ClientMessage::RemoveSession { .. }
+                | ClientMessage::RewindSession { .. }
                 | ClientMessage::ResumeSession { .. }
+                | ClientMessage::ExportSession { .. }
                 | ClientMessage::GetUsage
                 | ClientMessage::KeyringAdd { .. }
                 | ClientMessage::KeyringList { .. }
@@ -1400,6 +1413,11 @@ async fn handle_request(
     } else {
         Session::new(provider.name(), &req.model)
     };
+    // cline multi-root: surface any extra workspace roots to the agent loop,
+    // which renders them as a `<workspace-roots>` block. Empty ⇒ no change.
+    if !req.roots.is_empty() {
+        session.roots = req.roots.iter().map(std::path::PathBuf::from).collect();
+    }
     // Bug #8: stash the session id so a later `/goal` activation on this
     // connection can checkpoint without waiting for the first iteration
     // to complete.
@@ -1491,6 +1509,24 @@ async fn handle_request(
             // ^ per-connection goal slot. When `Some(Active|Verifying)` the
             // `run_loop` body renders an `<origin-goal>` block on each turn;
             // the post-loop driver below decides verify-vs-iterate-vs-clear.
+            policy: None,
+            conseca: None,
+            // ^ DENY-ONLY governance overlay (Task 3). Wired as fields but left
+            // `None` here so default daemon behavior is unchanged; a future
+            // admin-config path can populate these to narrow tool access.
+            effort: req
+                .effort
+                .as_deref()
+                .and_then(origin_provider::ReasoningEffort::from_wire_str),
+            // ^ claude-code `/effort`+`/fast`: the CLI sends a canonical token;
+            // an unknown token maps to `None` ⇒ wire byte-identical.
+            attachments: req.attachments.clone(),
+            // ^ aider/gemini/claude image+PDF input: applied to turn 1 only.
+            system_suffix: (!req.system.is_empty()).then(|| req.system.clone()),
+            // ^ claude-code output styles: the CLI puts the active style's
+            // system suffix in `req.system`; empty ⇒ no addendum (wire unchanged).
+            read_only: req.read_only,
+            // ^ gemini Plan Mode: deny-only read-only overlay for this turn.
         };
         drive_goal_loop(
             conn,
@@ -2318,7 +2354,19 @@ async fn handle_admin(
                 message: e.to_string(),
             },
         },
+        ClientMessage::RewindSession {
+            session_id,
+            keep_turns,
+        } => match session_store.truncate_after(&session_id, keep_turns) {
+            Ok(_removed) => StreamEvent::AdminOk,
+            Err(e) => StreamEvent::AdminError {
+                message: e.to_string(),
+            },
+        },
         ClientMessage::ResumeSession { session_id } => resume_session_event(session_store, &session_id),
+        ClientMessage::ExportSession { session_id, format } => {
+            export_session_event(session_store, &session_id, &format)
+        }
         ClientMessage::GetUsage => StreamEvent::UsageReport {
             rows: build_usage_rows(&metrics.snapshot()),
         },
@@ -2395,11 +2443,20 @@ fn build_usage_rows(snap: &origin_metrics::Snapshot) -> Vec<origin_daemon::proto
     }
     acc.into_iter()
         .map(
-            |((provider, model), (tokens_in, tokens_out))| origin_daemon::protocol::UsageRow {
-                provider,
-                model,
-                tokens_in,
-                tokens_out,
+            |((provider, model), (tokens_in, tokens_out))| {
+                // Cost from output + fresh-input tokens (the metrics registry
+                // does not split cache tiers per model, so this is a floor).
+                let cost_usd = origin_cost::price_for(&model).map_or(0.0, |p| {
+                    let u = origin_cost::TokenUsage::new(tokens_in, tokens_out, 0, 0);
+                    origin_cost::cost_of(&p, &u).total()
+                });
+                origin_daemon::protocol::UsageRow {
+                    provider,
+                    model,
+                    tokens_in,
+                    tokens_out,
+                    cost_usd,
+                }
             },
         )
         .collect()
@@ -2442,6 +2499,86 @@ fn spawn_plan_relay(
 /// in-memory `Session` re-spawn (re-running pending tool calls, attaching the
 /// active provider, …) still belongs in the `Prompt` handler — `ResumeSession`
 /// describes the persisted state without touching the live agent loop.
+/// Build an [`origin_export::ExportSession`] from the persisted log and render
+/// it as Markdown (`format == "json"` selects JSON instead). Replies with
+/// [`StreamEvent::SessionExport`] or [`StreamEvent::AdminError`].
+fn export_session_event(session_store: &SessionStore, session_id: &str, format: &str) -> StreamEvent {
+    use origin_core::types::Block;
+    let messages = match session_store.load_messages(session_id) {
+        Ok(m) => m,
+        Err(e) => {
+            return StreamEvent::AdminError {
+                message: e.to_string(),
+            }
+        }
+    };
+    let summary = session_store
+        .list_summaries()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|s| s.id == session_id);
+    if messages.is_empty() && summary.is_none() {
+        return StreamEvent::AdminError {
+            message: format!("session not found: {session_id}"),
+        };
+    }
+    let (title, model, created_at) = summary.map_or((None, String::new(), 0), |s| {
+        let ms = u64::try_from(s.created_at).unwrap_or(0);
+        (s.title, s.model, ms)
+    });
+
+    let turns = messages
+        .iter()
+        .map(|m| {
+            let role = match m.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::Tool => "tool",
+                Role::System => "system",
+            }
+            .to_string();
+            let mut text = String::new();
+            let mut tools = Vec::new();
+            for b in &m.blocks {
+                match b {
+                    Block::Text { text: t, .. } => {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(t);
+                    }
+                    Block::ToolUse { name, .. } => tools.push(name.clone()),
+                    Block::Thinking { .. } | Block::ToolResult { .. } => {}
+                }
+            }
+            origin_export::ExportTurn { role, text, tools }
+        })
+        .collect();
+
+    let session = origin_export::ExportSession {
+        id: session_id.to_string(),
+        title,
+        provider: String::new(),
+        model,
+        created_at_unix_ms: created_at,
+        turns,
+    };
+
+    let content = if format == "json" {
+        match origin_export::to_json(&session) {
+            Ok(s) => s,
+            Err(e) => {
+                return StreamEvent::AdminError {
+                    message: e.to_string(),
+                }
+            }
+        }
+    } else {
+        origin_export::to_markdown(&session)
+    };
+    StreamEvent::SessionExport { content }
+}
+
 fn resume_session_event(session_store: &SessionStore, session_id: &str) -> StreamEvent {
     let messages = match session_store.load_messages(session_id) {
         Ok(m) => m,

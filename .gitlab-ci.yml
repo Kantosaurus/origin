@@ -1,0 +1,66 @@
+# GitLab CI example for origin — MR review parity with the GitHub bots.
+#
+# Mirrors kilocode/opencode's GitLab integration: a manual, opt-in job that
+# installs origin, reviews the merge-request diff with `origin run`, and posts
+# the result back as an MR note via the GitLab REST API.
+#
+# Required CI/CD variables (Settings → CI/CD → Variables):
+#   ANTHROPIC_API_KEY  — provider key for origin (mask + protect it).
+#   GITLAB_TOKEN       — a project/group access token with `api` scope so the
+#                        job can POST a note. (CI_JOB_TOKEN cannot write notes.)
+#
+# SECURITY: the diff is untrusted. It is written to a file and read by the shell
+# as data; it is never expanded into the command line. The job is `when: manual`
+# and gated to merge_request pipelines so it is strictly opt-in.
+
+stages:
+  - review
+
+origin_review:
+  stage: review
+  image: node:20-bookworm-slim
+  # Only offer this job on merge-request pipelines, and only when a human starts
+  # it from the MR / pipeline UI.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+      allow_failure: true
+  variables:
+    # Full clone so we can diff against the target branch.
+    GIT_DEPTH: "0"
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends git curl jq ca-certificates
+    - npm install -g @kantosaurus/origin
+  script:
+    - |
+      set -euo pipefail
+      # Fetch the MR target branch and diff against it.
+      git fetch origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+      git diff "origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}...HEAD" > mr.diff || true
+
+      # Build the review prompt in a file so the untrusted diff never hits argv.
+      {
+        echo "You are origin's merge-request reviewer."
+        echo "Produce a concise Markdown summary: a one-line verdict, then"
+        echo "grouped findings (Blocking / Should-fix / Nit) with file:line refs."
+        echo "Only comment on what the diff actually changes."
+        echo
+        echo "----- BEGIN DIFF -----"
+        cat mr.diff
+        echo "----- END DIFF -----"
+      } > prompt.txt
+
+      origin run "$(cat prompt.txt)" > review.md
+
+      # Compose the note body. jq -Rs slurps the file into a JSON string so any
+      # backticks/quotes/newlines in the review are safely encoded.
+      note_body="$(printf '🔎 **origin MR review**\n\n'; cat review.md)"
+      printf '%s' "$note_body" | jq -Rs '{body: .}' > note.json
+
+      # POST the note to the merge request.
+      curl --fail --silent --show-error \
+        --request POST \
+        --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+        --header "Content-Type: application/json" \
+        --data @note.json \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes"

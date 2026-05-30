@@ -36,6 +36,8 @@ async fn signs_and_invokes_bedrock_model() {
         messages: vec![Message::new(Role::User).with_block(Block::text("ping"))],
         model: "anthropic.claude-3-haiku-20240307-v1:0".into(),
         tools: vec![],
+        effort: None,
+        attachments: Vec::new(),
     };
     let resp = provider.chat(req).await.expect("bedrock chat should succeed");
 

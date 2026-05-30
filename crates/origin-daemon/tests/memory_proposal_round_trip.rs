@@ -110,6 +110,12 @@ async fn memory_proposed_round_trip_via_stub_provider() {
             coordinator: None,
             plan: None,
             goal: Arc::new(tokio::sync::Mutex::new(None)),
+            policy: None,
+            conseca: None,
+            effort: None,
+            attachments: Vec::new(),
+            system_suffix: None,
+            read_only: false,
         };
         let summary = run_loop(&mut session, &prompt.user_text, &provider, &AlwaysAllow, &opts)
             .await
@@ -177,6 +183,7 @@ async fn memory_proposed_round_trip_via_stub_provider() {
         model: "claude-opus-4-7".into(),
         user_text: "remember: x is the variable name we use".into(),
         session_id: None,
+        ..Default::default()
     });
     let body = serde_json::to_vec(&prompt).expect("encode prompt");
     let frame = encode(1, FrameKind::Request, &body);

@@ -134,6 +134,36 @@ pub struct App {
     /// Rendered as a high-visibility notice so a wedged daemon stops looking
     /// like an indefinitely-spinning spinner.
     pub stall_secs: Option<u64>,
+    /// Session reasoning-effort level (`fast`/`low`/`medium`/`high`/`max`) as a
+    /// canonical wire token, or `None` to leave the provider wire unchanged.
+    /// Seeded from the startup `--effort` flag and mutated mid-session by the
+    /// `/effort <level>` and `/fast` composer commands. Sent on every
+    /// `PromptRequest`. *Closes: claude-code `/effort`+`/fast` (interactive).*
+    pub effort: Option<String>,
+    /// Active output style (Explanatory / Learning / Concise), or `None` for the
+    /// default voice. Set by the `/output-style <name>` composer command; its
+    /// system suffix is sent on every `PromptRequest` (in the `system` field) so
+    /// the model adopts the style. *Closes: claude-code output styles.*
+    pub output_style: Option<origin_outputstyle::Style>,
+    /// Queued mid-turn steering hints (gemini model steering). The `/steer
+    /// <text>` composer command pushes a hint here; the next real prompt drains
+    /// the queue and merges the hints (in `<steering>` markers) ahead of the
+    /// user's text. Empty ⇒ the prompt is sent unchanged. *Closes: gemini model
+    /// steering (the queue+merge wire).*
+    pub steering: origin_steering::SteeringQueue,
+    /// Read-only "plan mode" (gemini Plan Mode). When `true`, every subsequent
+    /// `PromptRequest` carries `read_only`, so the daemon denies all mutating
+    /// tools for that turn. Toggled by the `/plan` composer command.
+    pub plan_mode: bool,
+    /// Multimodal attachments staged by `/attach <file>` for the next prompt
+    /// (interactive parity with headless `origin run --attach`). Drained into
+    /// the next `PromptRequest.attachments`; empty ⇒ text-only. *Closes: the
+    /// interactive half of aider/gemini/claude image+PDF input.*
+    pub pending_attachments: Vec<origin_multimodal::ContentBlock>,
+    /// Extra workspace roots for this session (cline multi-root), seeded from
+    /// the startup `--root` flags and sent on every `PromptRequest`. Empty ⇒
+    /// single-root behaviour.
+    pub workspace_roots: Vec<String>,
 }
 
 const BANNER: &[&str] = &[
@@ -162,6 +192,12 @@ impl App {
             turn_started: None,
             goal_status: None,
             stall_secs: None,
+            effort: None,
+            output_style: None,
+            steering: origin_steering::SteeringQueue::new(),
+            plan_mode: false,
+            pending_attachments: Vec::new(),
+            workspace_roots: Vec::new(),
         }
     }
 

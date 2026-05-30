@@ -5,6 +5,7 @@
 
 use origin_core::types::{Message, MessageId};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 #[derive(Debug)]
 pub struct Session {
@@ -17,6 +18,10 @@ pub struct Session {
     pub pending_proposals: HashMap<u32, origin_mem::MemoryProposal>,
     /// Monotonic counter handed to [`origin_mem::Proposer::scan`].
     pub next_proposal_id: u32,
+    /// Additional workspace roots the agent may read/edit across (cline
+    /// multi-root workspaces). Empty ⇒ single-root behaviour, and the assembled
+    /// system prompt is byte-identical. Populated from `PromptRequest.roots`.
+    pub roots: Vec<PathBuf>,
 }
 
 impl Session {
@@ -29,6 +34,7 @@ impl Session {
             messages: Vec::new(),
             pending_proposals: HashMap::new(),
             next_proposal_id: 1,
+            roots: Vec::new(),
         }
     }
 
@@ -45,6 +51,7 @@ impl Session {
             messages: Vec::new(),
             pending_proposals: HashMap::new(),
             next_proposal_id: 1,
+            roots: Vec::new(),
         }
     }
 

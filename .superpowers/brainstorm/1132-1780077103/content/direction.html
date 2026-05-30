@@ -1,0 +1,34 @@
+<h2>Direction so far</h2>
+<p class="subtitle">Locked from the first round. This is now a real multi-subsystem product, not a local widget — I'll propose how to break it into buildable sub-projects shortly.</p>
+
+<div class="section">
+  <span class="label">Decisions locked</span>
+  <div style="display:flex;flex-direction:column;gap:8px">
+    <div style="border:1px solid rgba(128,128,128,.30);border-radius:9px;padding:10px 12px"><strong>Audience:</strong> Multi-human <em>team server</em> — a shared board, humans + agents collaborating.</div>
+    <div style="border:1px solid rgba(128,128,128,.30);border-radius:9px;padding:10px 12px"><strong>Flow:</strong> Stages auto-hand-off; any column can be flagged a manual approval gate.</div>
+    <div style="border:1px solid rgba(128,128,128,.30);border-radius:9px;padding:10px 12px"><strong>Output:</strong> Each ticket runs in an isolated git branch/worktree → opens a PR.</div>
+  </div>
+</div>
+
+<div class="section">
+  <span class="label">Default pipeline</span>
+  <div class="mockup">
+    <div class="mockup-body">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px">
+        <span style="border:1px solid rgba(128,128,128,.35);border-radius:20px;padding:5px 12px">Backlog</span><span style="opacity:.4">→</span>
+        <span style="border:1px solid rgba(99,102,241,.5);border-radius:20px;padding:5px 12px">Plan 🤖</span><span style="opacity:.4">→</span>
+        <span style="border:1px solid rgba(99,102,241,.5);border-radius:20px;padding:5px 12px">Design 🤖</span><span style="opacity:.4">→</span>
+        <span style="border:1px solid rgba(99,102,241,.5);border-radius:20px;padding:5px 12px">Build 🤖</span><span style="opacity:.4">→</span>
+        <span style="border:1px solid rgba(99,102,241,.5);border-radius:20px;padding:5px 12px">Test 🤖</span><span style="opacity:.4">→</span>
+        <span style="border:1px solid rgba(99,102,241,.5);border-radius:20px;padding:5px 12px">Review 🤖/🧑</span><span style="opacity:.4">→</span>
+        <span style="border:1px solid rgba(99,102,241,.5);border-radius:20px;padding:5px 12px">Docs 🤖</span><span style="opacity:.4">→</span>
+        <span style="border:1px solid rgba(34,197,94,.5);border-radius:20px;padding:5px 12px">Done ✓</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <span class="label">Next</span>
+  <p>A few deployment questions in the <strong>terminal</strong> (how it's hosted, where the agents run, how teammates sign in) — these decide how we split the build.</p>
+</div>

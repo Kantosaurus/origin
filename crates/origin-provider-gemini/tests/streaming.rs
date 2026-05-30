@@ -44,6 +44,8 @@ async fn gemini_streams_text_then_turn_end() {
                 messages: vec![Message::new(Role::User).with_block(Block::text("hi"))],
                 model: "gemini-2.0-flash".into(),
                 tools: vec![],
+                effort: None,
+                attachments: Vec::new(),
             },
             &r,
         )

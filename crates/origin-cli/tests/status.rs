@@ -36,5 +36,6 @@ fn cost_is_zero_for_unknown_model() {
         elapsed: Duration::from_millis(10),
     };
     let s = render_line(&snap);
-    assert!(s.contains("$0.000"));
+    // Unpriced model renders a clean "$0" via origin_cost::fmt_usd.
+    assert!(s.contains("$0"), "got {s}");
 }

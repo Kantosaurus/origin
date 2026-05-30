@@ -1,0 +1,103 @@
+# origin-issue-triage — classify new issues and apply a label.
+#
+# Mirrors kilocode/opencode issue-triage bots: when an issue is opened, ask
+# `origin run` to classify it and apply one of the standard labels.
+#
+# origin's `origin-review::triage` classifies issues as Bug / Feature / Question
+# / Docs, and `origin-review::similarity()` can dedup against existing issues to
+# flag likely duplicates. This workflow is the CI shell that surfaces that
+# classification as a GitHub label + comment.
+#
+# SECURITY: the issue title and body are untrusted. They are passed via `env:`
+# and consumed by the shell as plain strings — never inlined via `${{ }}`.
+name: origin-issue-triage
+
+on:
+  issues:
+    types: [opened]
+
+# Least privilege: read code, write the label + a triage comment.
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: origin-issue-triage-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    name: origin triages the issue
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install origin
+        run: npm install -g @kantosaurus/origin
+
+      - name: Run origin triage
+        id: run
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Untrusted issue text, passed safely as env vars.
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          set -o pipefail
+          # Assemble the prompt in a file so untrusted text never reaches argv
+          # unquoted. Ask for a single bare label token we can validate.
+          {
+            echo "You are origin's issue triager (origin-review::triage)."
+            echo "Classify the issue below into exactly ONE of: bug, feature,"
+            echo "question, documentation."
+            echo "Respond with ONLY that single lowercase word on the first line,"
+            echo "then a one-paragraph rationale on the following lines."
+            echo
+            echo "TITLE:"
+            printf '%s\n' "$ISSUE_TITLE"
+            echo
+            echo "BODY:"
+            printf '%s\n' "$ISSUE_BODY"
+          } > triage-prompt.txt
+          origin run "$(cat triage-prompt.txt)" | tee triage.txt
+          # First line is the label; sanitize to a known-good set.
+          raw_label="$(head -n1 triage.txt | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z')"
+          case "$raw_label" in
+            bug|feature|question|documentation) label="$raw_label" ;;
+            *) label="needs-triage" ;;
+          esac
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+
+      - name: Apply label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          LABEL: ${{ steps.run.outputs.label }}
+        run: |
+          # --add-label creates the label on the fly if the repo allows it; if
+          # the label does not exist and creation is disallowed this is a no-op
+          # we tolerate so triage never hard-fails.
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label "$LABEL" || \
+            echo "Could not apply label '$LABEL' (it may not exist in this repo)."
+
+      - name: Post triage comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          LABEL: ${{ steps.run.outputs.label }}
+        run: |
+          {
+            echo "🏷️ **origin triage**: classified as \`${LABEL}\`."
+            echo
+            # Show the rationale (everything after the first label line).
+            tail -n +2 triage.txt
+            echo
+            echo "<sub>Classification by \`origin-review::triage\` (Bug / Feature /"
+            echo "Question / Docs). \`origin-review::similarity()\` can also dedup"
+            echo "this against existing issues to flag likely duplicates.</sub>"
+          } > triage-comment.md
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file triage-comment.md

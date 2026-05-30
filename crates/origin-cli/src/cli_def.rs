@@ -14,6 +14,16 @@ pub struct Cli {
     /// Run the 7-step interactive guided tour (P14.D.3).
     #[arg(long)]
     pub tutorial: bool,
+    /// Reasoning-effort level for the session (`fast`/`low`/`medium`/`high`/`max`).
+    /// Defaults to unset, leaving the provider wire unchanged. Parsed via
+    /// [`crate::effort::ReasoningEffort::parse_level`] at the call site.
+    #[arg(long)]
+    pub effort: Option<String>,
+    /// Extra workspace root the agent may read/edit across (repeatable, cline
+    /// multi-root). Applies to the interactive session; for `origin run` use the
+    /// `Run`-level `--root`.
+    #[arg(long = "root")]
+    pub root: Vec<String>,
     #[command(subcommand)]
     pub cmd: Option<Cmd>,
 }
@@ -47,9 +57,59 @@ pub enum Cmd {
         /// Model override.
         #[arg(long)]
         model: Option<String>,
+        /// Reasoning-effort level (`fast`/`low`/`medium`/`high`/`max`). When
+        /// omitted, falls back to the global `--effort`. Maps to the provider
+        /// effort wire; unknown values leave the wire unchanged.
+        #[arg(long)]
+        effort: Option<String>,
+        /// Attach an image or PDF as multimodal context (repeatable). Each
+        /// file is classified and base64/text-encoded into the first user turn.
+        #[arg(long = "attach")]
+        attach: Vec<String>,
+        /// Stdout contract: `text` (default human text), `json` (a single final
+        /// JSON object), or `stream-json` (JSON-Lines of every IPC event, the
+        /// same shape as `--json`).
+        #[arg(long = "output-format")]
+        output_format: Option<String>,
+        /// Path to a JSON Schema the final answer must satisfy. Enables
+        /// structured-output mode: the schema is injected into the prompt, the
+        /// reply is validated, and on failure the model is re-prompted (bounded
+        /// retries). Emits only the validated JSON object on success.
+        #[arg(long = "json-schema")]
+        json_schema: Option<String>,
+        /// Extra workspace root the agent may read/edit across (repeatable,
+        /// cline multi-root). Surfaced to the model as a `<workspace-roots>`
+        /// block.
+        #[arg(long = "root")]
+        root: Vec<String>,
+    },
+    /// Workload Identity Federation token exchange (RFC 8693): mint a bearer
+    /// token from a CI OIDC id token for keyless provider auth.
+    OidcExchange {
+        /// STS endpoint that performs the exchange.
+        #[arg(long = "token-url")]
+        token_url: String,
+        /// Subject token: a literal JWT, `@<path>` (read file), or `env:<NAME>`.
+        #[arg(long = "subject-token")]
+        subject_token: String,
+        /// Target audience for the exchanged token.
+        #[arg(long)]
+        audience: String,
+        /// Optional Anthropic workspace id (`ANTHROPIC_WORKSPACE_ID`).
+        #[arg(long = "workspace-id")]
+        workspace_id: Option<String>,
+        /// Optional federation rule id (`anthropic_federation_rule_id`).
+        #[arg(long = "federation-rule-id")]
+        federation_rule_id: Option<String>,
+        /// Emit the full `ExchangedToken` as JSON instead of just the token.
+        #[arg(long)]
+        json: bool,
     },
     /// Daemon usage snapshot (tokens in/out per provider/model).
     Usage,
+    /// Per-session cost / usage insights: the usage+COST table plus a
+    /// session-insights footer with a prompt-cache warm/cold nudge.
+    Insights,
     /// Manage persisted sessions.
     Sessions {
         #[command(subcommand)]
@@ -71,6 +131,204 @@ pub enum Cmd {
     /// providers and models, captures credentials, and writes
     /// `~/.origin/config.toml`. Re-running overwrites the existing config.
     Init,
+    /// Environment & runtime diagnostics + a privacy disclosure of every
+    /// outbound behaviour (openclaude `doctor:runtime` / `verify:privacy`).
+    Doctor {
+        /// Emit the report as JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+        /// Only print the privacy / phone-home disclosure and exit.
+        #[arg(long)]
+        privacy: bool,
+    },
+    /// Render a mermaid flowchart to ASCII in the terminal — a dependency-free
+    /// renderer (jcode parity). Reads a file, or stdin when PATH is `-`.
+    Mermaid {
+        /// Path to a `.mmd`/`.md` file, or `-` for stdin.
+        path: String,
+    },
+    /// Local knowledge / semantic index (`/knowledge`) persisted to
+    /// `~/.origin/knowledge.json`.
+    Knowledge {
+        #[command(subcommand)]
+        sub: KnowledgeSub,
+    },
+    /// Manage scheduled / recurring triggers (cron, `@every`, `@daily`,
+    /// webhook, fs-event) persisted to `~/.origin/schedule.toml`.
+    Schedule {
+        #[command(subcommand)]
+        sub: ScheduleSub,
+    },
+    /// Export a persisted session transcript to Markdown or JSON.
+    Export {
+        /// Session id to export.
+        session_id: String,
+        /// Emit JSON instead of Markdown.
+        #[arg(long)]
+        json: bool,
+        /// Write to this file instead of stdout.
+        #[arg(long, short = 'o')]
+        out: Option<String>,
+    },
+    /// Snapshot the working tree into the shadow-git checkpoint history.
+    Checkpoint {
+        /// Optional human label for the checkpoint.
+        label: Option<String>,
+    },
+    /// List shadow-git checkpoints, newest first.
+    Checkpoints,
+    /// Restore the working tree from a checkpoint id.
+    Rewind {
+        /// Checkpoint id to restore.
+        id: String,
+        /// Restore only the tracked files (do not move HEAD).
+        #[arg(long)]
+        files_only: bool,
+    },
+    /// Print the patch for a checkpoint id.
+    CheckpointDiff {
+        /// Checkpoint id to diff.
+        id: String,
+    },
+    /// Shallow-clone a dependency repo and print a compact overview.
+    Scout {
+        /// Repository URL to clone.
+        repo_url: String,
+        /// Cache directory (defaults to `~/.origin/scout`).
+        #[arg(long)]
+        cache: Option<String>,
+    },
+    /// Scan a source tree for `AI` / `AI!` / `AI?` trigger comments.
+    Watch {
+        /// Root directory to scan (defaults to the current directory).
+        #[arg(long)]
+        root: Option<String>,
+        /// Comma-separated file extensions to scan (defaults to a builtin set).
+        #[arg(long)]
+        ext: Option<String>,
+    },
+    /// Bundle files + an instruction onto the clipboard for a web chat.
+    CopyContext {
+        /// Optional instruction for the model.
+        #[arg(long, short = 'm')]
+        instruction: Option<String>,
+        /// Files to include in the bundle.
+        #[arg(required = true)]
+        files: Vec<String>,
+    },
+    /// Apply edits pasted from a web chat (read from the clipboard).
+    ApplyClipboard,
+    /// Dictate a prompt via an external speech-to-text engine.
+    Dictate {
+        /// Emit each transcript line eagerly instead of buffering utterances.
+        #[arg(long)]
+        interleave: bool,
+        /// Spoken-language hint passed to the STT engine.
+        #[arg(long)]
+        lang: Option<String>,
+        /// Capture device passed to the STT engine.
+        #[arg(long)]
+        device: Option<String>,
+    },
+    /// Pluggable web search (`DuckDuckGo` / Brave / Tavily).
+    Search {
+        /// The search query.
+        query: String,
+        /// Engine: `ddg` (default), `brave`, or `tavily`.
+        #[arg(long)]
+        engine: Option<String>,
+    },
+    /// Discover and inspect plugins / cross-tool skills.
+    Plugin {
+        #[command(subcommand)]
+        sub: PluginSub,
+    },
+    /// Inspect the builtin LSP server registry (opencode-style fleet).
+    Lsp {
+        #[command(subcommand)]
+        sub: LspSub,
+    },
+    /// Ambient / overnight autonomous mode (jcode Ambient/OpenClaw + Overnight).
+    Ambient {
+        #[command(subcommand)]
+        sub: AmbientSub,
+    },
+}
+
+/// `origin ambient …` subcommands.
+#[derive(Subcommand)]
+pub enum AmbientSub {
+    /// Render the morning report for the most recent ambient session, plus the
+    /// standing overnight plan. Read-only: rendering schedules no work.
+    Report,
+}
+
+/// `origin lsp …` subcommands.
+#[derive(Subcommand)]
+pub enum LspSub {
+    /// List every server in the builtin registry (language, server id, launch
+    /// command, extensions, install hint).
+    Ls,
+    /// Resolve the language server for a file extension and report whether its
+    /// binary is already on `PATH`, the would-launch command, and the install
+    /// hint. Read-only by default; set `ORIGIN_LSP_AUTO=1` to additionally print
+    /// the launch the daemon would perform (still no spawn from the CLI).
+    Ensure {
+        /// File extension to resolve (with or without a leading dot).
+        ext: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PluginSub {
+    /// List discovered `.claude` / `.agents` skills.
+    Ls,
+    /// Parse a plugin manifest and report its surface + context cost.
+    Info {
+        /// Path to a plugin manifest TOML file.
+        manifest: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum KnowledgeSub {
+    /// Index a document by id with free text.
+    Add {
+        /// Stable document id.
+        id: String,
+        /// The text to index.
+        text: String,
+    },
+    /// Full-text search the index; prints the top hits.
+    Search {
+        /// Query string.
+        query: String,
+        /// Maximum number of hits.
+        #[arg(long, default_value_t = 5)]
+        k: usize,
+    },
+    /// Remove a document by id.
+    Rm { id: String },
+    /// List every indexed document id.
+    Ls,
+}
+
+#[derive(Subcommand)]
+pub enum ScheduleSub {
+    /// Add a trigger. SPEC is `@every 5m`, `@daily 09:30`, or a 5-field cron
+    /// (`min hour dom mon dow`). The PROMPT is run when the trigger fires.
+    Add {
+        /// Unique trigger id.
+        id: String,
+        /// Schedule spec.
+        spec: String,
+        /// Prompt template to run on fire.
+        prompt: String,
+    },
+    /// List configured triggers and their next fire time.
+    Ls,
+    /// Remove a trigger by id.
+    Rm { id: String },
 }
 
 #[derive(Subcommand)]
@@ -79,6 +337,18 @@ pub enum ProvidersSub {
     Ls,
     /// Print one provider's full config.
     Describe { id: String },
+    /// Best-effort refresh of the runtime model catalog from a custom
+    /// provider's `/models` endpoint, persisting the result to the on-disk
+    /// model cache (`~/.origin/models-cache.json`).
+    ///
+    /// When no custom provider with a reachable models endpoint and resolvable
+    /// API key is configured, this prints a clear message and changes nothing.
+    Refresh {
+        /// Refresh only this custom provider; defaults to the first configured
+        /// custom provider.
+        #[arg(long)]
+        provider: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -95,6 +365,15 @@ pub enum SessionsSub {
     Resume { session_id: String },
     /// Delete a session and all its messages.
     Rm { session_id: String },
+    /// Conversation rewind: keep only the first `--keep` turns of a session,
+    /// dropping the rest (the session itself stays resumable).
+    Rewind {
+        session_id: String,
+        /// Number of leading turns to keep (turns at or after this index are
+        /// removed).
+        #[arg(long)]
+        keep: u32,
+    },
 }
 
 #[derive(Subcommand)]

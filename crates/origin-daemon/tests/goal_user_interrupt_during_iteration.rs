@@ -135,6 +135,7 @@ async fn push_back_buffer_dispatches_pending_before_wire_read() {
         model: "m".into(),
         user_text: "after the interrupt".into(),
         session_id: None,
+        ..Default::default()
     });
     *pending.lock().await = Some(followup);
 
