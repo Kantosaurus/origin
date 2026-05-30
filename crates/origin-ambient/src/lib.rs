@@ -220,6 +220,132 @@ pub const fn should_schedule(now_min: u32, window_start: u32, window_end: u32) -
     }
 }
 
+/// Drives an [`OvernightPlan`] forward through a wall-clock window.
+///
+/// The driver is **pure**: it never reads the clock, performs I/O, or executes
+/// tasks. The caller owns the loop and passes `now_ms` in on every query, while
+/// the driver tracks the cursor into the plan and accumulates outcomes
+/// (tokens spent, branch lines, opened PRs) for the eventual [`MorningReport`].
+///
+/// Typical loop:
+/// ```
+/// use origin_ambient::{AmbientTask, OvernightDriver, OvernightPlan};
+///
+/// let plan = OvernightPlan::new(vec![AmbientTask::Tests, AmbientTask::Docs], 60_000);
+/// let mut driver = OvernightDriver::new(plan, 1_000);
+/// while let Some(task) = driver.next_due(5_000) {
+///     // ... execute `task`, measuring `tokens` and maybe opening a PR ...
+///     driver.record(task, 1_000, None);
+/// }
+/// let report = driver.into_report(20_234);
+/// assert_eq!(report.tokens_spent, 2_000);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OvernightDriver {
+    /// The plan being driven (task list + wall-clock ceiling).
+    plan: OvernightPlan,
+    /// Wall-clock instant the session began, in milliseconds.
+    start_ms: u64,
+    /// Index of the next task in `plan.tasks` to run.
+    cursor: usize,
+    /// Each completed task paired with the tokens it spent, in run order.
+    ran: Vec<(AmbientTask, u64)>,
+    /// Running total of tokens spent across recorded tasks.
+    tokens: u64,
+    /// Identifiers/URLs of pull requests opened by recorded tasks.
+    prs: Vec<String>,
+}
+
+impl OvernightDriver {
+    /// Construct a driver for `plan`, treating `start_ms` as the session start.
+    ///
+    /// The cursor begins at the first task and no outcomes are recorded yet.
+    #[must_use]
+    pub const fn new(plan: OvernightPlan, start_ms: u64) -> Self {
+        Self {
+            plan,
+            start_ms,
+            cursor: 0,
+            ran: Vec::new(),
+            tokens: 0,
+            prs: Vec::new(),
+        }
+    }
+
+    /// Whether the wall-clock window has elapsed at `now_ms`.
+    ///
+    /// `true` once `now_ms - start_ms >= plan.max_wall_ms`. Saturating in
+    /// `now_ms`: a `now_ms` before `start_ms` is treated as zero elapsed time.
+    #[must_use]
+    const fn window_elapsed(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.start_ms) >= self.plan.max_wall_ms
+    }
+
+    /// Return the next task to run, or `None` when the driver should stop.
+    ///
+    /// Yields `Some(task)` only when the window has **not** yet elapsed at
+    /// `now_ms` *and* tasks remain at or after the cursor. This is a peek: it
+    /// does **not** advance the cursor — call [`record`](Self::record) once the
+    /// task has run.
+    #[must_use]
+    pub fn next_due(&self, now_ms: u64) -> Option<AmbientTask> {
+        if self.window_elapsed(now_ms) {
+            return None;
+        }
+        self.plan.tasks.get(self.cursor).copied()
+    }
+
+    /// Record a completed task's outcome and advance the cursor.
+    ///
+    /// Remembers `task` with the `tokens` it spent (so [`into_report`] can render
+    /// a per-task line), accumulates `tokens` into the running total, collects
+    /// `pr` when `Some`, and moves the cursor to the next task. The cursor
+    /// advance saturates so repeated calls past the end of the plan can never
+    /// overflow.
+    ///
+    /// [`into_report`]: Self::into_report
+    pub fn record(&mut self, task: AmbientTask, tokens: u64, pr: Option<String>) {
+        self.ran.push((task, tokens));
+        self.tokens = self.tokens.saturating_add(tokens);
+        if let Some(pr) = pr {
+            self.prs.push(pr);
+        }
+        self.cursor = self.cursor.saturating_add(1);
+    }
+
+    /// Whether the session is finished at `now_ms`.
+    ///
+    /// `true` when the wall-clock window has elapsed **or** every task in the
+    /// plan has been recorded (the cursor has reached the end of the list).
+    #[must_use]
+    pub fn is_finished(&self, now_ms: u64) -> bool {
+        self.window_elapsed(now_ms) || self.cursor >= self.plan.tasks.len()
+    }
+
+    /// Consume the driver into a [`MorningReport`].
+    ///
+    /// Each recorded task becomes a `ran` line naming the task, its token cost,
+    /// and the PR-gated branch it lands on for `day_unix`, e.g.
+    /// `"tests — 1000 tokens (branch origin/ambient/tests-20234)"`. The report's
+    /// `tokens_spent` is the accumulated total and `prs_opened` is every
+    /// collected PR identifier, in run order.
+    #[must_use]
+    pub fn into_report(self, day_unix: u64) -> MorningReport {
+        let ran = self
+            .ran
+            .iter()
+            .map(|&(task, tokens)| {
+                format!(
+                    "{} — {tokens} tokens (branch {})",
+                    task.slug(),
+                    branch_name(task, day_unix)
+                )
+            })
+            .collect();
+        MorningReport::new(ran, self.tokens, self.prs)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
@@ -335,5 +461,88 @@ mod tests {
         let json = serde_json::to_string(&plan).unwrap();
         let back: OvernightPlan = serde_json::from_str(&json).unwrap();
         assert_eq!(plan, back);
+    }
+
+    #[test]
+    fn driver_yields_task_while_window_open() {
+        let plan = OvernightPlan::new(vec![AmbientTask::Tests, AmbientTask::Docs], 10_000);
+        let driver = OvernightDriver::new(plan, 1_000);
+        // 1_000 + 5_000 = 6_000 elapsed < 10_000 window, tasks remain.
+        assert_eq!(driver.next_due(6_000), Some(AmbientTask::Tests));
+        // next_due is a peek: cursor did not move, so it still yields the first.
+        assert_eq!(driver.next_due(6_000), Some(AmbientTask::Tests));
+        assert!(!driver.is_finished(6_000));
+    }
+
+    #[test]
+    fn driver_yields_none_when_window_elapsed() {
+        let plan = OvernightPlan::new(vec![AmbientTask::Tests], 10_000);
+        let driver = OvernightDriver::new(plan, 1_000);
+        // Exactly at the ceiling (1_000 + 10_000) counts as elapsed.
+        assert_eq!(driver.next_due(11_000), None);
+        assert_eq!(driver.next_due(50_000), None);
+        assert!(driver.is_finished(11_000));
+        // Tasks still remain, but the window closed.
+        assert!(driver.is_finished(11_000));
+    }
+
+    #[test]
+    fn driver_yields_none_and_finishes_when_all_recorded() {
+        let plan = OvernightPlan::new(vec![AmbientTask::Tests, AmbientTask::Docs], 1_000_000);
+        let mut driver = OvernightDriver::new(plan, 0);
+        driver.record(AmbientTask::Tests, 100, None);
+        driver.record(AmbientTask::Docs, 200, None);
+        // Window is wide open, but every task is consumed.
+        assert_eq!(driver.next_due(5_000), None);
+        assert!(driver.is_finished(5_000));
+        // Recording past the end is saturating and stays finished.
+        driver.record(AmbientTask::Refactor, 1, None);
+        assert!(driver.is_finished(5_000));
+    }
+
+    #[test]
+    fn driver_into_report_accumulates_ran_tokens_and_prs() {
+        let plan = OvernightPlan::new(
+            vec![AmbientTask::Tests, AmbientTask::Docs, AmbientTask::Refactor],
+            1_000_000,
+        );
+        let mut driver = OvernightDriver::new(plan, 0);
+        driver.record(AmbientTask::Tests, 1_000, Some("pr-1".to_string()));
+        driver.record(AmbientTask::Docs, 250, None); // no PR -> skipped
+        driver.record(AmbientTask::Refactor, 750, Some("pr-2".to_string()));
+
+        let report = driver.into_report(20_234);
+
+        assert_eq!(report.tokens_spent, 2_000);
+        assert_eq!(report.prs_opened, vec!["pr-1", "pr-2"]); // None skipped
+        assert_eq!(report.ran.len(), 3);
+        assert_eq!(
+            report.ran[0],
+            "tests — 1000 tokens (branch origin/ambient/tests-20234)"
+        );
+        assert_eq!(
+            report.ran[1],
+            "docs — 250 tokens (branch origin/ambient/docs-20234)"
+        );
+        assert_eq!(
+            report.ran[2],
+            "refactor — 750 tokens (branch origin/ambient/refactor-20234)"
+        );
+    }
+
+    #[test]
+    fn driver_drives_a_full_loop() {
+        let plan = OvernightPlan::new(vec![AmbientTask::Tests, AmbientTask::Docs], 60_000);
+        let mut driver = OvernightDriver::new(plan, 1_000);
+        let mut count = 0_u32;
+        // now_ms stays well within the window for the whole loop.
+        while let Some(task) = driver.next_due(5_000) {
+            driver.record(task, 1_000, None);
+            count += 1;
+            assert!(count <= 2, "loop must terminate after the plan's tasks");
+        }
+        assert_eq!(count, 2);
+        assert!(driver.is_finished(5_000));
+        assert_eq!(driver.into_report(1).tokens_spent, 2_000);
     }
 }
