@@ -194,6 +194,9 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
                 origin_cli::providers::refresh(provider.as_deref());
                 Ok(())
             }
+            ProvidersSub::Recommend { models, write } => {
+                origin_cli::recommend::run(&models, write)
+            }
         },
         Cmd::Init => origin_cli::init::run().await,
         Cmd::Import(a) => import_subcommand(&a),
