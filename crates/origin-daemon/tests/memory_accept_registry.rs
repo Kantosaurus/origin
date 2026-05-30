@@ -105,6 +105,7 @@ async fn accept_persists_via_proposal_registry() {
         attachments: Vec::new(),
         system_suffix: None,
         read_only: false,
+        router: None,
     };
     let _summary = run_loop(
         &mut session,

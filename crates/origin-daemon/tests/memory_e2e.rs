@@ -113,6 +113,7 @@ async fn memory_e2e_proposer_to_store_via_wiremock() {
         attachments: Vec::new(),
         system_suffix: None,
         read_only: false,
+        router: None,
     };
     let _summary = run_loop(
         &mut session,
