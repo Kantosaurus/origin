@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 default = []
-otel = ["dep:opentelemetry", "dep:opentelemetry-otlp"]
+otel = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk"]
 
 [dependencies]
 prometheus = { workspace = true }
@@ -20,8 +20,10 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [[bench]]
 name = "encode"

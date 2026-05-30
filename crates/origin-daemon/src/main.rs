@@ -538,6 +538,19 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     if let Some(bind) = parse_metrics_bind() {
         spawn_metrics_endpoint((*metrics).clone(), bind);
     }
+    // cline/gemini OpenTelemetry export: when built `--features otel` and
+    // ORIGIN_OTLP_ENDPOINT is set, install a real OTLP/gRPC metrics pipeline.
+    // The global meter provider keeps the returned handle alive (we drop the
+    // local clone). Off by default (feature + env both required).
+    #[cfg(feature = "otel")]
+    {
+        if let Ok(endpoint) = env::var("ORIGIN_OTLP_ENDPOINT") {
+            match origin_metrics::exporter::otel::install(&endpoint) {
+                Ok(_provider) => info!(%endpoint, "otel: OTLP metrics exporter installed"),
+                Err(e) => tracing::warn!(error = %e, "otel: failed to install OTLP exporter"),
+            }
+        }
+    }
 
     let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
     let listener = Listener::bind(&path).await?;

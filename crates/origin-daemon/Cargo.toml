@@ -21,6 +21,10 @@ bedrock = ["dep:origin-provider-bedrock"]
 github-models = ["dep:origin-provider-github"]
 oauth-providers = []
 custom-providers = []
+# Opt-in OpenTelemetry OTLP metrics export. Off by default so the standard
+# daemon build does not pull tonic/prost; build with `--features otel` and set
+# ORIGIN_OTLP_ENDPOINT to stream metrics to a collector.
+otel = ["origin-metrics/otel"]
 
 [dependencies]
 origin-ipc              = { path = "../origin-ipc" }
