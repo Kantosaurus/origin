@@ -932,6 +932,16 @@ pub async fn run_loop(
     } else {
         String::new()
     };
+    // aider model-tuned edit formats: when `ORIGIN_EDITFMT=1`, append a compact
+    // `<origin-edit-format>` block selected by `origin_editfmt::best_format_for`
+    // so the model emits in-prose edits in its best-tested format (Claude ⇒
+    // search/replace, GPT ⇒ unified diff, …). The structured Edit/MultiEdit/
+    // ApplyPatch tools are unaffected. Default-off ⇒ empty ⇒ byte-identical.
+    let edit_format_block = if std::env::var("ORIGIN_EDITFMT").as_deref() == Ok("1") {
+        origin_editfmt::system_block(&session.model)
+    } else {
+        String::new()
+    };
     // Optional output-style addendum (claude-code output styles). Default-off:
     // `None`/empty appends nothing, leaving the assembled prompt — and the
     // prompt-cache breakpoints — byte-identical to before.
@@ -940,7 +950,7 @@ pub async fn run_loop(
     // roots, tell the model it may read/edit across them. Empty ⇒ byte-identical.
     let roots_block = workspace_roots_block(&session.roots);
     let recalled_system = {
-        let parts: [&str; 9] = [
+        let parts: [&str; 10] = [
             &repo_map_block,
             identity_block,
             &directive_block,
@@ -950,6 +960,7 @@ pub async fn run_loop(
             &goal_block,
             &style_block,
             &roots_block,
+            &edit_format_block,
         ];
         parts
             .iter()
