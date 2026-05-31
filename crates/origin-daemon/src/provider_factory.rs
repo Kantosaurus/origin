@@ -479,10 +479,25 @@ impl ProviderFactory {
 static GLOBAL_FACTORY: std::sync::OnceLock<GlobalFactory> = std::sync::OnceLock::new();
 
 /// A registered factory plus the account its rebuilds resolve credentials for.
+///
+/// `account` is behind a `std::sync::RwLock` so a `/account` switch can update
+/// which account a cross-provider rebuild resolves credentials for, after the
+/// factory was registered once at startup. The lock is held only long enough to
+/// clone the inner `Arc<str>` (never across an `await`), so it cannot deadlock
+/// the async loop.
 #[derive(Clone)]
 struct GlobalFactory {
     factory: Arc<ProviderFactory>,
-    account: Arc<str>,
+    account: Arc<std::sync::RwLock<Arc<str>>>,
+}
+
+/// Read the current account out of a registered factory, cloning the inner
+/// `Arc<str>` and releasing the lock immediately. Falls back to the poisoned
+/// inner value rather than panicking, so a poisoned lock never aborts a turn.
+fn current_account_of(g: &GlobalFactory) -> Arc<str> {
+    g.account
+        .read()
+        .map_or_else(|p| Arc::clone(&p.into_inner()), |a| Arc::clone(&a))
 }
 
 /// Register the daemon-wide [`ProviderFactory`] + default `account` so the agent
@@ -496,8 +511,31 @@ struct GlobalFactory {
 pub fn set_global(factory: Arc<ProviderFactory>, account: impl Into<Arc<str>>) {
     let _ = GLOBAL_FACTORY.set(GlobalFactory {
         factory,
-        account: account.into(),
+        account: Arc::new(std::sync::RwLock::new(account.into())),
     });
+}
+
+/// Update the account the process-wide factory resolves credentials for.
+///
+/// Called from the `/account` switch handler so a subsequent cross-provider
+/// rebuild uses the freshly-selected account's credentials rather than the
+/// startup default. No-op when [`set_global`] was never called (the default),
+/// keeping the agent loop byte-identical. The write lock is held only for the
+/// assignment.
+pub fn update_global_account(account: &str) {
+    if let Some(g) = GLOBAL_FACTORY.get() {
+        if let Ok(mut w) = g.account.write() {
+            *w = Arc::from(account);
+        }
+    }
+}
+
+/// The account the process-wide factory currently resolves credentials for, or
+/// `None` when no factory is registered. Read-only query, primarily for tests
+/// and diagnostics.
+#[must_use]
+pub fn get_current_account() -> Option<Arc<str>> {
+    GLOBAL_FACTORY.get().map(current_account_of)
 }
 
 /// The registered factory + account, or `None` when the daemon never called
@@ -517,7 +555,9 @@ fn global() -> Option<GlobalFactory> {
 /// call site stays a one-liner.
 pub async fn build_provider_for(provider_id: &str, model: &str) -> Option<Arc<dyn Provider>> {
     let g = global()?;
-    g.factory.build_provider_for(provider_id, model, &g.account).await
+    // Clone the current account out and drop the lock before the await.
+    let account = current_account_of(&g);
+    g.factory.build_provider_for(provider_id, model, &account).await
 }
 
 /// Intern a provider id into a process-static `&'static str`, leaking each

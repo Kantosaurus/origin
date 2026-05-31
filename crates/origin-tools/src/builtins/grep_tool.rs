@@ -18,7 +18,7 @@ pub enum OutputMode {
 }
 
 #[allow(clippy::module_name_repetitions)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GrepArgs {
     pub pattern: String,
     pub path: Option<String>,
@@ -30,6 +30,29 @@ pub struct GrepArgs {
     pub after: u32,
     pub line_numbers: bool,
     pub multiline: bool,
+    /// Already-seen line regions to elide from `content`-mode results.
+    ///
+    /// Defaults to `None` (absent). Only consulted when the
+    /// `ORIGIN_AGENTGREP_TRUNCATE=1` env gate is set; otherwise it is ignored
+    /// and the result is byte-identical to a run without this field. Populated
+    /// by the daemon from session history, not by the tool input schema.
+    pub exposure: Option<Vec<ExposureWindow>>,
+}
+
+/// A contiguous, already-exposed region of a file.
+///
+/// Lines are 1-based and the range is inclusive on both ends
+/// (`start_line..=end_line`), matching the 1-based `line` numbers carried by
+/// `content`-mode match objects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExposureWindow {
+    /// File path this window applies to. Compared verbatim against the `file`
+    /// string carried by `content`-mode match objects.
+    pub file: String,
+    /// First exposed line (1-based, inclusive).
+    pub start_line: u64,
+    /// Last exposed line (1-based, inclusive).
+    pub end_line: u64,
 }
 
 /// Opt-in sentinel: a `pattern` beginning with this prefix selects the agentgrep
@@ -256,6 +279,33 @@ fn regex_escape(s: &str) -> String {
     out
 }
 
+/// Elide `content`-mode matches that fall inside an already-exposed region.
+///
+/// Removes, in place, any match whose `(file, line)` lands inside one of the
+/// supplied [`ExposureWindow`]s. A window matches when its `file` equals the
+/// match's `file` string verbatim and the match's 1-based `line` is within the
+/// inclusive range `start_line..=end_line`. Matches lacking a readable
+/// `file`/`line` are never elided. Returns the number of matches removed; an
+/// empty `exposure` removes nothing and returns `0`.
+fn truncate_by_exposure(matches: &mut Vec<Value>, exposure: &[ExposureWindow]) -> u32 {
+    if exposure.is_empty() {
+        return 0;
+    }
+    let before = matches.len();
+    matches.retain(|m| {
+        let file = m.get("file").and_then(Value::as_str);
+        let line = m.get("line").and_then(Value::as_u64);
+        let (Some(file), Some(line)) = (file, line) else {
+            return true;
+        };
+        let elide = exposure
+            .iter()
+            .any(|w| w.file == file && line >= w.start_line && line <= w.end_line);
+        !elide
+    });
+    u32::try_from(before - matches.len()).unwrap_or(u32::MAX)
+}
+
 /// # Errors
 /// `regex.invalid` on bad pattern, `io.*` on walk failures.
 #[allow(clippy::module_name_repetitions, clippy::too_many_lines)]
@@ -361,6 +411,23 @@ pub fn grep_v2(args: GrepArgs) -> Result<Value, ToolError> {
                     break 'walk;
                 }
             }
+        }
+    }
+
+    // Exposure-aware truncation (opt-in): when `ORIGIN_AGENTGREP_TRUNCATE=1`,
+    // drop `content`-mode matches whose (file, line) was already shown to the
+    // model in an earlier turn, so re-running a search doesn't re-spend tokens
+    // on already-seen regions. Default-off (gate unset) OR no `exposure` ⇒
+    // `match_results` is untouched, so the result is byte-identical to before.
+    // `files_with_matches` / `count` modes are never affected.
+    if std::env::var("ORIGIN_AGENTGREP_TRUNCATE").as_deref() == Ok("1")
+        && matches!(mode, OutputMode::Content)
+    {
+        if let Some(exposure) = args.exposure.as_ref() {
+            // Elided matches are simply dropped; there is no metadata slot
+            // in the result shape, and `{"matches": …}` reflects the
+            // reduced set directly.
+            let _elided = truncate_by_exposure(&mut match_results, exposure);
         }
     }
 
@@ -1022,5 +1089,79 @@ mod agentgrep_tests {
         assert!(is_definition_line("fn foo() {}"));
         assert!(is_definition_line("class Foo {"));
         assert!(is_definition_line("def foo():"));
+    }
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::{truncate_by_exposure, ExposureWindow, GrepArgs};
+    use serde_json::json;
+
+    #[test]
+    fn elides_inside_window_and_is_file_selective() {
+        let mut matches = vec![
+            json!({ "file": "src/a.rs", "line": 5, "text": "hit a5" }),
+            json!({ "file": "src/a.rs", "line": 50, "text": "hit a50" }),
+            json!({ "file": "src/b.rs", "line": 5, "text": "hit b5" }),
+        ];
+        let exposure = vec![ExposureWindow {
+            file: "src/a.rs".to_string(),
+            start_line: 1,
+            end_line: 10,
+        }];
+        let elided = truncate_by_exposure(&mut matches, &exposure);
+        // a5 is inside the window on the right file -> elided.
+        // a50 is outside the window -> kept.
+        // b5 is in a different file -> kept (multi-file selectivity).
+        assert_eq!(elided, 1);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0]["file"], "src/a.rs");
+        assert_eq!(matches[0]["line"], 50);
+        assert_eq!(matches[1]["file"], "src/b.rs");
+        assert_eq!(matches[1]["line"], 5);
+    }
+
+    #[test]
+    fn boundaries_are_inclusive() {
+        let mut matches = vec![
+            json!({ "file": "src/a.rs", "line": 9, "text": "before" }),
+            json!({ "file": "src/a.rs", "line": 10, "text": "start boundary" }),
+            json!({ "file": "src/a.rs", "line": 20, "text": "end boundary" }),
+            json!({ "file": "src/a.rs", "line": 21, "text": "after" }),
+        ];
+        let exposure = vec![ExposureWindow {
+            file: "src/a.rs".to_string(),
+            start_line: 10,
+            end_line: 20,
+        }];
+        let elided = truncate_by_exposure(&mut matches, &exposure);
+        // Lines 10 and 20 (both boundaries, inclusive) are elided; the lines
+        // one outside the window on each side (9 and 21) are kept.
+        assert_eq!(elided, 2);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0]["line"], 9);
+        assert_eq!(matches[1]["line"], 21);
+    }
+
+    #[test]
+    fn empty_exposure_is_noop() {
+        let mut matches = vec![
+            json!({ "file": "src/a.rs", "line": 5, "text": "hit" }),
+            json!({ "file": "src/b.rs", "line": 7, "text": "hit" }),
+        ];
+        let exposure: Vec<ExposureWindow> = Vec::new();
+        let elided = truncate_by_exposure(&mut matches, &exposure);
+        assert_eq!(elided, 0);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0]["line"], 5);
+        assert_eq!(matches[1]["line"], 7);
+    }
+
+    #[test]
+    fn default_grep_args_has_no_exposure() {
+        // The exposure field is absent (`None`) by default, so a `GrepArgs`
+        // built without it — the daemon-free path — keeps the legacy behavior.
+        let args = GrepArgs::default();
+        assert_eq!(args.exposure, None);
     }
 }

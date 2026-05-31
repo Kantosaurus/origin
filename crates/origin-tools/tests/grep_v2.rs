@@ -27,6 +27,7 @@ fn files_with_matches_default_mode() {
         after: 0,
         line_numbers: false,
         multiline: false,
+        exposure: None,
     })
     .unwrap();
     let arr = out["files"].as_array().unwrap();
@@ -47,6 +48,7 @@ fn content_mode_returns_lines() {
         after: 0,
         line_numbers: true,
         multiline: false,
+        exposure: None,
     })
     .unwrap();
     let arr = out["matches"].as_array().unwrap();
@@ -67,6 +69,7 @@ fn count_mode_returns_counts() {
         after: 0,
         line_numbers: false,
         multiline: false,
+        exposure: None,
     })
     .unwrap();
     let arr = out["counts"].as_array().unwrap();
@@ -88,6 +91,7 @@ fn head_limit_caps_output() {
         after: 0,
         line_numbers: true,
         multiline: false,
+        exposure: None,
     })
     .unwrap();
     let arr = out["matches"].as_array().unwrap();
@@ -108,6 +112,7 @@ fn type_filter_only_matches_named_type() {
         after: 0,
         line_numbers: false,
         multiline: false,
+        exposure: None,
     })
     .unwrap();
     let arr = out["files"].as_array().unwrap();
@@ -130,6 +135,7 @@ fn glob_filter_only_matches_pattern() {
         after: 0,
         line_numbers: false,
         multiline: false,
+        exposure: None,
     })
     .unwrap();
     let arr = out["files"].as_array().unwrap();

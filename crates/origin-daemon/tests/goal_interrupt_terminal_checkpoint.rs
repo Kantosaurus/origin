@@ -41,6 +41,8 @@ fn interrupt_arm_writes_terminal_cleared_snapshot() {
         pending_tool_calls: Vec::new(),
         plan_seq: 0,
         goal: Some(snap),
+        detached_at_unix: None,
+        memory_estimate_bytes: None,
     };
 
     {

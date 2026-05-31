@@ -58,6 +58,8 @@ fn session_store_round_trips_messages_and_resume_token() {
         pending_tool_calls: Vec::new(),
         plan_seq: 0,
         goal: None,
+        detached_at_unix: None,
+        memory_estimate_bytes: None,
     };
     store.save_resume_token(&token).expect("save token");
 

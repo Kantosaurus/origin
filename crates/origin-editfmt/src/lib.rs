@@ -189,6 +189,70 @@ pub fn system_block(model: &str) -> String {
     )
 }
 
+/// Detects which [`EditFormat`] a block of model-emitted prose is written in.
+///
+/// The scan keys on the exact textual markers the `parse_*` functions
+/// consume, and returns the most specific matching format:
+///
+/// * [`EditFormat::DiffFenced`] — a code fence (` ``` `) together with a
+///   `<<<<<<<` SEARCH marker, matching [`parse`]'s fenced search/replace path.
+/// * [`EditFormat::SearchReplace`] — a `<<<<<<<` SEARCH marker without a fence.
+/// * [`EditFormat::Udiff`] — an `@@` hunk header, the hard requirement of the
+///   unified-diff parser (typically alongside `--- ` / `+++ ` headers).
+/// * [`EditFormat::WholeFile`] — a code fence with none of the above markers.
+///
+/// Returns `None` when `text` carries no edit-format markers at all (so a
+/// caller can fall back to a model-tuned default).
+#[must_use]
+pub fn format_from_text(text: &str) -> Option<EditFormat> {
+    let mut has_fence = false;
+    let mut has_search_marker = false;
+    let mut has_udiff_hunk = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            has_fence = true;
+        }
+        if trimmed.starts_with("<<<<<<<") {
+            has_search_marker = true;
+        }
+        // `parse_udiff` keys strictly on a line beginning with `@@`.
+        if line.starts_with("@@") {
+            has_udiff_hunk = true;
+        }
+    }
+    if has_search_marker {
+        // A fenced SEARCH/REPLACE block is the diff-fenced format; a bare one is
+        // plain search/replace. Mirrors `parse_search_replace`'s `require_fence`.
+        if has_fence {
+            return Some(EditFormat::DiffFenced);
+        }
+        return Some(EditFormat::SearchReplace);
+    }
+    if has_udiff_hunk {
+        return Some(EditFormat::Udiff);
+    }
+    if has_fence {
+        return Some(EditFormat::WholeFile);
+    }
+    None
+}
+
+/// Extracts every hunk from model-emitted `text`, auto-detecting the format.
+///
+/// When [`format_from_text`] recognizes a format, `text` is parsed with it;
+/// otherwise the parser falls back to [`best_format_for`] for `model`. The
+/// result is whatever [`parse`] returns for the chosen format.
+///
+/// # Errors
+///
+/// Returns [`EditFmtError::Parse`] when the detected (or fallback) format's
+/// parser finds no well-formed block in `text`.
+pub fn extract_all_hunks(text: &str, model: &str) -> Result<Vec<Hunk>, EditFmtError> {
+    let fmt = format_from_text(text).unwrap_or_else(|| best_format_for(model));
+    parse(fmt, text)
+}
+
 /// Optional filename hint preceding a search/replace block.
 fn extract_filename(lines: &[&str], block_start: usize) -> String {
     // Walk backwards over blank lines / fence lines to find a path-ish line.
@@ -558,5 +622,91 @@ mod tests {
         assert_eq!(best_format_for("gpt-4o"), EditFormat::Udiff);
         let block = system_block("gpt-4o");
         assert!(block.contains("unified diff"), "block: {block}");
+    }
+
+    #[test]
+    fn format_from_text_detects_search_replace() {
+        let text = "src/main.rs\n\
+                    <<<<<<< SEARCH\n\
+                    let x = 1;\n\
+                    =======\n\
+                    let x = 2;\n\
+                    >>>>>>> REPLACE\n";
+        assert_eq!(format_from_text(text), Some(EditFormat::SearchReplace));
+    }
+
+    #[test]
+    fn format_from_text_detects_diff_fenced() {
+        let text = "file.py\n```diff\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n```\n";
+        assert_eq!(format_from_text(text), Some(EditFormat::DiffFenced));
+    }
+
+    #[test]
+    fn format_from_text_detects_udiff() {
+        let text = "--- a/src/lib.rs\n\
+                    +++ b/src/lib.rs\n\
+                    @@ -1,3 +1,3 @@\n\
+                    ctx line\n\
+                    -old line\n\
+                    +new line\n\
+                    more ctx\n";
+        assert_eq!(format_from_text(text), Some(EditFormat::Udiff));
+    }
+
+    #[test]
+    fn format_from_text_detects_whole_file_fence_only() {
+        let text = "config.toml\n```\nkey = \"value\"\nother = 1\n```\n";
+        assert_eq!(format_from_text(text), Some(EditFormat::WholeFile));
+    }
+
+    #[test]
+    fn format_from_text_none_for_plain_prose() {
+        assert_eq!(format_from_text("just some prose, no markers here"), None);
+        assert_eq!(format_from_text(""), None);
+    }
+
+    #[test]
+    fn extract_all_hunks_round_trips_search_replace() {
+        let text = "src/main.rs\n\
+                    <<<<<<< SEARCH\n\
+                    let x = 1;\n\
+                    =======\n\
+                    let x = 2;\n\
+                    >>>>>>> REPLACE\n";
+        // Detected as SearchReplace, so `model` is irrelevant here.
+        let hunks = extract_all_hunks(text, "claude-opus-4").unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].file, "src/main.rs");
+        assert_eq!(hunks[0].before, "let x = 1;");
+        assert_eq!(hunks[0].after, "let x = 2;");
+        let out = apply(&hunks[0], "let x = 1;").unwrap();
+        assert_eq!(out, "let x = 2;");
+    }
+
+    #[test]
+    fn extract_all_hunks_falls_back_to_model_default() {
+        // No markers: detection is `None`, so we fall back to `best_format_for`.
+        // gpt-4o maps to Udiff, whose parser errors with no `@@` header.
+        let err = extract_all_hunks("plain prose with no edits", "gpt-4o").unwrap_err();
+        assert!(matches!(err, EditFmtError::Parse(_)));
+    }
+
+    #[test]
+    fn extract_all_hunks_plain_prose_matches_parse_contract() {
+        // For a Claude default (SearchReplace), no-block input is a Parse error,
+        // exactly as `parse` reports for missing blocks.
+        let text = "just some prose";
+        let via_extract = extract_all_hunks(text, "claude-opus-4");
+        let via_parse = parse(best_format_for("claude-opus-4"), text);
+        assert_eq!(via_extract, via_parse);
+        assert!(matches!(via_extract, Err(EditFmtError::Parse(_))));
+    }
+
+    #[test]
+    fn extract_all_hunks_udiff_round_trips() {
+        let text = "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n ctx line\n-old line\n+new line\n more ctx\n";
+        let hunks = extract_all_hunks(text, "claude-opus-4").unwrap();
+        let out = apply(&hunks[0], "ctx line\nold line\nmore ctx").unwrap();
+        assert_eq!(out, "ctx line\nnew line\nmore ctx");
     }
 }

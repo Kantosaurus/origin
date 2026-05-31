@@ -101,6 +101,125 @@ pub mod genai {
 
     /// `gen_ai.tool.name` attribute: the invoked tool's name.
     pub const TOOL_NAME: &str = "gen_ai.tool.name";
+
+    // -- Request attributes (sampling / generation parameters) --------------
+
+    /// `gen_ai.request.temperature` attribute: requested sampling temperature.
+    pub const REQUEST_TEMPERATURE: &str = "gen_ai.request.temperature";
+
+    /// `gen_ai.request.top_p` attribute: requested nucleus-sampling `top_p`.
+    pub const REQUEST_TOP_P: &str = "gen_ai.request.top_p";
+
+    /// `gen_ai.request.top_k` attribute: requested top-k sampling value.
+    pub const REQUEST_TOP_K: &str = "gen_ai.request.top_k";
+
+    /// `gen_ai.request.max_tokens` attribute: requested max output tokens.
+    pub const REQUEST_MAX_TOKENS: &str = "gen_ai.request.max_tokens";
+
+    /// `gen_ai.request.frequency_penalty` attribute: requested frequency penalty.
+    pub const REQUEST_FREQUENCY_PENALTY: &str = "gen_ai.request.frequency_penalty";
+
+    /// `gen_ai.request.presence_penalty` attribute: requested presence penalty.
+    pub const REQUEST_PRESENCE_PENALTY: &str = "gen_ai.request.presence_penalty";
+
+    /// `gen_ai.request.stop_sequences` attribute: requested stop sequences.
+    pub const REQUEST_STOP_SEQUENCES: &str = "gen_ai.request.stop_sequences";
+
+    /// `gen_ai.request.seed` attribute: requested deterministic sampling seed.
+    pub const REQUEST_SEED: &str = "gen_ai.request.seed";
+
+    /// `gen_ai.request.encoding_formats` attribute: requested embedding encodings.
+    pub const REQUEST_ENCODING_FORMATS: &str = "gen_ai.request.encoding_formats";
+
+    /// `gen_ai.request.choice.count` attribute: number of completion choices requested.
+    pub const REQUEST_CHOICE_COUNT: &str = "gen_ai.request.choice.count";
+
+    // -- Response attributes -------------------------------------------------
+
+    /// `gen_ai.response.id` attribute: provider-assigned response identifier.
+    pub const RESPONSE_ID: &str = "gen_ai.response.id";
+
+    /// `gen_ai.response.finish_reasons` attribute: per-choice finish reasons.
+    pub const RESPONSE_FINISH_REASONS: &str = "gen_ai.response.finish_reasons";
+
+    // -- Usage ---------------------------------------------------------------
+
+    /// `gen_ai.usage.cached_input_tokens` attribute: prompt tokens served from cache.
+    pub const USAGE_CACHED_INPUT_TOKENS: &str = "gen_ai.usage.cached_input_tokens";
+
+    // -- Operation / agent / tool / conversation -----------------------------
+
+    /// `gen_ai.agent.id` attribute: the unique agent identifier.
+    pub const AGENT_ID: &str = "gen_ai.agent.id";
+
+    /// `gen_ai.agent.name` attribute: the human-readable agent name.
+    pub const AGENT_NAME: &str = "gen_ai.agent.name";
+
+    /// `gen_ai.agent.description` attribute: free-form agent description.
+    pub const AGENT_DESCRIPTION: &str = "gen_ai.agent.description";
+
+    /// `gen_ai.tool.call.id` attribute: the tool-call identifier.
+    pub const TOOL_CALL_ID: &str = "gen_ai.tool.call.id";
+
+    /// `gen_ai.tool.description` attribute: free-form tool description.
+    pub const TOOL_DESCRIPTION: &str = "gen_ai.tool.description";
+
+    /// `gen_ai.tool.type` attribute: the tool kind (`function`, `extension`, …).
+    pub const TOOL_TYPE: &str = "gen_ai.tool.type";
+
+    /// `gen_ai.conversation.id` attribute: the conversation/thread identifier.
+    pub const CONVERSATION_ID: &str = "gen_ai.conversation.id";
+
+    /// `gen_ai.data_source.id` attribute: the retrieval data-source identifier.
+    pub const DATA_SOURCE_ID: &str = "gen_ai.data_source.id";
+
+    // -- Provider / system ---------------------------------------------------
+
+    /// `gen_ai.provider.name` attribute: the provider (newer alias of `system`).
+    pub const PROVIDER_NAME: &str = "gen_ai.provider.name";
+
+    /// `server.address` attribute: the `GenAI` server host or socket path.
+    pub const SERVER_ADDRESS: &str = "server.address";
+
+    /// `server.port` attribute: the `GenAI` server port.
+    pub const SERVER_PORT: &str = "server.port";
+
+    /// `error.type` attribute: the error class for a failed operation.
+    pub const ERROR_TYPE: &str = "error.type";
+
+    // -- Metric instrument names ---------------------------------------------
+
+    /// `gen_ai.client.token.usage` metric: client-side token-usage histogram.
+    pub const CLIENT_TOKEN_USAGE: &str = "gen_ai.client.token.usage";
+
+    /// `gen_ai.server.request.duration` metric: server-side request duration.
+    pub const SERVER_REQUEST_DURATION: &str = "gen_ai.server.request.duration";
+
+    /// `gen_ai.server.time_per_output_token` metric: per-output-token latency.
+    pub const TIME_PER_OUTPUT_TOKEN: &str = "gen_ai.server.time_per_output_token";
+
+    // -- Standard `gen_ai.operation.name` values -----------------------------
+
+    /// `gen_ai.operation.name` value: a chat completion.
+    pub const OPERATION_CHAT: &str = "chat";
+
+    /// `gen_ai.operation.name` value: a content-generation call.
+    pub const OPERATION_GENERATE_CONTENT: &str = "generate_content";
+
+    /// `gen_ai.operation.name` value: a text-completion call.
+    pub const OPERATION_TEXT_COMPLETION: &str = "text_completion";
+
+    /// `gen_ai.operation.name` value: an embeddings call.
+    pub const OPERATION_EMBEDDINGS: &str = "embeddings";
+
+    /// `gen_ai.operation.name` value: a tool execution.
+    pub const OPERATION_EXECUTE_TOOL: &str = "execute_tool";
+
+    /// `gen_ai.operation.name` value: agent creation.
+    pub const OPERATION_CREATE_AGENT: &str = "create_agent";
+
+    /// `gen_ai.operation.name` value: agent invocation.
+    pub const OPERATION_INVOKE_AGENT: &str = "invoke_agent";
 }
 
 /// Convention-mapped name for one of origin's internal metric families.
@@ -189,5 +308,78 @@ mod tests {
         ] {
             assert!(k.starts_with("gen_ai."), "{k} must be a gen_ai.* key");
         }
+    }
+
+    #[test]
+    fn newly_added_request_attributes_pin_convention_strings() {
+        assert_eq!(genai::REQUEST_TEMPERATURE, "gen_ai.request.temperature");
+        assert_eq!(genai::REQUEST_TOP_P, "gen_ai.request.top_p");
+        assert_eq!(genai::REQUEST_TOP_K, "gen_ai.request.top_k");
+        assert_eq!(genai::REQUEST_MAX_TOKENS, "gen_ai.request.max_tokens");
+        assert_eq!(
+            genai::REQUEST_FREQUENCY_PENALTY,
+            "gen_ai.request.frequency_penalty"
+        );
+        assert_eq!(
+            genai::REQUEST_PRESENCE_PENALTY,
+            "gen_ai.request.presence_penalty"
+        );
+        assert_eq!(genai::REQUEST_STOP_SEQUENCES, "gen_ai.request.stop_sequences");
+        assert_eq!(genai::REQUEST_SEED, "gen_ai.request.seed");
+        assert_eq!(
+            genai::REQUEST_ENCODING_FORMATS,
+            "gen_ai.request.encoding_formats"
+        );
+        assert_eq!(genai::REQUEST_CHOICE_COUNT, "gen_ai.request.choice.count");
+    }
+
+    #[test]
+    fn newly_added_response_and_usage_attributes_pin_convention_strings() {
+        assert_eq!(genai::RESPONSE_ID, "gen_ai.response.id");
+        assert_eq!(genai::RESPONSE_FINISH_REASONS, "gen_ai.response.finish_reasons");
+        assert_eq!(
+            genai::USAGE_CACHED_INPUT_TOKENS,
+            "gen_ai.usage.cached_input_tokens"
+        );
+    }
+
+    #[test]
+    fn newly_added_agent_tool_conversation_attributes_pin_convention_strings() {
+        assert_eq!(genai::AGENT_ID, "gen_ai.agent.id");
+        assert_eq!(genai::AGENT_NAME, "gen_ai.agent.name");
+        assert_eq!(genai::AGENT_DESCRIPTION, "gen_ai.agent.description");
+        assert_eq!(genai::TOOL_CALL_ID, "gen_ai.tool.call.id");
+        assert_eq!(genai::TOOL_DESCRIPTION, "gen_ai.tool.description");
+        assert_eq!(genai::TOOL_TYPE, "gen_ai.tool.type");
+        assert_eq!(genai::CONVERSATION_ID, "gen_ai.conversation.id");
+        assert_eq!(genai::DATA_SOURCE_ID, "gen_ai.data_source.id");
+    }
+
+    #[test]
+    fn newly_added_provider_and_metric_names_pin_convention_strings() {
+        assert_eq!(genai::PROVIDER_NAME, "gen_ai.provider.name");
+        assert_eq!(genai::SERVER_ADDRESS, "server.address");
+        assert_eq!(genai::SERVER_PORT, "server.port");
+        assert_eq!(genai::ERROR_TYPE, "error.type");
+        assert_eq!(genai::CLIENT_TOKEN_USAGE, "gen_ai.client.token.usage");
+        assert_eq!(
+            genai::SERVER_REQUEST_DURATION,
+            "gen_ai.server.request.duration"
+        );
+        assert_eq!(
+            genai::TIME_PER_OUTPUT_TOKEN,
+            "gen_ai.server.time_per_output_token"
+        );
+    }
+
+    #[test]
+    fn newly_added_operation_name_values_pin_convention_strings() {
+        assert_eq!(genai::OPERATION_CHAT, "chat");
+        assert_eq!(genai::OPERATION_GENERATE_CONTENT, "generate_content");
+        assert_eq!(genai::OPERATION_TEXT_COMPLETION, "text_completion");
+        assert_eq!(genai::OPERATION_EMBEDDINGS, "embeddings");
+        assert_eq!(genai::OPERATION_EXECUTE_TOOL, "execute_tool");
+        assert_eq!(genai::OPERATION_CREATE_AGENT, "create_agent");
+        assert_eq!(genai::OPERATION_INVOKE_AGENT, "invoke_agent");
     }
 }

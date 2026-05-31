@@ -100,6 +100,8 @@ pub fn make_goal_checkpoint_token(
             status: g.status.clone().into(),
             last_status_tag: g.last_status_tag.clone().map(Into::into),
         }),
+        detached_at_unix: None,
+        memory_estimate_bytes: None,
     }
 }
 

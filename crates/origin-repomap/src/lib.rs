@@ -181,6 +181,79 @@ pub fn build_map(
     Ok(out)
 }
 
+/// Merge several workspace roots' symbol graphs into one corpus, then rank the
+/// whole thing through [`build_map`] under a single shared token budget.
+///
+/// Each element of `per_root` is one root's `Vec<FileSymbols>` (as produced by
+/// the scanner). The rows are concatenated *in root order* and de-duplicated by
+/// [`FileSymbols::file`]: the first occurrence of a path wins and any later row
+/// naming the same path is dropped wholesale (symbol sets are **not** unioned).
+/// This keeps the corpus deterministic — a file shared by two roots contributes
+/// exactly one node, seeded from the earliest root — while letting the existing
+/// personalized `PageRank` re-rank the combined def→ref graph so cross-root
+/// dependencies (root A referencing a symbol root B defines) influence the map.
+///
+/// Re-ranking is delegated entirely to [`build_map`]; this function only owns the
+/// concatenate-and-dedup step. Identical input therefore yields identical output.
+///
+/// # Errors
+///
+/// Returns [`RepoMapError::Empty`] when the merged corpus contains no files
+/// (every root was empty), matching [`build_map`]'s contract.
+pub fn merge_and_rerank_maps(
+    per_root: Vec<Vec<FileSymbols>>,
+    focus: &[String],
+    token_budget: u32,
+) -> Result<Vec<RankedEntry>, RepoMapError> {
+    let merged = dedup_corpus(per_root);
+    if merged.is_empty() {
+        return Err(RepoMapError::Empty);
+    }
+    build_map(&merged, focus, token_budget)
+}
+
+/// Build a token-budgeted repo map spanning several pre-scanned workspace roots.
+///
+/// This is the multi-root entry point. Because the crate is pure (no I/O, no
+/// directory walking — see the crate-level docs), each root must already be
+/// scanned into a `Vec<FileSymbols>` by the caller (e.g. via [`scan_path`]); the
+/// roots are then merged and re-ranked together via [`merge_and_rerank_maps`],
+/// so a single shared `token_budget` is split across all roots and cross-root
+/// references are honoured by the ranker.
+///
+/// # Errors
+///
+/// Returns [`RepoMapError::Empty`] when `per_root` is empty or every root is
+/// empty (the merged corpus has no files), matching [`build_map`]'s contract.
+pub fn build_map_multi_root(
+    per_root: Vec<Vec<FileSymbols>>,
+    focus: &[String],
+    token_budget: u32,
+) -> Result<Vec<RankedEntry>, RepoMapError> {
+    if per_root.is_empty() {
+        return Err(RepoMapError::Empty);
+    }
+    merge_and_rerank_maps(per_root, focus, token_budget)
+}
+
+/// Concatenate per-root rows into one corpus, dropping later duplicates by path.
+///
+/// First occurrence of each [`FileSymbols::file`] wins; subsequent rows naming a
+/// path already seen are discarded (their symbol sets are *not* merged). Order is
+/// the stable concatenation order of `per_root`, so the result is deterministic.
+fn dedup_corpus(per_root: Vec<Vec<FileSymbols>>) -> Vec<FileSymbols> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut merged: Vec<FileSymbols> = Vec::new();
+    for root in per_root {
+        for f in root {
+            if seen.insert(f.file.clone()) {
+                merged.push(f);
+            }
+        }
+    }
+    merged
+}
+
 /// Core ranker shared by the public entry points.
 ///
 /// Builds the def→ref adjacency, runs `iters` rounds of power iteration with the
@@ -1252,5 +1325,70 @@ mod tests {
         // The same symbol declared twice is reported once (first occurrence).
         let defs = scan_definitions(Language::Rust, "fn dup() {}\nfn dup() {}");
         assert_eq!(defs, vec!["dup".to_string()]);
+    }
+
+    // ---- multi-root merge + re-rank -----------------------------------------
+
+    #[test]
+    fn merge_and_rerank_over_three_roots_is_deterministic() {
+        // Three roots, each contributing files that reference a shared definer.
+        let roots = || {
+            vec![
+                vec![def("core.rs", &["Engine"], 10), refs("a.rs", &["Engine"], 10)],
+                vec![refs("b.rs", &["Engine"], 10), def("util.rs", &["Helper"], 10)],
+                vec![refs("c.rs", &["Engine", "Helper"], 10)],
+            ]
+        };
+        let first = merge_and_rerank_maps(roots(), &[], 1_000).unwrap();
+        let second = merge_and_rerank_maps(roots(), &[], 1_000).unwrap();
+        assert_eq!(first, second, "multi-root ranking must be deterministic");
+    }
+
+    #[test]
+    fn merge_dedups_file_present_in_two_roots() {
+        // core.rs appears in two roots; the merged map must contain it once.
+        let roots = vec![
+            vec![def("core.rs", &["Engine"], 10), refs("a.rs", &["Engine"], 10)],
+            vec![def("core.rs", &["Engine"], 10), refs("b.rs", &["Engine"], 10)],
+        ];
+        let map = merge_and_rerank_maps(roots, &[], 10_000).unwrap();
+        let core_count = map.iter().filter(|e| e.file == "core.rs").count();
+        assert_eq!(core_count, 1, "duplicate path must collapse to one entry");
+    }
+
+    #[test]
+    fn merge_empty_input_is_empty_error() {
+        // No roots at all, and roots that are all empty, both map to Empty.
+        assert_eq!(merge_and_rerank_maps(vec![], &[], 1_000), Err(RepoMapError::Empty));
+        assert_eq!(
+            merge_and_rerank_maps(vec![vec![], vec![]], &[], 1_000),
+            Err(RepoMapError::Empty)
+        );
+        assert_eq!(build_map_multi_root(vec![], &[], 1_000), Err(RepoMapError::Empty));
+    }
+
+    #[test]
+    fn single_root_merge_equals_build_map() {
+        // Wrapping one root's files must yield exactly what build_map produces.
+        let files = vec![
+            def("core.rs", &["Engine", "Config"], 20),
+            refs("a.rs", &["Engine"], 10),
+            refs("b.rs", &["Engine"], 10),
+        ];
+        let direct = build_map(&files, &[], 100).unwrap();
+        let via_merge = merge_and_rerank_maps(vec![files], &[], 100).unwrap();
+        assert_eq!(via_merge, direct, "single-root path must be byte-identical");
+    }
+
+    #[test]
+    fn build_map_multi_root_delegates_to_merge() {
+        // The public multi-root entry point matches the merge helper directly.
+        let roots = vec![
+            vec![def("core.rs", &["Engine"], 10)],
+            vec![refs("a.rs", &["Engine"], 10), refs("b.rs", &["Engine"], 10)],
+        ];
+        let via_helper = merge_and_rerank_maps(roots.clone(), &[], 1_000).unwrap();
+        let via_entry = build_map_multi_root(roots, &[], 1_000).unwrap();
+        assert_eq!(via_entry, via_helper);
     }
 }

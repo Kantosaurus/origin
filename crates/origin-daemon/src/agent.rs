@@ -2306,6 +2306,9 @@ async fn dispatch_tool(
                     .unwrap_or(0),
                 line_numbers: args.get("line_numbers").and_then(Value::as_bool).unwrap_or(false),
                 multiline: args.get("multiline").and_then(Value::as_bool).unwrap_or(false),
+                // Exposure-aware truncation is wired in a later step; the
+                // default-off path passes no exposure (byte-identical).
+                exposure: None,
             };
             origin_tools::builtins::grep_tool::grep_v2(gargs)
                 .map(|v| serde_json::to_string(&v).expect("BUG: GrepResult always serializes"))

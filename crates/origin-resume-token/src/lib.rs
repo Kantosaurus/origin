@@ -59,6 +59,19 @@ pub struct ResumeToken {
     /// keeps old tokens (written before this field existed) deserializable.
     #[serde(default)]
     pub goal: Option<origin_goal::GoalSnapshot>,
+    /// Unix epoch seconds at which the supervisor detached this agent, if it
+    /// was detached. `None` for live tokens and for any token written before
+    /// this field existed. `#[serde(default)]` keeps those old tokens
+    /// deserializable (defaults to `None`).
+    #[serde(default)]
+    pub detached_at_unix: Option<u64>,
+    /// Estimated resident memory of the agent at detach time, in bytes, used
+    /// by the supervisor-lifecycle feature to record why an agent was
+    /// detached (e.g. memory pressure). `None` when unknown and for any token
+    /// written before this field existed. `#[serde(default)]` keeps those old
+    /// tokens deserializable (defaults to `None`).
+    #[serde(default)]
+    pub memory_estimate_bytes: Option<u64>,
 }
 
 /// On-disk wrapper. `payload` is the inner `ResumeToken` JSON serialized
@@ -314,6 +327,8 @@ mod tests {
             pending_tool_calls: vec!["tool-1".into()],
             plan_seq: 42,
             goal: None,
+            detached_at_unix: None,
+            memory_estimate_bytes: None,
         }
     }
 
@@ -408,5 +423,57 @@ mod tests {
 
         let err = ResumeToken::load_all(tmp.path()).expect_err("must reject legacy");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn backward_compat() {
+        // A payload written before `detached_at_unix` / `memory_estimate_bytes`
+        // existed simply lacks those keys. Hand-craft such an inner JSON (the
+        // exact shape the old serializer produced) and confirm it deserializes
+        // with both new fields defaulting to None. This is the load-side
+        // guarantee `#[serde(default)]` provides.
+        let old_payload = serde_json::json!({
+            "session_id": "old",
+            "last_turn": 1,
+            "cas_handle_root": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "pending_tool_calls": ["t-0"],
+            "plan_seq": 9,
+            "goal": null,
+        });
+        let inner = serde_json::to_string(&old_payload).expect("ser old payload");
+        let token: ResumeToken = serde_json::from_str(&inner).expect("deserialize old token");
+        assert_eq!(token.session_id, "old");
+        assert_eq!(token.last_turn, 1);
+        assert_eq!(token.plan_seq, 9);
+        assert_eq!(token.detached_at_unix, None);
+        assert_eq!(token.memory_estimate_bytes, None);
+
+        // Also verify the field can be entirely absent (not just null).
+        let bare = serde_json::json!({
+            "session_id": "older",
+            "last_turn": 0,
+            "cas_handle_root": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "pending_tool_calls": [],
+            "plan_seq": 0,
+        });
+        let inner = serde_json::to_string(&bare).expect("ser bare payload");
+        let token: ResumeToken = serde_json::from_str(&inner).expect("deserialize bare token");
+        assert_eq!(token.goal, None);
+        assert_eq!(token.detached_at_unix, None);
+        assert_eq!(token.memory_estimate_bytes, None);
+    }
+
+    #[test]
+    fn round_trip_with_fields() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut token = sample("S");
+        token.detached_at_unix = Some(1_717_200_000);
+        token.memory_estimate_bytes = Some(512 * 1024 * 1024);
+        token.save(tmp.path()).expect("save");
+        let mut loaded = ResumeToken::load_all(tmp.path()).expect("load");
+        assert_eq!(loaded.len(), 1);
+        let got = loaded.pop().expect("one");
+        assert_eq!(got.detached_at_unix, Some(1_717_200_000));
+        assert_eq!(got.memory_estimate_bytes, Some(512 * 1024 * 1024));
     }
 }

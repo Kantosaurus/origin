@@ -22,6 +22,8 @@ fn token_round_trips_with_active_goal() {
             status: GoalStatusWire::Active,
             last_status_tag: None,
         }),
+        detached_at_unix: None,
+        memory_estimate_bytes: None,
     };
     let bytes = serde_json::to_vec(&token).unwrap();
     let back: ResumeToken = serde_json::from_slice(&bytes).unwrap();
@@ -64,6 +66,8 @@ fn token_round_trips_with_terminal_status() {
             },
             last_status_tag: None,
         }),
+        detached_at_unix: None,
+        memory_estimate_bytes: None,
     };
     let bytes = serde_json::to_vec(&token).unwrap();
     let back: ResumeToken = serde_json::from_slice(&bytes).unwrap();

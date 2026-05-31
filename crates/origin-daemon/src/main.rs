@@ -988,6 +988,8 @@ fn spawn_handler_task(
                                         pending_tool_calls: Vec::new(),
                                         plan_seq: 0,
                                         goal: Some(snap),
+                                        detached_at_unix: None,
+                                        memory_estimate_bytes: None,
                                     };
                                     if let Err(e) = session_store.save_resume_token(&token) {
                                         warn!(error = %e, "clear: terminal goal checkpoint save failed");
@@ -1178,6 +1180,8 @@ fn spawn_handler_task(
                                 pending_tool_calls: Vec::new(),
                                 plan_seq: 0,
                                 goal: Some(snap),
+                                detached_at_unix: None,
+                                memory_estimate_bytes: None,
                             };
                             if let Err(e) = session_store.save_resume_token(&token) {
                                 warn!(error = %e, "goal interrupt: terminal save failed");
@@ -1799,6 +1803,8 @@ fn cleared_resume_token(
             status: origin_goal::GoalStatusWire::Cleared { by },
             last_status_tag: state.last_status_tag.clone().map(Into::into),
         }),
+        detached_at_unix: None,
+        memory_estimate_bytes: None,
     }
 }
 
@@ -2342,6 +2348,13 @@ async fn handle_switch(
         let mut g = active.write().await;
         *g = new_provider;
     }
+
+    // Keep the process-wide factory's account in sync so a subsequent
+    // CROSS-provider router rebuild (`provider_factory::build_provider_for`)
+    // resolves credentials for the freshly-switched account rather than the
+    // startup default. No-op unless `set_global` was called at startup (i.e.
+    // cross-provider routing is active), so the default path is unchanged.
+    origin_daemon::provider_factory::update_global_account(account);
 
     let ev = StreamEvent::ProviderActive {
         provider: id.as_str().to_string(),
