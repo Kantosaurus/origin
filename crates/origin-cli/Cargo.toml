@@ -29,7 +29,7 @@ origin-migrate = { path = "../origin-migrate" }
 origin-store = { path = "../origin-store" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
 anyhow = "1"
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 jsonschema = { workspace = true }
