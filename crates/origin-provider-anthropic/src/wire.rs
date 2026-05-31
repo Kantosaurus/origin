@@ -43,6 +43,39 @@ pub struct WireRequest<'a> {
     /// the request byte-identical to the pre-effort behavior.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<&'static str>,
+    /// Extended-thinking control block. `None` is omitted from the wire
+    /// entirely, keeping the request byte-identical to the pre-thinking-tokens
+    /// behavior. `Some` emits `"thinking": {"type":"enabled","budget_tokens":n}`
+    /// (Anthropic Messages API); callers must ensure `max_tokens` exceeds the
+    /// budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<WireThinking>,
+}
+
+/// Anthropic extended-thinking control block.
+///
+/// Serialises to `{"type":"enabled","budget_tokens": n}`. Only constructed when
+/// a turn's `thinking_tokens` is `Some`; the surrounding `WireRequest.thinking`
+/// is omitted otherwise so the unset path stays byte-identical.
+#[derive(Serialize, Clone, Copy)]
+pub struct WireThinking {
+    /// Always `"enabled"` per the Messages API.
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    /// Token budget the model may spend on thinking. Must be strictly less than
+    /// the request's top-level `max_tokens`.
+    pub budget_tokens: u32,
+}
+
+impl WireThinking {
+    /// Construct an enabled extended-thinking block with the given budget.
+    #[must_use]
+    pub const fn enabled(budget_tokens: u32) -> Self {
+        Self {
+            kind: "enabled",
+            budget_tokens,
+        }
+    }
 }
 
 #[derive(Serialize)]

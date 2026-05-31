@@ -45,6 +45,7 @@ async fn reads_token_from_vault_and_calls_github_models() {
             model: "gpt-4o-mini".into(),
             tools: vec![],
             effort: None,
+            thinking_tokens: None,
             attachments: Vec::new(),
         })
         .await
@@ -71,6 +72,7 @@ async fn missing_vault_entry_maps_to_auth() {
             model: "gpt-4o-mini".into(),
             tools: vec![],
             effort: None,
+            thinking_tokens: None,
             attachments: Vec::new(),
         })
         .await
@@ -103,6 +105,7 @@ async fn auth_error_status_maps_to_provider_auth() {
             model: "gpt-4o-mini".into(),
             tools: vec![],
             effort: None,
+            thinking_tokens: None,
             attachments: Vec::new(),
         })
         .await
@@ -149,6 +152,7 @@ async fn token_is_reread_on_each_chat_call() {
             model: "m".into(),
             tools: vec![],
             effort: None,
+            thinking_tokens: None,
             attachments: Vec::new(),
         })
         .await
@@ -168,6 +172,7 @@ async fn token_is_reread_on_each_chat_call() {
             model: "m".into(),
             tools: vec![],
             effort: None,
+            thinking_tokens: None,
             attachments: Vec::new(),
         })
         .await

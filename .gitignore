@@ -2,8 +2,15 @@
 /target/
 **/target/
 /target-tdd/
+/target-clippy/
+/target-test/
 **/*.rs.bk
 *.pdb
+
+# Local gaps analysis / planning docs — kept on disk, not tracked
+/Gaps.md
+/docs/gaps-implementation-plan.md
+/docs/gaps-overnight-tracker.md
 
 # proptest regression files (auto-generated)
 **/*.proptest-regressions

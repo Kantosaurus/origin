@@ -71,6 +71,7 @@ async fn large_tool_result_emitted_as_reference_when_volatile() {
             model: "claude-3-5-haiku-20241022".into(),
             tools: vec![],
             effort: None,
+            thinking_tokens: None,
             attachments: Vec::new(),
         })
         .await
@@ -156,6 +157,7 @@ async fn large_tool_result_inlined_when_handle_registered_sticky() {
             model: "claude-3-5-haiku-20241022".into(),
             tools: vec![],
             effort: None,
+            thinking_tokens: None,
             attachments: Vec::new(),
         })
         .await
@@ -246,6 +248,7 @@ async fn large_tool_result_referenced_when_handle_registered_sliding() {
             model: "claude-3-5-haiku-20241022".into(),
             tools: vec![],
             effort: None,
+            thinking_tokens: None,
             attachments: Vec::new(),
         })
         .await

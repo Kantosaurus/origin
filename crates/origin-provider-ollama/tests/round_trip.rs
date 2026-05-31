@@ -44,6 +44,7 @@ async fn ollama_streams_text_then_turn_end() {
                 model: "llama3".into(),
                 tools: vec![],
                 effort: None,
+                thinking_tokens: None,
                 attachments: Vec::new(),
             },
             &r,
@@ -102,6 +103,7 @@ async fn ollama_chat_non_streaming_round_trip() {
             model: "llama3".into(),
             tools: vec![],
             effort: None,
+            thinking_tokens: None,
             attachments: Vec::new(),
         })
         .await
@@ -140,6 +142,7 @@ async fn ollama_auth_error_maps_to_provider_auth() {
             model: "llama3".into(),
             tools: vec![],
             effort: None,
+            thinking_tokens: None,
             attachments: Vec::new(),
         })
         .await

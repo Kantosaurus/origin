@@ -39,6 +39,30 @@ type SharedApp = Arc<Mutex<App>>;
 type SharedComposer = Arc<Mutex<Composer>>;
 type SharedWidget = Arc<Mutex<StreamWidget>>;
 
+/// Process-wide extended-thinking budget (in tokens) seeded from the startup
+/// `--thinking-tokens` flag. `None` (the default) ⇒ no thinking budget on any
+/// `PromptRequest`, keeping the provider wire byte-identical.
+///
+/// The session reasoning-effort token lives on `App` (in `tui.rs`), but the
+/// thinking budget is a scalar set once at startup and never mutated
+/// mid-session, so a `OnceLock`-backed process global is the simplest home that
+/// the TUI prompt path (`call_daemon`) can read without threading a new field
+/// through `App`. `set_thinking_tokens_seed` is called exactly once during
+/// startup before any prompt is driven.
+static THINKING_TOKENS_SEED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+
+/// Record the startup `--thinking-tokens` seed. Idempotent: only the first call
+/// wins (later calls are no-ops), matching the once-at-startup contract.
+fn set_thinking_tokens_seed(value: Option<u32>) {
+    let _ = THINKING_TOKENS_SEED.set(value);
+}
+
+/// Read the startup `--thinking-tokens` seed; `None` until set, and `None`
+/// thereafter unless a positive budget was provided.
+fn thinking_tokens_seed() -> Option<u32> {
+    THINKING_TOKENS_SEED.get().copied().flatten()
+}
+
 /// Stack size for the thread that drives the async entrypoint.
 ///
 /// The TUI's top-level future is a single large state machine — many
@@ -131,11 +155,20 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
             bearer,
             model,
             effort,
+            thinking_tokens,
+            alias,
             attach,
             output_format,
             json_schema,
             root,
         } => {
+            // Run-level `--thinking-tokens` wins; otherwise inherit the startup
+            // seed. `0` is a hard error (matches the global flag's contract).
+            let thinking_tokens =
+                match origin_cli::config::validate_thinking_tokens(thinking_tokens.or_else(thinking_tokens_seed)) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(anyhow::anyhow!("{e}"))),
+                };
             origin_cli::headless::run(origin_cli::headless::RunArgs {
                 text,
                 json,
@@ -143,6 +176,8 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
                 bearer,
                 model,
                 effort,
+                thinking_tokens,
+                aliases: alias,
                 attach,
                 output_format,
                 json_schema,
@@ -200,6 +235,7 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
         },
         Cmd::Init => origin_cli::init::run().await,
         Cmd::Import(a) => import_subcommand(&a),
+        Cmd::ResumeForeign { source, path } => origin_cli::resume_foreign::run(source, path).await,
         Cmd::Doctor { json, privacy } => origin_cli::doctor::run(json, privacy).await,
         Cmd::Mermaid { path } => origin_cli::mermaid::run(&path),
         Cmd::Knowledge { sub } => origin_cli::knowledge::run(sub),
@@ -228,6 +264,8 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
         Cmd::Plugin { sub } => origin_cli::plugin::run(sub),
         Cmd::Lsp { sub } => origin_cli::lsp::run(&sub),
         Cmd::Ambient { sub } => origin_cli::ambient::run(&sub),
+        Cmd::Bench { samples, json, from } => origin_cli::bench::run(samples, json, from),
+        Cmd::Review { strictness } => origin_cli::review::run(&strictness),
     })
 }
 
@@ -271,6 +309,13 @@ async fn run() -> Result<()> {
             |level| Some(level.as_str().to_string()),
         )
     });
+    // Resolve the optional extended-thinking budget (aider `--thinking-tokens`).
+    // Default-off: unset ⇒ `None` ⇒ wire unchanged. `0` is a hard error (a zero
+    // budget is meaningless and Anthropic rejects it). The validated value is
+    // recorded process-wide and rides on every PromptRequest the TUI sends.
+    let thinking_tokens_seed = origin_cli::config::validate_thinking_tokens(cli.thinking_tokens)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    set_thinking_tokens_seed(thinking_tokens_seed);
     if cli.tutorial {
         // Localized welcome chrome (item A; origin-i18n locale from
         // $LC_ALL/$LANG, English fallback).
@@ -301,20 +346,34 @@ async fn run() -> Result<()> {
     // session). The provider/account pair is also forwarded to the daemon
     // when we auto-spawn it — the daemon itself only reads ORIGIN_PROVIDER /
     // ORIGIN_ACCOUNT, not config.toml, so we have to hand it the answer.
-    let (default_provider, default_account, default_model) =
-        origin_cli::config::load().ok().flatten().map_or_else(
-            || {
-                (
-                    "anthropic".to_string(),
-                    "default".to_string(),
-                    "claude-opus-4-7".to_string(),
-                )
-            },
-            |c| (c.primary.provider, c.primary.account, c.primary.model),
-        );
+    let loaded_cfg = origin_cli::config::load().ok().flatten();
+    let (default_provider, default_account, default_model) = loaded_cfg.as_ref().map_or_else(
+        || {
+            (
+                "anthropic".to_string(),
+                "default".to_string(),
+                "claude-opus-4-7".to_string(),
+            )
+        },
+        |c| {
+            (
+                c.primary.provider.clone(),
+                c.primary.account.clone(),
+                c.primary.model.clone(),
+            )
+        },
+    );
 
     let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
-    let mut model = env::var("ORIGIN_MODEL").unwrap_or(default_model);
+    // Resolve the model id against the config `[aliases]` table (aider `--alias`).
+    // The substitution is the single CLI-side resolution point: an undefined
+    // alias — or any literal model id — passes through unchanged, so the
+    // pre-alias behaviour is byte-identical. Empty/absent table ⇒ no-op.
+    let raw_model = env::var("ORIGIN_MODEL").unwrap_or(default_model);
+    let mut model = loaded_cfg.as_ref().map_or_else(
+        || raw_model.clone(),
+        |c| origin_cli::config::resolve_alias(&c.aliases, &raw_model),
+    );
     let session_id = format!("{:032x}", rand::random::<u128>());
 
     // Quickstart docs promise auto-spawn: stand up `origin-daemon` as a
@@ -1105,6 +1164,9 @@ async fn handle_prompt_turn(
     let handle_for_goal = handle.clone();
     // Snapshot the session effort level so this turn carries `/effort`/`/fast`.
     let effort = app.lock().effort.clone();
+    // Carry the startup `--thinking-tokens` budget on every turn (aider
+    // `--thinking-tokens`). `None` ⇒ wire unchanged.
+    let thinking_tokens = thinking_tokens_seed();
     // The active output style's system suffix rides in the `system` field.
     let system_suffix = app
         .lock()
@@ -1125,6 +1187,7 @@ async fn handle_prompt_turn(
         &user_text,
         session_id,
         effort,
+        thinking_tokens,
         system_suffix,
         read_only,
         attachments,
@@ -1234,13 +1297,24 @@ async fn handle_prompt_turn(
     )
     .await;
 
+    // claude-code MessageDisplay (CLI render side): fire the `MessageDisplay`
+    // shell hook on the final assistant text *before* taking the `App` lock, so
+    // no parking_lot guard is held across the await. Default-off: with no
+    // `hooks.json` / no `MessageDisplay` hook this is `None` ⇒ identity, and the
+    // output-style transform alone decides the render (byte-identical).
+    let display_action = if reply.is_ok() {
+        fire_message_display_hook(app).await
+    } else {
+        None
+    };
+
     let mut a = app.lock();
     // End the live timer regardless of success/failure so elapsed stops
     // ticking and folds into the cumulative total.
     a.stop_turn_timer();
     match reply {
         Ok((r, _elapsed)) => {
-            a.finalize_assistant_turn(r.turns);
+            a.finalize_assistant_turn_with_action(r.turns, display_action.as_ref());
             // Render each memory proposal as a status line (P6.7).
             for (id, body, tags) in &proposals {
                 let truncated: String = body.chars().take(60).collect();
@@ -1262,6 +1336,21 @@ async fn handle_prompt_turn(
     handle.mark_dirty();
 }
 
+/// Fire the `MessageDisplay` shell hook on the buffered assistant text.
+///
+/// Snapshots the text under a short-lived lock (the `parking_lot` guard is dropped
+/// before the await, never held across it), then dispatches to the configured
+/// hook and returns its [`DisplayAction`](origin_outputstyle::DisplayAction).
+/// Default-off: with no buffered text, no `hooks.json`, or no `MessageDisplay`
+/// hook this is `None` ⇒ the output-style transform alone decides the render
+/// (byte-identical to the no-hook path).
+async fn fire_message_display_hook(
+    app: &SharedApp,
+) -> Option<origin_outputstyle::DisplayAction> {
+    let text = app.lock().current_assistant_text().map(str::to_owned)?;
+    origin_cli::display_hook::message_display_action(&text).await
+}
+
 /// Read and classify+encode one file into a multimodal content block for the
 /// interactive `/attach` command (image → base64 image block; PDF → text).
 fn attach_file(path: &str) -> anyhow::Result<origin_multimodal::ContentBlock> {
@@ -1280,6 +1369,9 @@ async fn call_daemon(
     session_id: &str,
     // Session reasoning-effort token (`/effort`/`/fast`); `None` ⇒ wire unchanged.
     effort: Option<String>,
+    // Extended-thinking budget in tokens (`--thinking-tokens`); `None` ⇒ wire
+    // unchanged. Only the Anthropic provider honours it.
+    thinking_tokens: Option<u32>,
     // Active output-style system suffix (`/output-style`); empty ⇒ no addendum.
     system_suffix: String,
     // Read-only plan mode (`/plan`); when true the daemon denies mutating tools.
@@ -1315,6 +1407,7 @@ async fn call_daemon(
         user_text: user_text.to_string(),
         session_id: Some(session_id.to_string()),
         effort,
+        thinking_tokens,
         attachments,
         read_only,
         roots,

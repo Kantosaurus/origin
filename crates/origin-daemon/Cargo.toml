@@ -79,6 +79,7 @@ origin-schedule         = { path = "../origin-schedule" }
 origin-ambient          = { path = "../origin-ambient" }
 origin-editfmt          = { path = "../origin-editfmt" }
 origin-hooks            = { path = "../origin-hooks" }
+origin-migrate          = { path = "../origin-migrate" }
 ctrlc                   = "3"
 dirs                    = "5"
 which                   = "8"

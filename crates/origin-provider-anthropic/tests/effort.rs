@@ -18,6 +18,7 @@ fn req_with(effort: Option<ReasoningEffort>) -> ChatRequest {
         model: "claude-x".to_string(),
         tools: Vec::<ToolSchema>::new(),
         effort,
+        thinking_tokens: None,
         attachments: Vec::new(),
     }
 }

@@ -297,18 +297,58 @@ impl Router {
         candidates
             .iter()
             .filter(|m| !self.is_exhausted(m))
-            .max_by(|a, b| {
-                let ha = self.health(a).copied().unwrap_or_default();
-                let hb = self.health(b).copied().unwrap_or_default();
-                ha.score()
-                    .partial_cmp(&hb.score())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    // Lower cost_rank is better, so reverse the comparison to
-                    // keep "greater is better" for max_by.
-                    .then(hb.cost_rank.cmp(&ha.cost_rank))
-            })
+            .max_by(|a, b| self.score_cmp(a, b))
             .cloned()
     }
+
+    /// Compare two candidates the way [`Strategy::Scored`] does: higher
+    /// [`Health::score`] wins, with a lower `cost_rank` as the tiebreak.
+    fn score_cmp(&self, a: &ModelRef, b: &ModelRef) -> std::cmp::Ordering {
+        let ha = self.health(a).copied().unwrap_or_default();
+        let hb = self.health(b).copied().unwrap_or_default();
+        ha.score()
+            .partial_cmp(&hb.score())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            // Lower cost_rank is better, so reverse the comparison to keep
+            // "greater is better" for `max_by`.
+            .then(hb.cost_rank.cmp(&ha.cost_rank))
+    }
+
+    /// Rank every non-exhausted candidate best-first by [`Strategy::Scored`].
+    ///
+    /// Unlike [`Router::choose`], which returns only the single best model,
+    /// this returns the full ordering so callers can present a ranked list.
+    /// The order is the same one `choose` would pick from: higher
+    /// [`Health::score`] first, `cost_rank` breaking ties. Exhausted models
+    /// are dropped. The comparison is independent of the configured strategy,
+    /// so this works regardless of how the router was constructed.
+    #[must_use]
+    pub fn scored_order(&self, candidates: &[ModelRef]) -> Vec<ModelRef> {
+        let mut ranked: Vec<ModelRef> =
+            candidates.iter().filter(|m| !self.is_exhausted(m)).cloned().collect();
+        ranked.sort_by(|a, b| self.score_cmp(b, a));
+        ranked
+    }
+}
+
+/// Rank `candidates` by measured latency via the [`Strategy::Scored`] health
+/// model, best (lowest latency) first.
+///
+/// Each entry in `samples` pairs a candidate with its measured round-trip
+/// latency in milliseconds; a candidate absent from `samples` keeps the
+/// default (zero-latency) health and therefore sorts ahead of any measured
+/// one — callers that want measured models to win should supply a sample for
+/// every candidate. This is the pure ranking helper behind the local-Ollama
+/// latency fold in `origin providers recommend`: it does no I/O, so the
+/// latency-to-order mapping is unit-testable without a live server.
+#[must_use]
+pub fn rank_by_latency(samples: &[(ModelRef, u64)]) -> Vec<ModelRef> {
+    let mut router = Router::new(Strategy::Scored);
+    for (m, latency_ms) in samples {
+        router.record_result(m, *latency_ms, true);
+    }
+    let candidates: Vec<ModelRef> = samples.iter().map(|(m, _)| m.clone()).collect();
+    router.scored_order(&candidates)
 }
 
 #[inline]
@@ -488,6 +528,51 @@ mod tests {
     #[test]
     fn model_ref_key_is_provider_slash_model() {
         assert_eq!(m("anthropic", "claude-opus-4").key(), "anthropic/claude-opus-4");
+    }
+
+    #[test]
+    fn scored_order_ranks_all_candidates_best_first() {
+        let slow = m("p", "slow");
+        let mid = m("p", "mid");
+        let fast = m("p", "fast");
+        let mut r = Router::new(Strategy::Scored);
+        r.record_result(&slow, 2_000, true);
+        r.record_result(&mid, 800, true);
+        r.record_result(&fast, 100, true);
+        let order = r.scored_order(&[slow.clone(), mid.clone(), fast.clone()]);
+        assert_eq!(order, vec![fast, mid, slow]);
+    }
+
+    #[test]
+    fn scored_order_drops_exhausted() {
+        let a = m("p", "a");
+        let b = m("p", "b");
+        let mut r = Router::new(Strategy::Scored);
+        r.record_result(&a, 100, true);
+        r.record_result(&b, 900, true);
+        r.mark_exhausted(&a);
+        // a would lead on score but is exhausted, so only b remains.
+        assert_eq!(r.scored_order(&[a, b.clone()]), vec![b]);
+    }
+
+    #[test]
+    fn rank_by_latency_orders_lowest_first() {
+        let slow = m("ollama", "llama3.1:70b");
+        let fast = m("ollama", "llama3.2");
+        // fast has the lower measured latency, so it must lead.
+        let order = rank_by_latency(&[(slow.clone(), 1_800), (fast.clone(), 120)]);
+        assert_eq!(order, vec![fast, slow]);
+    }
+
+    #[test]
+    fn rank_by_latency_empty_is_empty() {
+        assert!(rank_by_latency(&[]).is_empty());
+    }
+
+    #[test]
+    fn rank_by_latency_single_sample_round_trips() {
+        let only = m("ollama", "qwen2.5-coder");
+        assert_eq!(rank_by_latency(&[(only.clone(), 250)]), vec![only]);
     }
 
     #[test]

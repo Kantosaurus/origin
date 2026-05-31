@@ -40,6 +40,7 @@ impl Verifier for AnthropicHaikuVerifier {
             model: self.model.clone(),
             tools: Vec::new(),
             effort: None,
+            thinking_tokens: None,
             attachments: Vec::new(),
         };
         let resp = self.provider.chat(req).await.map_err(|e| match e {

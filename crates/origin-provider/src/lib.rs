@@ -105,7 +105,7 @@ impl ReasoningEffort {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChatRequest {
     pub system: String,
     pub messages: Vec<Message>,
@@ -125,6 +125,16 @@ pub struct ChatRequest {
     /// translates each block via the `origin-multimodal` `encode_*_block`
     /// helpers and appends it to the final user message's content.
     pub attachments: Vec<origin_multimodal::ContentBlock>,
+    /// Optional extended-thinking budget (in tokens) for this turn.
+    ///
+    /// `None` (the default) leaves every provider's wire byte-identical to the
+    /// pre-thinking-tokens behavior. `Some(n)` asks an extended-thinking-aware
+    /// provider (today: Anthropic) to enable interleaved/extended thinking with
+    /// a `budget_tokens` of `n`; the encoder also guarantees the top-level
+    /// `max_tokens` exceeds `n`, per Anthropic's requirement. Providers that do
+    /// not support an explicit thinking budget (e.g. `OpenAI`-compatible) ignore
+    /// the value entirely. *Closes: aider `--thinking-tokens`.*
+    pub thinking_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

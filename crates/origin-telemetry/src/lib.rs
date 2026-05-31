@@ -205,6 +205,144 @@ pub fn to_jsonl(e: &Event) -> Result<String, TelemetryError> {
     serde_json::to_string(&redacted).map_err(|err| TelemetryError::Serde(err.to_string()))
 }
 
+/// Why a session stopped, bucketed for product "pain" analysis.
+///
+/// Tags serialize to stable `snake_case` strings (`completed`,
+/// `user_interrupt`, `error`, `budget_exhausted`, `abandoned`, `idle`) so the
+/// JSONL schema is forward-compatible across daemon versions. Mirrors jcode's
+/// schema-v5 `session_stop_reason` pain buckets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStopReason {
+    /// The agent finished the requested work normally.
+    Completed,
+    /// The user explicitly interrupted (e.g. Ctrl-C, cancel).
+    UserInterrupt,
+    /// The session ended because of an unrecovered error.
+    Error,
+    /// A token, time, or cost budget was exhausted.
+    BudgetExhausted,
+    /// The user walked away without an explicit stop (no terminal signal).
+    Abandoned,
+    /// The session was closed after an inactivity timeout.
+    Idle,
+}
+
+/// Agent-time / pain-bucket metrics for a single session (opt-in, additive).
+///
+/// Captures jcode schema-v5 intent: the model-call vs tool-execution time
+/// split, time-to-first-useful-action, turn count, an autonomy counter
+/// (consecutive turns without user input), and the [`SessionStopReason`]. Every
+/// numeric field is optional so a partially populated record serializes only
+/// the fields the daemon actually measured; an all-`None` record with no stop
+/// reason serializes to `{}`-shaped output (only the always-present scalars).
+///
+/// This type is a pure data carrier. The daemon may build one incrementally and
+/// hand it to [`PainMetrics::into_event`] to fold it into the existing JSONL
+/// sink without changing the turn-event path.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, serde::Deserialize)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the *_ms suffixes are part of the wire schema and must be explicit"
+)]
+pub struct PainMetrics {
+    /// Why the session stopped, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<SessionStopReason>,
+    /// Wall-clock time spent inside model calls, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_time_ms: Option<u64>,
+    /// Wall-clock time spent executing tools, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_time_ms: Option<u64>,
+    /// Time from session start to the first useful action, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_to_first_useful_action_ms: Option<u64>,
+    /// Total number of turns in the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_count: Option<u32>,
+    /// Longest run of consecutive turns taken without user input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autonomy_streak: Option<u32>,
+}
+
+impl PainMetrics {
+    /// Creates an empty metrics record with every field unset.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            stop_reason: None,
+            model_time_ms: None,
+            tool_time_ms: None,
+            time_to_first_useful_action_ms: None,
+            turn_count: None,
+            autonomy_streak: None,
+        }
+    }
+
+    /// Returns a copy with the [`SessionStopReason`] set.
+    #[must_use]
+    pub const fn with_stop_reason(mut self, reason: SessionStopReason) -> Self {
+        self.stop_reason = Some(reason);
+        self
+    }
+
+    /// Returns a copy with the model-call vs tool-execution time split set.
+    #[must_use]
+    pub const fn with_agent_time_split(mut self, model_time_ms: u64, tool_time_ms: u64) -> Self {
+        self.model_time_ms = Some(model_time_ms);
+        self.tool_time_ms = Some(tool_time_ms);
+        self
+    }
+
+    /// Returns a copy with time-to-first-useful-action set, in milliseconds.
+    #[must_use]
+    pub const fn with_time_to_first_useful_action_ms(mut self, ms: u64) -> Self {
+        self.time_to_first_useful_action_ms = Some(ms);
+        self
+    }
+
+    /// Returns a copy with the turn count and autonomy streak set.
+    #[must_use]
+    pub const fn with_turns(mut self, turn_count: u32, autonomy_streak: u32) -> Self {
+        self.turn_count = Some(turn_count);
+        self.autonomy_streak = Some(autonomy_streak);
+        self
+    }
+
+    /// Total measured agent time (model + tool), in milliseconds.
+    ///
+    /// Returns `None` unless at least one half of the split is present; a
+    /// missing half is treated as zero so a partially measured session still
+    /// yields a usable total.
+    #[must_use]
+    pub fn total_agent_time_ms(&self) -> Option<u64> {
+        match (self.model_time_ms, self.tool_time_ms) {
+            (None, None) => None,
+            (model, tool) => Some(model.unwrap_or(0).saturating_add(tool.unwrap_or(0))),
+        }
+    }
+
+    /// Folds these metrics into a redactable [`Event`] of the given name.
+    ///
+    /// The metrics are serialized as a single JSON property under the key
+    /// `pain_metrics`, so the record rides the existing JSONL sink (including
+    /// [`redact`] and sampling) without a new event path. The fields here are
+    /// numeric and an enum tag, so redaction is a no-op for them in practice;
+    /// any caller-added string props are still redacted as usual.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError::Serde`] if the metrics fail to serialize.
+    pub fn into_event(self, name: String, ts_unix_ms: u64) -> Result<Event, TelemetryError> {
+        let json =
+            serde_json::to_string(&self).map_err(|err| TelemetryError::Serde(err.to_string()))?;
+        let mut event = Event::new(name, ts_unix_ms);
+        event.props.push(("pain_metrics".to_owned(), json));
+        Ok(event)
+    }
+}
+
 /// Buffers events and produces redacted, sampled JSONL lines on demand.
 #[derive(Debug)]
 pub struct Pipeline {
@@ -396,5 +534,104 @@ mod tests {
         assert_eq!(cfg.endpoint.as_deref(), Some("https://t.example"));
         let pipe = Pipeline::new(cfg);
         assert_eq!(pipe.config().endpoint.as_deref(), Some("https://t.example"));
+    }
+
+    #[test]
+    fn stop_reason_serializes_stable_snake_case_tags() {
+        let cases = [
+            (SessionStopReason::Completed, "\"completed\""),
+            (SessionStopReason::UserInterrupt, "\"user_interrupt\""),
+            (SessionStopReason::Error, "\"error\""),
+            (SessionStopReason::BudgetExhausted, "\"budget_exhausted\""),
+            (SessionStopReason::Abandoned, "\"abandoned\""),
+            (SessionStopReason::Idle, "\"idle\""),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(serde_json::to_string(&reason).unwrap(), expected);
+            let back: SessionStopReason = serde_json::from_str(expected).unwrap();
+            assert_eq!(back, reason);
+        }
+    }
+
+    #[test]
+    fn pain_metrics_round_trips() {
+        let metrics = PainMetrics::new()
+            .with_stop_reason(SessionStopReason::BudgetExhausted)
+            .with_agent_time_split(1200, 800)
+            .with_time_to_first_useful_action_ms(450)
+            .with_turns(9, 6);
+        let json = serde_json::to_string(&metrics).unwrap();
+        let back: PainMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, metrics);
+        assert_eq!(back.total_agent_time_ms(), Some(2000));
+    }
+
+    #[test]
+    fn pain_metrics_omits_absent_optional_fields() {
+        // A fully empty record serializes to an empty object: no field bytes.
+        let empty = PainMetrics::new();
+        assert_eq!(serde_json::to_string(&empty).unwrap(), "{}");
+        assert_eq!(empty.total_agent_time_ms(), None);
+
+        // A partial record only carries the fields that were set.
+        let partial = PainMetrics::new().with_turns(3, 2);
+        let json = serde_json::to_string(&partial).unwrap();
+        assert!(json.contains("turn_count"));
+        assert!(json.contains("autonomy_streak"));
+        assert!(!json.contains("model_time_ms"));
+        assert!(!json.contains("stop_reason"));
+        assert!(!json.contains("time_to_first_useful_action_ms"));
+    }
+
+    #[test]
+    fn total_agent_time_handles_partial_split() {
+        assert_eq!(
+            PainMetrics::new().with_time_to_first_useful_action_ms(5).total_agent_time_ms(),
+            None
+        );
+        let mut only_model = PainMetrics::new();
+        only_model.model_time_ms = Some(100);
+        assert_eq!(only_model.total_agent_time_ms(), Some(100));
+        let mut only_tool = PainMetrics::new();
+        only_tool.tool_time_ms = Some(70);
+        assert_eq!(only_tool.total_agent_time_ms(), Some(70));
+    }
+
+    #[test]
+    fn pain_metrics_event_redacts_and_ships_through_pipeline() {
+        let metrics = PainMetrics::new()
+            .with_stop_reason(SessionStopReason::Completed)
+            .with_agent_time_split(10, 20)
+            .with_turns(2, 1);
+        let mut event = metrics.into_event("session_stop".to_owned(), 1234).unwrap();
+        // Numeric/enum metrics survive; a caller-added secret prop is redacted.
+        event.props.push(("api_key".to_owned(), "sk-supersecretvalue123".to_owned()));
+
+        let line = to_jsonl(&event).unwrap();
+        assert!(line.contains("\"name\":\"session_stop\""));
+        assert!(line.contains("pain_metrics"));
+        assert!(line.contains("completed"));
+        assert!(!line.contains("supersecret"));
+        assert!(line.contains(REDACTED));
+
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["name"], "session_stop");
+        assert_eq!(parsed["props"][0][0], "pain_metrics");
+        // The embedded metrics JSON parses back into a PainMetrics.
+        let inner: PainMetrics =
+            serde_json::from_str(parsed["props"][0][1].as_str().unwrap()).unwrap();
+        assert_eq!(inner.stop_reason, Some(SessionStopReason::Completed));
+        assert_eq!(inner.total_agent_time_ms(), Some(30));
+    }
+
+    #[test]
+    fn plain_event_serialization_is_unchanged_by_extension() {
+        // Existing turn-event path must serialize byte-identically: no new keys.
+        let event = ev("turn", &[("provider", "anthropic")], 42);
+        let line = to_jsonl(&event).unwrap();
+        assert_eq!(
+            line,
+            r#"{"name":"turn","props":[["provider","anthropic"]],"ts_unix_ms":42}"#
+        );
     }
 }

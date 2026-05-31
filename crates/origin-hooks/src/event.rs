@@ -48,6 +48,30 @@ pub enum LifecycleEvent {
         /// The message text about to be displayed.
         text: String,
     },
+    /// Fired just before the provider `chat`/`chat_stream` call for a turn
+    /// (gemini `BeforeModel` / claude `PreToolUse`-adjacent). Informational.
+    BeforeModel {
+        /// The model identifier the turn will call.
+        model: String,
+    },
+    /// Fired just after the provider call returns for a turn (gemini
+    /// `AfterModel`). Informational.
+    AfterModel {
+        /// The model identifier the turn called.
+        model: String,
+    },
+    /// Fired just before transcript compaction runs (gemini `PreCompress` /
+    /// claude `PreCompact`). Informational.
+    PreCompress {
+        /// Current transcript size in bytes prompting the compaction.
+        current_bytes: u64,
+    },
+    /// A side-band notification (gemini `Notification`): turn completion, an
+    /// approval prompt, or another user-facing signal. Informational.
+    Notification {
+        /// A short, human-readable notification message.
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

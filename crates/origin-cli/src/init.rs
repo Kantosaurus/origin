@@ -132,6 +132,10 @@ pub async fn run_with<R: BufRead + Send, W: Write + Send>(
         primary,
         backup,
         subagent,
+        // Onboarding does not define model aliases; users add an `[aliases]`
+        // table to `~/.origin/config.toml` by hand. Empty ⇒ the table is omitted
+        // from the written file (byte-identical to the pre-alias schema).
+        aliases: std::collections::BTreeMap::new(),
     };
     config::save_to(cfg_path, &cfg).map_err(|e| anyhow!("save config: {e}"))?;
     {

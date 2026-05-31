@@ -7,8 +7,16 @@
 //! an [`SdkMeterProvider`], and installs it as the process-global meter provider
 //! via [`opentelemetry::global::set_meter_provider`].
 //!
+//! Alongside metrics it also installs a **trace** (span) OTLP pipeline against
+//! the same endpoint (a [`BatchSpanProcessor`] feeding the global tracer
+//! provider), so spans and metrics correlate on `service.name`. Both share the
+//! [`Resource`] built by `resource()`. The `GenAI` semantic-convention attribute
+//! and metric names the export attaches live in [`crate::keys::genai`].
+//!
 //! [`PeriodicReader`]: opentelemetry_sdk::metrics::PeriodicReader
 //! [`SdkMeterProvider`]: opentelemetry_sdk::metrics::SdkMeterProvider
+//! [`BatchSpanProcessor`]: opentelemetry_sdk::trace::BatchSpanProcessor
+//! [`Resource`]: opentelemetry_sdk::Resource
 
 #[cfg(feature = "otel")]
 pub mod otel {
@@ -31,6 +39,12 @@ pub mod otel {
 
     /// Per-export deadline handed to the gRPC client.
     const EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// The OTLP `Resource` shared by the metrics and trace pipelines so both
+    /// signals carry an identical `service.name` in the collector.
+    fn resource() -> Resource {
+        Resource::new([KeyValue::new("service.name", env!("CARGO_PKG_NAME"))])
+    }
 
     /// Build a real OTLP metrics [`SdkMeterProvider`] pointing at `endpoint`
     /// and install it as the process-global meter provider.
@@ -64,14 +78,60 @@ pub mod otel {
             .with_exporter(exporter)
             .with_period(EXPORT_PERIOD)
             .with_timeout(EXPORT_TIMEOUT)
-            .with_resource(Resource::new([KeyValue::new(
-                "service.name",
-                env!("CARGO_PKG_NAME"),
-            )]))
+            .with_resource(resource())
             .build()
             .map_err(|e| format!("otlp metrics pipeline build failed: {e}"))?;
 
         global::set_meter_provider(provider.clone());
+
+        // Best-effort: also stand up the trace (span) pipeline against the same
+        // endpoint and install it as the global tracer provider. A failure here
+        // must not tear down the already-installed metrics pipeline, so the
+        // result is intentionally swallowed (the caller still gets the meter
+        // provider it asked for). Spans are emitted via the global tracer; no
+        // call-site change is required to start collecting them.
+        let _trace = install_traces(endpoint);
+
+        Ok(provider)
+    }
+
+    /// Build a real OTLP **trace** `TracerProvider` pointing at `endpoint` and
+    /// install it as the process-global tracer provider.
+    ///
+    /// Mirrors [`install`]: the gRPC (tonic) transport feeds a
+    /// [`BatchSpanProcessor`] driven by the ambient Tokio runtime
+    /// ([`runtime::Tokio`]), so building only validates configuration and spins
+    /// up the background batch task — an unreachable collector still installs
+    /// cleanly and failed exports are retried/dropped off the hot path. The
+    /// span `Resource` matches the metrics pipeline so both signals correlate
+    /// on `service.name`. The returned handle is also set globally, so callers
+    /// that want to `shutdown()` it on teardown can hold it.
+    ///
+    /// # Errors
+    /// Returns a `String` describing the failure if the OTLP trace pipeline
+    /// cannot be constructed (e.g. a malformed endpoint or a transport the
+    /// enabled features do not support).
+    ///
+    /// [`BatchSpanProcessor`]: opentelemetry_sdk::trace::BatchSpanProcessor
+    /// [`runtime::Tokio`]: opentelemetry_sdk::runtime::Tokio
+    pub fn install_traces(
+        endpoint: &str,
+    ) -> Result<opentelemetry_sdk::trace::TracerProvider, String> {
+        let exporter = opentelemetry_otlp::new_exporter()
+            .tonic()
+            .with_endpoint(endpoint)
+            .with_timeout(EXPORT_TIMEOUT);
+
+        let provider = opentelemetry_otlp::new_pipeline()
+            .tracing()
+            .with_exporter(exporter)
+            .with_trace_config(
+                opentelemetry_sdk::trace::Config::default().with_resource(resource()),
+            )
+            .install_batch(runtime::Tokio)
+            .map_err(|e| format!("otlp trace pipeline build failed: {e}"))?;
+
+        global::set_tracer_provider(provider.clone());
         Ok(provider)
     }
 }
@@ -110,5 +170,34 @@ mod tests {
         })
         .await;
         built.expect("install must not hang");
+    }
+
+    /// The trace (span) pipeline builds against a syntactically valid endpoint
+    /// without a live collector, mirroring the metrics pipeline: the
+    /// `BatchSpanProcessor` connects on first export off the hot path. We bound
+    /// it in a `timeout` and `mem::forget` the provider so its drop does not
+    /// attempt a flush against the absent collector on test teardown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_traces_builds_a_real_pipeline() {
+        let built = tokio::time::timeout(Duration::from_secs(20), async {
+            let p = otel::install_traces(otel::DEFAULT_ENDPOINT)
+                .expect("building an OTLP trace pipeline against a valid endpoint must succeed");
+            std::mem::forget(p);
+        })
+        .await;
+        built.expect("install_traces must not hang");
+    }
+
+    /// The keys module exposes the `GenAI` semantic-convention names under the
+    /// `otel` feature, and the internal-family mapping resolves to them.
+    #[test]
+    fn keys_expose_gen_ai_convention_names() {
+        use crate::keys::{gen_ai_for_internal, genai};
+        assert_eq!(genai::SYSTEM, "gen_ai.system");
+        assert_eq!(genai::USAGE_INPUT_TOKENS, "gen_ai.usage.input_tokens");
+        assert_eq!(
+            gen_ai_for_internal("origin_tokens_in_total"),
+            Some(genai::USAGE_INPUT_TOKENS)
+        );
     }
 }

@@ -29,6 +29,7 @@ fn cache_marker_on_non_first_message_is_emitted() {
         model: "claude".into(),
         tools: vec![],
         effort: None,
+        thinking_tokens: None,
         attachments: Vec::new(),
     };
     let body = encode_request_for_test(&req);

@@ -24,6 +24,7 @@ fn req_with(attachments: Vec<ContentBlock>) -> ChatRequest {
         model: "gpt-x".to_string(),
         tools: Vec::new(),
         effort: None,
+        thinking_tokens: None,
         attachments,
     }
 }
@@ -77,4 +78,33 @@ async fn image_attachment_becomes_image_url_part() {
         .await
         .expect("chat with image attachment must match the image_url-requiring mock");
     assert!(!resp.assistant.blocks.is_empty());
+}
+
+#[tokio::test]
+async fn image_attachment_becomes_image_url_part_on_streaming_path() {
+    // Regression: `chat_stream` (the DEFAULT path) previously skipped
+    // `append_attachments`, silently dropping images on every streamed turn.
+    // The mock only matches when the streaming body carries an `image_url`
+    // part, so a successful stream proves injection on the streaming path.
+    let server = MockServer::start().await;
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_has_image_url)
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let png = ContentBlock::image("image/png", "aGVsbG8=");
+    let prov = provider(&server.uri());
+    let ring = origin_stream::Ring::with_capacity(64 * 1024);
+    let mut sub = ring.subscribe();
+    let r = ring.clone();
+    let handle = tokio::spawn(async move {
+        prov.chat_stream(req_with(vec![png]), &r)
+            .await
+            .expect("streaming chat with an image must match the image_url-requiring mock");
+    });
+    while sub.next().await.expect("recv").is_some() {}
+    handle.await.expect("prov task");
 }

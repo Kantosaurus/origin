@@ -28,6 +28,40 @@ use serde::{Deserialize, Serialize};
 /// the cheap cache-read. Used to flag "your cache just went cold" (jcode parity).
 pub const PROMPT_CACHE_TTL_MS: u64 = 5 * 60 * 1_000;
 
+/// Decide whether a turn started against a *cold* prompt cache.
+///
+/// A cache is considered cold when either:
+/// - more than [`PROMPT_CACHE_TTL_MS`] elapsed since the previous turn
+///   (`now_ms - prev_turn_ms > PROMPT_CACHE_TTL_MS`), so the ephemeral cache had
+///   likely expired and this turn re-paid the cache-write premium; or
+/// - the turn read **zero** tokens from the cache (`cache_read_tokens == 0`)
+///   even though a prior turn had a warm cache (`had_prior_warm == true`),
+///   which is the provider-side signal that the cache entry is gone.
+///
+/// `prev_turn_ms == None` means this is the first turn of the session: there is
+/// no prior cache to go cold, so the result is always warm (`false`).
+///
+/// This is the extracted pure decision behind the live TUI cache-cold nudge. Its
+/// time-gap arm matches [`CostMeter`]'s internal `cache_warm` rule (cold once the
+/// idle gap exceeds [`PROMPT_CACHE_TTL_MS`]); the `cache_read` arm additionally
+/// catches a provider that reports zero cache reads inside the TTL window.
+#[must_use]
+pub const fn is_cache_cold(
+    prev_turn_ms: Option<u64>,
+    now_ms: u64,
+    cache_read_tokens: u64,
+    had_prior_warm: bool,
+) -> bool {
+    match prev_turn_ms {
+        // First turn of the session: nothing to expire.
+        None => false,
+        Some(prev) => {
+            let gap = now_ms.saturating_sub(prev);
+            gap > PROMPT_CACHE_TTL_MS || (cache_read_tokens == 0 && had_prior_warm)
+        }
+    }
+}
+
 /// Token counts for a single provider turn.
 ///
 /// Fields mirror [`origin_provider`'s `Usage`] shape so the daemon can convert
@@ -482,6 +516,51 @@ mod tests {
         );
         assert!(!cold.cache_warm, "gap beyond TTL is cold");
         assert_eq!(m.insights().cold_cache_turns, 1);
+    }
+
+    #[test]
+    fn is_cache_cold_first_turn_is_warm() {
+        // No previous turn => nothing to expire, always warm.
+        assert!(!is_cache_cold(None, 0, 0, false));
+        assert!(!is_cache_cold(None, PROMPT_CACHE_TTL_MS * 10, 0, true));
+    }
+
+    #[test]
+    fn is_cache_cold_gap_beyond_ttl_is_cold() {
+        // Gap strictly greater than the TTL => cold even with cache reads.
+        assert!(is_cache_cold(
+            Some(0),
+            PROMPT_CACHE_TTL_MS + 1,
+            5_000,
+            true
+        ));
+    }
+
+    #[test]
+    fn is_cache_cold_gap_within_ttl_with_reads_is_warm() {
+        // Gap below the TTL and the turn read from cache => warm.
+        assert!(!is_cache_cold(
+            Some(0),
+            PROMPT_CACHE_TTL_MS - 1,
+            5_000,
+            true
+        ));
+        // Exactly at the TTL boundary is still warm (cache not yet expired).
+        assert!(!is_cache_cold(Some(0), PROMPT_CACHE_TTL_MS, 5_000, true));
+    }
+
+    #[test]
+    fn is_cache_cold_zero_reads_after_warm_is_cold() {
+        // Within the TTL window, but the provider served zero cache reads while a
+        // prior turn was warm => the cache entry is gone (cold).
+        assert!(is_cache_cold(Some(0), 1_000, 0, true));
+    }
+
+    #[test]
+    fn is_cache_cold_zero_reads_without_prior_warm_is_warm() {
+        // Zero cache reads but no prior warm turn (e.g. first cache-write turn):
+        // not a regression, so warm.
+        assert!(!is_cache_cold(Some(0), 1_000, 0, false));
     }
 
     #[test]

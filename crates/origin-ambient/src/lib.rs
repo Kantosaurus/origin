@@ -24,7 +24,83 @@
 
 #![forbid(unsafe_code)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde::{Deserialize, Serialize};
+
+/// Default minimum idle gap before ambient work may run (5 minutes, in ms).
+///
+/// Ambient work is opportunistic: it should only start once the interactive
+/// user has been quiet for at least this long, so a burst of typing is never
+/// interrupted by background dispatch.
+pub const DEFAULT_MIN_IDLE_MS: u64 = 5 * 60 * 1_000;
+
+/// Tracks how long the interactive user has been idle, for ambient gating.
+///
+/// The ambient loop owns one of these (typically behind an `Arc`) and consults
+/// [`is_idle`](Self::is_idle) before dispatching proactive work. The prompt
+/// path is expected to call [`note_activity`](Self::note_activity) on every user
+/// turn so the tracker reflects real interactive activity; until that one-line
+/// wire lands, the tracker simply reports the gap since construction (or since
+/// the last loop-driven `note_activity`).
+///
+/// All operations are lock-free (`AtomicU64`, relaxed ordering): a stale read
+/// only ever delays ambient work by one tick, which is harmless.
+///
+/// ```
+/// use origin_ambient::IdleTracker;
+///
+/// let t = IdleTracker::new(1_000);
+/// assert_eq!(t.idle_for_ms(1_000), 0);
+/// assert_eq!(t.idle_for_ms(4_000), 3_000);
+/// assert!(t.is_idle(7_000, 5_000));   // idle 6_000 >= 5_000 threshold
+/// assert!(!t.is_idle(4_000, 5_000));  // idle 3_000 < threshold
+/// t.note_activity(4_000);             // user did something at t=4_000
+/// assert_eq!(t.idle_for_ms(4_500), 500);
+/// ```
+#[derive(Debug)]
+pub struct IdleTracker {
+    /// Wall-clock instant of the last observed user activity, in epoch ms.
+    last_activity_ms: AtomicU64,
+}
+
+impl IdleTracker {
+    /// Construct a tracker seeded with `now_ms` as the last-activity instant.
+    ///
+    /// Seeding with "now" means a freshly started loop treats the user as
+    /// having just been active, so ambient work waits a full idle window before
+    /// its first dispatch rather than firing immediately on startup.
+    #[must_use]
+    pub const fn new(now_ms: u64) -> Self {
+        Self {
+            last_activity_ms: AtomicU64::new(now_ms),
+        }
+    }
+
+    /// Record that the user was active at `now_ms`, resetting the idle clock.
+    ///
+    /// Monotonic-by-max: an out-of-order or stale `now_ms` that is older than
+    /// the stored instant is ignored, so a late call can never make the user
+    /// appear *more* idle than they are.
+    pub fn note_activity(&self, now_ms: u64) {
+        self.last_activity_ms.fetch_max(now_ms, Ordering::Relaxed);
+    }
+
+    /// Milliseconds since the last observed activity, saturating at zero.
+    ///
+    /// A `now_ms` earlier than the stored instant (clock skew) yields 0 rather
+    /// than underflowing.
+    #[must_use]
+    pub fn idle_for_ms(&self, now_ms: u64) -> u64 {
+        now_ms.saturating_sub(self.last_activity_ms.load(Ordering::Relaxed))
+    }
+
+    /// Whether the user has been idle for at least `threshold_ms` at `now_ms`.
+    #[must_use]
+    pub fn is_idle(&self, now_ms: u64, threshold_ms: u64) -> bool {
+        self.idle_for_ms(now_ms) >= threshold_ms
+    }
+}
 
 /// Adaptive daily token budget that always protects a user reserve.
 ///
@@ -350,6 +426,48 @@ impl OvernightDriver {
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_tracker_grows_until_activity_resets_it() {
+        let t = IdleTracker::new(1_000);
+        // Right at construction the user just acted: zero idle.
+        assert_eq!(t.idle_for_ms(1_000), 0);
+        // Idle grows with the clock.
+        assert_eq!(t.idle_for_ms(4_000), 3_000);
+        // A fresh activity at t=4_000 resets the idle clock.
+        t.note_activity(4_000);
+        assert_eq!(t.idle_for_ms(4_000), 0);
+        assert_eq!(t.idle_for_ms(4_500), 500);
+    }
+
+    #[test]
+    fn idle_tracker_saturates_on_clock_skew() {
+        let t = IdleTracker::new(10_000);
+        // A `now_ms` before the stored instant must not underflow.
+        assert_eq!(t.idle_for_ms(5_000), 0);
+    }
+
+    #[test]
+    fn idle_tracker_note_activity_is_monotonic() {
+        let t = IdleTracker::new(1_000);
+        t.note_activity(5_000);
+        // A stale (older) note must not move the clock backward.
+        t.note_activity(2_000);
+        assert_eq!(t.idle_for_ms(8_000), 3_000);
+    }
+
+    #[test]
+    fn idle_tracker_is_idle_threshold_boundary() {
+        let t = IdleTracker::new(0);
+        // Idle exactly equals threshold -> idle (inclusive lower bound).
+        assert!(t.is_idle(5_000, 5_000));
+        // One ms short of the threshold -> not idle.
+        assert!(!t.is_idle(4_999, 5_000));
+        // Well past the threshold -> idle.
+        assert!(t.is_idle(600_000, DEFAULT_MIN_IDLE_MS));
+        // Just started, default threshold -> not idle yet.
+        assert!(!t.is_idle(1_000, DEFAULT_MIN_IDLE_MS));
+    }
 
     #[test]
     fn may_run_never_dips_into_reserve() {

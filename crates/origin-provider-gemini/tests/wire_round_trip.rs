@@ -42,6 +42,7 @@ async fn calls_gemini_generate_content_endpoint() {
         model: "gemini-2.0-flash".into(),
         tools: vec![],
         effort: None,
+        thinking_tokens: None,
         attachments: Vec::new(),
     };
     let resp = provider.chat(req).await.expect("gemini chat should succeed");
@@ -87,6 +88,7 @@ async fn auth_error_maps_to_provider_auth() {
             model: "gemini-2.0-flash".into(),
             tools: vec![],
             effort: None,
+            thinking_tokens: None,
             attachments: Vec::new(),
         })
         .await

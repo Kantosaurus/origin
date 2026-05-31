@@ -1,25 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `origin providers …` subcommand handlers.
 
-use origin_modeldiscovery::{parse_models_response, ModelCache};
+use origin_modeldiscovery::{merge_catalog, parse_models_response, ModelCache};
 use origin_provider::catalog::{AuthScheme, Catalog};
+
+/// Resolve the origin home directory.
+///
+/// The `ORIGIN_HOME` env var overrides the platform home (resolved via
+/// [`dirs::home_dir`]) so integration tests can point IO at a scratch directory
+/// without racing `HOME` / `USERPROFILE` across threads.
+fn origin_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("ORIGIN_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir)
+}
 
 /// Build the catalog the CLI should display, mirroring the daemon's merge of
 /// `~/.origin/providers.toml` on top of the builtin entries.
 ///
 /// Custom-providers IO and parse errors are surfaced on stderr but do not
 /// abort the listing — the builtin catalog is always shown.
-///
-/// The home directory is normally resolved via [`dirs::home_dir`]; the
-/// `ORIGIN_HOME` env var overrides it so integration tests can point the
-/// merge at a scratch directory without racing `HOME` / `USERPROFILE` across
-/// threads.
 fn merged_catalog() -> Catalog {
     let mut cat = Catalog::builtin();
-    let home = std::env::var_os("ORIGIN_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(dirs::home_dir);
-    if let Some(home) = home {
+    if let Some(home) = origin_home() {
         let path = home.join(".origin").join("providers.toml");
         match origin_provider::custom::load(&path) {
             Ok(custom) => {
@@ -37,20 +40,55 @@ fn merged_catalog() -> Catalog {
     cat
 }
 
+/// Short label for an [`AuthScheme`], as printed in the `ls` table.
+const fn auth_label(auth: &AuthScheme) -> &'static str {
+    match auth {
+        AuthScheme::None => "none",
+        AuthScheme::ApiKey { .. } => "api-key",
+        AuthScheme::OAuth(_) => "oauth",
+        AuthScheme::SigV4 { .. } => "sigv4",
+        AuthScheme::Custom => "custom",
+    }
+}
+
+/// Merge a provider's builtin model id with any runtime-discovered models held
+/// in `cache`, returning the de-duplicated, builtin-first union.
+///
+/// The builtin "catalog" for a provider is its single `default_model`;
+/// [`origin_modeldiscovery::merge_catalog`] keeps that id first and appends any
+/// discovered ids not already present. When the cache holds nothing for the
+/// provider, the result is exactly `[default_model]` — so callers that only
+/// print extras (see [`ls`]) emit byte-identical output to the no-cache case.
+fn merged_models_for(default_model: &str, cache: &ModelCache, provider_id: &str) -> Vec<String> {
+    let builtin = [default_model.to_string()];
+    let discovered = cache.get(provider_id).unwrap_or_default();
+    merge_catalog(&builtin, discovered)
+}
+
 /// Print every catalog entry (builtin + custom) as a fixed-width table.
+///
+/// When the on-disk model cache (`~/.origin/models-cache.json`, written by
+/// [`refresh`]) holds runtime-discovered models for a provider, they are merged
+/// with the builtin default via [`origin_modeldiscovery::merge_catalog`]
+/// (deduped, builtin-first) and listed on indented lines beneath that
+/// provider's row. When no cache exists — or a provider has no discovered
+/// models beyond its builtin default — the output is byte-identical to the
+/// builtin-only listing.
 pub fn ls() {
     let cat = merged_catalog();
+    let cache = origin_home().map_or_else(ModelCache::default, |home| load_cache(&home));
     println!("{:<20} {:<35} {:<14} AUTH", "ID", "DISPLAY NAME", "WIRE");
     for e in cat.entries() {
         let wire = format!("{:?}", e.wire);
-        let auth = match &e.auth {
-            AuthScheme::None => "none",
-            AuthScheme::ApiKey { .. } => "api-key",
-            AuthScheme::OAuth(_) => "oauth",
-            AuthScheme::SigV4 { .. } => "sigv4",
-            AuthScheme::Custom => "custom",
-        };
+        let auth = auth_label(&e.auth);
         println!("{:<20} {:<35} {:<14} {auth}", e.id, e.display_name, wire);
+        // Only emit extra lines when discovery contributed models beyond the
+        // builtin default, preserving byte-identical output for the empty-cache
+        // path. `merge_catalog` keeps the builtin default at index 0.
+        let models = merged_models_for(&e.default_model, &cache, &e.id);
+        for model in models.iter().skip(1) {
+            println!("{:<20} models: {model}", "");
+        }
     }
 }
 
@@ -65,10 +103,7 @@ pub fn ls() {
 /// This never returns an error and never changes default `ls`/`describe`
 /// behaviour.
 pub fn refresh(provider: Option<&str>) {
-    let Some(home) = std::env::var_os("ORIGIN_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(dirs::home_dir)
-    else {
+    let Some(home) = origin_home() else {
         println!("no refresh source configured: cannot resolve the home directory");
         return;
     };
@@ -217,7 +252,7 @@ pub fn describe(id: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_file, load_cache, persist_cache};
+    use super::{cache_file, load_cache, merged_models_for, persist_cache};
     use origin_modeldiscovery::{ModelCache, ModelInfo};
 
     #[test]
@@ -247,5 +282,48 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = load_cache(dir.path());
         assert!(cache.get("anything").is_none());
+    }
+
+    #[test]
+    fn merged_models_empty_cache_is_builtin_only() {
+        // The empty-cache path drives the byte-identical `ls` output: with no
+        // discovered models, the merged list is exactly the builtin default.
+        let cache = ModelCache::new();
+        let merged = merged_models_for("gpt-4o", &cache, "openai");
+        assert_eq!(merged, ["gpt-4o"]);
+    }
+
+    #[test]
+    fn merged_models_combines_dedups_builtin_first() {
+        // `refresh` keys the on-disk cache by provider id; `ls` merges that
+        // discovered set with the builtin default via `merge_catalog`.
+        let mut cache = ModelCache::new();
+        cache.put(
+            "openai",
+            1_000,
+            vec![
+                ModelInfo::new("gpt-4o-mini".to_string(), Some(128_000), true),
+                // Duplicate of the builtin default: must not reappear.
+                ModelInfo::new("gpt-4o".to_string(), None, true),
+                ModelInfo::new("o3".to_string(), None, true),
+            ],
+        );
+        let merged = merged_models_for("gpt-4o", &cache, "openai");
+        // Builtin default first, then discovered ids in listing order, deduped.
+        assert_eq!(merged, ["gpt-4o", "gpt-4o-mini", "o3"]);
+    }
+
+    #[test]
+    fn merged_models_ignores_other_providers_cache() {
+        // A discovered set cached under a different provider id must not leak
+        // into an unrelated provider's merged list.
+        let mut cache = ModelCache::new();
+        cache.put(
+            "groq",
+            1_000,
+            vec![ModelInfo::new("llama-3.3-70b-versatile".to_string(), None, true)],
+        );
+        let merged = merged_models_for("gpt-4o", &cache, "openai");
+        assert_eq!(merged, ["gpt-4o"]);
     }
 }

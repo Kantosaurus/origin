@@ -9,7 +9,8 @@
 
 use anyhow::Result;
 use origin_websearch::{
-    endpoint_for, parse_brave_json, parse_duckduckgo_html, parse_tavily_json, rank, Engine, SearchHit,
+    endpoint_for, ground, parse_brave_json, parse_duckduckgo_html, parse_tavily_json, rank, Engine,
+    SearchHit,
 };
 
 /// Parse the `--engine` flag into an [`Engine`], defaulting to `DuckDuckGo`.
@@ -91,11 +92,21 @@ pub async fn run(query: &str, engine: Option<String>) -> Result<()> {
         println!("no results");
         return Ok(());
     }
-    for hit in ranked {
+    for hit in &ranked {
         println!("{}", hit.title);
         println!("  {}", hit.url);
         if !hit.snippet.is_empty() {
             println!("  {}", hit.snippet);
+        }
+    }
+
+    // Opt-in grounded, cited summary over the top ranked hits. Offline
+    // synthesis from the snippets already fetched — no extra network call.
+    // Unset ⇒ output is byte-identical to the prior link-list behavior.
+    if std::env::var_os("ORIGIN_SEARCH_GROUND").is_some() {
+        let grounded = ground(query, &ranked);
+        if !grounded.is_empty() {
+            println!("\n{}", grounded.render());
         }
     }
     Ok(())

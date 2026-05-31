@@ -50,10 +50,33 @@ impl LspClient {
     /// # Errors
     /// `LspError::Spawn` if the binary cannot be started, `Protocol` if init fails.
     pub async fn spawn(binary: &str, workspace_root: &Path) -> Result<Self, LspError> {
+        Self::spawn_with_args(binary, &[], workspace_root).await
+    }
+
+    /// Spawn `binary` with explicit launch `args` (for example `--stdio`) and
+    /// complete the `initialize` handshake against `workspace_root`.
+    ///
+    /// Most servers in the fleet registry need a launch flag (`pyright-langserver
+    /// --stdio`, `solargraph stdio`, …); the bare [`spawn`](Self::spawn) covers
+    /// the argv-free servers (such as `rust-analyzer`). The daemon's autonomous
+    /// probe splits the registry `launch` string and routes here.
+    ///
+    /// # Errors
+    /// `LspError::Spawn` if the binary cannot be started, `Protocol` if init fails.
+    pub async fn spawn_with_args(
+        binary: &str,
+        args: &[&str],
+        workspace_root: &Path,
+    ) -> Result<Self, LspError> {
         let mut cmd = Command::new(binary);
-        cmd.stdin(Stdio::piped())
+        cmd.args(args)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::null())
+            // Reap the server when the client handle is dropped. Without this a
+            // short-lived diagnostics probe (spawn → did_open → drop) would leak
+            // a long-running language-server child after the handle goes away.
+            .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| LspError::Spawn(e.to_string()))?;
         let stdin = child
             .stdin
@@ -143,6 +166,63 @@ impl LspClient {
             || g.values().flatten().cloned().collect(),
             |p| g.get(p).cloned().unwrap_or_default(),
         )
+    }
+
+    /// One-shot diagnostics probe for a single file.
+    ///
+    /// Spawns `program` (with launch `args` such as `--stdio`) against
+    /// `workspace_root`, opens `path` (`did_open` with `language_id` + `text`),
+    /// then polls for `textDocument/publishDiagnostics` until either the server
+    /// has reported diagnostics for `path` or `timeout` elapses, whichever comes
+    /// first. The spawned server is reaped when the returned client is dropped
+    /// (`kill_on_drop`), so the caller need only drop the [`LspClient`] this
+    /// returns (or let it fall out of scope).
+    ///
+    /// Returns the diagnostics observed for `path` (possibly empty) and the live
+    /// [`LspClient`] so the caller controls teardown timing. This is the routine
+    /// the daemon's autonomous post-edit feedback uses: spawn → open → bounded
+    /// wait → drop.
+    ///
+    /// The poll loop sleeps in short slices so a server that publishes quickly
+    /// returns well before `timeout`; a server that never publishes simply hits
+    /// the deadline and returns whatever (if anything) it had reported.
+    ///
+    /// # Errors
+    /// `LspError::Spawn` if the binary cannot be started; `Protocol`/`Io` if the
+    /// initialize handshake or the `did_open` write fails.
+    pub async fn diagnose_file(
+        program: &str,
+        args: &[&str],
+        workspace_root: &Path,
+        path: &Path,
+        language_id: &str,
+        text: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(Self, Vec<Diagnostic>), LspError> {
+        let client = Self::spawn_with_args(program, args, workspace_root).await?;
+        client.did_open(path, language_id, text).await?;
+        // Poll in short slices: many servers publish within a few hundred ms of
+        // `did_open`, so we return as soon as `path` has any reported entry
+        // rather than always waiting the full `timeout`. A server that reports
+        // an empty diagnostic set never inserts the key here, so a clean file
+        // costs the full deadline — acceptable for a best-effort probe.
+        let deadline = std::time::Instant::now() + timeout;
+        let slice = std::time::Duration::from_millis(100);
+        loop {
+            let ready = {
+                let g = client.diags.read().await;
+                g.get(path).cloned()
+            };
+            if let Some(diags) = ready {
+                return Ok((client, diags));
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(slice).await;
+        }
+        let diags = client.diagnostics(Some(path)).await;
+        Ok((client, diags))
     }
 }
 
@@ -287,4 +367,82 @@ async fn handle_diagnostics(v: &Value, diags: &Arc<RwLock<HashMap<PathBuf, Vec<D
         }
     }
     diags.write().await.insert(path, out);
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{file_uri_to_path, handle_diagnostics, percent_decode, Diagnostic};
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    #[test]
+    fn percent_decode_handles_spaces_and_literals() {
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("plain"), "plain");
+        // Malformed escape is left verbatim.
+        assert_eq!(percent_decode("a%zz"), "a%zz");
+    }
+
+    #[test]
+    fn file_uri_round_trips_unix_path() {
+        let p = file_uri_to_path("file:///home/u/my%20proj/src.rs");
+        assert_eq!(p, PathBuf::from("/home/u/my proj/src.rs"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_uri_drops_leading_slash_before_drive() {
+        let p = file_uri_to_path("file:///C:/Users/x/main.rs");
+        assert_eq!(p, PathBuf::from("C:/Users/x/main.rs"));
+    }
+
+    #[tokio::test]
+    async fn handle_diagnostics_parses_publish_payload() {
+        let diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let payload = json!({
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": "file:///tmp/a.rs",
+                "diagnostics": [
+                    {
+                        "range": { "start": { "line": 9, "character": 4 } },
+                        "severity": 1,
+                        "message": "mismatched types",
+                        "code": "E0308"
+                    }
+                ]
+            }
+        });
+        handle_diagnostics(&payload, &diags).await;
+        let got = diags.read().await.get(&PathBuf::from("/tmp/a.rs")).cloned().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].line, 9);
+        assert_eq!(got[0].col, 4);
+        assert_eq!(got[0].severity, 1);
+        assert_eq!(got[0].message, "mismatched types");
+        assert_eq!(got[0].code.as_deref(), Some("E0308"));
+    }
+
+    #[tokio::test]
+    async fn handle_diagnostics_defaults_missing_fields() {
+        let diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        // No severity, no code, no range → severity defaults to 2 (warning),
+        // line/col default to 0, and the key is still inserted (empty-but-present).
+        let payload = json!({
+            "method": "textDocument/publishDiagnostics",
+            "params": { "uri": "file:///tmp/b.rs", "diagnostics": [ { "message": "bare" } ] }
+        });
+        handle_diagnostics(&payload, &diags).await;
+        let got = diags.read().await.get(&PathBuf::from("/tmp/b.rs")).cloned().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].severity, 2);
+        assert_eq!(got[0].line, 0);
+        assert!(got[0].code.is_none());
+    }
 }

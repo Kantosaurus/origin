@@ -18,6 +18,23 @@ const DEFAULT_BASE: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 16_384;
 
+/// Resolve the top-level `max_tokens` for a turn given an optional extended-
+/// thinking budget.
+///
+/// Anthropic requires `max_tokens` to be strictly greater than the thinking
+/// `budget_tokens`. When `thinking_tokens` is `None` we keep [`DEFAULT_MAX_TOKENS`]
+/// verbatim, so the unset path is byte-identical to the pre-thinking behavior.
+/// When set, we reserve [`DEFAULT_MAX_TOKENS`] of visible-output headroom on top
+/// of the budget (`budget + DEFAULT_MAX_TOKENS`), which both satisfies the
+/// `max_tokens > budget` constraint and leaves room for the model's actual
+/// answer after it finishes thinking. Saturating add keeps it total on overflow.
+const fn resolve_max_tokens(thinking_tokens: Option<u32>) -> u32 {
+    match thinking_tokens {
+        None => DEFAULT_MAX_TOKENS,
+        Some(budget) => budget.saturating_add(DEFAULT_MAX_TOKENS),
+    }
+}
+
 const OAUTH_BETA_HEADERS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24";
 const CLAUDE_CLI_USER_AGENT: &str = "claude-cli/2.1.123 (external, sdk-cli)";
 const OAUTH_BILLING_HEADER: &str = "cc_version=2.1.123; cc_entrypoint=sdk-cli; cch=33f85;";
@@ -189,7 +206,10 @@ impl Anthropic {
 
         let body = wire::WireRequest {
             model: &req.model,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            // Bump `max_tokens` above the thinking budget when one is set
+            // (Anthropic requires `max_tokens` > `budget_tokens`); otherwise
+            // unchanged at `DEFAULT_MAX_TOKENS` ⇒ byte-identical default.
+            max_tokens: resolve_max_tokens(req.thinking_tokens),
             system: if system_text.is_empty() {
                 None
             } else {
@@ -201,6 +221,7 @@ impl Anthropic {
                 user_id: m.user_id.clone(),
             }),
             effort: req.effort.map(ReasoningEffort::as_wire_str),
+            thinking: req.thinking_tokens.map(wire::WireThinking::enabled),
         };
 
         let mut body_value =
@@ -291,6 +312,7 @@ impl Provider for Anthropic {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // cohesive streaming method: body build + status handling + optional cassette record/replay tap
     async fn chat_stream(&self, req: ChatRequest, ring: &origin_stream::Ring) -> Result<(), ProviderError> {
         let expanded = expand_messages_for_wire(&req.messages, self.cas.as_ref(), self.plan.as_ref())?;
         let plan = self.plan.as_ref();
@@ -320,7 +342,10 @@ impl Provider for Anthropic {
 
         let mut body_json = serde_json::json!({
             "model": req.model,
-            "max_tokens": DEFAULT_MAX_TOKENS,
+            // Bump `max_tokens` above the thinking budget when one is set
+            // (Anthropic requires `max_tokens` > `budget_tokens`); otherwise
+            // unchanged at `DEFAULT_MAX_TOKENS` ⇒ byte-identical default.
+            "max_tokens": resolve_max_tokens(req.thinking_tokens),
             "system": if system_text.is_empty() {
                 serde_json::Value::Null
             } else {
@@ -337,8 +362,44 @@ impl Provider for Anthropic {
         if let Some(level) = req.effort {
             body_json["effort"] = serde_json::Value::String(level.as_wire_str().to_string());
         }
+        // Emit the extended-thinking block only when a budget is set, so the
+        // unset path is byte-identical. `max_tokens` was already bumped above to
+        // exceed the budget, per Anthropic's requirement.
+        if let Some(budget) = req.thinking_tokens {
+            body_json["thinking"] = serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            });
+        }
+        // Inject multimodal attachments into the last user message, mirroring the
+        // non-streaming `chat` path (which injects via `build_chat_body`).
+        // Streaming is the DEFAULT path, so without this every streamed turn
+        // silently dropped attached images/PDFs. No-op when empty ⇒
+        // byte-identical to the pre-attachment wire.
+        append_attachments(&mut body_json, &req.attachments);
 
         let url = self.messages_url();
+
+        // Optional cassette tap on the STREAMING path (env
+        // `ORIGIN_CASSETTE=record:<path>|replay:<path>`). Default (unset) returns
+        // `None`, so the network path below is unchanged and byte-identical to
+        // the pre-cassette behavior. The recorded body is the raw SSE event-stream
+        // text, replayed through `parse_into_ring` exactly as a live response.
+        let cassette_mode = cassette::Mode::from_env();
+        let req_body_text = serde_json::to_string(&body_json).unwrap_or_default();
+
+        // Replay mode: serve the recorded SSE text from disk with no network I/O.
+        // `&[u8]` is an `AsyncRead`, so the buffered text flows through the same
+        // SSE → ring parser a live byte stream would.
+        if let Some(cassette::Mode::Replay(path)) = &cassette_mode {
+            let sse = cassette::replay(path, "POST", &url, &req_body_text)?;
+            crate::streaming::parse_into_ring(sse.as_bytes(), ring)
+                .await
+                .map_err(|e| ProviderError::Api(e.to_string()))?;
+            ring.close();
+            return Ok(());
+        }
+
         let resp = self
             .apply_auth(self.client.post(&url))
             .header("anthropic-version", API_VERSION)
@@ -373,6 +434,23 @@ impl Provider for Anthropic {
                 let text = resp.text().await.unwrap_or_default();
                 return Err(ProviderError::Api(format!("status {s}: {text}")));
             }
+        }
+
+        // Record mode: buffer the whole SSE body to text, persist it (after
+        // secret scrubbing + the save gate), THEN replay the buffered text into
+        // the ring so the live caller still streams. Buffering is acceptable here
+        // because recording is a test/dev affordance, not the hot path.
+        if let Some(cassette::Mode::Record(path)) = &cassette_mode {
+            let sse = resp
+                .text()
+                .await
+                .map_err(|e| ProviderError::Api(format!("stream decode: {e}")))?;
+            cassette::record(path, "POST", &url, &req_body_text, 200, &sse)?;
+            crate::streaming::parse_into_ring(sse.as_bytes(), ring)
+                .await
+                .map_err(|e| ProviderError::Api(e.to_string()))?;
+            ring.close();
+            return Ok(());
         }
 
         let byte_stream = resp.bytes_stream();
@@ -809,7 +887,7 @@ pub fn encode_request_for_test(req: &ChatRequest) -> serde_json::Value {
         .collect::<Vec<_>>();
     let body = wire::WireRequest {
         model: &req.model,
-        max_tokens: DEFAULT_MAX_TOKENS,
+        max_tokens: resolve_max_tokens(req.thinking_tokens),
         system: if req.system.is_empty() {
             None
         } else {
@@ -819,6 +897,7 @@ pub fn encode_request_for_test(req: &ChatRequest) -> serde_json::Value {
         tools: wire_tools,
         metadata: None,
         effort: req.effort.map(ReasoningEffort::as_wire_str),
+        thinking: req.thinking_tokens.map(wire::WireThinking::enabled),
     };
     serde_json::to_value(&body).expect("WireRequest serialises to JSON")
 }

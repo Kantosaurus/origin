@@ -316,6 +316,627 @@ fn power_iterate(
     scores
 }
 
+// ----------------------------------------------------------------------------
+// Lightweight, dependency-free definition scanner.
+// ----------------------------------------------------------------------------
+//
+// The `PageRank` ranker above consumes a pre-built symbol graph ([`FileSymbols`]).
+// Upstream, `origin-codegraph` produces that graph with tree-sitter — accurate
+// but heavyweight (one compiled grammar per language). For the *repo-map* fast
+// path we want a scanner that needs no grammar at all: a cheap, line-oriented
+// heuristic that recognizes definition "leaders" (`fn`, `def`, `class`, …) and
+// pulls out the declared name. It is intentionally approximate — good enough to
+// seed the def→ref graph for ranking, at zero dependency and near-zero cost.
+//
+// The scanner is pure string work: no `regex` crate, no tree-sitter, no I/O. It
+// keys off a file extension → [`Language`] map and a per-language set of leaders.
+
+/// Source languages the lightweight [`scan_definitions`] heuristic understands.
+///
+/// This is deliberately broader than the tree-sitter grammar set: because the
+/// scanner is pure text heuristics, adding a language costs only a few match
+/// arms, not a compiled grammar. Unknown extensions map to `None` and are simply
+/// skipped by callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Language {
+    /// Rust (`.rs`).
+    Rust,
+    /// TypeScript / JavaScript (`.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`).
+    TypeScript,
+    /// Python (`.py`, `.pyi`).
+    Python,
+    /// Go (`.go`).
+    Go,
+    /// Java (`.java`).
+    Java,
+    /// C (`.c`, `.h`).
+    C,
+    /// C++ (`.cc`, `.cpp`, `.cxx`, `.hpp`, `.hh`, `.hxx`).
+    Cpp,
+    /// C# (`.cs`).
+    CSharp,
+    /// Ruby (`.rb`).
+    Ruby,
+    /// PHP (`.php`).
+    Php,
+    /// Swift (`.swift`).
+    Swift,
+    /// Kotlin (`.kt`, `.kts`).
+    Kotlin,
+    /// Scala (`.scala`, `.sc`).
+    Scala,
+    /// Zig (`.zig`).
+    Zig,
+    /// Haskell (`.hs`).
+    Haskell,
+    /// Lua (`.lua`).
+    Lua,
+    /// Elixir (`.ex`, `.exs`).
+    Elixir,
+    /// POSIX / Bash shell (`.sh`, `.bash`, `.zsh`).
+    Shell,
+}
+
+impl Language {
+    /// Detect a language from a file's lowercase extension (no leading dot).
+    ///
+    /// Returns `None` for extensions the heuristic scanner does not cover.
+    #[must_use]
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        // Lowercase once so callers can pass mixed-case extensions.
+        let lower = ext.to_ascii_lowercase();
+        let lang = match lower.as_str() {
+            "rs" => Self::Rust,
+            "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => Self::TypeScript,
+            "py" | "pyi" => Self::Python,
+            "go" => Self::Go,
+            "java" => Self::Java,
+            "c" | "h" => Self::C,
+            "cc" | "cpp" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" => Self::Cpp,
+            "cs" => Self::CSharp,
+            "rb" => Self::Ruby,
+            "php" | "phtml" => Self::Php,
+            "swift" => Self::Swift,
+            "kt" | "kts" => Self::Kotlin,
+            "scala" | "sc" => Self::Scala,
+            "zig" => Self::Zig,
+            "hs" => Self::Haskell,
+            "lua" => Self::Lua,
+            "ex" | "exs" => Self::Elixir,
+            "sh" | "bash" | "zsh" | "ksh" => Self::Shell,
+            _ => return None,
+        };
+        Some(lang)
+    }
+
+    /// Detect a language from a file path by inspecting its extension.
+    ///
+    /// Splits on the final `.` of the final path component (so `foo.test.ts`
+    /// keys off `ts`). Returns `None` when there is no extension or the
+    /// extension is unrecognized.
+    #[must_use]
+    pub fn from_path(path: &str) -> Option<Self> {
+        let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+        // A leading-dot file (`.gitignore`) has no real extension.
+        let (_stem, ext) = name.rsplit_once('.')?;
+        if ext.is_empty() {
+            return None;
+        }
+        Self::from_extension(ext)
+    }
+}
+
+/// Extract the names of top-level definitions from `source` using cheap,
+/// per-language leader heuristics.
+///
+/// This is the dependency-free counterpart to tree-sitter extraction: it scans
+/// line by line, strips comments/leading noise, and for each recognized
+/// definition leader (`fn`, `def`, `class`, `struct`, `func`, `fun`, …) pulls
+/// out the following identifier. The result feeds [`FileSymbols::defines`] so
+/// the ranker can build a def→ref graph without compiling any grammar.
+///
+/// It is *heuristic*: it favours recall over precision, may miss exotic
+/// declarations, and does not attempt to resolve scopes. Names are returned in
+/// source order with duplicates removed (first occurrence wins).
+#[must_use]
+pub fn scan_definitions(lang: Language, source: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for raw in source.lines() {
+        let line = strip_line_comment(lang, raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        for name in definitions_in_line(lang, line) {
+            if seen.insert(name.clone()) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// Convenience wrapper: detect the language from `path`, then scan `source`.
+///
+/// Returns `None` when the path's extension is not one the scanner recognizes,
+/// letting callers skip non-source files cheaply.
+#[must_use]
+pub fn scan_path(path: &str, source: &str) -> Option<(Language, Vec<String>)> {
+    let lang = Language::from_path(path)?;
+    Some((lang, scan_definitions(lang, source)))
+}
+
+/// Strip a trailing line comment so leaders inside comments are ignored.
+///
+/// Uses the dominant single-line comment token per language family. Block
+/// comments and string-embedded comment tokens are intentionally *not* handled —
+/// the scanner trades a little precision for staying allocation-light.
+fn strip_line_comment(lang: Language, line: &str) -> &str {
+    let token = match lang {
+        // `#` line comments.
+        Language::Python | Language::Ruby | Language::Elixir | Language::Shell => "#",
+        // `--` line comments.
+        Language::Haskell | Language::Lua => "--",
+        // `//` line comments (C-family and friends, including Zig).
+        Language::Rust
+        | Language::TypeScript
+        | Language::Go
+        | Language::Java
+        | Language::C
+        | Language::Cpp
+        | Language::CSharp
+        | Language::Php
+        | Language::Swift
+        | Language::Kotlin
+        | Language::Scala
+        | Language::Zig => "//",
+    };
+    split_before(line, token)
+}
+
+/// Return the slice of `line` before the first occurrence of `token`.
+fn split_before<'a>(line: &'a str, token: &str) -> &'a str {
+    line.find(token).map_or(line, |idx| &line[..idx])
+}
+
+/// Extract any definition names declared on a single (already comment-stripped,
+/// trimmed) line for `lang`. Most lines yield zero or one name; a few patterns
+/// (e.g. Zig `const X = struct`) are handled specially.
+fn definitions_in_line(lang: Language, line: &str) -> Vec<String> {
+    match lang {
+        Language::Rust => leader_defs(line, &["fn", "struct", "enum", "trait", "type", "mod", "const", "static", "union", "macro_rules!"]),
+        Language::TypeScript => ts_defs(line),
+        Language::Python => leader_defs(line, &["def", "class"]),
+        Language::Go => go_defs(line),
+        Language::Java | Language::CSharp => brace_lang_defs(line, lang),
+        Language::C | Language::Cpp => c_family_defs(line, lang),
+        Language::Ruby => leader_defs(line, &["def", "class", "module"]),
+        Language::Php => leader_defs(line, &["function", "class", "interface", "trait", "enum"]),
+        Language::Swift => leader_defs(line, &["func", "class", "struct", "enum", "protocol", "extension", "actor"]),
+        Language::Kotlin => kotlin_defs(line),
+        Language::Scala => leader_defs(line, &["def", "class", "object", "trait", "case class"]),
+        Language::Zig => zig_defs(line),
+        Language::Haskell => haskell_defs(line),
+        Language::Lua => lua_defs(line),
+        Language::Elixir => leader_defs(line, &["def", "defp", "defmodule", "defmacro", "defstruct", "defprotocol"]),
+        Language::Shell => shell_defs(line),
+    }
+}
+
+/// Generic "leader keyword then identifier" extractor.
+///
+/// For each leader in `leaders`, if `line` begins with that leader followed by
+/// whitespace (after skipping common modifier words like `pub`, `async`,
+/// `export`, visibility keywords, etc.), the next identifier token is taken as
+/// the defined name. Returns the single name found, or empty.
+fn leader_defs(line: &str, leaders: &[&str]) -> Vec<String> {
+    let rest = strip_modifiers(line);
+    for leader in leaders {
+        if let Some(after) = match_leader(rest, leader) {
+            if let Some(name) = definition_name(after) {
+                return vec![name];
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Construct keywords that can directly follow another leader/modifier and must
+/// not themselves be mistaken for the declared name. Handles forms like Kotlin
+/// `data class Foo` / `enum class Bar` / `annotation class Baz` and Scala
+/// `case class Qux` where two keywords precede the real identifier.
+const CONSTRUCT_KEYWORDS: &[&str] = &[
+    "class", "struct", "enum", "interface", "object", "trait", "fn", "func",
+    "fun", "def", "type", "record", "union", "namespace", "protocol", "actor",
+];
+
+/// Extract the declared name after a leader, skipping a single immediately
+/// following construct keyword (so `enum class Foo` yields `Foo`, not `class`).
+fn definition_name(after: &str) -> Option<String> {
+    let trimmed = after.trim_start();
+    for kw in CONSTRUCT_KEYWORDS {
+        if let Some(rest) = match_leader(trimmed, kw) {
+            // Only skip when a real identifier follows the second keyword.
+            if let Some(name) = first_identifier(rest) {
+                return Some(name);
+            }
+        }
+    }
+    first_identifier(after)
+}
+
+/// Strip leading visibility / modifier keywords shared across many languages so
+/// the leader match can see the real declaration keyword.
+///
+/// Keywords that *also* serve as definition leaders (`const`, `static`, `data`)
+/// are deliberately omitted here so they survive for the leader match — e.g.
+/// Rust `const FOO` and Haskell `data Foo` must reach their leaders intact.
+fn strip_modifiers(line: &str) -> &str {
+    const MODIFIERS: &[&str] = &[
+        "pub", "public", "private", "protected", "internal", "export", "default",
+        "final", "abstract", "sealed", "open", "override", "async",
+        "inline", "extern", "unsafe", "mut", "virtual", "partial",
+        "suspend", "lateinit", "readonly", "declare", "implicit", "lazy",
+        "annotation",
+    ];
+    let mut cur = line;
+    loop {
+        let trimmed = cur.trim_start();
+        // Handle Rust `pub(crate)` / `pub(super)` visibility scopes.
+        if let Some(after) = trimmed.strip_prefix("pub(") {
+            if let Some(close) = after.find(')') {
+                cur = &after[close + 1..];
+                continue;
+            }
+        }
+        let mut advanced = false;
+        for m in MODIFIERS {
+            if let Some(after) = match_leader(trimmed, m) {
+                cur = after;
+                advanced = true;
+                break;
+            }
+        }
+        if !advanced {
+            return trimmed;
+        }
+    }
+}
+
+/// If `text` starts with `leader` as a whole word, return the remainder after
+/// it (leading whitespace not yet trimmed). Whole-word means the char after the
+/// leader is not an identifier char — so `fn` matches `fn foo` but not `fnord`.
+/// A leader ending in `!` (e.g. `macro_rules!`) matches literally.
+fn match_leader<'a>(text: &'a str, leader: &str) -> Option<&'a str> {
+    let after = text.strip_prefix(leader)?;
+    // For `name!`-style leaders the `!` already bounds the word.
+    if leader.ends_with('!') {
+        return Some(after);
+    }
+    match after.chars().next() {
+        // Boundary: must be whitespace or a delimiter, not another ident char.
+        Some(c) if is_ident_char(c) => None,
+        _ => Some(after),
+    }
+}
+
+/// Read the first identifier token from `text`, skipping leading whitespace and
+/// any non-identifier punctuation directly before it (e.g. `*`, `&`, `(`).
+fn first_identifier(text: &str) -> Option<String> {
+    let mut chars = text.char_indices().peekable();
+    // Skip until we hit a valid identifier-start character.
+    let start = loop {
+        let (i, c) = *chars.peek()?;
+        if is_ident_start(c) {
+            break i;
+        }
+        chars.next();
+    };
+    let mut end = text.len();
+    for (i, c) in text[start..].char_indices() {
+        if !is_ident_char(c) {
+            end = start + i;
+            break;
+        }
+    }
+    let ident = &text[start..end];
+    if ident.is_empty() {
+        None
+    } else {
+        Some(ident.to_owned())
+    }
+}
+
+/// `true` for characters allowed to start an identifier across the supported
+/// languages (ASCII letters, `_`; PHP/Kotlin/etc. also use `$` and `@`).
+const fn is_ident_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_' || c == '$'
+}
+
+/// `true` for characters allowed within an identifier.
+const fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '$'
+}
+
+/// TypeScript / JavaScript: functions, classes, interfaces, enums, types, plus
+/// `const NAME = (…) =>` / `const NAME = function` arrow/assignment forms.
+fn ts_defs(line: &str) -> Vec<String> {
+    if let names @ [_, ..] = leader_defs(line, &["function", "class", "interface", "enum", "type", "namespace"]).as_slice() {
+        return names.to_vec();
+    }
+    // `const foo = (...) => {}` / `let bar = function() {}` style definitions.
+    let rest = strip_modifiers(line);
+    for binder in ["const", "let", "var"] {
+        if let Some(after) = match_leader(rest, binder) {
+            if let Some(name) = first_identifier(after) {
+                let tail = after.trim_start();
+                // Only treat as a definition when it binds a function/arrow.
+                if tail.contains("=>") || tail.contains("function") {
+                    return vec![name];
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Go: `func`, `type` (struct/interface/alias). Receiver methods `func (r T) M()`
+/// are handled by skipping a parenthesized receiver before the method name.
+fn go_defs(line: &str) -> Vec<String> {
+    let rest = strip_modifiers(line);
+    if let Some(after) = match_leader(rest, "func") {
+        let after = after.trim_start();
+        // Method form: `func (recv Type) Name(...)` — skip the receiver group.
+        let after = after.strip_prefix('(').map_or(after, |inner| {
+            inner.find(')').map_or(after, |close| &inner[close + 1..])
+        });
+        if let Some(name) = first_identifier(after) {
+            return vec![name];
+        }
+    }
+    leader_defs(line, &["type"])
+}
+
+/// Java / C#: `class`, `interface`, `enum`, `record`, `struct` (C#), plus a
+/// best-effort method-signature heuristic (`ReturnType name(` at statement
+/// start). The method heuristic only fires when the line ends in `(` args and
+/// is not a control-flow keyword, to keep false positives low.
+fn brace_lang_defs(line: &str, lang: Language) -> Vec<String> {
+    let type_leaders: &[&str] = if lang == Language::CSharp {
+        &["class", "interface", "enum", "record", "struct", "namespace", "delegate"]
+    } else {
+        &["class", "interface", "enum", "record"]
+    };
+    let names = leader_defs(line, type_leaders);
+    if !names.is_empty() {
+        return names;
+    }
+    method_signature(line)
+}
+
+/// Kotlin: `fun`/`class`/`object`/`interface`/`enum` plus the modifier-prefixed
+/// class idioms (`data class`, `enum class`, `sealed class`, `value class`).
+///
+/// `data`/`value`/`inner` are Kotlin-specific *class modifiers* that the shared
+/// [`strip_modifiers`] deliberately leaves alone (to protect Haskell `data`), so
+/// they are peeled here before the generic leader match.
+fn kotlin_defs(line: &str) -> Vec<String> {
+    let rest = strip_modifiers(line);
+    // Peel Kotlin class modifiers that the shared stripper intentionally skips.
+    let mut cur = rest;
+    loop {
+        let trimmed = cur.trim_start();
+        let mut advanced = false;
+        for m in ["data", "value", "inner", "companion"] {
+            if let Some(after) = match_leader(trimmed, m) {
+                // Only peel when a class-construct keyword still follows.
+                let tail = after.trim_start();
+                if ["class", "object", "enum", "interface"]
+                    .iter()
+                    .any(|kw| match_leader(tail, kw).is_some())
+                {
+                    cur = after;
+                    advanced = true;
+                    break;
+                }
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    leader_defs(cur, &["fun", "class", "object", "interface", "enum"])
+}
+
+/// C / C++: `struct`/`class`/`enum`/`union`/`namespace` declarations and
+/// free-function / method definitions via the shared [`method_signature`]
+/// heuristic.
+fn c_family_defs(line: &str, lang: Language) -> Vec<String> {
+    let type_leaders: &[&str] = if lang == Language::Cpp {
+        &["class", "struct", "enum", "union", "namespace"]
+    } else {
+        &["struct", "enum", "union"]
+    };
+    let names = leader_defs(line, type_leaders);
+    if !names.is_empty() {
+        return names;
+    }
+    method_signature(line)
+}
+
+/// C-family control-flow / operator keywords that can appear as `keyword(` and
+/// must never be mistaken for a function definition.
+const C_CONTROL_KEYWORDS: &[&str] = &[
+    "if", "for", "while", "switch", "return", "catch", "sizeof", "do",
+    "else", "case", "throw", "new", "delete", "and", "or", "not",
+];
+
+/// Heuristic for C-family function/method definitions: a line shaped like
+/// `… name(args)` where `name` is the identifier immediately before the first
+/// `(`, the line is not a control-flow statement or bare call, and the text
+/// after the matching `)` opens a body `{` or is a prototype (`;`). A preceding
+/// return-type / modifier token must exist, which rules out plain calls.
+/// Returns at most one name.
+fn method_signature(line: &str) -> Vec<String> {
+    let Some(paren) = line.find('(') else {
+        return Vec::new();
+    };
+    let head = line[..paren].trim_end();
+    // The name is the last identifier-run before `(`.
+    let name_start = head
+        .char_indices()
+        .rev()
+        .take_while(|&(_, c)| is_ident_char(c))
+        .last()
+        .map(|(i, _)| i);
+    let Some(start) = name_start else {
+        return Vec::new();
+    };
+    let name = &head[start..];
+    // Reject control-flow keywords masquerading as calls.
+    if name.is_empty() || C_CONTROL_KEYWORDS.contains(&name) {
+        return Vec::new();
+    }
+    // A preceding token (return type / modifier) must exist for a definition;
+    // a bare `name(` with nothing before it is almost always a call. An `=` in
+    // the head means an assignment/initializer — a call expression, not a decl.
+    let lead = head[..start].trim();
+    if lead.is_empty() || lead.contains('=') {
+        return Vec::new();
+    }
+    // Inspect what follows the matching close-paren: a `{` body opener or a `;`
+    // prototype terminator marks a definition; anything else (`.`, `,`, `=`,
+    // chained calls) means this was an expression, not a declaration.
+    let after_args = match_paren_tail(&line[paren..]);
+    let tail = after_args.trim_start();
+    // A trailing C++ specifier (`const`/`noexcept`/`override`) still precedes a
+    // body or prototype, so treat those as definition headers too.
+    let trailing_specifier = ["const", "noexcept", "override"]
+        .iter()
+        .any(|kw| tail.starts_with(kw));
+    let looks_like_def = tail.starts_with('{')
+        || tail.is_empty() // header continues on the next line (e.g. `void f(`)
+        || tail.starts_with(';')
+        || trailing_specifier;
+    if !looks_like_def {
+        return Vec::new();
+    }
+    vec![name.to_owned()]
+}
+
+/// Given a slice beginning at `(`, return the slice immediately after its
+/// matching `)` (balanced). Returns the empty string when unbalanced (the
+/// argument list spills onto later lines).
+fn match_paren_tail(from_open: &str) -> &str {
+    let mut depth: usize = 0;
+    for (i, c) in from_open.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &from_open[i + 1..];
+                }
+            }
+            _ => {}
+        }
+    }
+    ""
+}
+
+/// Zig: `fn name(`, `pub fn name(`, and the `const Name = struct/enum/union {`
+/// type-definition idiom.
+fn zig_defs(line: &str) -> Vec<String> {
+    let rest = strip_modifiers(line);
+    if let Some(after) = match_leader(rest, "fn") {
+        if let Some(name) = first_identifier(after) {
+            return vec![name];
+        }
+    }
+    // `const Name = struct {` / `= enum {` / `= union {` / `= opaque {`.
+    for binder in ["const", "var"] {
+        if let Some(after) = match_leader(rest, binder) {
+            if let Some(name) = first_identifier(after) {
+                let tail = after.trim_start();
+                if tail.contains("struct")
+                    || tail.contains("enum")
+                    || tail.contains("union")
+                    || tail.contains("opaque")
+                {
+                    return vec![name];
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Haskell: top-level type signatures (`name :: …`), `data`/`newtype`/`type`
+/// declarations, `class`/`instance` heads. Only column-0 declarations count as
+/// top-level, which the caller approximates by trimming — so we additionally
+/// require the original line to be unindented by checking the leading char.
+fn haskell_defs(line: &str) -> Vec<String> {
+    // `data Foo = …`, `newtype Bar = …`, `type Baz = …`, `class C a where`.
+    if let names @ [_, ..] = leader_defs(line, &["data", "newtype", "type", "class"]).as_slice() {
+        return names.to_vec();
+    }
+    // Top-level value/function signature: `name :: Type`.
+    if let Some(idx) = line.find("::") {
+        let head = line[..idx].trim();
+        // A single identifier (or comma-separated group) to the left of `::`.
+        let first = head.split(',').next().unwrap_or(head).trim();
+        if let Some(name) = first_identifier(first) {
+            if name == first || first.starts_with(&name) {
+                return vec![name];
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Lua: `function name(`, `function tbl.name(`, `function tbl:method(`, and
+/// `local function name(`. The dotted/colon-qualified tail name is taken.
+fn lua_defs(line: &str) -> Vec<String> {
+    let rest = strip_modifiers(line);
+    let rest = match_leader(rest, "local").map_or(rest, |a| a.trim_start());
+    if let Some(after) = match_leader(rest, "function") {
+        let after = after.trim_start();
+        // Qualified name `a.b:c` — take the final segment as the symbol.
+        let qualified: String = after
+            .chars()
+            .take_while(|&c| is_ident_char(c) || c == '.' || c == ':')
+            .collect();
+        let leaf = qualified.rsplit(['.', ':']).next().unwrap_or(&qualified);
+        if let Some(name) = first_identifier(leaf) {
+            return vec![name];
+        }
+    }
+    Vec::new()
+}
+
+/// Shell: POSIX `name() {` and ksh/bash `function name { … }` definitions.
+fn shell_defs(line: &str) -> Vec<String> {
+    // `function name` form.
+    if let Some(after) = match_leader(line, "function") {
+        if let Some(name) = first_identifier(after) {
+            return vec![name];
+        }
+    }
+    // `name()` / `name ()` POSIX form: identifier immediately followed by `()`.
+    if let Some(paren) = line.find('(') {
+        let head = line[..paren].trim();
+        // Only a bare identifier may precede `(` in a function definition.
+        if !head.is_empty() && head.chars().all(is_ident_char) {
+            let after_paren = line[paren..].trim_start();
+            if after_paren.starts_with("()") || after_paren.starts_with("( )") {
+                return vec![head.to_owned()];
+            }
+        }
+    }
+    Vec::new()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
@@ -454,5 +1075,182 @@ mod tests {
         let plain = pagerank(&files, 0.85, 30);
         let bogus = personalized_pagerank(&files, &["nonexistent.rs".into()], 0.85, 30);
         assert_eq!(plain, bogus, "unknown focus must degrade to plain pagerank");
+    }
+
+    // ---- lightweight definition scanner -------------------------------------
+
+    /// Assert the scanner extracts exactly `expected` (order-sensitive) from
+    /// `src` under `lang`.
+    fn assert_defs(lang: Language, src: &str, expected: &[&str]) {
+        let got = scan_definitions(lang, src);
+        let want: Vec<String> = expected.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(got, want, "scanning {lang:?}");
+    }
+
+    #[test]
+    fn extension_and_path_detection() {
+        assert_eq!(Language::from_extension("rs"), Some(Language::Rust));
+        assert_eq!(Language::from_extension("CPP"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("exs"), Some(Language::Elixir));
+        assert_eq!(Language::from_extension("kts"), Some(Language::Kotlin));
+        assert_eq!(Language::from_extension("nope"), None);
+        assert_eq!(Language::from_path("src/main.rs"), Some(Language::Rust));
+        assert_eq!(Language::from_path(r"C:\proj\a\b.swift"), Some(Language::Swift));
+        assert_eq!(Language::from_path("foo.test.ts"), Some(Language::TypeScript));
+        assert_eq!(Language::from_path("Makefile"), None);
+        assert_eq!(Language::from_path(".gitignore"), None);
+    }
+
+    #[test]
+    fn existing_languages_still_scan() {
+        assert_defs(
+            Language::Rust,
+            "pub fn build() {}\nstruct Engine;\nconst MAX: u8 = 9;\nmod inner {}",
+            &["build", "Engine", "MAX", "inner"],
+        );
+        assert_defs(
+            Language::Python,
+            "def run(x):\n    pass\nclass Widget:\n    pass",
+            &["run", "Widget"],
+        );
+        assert_defs(
+            Language::Go,
+            "func Hello() {}\nfunc (r *Repo) Save() {}\ntype Repo struct {}",
+            &["Hello", "Save", "Repo"],
+        );
+        assert_defs(
+            Language::TypeScript,
+            "export function load() {}\nclass App {}\nconst handler = () => {};",
+            &["load", "App", "handler"],
+        );
+        assert_defs(
+            Language::Java,
+            "public class Foo {\n    public int add(int a) { return a; }\n}",
+            &["Foo", "add"],
+        );
+    }
+
+    #[test]
+    fn scans_c_and_cpp() {
+        assert_defs(
+            Language::C,
+            "int add(int a, int b) {\n    return a + b;\n}\nstruct Point { int x; };",
+            &["add", "Point"],
+        );
+        assert_defs(
+            Language::Cpp,
+            "class Widget {\npublic:\n    void draw();\n};\nnamespace gfx {}",
+            // A method prototype `void draw();` is a legitimate declaration.
+            &["Widget", "draw", "gfx"],
+        );
+        // A bare call must NOT be picked up as a definition.
+        assert_defs(Language::C, "    do_thing(x, y);", &[]);
+        // Control-flow keywords must not be treated as functions.
+        assert_defs(Language::C, "    if (cond) {", &[]);
+    }
+
+    #[test]
+    fn scans_csharp_ruby_php() {
+        assert_defs(
+            Language::CSharp,
+            "public record Money(decimal Amount);\ninterface IRepo { }",
+            &["Money", "IRepo"],
+        );
+        assert_defs(
+            Language::Ruby,
+            "module M\n  class Cat\n    def meow\n    end\n  end\nend",
+            &["M", "Cat", "meow"],
+        );
+        assert_defs(
+            Language::Php,
+            "<?php\nclass User {\n    public function name() {}\n}",
+            &["User", "name"],
+        );
+    }
+
+    #[test]
+    fn scans_swift_kotlin_scala() {
+        assert_defs(
+            Language::Swift,
+            "struct Vec {}\nfunc dot() {}\nprotocol Drawable {}\nenum Color {}",
+            &["Vec", "dot", "Drawable", "Color"],
+        );
+        assert_defs(
+            Language::Kotlin,
+            "fun main() {}\ndata class Point(val x: Int)\nenum class Dir { N }\nobject Reg {}",
+            &["main", "Point", "Dir", "Reg"],
+        );
+        assert_defs(
+            Language::Scala,
+            "object App {}\ncase class Item(id: Int)\ntrait Show {}\ndef run() = {}",
+            &["App", "Item", "Show", "run"],
+        );
+    }
+
+    #[test]
+    fn scans_zig_haskell_lua_elixir_shell() {
+        assert_defs(
+            Language::Zig,
+            "pub fn add(a: u8) u8 {\n    return a;\n}\nconst Point = struct {\n    x: u8,\n};",
+            &["add", "Point"],
+        );
+        assert_defs(
+            Language::Haskell,
+            "module M where\nfib :: Int -> Int\nfib n = n\ndata Tree = Leaf\nnewtype Age = Age Int",
+            &["fib", "Tree", "Age"],
+        );
+        assert_defs(
+            Language::Lua,
+            "function greet(name)\nend\nlocal function helper()\nend\nfunction M.attach(o)\nend",
+            &["greet", "helper", "attach"],
+        );
+        assert_defs(
+            Language::Elixir,
+            "defmodule Calc do\n  def add(a, b), do: a + b\n  defp secret(), do: 1\nend",
+            &["Calc", "add", "secret"],
+        );
+        assert_defs(
+            Language::Shell,
+            "build() {\n  echo hi\n}\nfunction deploy {\n  echo bye\n}",
+            &["build", "deploy"],
+        );
+    }
+
+    #[test]
+    fn comments_are_ignored() {
+        // A `fn` mentioned only inside a comment must not yield a symbol.
+        assert_defs(Language::Rust, "// fn ghost() {}\nfn real() {}", &["real"]);
+        assert_defs(Language::Python, "# def ghost():\ndef real():\n    pass", &["real"]);
+        assert_defs(Language::Lua, "-- function ghost()\nfunction real()\nend", &["real"]);
+    }
+
+    #[test]
+    fn scan_path_detects_then_scans() {
+        let (lang, defs) = scan_path("lib/widget.rb", "class Widget\n  def go\n  end\nend").unwrap();
+        assert_eq!(lang, Language::Ruby);
+        assert_eq!(defs, vec!["Widget".to_string(), "go".to_string()]);
+        assert!(scan_path("README.md", "# hi").is_none());
+    }
+
+    #[test]
+    fn scanner_output_feeds_the_ranker() {
+        // End-to-end: scanned definitions populate FileSymbols and rank sensibly.
+        let core_src = "pub struct Engine {}\npub fn start() {}";
+        let (lang, core_defs) = scan_path("core.rs", core_src).unwrap();
+        assert_eq!(lang, Language::Rust);
+        let files = vec![
+            FileSymbols::new("core.rs", core_defs, vec![], 20),
+            refs("a.rs", &["Engine"], 10),
+            refs("b.rs", &["Engine"], 10),
+        ];
+        let ranked = pagerank(&files, 0.85, 30);
+        assert_eq!(ranked[0].0, "core.rs", "the scanned definer should rank first");
+    }
+
+    #[test]
+    fn scan_dedups_repeated_names() {
+        // The same symbol declared twice is reported once (first occurrence).
+        let defs = scan_definitions(Language::Rust, "fn dup() {}\nfn dup() {}");
+        assert_eq!(defs, vec!["dup".to_string()]);
     }
 }

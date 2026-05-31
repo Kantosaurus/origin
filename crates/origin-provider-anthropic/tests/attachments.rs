@@ -23,6 +23,7 @@ fn req_with(attachments: Vec<ContentBlock>) -> ChatRequest {
         model: "claude-x".to_string(),
         tools: Vec::new(),
         effort: None,
+        thinking_tokens: None,
         attachments,
     }
 }
@@ -67,6 +68,46 @@ async fn image_attachment_is_injected_into_last_user_message() {
         .await
         .expect("chat with image attachment must match the image-requiring mock");
     assert_eq!(resp.assistant.blocks.len(), 1);
+}
+
+#[tokio::test]
+async fn image_attachment_is_injected_on_streaming_path() {
+    // Regression: `chat_stream` (the DEFAULT provider path) previously skipped
+    // `append_attachments`, silently dropping images on every streamed turn.
+    // The mock only matches when the streaming POST body carries an image block,
+    // so a successful stream proves injection on the streaming path too.
+    let server = MockServer::start().await;
+    let sse_body = std::fs::read(format!(
+        "{}/tests/fixtures/sse_hello.txt",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("fixture");
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_has_image_block)
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let png = ContentBlock::image("image/png", "aGVsbG8=");
+    let provider = origin_provider_anthropic::Anthropic::with_base_url("k", &server.uri());
+    let ring = origin_stream::Ring::with_capacity(64 * 1024);
+    let mut sub = ring.subscribe();
+    let r = ring.clone();
+    let handle = tokio::spawn(async move {
+        provider
+            .chat_stream(req_with(vec![png]), &r)
+            .await
+            .expect("streaming chat with an image must match the image-requiring mock");
+    });
+    let mut text = String::new();
+    while let Some(ev) = sub.next().await.expect("recv") {
+        if ev.kind() == origin_stream::TokenKind::TextDelta {
+            text.push_str(std::str::from_utf8(ev.payload()).unwrap_or_default());
+        }
+    }
+    handle.await.expect("prov task");
+    assert_eq!(text, "Hello!", "streamed text decodes after the image-bearing body matched");
 }
 
 #[test]

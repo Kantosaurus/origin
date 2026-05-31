@@ -237,6 +237,122 @@ pub fn parse_model_command(line: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// Modal input mode for the opt-in vim layer (aider L107 parity).
+///
+/// Default sessions never construct anything but [`VimMode::Insert`] and the
+/// vim reducer is never consulted, so the composer's direct-insert behaviour is
+/// byte-identical unless the user opts in (`/vim`, `ORIGIN_VIM=1`, or a config
+/// flag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VimMode {
+    /// Direct text entry — every printable key inserts (today's behaviour).
+    #[default]
+    Insert,
+    /// Command mode — `hjkl`/`0`/`$`/`w`/`b` move; `i`/`a`/`A`/`I` enter insert.
+    Normal,
+}
+
+/// The effect a key has in vim mode, returned by the pure [`vim_key`] reducer.
+///
+/// The caller (`tui.rs`) owns the actual cursor/buffer mutation; this enum is
+/// the deterministically-testable decision. [`VimAction::Pass`] means "not a
+/// vim key — handle it the normal way" so unmapped keys fall through unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VimAction {
+    /// Switch to the given mode (no cursor change of its own).
+    SwitchMode(VimMode),
+    /// Move the cursor one cell left (`h`).
+    MoveLeft,
+    /// Move the cursor one cell right (`l`).
+    MoveRight,
+    /// Move to the previous line (`k`).
+    MoveUp,
+    /// Move to the next line (`j`).
+    MoveDown,
+    /// Jump to the start of the line (`0`).
+    LineStart,
+    /// Jump to the end of the line (`$`).
+    LineEnd,
+    /// Jump forward one word (`w`).
+    WordForward,
+    /// Jump back one word (`b`).
+    WordBack,
+    /// Enter insert mode at the cursor (`i`).
+    InsertHere,
+    /// Enter insert mode after the cursor (`a`).
+    AppendAfter,
+    /// Enter insert mode at the line start (`I`).
+    InsertLineStart,
+    /// Enter insert mode at the line end (`A`).
+    AppendLineEnd,
+    /// Begin a `:`-command (Normal mode only).
+    BeginCommand,
+    /// Not a vim binding in this mode — caller uses its normal handling.
+    Pass,
+}
+
+/// Pure modal-key reducer for the opt-in vim input layer.
+///
+/// Given the current [`VimMode`] and a key event, returns the [`VimAction`] to
+/// apply. The cursor/buffer mutation lives in the caller; this map is the
+/// unit-tested core.
+///
+/// Semantics:
+/// - In [`VimMode::Insert`], only `Esc` is special (→ Normal); every other key
+///   is [`VimAction::Pass`] so insertion stays byte-identical to the legacy
+///   reducer.
+/// - In [`VimMode::Normal`], `hjkl`/`0`/`$`/`w`/`b` move, `i`/`a`/`A`/`I` enter
+///   insert, `:` begins a command, and `Esc` re-asserts Normal. Unmapped keys
+///   are [`VimAction::Pass`] (they do not insert text in Normal mode — the
+///   caller drops them).
+///
+/// Modifier chords (anything with `CONTROL`/`ALT`) always [`VimAction::Pass`]
+/// so the global `Ctrl+C`/`Ctrl+D` exits keep working in either mode.
+#[must_use]
+pub fn vim_key(mode: VimMode, ev: KeyEvent) -> VimAction {
+    if ev.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+        return VimAction::Pass;
+    }
+    if ev.code == KeyCode::Esc {
+        return VimAction::SwitchMode(VimMode::Normal);
+    }
+    match mode {
+        VimMode::Insert => VimAction::Pass,
+        VimMode::Normal => vim_normal_key(ev.code),
+    }
+}
+
+/// Normal-mode key table, split out to keep [`vim_key`] flat (no nested match
+/// on the mode *and* the code in one function body).
+const fn vim_normal_key(code: KeyCode) -> VimAction {
+    match code {
+        KeyCode::Char('h') | KeyCode::Left => VimAction::MoveLeft,
+        KeyCode::Char('l') | KeyCode::Right => VimAction::MoveRight,
+        KeyCode::Char('k') | KeyCode::Up => VimAction::MoveUp,
+        KeyCode::Char('j') | KeyCode::Down => VimAction::MoveDown,
+        KeyCode::Char('0') => VimAction::LineStart,
+        KeyCode::Char('$') => VimAction::LineEnd,
+        KeyCode::Char('w') => VimAction::WordForward,
+        KeyCode::Char('b') => VimAction::WordBack,
+        KeyCode::Char('i') => VimAction::SwitchMode(VimMode::Insert),
+        KeyCode::Char('a') => VimAction::AppendAfter,
+        KeyCode::Char('A') => VimAction::AppendLineEnd,
+        KeyCode::Char('I') => VimAction::InsertLineStart,
+        KeyCode::Char(':') => VimAction::BeginCommand,
+        _ => VimAction::Pass,
+    }
+}
+
+/// Whether the opt-in vim input layer should be active for this session.
+///
+/// True when `ORIGIN_VIM=1` (env opt-in) or `config_flag` is set (e.g. a
+/// `config.toml` field threaded in by the caller). Default-off ⇒ the composer's
+/// direct-insert behaviour is byte-identical.
+#[must_use]
+pub fn vim_enabled(config_flag: bool) -> bool {
+    config_flag || std::env::var("ORIGIN_VIM").as_deref() == Ok("1")
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unreachable)] // panic! is the idiomatic mismatched-variant assertion in test code
 mod tests {
@@ -497,6 +613,102 @@ mod tests {
         // refuse `/model` so /model handling owns the verb.
         assert!(parse_skill_command("/model").is_none());
         assert!(parse_skill_command("/model:foo").is_none());
+    }
+
+    // ---- vim input layer (aider L107) ----
+
+    #[test]
+    fn vim_default_mode_is_insert() {
+        assert_eq!(VimMode::default(), VimMode::Insert);
+    }
+
+    #[test]
+    fn vim_insert_passes_through_printable_keys() {
+        // In Insert mode every printable key is Pass, so the caller's normal
+        // direct-insert path runs unchanged (byte-identical default).
+        assert_eq!(vim_key(VimMode::Insert, k(KeyCode::Char('x'))), VimAction::Pass);
+        assert_eq!(vim_key(VimMode::Insert, k(KeyCode::Char('h'))), VimAction::Pass);
+        assert_eq!(vim_key(VimMode::Insert, k(KeyCode::Enter)), VimAction::Pass);
+    }
+
+    #[test]
+    fn vim_esc_enters_normal_from_insert() {
+        assert_eq!(
+            vim_key(VimMode::Insert, k(KeyCode::Esc)),
+            VimAction::SwitchMode(VimMode::Normal)
+        );
+    }
+
+    #[test]
+    fn vim_normal_hjkl_moves() {
+        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('h'))), VimAction::MoveLeft);
+        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('j'))), VimAction::MoveDown);
+        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('k'))), VimAction::MoveUp);
+        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('l'))), VimAction::MoveRight);
+    }
+
+    #[test]
+    fn vim_normal_line_and_word_motions() {
+        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('0'))), VimAction::LineStart);
+        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('$'))), VimAction::LineEnd);
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char('w'))),
+            VimAction::WordForward
+        );
+        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('b'))), VimAction::WordBack);
+    }
+
+    #[test]
+    fn vim_normal_insert_entries() {
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char('i'))),
+            VimAction::SwitchMode(VimMode::Insert)
+        );
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char('a'))),
+            VimAction::AppendAfter
+        );
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char('A'))),
+            VimAction::AppendLineEnd
+        );
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char('I'))),
+            VimAction::InsertLineStart
+        );
+    }
+
+    #[test]
+    fn vim_normal_colon_begins_command() {
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char(':'))),
+            VimAction::BeginCommand
+        );
+    }
+
+    #[test]
+    fn vim_normal_unmapped_key_passes() {
+        // An unmapped printable key in Normal mode does NOT insert — it passes
+        // so the caller drops it (vim Normal mode never types text).
+        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('z'))), VimAction::Pass);
+    }
+
+    #[test]
+    fn vim_ctrl_chords_always_pass() {
+        // Ctrl+C / Ctrl+D must keep reaching the global exit reducer in either
+        // mode, so modifier chords are never captured by the vim layer.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(vim_key(VimMode::Normal, ctrl_c), VimAction::Pass);
+        assert_eq!(vim_key(VimMode::Insert, ctrl_c), VimAction::Pass);
+    }
+
+    #[test]
+    fn vim_enabled_off_by_default() {
+        // With no config flag and ORIGIN_VIM unset/!="1", the layer is off.
+        // (We only assert the config-flag arm here to avoid mutating process
+        // env in a shared test binary; the env arm is exercised via the OR.)
+        assert!(!vim_enabled(false) || std::env::var("ORIGIN_VIM").as_deref() == Ok("1"));
+        assert!(vim_enabled(true));
     }
 }
 

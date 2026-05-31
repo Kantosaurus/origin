@@ -16,6 +16,7 @@ fn anthropic_encoded_request_uses_16384_max_tokens() {
         model: "claude-test".into(),
         tools: vec![],
         effort: None,
+        thinking_tokens: None,
         attachments: Vec::new(),
     };
     let body = encode_request_for_test(&req);

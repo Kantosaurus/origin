@@ -18,9 +18,16 @@ otel = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk"]
 prometheus = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
+# The workspace deps already enable `trace` on `opentelemetry` and the
+# `grpc-tonic`/`metrics` features on `opentelemetry-otlp` + `opentelemetry_sdk`.
+# We additionally request the `trace` feature on the OTLP exporter and the SDK
+# (unioned with the workspace definition) so the span/OTLP export path compiles.
+# Every transitive dep this activates (rand, async-trait, percent-encoding,
+# opentelemetry-proto/trace) is already in Cargo.lock, so no NEW external crate
+# enters the build graph.
 opentelemetry = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true, features = ["trace"] }
+opentelemetry_sdk = { workspace = true, optional = true, features = ["trace"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

@@ -218,6 +218,7 @@ impl Verifier for ScriptedVerifier<'_> {
             model: "claude-haiku-4-5".into(),
             tools: Vec::new(),
             effort: None,
+            thinking_tokens: None,
             attachments: Vec::new(),
         };
         let resp = self

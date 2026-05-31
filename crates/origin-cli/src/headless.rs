@@ -40,6 +40,14 @@ pub struct RunArgs {
     pub model: Option<String>,
     /// Reasoning-effort token.
     pub effort: Option<String>,
+    /// Extended-thinking budget in tokens (aider `--thinking-tokens`), already
+    /// validated (`> 0`) and merged with the startup seed by the dispatcher.
+    /// `None` ⇒ wire unchanged. Only the Anthropic provider honours it.
+    pub thinking_tokens: Option<u32>,
+    /// Ad-hoc model alias definitions from repeated `--alias name=target`. Merged
+    /// on top of the config `[aliases]` table; resolution runs before the prompt
+    /// is sent. Empty ⇒ config-only resolution (or pass-through).
+    pub aliases: Vec<String>,
     /// Files to attach as multimodal context.
     pub attach: Vec<String>,
     /// Stdout contract: `text` | `json` | `stream-json`.
@@ -123,6 +131,8 @@ pub async fn run(args: RunArgs) -> Result<()> {
         bearer,
         model,
         effort,
+        thinking_tokens,
+        aliases,
         attach,
         output_format,
         json_schema,
@@ -132,8 +142,12 @@ pub async fn run(args: RunArgs) -> Result<()> {
     let _ = bearer;
 
     let fmt = OutputFormat::resolve(json, output_format.as_deref())?;
-    let model =
+    let raw_model =
         model.unwrap_or_else(|| std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".into()));
+    // Resolve the requested model against the merged alias map (config
+    // `[aliases]` + ad-hoc `--alias`). Undefined alias / literal id ⇒
+    // pass-through (byte-identical to no aliases).
+    let model = resolve_run_model(&raw_model, &aliases)?;
     let attachments = encode_attachments(&attach)?;
 
     let mut conn = match remote {
@@ -152,7 +166,17 @@ pub async fn run(args: RunArgs) -> Result<()> {
     };
 
     if let Some(schema_path) = json_schema {
-        return run_structured(&mut conn, &text, &model, effort, attachments, roots, &schema_path).await;
+        return run_structured(
+            &mut conn,
+            &text,
+            &model,
+            effort,
+            thinking_tokens,
+            attachments,
+            roots,
+            &schema_path,
+        )
+        .await;
     }
 
     // Plain (non-schema) path. Attachments ride on the single turn.
@@ -167,6 +191,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         user_text: text,
         session_id: None,
         effort,
+        thinking_tokens,
         attachments,
         read_only: false,
         roots,
@@ -188,6 +213,7 @@ async fn run_structured(
     text: &str,
     model: &str,
     effort: Option<String>,
+    thinking_tokens: Option<u32>,
     attachments: Vec<origin_multimodal::ContentBlock>,
     roots: Vec<String>,
     schema_path: &str,
@@ -211,6 +237,7 @@ async fn run_structured(
             user_text: user_text.clone(),
             session_id: None,
             effort: effort.clone(),
+            thinking_tokens,
             // Attachments only matter on the first attempt's content.
             attachments: if attempt == 0 {
                 attachments.clone()
@@ -318,6 +345,29 @@ async fn drive_turn(conn: &mut Conn, prompt: PromptRequest, emit: Emit) -> Resul
         break;
     }
     Ok(acc)
+}
+
+/// Resolve a requested model id against the merged alias map for `origin run`.
+///
+/// The config `[aliases]` table (if any) is loaded and merged with the ad-hoc
+/// `--alias name=target` specs (ad-hoc wins on collision), then [`crate::config::resolve_alias`]
+/// substitutes the target. An undefined alias — or any literal model id — passes
+/// through unchanged, so the pre-alias behaviour is byte-identical. A config
+/// read failure is non-fatal (treated as no config aliases); only a malformed
+/// `--alias` spec is a hard error.
+///
+/// # Errors
+/// Returns an error when a `--alias` spec is malformed (missing `=`, empty name,
+/// or empty target).
+fn resolve_run_model(raw_model: &str, alias_specs: &[String]) -> Result<String> {
+    let base = crate::config::load()
+        .ok()
+        .flatten()
+        .map(|c| c.aliases)
+        .unwrap_or_default();
+    let merged = crate::config::merge_alias_specs(&base, alias_specs)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(crate::config::resolve_alias(&merged, raw_model))
 }
 
 /// Read each path and encode it into an `origin_multimodal::ContentBlock`.

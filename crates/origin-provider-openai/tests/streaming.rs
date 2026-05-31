@@ -49,6 +49,7 @@ async fn openai_streams_text_then_turn_end() {
                 model: "gpt-4o".into(),
                 tools: vec![],
                 effort: None,
+                thinking_tokens: None,
                 attachments: Vec::new(),
             },
             &r,

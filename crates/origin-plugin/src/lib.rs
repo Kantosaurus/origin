@@ -419,6 +419,149 @@ fn collect_from(
     Ok(())
 }
 
+/// Candidate manifest file names, tried in order, when validating a directory.
+pub const MANIFEST_NAMES: [&str; 2] = ["plugin.toml", "manifest.toml"];
+
+/// Validates the plugin manifest at `path` and returns the parsed [`Manifest`].
+///
+/// `path` may point either directly at a manifest file or at a plugin directory
+/// containing one of [`MANIFEST_NAMES`]. A manifest is considered valid when it
+/// parses cleanly and declares a non-empty `name` (the install destination is
+/// derived from it). Unknown keys remain tolerated, matching [`parse_manifest`].
+///
+/// # Errors
+///
+/// Returns [`PluginError::Io`] if no manifest file can be read at `path` and
+/// [`PluginError::Toml`] if the manifest is malformed or omits `name`.
+pub fn validate_manifest_at(path: &std::path::Path) -> Result<Manifest, PluginError> {
+    let src = read_manifest_source(path)?;
+    let manifest = parse_manifest(&src)?;
+    if manifest.name.trim().is_empty() {
+        return Err(PluginError::Toml(
+            "manifest is missing a non-empty `name`".to_owned(),
+        ));
+    }
+    Ok(manifest)
+}
+
+/// `true` when `name` is a single, filesystem-safe path component suitable for
+/// joining onto the plugins root. Guards `install_into` against path traversal
+/// from a hostile bundle manifest (`..`, `/`, `\\`, absolute paths, NUL, leading
+/// dot). Mirrors the conservative character set used for crate-style names.
+fn is_safe_plugin_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Reads manifest source from a file path or a directory containing a manifest.
+fn read_manifest_source(path: &std::path::Path) -> Result<String, PluginError> {
+    if path.is_file() {
+        return std::fs::read_to_string(path).map_err(|e| PluginError::Io(e.to_string()));
+    }
+    if path.is_dir() {
+        for name in MANIFEST_NAMES {
+            let candidate = path.join(name);
+            if candidate.is_file() {
+                return std::fs::read_to_string(&candidate)
+                    .map_err(|e| PluginError::Io(e.to_string()));
+            }
+        }
+        return Err(PluginError::Io(format!(
+            "no plugin manifest ({}) found in {}",
+            MANIFEST_NAMES.join(" or "),
+            path.display()
+        )));
+    }
+    Err(PluginError::Io(format!("path not found: {}", path.display())))
+}
+
+/// Installs the plugin bundle at `src` into `plugins_root/<manifest name>`.
+///
+/// The source directory tree is copied verbatim (its `.git` directory, if any,
+/// is skipped) into a destination named after the validated manifest. Any
+/// pre-existing destination is removed first, so re-installing overwrites
+/// cleanly and the operation is idempotent. On manifest-validation failure the
+/// partially-copied destination is removed before the error is returned, so a
+/// failed install never leaves a half-written plugin behind.
+///
+/// Returns the validated [`Manifest`] together with the destination path.
+///
+/// # Errors
+///
+/// Returns [`PluginError::Io`] on any filesystem failure and the manifest error
+/// from [`validate_manifest_at`] when the copied bundle has no valid manifest.
+pub fn install_into(
+    src: &std::path::Path,
+    plugins_root: &std::path::Path,
+) -> Result<(Manifest, std::path::PathBuf), PluginError> {
+    // Validate before copying so a clearly-broken source fails fast and we do
+    // not derive a destination name from a missing manifest.
+    let manifest = validate_manifest_at(src)?;
+    // SECURITY: the destination dir name is derived from the (untrusted) bundle
+    // manifest and is then `remove_dir_all`/`create_dir_all`/copied into. Reject
+    // any name that is not a single safe path component so a hostile manifest
+    // (`name = "../.."`, an absolute path, …) cannot traverse out of the plugins
+    // root and delete or overwrite arbitrary files.
+    let name = manifest.name.trim();
+    if !is_safe_plugin_name(name) {
+        return Err(PluginError::Toml(format!(
+            "manifest `name` must be a simple identifier ([A-Za-z0-9_-], no path separators or leading dot, <=64 chars); got {name:?}"
+        )));
+    }
+    let dest = plugins_root.join(name);
+    // Defense-in-depth: the destination must be a direct child of the plugins
+    // root, even if the name check above ever regresses.
+    if dest.parent() != Some(plugins_root) {
+        return Err(PluginError::Io(
+            "refusing to install outside the plugins root".to_owned(),
+        ));
+    }
+
+    // Idempotent overwrite: clear any prior install at the destination.
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest).map_err(|e| PluginError::Io(e.to_string()))?;
+    }
+    std::fs::create_dir_all(&dest).map_err(|e| PluginError::Io(e.to_string()))?;
+
+    // Copy the tree, then re-validate at the destination as a defensive check.
+    if let Err(e) = copy_tree(src, &dest) {
+        std::fs::remove_dir_all(&dest).ok();
+        return Err(e);
+    }
+    match validate_manifest_at(&dest) {
+        Ok(installed) => Ok((installed, dest)),
+        Err(e) => {
+            std::fs::remove_dir_all(&dest).ok();
+            Err(e)
+        }
+    }
+}
+
+/// Recursively copies the directory tree at `src` into `dest`, skipping `.git`.
+fn copy_tree(src: &std::path::Path, dest: &std::path::Path) -> Result<(), PluginError> {
+    std::fs::create_dir_all(dest).map_err(|e| PluginError::Io(e.to_string()))?;
+    let entries = std::fs::read_dir(src).map_err(|e| PluginError::Io(e.to_string()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| PluginError::Io(e.to_string()))?;
+        let file_type = entry.file_type().map_err(|e| PluginError::Io(e.to_string()))?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        if file_type.is_dir() {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            copy_tree(&from, &to)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&from, &to).map_err(|e| PluginError::Io(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
@@ -575,5 +718,140 @@ mod tests {
     fn discover_skills_tolerates_missing_roots() {
         let skills = discover_skills(&["/nonexistent/origin/plugin/root".to_owned()]).unwrap();
         assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn validate_manifest_at_accepts_wellformed_and_rejects_malformed() {
+        let root = temp_dir("validate");
+
+        // Well-formed bundle directory with a manifest file.
+        let good = root.join("good");
+        fs::create_dir_all(&good).unwrap();
+        fs::write(
+            good.join("plugin.toml"),
+            "name = \"fmt\"\nversion = \"0.1.0\"\ncommands = [\"format\"]\n",
+        )
+        .unwrap();
+        let m = validate_manifest_at(&good).unwrap();
+        assert_eq!(m.name, "fmt");
+        assert_eq!(m.commands, vec!["format"]);
+
+        // Malformed manifest: type mismatch is rejected as a Toml error.
+        let bad = root.join("bad");
+        fs::create_dir_all(&bad).unwrap();
+        fs::write(bad.join("plugin.toml"), "name = [\"oops\"]\n").unwrap();
+        assert!(matches!(
+            validate_manifest_at(&bad),
+            Err(PluginError::Toml(_))
+        ));
+
+        // Missing-name manifest is rejected even though it parses.
+        let nameless = root.join("nameless");
+        fs::create_dir_all(&nameless).unwrap();
+        fs::write(nameless.join("plugin.toml"), "version = \"1\"\n").unwrap();
+        assert!(matches!(
+            validate_manifest_at(&nameless),
+            Err(PluginError::Toml(_))
+        ));
+
+        // Directory with no manifest at all is an Io error.
+        let empty = root.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(matches!(validate_manifest_at(&empty), Err(PluginError::Io(_))));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn install_into_copies_local_bundle_and_is_idempotent() {
+        let root = temp_dir("install");
+        let src = root.join("src-bundle");
+        let nested = src.join("commands");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            src.join("plugin.toml"),
+            "name = \"demo\"\nversion = \"2.0\"\nagents = [\"a\", \"b\"]\n",
+        )
+        .unwrap();
+        fs::write(nested.join("hello.md"), "# hello").unwrap();
+        // A .git directory must not be copied into the install.
+        let git = src.join(".git");
+        fs::create_dir_all(&git).unwrap();
+        fs::write(git.join("config"), "[core]").unwrap();
+
+        let plugins_root = root.join("plugins");
+        let (manifest, dest) = install_into(&src, &plugins_root).unwrap();
+        assert_eq!(manifest.name, "demo");
+        assert_eq!(manifest.agents, vec!["a", "b"]);
+        assert_eq!(dest, plugins_root.join("demo"));
+        assert!(dest.join("plugin.toml").is_file());
+        assert!(dest.join("commands").join("hello.md").is_file());
+        assert!(!dest.join(".git").exists());
+
+        // Re-installing overwrites cleanly: a stale file from a prior install is
+        // gone after a fresh install.
+        fs::write(dest.join("stale.txt"), "old").unwrap();
+        let (again, dest2) = install_into(&src, &plugins_root).unwrap();
+        assert_eq!(again.name, "demo");
+        assert_eq!(dest2, dest);
+        assert!(!dest.join("stale.txt").exists());
+        assert!(dest.join("plugin.toml").is_file());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn install_into_rejects_invalid_manifest_without_leaving_dir() {
+        let root = temp_dir("install-bad");
+        let src = root.join("bad-bundle");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("plugin.toml"), "commands = \"not-an-array\"\n").unwrap();
+
+        let plugins_root = root.join("plugins");
+        let err = install_into(&src, &plugins_root).unwrap_err();
+        assert!(matches!(err, PluginError::Toml(_)));
+        // Fast-fail before any destination is created.
+        assert!(!plugins_root.join("bad-bundle").exists());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn install_into_rejects_path_traversal_name() {
+        // SECURITY regression: a hostile bundle manifest whose `name` tries to
+        // escape the plugins root must be rejected before any filesystem side
+        // effect, so it cannot delete/overwrite arbitrary files.
+        let root = temp_dir("install-traversal");
+        let src = root.join("evil-bundle");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("plugin.toml"),
+            "name = \"../../etc\"\nversion = \"1.0\"\n",
+        )
+        .unwrap();
+        let plugins_root = root.join("plugins");
+        fs::create_dir_all(&plugins_root).unwrap();
+
+        let err = install_into(&src, &plugins_root).unwrap_err();
+        assert!(matches!(err, PluginError::Toml(_)), "traversal name must be rejected");
+        // The plugins root is untouched — nothing created or removed.
+        assert!(
+            plugins_root.read_dir().unwrap().next().is_none(),
+            "plugins root must stay empty after a rejected traversal install"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn is_safe_plugin_name_accepts_simple_rejects_dangerous() {
+        assert!(is_safe_plugin_name("demo"));
+        assert!(is_safe_plugin_name("my-plugin_2"));
+        assert!(!is_safe_plugin_name(""));
+        assert!(!is_safe_plugin_name("../etc"));
+        assert!(!is_safe_plugin_name("a/b"));
+        assert!(!is_safe_plugin_name("a\\b"));
+        assert!(!is_safe_plugin_name(".hidden"));
+        assert!(!is_safe_plugin_name("has space"));
     }
 }

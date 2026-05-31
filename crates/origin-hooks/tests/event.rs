@@ -50,6 +50,19 @@ fn every_event_kind_serializes() {
         },
         LifecycleEvent::SessionStart,
         LifecycleEvent::SessionEnd,
+        LifecycleEvent::MessageDisplay {
+            text: "hello".into(),
+        },
+        LifecycleEvent::BeforeModel {
+            model: "claude".into(),
+        },
+        LifecycleEvent::AfterModel {
+            model: "claude".into(),
+        },
+        LifecycleEvent::PreCompress { current_bytes: 4096 },
+        LifecycleEvent::Notification {
+            message: "turn complete".into(),
+        },
     ];
     for ev in evs {
         let json = serde_json::to_string(&ev).expect("ser");
@@ -83,4 +96,34 @@ fn empty_stdout_means_passthrough() {
 #[test]
 fn rejects_malformed_json() {
     assert!(parse_hook_stdout(b"{not json}").is_err());
+}
+
+#[test]
+fn new_events_serialize_with_expected_tags() {
+    let before = serde_json::to_string(&LifecycleEvent::BeforeModel {
+        model: "claude".into(),
+    })
+    .expect("ser");
+    assert!(before.contains("\"kind\":\"before_model\""), "got {before}");
+
+    let pre = serde_json::to_string(&LifecycleEvent::PreCompress { current_bytes: 9 }).expect("ser");
+    assert!(pre.contains("\"kind\":\"pre_compress\""), "got {pre}");
+
+    let note = serde_json::to_string(&LifecycleEvent::Notification {
+        message: "done".into(),
+    })
+    .expect("ser");
+    assert!(note.contains("\"kind\":\"notification\""), "got {note}");
+}
+
+#[test]
+fn override_round_trips_independent_of_event() {
+    // A hook's stdout override is parsed independent of which event triggered
+    // it, so a `Mutate` verdict from an `AfterModel`/`Notification` hook
+    // decodes the same as from any other event.
+    let stdout = br#"{"override":{"action":"mutate","patch":"redacted"}}"#;
+    match parse_hook_stdout(stdout).expect("parse") {
+        HookOverride::Mutate { patch } => assert_eq!(patch, "redacted"),
+        other => panic!("wrong variant: {other:?}"),
+    }
 }

@@ -11,6 +11,7 @@ fn resp(status: Option<u16>, html: &str, title: &str) -> SnapshotResp {
         status,
         title: Some(title.into()),
         error: None,
+        console: None,
     }
 }
 

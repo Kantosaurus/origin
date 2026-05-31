@@ -49,9 +49,11 @@ origin-skills   = { path = "../origin-skills" }
 origin-tools    = { path = "../origin-tools" }
 origin-goal     = { path = "../origin-goal" }
 origin-cost     = { path = "../origin-cost" }
+origin-router   = { path = "../origin-router" }
 origin-doctor   = { path = "../origin-doctor" }
 origin-mermaid  = { path = "../origin-mermaid" }
 origin-knowledge = { path = "../origin-knowledge" }
+origin-mem      = { path = "../origin-mem" }
 origin-schedule = { path = "../origin-schedule" }
 origin-export   = { path = "../origin-export" }
 origin-i18n     = { path = "../origin-i18n" }
@@ -64,9 +66,13 @@ origin-websearch = { path = "../origin-websearch" }
 origin-plugin   = { path = "../origin-plugin" }
 origin-modeldiscovery = { path = "../origin-modeldiscovery" }
 origin-outputstyle = { path = "../origin-outputstyle" }
+origin-hooks    = { path = "../origin-hooks" }
 origin-steering = { path = "../origin-steering" }
 origin-lspfleet = { path = "../origin-lspfleet" }
 origin-ambient  = { path = "../origin-ambient" }
+origin-bench    = { path = "../origin-bench" }
+origin-review   = { path = "../origin-review" }
+origin-notify   = { path = "../origin-notify" }
 origin-multimodal = { path = "../origin-multimodal" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 which = "8"

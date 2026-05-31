@@ -19,6 +19,13 @@ pub struct Cli {
     /// [`crate::effort::ReasoningEffort::parse_level`] at the call site.
     #[arg(long)]
     pub effort: Option<String>,
+    /// Extended-thinking budget in tokens for the session (Anthropic). Seeds the
+    /// session so every prompt carries it. Defaults to unset, leaving the
+    /// provider wire byte-identical. `0` is rejected. Only the Anthropic
+    /// provider honours it; other providers ignore it. *Closes: aider
+    /// `--thinking-tokens`.*
+    #[arg(long = "thinking-tokens")]
+    pub thinking_tokens: Option<u32>,
     /// Extra workspace root the agent may read/edit across (repeatable, cline
     /// multi-root). Applies to the interactive session; for `origin run` use the
     /// `Run`-level `--root`.
@@ -62,6 +69,18 @@ pub enum Cmd {
         /// effort wire; unknown values leave the wire unchanged.
         #[arg(long)]
         effort: Option<String>,
+        /// Extended-thinking budget in tokens for this turn (Anthropic). When
+        /// omitted, falls back to the global `--thinking-tokens`. `0` is
+        /// rejected. Only the Anthropic provider honours it. *Closes: aider
+        /// `--thinking-tokens`.*
+        #[arg(long = "thinking-tokens")]
+        thinking_tokens: Option<u32>,
+        /// Define an ad-hoc model alias for this invocation, as
+        /// `name=provider/model` (or `name=bare-model-id`). Repeatable. Resolved
+        /// before the prompt is sent, in addition to any `[aliases]` table in
+        /// `~/.origin/config.toml`. Ad-hoc aliases take precedence over config.
+        #[arg(long = "alias")]
+        alias: Vec<String>,
         /// Attach an image or PDF as multimodal context (repeatable). Each
         /// file is classified and base64/text-encoded into the first user turn.
         #[arg(long = "attach")]
@@ -122,6 +141,18 @@ pub enum Cmd {
     },
     /// Import a session/skill set from another harness (P14.B.7).
     Import(crate::import::ImportArgs),
+    /// Cross-harness *live resume*: reconstruct a foreign harness's transcript
+    /// (Claude Code / jcode / opencode) into a brand-new resumable origin
+    /// session, then continue it with `origin sessions resume <id>`. Unlike
+    /// `origin import` (which only stores history), this hydrates a session you
+    /// can keep talking to. *Closes: jcode L227.*
+    ResumeForeign {
+        /// Originating harness: `claude-code` | `jcode` | `opencode` (aliases
+        /// `claude`/`cc`/`oc` are also accepted).
+        source: String,
+        /// Path to the external session file or harness root directory.
+        path: String,
+    },
     /// List and describe known providers from the builtin catalog.
     Providers {
         #[command(subcommand)]
@@ -253,6 +284,37 @@ pub enum Cmd {
         #[command(subcommand)]
         sub: AmbientSub,
     },
+    /// Run the origin-bench reliability harness and emit the multi-sample
+    /// report (pass@k / pass^k / flakiness + a failure histogram).
+    ///
+    /// Default (live) path: the bench task set is run `--samples` times per
+    /// task through the offline-capable subprocess runner. With
+    /// `--from <results.json>` a recorded `TaskResult` array is grouped into
+    /// per-task samples and rendered instead — no provider/daemon needed.
+    Bench {
+        /// Number of independent runs collected per task; also the `k` used for
+        /// the `pass@k` / `pass^k` columns. Capped to keep work bounded.
+        #[arg(long, default_value_t = 1)]
+        samples: u32,
+        /// Emit the report as JSON instead of Markdown.
+        #[arg(long)]
+        json: bool,
+        /// Compute the report from a recorded `TaskResult` JSON array at this
+        /// path (offline) instead of running the task set live.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Confidence-scored, multi-dimension review of the working-tree diff vs
+    /// `HEAD`. Runs fully local static heuristics through `origin-review`'s
+    /// confidence dedup + strictness filter and prints a deduped report
+    /// (claude-code multi-agent confidence-scored review, local half).
+    Review {
+        /// How aggressively to surface findings: `strict` (high-confidence
+        /// only), `balanced` (default), or `lenient` (surface almost
+        /// everything).
+        #[arg(long, default_value = "balanced")]
+        strictness: String,
+    },
 }
 
 /// `origin ambient …` subcommands.
@@ -287,6 +349,11 @@ pub enum PluginSub {
     Info {
         /// Path to a plugin manifest TOML file.
         manifest: String,
+    },
+    /// Install a plugin bundle from a local path or git URL into ~/.origin/plugins/.
+    Install {
+        /// Local directory path or git URL (http(s)/git/ssh) of the bundle.
+        source: String,
     },
 }
 
