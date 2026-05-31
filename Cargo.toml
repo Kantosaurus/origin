@@ -34,7 +34,7 @@ parquet = { version = "53", default-features = false, features = ["arrow", "snap
 jsonschema = { version = "0.18", default-features = false }
 prometheus = { version = "0.13", default-features = false }
 opentelemetry = { version = "0.24", default-features = false, features = ["trace", "metrics"] }
-opentelemetry-otlp = { version = "0.17", default-features = false, features = ["grpc-tonic", "metrics"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "metrics"] }
 opentelemetry_sdk = { version = "0.24", default-features = false, features = ["metrics", "rt-tokio"] }
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
