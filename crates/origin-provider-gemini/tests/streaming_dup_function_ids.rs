@@ -62,6 +62,7 @@ async fn duplicate_function_name_yields_distinct_ids() {
                 model: "gemini-2.0-flash".into(),
                 tools: vec![],
                 effort: None,
+                thinking_tokens: None,
                 attachments: Vec::new(),
             },
             &r,

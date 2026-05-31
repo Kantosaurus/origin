@@ -31,15 +31,19 @@
 
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::event::LifecycleEvent;
 use crate::shellpool::ShellSpec;
 
-/// The kind of lifecycle event a hook subscribes to. Serialized form matches the
-/// `snake_case` tag of [`LifecycleEvent`](crate::event::LifecycleEvent).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// The kind of lifecycle event a hook subscribes to.
+///
+/// The canonical serialized form is the `snake_case` tag of
+/// [`LifecycleEvent`](crate::event::LifecycleEvent). For drop-in compatibility
+/// with a Claude `hooks.json`, [`HookEventKind::from_label`] also accepts the
+/// Claude event names (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`,
+/// `PreCompact`, `Notification`, …) as aliases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HookEventKind {
     /// Before a user prompt is processed.
     PrePrompt,
@@ -59,6 +63,57 @@ pub enum HookEventKind {
     SessionEnd,
     /// Before an assistant message is displayed (transform/hide capable).
     MessageDisplay,
+    /// Just before the provider model call for a turn (informational).
+    BeforeModel,
+    /// Just after the provider model call returns (informational).
+    AfterModel,
+    /// Just before transcript compaction runs (informational).
+    PreCompress,
+    /// A side-band notification (informational).
+    Notification,
+}
+
+impl HookEventKind {
+    /// Parse an event-kind label, accepting both the canonical origin
+    /// `snake_case` names and Claude-compatible aliases.
+    ///
+    /// Matching is case-insensitive and ignores surrounding whitespace, so a
+    /// Claude `hooks.json` (which uses names like `PreToolUse`) loads unchanged.
+    /// Returns `None` for an unrecognised label.
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        // Each arm lists the canonical origin `snake_case` name first, then any
+        // Claude-compat aliases that map onto the same kind, so a Claude
+        // `hooks.json` loads unchanged.
+        match label.trim().to_ascii_lowercase().as_str() {
+            "pre_prompt" | "userpromptsubmit" => Some(Self::PrePrompt),
+            "post_prompt" | "stop" => Some(Self::PostPrompt),
+            "pre_tool" | "pretooluse" => Some(Self::PreTool),
+            "post_tool" | "posttooluse" => Some(Self::PostTool),
+            "pre_commit" => Some(Self::PreCommit),
+            "post_commit" => Some(Self::PostCommit),
+            "session_start" | "sessionstart" => Some(Self::SessionStart),
+            "session_end" | "sessionend" => Some(Self::SessionEnd),
+            "message_display" => Some(Self::MessageDisplay),
+            "before_model" => Some(Self::BeforeModel),
+            "after_model" => Some(Self::AfterModel),
+            "pre_compress" | "precompact" => Some(Self::PreCompress),
+            "notification" => Some(Self::Notification),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for HookEventKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let label = String::deserialize(deserializer)?;
+        Self::from_label(&label).ok_or_else(|| {
+            serde::de::Error::custom(format!("unknown hook event kind `{label}`"))
+        })
+    }
 }
 
 impl LifecycleEvent {
@@ -75,6 +130,10 @@ impl LifecycleEvent {
             Self::SessionStart => HookEventKind::SessionStart,
             Self::SessionEnd => HookEventKind::SessionEnd,
             Self::MessageDisplay { .. } => HookEventKind::MessageDisplay,
+            Self::BeforeModel { .. } => HookEventKind::BeforeModel,
+            Self::AfterModel { .. } => HookEventKind::AfterModel,
+            Self::PreCompress { .. } => HookEventKind::PreCompress,
+            Self::Notification { .. } => HookEventKind::Notification,
         }
     }
 }
@@ -253,5 +312,68 @@ mod tests {
             LifecycleEvent::PrePrompt { text: String::new() }.kind(),
             HookEventKind::PrePrompt
         );
+        assert_eq!(
+            LifecycleEvent::BeforeModel { model: String::new() }.kind(),
+            HookEventKind::BeforeModel
+        );
+        assert_eq!(
+            LifecycleEvent::AfterModel { model: String::new() }.kind(),
+            HookEventKind::AfterModel
+        );
+        assert_eq!(
+            LifecycleEvent::PreCompress { current_bytes: 0 }.kind(),
+            HookEventKind::PreCompress
+        );
+        assert_eq!(
+            LifecycleEvent::Notification { message: String::new() }.kind(),
+            HookEventKind::Notification
+        );
+    }
+
+    #[test]
+    fn from_label_accepts_canonical_origin_names() {
+        assert_eq!(HookEventKind::from_label("pre_tool"), Some(HookEventKind::PreTool));
+        assert_eq!(
+            HookEventKind::from_label("message_display"),
+            Some(HookEventKind::MessageDisplay)
+        );
+        assert_eq!(HookEventKind::from_label("before_model"), Some(HookEventKind::BeforeModel));
+        assert_eq!(HookEventKind::from_label("pre_compress"), Some(HookEventKind::PreCompress));
+        assert_eq!(HookEventKind::from_label("nope"), None);
+    }
+
+    #[test]
+    fn from_label_accepts_claude_aliases() {
+        // Claude event names map onto the equivalent origin event kinds.
+        assert_eq!(HookEventKind::from_label("PreToolUse"), Some(HookEventKind::PreTool));
+        assert_eq!(HookEventKind::from_label("PostToolUse"), Some(HookEventKind::PostTool));
+        assert_eq!(
+            HookEventKind::from_label("UserPromptSubmit"),
+            Some(HookEventKind::PrePrompt)
+        );
+        assert_eq!(HookEventKind::from_label("Stop"), Some(HookEventKind::PostPrompt));
+        assert_eq!(HookEventKind::from_label("PreCompact"), Some(HookEventKind::PreCompress));
+        assert_eq!(
+            HookEventKind::from_label("Notification"),
+            Some(HookEventKind::Notification)
+        );
+        // Case- and whitespace-insensitive.
+        assert_eq!(HookEventKind::from_label("  pretooluse "), Some(HookEventKind::PreTool));
+    }
+
+    #[test]
+    fn config_parses_claude_event_names() {
+        // A Claude-style hooks.json loads without rewriting event names.
+        let json = r#"{
+            "hooks": [
+                { "event": "PreToolUse", "program": "guard" },
+                { "event": "Stop", "program": "on-stop.sh" },
+                { "event": "PreCompact", "program": "on-compact.sh" }
+            ]
+        }"#;
+        let cfg = HooksConfig::from_json_str(json).unwrap();
+        assert!(cfg.has_event(HookEventKind::PreTool));
+        assert!(cfg.has_event(HookEventKind::PostPrompt));
+        assert!(cfg.has_event(HookEventKind::PreCompress));
     }
 }

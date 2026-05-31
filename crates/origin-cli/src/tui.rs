@@ -14,9 +14,10 @@ use origin_tui::widgets::plan_panel::PlanLine;
 use unicode_width::UnicodeWidthChar;
 
 use crate::autocomplete::CompletionSources;
+use crate::input::VimMode;
 use crate::status::UsageSnapshot;
 use crate::suggestions::SuggestionState;
-use crate::theme;
+use crate::theme::{self, Theme};
 
 #[derive(Debug, Clone)]
 pub struct ScrollLine {
@@ -108,6 +109,46 @@ pub fn stall_seconds(quiet: Duration, threshold: Duration) -> Option<u64> {
     }
 }
 
+/// Pure desktop-notification gate (aider L107 OS-notification parity).
+///
+/// Returns whether a turn-completion desktop notification should fire. Two
+/// inputs gate it: `enabled` (the resolved opt-in flag — `ORIGIN_NOTIFY_DESKTOP=1`
+/// or a config flag) and `succeeded` (whether the turn ended cleanly). A failed
+/// turn already surfaces an error line, so we only chime on success. Default
+/// (`enabled == false`) ⇒ `false` ⇒ no spawn ⇒ byte-identical.
+#[must_use]
+pub const fn should_notify(enabled: bool, succeeded: bool) -> bool {
+    enabled && succeeded
+}
+
+/// Whether the opt-in desktop-notification layer is active for this session.
+///
+/// True when `ORIGIN_NOTIFY_DESKTOP=1` or `config_flag` is set. Mirrors the
+/// daemon's `ORIGIN_NOTIFY` opt-in but uses a CLI-specific variable so the two
+/// surfaces can be toggled independently. Default-off ⇒ no notification.
+#[must_use]
+pub fn desktop_notify_enabled(config_flag: bool) -> bool {
+    config_flag || std::env::var("ORIGIN_NOTIFY_DESKTOP").as_deref() == Ok("1")
+}
+
+/// Fire a best-effort desktop notification for a completed turn.
+///
+/// Gated by [`should_notify`]; when it returns `false` this is a no-op (no
+/// process spawn, no observable effect). Otherwise it builds the OS-native
+/// notifier command via [`origin_notify::desktop_command`] and spawns it,
+/// swallowing every error — a missing notifier binary must never disturb the
+/// session. Returns `true` when a spawn was attempted, for tests/telemetry.
+#[must_use]
+pub fn notify_turn_complete(enabled: bool, succeeded: bool) -> bool {
+    if !should_notify(enabled, succeeded) {
+        return false;
+    }
+    let n = origin_notify::Notification::new("origin", "Turn complete", false);
+    let (program, cmd_args) = origin_notify::desktop_command(&n);
+    let _ = std::process::Command::new(program).args(cmd_args).spawn();
+    true
+}
+
 #[derive(Debug)]
 pub struct App {
     pub scrollback: Vec<ScrollLine>,
@@ -164,6 +205,61 @@ pub struct App {
     /// the startup `--root` flags and sent on every `PromptRequest`. Empty ⇒
     /// single-root behaviour.
     pub workspace_roots: Vec<String>,
+    /// Live "prompt cache went cold" state (jcode parity). Tracks the wall-clock
+    /// end of the previous turn and whether any prior turn had a warm cache, so a
+    /// new turn whose gap exceeds [`origin_cost::PROMPT_CACHE_TTL_MS`] — or whose
+    /// usage reports zero cache reads after a warm turn — flips
+    /// `cache_cold` on for that turn. Cleared on the next warm turn. Purely
+    /// additive to the status line; byte-identical when warm or unused.
+    cache_cold: CacheColdState,
+    /// Opt-in vim input mode (aider L107). [`VimMode::Insert`] is the default
+    /// and reproduces today's direct-insert composer; the caller only consults
+    /// the vim reducer when [`Self::vim_active`] is set, so a default session is
+    /// byte-identical. Toggled by the `/vim` composer command or `ORIGIN_VIM=1`.
+    pub vim_mode: VimMode,
+    /// Whether the vim layer is active this session. `false` ⇒ the vim reducer
+    /// is never consulted and input is byte-identical.
+    pub vim_active: bool,
+    /// Active color preset (aider L107). [`Theme::Default`] reproduces the
+    /// legacy "Burnished Copper" constants verbatim, so the default render path
+    /// is byte-identical; changed only by the `/theme <name>` composer command.
+    pub theme: Theme,
+    /// Opt-in desktop-notification flag (aider L107). When set, a best-effort OS
+    /// notification fires on successful turn completion via `origin-notify`.
+    /// Default `false` ⇒ no spawn ⇒ byte-identical.
+    pub notify_desktop: bool,
+}
+
+/// State backing the live cache-cold status-line nudge. All times are
+/// wall-clock milliseconds (`SystemTime` since the Unix epoch); this lives in
+/// the CLI, not a workflow, so real time is fine.
+#[derive(Debug, Default)]
+struct CacheColdState {
+    /// Wall-clock ms at which the previous turn ended, or `None` before any turn.
+    last_turn_end_ms: Option<u64>,
+    /// Wall-clock ms at which the in-flight turn started. Used to measure the
+    /// idle gap against `last_turn_end_ms`. `None` between turns.
+    turn_start_ms: Option<u64>,
+    /// Cumulative `cache_read` tokens observed at the moment the in-flight turn
+    /// started, so the turn's own cache reads can be isolated as a delta.
+    cache_read_at_start: u32,
+    /// `true` once any turn has been served from a warm cache (`cache_read > 0`).
+    /// Gates the "zero cache reads ⇒ cold" arm so a session's very first
+    /// cache-write turn is not misreported as cold.
+    had_prior_warm: bool,
+    /// Whether the *current/most-recent* turn started against a cold cache. This
+    /// is the bit the status line renders.
+    cold: bool,
+}
+
+/// Current wall-clock time in milliseconds since the Unix epoch. Saturates to
+/// `0` on the impossible pre-epoch case rather than panicking; this only feeds a
+/// best-effort idle-gap heuristic, so a degraded clock at worst suppresses the
+/// nudge.
+fn now_wallclock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 const BANNER: &[&str] = &[
@@ -198,12 +294,22 @@ impl App {
             plan_mode: false,
             pending_attachments: Vec::new(),
             workspace_roots: Vec::new(),
+            cache_cold: CacheColdState::default(),
+            vim_mode: VimMode::Insert,
+            vim_active: false,
+            theme: Theme::Default,
+            notify_desktop: false,
         }
     }
 
     /// Start the live turn timer. Called when a user submission begins.
     pub fn start_turn_timer(&mut self) {
         self.turn_started = Some(Instant::now());
+        // Snapshot the wall-clock start and the cumulative cache-read counter so
+        // `stop_turn_timer` can measure this turn's idle gap and isolate its own
+        // cache reads for the cold-cache nudge.
+        self.cache_cold.turn_start_ms = Some(now_wallclock_ms());
+        self.cache_cold.cache_read_at_start = self.usage.cache_read_input_tokens;
     }
 
     /// Stop the live timer and fold the elapsed delta into `usage.elapsed`
@@ -215,6 +321,48 @@ impl App {
         }
         // No turn in flight => no stall possible; clear any lingering notice.
         self.stall_secs = None;
+        self.evaluate_cache_cold();
+    }
+
+    /// Decide whether the just-finished turn started against a cold prompt cache
+    /// and update the live nudge state, using the real wall clock for the turn
+    /// end. Thin wrapper over [`Self::evaluate_cache_cold_at`] so the decision is
+    /// deterministically testable.
+    fn evaluate_cache_cold(&mut self) {
+        self.evaluate_cache_cold_at(now_wallclock_ms());
+    }
+
+    /// Core of the cache-cold decision with an explicit `now_ms` for the turn
+    /// end. Reuses `origin_cost::is_cache_cold` so the TUI surface and the cost
+    /// meter share one decision. Purely additive: when warm (or no turn ran) the
+    /// rendered status line is unchanged.
+    fn evaluate_cache_cold_at(&mut self, now_ms: u64) {
+        let Some(start_ms) = self.cache_cold.turn_start_ms.take() else {
+            return;
+        };
+        let turn_cache_read = self
+            .usage
+            .cache_read_input_tokens
+            .saturating_sub(self.cache_cold.cache_read_at_start);
+        let cold = origin_cost::is_cache_cold(
+            self.cache_cold.last_turn_end_ms,
+            start_ms,
+            u64::from(turn_cache_read),
+            self.cache_cold.had_prior_warm,
+        );
+        if turn_cache_read > 0 {
+            self.cache_cold.had_prior_warm = true;
+        }
+        self.cache_cold.cold = cold;
+        self.cache_cold.last_turn_end_ms = Some(now_ms);
+    }
+
+    /// Whether the most-recent turn started against a cold prompt cache — the bit
+    /// the status line renders as a brief nudge. Exposed for tests and the
+    /// renderer.
+    #[must_use]
+    pub const fn cache_cold(&self) -> bool {
+        self.cache_cold.cold
     }
 
     /// A cheap fingerprint of everything a daemon stream event can change
@@ -368,6 +516,78 @@ impl App {
         self.goal_status = status;
     }
 
+    /// Handle a `/theme <name>` composer command (aider L107 theme preset).
+    ///
+    /// On a recognised name, switches the active [`Theme`] and returns `true`;
+    /// an unknown name leaves the theme unchanged and returns `false` so the
+    /// caller can surface a usage hint. The default theme is unchanged unless
+    /// this is called, so the default render path stays byte-identical.
+    pub fn set_theme_by_name(&mut self, name: &str) -> bool {
+        Theme::parse(name).is_some_and(|t| {
+            self.theme = t;
+            true
+        })
+    }
+
+    /// The palette for the active theme — the named colors the renderer reads
+    /// when a non-default theme is in effect.
+    #[must_use]
+    pub const fn palette(&self) -> theme::Palette {
+        theme::palette(self.theme)
+    }
+
+    /// Toggle the opt-in vim input layer (aider L107), returning the new active
+    /// state. Enabling always starts in [`VimMode::Normal`] (vim convention);
+    /// disabling resets to [`VimMode::Insert`] so the composer is immediately
+    /// back to byte-identical direct insert.
+    pub fn toggle_vim(&mut self) -> bool {
+        self.vim_active = !self.vim_active;
+        self.vim_mode = if self.vim_active {
+            VimMode::Normal
+        } else {
+            VimMode::Insert
+        };
+        self.vim_active
+    }
+
+    /// Apply a [`crate::input::VimAction`] to the input buffer/cursor.
+    ///
+    /// This is the (impure) mutation the pure `vim_key` reducer feeds: mode
+    /// switches update [`Self::vim_mode`]; motions move [`Self::cursor`] within
+    /// the current buffer. Returns whether the event was consumed by the vim
+    /// layer (`false` ⇒ [`crate::input::VimAction::Pass`], so the caller runs
+    /// its normal handling). Cursor moves are clamped to the buffer; word
+    /// motions step over runs of non-whitespace.
+    pub fn apply_vim_action(&mut self, action: crate::input::VimAction) -> bool {
+        use crate::input::VimAction as A;
+        if action == A::Pass {
+            return false;
+        }
+        let len = self.input.chars().count();
+        // Resolve the action into an optional cursor target and an optional
+        // mode switch, so each effect is expressed once and clippy sees no two
+        // arms with identical bodies. `None` cursor ⇒ leave the cursor put.
+        let (cursor, mode): (Option<usize>, Option<VimMode>) = match action {
+            A::Pass => (None, None),
+            A::SwitchMode(m) => (None, Some(m)),
+            A::InsertHere | A::BeginCommand => (None, Some(VimMode::Insert)),
+            A::AppendAfter => (Some((self.cursor + 1).min(len)), Some(VimMode::Insert)),
+            A::InsertLineStart => (Some(0), Some(VimMode::Insert)),
+            A::AppendLineEnd => (Some(len), Some(VimMode::Insert)),
+            A::MoveLeft | A::MoveUp => (Some(self.cursor.saturating_sub(1)), None),
+            A::MoveRight | A::MoveDown => (Some((self.cursor + 1).min(len)), None),
+            A::LineStart | A::WordBack => (Some(0), None),
+            A::LineEnd | A::WordForward => (Some(len), None),
+        };
+        if let Some(c) = cursor {
+            self.cursor = c;
+        }
+        if let Some(m) = mode {
+            self.vim_mode = m;
+        }
+        true
+    }
+
     pub fn add_tool_line(&mut self, text: String) {
         self.scrollback
             .push(ScrollLine::styled(text, theme::TOOL, 0, false));
@@ -384,8 +604,42 @@ impl App {
         self.scroll_offset = 0;
     }
 
-    pub fn finalize_assistant_turn(&mut self, _turns: u32) {
-        if let Some(text) = self.current_assistant.take() {
+    /// The text buffered for the in-flight assistant turn, if any.
+    ///
+    /// Lets the caller fire the (async) `MessageDisplay` shell hook on the
+    /// rendered text *before* it acquires the `App` lock and calls
+    /// [`finalize_assistant_turn`](Self::finalize_assistant_turn), passing the
+    /// resulting action in. `None` ⇒ no turn buffered ⇒ nothing to render.
+    #[must_use]
+    pub fn current_assistant_text(&self) -> Option<&str> {
+        self.current_assistant.as_deref()
+    }
+
+    /// Flush the buffered assistant turn into scrollback.
+    ///
+    /// No `MessageDisplay` hook action: equivalent to
+    /// [`finalize_assistant_turn_with_action`](Self::finalize_assistant_turn_with_action)
+    /// with `None`, so the active output style alone decides the render.
+    pub fn finalize_assistant_turn(&mut self, turns: u32) {
+        self.finalize_assistant_turn_with_action(turns, None);
+    }
+
+    pub fn finalize_assistant_turn_with_action(
+        &mut self,
+        _turns: u32,
+        hook_action: Option<&origin_outputstyle::DisplayAction>,
+    ) {
+        if let Some(raw) = self.current_assistant.take() {
+            // claude-code MessageDisplay: a `MessageDisplay` shell hook (when one
+            // fired and returned an action) decides the rendered text outright;
+            // otherwise the active output style may rewrite or hide it. No hook
+            // *and* no style (or the default) ⇒ identity ⇒ `Some(raw)` unchanged,
+            // so rendering is byte-identical. `None` suppresses the message.
+            let Some(text) =
+                origin_outputstyle::resolve_display(&raw, self.output_style, hook_action)
+            else {
+                return;
+            };
             if !text.is_empty() {
                 let mut in_code_block = false;
                 for line in text.split('\n') {
@@ -407,6 +661,13 @@ impl App {
                             theme::CODE_BG,
                             false,
                         ));
+                    } else if let Some(task) = crate::markdown_tasks::render_gfm_task_line(line) {
+                        // claude-code L147 (GFM task-list rendering): `- [ ]` /
+                        // `- [x]` lines render with a checkbox glyph. Pure
+                        // fall-through: non-task lines yield `None` and keep the
+                        // byte-identical default styling below.
+                        self.scrollback
+                            .push(ScrollLine::styled(format!("  {task}"), theme::BODY, 0, false));
                     } else {
                         let (fg, bold) = md_line_style(line);
                         self.scrollback
@@ -418,6 +679,12 @@ impl App {
                 self.scrollback
                     .push(ScrollLine::styled(String::new(), 0, 0, false));
             }
+            // aider L107 OS-notification: best-effort desktop chime on turn
+            // completion. Gated by the opt-in flag (default-off ⇒ no spawn ⇒
+            // byte-identical) and best-effort — a missing notifier never
+            // disturbs the session. `succeeded == true`: reaching this arm means
+            // the turn produced a (possibly empty-rendered) assistant reply.
+            let _ = notify_turn_complete(self.notify_desktop, true);
         }
     }
 
@@ -643,12 +910,21 @@ impl App {
             let tok_in = format_tokens(self.usage.input_tokens);
             let tok_out = format_tokens(self.usage.output_tokens);
 
+            // Brief, non-intrusive cache-cold nudge (jcode parity). Empty when
+            // the cache is warm or no turn has run, so the line is byte-identical
+            // in the common case. `⧗` (U+29D7) reads as a "stale hourglass".
+            let cold_marker = if self.cache_cold.cold {
+                " \u{00B7} \u{29D7} cache cold"
+            } else {
+                ""
+            };
+
             let (prefix, status) = if self.spinner.active {
                 let sc = self.spinner.frame_char();
                 (
                     Some(sc),
                     format!(
-                        "{sc} {} \u{00B7} {} \u{00B7} {tok_in}\u{2191} {tok_out}\u{2193} \u{00B7} ${cost:.3} \u{00B7} {secs:.1}s",
+                        "{sc} {} \u{00B7} {} \u{00B7} {tok_in}\u{2191} {tok_out}\u{2193} \u{00B7} ${cost:.3} \u{00B7} {secs:.1}s{cold_marker}",
                         self.workflow, self.usage.model,
                     ),
                 )
@@ -656,7 +932,7 @@ impl App {
                 (
                     None,
                     format!(
-                        "{} \u{00B7} {} \u{00B7} {tok_in}\u{2191} {tok_out}\u{2193} \u{00B7} ${cost:.3} \u{00B7} {secs:.1}s",
+                        "{} \u{00B7} {} \u{00B7} {tok_in}\u{2191} {tok_out}\u{2193} \u{00B7} ${cost:.3} \u{00B7} {secs:.1}s{cold_marker}",
                         self.workflow, self.usage.model,
                     ),
                 )
@@ -694,6 +970,25 @@ impl App {
                         c,
                         Cell::new(ch, theme::ACCENT, theme::SURFACE_RAISED, Attr::BOLD),
                     );
+                }
+            }
+            // Overpaint the cache-cold nudge in a gentle yellow so it reads as a
+            // hint rather than an error. Skipped entirely when warm (the marker
+            // is empty and `find` yields `None`).
+            if self.cache_cold.cold {
+                if let Some(pos) = status.find('\u{29D7}') {
+                    let display_col = char_display_width(&status[..pos]);
+                    for (i, ch) in status[pos..].chars().enumerate() {
+                        let c = layout.cs + display_col + clamp_u16(i);
+                        if c >= layout.cr {
+                            break;
+                        }
+                        main.put(
+                            layout.r_status,
+                            c,
+                            Cell::new(ch, theme::YELLOW, theme::SURFACE_RAISED, Attr::PLAIN),
+                        );
+                    }
                 }
             }
         }
@@ -941,8 +1236,13 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
         Cell::new('\u{251C}', theme::BORDER, theme::PANEL_BG, Attr::PLAIN),
     );
 
+    // cline L171: render the plan as a live focus-chain checkbox todo list.
+    // The checkbox marker (`[ ]`/`[~]`/`[x]`) carries the GFM-style state; the
+    // existing status glyph stays as a colored leading dot so progress reads at
+    // a glance.
+    let checklist = render_focus_chain(plan_lines);
     let mut row: u16 = 2;
-    for pl in plan_lines {
+    for (pl, checkbox) in plan_lines.iter().zip(&checklist) {
         if row >= rows {
             break;
         }
@@ -962,7 +1262,7 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
             side,
             row,
             4,
-            &pl.content,
+            checkbox,
             cols.saturating_sub(4),
             Style {
                 fg: theme::BODY,
@@ -972,6 +1272,76 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
         );
         row += 1;
     }
+}
+
+/// Checkbox state for one focus-chain row, derived from a plan step's status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskState {
+    /// Not started.
+    Pending,
+    /// Currently being worked.
+    InProgress,
+    /// Complete (or cancelled — both render as a filled box).
+    Done,
+}
+
+impl TaskState {
+    /// GFM-style three-state checkbox marker for this row.
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::Pending => "[ ]",
+            Self::InProgress => "[~]",
+            Self::Done => "[x]",
+        }
+    }
+}
+
+/// Map a plan-panel status glyph (`○`/`◐`/`●`/`✕`) to a checkbox state.
+///
+/// Mirrors `origin_tui::widgets::plan_panel::status_glyph`: pending is open,
+/// in-progress is half, done and cancelled are filled. Unknown glyphs are
+/// treated as pending so a future status never panics the renderer.
+const fn task_state_for_glyph(glyph: char) -> TaskState {
+    match glyph {
+        '\u{25D0}' => TaskState::InProgress,
+        '\u{25CF}' | '\u{2715}' => TaskState::Done,
+        _ => TaskState::Pending,
+    }
+}
+
+/// Render the active plan as a live focus-chain checklist (cline L171).
+///
+/// Each plan step becomes a GFM-style checkbox line — `[ ]` pending, `[~]`
+/// in-progress, `[x]` done — in plan (Logoot) order, with the step body
+/// appended. When no step carries an explicit non-pending status (the plan
+/// hasn't reported progress yet), a reasonable focus is derived: the first
+/// step is treated as in-progress and the rest stay pending, so the panel
+/// always highlights one active item. Returns an empty `Vec` for an empty
+/// plan, so the caller renders nothing when there is no plan.
+#[must_use]
+pub fn render_focus_chain(plan_lines: &[PlanLine]) -> Vec<String> {
+    if plan_lines.is_empty() {
+        return Vec::new();
+    }
+    let mut states: Vec<TaskState> = plan_lines
+        .iter()
+        .map(|pl| task_state_for_glyph(pl.status_glyph))
+        .collect();
+
+    // Derive a focus when the plan reports no explicit progress: with every
+    // step pending, promote the first to in-progress so one item reads as
+    // active. A plan that already marks any step keeps its reported states.
+    if states.iter().all(|s| *s == TaskState::Pending) {
+        if let Some(first) = states.first_mut() {
+            *first = TaskState::InProgress;
+        }
+    }
+
+    states
+        .iter()
+        .zip(plan_lines)
+        .map(|(state, pl)| format!("{} {}", state.marker(), pl.content))
+        .collect()
 }
 
 /// Display width of a single char in terminal cells (`0`-width control chars
@@ -1309,5 +1679,208 @@ mod tests {
         app.stall_secs = Some(90);
         app.stop_turn_timer();
         assert_eq!(app.stall_secs, None, "ending a turn must clear the stall notice");
+    }
+
+    // Drive one turn through the cache-cold state machine with explicit
+    // wall-clock times so the time-gap arm is deterministic. `cache_read` is the
+    // tokens the daemon reported served from cache during the turn.
+    fn run_turn(app: &mut App, start_ms: u64, end_ms: u64, cache_read: u32) {
+        app.cache_cold.turn_start_ms = Some(start_ms);
+        app.cache_cold.cache_read_at_start = app.usage.cache_read_input_tokens;
+        app.record_usage_tokens(0, 0, cache_read, 0);
+        app.evaluate_cache_cold_at(end_ms);
+    }
+
+    #[test]
+    fn cache_cold_first_turn_is_warm() {
+        let mut app = App::new("anthropic", "claude-sonnet-4-6", CompletionSources::default());
+        assert!(!app.cache_cold(), "no turn yet => warm");
+        run_turn(&mut app, 0, 1_000, 0);
+        assert!(!app.cache_cold(), "first turn has no prior cache to expire");
+    }
+
+    #[test]
+    fn cache_cold_gap_beyond_ttl_is_cold() {
+        let mut app = App::new("anthropic", "claude-sonnet-4-6", CompletionSources::default());
+        // Warm turn establishes a prior cache.
+        run_turn(&mut app, 0, 1_000, 5_000);
+        assert!(!app.cache_cold());
+        // Next turn starts well after the TTL => cold.
+        let start = 1_000 + origin_cost::PROMPT_CACHE_TTL_MS + 1;
+        run_turn(&mut app, start, start + 500, 5_000);
+        assert!(app.cache_cold(), "idle gap beyond TTL must flag cold");
+    }
+
+    #[test]
+    fn cache_cold_gap_within_ttl_with_reads_is_warm() {
+        let mut app = App::new("anthropic", "claude-sonnet-4-6", CompletionSources::default());
+        run_turn(&mut app, 0, 1_000, 5_000);
+        // Next turn starts within the TTL and reads from cache => warm.
+        let start = 1_000 + origin_cost::PROMPT_CACHE_TTL_MS - 1;
+        run_turn(&mut app, start, start + 500, 5_000);
+        assert!(!app.cache_cold(), "quick follow-up with cache reads stays warm");
+    }
+
+    // A `PlanLine` fixture with the given status glyph and body. `id`/`holder`
+    // do not affect focus-chain rendering, so they are filler.
+    fn plan_line(glyph: char, body: &str) -> PlanLine {
+        PlanLine {
+            id: origin_plan::StepId::from_u128(0),
+            indent: 0,
+            status_glyph: glyph,
+            content: body.to_string(),
+            holder: None,
+        }
+    }
+
+    #[test]
+    fn focus_chain_empty_plan_is_empty() {
+        assert!(render_focus_chain(&[]).is_empty());
+    }
+
+    #[test]
+    fn focus_chain_maps_explicit_statuses() {
+        // Pending ○, in-progress ◐, done ●, cancelled ✕.
+        let lines = [
+            plan_line('\u{25CF}', "first"),
+            plan_line('\u{25D0}', "second"),
+            plan_line('\u{25CB}', "third"),
+            plan_line('\u{2715}', "fourth"),
+        ];
+        let chain = render_focus_chain(&lines);
+        assert_eq!(
+            chain,
+            vec![
+                "[x] first".to_string(),
+                "[~] second".to_string(),
+                "[ ] third".to_string(),
+                "[x] fourth".to_string(),
+            ],
+            "explicit statuses map to checkbox markers in plan order"
+        );
+    }
+
+    #[test]
+    fn focus_chain_derives_focus_when_all_pending() {
+        // No reported progress => promote the first step to in-progress so one
+        // item reads as the active focus; the rest stay pending.
+        let lines = [
+            plan_line('\u{25CB}', "alpha"),
+            plan_line('\u{25CB}', "beta"),
+            plan_line('\u{25CB}', "gamma"),
+        ];
+        let chain = render_focus_chain(&lines);
+        assert_eq!(
+            chain,
+            vec![
+                "[~] alpha".to_string(),
+                "[ ] beta".to_string(),
+                "[ ] gamma".to_string(),
+            ],
+            "all-pending plan derives the first step as in-progress"
+        );
+    }
+
+    #[test]
+    fn focus_chain_preserves_order_and_does_not_derive_when_progress_exists() {
+        // A done step means progress is reported, so no derivation kicks in and
+        // the lone pending step stays pending.
+        let lines = [
+            plan_line('\u{25CF}', "done one"),
+            plan_line('\u{25CB}', "pending two"),
+        ];
+        let chain = render_focus_chain(&lines);
+        assert_eq!(
+            chain,
+            vec!["[x] done one".to_string(), "[ ] pending two".to_string()],
+            "reported progress suppresses the all-pending derivation"
+        );
+    }
+
+    #[test]
+    fn should_notify_off_by_default() {
+        // Default gate (disabled) never fires, regardless of outcome.
+        assert!(!should_notify(false, true));
+        assert!(!should_notify(false, false));
+    }
+
+    #[test]
+    fn should_notify_fires_only_on_enabled_success() {
+        assert!(should_notify(true, true));
+        // Enabled but the turn failed => no chime (error line already shown).
+        assert!(!should_notify(true, false));
+    }
+
+    #[test]
+    fn notify_turn_complete_no_spawn_when_disabled() {
+        // Disabled => returns false (no process spawn attempted).
+        assert!(!notify_turn_complete(false, true));
+    }
+
+    #[test]
+    fn default_app_is_byte_identical_opt_ins_off() {
+        // The opt-in TUI/config layers must all default OFF so a fresh App is
+        // unchanged from before this workstream.
+        let app = App::new("anthropic", "m", CompletionSources::default());
+        assert_eq!(app.theme, Theme::Default);
+        assert!(!app.vim_active);
+        assert_eq!(app.vim_mode, VimMode::Insert);
+        assert!(!app.notify_desktop);
+        assert_eq!(app.palette(), theme::palette(Theme::Default));
+    }
+
+    #[test]
+    fn set_theme_by_name_switches_and_rejects_unknown() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        assert!(app.set_theme_by_name("dark"));
+        assert_eq!(app.theme, Theme::Dark);
+        assert_eq!(app.palette(), theme::palette(Theme::Dark));
+        // Unknown name leaves the theme untouched.
+        assert!(!app.set_theme_by_name("chartreuse"));
+        assert_eq!(app.theme, Theme::Dark);
+    }
+
+    #[test]
+    fn toggle_vim_flips_active_and_mode() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        assert!(app.toggle_vim());
+        assert!(app.vim_active);
+        assert_eq!(app.vim_mode, VimMode::Normal, "enabling vim starts in Normal");
+        assert!(!app.toggle_vim());
+        assert!(!app.vim_active);
+        assert_eq!(app.vim_mode, VimMode::Insert, "disabling resets to Insert");
+    }
+
+    #[test]
+    fn apply_vim_action_moves_cursor_and_switches_mode() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.input = "hello".to_string();
+        app.cursor = 2;
+        app.vim_mode = VimMode::Normal;
+        // h moves left, clamped at 0.
+        assert!(app.apply_vim_action(crate::input::VimAction::MoveLeft));
+        assert_eq!(app.cursor, 1);
+        // $ jumps to end (char count).
+        assert!(app.apply_vim_action(crate::input::VimAction::LineEnd));
+        assert_eq!(app.cursor, 5);
+        // i switches to Insert and is consumed.
+        assert!(app.apply_vim_action(crate::input::VimAction::SwitchMode(VimMode::Insert)));
+        assert_eq!(app.vim_mode, VimMode::Insert);
+        // Pass is not consumed.
+        assert!(!app.apply_vim_action(crate::input::VimAction::Pass));
+    }
+
+    #[test]
+    fn cache_cold_zero_reads_after_warm_is_cold_then_clears() {
+        let mut app = App::new("anthropic", "claude-sonnet-4-6", CompletionSources::default());
+        // Warm turn first.
+        run_turn(&mut app, 0, 1_000, 5_000);
+        assert!(!app.cache_cold());
+        // Quick follow-up but the daemon reported zero cache reads => cold.
+        run_turn(&mut app, 1_100, 1_600, 0);
+        assert!(app.cache_cold(), "zero cache reads after a warm turn is cold");
+        // The next warm turn clears the nudge.
+        run_turn(&mut app, 1_700, 2_200, 5_000);
+        assert!(!app.cache_cold(), "a warm turn clears the cold marker");
     }
 }

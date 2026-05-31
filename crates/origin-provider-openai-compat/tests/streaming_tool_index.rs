@@ -103,6 +103,7 @@ async fn parallel_tool_calls_carry_index_prefix() {
                     model: "gpt-test".into(),
                     tools: vec![],
                     effort: None,
+                    thinking_tokens: None,
                     attachments: Vec::new(),
                 },
                 &r,

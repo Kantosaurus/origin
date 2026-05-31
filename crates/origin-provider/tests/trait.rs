@@ -28,6 +28,7 @@ async fn fake_provider_round_trips() {
         model: "fake-1".to_string(),
         tools: Vec::<ToolSchema>::new(),
         effort: None,
+        thinking_tokens: None,
         attachments: Vec::new(),
     };
     let resp = p.chat(req).await.expect("fake provider should not fail");
@@ -71,6 +72,7 @@ async fn fake_provider_streams_one_token() {
             model: "stream-1".into(),
             tools: vec![],
             effort: None,
+            thinking_tokens: None,
             attachments: Vec::new(),
         },
         &ring,

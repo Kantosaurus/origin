@@ -21,6 +21,13 @@ pub struct PromptRequest {
     /// `ChatRequest`. *Closes: claude-code `/effort`+`/fast`.*
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Optional extended-thinking budget (in tokens) for this turn. `None` (the
+    /// default) leaves the provider wire byte-identical. The daemon threads this
+    /// onto `LoopOptions.thinking_tokens`, which the Anthropic encoder maps to
+    /// `"thinking": {"type":"enabled","budget_tokens": n}` (bumping `max_tokens`
+    /// above `n`); other providers ignore it. *Closes: aider `--thinking-tokens`.*
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_tokens: Option<u32>,
     /// Multimodal attachments (images / extracted PDF text) to append to the
     /// FIRST user turn. Empty by default ⇒ text-only wire unchanged. The CLI
     /// encodes each file via `origin_multimodal::to_content_block` so the
@@ -118,6 +125,17 @@ pub enum ClientMessage {
     /// hydratable state. Returns [`StreamEvent::AdminError`] if the
     /// session does not exist.
     ResumeSession { session_id: String },
+    /// Cross-harness *live resume*: hydrate a brand-new resumable origin
+    /// session from a foreign harness's transcript. `source` is the originating
+    /// harness tag (`claude-code` | `jcode` | `opencode`, plus the aliases
+    /// [`origin_migrate::reconstruct::SourceKind::from_tag`] accepts); `path` is
+    /// the external session file or harness root directory. The daemon
+    /// reconstructs the transcript via [`origin_migrate::reconstruct`], creates a
+    /// new session seeded with those messages, and replies with
+    /// [`StreamEvent::ForeignResumed`] (or [`StreamEvent::AdminError`] on an
+    /// unknown source / parse / I/O failure). *Closes: jcode L227 cross-harness
+    /// session import AND resume.*
+    ResumeForeign { source: String, path: String },
     /// P13.4.2: ask the daemon for a per-provider/per-model token usage
     /// snapshot. The daemon replies with [`StreamEvent::UsageReport`].
     GetUsage,
@@ -341,6 +359,19 @@ pub enum StreamEvent {
         messages_loaded: u32,
         restored_to_turn: u32,
         had_resume_token: bool,
+    },
+    /// Response to [`ClientMessage::ResumeForeign`]. `session_id` is the
+    /// freshly-created origin session seeded with the reconstructed foreign
+    /// transcript; `messages_loaded` is the number of message rows persisted;
+    /// `suggested_model` is the origin-catalog model the new session adopted
+    /// (mapped from the foreign session's model family via
+    /// [`origin_migrate::reconstruct::suggest_model`]). The new session is a
+    /// first-class resumable origin session (`origin sessions resume
+    /// <session_id>`).
+    ForeignResumed {
+        session_id: String,
+        messages_loaded: u32,
+        suggested_model: String,
     },
     /// Positive ack for a successful [`ClientMessage::ActivateSkill`].
     /// `allowed_tools` is the intersection mask currently in effect after

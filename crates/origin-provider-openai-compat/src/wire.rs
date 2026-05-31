@@ -112,6 +112,14 @@ pub struct WireUsage {
 }
 
 /// Encode a `ChatRequest` into the `OpenAI` wire-shape request.
+///
+/// `ChatRequest.thinking_tokens` is intentionally **not** mapped here: the
+/// explicit extended-thinking `budget_tokens` control is an Anthropic Messages
+/// API concept with no `OpenAI` Chat Completions equivalent (`OpenAI`-style
+/// reasoning models expose only the coarse `reasoning_effort` knob, which is
+/// already wired from `ChatRequest.effort`). The field is therefore a no-op for
+/// `OpenAI`-compatible backends, leaving the body byte-identical whether or not
+/// a thinking budget was requested.
 #[must_use]
 pub fn encode_request(req: &ChatRequest, stream: bool) -> WireRequest<'_> {
     let mut messages = Vec::with_capacity(req.messages.len() + 1);

@@ -19,6 +19,7 @@ async fn live_smoke() {
         model: "claude-opus-4-7".into(),
         tools: vec![],
         effort: None,
+        thinking_tokens: None,
         attachments: Vec::new(),
     };
     let resp = provider.chat(req).await.expect("anthropic should answer");

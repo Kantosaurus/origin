@@ -39,6 +39,7 @@ async fn bedrock_request_max_tokens_matches_anthropic_ceiling() {
         model: "anthropic.claude-3-haiku-20240307-v1:0".into(),
         tools: vec![],
         effort: None,
+        thinking_tokens: None,
         attachments: Vec::new(),
     };
     provider.chat(req).await.expect("bedrock chat should succeed");

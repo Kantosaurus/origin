@@ -19,7 +19,7 @@ use origin_skills::SkillRegistry;
 use origin_tools::dispatch::MemoryHandle;
 use origin_tools::{registry_iter, SideEffects, ToolMeta};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::task::spawn_blocking as sb;
@@ -49,13 +49,15 @@ impl origin_vcs::GitRunner for CmdGit {
     }
 }
 
-/// Best-effort per-turn shadow-git checkpoint. No-op unless
-/// `ORIGIN_CHECKPOINTS=1`. Every failure is swallowed — a checkpoint must
-/// never fail the turn that produced it. Default-off ⇒ byte-identical behavior.
-fn maybe_checkpoint_turn() {
-    if std::env::var("ORIGIN_CHECKPOINTS").as_deref() != Ok("1") {
-        return;
-    }
+/// Best-effort shadow-git checkpoint with the given `label`, shared by the
+/// per-turn and per-tool callers.
+///
+/// This is the only place that drives [`origin_vcs::ShadowGit`]; it does NOT
+/// consult any env gate — callers decide whether to invoke it. Every failure is
+/// swallowed: a checkpoint must never fail the turn that produced it. The
+/// caller-supplied `label` becomes the checkpoint's commit subject, so it is
+/// what distinguishes entries in `origin checkpoints`.
+fn checkpoint_with_label(label: &str) {
     let Ok(cwd) = std::env::current_dir() else {
         return;
     };
@@ -66,9 +68,60 @@ fn maybe_checkpoint_turn() {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     let runner = CmdGit;
     let sg = origin_vcs::ShadowGit::new(&runner, shadow);
-    if let Err(e) = sg.snapshot("turn", now_ms) {
+    if let Err(e) = sg.snapshot(label, now_ms) {
         tracing::debug!(error = %e, "shadow-git checkpoint failed (ignored)");
     }
+}
+
+/// Best-effort per-turn shadow-git checkpoint. No-op unless
+/// `ORIGIN_CHECKPOINTS=1`. Every failure is swallowed — a checkpoint must
+/// never fail the turn that produced it. Default-off ⇒ byte-identical behavior.
+fn maybe_checkpoint_turn() {
+    if std::env::var("ORIGIN_CHECKPOINTS").as_deref() != Ok("1") {
+        return;
+    }
+    checkpoint_with_label("turn");
+}
+
+/// Whether the per-tool-use checkpoint feature is enabled.
+///
+/// Reads the `ORIGIN_CHECKPOINTS_PER_TOOL` env gate (set to `1` to enable).
+/// This is INDEPENDENT of `ORIGIN_CHECKPOINTS` so per-turn snapshots remain the
+/// default granularity; only setting this flag opts into the finer per-tool
+/// snapshots. Unset (the default) ⇒ `false` ⇒ byte-identical behavior.
+fn per_tool_checkpoints_enabled() -> bool {
+    std::env::var("ORIGIN_CHECKPOINTS_PER_TOOL").as_deref() == Ok("1")
+}
+
+/// Build the commit-subject label for a per-tool checkpoint.
+///
+/// Combines the `tool` name with the file path(s) it edited so the snapshot is
+/// distinguishable from per-turn (`"turn"`) checkpoints and from one another in
+/// `origin checkpoints`. With no edited paths the label degrades to just the
+/// tool name (`"tool:Edit"`); with one or more it appends them comma-joined
+/// (`"tool:Edit src/lib.rs"`).
+fn per_tool_checkpoint_label(tool: &str, edited: &[String]) -> String {
+    if edited.is_empty() {
+        format!("tool:{tool}")
+    } else {
+        format!("tool:{tool} {}", edited.join(","))
+    }
+}
+
+/// Best-effort per-tool-use shadow-git checkpoint (cline L163 follow-up).
+///
+/// No-op unless `ORIGIN_CHECKPOINTS_PER_TOOL=1`. Called after a SUCCESSFUL
+/// mutating tool dispatch with the tool name and its parsed args; snapshots the
+/// workspace via the same [`checkpoint_with_label`] machinery the per-turn path
+/// uses, labelled by [`per_tool_checkpoint_label`] so the entries are
+/// distinguishable. Every failure is swallowed and the gate is default-off, so
+/// the default code path is byte-identical.
+fn maybe_checkpoint_per_tool(tool: &str, args: &Value) {
+    if !per_tool_checkpoints_enabled() {
+        return;
+    }
+    let edited = edited_paths_from_tool(tool, args);
+    checkpoint_with_label(&per_tool_checkpoint_label(tool, &edited));
 }
 
 /// DENY-ONLY governance overlay (Task 3).
@@ -318,6 +371,30 @@ fn patch_target_paths(patch: &str) -> Vec<String> {
     out
 }
 
+/// Extract the file path(s) a mutating tool call edited, for the optional
+/// autonomous LSP-diagnostics feedback ([`crate::lsp_diagnostics`]).
+///
+/// Recognizes the path-bearing builtins: `Edit`/`Write`/`MultiEdit` carry a
+/// single `file_path`; `ApplyPatch` carries a `patch` body whose target files
+/// are recovered with [`patch_target_paths`]. Any other (or malformed) tool
+/// yields an empty vec. Best-effort and lossy — the result only ever *adds*
+/// candidates to the diagnostics probe set, which is itself default-off.
+fn edited_paths_from_tool(name: &str, args: &Value) -> Vec<String> {
+    match name {
+        "Edit" | "Write" | "MultiEdit" => {
+            match args.get("file_path").and_then(Value::as_str) {
+                Some(p) if !p.is_empty() => vec![p.to_string()],
+                _ => Vec::new(),
+            }
+        }
+        "ApplyPatch" => args
+            .get("patch")
+            .and_then(Value::as_str)
+            .map_or_else(Vec::new, patch_target_paths),
+        _ => Vec::new(),
+    }
+}
+
 /// Maximum number of times `run_loop` retries a single turn's provider call
 /// after a `ProviderError::RateLimit`. After the cap is hit the error is
 /// propagated as a `LoopError::Provider` and the turn fails normally.
@@ -329,6 +406,81 @@ const MAX_PROVIDER_RETRIES: u32 = 3;
 /// bounded while still respecting short server-side backoffs.
 const MAX_RATE_LIMIT_SLEEP_SECS: u32 = 60;
 
+/// Extract the path a read-class tool touched, for swarm collaboration
+/// tracking (WS-L, jcode L238).
+///
+/// `Read` carries a single `file_path`; `Glob`/`Grep` carry an optional `path`
+/// search root. Any other (or pathless) tool yields `None`. Best-effort and
+/// lossy — only feeds the advisory [`origin_swarm::FileRegistry`].
+fn read_path_from_tool<'a>(name: &str, args: &'a Value) -> Option<&'a str> {
+    let key = match name {
+        "Read" => "file_path",
+        "Glob" | "Grep" => "path",
+        _ => return None,
+    };
+    args.get(key).and_then(Value::as_str).filter(|p| !p.is_empty())
+}
+
+/// Best-effort swarm-collaboration bookkeeping for one successful tool call
+/// (WS-L, jcode L238). Reached only when a [`SwarmCollab`] is in scope; it
+/// further no-ops unless the `ORIGIN_SWARM_COLLAB` env is set — so the default
+/// everywhere is byte-identical. Never panics; never returns an error.
+///
+/// On a read-class tool (`Read`/`Glob`/`Grep`) it records this worker as a
+/// reader of the path. On an edit-class tool (`Edit`/`Write`/`MultiEdit`/
+/// `ApplyPatch`) it records the edit and, for each OTHER worker that had read
+/// the path, delivers a file-shift notice into that worker's mailbox (when the
+/// `mailboxes` map is wired) or logs it (the fallback when per-worker mailbox
+/// plumbing is not reachable from here).
+fn record_swarm_collab(collab: &SwarmCollab, name: &str, args: &Value) {
+    // Gate: env must be set. Unset ⇒ no tracking ⇒ byte-identical.
+    if std::env::var_os("ORIGIN_SWARM_COLLAB").is_none() {
+        return;
+    }
+    if let Some(path) = read_path_from_tool(name, args) {
+        collab.registry.record_read(collab.worker_id, path);
+        return;
+    }
+    for path in edited_paths_from_tool(name, args) {
+        let Some(notice) = collab.registry.record_edit_notice(collab.worker_id, &path) else {
+            continue;
+        };
+        deliver_file_shift(collab, &notice);
+    }
+}
+
+/// Deliver a [`origin_swarm::FileShiftNotice`] to each affected reader's
+/// mailbox, or log it when the mailbox map is not wired.
+fn deliver_file_shift(collab: &SwarmCollab, notice: &origin_swarm::FileShiftNotice) {
+    let body = format!(
+        "file-shift: {} was edited by worker {:032x}; re-check your view",
+        notice.path.display(),
+        notice.editor.value()
+    );
+    let Some(mailboxes) = collab.mailboxes.as_ref() else {
+        tracing::info!(
+            path = %notice.path.display(),
+            readers = notice.readers.len(),
+            "swarm collab: file-shift notice (no mailbox plumbing; logging only)"
+        );
+        return;
+    };
+    for reader in &notice.readers {
+        if let Some(mbox) = mailboxes.get(reader) {
+            mbox.push(origin_swarm::Message::new(
+                notice.editor,
+                origin_swarm::MsgScope::Direct(*reader),
+                body.clone(),
+            ));
+        } else {
+            tracing::info!(
+                reader = %format!("{:032x}", reader.value()),
+                "swarm collab: file-shift reader has no mailbox; dropping notice"
+            );
+        }
+    }
+}
+
 /// When the primary model is rate-limited and all retries are exhausted,
 /// try a cheaper model from the same family before killing the turn.
 fn rate_limit_fallback(model: &str) -> Option<&'static str> {
@@ -339,6 +491,62 @@ fn rate_limit_fallback(model: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Real-time swarm collaboration context for a worker's agent loop (WS-L,
+/// jcode L238).
+///
+/// Installed by a swarm worker around its [`run_loop`] call via
+/// [`scope_swarm_collab`]; the per-tool hook reads it from the
+/// [`SWARM_COLLAB`] task-local. Threading it as a task-local (rather than a
+/// `LoopOptions` field) keeps every existing `LoopOptions` construction site
+/// untouched, so the daemon is byte-identical when no worker scopes it.
+///
+/// When a context is in scope AND the process env `ORIGIN_SWARM_COLLAB` is set,
+/// the loop:
+/// - calls [`origin_swarm::FileRegistry::record_read`] after a successful
+///   read-class tool (`Read`/`Glob`/`Grep`),
+/// - calls [`origin_swarm::FileRegistry::record_edit`] after a successful
+///   edit-class tool (`Edit`/`Write`/`MultiEdit`/`ApplyPatch`) and, for each
+///   returned reader, enqueues a [`origin_swarm::FileShiftNotice`]-derived
+///   [`origin_swarm::Message`] into that worker's mailbox when the `mailboxes`
+///   map is wired, or logs it otherwise.
+///
+/// Best-effort: a tracking failure never tears down the turn.
+#[derive(Clone)]
+pub struct SwarmCollab {
+    /// Identity of the worker running this loop. Used as the reader/editor in
+    /// every registry call.
+    pub worker_id: origin_swarm::WorkerId,
+    /// Shared, room-wide file-read registry. All workers in one swarm room
+    /// share a single `Arc<FileRegistry>`.
+    pub registry: Arc<origin_swarm::FileRegistry>,
+    /// Optional shared map `WorkerId → Mailbox`. When present, a file-shift
+    /// notice is delivered as a [`origin_swarm::Message`] into each affected
+    /// reader's mailbox. When `None`, the notice is logged instead (the
+    /// "mailbox plumbing isn't reachable" fallback).
+    pub mailboxes: Option<Arc<std::collections::HashMap<origin_swarm::WorkerId, Arc<origin_swarm::Mailbox>>>>,
+}
+
+tokio::task_local! {
+    /// Per-worker swarm-collaboration context (WS-L). A swarm worker sets this
+    /// for the duration of its [`run_loop`] via [`scope_swarm_collab`]; the
+    /// per-tool hook reads it. Unset on every non-worker task ⇒ no tracking ⇒
+    /// byte-identical.
+    static SWARM_COLLAB: SwarmCollab;
+}
+
+/// Run `fut` with `collab` installed in the [`SWARM_COLLAB`] task-local so the
+/// per-tool hook inside [`run_loop`] records this worker's reads/edits and
+/// emits file-shift notices (WS-L, jcode L238).
+///
+/// Intended for a swarm worker to wrap its `run_loop` call. Tasks that never
+/// call this see an unset task-local and behave exactly as before.
+pub async fn scope_swarm_collab<F, T>(collab: SwarmCollab, fut: F) -> T
+where
+    F: std::future::Future<Output = T> + Send,
+{
+    SWARM_COLLAB.scope(collab, fut).await
 }
 
 #[derive(Clone)]
@@ -452,6 +660,14 @@ pub struct LoopOptions {
     /// byte-identical. Set from `PromptRequest.effort` in `handle_request`.
     /// *Closes: claude-code `/effort`+`/fast` (the agent-loop wire).*
     pub effort: Option<origin_provider::ReasoningEffort>,
+    /// Optional extended-thinking budget (in tokens) for every turn of this
+    /// loop. `None` (the default) leaves each `ChatRequest.thinking_tokens` as
+    /// `None` ⇒ provider wire byte-identical. Set from
+    /// `PromptRequest.thinking_tokens` in `handle_request`. Only the Anthropic
+    /// encoder honours it (enables extended thinking with `budget_tokens`);
+    /// other providers ignore it. *Closes: aider `--thinking-tokens` (the
+    /// agent-loop wire).*
+    pub thinking_tokens: Option<u32>,
     /// Multimodal attachments to append to the FIRST user turn of this loop
     /// (turn 1 only — later turns carry tool-results, not the user image).
     /// Empty ⇒ text-only wire unchanged. Set from `PromptRequest.attachments`.
@@ -510,6 +726,7 @@ impl Default for LoopOptions {
             policy: None,
             conseca: None,
             effort: None,
+            thinking_tokens: None,
             attachments: Vec::new(),
             system_suffix: None,
             read_only: false,
@@ -702,6 +919,64 @@ pub(crate) struct StreamingTurn {
     pub speculative: SpeculativeRegistry,
 }
 
+/// Session-id prefixes reserved for the daemon's own self-dispatched prompts
+/// (ambient / scheduler / overnight / webhook). These loops connect back to the
+/// daemon's IPC socket as ordinary clients, so their turns flow through
+/// [`run_loop`] exactly like an interactive prompt — the only in-band signal that
+/// tells them apart here is the synthetic `session_id` each loop stamps.
+const SELF_DISPATCH_SESSION_PREFIXES: [&str; 4] = ["ambient-", "sched-", "overnight-", "webhook-"];
+
+/// Whether `session_id` belongs to a daemon self-dispatch (ambient / scheduler /
+/// overnight / webhook) rather than a genuine interactive/headless user prompt.
+///
+/// Used to gate the ambient idle-tracker bump so the loops the idle gate
+/// protects against do not reset the user's idle clock. Conservative: an
+/// unrecognised id is treated as a real user prompt.
+#[must_use]
+fn is_self_dispatch_session(session_id: &str) -> bool {
+    SELF_DISPATCH_SESSION_PREFIXES
+        .iter()
+        .any(|p| session_id.starts_with(p))
+}
+
+#[cfg(test)]
+mod self_dispatch_session_tests {
+    use super::is_self_dispatch_session;
+
+    #[test]
+    fn self_dispatch_prefixes_are_recognised() {
+        for id in [
+            "ambient-tests",
+            "sched-1717000000000",
+            "overnight-docs",
+            "webhook-1717000000000",
+        ] {
+            assert!(
+                is_self_dispatch_session(id),
+                "{id} should be treated as a daemon self-dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_user_sessions_are_not_self_dispatch() {
+        // Random hex MessageIds, headless `origin run` ids, and human-named
+        // sessions must all count as real user activity.
+        for id in [
+            "01J9Z8Q4K0000000000000000A",
+            "",
+            "my-feature-work",
+            "scheduler",
+            "ambientish",
+        ] {
+            assert!(
+                !is_self_dispatch_session(id),
+                "{id:?} should count as a genuine user prompt"
+            );
+        }
+    }
+}
+
 /// Run the agent loop until the assistant emits a turn without any `tool_use`
 /// blocks, or until `max_turns` is reached.
 ///
@@ -727,6 +1002,21 @@ pub async fn run_loop(
     static EMPTY_SKILLS: SkillRegistry = SkillRegistry::new();
 
     session.push(Message::new(Role::User).with_block(Block::text(user_text)));
+
+    // Ambient idle gate (jcode L223): a genuine user prompt is REAL activity, so
+    // bump the ambient idle tracker now that the turn is starting. Best-effort
+    // and a cheap atomic store; a no-op when `ORIGIN_AMBIENT` is unset (the
+    // tracker was never initialised), so default builds are byte-identical.
+    //
+    // We MUST NOT bump for the daemon's own self-dispatched prompts (ambient /
+    // scheduler / overnight / webhook) — those are exactly the background loops
+    // the idle gate protects the user from, and resetting the clock on them would
+    // let one self-dispatch keep the gate open indefinitely. They reach this same
+    // `run_loop` over the IPC socket, indistinguishable except by the synthetic
+    // session id each loop stamps, so we skip the bump for those prefixes.
+    if !is_self_dispatch_session(&session.id) {
+        crate::ambient::note_user_activity();
+    }
 
     // Live lifecycle hooks (gemini): loaded once from ~/.origin/hooks.json.
     // `None` (no config — the default) makes every fire below a no-op, so the
@@ -999,22 +1289,76 @@ pub async fn run_loop(
     // read-only turn never triggers shadow-git work even when the flag is on.
     let mut turn_mutated = false;
 
+    // Autonomous post-edit LSP diagnostics (opencode). `lsp_diag_block` is the
+    // `<lsp-diagnostics>` block (if any) appended to the NEXT turn's system
+    // prompt; `lsp_edited_paths` accumulates the distinct files the CURRENT
+    // turn mutated. Both stay empty unless `ORIGIN_LSP_DIAGNOSTICS=1`, so the
+    // per-turn system prompt — and thus the prompt-cache breakpoints — are
+    // byte-identical to before when the feature is off.
+    let mut lsp_diag_block = String::new();
+    let lsp_diag_enabled = crate::lsp_diagnostics::enabled();
+
     for turn in 1..=opts.max_turns {
-        // Live per-turn model routing (origin-router). When a router is wired,
-        // it picks a model for this turn's phase (turn 1 ⇒ Plan, later ⇒ Edit);
-        // a cross-provider pick returns `None`, so we fall back to the session
-        // model. With no router (the default) this is exactly `session.model`.
-        let turn_model = opts
-            .router
-            .as_ref()
-            .and_then(|lr| lr.choose_model(turn, provider.name()))
-            .unwrap_or_else(|| session.model.clone());
+        // Distinct files this turn mutated (for the post-edit diagnostics probe).
+        // Always empty unless the feature is enabled, so it allocates nothing on
+        // the default path.
+        let mut lsp_edited_paths: BTreeSet<String> = BTreeSet::new();
+        // Live per-turn model routing (origin-router). When a router is wired it
+        // picks a model for this turn's phase (turn 1 ⇒ Plan, later ⇒ Edit).
+        //
+        // A pick on the ACTIVE provider keeps the zero-cost path: we reuse the
+        // borrowed `provider` and only override `turn_model`.
+        //
+        // A pick on a DIFFERENT provider (foundation L84 / kilo L265) is now
+        // honoured when a process-wide provider factory is registered
+        // (`provider_factory::set_global`): we rebuild an owned provider for that
+        // turn and use it in place of the borrowed one. The owned provider is
+        // held in `rebuilt` for the rest of this turn so `turn_provider` (a plain
+        // `&dyn Provider`) stays valid. On rebuild failure (missing creds /
+        // unknown id / no factory registered) `build_provider_for` returns `None`
+        // and we fall back to the active provider for the turn — no panic.
+        //
+        // With no router (the default) `rebuilt` is `None`, `turn_provider` is
+        // the borrowed `provider`, and `turn_model` is `session.model` — exactly
+        // the pre-existing wire.
+        let mut rebuilt: Option<Arc<dyn Provider>> = None;
+        let turn_model = match opts.router.as_ref().and_then(|lr| lr.choose_model_ref(turn)) {
+            Some(pick) if pick.provider.as_str() == provider.name() => pick.model,
+            Some(pick) => {
+                // Cross-provider pick: try to rebuild. `build_provider_for`
+                // reaches the registered factory + credentials; `None` ⇒ fall
+                // back to the active provider with the session model.
+                match crate::provider_factory::build_provider_for(&pick.provider, &pick.model).await
+                {
+                    Some(p) => {
+                        rebuilt = Some(p);
+                        pick.model
+                    }
+                    None => session.model.clone(),
+                }
+            }
+            None => session.model.clone(),
+        };
+        // The provider this turn's chat call uses: the freshly-built owned one
+        // for a cross-provider pick, otherwise the borrowed active provider.
+        let turn_provider: &dyn Provider = rebuilt.as_deref().unwrap_or(provider);
+        // Per-turn system prompt. When the optional post-edit LSP-diagnostics
+        // feature produced a block on the previous turn, append it here so the
+        // model sees the feedback its edit generated. Empty block (the default,
+        // and the steady state once issues are fixed) ⇒ `recalled_system` is
+        // reused verbatim, keeping the wire — and the prompt cache — unchanged.
+        let turn_system = if lsp_diag_block.is_empty() {
+            recalled_system.clone()
+        } else {
+            format!("{recalled_system}\n\n{lsp_diag_block}")
+        };
         let req = ChatRequest {
-            system: recalled_system.clone(),
+            system: turn_system,
             messages: session.snapshot(),
             model: turn_model.clone(),
             tools: tools_schema.clone(),
             effort: opts.effort,
+            thinking_tokens: opts.thinking_tokens,
             // Attach images/PDF only to the first turn's user message. On later
             // turns the trailing message is a tool-result, so re-attaching would
             // mis-place the block (and re-upload the bytes every turn).
@@ -1031,18 +1375,27 @@ pub async fn run_loop(
         // `MAX_PROVIDER_RETRIES`. `ChatRequest` is `Clone`, so we re-build
         // the wire request each attempt without re-snapshotting the session.
         let provider_call_start = std::time::Instant::now();
+        // gemini BeforeModel lifecycle hook (informational): the turn is about
+        // to call the provider. No hooks configured ⇒ skipped (byte-identical).
+        if let Some(h) = &hooks {
+            let _ = h
+                .fire(&origin_hooks::LifecycleEvent::BeforeModel {
+                    model: turn_model.clone(),
+                })
+                .await;
+        }
         let (resp, mut speculative) = {
             let mut attempt: u32 = 0;
             loop {
                 let result: Result<(origin_provider::ChatResponse, SpeculativeRegistry), LoopError> =
                     if opts.streaming_disabled {
-                        provider
+                        turn_provider
                             .chat(req.clone())
                             .await
                             .map(|r| (r, SpeculativeRegistry::default()))
                             .map_err(LoopError::Provider)
                     } else {
-                        run_streaming_turn(provider, req.clone(), opts)
+                        run_streaming_turn(turn_provider, req.clone(), opts)
                             .await
                             .map(|st| (st.response, st.speculative))
                     };
@@ -1068,7 +1421,7 @@ pub async fn run_loop(
                         // marks this model exhausted so a `QuotaFallback` chain
                         // skips it next turn/prompt. A later success clears it.
                         if let Some(lr) = &opts.router {
-                            lr.mark_exhausted(provider.name(), &turn_model);
+                            lr.mark_exhausted(turn_provider.name(), &turn_model);
                         }
                         // Surface the backoff to the CLI so a 60s sleep
                         // doesn't look identical to a hang. `attempt` here is
@@ -1101,13 +1454,13 @@ pub async fn run_loop(
                             let mut fb_req = req.clone();
                             fb_req.model = fallback.to_string();
                             let fb_result = if opts.streaming_disabled {
-                                provider
+                                turn_provider
                                     .chat(fb_req)
                                     .await
                                     .map(|r| (r, SpeculativeRegistry::default()))
                                     .map_err(LoopError::Provider)
                             } else {
-                                run_streaming_turn(provider, fb_req, opts)
+                                run_streaming_turn(turn_provider, fb_req, opts)
                                     .await
                                     .map(|st| (st.response, st.speculative))
                             };
@@ -1139,6 +1492,16 @@ pub async fn run_loop(
             }
         };
 
+        // gemini AfterModel lifecycle hook (informational): the provider call
+        // returned for this turn. No hooks configured ⇒ skipped.
+        if let Some(h) = &hooks {
+            let _ = h
+                .fire(&origin_hooks::LifecycleEvent::AfterModel {
+                    model: turn_model.clone(),
+                })
+                .await;
+        }
+
         // Live router (openclaude SmartRouter / Scored EMA): fold this turn's
         // provider latency + success into the router's health so future turns /
         // prompts rank this model on measured signal. A success also clears any
@@ -1146,7 +1509,10 @@ pub async fn run_loop(
         if let Some(lr) = &opts.router {
             let latency_ms =
                 u64::try_from(provider_call_start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            lr.record(provider.name(), &turn_model, latency_ms, true);
+            // Use the provider actually called this turn (the rebuilt one for a
+            // cross-provider pick) so health/quota signal is attributed to the
+            // right `provider/model`, exactly as the same-provider path does.
+            lr.record(turn_provider.name(), &turn_model, latency_ms, true);
         }
 
         // Charge this turn's provider call against the cumulative counters
@@ -1222,9 +1588,17 @@ pub async fn run_loop(
 
             // gemini PostPrompt lifecycle hook (informational): the prompt is
             // resolving with this assistant text. No hooks configured ⇒ skipped.
+            // A `Notification` fires alongside it as the turn-completion signal
+            // (gemini `Notification`), so a hook can surface a desktop/bell ping
+            // without subscribing to `PostPrompt`. Both no-op without hooks.
             if let Some(h) = &hooks {
                 let _ = h
                     .fire(&origin_hooks::LifecycleEvent::PostPrompt { text: text.clone() })
+                    .await;
+                let _ = h
+                    .fire(&origin_hooks::LifecycleEvent::Notification {
+                        message: "turn complete".to_string(),
+                    })
                     .await;
             }
 
@@ -1344,6 +1718,15 @@ pub async fn run_loop(
             // Only mutating tools flip the flag; pure tools leave it untouched.
             if matches!(meta.side_effects, SideEffects::Mutating) {
                 turn_mutated = true;
+                // Autonomous post-edit LSP diagnostics (opencode): record the
+                // distinct files this edit touched so the end-of-turn probe can
+                // feed compiler/linter diagnostics back to the model. Gated:
+                // collects nothing unless `ORIGIN_LSP_DIAGNOSTICS=1`.
+                if lsp_diag_enabled {
+                    for p in edited_paths_from_tool(&name, &args) {
+                        lsp_edited_paths.insert(p);
+                    }
+                }
             }
 
             if let Some(tx) = &opts.event_tx {
@@ -1463,6 +1846,27 @@ pub async fn run_loop(
                 }
             };
 
+            // Real-time swarm collaboration (WS-L, jcode L238). Reaching here
+            // means the tool succeeded (failures `continue` above). When a
+            // swarm-worker collab context is in scope AND the gate env is set,
+            // record this worker's read/edit and notify any other worker who
+            // read a path this worker just edited. No-op + byte-identical when
+            // no context is scoped or the gate is unset. Best-effort; never
+            // breaks the turn.
+            let _ = SWARM_COLLAB.try_with(|collab| {
+                record_swarm_collab(collab, &name, &args);
+            });
+
+            // Optional per-tool-use shadow-git checkpoint (WS-S, cline L163
+            // follow-up). Reaching here means the tool succeeded. Only mutating
+            // tools produce a snapshot, and only when ORIGIN_CHECKPOINTS_PER_TOOL
+            // is set — independent of the per-turn ORIGIN_CHECKPOINTS gate, so
+            // per-turn stays the default granularity. Best-effort and
+            // default-off ⇒ byte-identical when the gate is unset.
+            if matches!(meta.side_effects, SideEffects::Mutating) {
+                maybe_checkpoint_per_tool(&name, &args);
+            }
+
             // Stream a truncated preview of the result back to the CLI so the
             // user sees the tool's actual output. The LLM still consumes the
             // full body via the `Block::ToolResult` round-trip below.
@@ -1564,6 +1968,24 @@ pub async fn run_loop(
         // `session.snapshot()`) is billed against Anthropic's prompt cache
         // instead of as fresh input tokens. See [`apply_turn_cache_markers`].
         apply_turn_cache_markers(&mut session.messages, opts.plan.as_ref());
+
+        // Autonomous post-edit LSP diagnostics (opencode). When the feature is
+        // on and this turn mutated path-bearing files, spawn the resolved
+        // language server(s), collect diagnostics under a short timeout, and
+        // stash the rendered `<lsp-diagnostics>` block for the NEXT turn's
+        // system prompt. Best-effort: any failure leaves `lsp_diag_block`
+        // empty, so the loop continues unaffected. Default-off ⇒ this whole
+        // block is skipped and the prompt stays byte-identical.
+        if lsp_diag_enabled {
+            lsp_diag_block = if lsp_edited_paths.is_empty() {
+                String::new()
+            } else {
+                let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                crate::lsp_diagnostics::lsp_diagnostics_block(&root, &lsp_edited_paths)
+                    .await
+                    .unwrap_or_default()
+            };
+        }
     }
     Err(LoopError::MaxTurns(opts.max_turns))
 }
@@ -2374,11 +2796,10 @@ async fn dispatch_tool(
         }
         // ── Web tools (stateless) ──
         "WebFetch" => {
-            let url = args
-                .get("url")
-                .and_then(Value::as_str)
-                .ok_or_else(|| LoopError::BadArgs("WebFetch: missing `url`".into()))?;
-            origin_tools::builtins::web_fetch::web_fetch(url)
+            // Accepts either a single `url` or a `urls` array (up to 20);
+            // `web_fetch_args` validates that at least one URL is present and
+            // renders combined per-URL markdown when several are requested.
+            origin_tools::builtins::web_fetch::web_fetch_args(args)
                 .await
                 .map_err(LoopError::ToolFailure)
         }
@@ -2421,6 +2842,14 @@ async fn dispatch_tool(
                     .await
                     .map_err(|e| LoopError::ToolFailure(format!("Browser: {e}")))?
             };
+            // Visual loop (opt-in via `ORIGIN_BROWSER_VISUAL=1`): after the
+            // action, attach a post-action screenshot (as a multimodal image
+            // ContentBlock) plus recent console lines so the model can
+            // *visually* verify the page. Gate OFF (the default) ⇒ the tool
+            // result is byte-identical to the bare `SnapshotResp` JSON.
+            if std::env::var("ORIGIN_BROWSER_VISUAL").as_deref() == Ok("1") {
+                return browser_visual_result(&verb, &resp);
+            }
             serde_json::to_string(&resp).map_err(|e| LoopError::ToolFailure(format!("Browser: json: {e}")))
         }
         // ── Task ──
@@ -2437,6 +2866,69 @@ async fn dispatch_tool(
         }
         other => Err(LoopError::UnknownTool(other.into())),
     }
+}
+
+/// The filesystem path a [`origin_browser::Verb`] asked the browser to write a
+/// screenshot to, if any. Only [`origin_browser::Verb::Screenshot`] carries one;
+/// every other verb returns `None` (the visual loop then attaches console only).
+fn browser_screenshot_path(verb: &origin_browser::Verb) -> Option<&str> {
+    match verb {
+        origin_browser::Verb::Screenshot { path, .. } => Some(path.as_str()),
+        origin_browser::Verb::Open { .. }
+        | origin_browser::Verb::Click { .. }
+        | origin_browser::Verb::Fill { .. }
+        | origin_browser::Verb::Extract { .. }
+        | origin_browser::Verb::Snapshot { .. }
+        | origin_browser::Verb::Close { .. } => None,
+    }
+}
+
+/// Build the **visual-loop** tool-result body for the `Browser` tool.
+///
+/// Gated by `ORIGIN_BROWSER_VISUAL=1` at the call site; this function assumes
+/// the gate is on. It captures the post-action screenshot (read back from the
+/// path the verb wrote, when present) and the recent console lines carried on
+/// the response, then emits an **additive** JSON envelope:
+///
+/// ```text
+/// {"response": <the original SnapshotResp>,
+///  "visual": {"attachments": [<ContentBlock image>...],
+///             "console": "console (N lines):\n…"}}
+/// ```
+///
+/// When neither a screenshot nor any console line is available, the envelope is
+/// the bare `SnapshotResp` JSON — identical to the gate-off path — so a backend
+/// that cannot screenshot and logs nothing adds no noise.
+///
+/// The image rides as an `origin_multimodal::ContentBlock` so the existing
+/// attachment/tool-result plumbing the model already understands can render it.
+fn browser_visual_result(
+    verb: &origin_browser::Verb,
+    resp: &origin_browser::SnapshotResp,
+) -> Result<String, LoopError> {
+    let console: &[String] = resp.console.as_deref().unwrap_or_default();
+    let capture =
+        origin_browser::VisualCapture::from_action(browser_screenshot_path(verb), console);
+    if capture.is_empty() {
+        return serde_json::to_string(resp)
+            .map_err(|e| LoopError::ToolFailure(format!("Browser: json: {e}")));
+    }
+    let mut attachments: Vec<origin_multimodal::ContentBlock> = Vec::new();
+    if let Some(png) = capture.screenshot_png.as_deref() {
+        attachments.push(origin_multimodal::ContentBlock::image(
+            "image/png",
+            origin_multimodal::base64_encode(png),
+        ));
+    }
+    let envelope = serde_json::json!({
+        "response": resp,
+        "visual": {
+            "attachments": attachments,
+            "console": capture.console_text(),
+        }
+    });
+    serde_json::to_string(&envelope)
+        .map_err(|e| LoopError::ToolFailure(format!("Browser: json: {e}")))
 }
 
 /// Serialize a [`origin_codegraph::query::QueryResult`] as a JSON string.
@@ -3645,6 +4137,40 @@ mod wiring_tests {
         maybe_checkpoint_turn();
     }
 
+    /// WS-S: the per-tool checkpoint gate is OFF by default and INDEPENDENT of
+    /// the per-turn gate. With `ORIGIN_CHECKPOINTS_PER_TOOL` unset,
+    /// `per_tool_checkpoints_enabled` reads false (so no live git work runs).
+    #[test]
+    fn per_tool_checkpoint_gate_off_by_default() {
+        assert!(
+            std::env::var("ORIGIN_CHECKPOINTS_PER_TOOL").as_deref() != Ok("1"),
+            "per-tool checkpoints must be opt-in via ORIGIN_CHECKPOINTS_PER_TOOL=1"
+        );
+        assert!(
+            !per_tool_checkpoints_enabled(),
+            "gate must read false when the env var is unset"
+        );
+    }
+
+    /// WS-S: the per-tool checkpoint label combines the tool name with its
+    /// edited path(s) so entries are distinguishable in `origin checkpoints`,
+    /// and degrades to just the tool name when no path was edited.
+    #[test]
+    fn per_tool_checkpoint_label_combines_tool_and_paths() {
+        assert_eq!(per_tool_checkpoint_label("Edit", &[]), "tool:Edit");
+        assert_eq!(
+            per_tool_checkpoint_label("Write", &["main.py".to_string()]),
+            "tool:Write main.py"
+        );
+        assert_eq!(
+            per_tool_checkpoint_label(
+                "ApplyPatch",
+                &["src/a.rs".to_string(), "src/b.rs".to_string()]
+            ),
+            "tool:ApplyPatch src/a.rs,src/b.rs"
+        );
+    }
+
     /// Task 2: the autoformat gate is OFF by default, and the formatter mapping
     /// the gate consults resolves known extensions and skips unknown ones.
     #[test]
@@ -3666,6 +4192,43 @@ mod wiring_tests {
         assert!(paths.contains(&"src/a.rs".to_string()));
         assert!(paths.contains(&"src/b.rs".to_string()));
         assert!(!paths.iter().any(|p| p == "/dev/null"));
+    }
+
+    /// WS-J: `edited_paths_from_tool` pulls `file_path` from Edit/Write/MultiEdit
+    /// and patch targets from `ApplyPatch`, and yields nothing for non-edit tools
+    /// or a missing/empty path.
+    #[test]
+    fn edited_paths_extracts_from_edit_tools() {
+        let edit = serde_json::json!({ "file_path": "src/lib.rs", "old_string": "a", "new_string": "b" });
+        assert_eq!(edited_paths_from_tool("Edit", &edit), vec!["src/lib.rs".to_string()]);
+        let write = serde_json::json!({ "file_path": "main.py", "content": "x" });
+        assert_eq!(edited_paths_from_tool("Write", &write), vec!["main.py".to_string()]);
+        let multi = serde_json::json!({ "file_path": "a.ts", "edits": [] });
+        assert_eq!(edited_paths_from_tool("MultiEdit", &multi), vec!["a.ts".to_string()]);
+
+        let patch =
+            serde_json::json!({ "patch": "*** Update File: src/a.rs\n+++ b/src/b.rs\n" });
+        let got = edited_paths_from_tool("ApplyPatch", &patch);
+        assert!(got.contains(&"src/a.rs".to_string()));
+        assert!(got.contains(&"src/b.rs".to_string()));
+
+        // Non-edit tools and missing/empty paths yield nothing.
+        assert!(edited_paths_from_tool("Read", &serde_json::json!({ "file_path": "x" })).is_empty());
+        assert!(edited_paths_from_tool("Edit", &serde_json::json!({})).is_empty());
+        assert!(edited_paths_from_tool("Edit", &serde_json::json!({ "file_path": "" })).is_empty());
+    }
+
+    /// WS-J: the autonomous post-edit LSP diagnostics feature is opt-in. With
+    /// `ORIGIN_LSP_DIAGNOSTICS` unset the gate reads false, so `run_loop` skips
+    /// the probe and the next turn's system prompt stays byte-identical.
+    #[test]
+    fn lsp_diagnostics_gate_off_by_default() {
+        if std::env::var_os("ORIGIN_LSP_DIAGNOSTICS").is_none() {
+            assert!(
+                !crate::lsp_diagnostics::enabled(),
+                "LSP diagnostics must be opt-in via ORIGIN_LSP_DIAGNOSTICS=1"
+            );
+        }
     }
 
     /// Task 3(a): with both governance layers `None` (the default), an Allow is
@@ -3868,5 +4431,130 @@ mod wiring_tests {
             Outcome::Allow,
             "cmd-guard only inspects the Bash tool"
         );
+    }
+
+    /// WS-D browser visual loop: the gate is OFF by default. With
+    /// `ORIGIN_BROWSER_VISUAL` unset, the `Browser` arm serializes the bare
+    /// `SnapshotResp` — so `browser_visual_result` is never invoked and the
+    /// tool output is byte-identical to the pre-visual behavior.
+    #[test]
+    fn browser_visual_gate_off_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("ORIGIN_BROWSER_VISUAL");
+        let enabled = std::env::var("ORIGIN_BROWSER_VISUAL").as_deref() == Ok("1");
+        assert!(!enabled, "visual loop must be opt-in via ORIGIN_BROWSER_VISUAL=1");
+
+        // The bare-serialization path the gate-off arm takes is exactly
+        // `serde_json::to_string(&resp)` — no `visual`/`response` envelope keys.
+        let resp = origin_browser::SnapshotResp {
+            ok: true,
+            r#ref: None,
+            snapshot: Some("snap".into()),
+            html: None,
+            status: Some(200),
+            title: Some("OK".into()),
+            error: None,
+            console: None,
+        };
+        let bare = serde_json::to_string(&resp).expect("serialize bare resp");
+        assert!(!bare.contains("\"visual\""), "gate-off output must not wrap");
+        assert!(!bare.contains("\"console\""), "None console omitted from wire");
+    }
+
+    /// WS-D: when the gate is on but the backend produced neither a screenshot
+    /// nor any console line, `browser_visual_result` returns the bare
+    /// `SnapshotResp` JSON — identical to the gate-off path (no empty envelope).
+    #[test]
+    fn browser_visual_empty_capture_is_bare_response() {
+        let verb = origin_browser::Verb::Snapshot {
+            session: "s".into(),
+        };
+        let resp = origin_browser::SnapshotResp {
+            ok: true,
+            r#ref: None,
+            snapshot: Some("snap".into()),
+            html: None,
+            status: Some(200),
+            title: Some("OK".into()),
+            error: None,
+            console: None,
+        };
+        let out = browser_visual_result(&verb, &resp).expect("visual result");
+        let bare = serde_json::to_string(&resp).expect("serialize bare resp");
+        assert_eq!(out, bare, "empty capture must not add envelope keys");
+    }
+
+    /// WS-D: with a captured screenshot + console lines, the visual result is an
+    /// additive envelope: `{response, visual:{attachments:[image], console}}`.
+    /// The image is a real `origin_multimodal::ContentBlock` (kind/media/base64).
+    #[test]
+    fn browser_visual_envelope_carries_screenshot_and_console() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shot = dir.path().join("page.png");
+        // PNG magic + a little payload — the visual module validates the magic.
+        let mut png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(b"IHDRdata");
+        std::fs::write(&shot, &png).expect("write png");
+
+        let verb = origin_browser::Verb::Screenshot {
+            session: "s".into(),
+            path: shot.to_str().expect("utf8 path").into(),
+        };
+        let resp = origin_browser::SnapshotResp {
+            ok: true,
+            r#ref: None,
+            snapshot: None,
+            html: None,
+            status: Some(200),
+            title: Some("OK".into()),
+            error: None,
+            console: Some(vec!["[log] ready".into(), "[error] oops".into()]),
+        };
+
+        let out = browser_visual_result(&verb, &resp).expect("visual result");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+
+        // Original response preserved under `response`.
+        assert_eq!(v["response"]["status"], 200);
+        assert_eq!(v["response"]["title"], "OK");
+
+        // Screenshot rode as a ContentBlock image with the expected base64.
+        let img = &v["visual"]["attachments"][0];
+        assert_eq!(img["kind"], "image");
+        assert_eq!(img["media_type"], "image/png");
+        assert_eq!(img["base64"], origin_multimodal::base64_encode(&png));
+
+        // Console text block has the bounded header + both lines.
+        let console = v["visual"]["console"].as_str().expect("console text");
+        assert!(console.starts_with("console (2 lines):"));
+        assert!(console.contains("[log] ready"));
+        assert!(console.contains("[error] oops"));
+    }
+
+    /// WS-D: a non-`Screenshot` verb has no screenshot path, so a console-only
+    /// backend still produces a valid envelope — console attaches, no image.
+    #[test]
+    fn browser_visual_console_only_without_screenshot() {
+        let verb = origin_browser::Verb::Click {
+            r#ref: "e1".into(),
+            session: "s".into(),
+        };
+        let resp = origin_browser::SnapshotResp {
+            ok: true,
+            r#ref: None,
+            snapshot: None,
+            html: None,
+            status: Some(200),
+            title: None,
+            error: None,
+            console: Some(vec!["[warn] slow".into()]),
+        };
+        let out = browser_visual_result(&verb, &resp).expect("visual result");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert!(
+            v["visual"]["attachments"].as_array().expect("array").is_empty(),
+            "no screenshot ⇒ no image attachment"
+        );
+        assert!(v["visual"]["console"].as_str().expect("console").contains("[warn] slow"));
     }
 }

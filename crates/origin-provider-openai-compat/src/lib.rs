@@ -109,12 +109,36 @@ impl Provider for OpenAiCompat {
         let req = ChatRequest { messages, ..req };
         let mut body = serde_json::to_value(wire::encode_request(&req, true))
             .map_err(|e| ProviderError::Api(format!("encode: {e}")))?;
+        // Inject multimodal attachments before the quirk pass, mirroring `chat`.
+        // Streaming is the DEFAULT provider path, so omitting this silently
+        // dropped images/PDFs on every streamed turn. No-op when empty ⇒
+        // byte-identical to the text-only request.
+        append_attachments(&mut body, &req.attachments);
         apply_shim_quirks(&self.cfg.base_url, &mut body);
         let url = format!(
             "{}{}",
             self.cfg.base_url.trim_end_matches('/'),
             self.cfg.chat_path
         );
+
+        // Optional cassette tap on the STREAMING path (env
+        // `ORIGIN_CASSETTE=record:<path>|replay:<path>`). Default (unset) returns
+        // `None`, so the network path below is unchanged and byte-identical to
+        // the pre-cassette behavior. The recorded body is the raw SSE event-stream
+        // text; on both record and replay it is wrapped back into a synthetic
+        // `reqwest::Response` so it flows through the exact same SSE → ring parser
+        // a live response would.
+        let cassette_mode = cassette::Mode::from_env();
+        let req_body_text = serde_json::to_string(&body).unwrap_or_default();
+
+        // Replay mode: serve the recorded SSE text from disk with no network I/O.
+        if let Some(cassette::Mode::Replay(path)) = &cassette_mode {
+            let sse = cassette::replay(path, "POST", &url, &req_body_text)?;
+            let result = streaming::parse_into_ring(response_from_sse(sse), ring).await;
+            ring.close();
+            return result;
+        }
+
         let mut builder = self
             .client
             .post(&url)
@@ -137,9 +161,152 @@ impl Provider for OpenAiCompat {
             ring.close();
             return Err(err);
         }
+
+        // Record mode: buffer the whole SSE body to text, persist it (after
+        // secret scrubbing + the save gate), THEN replay the buffered text into
+        // the ring so the live caller still streams. Buffering is acceptable here
+        // because recording is a test/dev affordance, not the hot path.
+        if let Some(cassette::Mode::Record(path)) = &cassette_mode {
+            let sse = match resp.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    ring.close();
+                    return Err(ProviderError::Api(format!("stream decode: {e}")));
+                }
+            };
+            cassette::record(path, "POST", &url, &req_body_text, 200, &sse)?;
+            let result = streaming::parse_into_ring(response_from_sse(sse), ring).await;
+            ring.close();
+            return result;
+        }
+
         let result = streaming::parse_into_ring(resp, ring).await;
         ring.close();
         result
+    }
+}
+
+/// Wrap recorded SSE event-stream text into a synthetic `reqwest::Response`.
+///
+/// The cassette stores the raw SSE body as UTF-8 text; replaying (and the
+/// record-then-feed path) rebuilds a `200 OK` `reqwest::Response` carrying that
+/// text so it can flow through the same [`streaming::parse_into_ring`] adapter a
+/// live network response uses — no second SSE parser, no server.
+fn response_from_sse(sse: String) -> reqwest::Response {
+    // `http::Response<String>` → `reqwest::Response` (no network); `String`
+    // satisfies `Into<reqwest::Body>`. This never fails for an in-memory body.
+    reqwest::Response::from(http::Response::new(sse))
+}
+
+/// Cassette tap on the streaming `chat_stream()` path (workstream WS-S).
+///
+/// Mirrors the non-streaming tap shipped on the Anthropic provider: records
+/// every streamed request + raw SSE body into an `origin-cassette` file when
+/// `ORIGIN_CASSETTE=record:<path>` is set (scrubbing secrets before persisting),
+/// and serves the recorded SSE without any network I/O when
+/// `ORIGIN_CASSETTE=replay:<path>` is set. With the variable unset, nothing in
+/// this module runs and the stream path is byte-identical to before.
+mod cassette {
+    use origin_cassette::{Cassette, Interaction, ReqShape, RespShape};
+    use origin_provider::ProviderError;
+
+    /// Parsed `ORIGIN_CASSETTE` mode. The path is the cassette JSON file.
+    pub enum Mode {
+        /// `record:<path>` — append each interaction to the cassette on disk.
+        Record(String),
+        /// `replay:<path>` — serve recorded responses, no network call.
+        Replay(String),
+    }
+
+    impl Mode {
+        /// Parse the `ORIGIN_CASSETTE` env var.
+        ///
+        /// Returns `None` when unset or malformed, so the default (no-cassette)
+        /// path is unaffected.
+        #[must_use]
+        pub fn from_env() -> Option<Self> {
+            let raw = std::env::var("ORIGIN_CASSETTE").ok()?;
+            if let Some(p) = raw.strip_prefix("record:") {
+                return (!p.is_empty()).then(|| Self::Record(p.to_string()));
+            }
+            if let Some(p) = raw.strip_prefix("replay:") {
+                return (!p.is_empty()).then(|| Self::Replay(p.to_string()));
+            }
+            None
+        }
+    }
+
+    /// Append a streamed request/SSE-body interaction to the cassette at `path`.
+    ///
+    /// Scrubs secrets before persisting and refuses to save if any leak remains.
+    ///
+    /// # Errors
+    /// Returns [`ProviderError::Api`] if the existing cassette cannot be parsed,
+    /// if a secret survives scrubbing, or if the file cannot be written.
+    pub fn record(
+        path: &str,
+        method: &str,
+        url: &str,
+        req_body: &str,
+        status: u16,
+        resp_body: &str,
+    ) -> Result<(), ProviderError> {
+        let mut cassette = match std::fs::read_to_string(path) {
+            Ok(existing) => Cassette::from_json(&existing)
+                .map_err(|e| ProviderError::Api(format!("cassette parse: {e}")))?,
+            Err(_) => Cassette::new("openai-compat-stream"),
+        };
+        cassette.record(Interaction {
+            request: ReqShape {
+                method: method.to_string(),
+                url: url.to_string(),
+                headers: Vec::new(),
+                body: req_body.to_string(),
+            },
+            response: RespShape {
+                status,
+                headers: Vec::new(),
+                body: resp_body.to_string(),
+            },
+        });
+        // Scrub credentials, then hard-gate the save so a live token can never be
+        // persisted to a cassette file.
+        origin_cassette::scrub_secrets(&mut cassette);
+        origin_cassette::assert_redacted(&cassette)
+            .map_err(|e| ProviderError::Api(format!("cassette redaction gate: {e}")))?;
+        let json = cassette
+            .to_json()
+            .map_err(|e| ProviderError::Api(format!("cassette serialize: {e}")))?;
+        std::fs::write(path, json).map_err(|e| ProviderError::Api(format!("cassette write: {e}")))
+    }
+
+    /// Replay the recorded SSE body for a `(method, url)` request from the
+    /// cassette at `path`.
+    ///
+    /// # Errors
+    /// Returns [`ProviderError::Api`] if the cassette cannot be read/parsed, no
+    /// matching interaction exists, or the recorded status is non-OK.
+    pub fn replay(path: &str, method: &str, url: &str, req_body: &str) -> Result<String, ProviderError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| ProviderError::Api(format!("cassette read: {e}")))?;
+        let cassette = Cassette::from_json(&text)
+            .map_err(|e| ProviderError::Api(format!("cassette parse: {e}")))?;
+        let probe = ReqShape {
+            method: method.to_string(),
+            url: url.to_string(),
+            headers: Vec::new(),
+            body: req_body.to_string(),
+        };
+        let interaction = cassette
+            .match_next(&probe)
+            .ok_or_else(|| ProviderError::Api(format!("cassette replay miss for {method} {url}")))?;
+        if interaction.response.status != 200 {
+            return Err(ProviderError::Api(format!(
+                "cassette replay status {}",
+                interaction.response.status
+            )));
+        }
+        Ok(interaction.response.body.clone())
     }
 }
 

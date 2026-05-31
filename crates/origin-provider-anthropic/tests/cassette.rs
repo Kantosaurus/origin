@@ -23,6 +23,7 @@ fn make_req() -> ChatRequest {
         model: "claude-x".to_string(),
         tools: Vec::new(),
         effort: None,
+        thinking_tokens: None,
         attachments: Vec::new(),
     }
 }

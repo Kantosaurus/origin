@@ -331,6 +331,14 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
         .with_plan(wire_plan.clone());
 
     let initial_account = env::var("ORIGIN_ACCOUNT").unwrap_or_else(|_| "default".into());
+    // Register the factory process-wide so the agent loop can rebuild a provider
+    // mid-loop for a CROSS-PROVIDER router pick (foundation L84 / kilo L265). This
+    // is inert unless `ORIGIN_ROUTER` is set and a pick lands on a different
+    // provider; credentials still resolve only through this factory's vault.
+    origin_daemon::provider_factory::set_global(
+        Arc::new(factory.clone()),
+        initial_account.clone(),
+    );
     let initial_provider_str = if let Ok(v) = env::var("ORIGIN_PROVIDER") {
         v
     } else {
@@ -577,6 +585,10 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     // Authenticated HTTP webhook trigger source (ORIGIN_WEBHOOK + _TOKEN); off
     // by default. A POST fires its body as a prompt onto the live agent path.
     origin_daemon::webhook::maybe_spawn(path.clone());
+    // gemini-cli Auto Memory (ORIGIN_MEM_GARDEN=1); off by default. Mines recent
+    // session transcripts on an idle cadence into a secret-redacted review inbox
+    // at ~/.origin/memory-inbox/ for the user to accept/reject.
+    origin_daemon::mem_garden::maybe_spawn(Arc::clone(&session_store));
 
     // Populate the shared `DaemonState` so the cooperative shutdown driver
     // can bind real per-phase callbacks. We do this AFTER each subsystem is
@@ -1178,6 +1190,7 @@ fn spawn_handler_task(
                 | ClientMessage::RemoveSession { .. }
                 | ClientMessage::RewindSession { .. }
                 | ClientMessage::ResumeSession { .. }
+                | ClientMessage::ResumeForeign { .. }
                 | ClientMessage::ExportSession { .. }
                 | ClientMessage::GetUsage
                 | ClientMessage::KeyringAdd { .. }
@@ -1544,6 +1557,9 @@ async fn handle_request(
                 .and_then(origin_provider::ReasoningEffort::from_wire_str),
             // ^ claude-code `/effort`+`/fast`: the CLI sends a canonical token;
             // an unknown token maps to `None` ⇒ wire byte-identical.
+            thinking_tokens: req.thinking_tokens,
+            // ^ aider `--thinking-tokens`: only the Anthropic encoder honours it
+            // (extended thinking with `budget_tokens`); `None` ⇒ wire unchanged.
             attachments: req.attachments.clone(),
             // ^ aider/gemini/claude image+PDF input: applied to turn 1 only.
             system_suffix: (!req.system.is_empty()).then(|| req.system.clone()),
@@ -2393,6 +2409,9 @@ async fn handle_admin(
             },
         },
         ClientMessage::ResumeSession { session_id } => resume_session_event(session_store, &session_id),
+        ClientMessage::ResumeForeign { source, path } => {
+            resume_foreign_event(session_store, &source, &path)
+        }
         ClientMessage::ExportSession { session_id, format } => {
             export_session_event(session_store, &session_id, &format)
         }
@@ -2638,6 +2657,65 @@ fn resume_session_event(session_store: &SessionStore, session_id: &str) -> Strea
     }
 }
 
+/// Build the [`StreamEvent`] reply for a [`ClientMessage::ResumeForeign`].
+///
+/// Cross-harness live resume: map the `source` tag to a
+/// [`SourceKind`](origin_migrate::reconstruct::SourceKind), reconstruct the
+/// foreign transcript at `path` into origin's native message model, then CREATE
+/// a fresh origin session seeded with those messages via the same
+/// `persist_session` + `persist_message` path the live agent loop uses (the
+/// [`persist`] helper). The new session adopts the reconstructed
+/// `suggested_model`. Replies with [`StreamEvent::ForeignResumed`] carrying the
+/// new id + persisted count + model, or [`StreamEvent::AdminError`] on an
+/// unknown source tag, a missing path, or a parse/I-O failure — never panics.
+fn resume_foreign_event(session_store: &SessionStore, source: &str, path: &str) -> StreamEvent {
+    use origin_migrate::reconstruct::{reconstruct_from_path, SourceKind};
+
+    let Some(kind) = SourceKind::from_tag(source) else {
+        return StreamEvent::AdminError {
+            message: format!("unknown foreign source: {source:?} (expected claude-code | jcode | opencode)"),
+        };
+    };
+    // Reject empty paths before touching the filesystem; `reconstruct_from_path`
+    // itself validates existence and surfaces parse/IO failures as SourceError.
+    if path.trim().is_empty() {
+        return StreamEvent::AdminError {
+            message: "empty path for foreign resume".to_string(),
+        };
+    }
+    let resumed = match reconstruct_from_path(kind, std::path::Path::new(path), None) {
+        Ok(r) => r,
+        Err(e) => {
+            return StreamEvent::AdminError {
+                message: format!("reconstruct {source} session at {path}: {e}"),
+            };
+        }
+    };
+
+    // Seed a brand-new origin session with the reconstructed transcript and
+    // persist it through the SAME create+append path the agent loop uses.
+    let mut session = Session::new(String::new(), resumed.suggested_model.clone());
+    session.messages = resumed.messages;
+    persist(session_store, &session);
+
+    // Saturate at u32::MAX — a transcript with >4 G messages is not feasible.
+    #[allow(clippy::cast_possible_truncation)]
+    let messages_loaded = u32::try_from(session.messages.len()).unwrap_or(u32::MAX);
+    info!(
+        source,
+        path,
+        session = %session.id,
+        messages_loaded,
+        suggested_model = %resumed.suggested_model,
+        "resume-foreign: hydrated new session"
+    );
+    StreamEvent::ForeignResumed {
+        session_id: session.id,
+        messages_loaded,
+        suggested_model: resumed.suggested_model,
+    }
+}
+
 /// Serialize `ev` and write it as a single `Event` frame. Mirrors the
 /// pattern used by `handle_switch` for `StreamEvent::ProviderActive`,
 /// but kept as a small helper because P13.2 emits three different
@@ -2860,4 +2938,76 @@ fn spawn_metrics_endpoint(metrics: Metrics, addr: String) {
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resume_foreign_event, SessionStore, StreamEvent};
+
+    /// End-to-end (sans IPC): reconstruct a Claude Code transcript at a path and
+    /// persist it into a fresh origin session. The reply's `messages_loaded`
+    /// must equal the number of rows actually written to the store, and the new
+    /// session must adopt the reconstructed model.
+    #[test]
+    #[allow(clippy::panic)] // test asserts the StreamEvent variant via a panicking else-arm
+    fn resume_foreign_persists_and_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Claude Code harness layout: <root>/projects/<proj>/<id>.jsonl
+        let root = dir.path().join("cc");
+        let proj = root.join("projects").join("demo");
+        std::fs::create_dir_all(&proj).expect("mkdir");
+        let jsonl = "{\"type\":\"human\",\"content\":\"fix the build\"}\n\
+                     {\"type\":\"assistant\",\"content\":\"patching Cargo.toml\"}\n\
+                     {\"type\":\"human\",\"content\":\"now run tests\"}\n";
+        std::fs::write(proj.join("abc.jsonl"), jsonl).expect("write transcript");
+
+        let store = SessionStore::open(dir.path().join("sessions.db")).expect("open store");
+        let ev = resume_foreign_event(&store, "claude-code", &root.display().to_string());
+
+        match ev {
+            StreamEvent::ForeignResumed {
+                session_id,
+                messages_loaded,
+                suggested_model,
+            } => {
+                assert_eq!(messages_loaded, 3, "three transcript turns");
+                assert_eq!(suggested_model, "claude-sonnet-4-6");
+
+                // The persisted row count must match what the reply reported.
+                let persisted = store.load_messages(&session_id).expect("load_messages");
+                assert_eq!(u32::try_from(persisted.len()).expect("fits u32"), messages_loaded);
+                // And the session is listed (resumable) with the reconstructed model.
+                let summary = store
+                    .list_summaries()
+                    .expect("list")
+                    .into_iter()
+                    .find(|s| s.id == session_id)
+                    .expect("new session present");
+                assert_eq!(summary.model, "claude-sonnet-4-6");
+                assert_eq!(summary.message_count, 3);
+            }
+            other => panic!("expected ForeignResumed, got {other:?}"),
+        }
+    }
+
+    /// An unknown source tag must fail with `AdminError` and never persist.
+    #[test]
+    fn resume_foreign_unknown_source_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(dir.path().join("sessions.db")).expect("open store");
+        let ev = resume_foreign_event(&store, "not-a-harness", "/whatever");
+        assert!(matches!(ev, StreamEvent::AdminError { .. }), "got {ev:?}");
+        assert!(store.list_summaries().expect("list").is_empty());
+    }
+
+    /// A missing path must fail with `AdminError` (validated before any read).
+    #[test]
+    fn resume_foreign_missing_path_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(dir.path().join("sessions.db")).expect("open store");
+        let missing = dir.path().join("does-not-exist");
+        let ev = resume_foreign_event(&store, "claude-code", &missing.display().to_string());
+        assert!(matches!(ev, StreamEvent::AdminError { .. }), "got {ev:?}");
+        assert!(store.list_summaries().expect("list").is_empty());
+    }
 }

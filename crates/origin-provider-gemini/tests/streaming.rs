@@ -45,6 +45,7 @@ async fn gemini_streams_text_then_turn_end() {
                 model: "gemini-2.0-flash".into(),
                 tools: vec![],
                 effort: None,
+                thinking_tokens: None,
                 attachments: Vec::new(),
             },
             &r,

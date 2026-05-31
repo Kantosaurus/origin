@@ -13,12 +13,17 @@
 //!   `Plan` (the model is deciding what to do), later turns are `Edit` (applying
 //!   tool results) — so aider's architect/editor split and gemini's phase-aware
 //!   Pro/Flash routing happen turn-by-turn.
-//! * It only overrides the turn's model when the chosen
+//! * The zero-cost path [`choose_model`](LiveRouter::choose_model) overrides the
+//!   turn's model **only** when the chosen
 //!   [`ModelRef`](origin_router::ModelRef)`.provider` matches the **active**
 //!   provider the loop already holds (`run_loop` borrows one `&dyn Provider`).
-//!   Cross-provider picks are skipped — a deliberate, honest constraint: routing
-//!   to a model on a *different* provider would require rebuilding the provider
-//!   mid-loop, which is out of scope for this wire.
+//! * Cross-provider picks are no longer pre-emptively dropped: the lower-level
+//!   [`choose_model_ref`](LiveRouter::choose_model_ref) surfaces the full
+//!   [`ModelRef`](origin_router::ModelRef) (provider + model) so the agent loop
+//!   can decide whether to rebuild a provider for that turn (see
+//!   [`crate::provider_factory::build_provider_for`]). When no factory is
+//!   reachable the loop still falls back to the active provider, so behaviour is
+//!   unchanged for the same-provider case.
 //!
 //! Activation is entirely opt-in via the `ORIGIN_ROUTER` environment variable.
 //! When it is unset, [`global`] returns `None`, [`LoopOptions.router`] stays
@@ -62,16 +67,35 @@ impl LiveRouter {
         }
     }
 
+    /// Pick the full [`ModelRef`] for `turn` — provider **and** model — without
+    /// any same-provider filtering. `None` ⇒ the strategy yielded nothing (an
+    /// exhausted `QuotaFallback` chain or empty `Scored` candidates).
+    ///
+    /// This is the cross-provider-aware primitive: a pick whose `provider`
+    /// differs from the active one is *surfaced* here (it is no longer dropped),
+    /// so the agent loop can rebuild a provider for that turn. Same-provider
+    /// callers that only want the zero-cost override should use
+    /// [`choose_model`](Self::choose_model) instead.
+    ///
+    /// Turn 1 is classified [`Phase::Plan`]; every later turn [`Phase::Edit`].
+    #[must_use]
+    pub fn choose_model_ref(&self, turn: u32) -> Option<ModelRef> {
+        let phase = if turn == 1 { Phase::Plan } else { Phase::Edit };
+        self.inner.lock().ok()?.choose(phase, &self.candidates)
+    }
+
     /// Pick the model for `turn`, returning the model id **only** when the
     /// chosen provider matches `active_provider`. `None` ⇒ the caller keeps
     /// `session.model` (cross-provider pick, exhausted chain, or empty
     /// `Scored` candidates).
     ///
+    /// Convenience wrapper over [`choose_model_ref`](Self::choose_model_ref)
+    /// that preserves the original zero-cost same-provider override path.
+    ///
     /// Turn 1 is classified [`Phase::Plan`]; every later turn [`Phase::Edit`].
     #[must_use]
     pub fn choose_model(&self, turn: u32, active_provider: &str) -> Option<String> {
-        let phase = if turn == 1 { Phase::Plan } else { Phase::Edit };
-        let chosen = self.inner.lock().ok()?.choose(phase, &self.candidates)?;
+        let chosen = self.choose_model_ref(turn)?;
         (chosen.provider == active_provider).then_some(chosen.model)
     }
 
@@ -194,19 +218,35 @@ mod tests {
     }
 
     #[test]
-    fn cross_provider_pick_is_skipped() {
+    fn cross_provider_pick_is_skipped_by_same_provider_helper() {
         let lr = LiveRouter::new(
             Strategy::Fixed(ModelRef::new("gemini", "gemini-2.5-pro")),
             Vec::new(),
         );
-        // Active provider is anthropic but the strategy routes to gemini ⇒ we
-        // must NOT override (the loop holds one anthropic provider).
+        // Active provider is anthropic but the strategy routes to gemini ⇒ the
+        // same-provider helper must NOT override (it cannot reuse the borrowed
+        // anthropic provider for a gemini model).
         assert_eq!(lr.choose_model(1, "anthropic"), None);
         // When the active provider matches, the override applies.
         assert_eq!(
             lr.choose_model(1, "gemini").as_deref(),
             Some("gemini-2.5-pro")
         );
+    }
+
+    #[test]
+    fn cross_provider_pick_is_surfaced_by_choose_model_ref() {
+        let lr = LiveRouter::new(
+            Strategy::Fixed(ModelRef::new("gemini", "gemini-2.5-pro")),
+            Vec::new(),
+        );
+        // The cross-provider-aware primitive surfaces the FULL pick — provider
+        // and model — even though the active loop provider is anthropic. This is
+        // what lets the agent loop rebuild a provider for the turn instead of
+        // silently dropping the pick (the old pre-emptive filter is gone).
+        let chosen = lr.choose_model_ref(1).expect("a Fixed strategy always picks");
+        assert_eq!(chosen.provider, "gemini");
+        assert_eq!(chosen.model, "gemini-2.5-pro");
     }
 
     #[test]

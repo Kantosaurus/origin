@@ -24,6 +24,7 @@ pub async fn run(
         model: model.to_string(),
         tools: Vec::new(),
         effort: None,
+        thinking_tokens: None,
         attachments: Vec::new(),
     };
     let summary = match provider.chat(req).await {

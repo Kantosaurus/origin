@@ -37,6 +37,7 @@ async fn signs_and_invokes_bedrock_model() {
         model: "anthropic.claude-3-haiku-20240307-v1:0".into(),
         tools: vec![],
         effort: None,
+        thinking_tokens: None,
         attachments: Vec::new(),
     };
     let resp = provider.chat(req).await.expect("bedrock chat should succeed");

@@ -57,6 +57,24 @@ impl Style {
         }
     }
 
+    /// Transform an assistant message for display, or hide it.
+    ///
+    /// Returns `Some(rewritten)` to render the (possibly rewritten) text, or
+    /// `None` to suppress the message entirely. Every built-in style is the
+    /// identity transform today — they shape the *prompt* via
+    /// [`Style::system_suffix`], not the *rendered* output — so this returns
+    /// `Some(text.to_owned())` for all variants, keeping rendering
+    /// byte-identical. It exists as the CLI-side seam a future style (or a
+    /// downstream embedder) can override to rewrite or hide displayed text.
+    #[must_use]
+    pub fn display_transform(self, text: &str) -> Option<String> {
+        match self {
+            Self::Default | Self::Explanatory | Self::Learning | Self::Concise => {
+                Some(text.to_owned())
+            }
+        }
+    }
+
     /// Extra system-prompt guidance contributed by this style.
     ///
     /// The daemon appends this to the system prompt. [`Style::Default`] returns
@@ -124,6 +142,24 @@ pub fn apply_display(text: &str, action: &DisplayAction) -> Option<String> {
         DisplayAction::Hide => None,
         DisplayAction::Replace(s) => Some(s.clone()),
     }
+}
+
+/// Resolve the final displayed form of an assistant message.
+///
+/// Composition order, hook-first: a `MessageDisplay` hook (when one fired and
+/// returned an `action`) decides outright — `Show` keeps the text, `Hide`
+/// suppresses it (`None`), `Replace` substitutes. When no hook fired
+/// (`action` is `None`), the active output `style` (or [`Style::Default`] when
+/// `None`) gets to transform via [`Style::display_transform`].
+///
+/// With no hook and the default style this is the identity (`Some(text)`),
+/// keeping rendering byte-identical to the no-style / no-hook path.
+#[must_use]
+pub fn resolve_display(text: &str, style: Option<Style>, action: Option<&DisplayAction>) -> Option<String> {
+    if let Some(action) = action {
+        return apply_display(text, action);
+    }
+    style.unwrap_or_default().display_transform(text)
 }
 
 /// Parse a `MessageDisplay` hook's JSON verdict.
@@ -261,6 +297,52 @@ mod tests {
         assert_eq!(
             apply_display("original", &result.action),
             Some("X".to_string())
+        );
+    }
+
+    #[test]
+    fn display_transform_is_identity_for_every_style() {
+        for style in [
+            Style::Default,
+            Style::Explanatory,
+            Style::Learning,
+            Style::Concise,
+        ] {
+            assert_eq!(
+                style.display_transform("verbatim"),
+                Some("verbatim".to_string()),
+                "{} should be identity",
+                style.label()
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_display_no_hook_no_style_is_identity() {
+        assert_eq!(resolve_display("hi", None, None), Some("hi".to_string()));
+        assert_eq!(
+            resolve_display("hi", Some(Style::Concise), None),
+            Some("hi".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_display_hook_wins_over_style() {
+        // Hide hook suppresses regardless of style.
+        assert_eq!(
+            resolve_display("secret", Some(Style::Default), Some(&DisplayAction::Hide)),
+            None
+        );
+        // Replace hook rewrites.
+        let replace = DisplayAction::Replace("[redacted]".to_string());
+        assert_eq!(
+            resolve_display("secret", None, Some(&replace)),
+            Some("[redacted]".to_string())
+        );
+        // Show hook keeps the original.
+        assert_eq!(
+            resolve_display("keep", None, Some(&DisplayAction::Show)),
+            Some("keep".to_string())
         );
     }
 }

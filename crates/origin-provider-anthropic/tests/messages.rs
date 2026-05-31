@@ -43,6 +43,7 @@ async fn calls_anthropic_messages_endpoint() {
         model: "claude-opus-4-7".into(),
         tools: vec![],
         effort: None,
+        thinking_tokens: None,
         attachments: Vec::new(),
     };
     let resp = provider.chat(req).await.expect("anthropic chat should succeed");
@@ -76,6 +77,7 @@ async fn auth_error_maps_to_provider_auth() {
             model: "x".into(),
             tools: vec![],
             effort: None,
+            thinking_tokens: None,
             attachments: Vec::new(),
         })
         .await

@@ -56,3 +56,22 @@ pub fn compact(input: &CompactionInput<'_>) -> CompactionOutput {
         compacted_indices: compacted,
     }
 }
+
+/// Compact `input`, firing a `PreCompress` lifecycle hook first.
+///
+/// Wraps the pure [`compact`] with a best-effort `PreCompress` fire (gemini /
+/// claude `PreCompact`): when `~/.origin/hooks.json` configures a hook, it is
+/// notified of the transcript size just before compaction; with no hooks the
+/// fire is a no-op and this is byte-identical to calling [`compact`] directly.
+///
+/// The hook is informational — its override is ignored — so compaction always
+/// proceeds. This is the firing site any runtime compaction call should adopt.
+pub async fn compact_with_hooks(input: &CompactionInput<'_>) -> CompactionOutput {
+    if let Some(h) = crate::hooks_runtime::global().await {
+        let current_bytes = u64::try_from(input.current_bytes).unwrap_or(u64::MAX);
+        let _ = h
+            .fire(&origin_hooks::LifecycleEvent::PreCompress { current_bytes })
+            .await;
+    }
+    compact(input)
+}
