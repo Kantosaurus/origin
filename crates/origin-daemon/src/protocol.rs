@@ -46,6 +46,14 @@ pub struct PromptRequest {
     /// Surfaced to the model via a `<workspace-roots>` system-prompt block.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roots: Vec<String>,
+    /// Opt-in interactive permission prompting. When `true`, the daemon routes
+    /// `RequiresPermission` tools (Bash/Write/Edit/…) through an IPC prompter
+    /// that emits [`StreamEvent::PermissionAsk`] and waits for the client's
+    /// [`ClientMessage::PermissionDecision`] before running the tool. `false`
+    /// (the default) keeps the historical auto-allow behaviour, so the wire and
+    /// tool execution are byte-identical. Headless/swarm never set this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub permission_ask: bool,
 }
 
 /// Request to rebuild the code graph over a set of paths.
@@ -89,6 +97,11 @@ pub struct PromptReply {
 pub enum ClientMessage {
     /// A user prompt to run through the agent loop.
     Prompt(PromptRequest),
+    /// Client's answer to a [`StreamEvent::PermissionAsk`], correlated by `id`.
+    /// `allow == false` denies the tool. Sent mid-turn over the same connection
+    /// serving the prompt (like [`ClientMessage::Interrupt`]). Only produced
+    /// when the turn opted into [`PromptRequest::permission_ask`].
+    PermissionDecision { id: u64, allow: bool },
     /// Hot-swap the active provider/account credential without restarting
     /// the daemon.
     SwitchAccount { provider: String, account_id: String },
@@ -284,6 +297,20 @@ pub enum StreamEvent {
         elided_bytes: u32,
     },
     TurnEnd,
+    /// Opt-in interactive permission ask (gated by
+    /// [`PromptRequest::permission_ask`]). Emitted before a `RequiresPermission`
+    /// tool runs; the daemon then blocks on the matching
+    /// [`ClientMessage::PermissionDecision`] (correlated by `id`). Never emitted
+    /// in the default (auto-allow) path, so default streams are byte-identical.
+    PermissionAsk {
+        /// Correlation id, unique within a turn. Echoed back in the decision.
+        id: u64,
+        /// Tool name (e.g. `Bash`, `Write`).
+        tool: String,
+        /// Truncated, human-readable preview of the tool arguments (the command
+        /// or path) so the user sees *what* they are approving.
+        args_preview: String,
+    },
     /// Emitted after a successful `ClientMessage::SwitchAccount` so the CLI
     /// can confirm the new provider/account is in effect for subsequent
     /// prompts.
@@ -534,4 +561,50 @@ pub enum ServerMessage {
         session_id: String,
         restored_to_turn: u32,
     },
+}
+
+#[cfg(test)]
+mod permission_wire_tests {
+    use super::*;
+
+    #[test]
+    fn permission_ask_event_round_trips() {
+        let ev = StreamEvent::PermissionAsk {
+            id: 7,
+            tool: "Bash".to_string(),
+            args_preview: "rm -rf build/".to_string(),
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(json.contains("\"kind\":\"permission_ask\""), "tagged on kind: {json}");
+        let back: StreamEvent = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            StreamEvent::PermissionAsk { id, tool, args_preview } => {
+                assert_eq!(id, 7);
+                assert_eq!(tool, "Bash");
+                assert_eq!(args_preview, "rm -rf build/");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn permission_decision_message_round_trips() {
+        let msg = ClientMessage::PermissionDecision { id: 7, allow: true };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let back: ClientMessage = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(back, ClientMessage::PermissionDecision { id: 7, allow: true }));
+    }
+
+    #[test]
+    fn permission_ask_defaults_off_and_is_omitted_when_false() {
+        // Byte-identical default: a request that never opts in must not emit the
+        // `permission_ask` key at all (skip_serializing_if).
+        let req = PromptRequest {
+            user_text: "hi".to_string(),
+            ..Default::default()
+        };
+        assert!(!req.permission_ask);
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(!json.contains("permission_ask"), "default request omits the flag: {json}");
+    }
 }

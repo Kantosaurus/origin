@@ -1439,6 +1439,9 @@ async fn call_daemon(
         attachments,
         read_only,
         roots,
+        // Wired to the session opt-in in a later step; default off keeps the
+        // request byte-identical and the daemon on the auto-allow path.
+        permission_ask: false,
     });
     let body = serde_json::to_vec(&msg)?;
     let frame = encode(1, FrameKind::Request, &body);

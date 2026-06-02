@@ -1071,6 +1071,12 @@ fn spawn_handler_task(
                 ClientMessage::SubscribePlan => {
                     spawn_plan_relay(plan_bus.subscribe(), Arc::clone(&conn));
                 }
+                ClientMessage::PermissionDecision { .. } => {
+                    // A decision reaching the OUTER loop has no in-flight ask to
+                    // resolve (the mid-turn case is routed by the prompt driver's
+                    // frame peek). Drop a stray/late decision so it can never
+                    // block or mis-resolve a future ask.
+                }
                 ClientMessage::Interrupt => {
                     // When `Interrupt` lands in the OUTER loop it means
                     // the previous `Prompt` already finished (or there
@@ -2461,6 +2467,7 @@ async fn handle_admin(
         | ClientMessage::ClearAll
         | ClientMessage::ActivateSkill { .. }
         | ClientMessage::DeactivateSkill { .. }
+        | ClientMessage::PermissionDecision { .. }
         | ClientMessage::ActivateWorkflow { .. } => return true,
     };
     write_event(conn, &ev).await.is_ok()
