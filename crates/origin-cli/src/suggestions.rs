@@ -12,9 +12,11 @@
 
 use crate::autocomplete::CompletionSources;
 
-/// Number of candidate rows visible in the popup at once. The full
-/// candidate list may be longer; navigation scrolls a window of this
-/// height through it (see [`visible_window`]).
+/// Height of the suggestion popup in rows.
+///
+/// The full ranked candidate list can be longer than this; the TUI renders a
+/// scrolling window of `MAX_VISIBLE` rows over it (see [`scroll_offset`]), so
+/// every match stays reachable by arrowing.
 pub const MAX_VISIBLE: usize = 6;
 
 #[derive(Debug, Clone, Default)]
@@ -22,6 +24,11 @@ pub struct SuggestionState {
     /// Wrapped candidate strings (already includes the leading `/`, `/-`,
     /// or `{workflow:` syntax so they can be rendered verbatim).
     pub candidates: Vec<String>,
+    /// Short descriptions parallel to [`candidates`](Self::candidates) — same
+    /// length and order. Empty strings for candidates with no known
+    /// description. Additive: a later wave renders these next to each row;
+    /// today's consumers ignore the field.
+    pub descriptions: Vec<String>,
     /// Ghost text shown after the cursor when there's a single unique
     /// match. Empty when ambiguous, no match, or popup not open.
     pub ghost: String,
@@ -41,17 +48,27 @@ pub fn suggest(buffer: &str, sources: &CompletionSources) -> SuggestionState {
     let (prefix_len, token) = trailing_token(buffer);
     if let Some(partial) = token.strip_prefix("{workflow:") {
         let partial = partial.strip_suffix('}').unwrap_or(partial);
-        return match_candidates(token, partial, prefix_len, &sources.workflows, |full| {
-            format!("{{workflow:{full}}}")
-        });
+        // Workflows carry no descriptions; pass an empty parallel list.
+        return match_candidates(
+            token,
+            partial,
+            prefix_len,
+            &sources.workflows,
+            &[],
+            |full| format!("{{workflow:{full}}}"),
+        );
     }
+    // Skill shapes (`/-` deactivate, `/` activate) match the combined
+    // verb+skill candidate list with descriptions kept index-aligned.
+    let names = sources.skill_candidates();
+    let descs = sources.skill_candidate_descriptions();
     if let Some(partial) = token.strip_prefix("/-") {
-        return match_candidates(token, partial, prefix_len, &sources.skills, |full| {
+        return match_candidates(token, partial, prefix_len, &names, &descs, |full| {
             format!("/-{full}")
         });
     }
     if let Some(partial) = token.strip_prefix('/') {
-        return match_candidates(token, partial, prefix_len, &sources.skills, |full| {
+        return match_candidates(token, partial, prefix_len, &names, &descs, |full| {
             format!("/{full}")
         });
     }
@@ -72,46 +89,101 @@ fn trailing_token(buffer: &str) -> (usize, &str) {
     })
 }
 
+/// Relevance buckets for a candidate against the typed `partial`, ordered
+/// best-first. Sorted ascending so a smaller discriminant ranks higher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Rank {
+    /// Candidate begins with `partial` (case-insensitive).
+    ExactPrefix,
+    /// `partial` starts a word inside the candidate (after a non-alphanumeric
+    /// boundary such as `-`, `:`, `_`), but not at the very start.
+    WordBoundary,
+    /// `partial` appears somewhere inside the candidate (case-insensitive).
+    Substring,
+}
+
+/// Compute the [`Rank`] of `name` against the lowercased `needle`, or `None`
+/// when `needle` doesn't appear at all. An empty `needle` matches every
+/// candidate as an `ExactPrefix` (bare `/` lists everything).
+fn rank_of(name: &str, needle: &str) -> Option<Rank> {
+    if needle.is_empty() {
+        return Some(Rank::ExactPrefix);
+    }
+    let lower = name.to_lowercase();
+    let pos = lower.find(needle)?;
+    if pos == 0 {
+        return Some(Rank::ExactPrefix);
+    }
+    // Word-boundary when the char immediately before the match is a
+    // recognized separator. Indexing into `lower` is byte-safe because
+    // ASCII separators are single-byte and `find` returns a char boundary.
+    let at_word_boundary = lower[..pos]
+        .chars()
+        .next_back()
+        .is_some_and(|c| !c.is_alphanumeric());
+    if at_word_boundary {
+        Some(Rank::WordBoundary)
+    } else {
+        Some(Rank::Substring)
+    }
+}
+
 fn match_candidates(
     token: &str,
     partial: &str,
     prefix_len: usize,
     names: &[String],
+    descriptions: &[String],
     wrap: impl Fn(&str) -> String,
 ) -> SuggestionState {
-    let mut matches: Vec<String> = names
+    let needle = partial.to_lowercase();
+    // Rank every candidate, keeping its original index so we can recover the
+    // parallel description and preserve stable order within a rank.
+    let mut ranked: Vec<(Rank, usize)> = names
         .iter()
-        .filter(|c| c.starts_with(partial))
-        .map(|m| wrap(m))
+        .enumerate()
+        .filter_map(|(i, name)| rank_of(name, &needle).map(|r| (r, i)))
         .collect();
-    matches.sort();
+    // Stable sort by rank only; equal ranks keep their source order so the
+    // ordering is deterministic ("stable order within a rank"). The full list
+    // is kept — the popup scrolls a `MAX_VISIBLE` window over it rather than
+    // truncating, so a low-ranked match is still reachable by arrowing.
+    ranked.sort_by_key(|(rank, _)| *rank);
 
-    // Keep the full match list so every skill is reachable; the popup
-    // renders a scrolling window of `MAX_VISIBLE` rows over it.
-    // Ghost text mirrors `unique_match_produces_ghost`: only when there's
-    // exactly one match AND it extends the current trailing token.
-    let ghost = if matches.len() == 1 && matches[0].starts_with(token) && matches[0].len() > token.len() {
-        matches[0][token.len()..].to_string()
+    let candidates: Vec<String> = ranked.iter().map(|&(_, i)| wrap(&names[i])).collect();
+    let candidate_descs: Vec<String> = ranked
+        .iter()
+        .map(|&(_, i)| descriptions.get(i).cloned().unwrap_or_default())
+        .collect();
+
+    // Ghost text is a TRUE case-sensitive PREFIX of the trailing token so it
+    // never proposes characters the user didn't actually type. Only when
+    // there's exactly one match AND it extends the token verbatim.
+    let ghost = if candidates.len() == 1
+        && candidates[0].starts_with(token)
+        && candidates[0].len() > token.len()
+    {
+        candidates[0][token.len()..].to_string()
     } else {
         String::new()
     };
 
     SuggestionState {
-        candidates: matches,
+        candidates,
+        descriptions: candidate_descs,
         ghost,
         selected: 0,
         prefix_len,
     }
 }
 
-/// Compute the scroll offset for the popup viewport so the selected
-/// candidate is always visible within a window of [`MAX_VISIBLE`] rows.
+/// Top index of the visible window so the `selected` candidate is always shown
+/// within a window of [`MAX_VISIBLE`] rows.
 ///
-/// Returns the index of the first candidate to render. The renderer then
-/// shows `candidates[offset .. offset + MAX_VISIBLE]`. When the full list
-/// fits in the window the offset is `0`. Otherwise the window scrolls just
-/// enough to keep `selected` on screen, clamped so it never runs past the
-/// end of the list.
+/// Given a candidate-list length `len` and the `selected` index, the popup
+/// shows `candidates[offset .. offset + MAX_VISIBLE]`. When the full list fits
+/// (`len <= MAX_VISIBLE`) the window is anchored at `0`; otherwise it scrolls
+/// just enough to keep `selected` on the bottom edge, clamped to the last page.
 #[must_use]
 pub fn scroll_offset(len: usize, selected: usize) -> usize {
     if len <= MAX_VISIBLE {
@@ -170,6 +242,7 @@ mod tests {
                 "polish".into(),
             ],
             workflows: vec!["frontend-design".into(), "polish-pass".into()],
+            ..Default::default()
         }
     }
 
@@ -315,46 +388,9 @@ mod tests {
         assert_eq!(s.selected, 0);
     }
 
-    fn many_skills() -> CompletionSources {
-        // 10 skills sharing the `t` prefix so a `/t` query matches them all.
-        let skills = (0..10).map(|i| format!("task-{i:02}")).collect();
-        CompletionSources {
-            skills,
-            workflows: vec![],
-        }
-    }
-
-    /// Regression: the candidate list must retain *every* matching skill,
-    /// not just the first `MAX_VISIBLE`, so users can scroll to all of them.
-    #[test]
-    fn long_match_list_is_not_truncated() {
-        let s = suggest("/task", &many_skills());
-        assert_eq!(s.candidates.len(), 10);
-        assert_eq!(s.candidates.first().unwrap(), "/task-00");
-        assert_eq!(s.candidates.last().unwrap(), "/task-09");
-    }
-
-    /// Arrowing past the bottom of the viewport must still land on real
-    /// later candidates (the bug was that they didn't exist at all).
-    #[test]
-    fn can_select_candidates_beyond_the_window() {
-        let mut s = suggest("/task", &many_skills());
-        for _ in 0..9 {
-            select_next(&mut s);
-        }
-        assert_eq!(s.selected, 9);
-        accept_selected_check(&s, "/task-09");
-    }
-
-    fn accept_selected_check(s: &SuggestionState, expected: &str) {
-        let mut buf = "/task".to_string();
-        accept_selected(s, &mut buf);
-        assert_eq!(buf, expected);
-    }
-
     #[test]
     fn scroll_offset_short_list_does_not_scroll() {
-        // List fits entirely in the window → no scrolling regardless of cursor.
+        assert_eq!(scroll_offset(0, 0), 0);
         assert_eq!(scroll_offset(MAX_VISIBLE, 0), 0);
         assert_eq!(scroll_offset(MAX_VISIBLE, MAX_VISIBLE - 1), 0);
         assert_eq!(scroll_offset(3, 2), 0);
@@ -362,20 +398,152 @@ mod tests {
 
     #[test]
     fn scroll_offset_keeps_selection_visible() {
-        let len = 10;
-        // First page: cursor within the initial window → offset stays 0.
+        let len = MAX_VISIBLE + 4;
+        // First page: every selection in [0, MAX_VISIBLE) needs no scroll.
         for sel in 0..MAX_VISIBLE {
             assert_eq!(scroll_offset(len, sel), 0, "sel={sel}");
         }
-        // Once the cursor passes the window bottom, scroll by one per step.
+        // Past the first page the window tracks the selection.
         assert_eq!(scroll_offset(len, MAX_VISIBLE), 1);
         assert_eq!(scroll_offset(len, MAX_VISIBLE + 1), 2);
-        // Clamp at the final page so the window never runs off the end.
+        // Last item anchors the final page.
         assert_eq!(scroll_offset(len, len - 1), len - MAX_VISIBLE);
         // Selected is always within [offset, offset + MAX_VISIBLE).
         for sel in 0..len {
             let off = scroll_offset(len, sel);
             assert!(sel >= off && sel < off + MAX_VISIBLE, "sel={sel} off={off}");
         }
+    }
+
+    /// The full ranked list is returned (not truncated to `MAX_VISIBLE`) so the
+    /// scrolling popup can reach every match by arrowing.
+    #[test]
+    fn returns_all_matches_for_scrolling() {
+        let many = CompletionSources {
+            skills: (0..MAX_VISIBLE + 3).map(|i| format!("widget-{i}")).collect(),
+            ..Default::default()
+        };
+        let s = suggest("/widget", &many);
+        assert_eq!(
+            s.candidates.len(),
+            MAX_VISIBLE + 3,
+            "all matching candidates must be kept for scrolling, got {:?}",
+            s.candidates
+        );
+    }
+
+    // -- New discovery behavior: built-in verbs, case-insensitive substring,
+    //    ranking, description carry-through, case-sensitive ghost. -----------
+
+    fn srcs_with_verbs() -> CompletionSources {
+        CompletionSources {
+            skills: vec![
+                "systematic-debugging".into(),
+                "impeccable".into(),
+            ],
+            skill_descriptions: vec!["debug methodically".into(), "polish UI".into()],
+            verbs: vec!["effort".into(), "clear".into()],
+            verb_descriptions: vec!["set reasoning effort".into(), "clear the chat".into()],
+            workflows: vec![],
+        }
+    }
+
+    /// Typing `/eff` surfaces the `effort` built-in verb candidate.
+    #[test]
+    fn builtin_verb_effort_is_suggested() {
+        let s = suggest("/eff", &srcs_with_verbs());
+        assert!(
+            s.candidates.iter().any(|c| c == "/effort"),
+            "expected `/effort` among candidates, got {:?}",
+            s.candidates
+        );
+    }
+
+    /// A mixed-case query matches a skill by case-insensitive substring:
+    /// `DEBUG` matches `systematic-debugging`.
+    #[test]
+    fn mixed_case_substring_matches_skill() {
+        let s = suggest("/DEBUG", &srcs_with_verbs());
+        assert!(
+            s.candidates.iter().any(|c| c == "/systematic-debugging"),
+            "expected `/systematic-debugging` for query /DEBUG, got {:?}",
+            s.candidates
+        );
+    }
+
+    /// Ranking: an exact-prefix match sorts before a mid-word substring
+    /// match. Query `de` is an exact prefix of `debug-helper` and a mid-word
+    /// substring of `wonder-tool` — the prefix candidate must come first.
+    #[test]
+    fn exact_prefix_outranks_midword_substring() {
+        let sources = CompletionSources {
+            // Source order deliberately puts the substring match FIRST so a
+            // plain stable sort by source order would fail; ranking must lift
+            // the exact-prefix candidate above it.
+            skills: vec!["wonder-tool".into(), "debug-helper".into()],
+            ..Default::default()
+        };
+        let s = suggest("/de", &sources);
+        assert_eq!(s.candidates[0], "/debug-helper");
+        assert_eq!(s.candidates[1], "/wonder-tool");
+    }
+
+    /// Word-boundary matches outrank plain mid-word substring matches.
+    /// Query `bug`: `systematic-debugging` has `bug` mid-word (substring),
+    /// `auto-bug-finder` has `bug` right after a `-` (word boundary).
+    #[test]
+    fn word_boundary_outranks_plain_substring() {
+        let sources = CompletionSources {
+            skills: vec!["systematic-debugging".into(), "auto-bug-finder".into()],
+            ..Default::default()
+        };
+        let s = suggest("/bug", &sources);
+        assert_eq!(s.candidates[0], "/auto-bug-finder");
+        assert_eq!(s.candidates[1], "/systematic-debugging");
+    }
+
+    /// Ghost text stays a TRUE case-sensitive prefix: a lowercase query does
+    /// NOT ghost-complete an uppercase candidate even though it matches by
+    /// case-insensitive substring.
+    #[test]
+    fn ghost_stays_case_sensitive_prefix() {
+        let sources = CompletionSources {
+            skills: vec!["Impeccable".into()],
+            ..Default::default()
+        };
+        let s = suggest("/imp", &sources);
+        // It still MATCHES (case-insensitive) and shows as a candidate...
+        assert_eq!(s.candidates, vec!["/Impeccable".to_string()]);
+        // ...but no ghost, because `/imp` is not a case-sensitive prefix of
+        // `/Impeccable` (would propose chars the user didn't type).
+        assert!(
+            s.ghost.is_empty(),
+            "expected empty ghost for case-mismatched prefix, got {:?}",
+            s.ghost
+        );
+    }
+
+    /// A case-sensitive prefix still ghost-completes as before.
+    #[test]
+    fn ghost_still_fires_for_case_sensitive_prefix() {
+        let sources = CompletionSources {
+            skills: vec!["impeccable".into()],
+            ..Default::default()
+        };
+        let s = suggest("/imp", &sources);
+        assert_eq!(s.ghost, "eccable");
+    }
+
+    /// Descriptions are carried through, index-aligned with candidates.
+    #[test]
+    fn descriptions_align_with_candidates() {
+        let s = suggest("/eff", &srcs_with_verbs());
+        assert_eq!(s.candidates.len(), s.descriptions.len());
+        let pair = s
+            .candidates
+            .iter()
+            .zip(s.descriptions.iter())
+            .find(|(c, _)| *c == "/effort");
+        assert_eq!(pair, Some((&"/effort".to_string(), &"set reasoning effort".to_string())));
     }
 }

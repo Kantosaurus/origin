@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, MouseEventKind};
+use crossterm::cursor::{Hide, Show};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt as _;
@@ -15,7 +18,7 @@ use origin_cli::cli_def::{Cli, Cmd, KeyringSub, PairSub, ProvidersSub, SessionsS
 use origin_cli::goal_render::render_goal_event;
 use origin_cli::input::{
     parse_clear_command, parse_mem_command, parse_model_command, parse_skill_command, parse_workflow_command,
-    reduce, InputAction,
+    permission_answer, reduce_editor, InputAction,
 };
 use origin_cli::plan_panel_wiring::Wiring as PlanPanelWiring;
 use origin_cli::tui::App;
@@ -290,6 +293,33 @@ fn import_subcommand(a: &origin_cli::import::ImportArgs) -> Result<()> {
     Ok(())
 }
 
+/// Best-effort restore of the terminal to its pre-TUI state. Idempotent and
+/// error-swallowing so it is safe to call from a panic hook, a `Drop` guard, and
+/// the normal exit path. Reverses the setup in [`run`] (raw mode + alternate
+/// screen + mouse capture + hidden cursor).
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
+    );
+}
+
+/// RAII guard that restores the terminal on drop — covering early `?` returns
+/// and unwinding panics, which the linear teardown at the end of [`run`] would
+/// otherwise skip (leaving the shell in raw mode / alt screen / mouse capture,
+/// forcing the user to blindly type `reset`).
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
 async fn run() -> Result<()> {
     run_self_update().await?;
 
@@ -375,7 +405,13 @@ async fn run() -> Result<()> {
         || raw_model.clone(),
         |c| origin_cli::config::resolve_alias(&c.aliases, &raw_model),
     );
-    let session_id = format!("{:032x}", rand::random::<u128>());
+    // `--resume <id>` reuses a prior session id; the daemon rehydrates that
+    // session's transcript on the first prompt (see handle_request →
+    // load_messages), so the model picks up where it left off. Default: fresh.
+    let resuming = cli.resume.clone();
+    let session_id = resuming
+        .clone()
+        .unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
 
     // Quickstart docs promise auto-spawn: stand up `origin-daemon` as a
     // detached child if nothing is listening on the IPC path yet, and wait
@@ -383,8 +419,26 @@ async fn run() -> Result<()> {
     // (Doing this before `enable_raw_mode` keeps spawn errors readable.)
     ensure_daemon_running(&path, &default_provider, &default_account).await?;
 
+    // Restore the terminal before the default panic handler prints, so a
+    // backtrace lands on the normal screen instead of a corrupted raw-mode one.
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_panic(info);
+    }));
     enable_raw_mode()?;
-    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    // Guard restores the terminal on ANY scope exit (early `?`, panic, normal).
+    let terminal_guard = TerminalGuard;
+    // `Hide` the hardware cursor: the renderer paints its own caret, and without
+    // this the real cursor teleports to the last damage run (the status line)
+    // and jitters there on every 80 ms heartbeat tick.
+    execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        Hide
+    )?;
 
     let (composer, widget, app) = setup_tui(default_provider, &model);
     // Seed the session reasoning-effort from the startup `--effort` flag.
@@ -394,6 +448,15 @@ async fn run() -> Result<()> {
     // Seed extra workspace roots from the startup `--root` flags (cline multi-root).
     if !cli.root.is_empty() {
         app.lock().workspace_roots.clone_from(&cli.root);
+    }
+    // Note a resumed session so the empty scrollback doesn't look like a fresh
+    // start — the daemon will rehydrate the transcript on the first prompt.
+    if let Some(id) = &resuming {
+        let short: String = id.chars().take(8).collect();
+        app.lock().add_line(
+            "system> ",
+            &format!("resumed session {short}\u{2026} \u{2014} the model will recall the earlier conversation"),
+        );
     }
 
     // First-run discovery: if `origin init`'s welcome flow queued a pending
@@ -413,6 +476,9 @@ async fn run() -> Result<()> {
     // `composer`/`widget` are not used after the render task takes them, so
     // move them in directly; `app`/`plan_panel`/`handle` are still needed
     // below, so those are cloned.
+    // Keep a composer handle for the event loop's resize arm; the render task
+    // takes its own clone (it's an Arc<Mutex<…>>, so both share one composer).
+    let composer_for_events = Arc::clone(&composer);
     let render_task = spawn_render_task(scheduler, composer, app.clone(), widget, plan_panel.clone());
 
     spawn_stall_watchdog(app.clone(), handle.clone());
@@ -420,11 +486,13 @@ async fn run() -> Result<()> {
     // Auto-fire the pending discovery prompt now that the TUI is wired up.
     fire_pending_prompt(pending_prompt, &app, &handle, &path, &mut model, &session_id).await;
 
-    let result = run_event_loop(app, handle, &path, &mut model, &session_id, plan_panel).await;
+    let result =
+        run_event_loop(app, handle, &path, &mut model, &session_id, plan_panel, composer_for_events).await;
 
     render_task.abort();
-    disable_raw_mode()?;
-    execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+    // Restore now (before the farewell) so "bye" prints on the normal screen;
+    // the guard's `Drop` afterward is then an idempotent no-op safety net.
+    drop(terminal_guard);
     // Localized farewell on a clean TUI exit (item A; origin-i18n locale from
     // $LC_ALL/$LANG, English fallback). Only on the Ok path so error output is
     // unchanged.
@@ -476,15 +544,18 @@ fn spawn_render_task(
         scheduler
             .run(move || {
                 let bytes = {
+                    // Snapshot the plan first; the side panel is shown exactly
+                    // when there is a plan to show (the panel was wired but
+                    // `side_visible` stayed false forever, so it never appeared).
+                    let lines = plan_panel.lock().render();
+                    let pal = app.lock().palette();
                     let mut c = composer.lock();
                     let mut w = widget.lock();
+                    // Reflows only on the hidden↔visible transition.
+                    c.set_side_visible(!lines.is_empty());
                     app.lock().draw(&mut c, &mut w);
                     if c.side_visible() {
-                        // Hold the plan-panel guard only for `render()` (it
-                        // drops at the end of this statement, before draw_side)
-                        // to keep lock contention off the hot render path.
-                        let lines = plan_panel.lock().render();
-                        origin_cli::tui::draw_side(c.side_grid(), &lines);
+                        origin_cli::tui::draw_side(c.side_grid(), &lines, pal);
                     }
                     c.frame()
                 };
@@ -514,18 +585,21 @@ fn spawn_stall_watchdog(app: SharedApp, handle: Handle) {
             let mut a = app.lock();
             if !a.spinner.active {
                 quiet_since = None;
-                a.stall_secs = None;
+                a.stall = None;
                 continue;
             }
             let sig = a.activity_signature();
             if sig == last_sig {
                 let since = *quiet_since.get_or_insert_with(std::time::Instant::now);
-                a.stall_secs =
-                    origin_cli::tui::stall_seconds(since.elapsed(), origin_cli::tui::STALL_WARN_AFTER);
+                a.stall = origin_cli::tui::stall_tier(
+                    since.elapsed(),
+                    origin_cli::tui::STALL_SOFT_AFTER,
+                    origin_cli::tui::STALL_WARN_AFTER,
+                );
             } else {
                 last_sig = sig;
                 quiet_since = Some(std::time::Instant::now());
-                a.stall_secs = None;
+                a.stall = None;
             }
             drop(a);
             handle.mark_dirty();
@@ -570,6 +644,7 @@ async fn run_event_loop(
     model: &mut String,
     session_id: &str,
     plan_panel: Arc<Mutex<PlanPanelWiring>>,
+    composer: SharedComposer,
 ) -> Result<()> {
     spawn_plan_subscription(path.to_string(), Arc::clone(&plan_panel), handle.clone());
     // Bug #5: shared slot holding the current `call_daemon`'s interrupt
@@ -583,6 +658,18 @@ async fn run_event_loop(
     let mut input_stream = crossterm::event::EventStream::new();
     while let Some(maybe_ev) = input_stream.next().await {
         let event = maybe_ev?;
+        // Terminal resize: reflow the composer's grids to the new size. Without
+        // this the grid stays frozen at launch size and scribbles past the new
+        // bounds. The draw routine re-wraps scrollback to the new width and
+        // clamps scroll on the next frame.
+        if let crossterm::event::Event::Resize(cols, rows) = event {
+            let mut c = composer.lock();
+            let side_visible = c.side_visible();
+            c.resize(cols, rows, side_visible);
+            drop(c);
+            handle.mark_dirty();
+            continue;
+        }
         // Mouse wheel scroll: drive the scrollback offset directly. Each
         // wheel tick advances by ~3 visual rows, matching the Shift+Arrow
         // handler below. Other mouse events (clicks, drag) are ignored.
@@ -598,6 +685,19 @@ async fn run_event_loop(
                 }
                 _ => {}
             }
+            continue;
+        }
+        // Bracketed paste: the terminal delivers the whole clipboard as one
+        // event, so a multi-line paste no longer streams key-by-key (where the
+        // first embedded newline would fire a truncated Submit). Append it
+        // verbatim (normalizing CR/CRLF to LF) in one shot, then one recompute.
+        if let crossterm::event::Event::Paste(pasted) = &event {
+            let normalized = pasted.replace("\r\n", "\n").replace('\r', "\n");
+            let mut a = app.lock();
+            a.input.insert_str(&normalized);
+            a.recompute_suggestions();
+            drop(a);
+            handle.mark_dirty();
             continue;
         }
         if let crossterm::event::Event::Key(ev) = event {
@@ -620,6 +720,15 @@ enum KeyOutcome {
 /// Handle one decoded key event. Returns [`KeyOutcome::Break`] only for the
 /// quit path; every other branch returns [`KeyOutcome::Continue`], matching
 /// the `continue`/fall-through behaviour of the original inline `match`.
+/// The input card's text width, derived from the current terminal size — used
+/// by the editor reducer for visual Home/End and Up/Down across wrapped lines.
+/// Mirrors the card geometry in `App::draw`.
+fn input_text_width() -> usize {
+    let cols = crossterm::terminal::size().map_or(80, |(c, _)| c);
+    let card_w = 75u16.min(cols.saturating_sub(4));
+    usize::from(card_w.saturating_sub(2))
+}
+
 async fn handle_key_event(
     ev: crossterm::event::KeyEvent,
     app: &SharedApp,
@@ -644,11 +753,37 @@ async fn handle_key_event(
         return outcome;
     }
 
+    // Pending permission ask (opt-in `/permissions`): y/n/Esc answers it. The
+    // decision is sent on a FRESH connection so the daemon's registry can
+    // resolve it (the turn's connection is busy streaming). Other keys fall
+    // through to normal handling; a no-op when nothing is pending.
+    if app.lock().pending_permission.is_some() {
+        if let Some(allow) = permission_answer(ev.code) {
+            let pending = app.lock().pending_permission.take();
+            if let Some(p) = pending {
+                let _ = send_decision(
+                    path,
+                    &ClientMessage::PermissionDecision { id: p.id, allow },
+                )
+                .await;
+                let verb = if allow { "allowed" } else { "denied" };
+                app.lock()
+                    .add_line("system> ", &format!("{verb}: {} {}", p.tool, p.args));
+            }
+            handle.mark_dirty();
+            return KeyOutcome::Continue;
+        }
+    }
+
     if matches!(ev.code, crossterm::event::KeyCode::Tab) {
         let mut a = app.lock();
         if !a.suggestions.candidates.is_empty() {
             let suggestions = a.suggestions.clone();
-            origin_cli::suggestions::accept_selected(&suggestions, &mut a.input);
+            // accept_selected works on a String; round-trip through the editor
+            // (set_buffer places the cursor at the end of the accepted text).
+            let mut buf = a.input.buffer().to_string();
+            origin_cli::suggestions::accept_selected(&suggestions, &mut buf);
+            a.input.set_buffer(buf);
             a.recompute_suggestions();
         }
         drop(a);
@@ -663,7 +798,7 @@ async fn handle_key_event(
         // or a goal indicator is visible. Either case means
         // Ctrl+C should send Interrupt instead of quitting.
         let op_in_flight = a.spinner.active || a.goal_status.is_some();
-        reduce(&mut a.input, ev, op_in_flight)
+        reduce_editor(&mut a.input, ev, op_in_flight, input_text_width())
     };
     handle_input_action(action, app, handle, interrupt_tx, path, model, session_id).await
 }
@@ -791,6 +926,18 @@ async fn handle_input_action(
 /// polling input and can deliver a Ctrl+C interrupt while the turn is live.
 /// Installs the interrupt sender into `interrupt_tx` and clears it (plus the
 /// spinner) when the turn completes.
+/// Commit a user prompt to the view synchronously: echo the `you>` line, open
+/// the assistant buffer, and start the turn timer. Called by both prompt paths
+/// BEFORE the (possibly spawned) turn runs, so the very next 6 ms frame shows
+/// the committed prompt + spinner + live timer instead of an empty card — the
+/// "did it take my input?" dead window after pressing Enter.
+fn begin_prompt_turn(app: &SharedApp, text: &str) {
+    let mut a = app.lock();
+    a.add_line("you> ", text);
+    a.start_assistant_turn();
+    a.start_turn_timer();
+}
+
 async fn spawn_prompt_turn(
     text: String,
     app: &SharedApp,
@@ -812,6 +959,9 @@ async fn spawn_prompt_turn(
         a.recompute_suggestions();
         a.spinner.start();
     }
+    // Commit the prompt synchronously so the first frame after Enter shows it,
+    // independent of the spawn/connect hop below.
+    begin_prompt_turn(app, &text);
     handle.mark_dirty();
     let app_for_turn = Arc::clone(app);
     let handle_for_turn = handle.clone();
@@ -875,6 +1025,12 @@ fn spawn_plan_subscription(path: String, wiring: Arc<Mutex<PlanPanelWiring>>, re
 /// (and which may mutate `model`), rather than an assistant prompt. Mirrors the
 /// detection order in `handle_submit`; an unrecognized `/foo` is NOT a command
 /// here (it is sent to the daemon as a prompt, matching `handle_submit`).
+/// Whether `text` is the help command (`/help` or `/?`).
+fn is_help_command(text: &str) -> bool {
+    let t = text.trim();
+    t == "/help" || t == "/?"
+}
+
 fn is_slash_command(text: &str) -> bool {
     slash_model_args(text).is_some()
         || slash_account_args(text).is_some()
@@ -1023,6 +1179,119 @@ async fn handle_submit(
         handle.mark_dirty();
         return;
     }
+    // `/permissions [on|off]` toggles opt-in interactive tool prompting. When
+    // ON, the daemon asks before running RequiresPermission tools (Bash/Write/
+    // Edit/…) and the user answers each with y/n. Default OFF keeps the historic
+    // auto-allow behaviour (byte-identical wire + tool execution).
+    if let Some(arg) = text
+        .trim()
+        .strip_prefix("/permissions")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        .map(str::trim)
+    {
+        app.lock().add_line("you> ", text);
+        let now_on = app.lock().set_permission_ask(arg);
+        let msg = if now_on {
+            "permission prompts ON \u{2014} approve Bash/Write/Edit before they run (y/n); /permissions off to disable"
+        } else {
+            "permission prompts OFF \u{2014} tools auto-run (default)"
+        };
+        app.lock().add_line("system> ", msg);
+        handle.mark_dirty();
+        return;
+    }
+    // `/mouse [on|off]` toggles terminal mouse capture. ON (default) gives wheel
+    // scrolling but intercepts the terminal's native drag-select/copy; OFF
+    // releases capture so the user can select & copy (scroll via PageUp/Shift+↑↓).
+    if let Some(arg) = text
+        .trim()
+        .strip_prefix("/mouse")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        .map(str::trim)
+    {
+        app.lock().add_line("you> ", text);
+        let now_on = app.lock().set_mouse_capture(arg);
+        if now_on {
+            let _ = execute!(std::io::stdout(), EnableMouseCapture);
+        } else {
+            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        }
+        let msg = if now_on {
+            "mouse capture ON \u{2014} wheel scrolls; terminal select/copy is intercepted (/mouse off to copy)"
+        } else {
+            "mouse capture OFF \u{2014} drag to select & copy; scroll with PageUp/Shift+\u{2191}\u{2193} (/mouse on to re-enable)"
+        };
+        app.lock().add_line("system> ", msg);
+        handle.mark_dirty();
+        return;
+    }
+    // `/theme [name]` switches the color palette (default/dark/light/high-contrast).
+    // The chrome re-themes immediately; scrollback already on screen keeps its
+    // baked colors (only new lines pick up the new theme).
+    if let Some(arg) = text
+        .trim()
+        .strip_prefix("/theme")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        .map(str::trim)
+    {
+        let msg = {
+            let mut a = app.lock();
+            a.add_line("you> ", text);
+            if a.set_theme_by_name(arg) {
+                format!("theme: {}", a.theme.name())
+            } else {
+                "usage: /theme default | dark | light | high-contrast".to_string()
+            }
+        };
+        app.lock().add_line("system> ", &msg);
+        handle.mark_dirty();
+        return;
+    }
+    // `/help` prints a command + keybinding cheatsheet to the scrollback. The
+    // power keystrokes (history recall, scroll, Home/End) are otherwise
+    // undiscoverable, and most slash commands are only found by typing `/`.
+    if is_help_command(text) {
+        let mut a = app.lock();
+        a.add_line("you> ", text);
+        a.add_line("system> ", "commands:");
+        a.add_line(
+            "tab> ",
+            "/model /effort /fast /output-style /steer /plan /attach /account /mem",
+        );
+        a.add_line("tab> ", "/theme /permissions /mouse /copy /clear /help");
+        a.add_line("system> ", "keys:");
+        a.add_line("tab> ", "Enter submit \u{00B7} Shift+Enter newline \u{00B7} Tab complete");
+        a.add_line("tab> ", "\u{2190}/\u{2192} move \u{00B7} Home/End line \u{00B7} \u{2191}/\u{2193} history \u{00B7} Backspace/Delete");
+        a.add_line("tab> ", "PageUp/PageDown \u{00B7} Shift+\u{2191}/\u{2193} scroll \u{00B7} End jump to bottom");
+        a.add_line("tab> ", "Ctrl+C interrupt/quit \u{00B7} Ctrl+D exit \u{00B7} Esc dismiss popup");
+        drop(a);
+        handle.mark_dirty();
+        return;
+    }
+    // `/copy` copies the last assistant reply to the system clipboard via an
+    // OSC 52 escape (works over SSH — the terminal owns the clipboard). This is
+    // the only in-TUI copy path; mouse capture otherwise intercepts selection.
+    if text.trim() == "/copy" {
+        let mut a = app.lock();
+        a.add_line("you> ", text);
+        let seq = a
+            .last_assistant
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .map(origin_cli::clipboard::osc52_sequence);
+        if let Some(seq) = seq {
+            a.add_line("ok> ", "copied the last reply to the clipboard");
+            drop(a);
+            use std::io::Write as _;
+            let _ = std::io::stdout().write_all(seq.as_bytes());
+            let _ = std::io::stdout().flush();
+        } else {
+            a.add_line("system> ", "nothing to copy yet");
+            drop(a);
+        }
+        handle.mark_dirty();
+        return;
+    }
     // `/attach <path>` stages an image/PDF for the next prompt (interactive
     // parity with headless `origin run --attach`). The file is classified and
     // encoded CLI-side so the daemon never reads client paths.
@@ -1148,6 +1417,8 @@ async fn handle_submit(
         return;
     }
 
+    begin_prompt_turn(app, text);
+    handle.mark_dirty();
     handle_prompt_turn(app, handle, path, model.as_str(), text, session_id, interrupt_rx).await;
 }
 
@@ -1165,14 +1436,9 @@ async fn handle_prompt_turn(
     session_id: &str,
     interrupt_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
 ) {
-    {
-        let mut a = app.lock();
-        a.add_line("you> ", text);
-        a.start_assistant_turn();
-        a.start_turn_timer();
-    }
-    handle.mark_dirty();
-
+    // The user line is echoed + the turn timer started synchronously by the
+    // caller (`begin_prompt_turn`) before this (possibly spawned) task runs, so
+    // the first frame after Enter is never empty.
     let mut proposals: Vec<(u32, String, Vec<String>)> = Vec::new();
     let app_for_delta = Arc::clone(app);
     let handle_for_delta = handle.clone();
@@ -1188,6 +1454,8 @@ async fn handle_prompt_turn(
     let handle_for_backoff = handle.clone();
     let app_for_goal = Arc::clone(app);
     let handle_for_goal = handle.clone();
+    let app_for_perm = Arc::clone(app);
+    let handle_for_perm = handle.clone();
     // Snapshot the session effort level so this turn carries `/effort`/`/fast`.
     let effort = app.lock().effort.clone();
     // Carry the startup `--thinking-tokens` budget on every turn (aider
@@ -1207,6 +1475,8 @@ async fn handle_prompt_turn(
     let attachments = std::mem::take(&mut app.lock().pending_attachments);
     // Session-wide multi-root list (from the startup `--root` flags).
     let roots = app.lock().workspace_roots.clone();
+    // Opt-in interactive permission prompting (`/permissions on`).
+    let permission_ask = app.lock().permission_ask;
     let reply = call_daemon(
         path,
         model,
@@ -1218,6 +1488,7 @@ async fn handle_prompt_turn(
         read_only,
         attachments,
         roots,
+        permission_ask,
         interrupt_rx,
         move |ev: &StreamEvent| {
             // Bug #4: route Goal* events through the dedicated renderer so
@@ -1226,6 +1497,16 @@ async fn handle_prompt_turn(
             render_goal_event(&mut *a, ev);
             drop(a);
             handle_for_goal.mark_dirty();
+        },
+        move |id, tool: &str, args: &str| {
+            // Surface the permission ask; the event loop's y/n handler reads
+            // `pending_permission` and sends the decision on a fresh connection.
+            app_for_perm.lock().pending_permission = Some(origin_cli::tui::PendingPermission {
+                id,
+                tool: tool.to_string(),
+                args: args.to_string(),
+            });
+            handle_for_perm.mark_dirty();
         },
         move |d| {
             app_for_delta.lock().append_to_current_assistant(d);
@@ -1240,8 +1521,14 @@ async fn handle_prompt_turn(
             };
             let mut a = app_for_tool.lock();
             a.finalize_assistant_turn(0);
-            a.add_tool_line(format!("  {line}"));
-            for dl in &diff_lines {
+            // ▸ running marker; flipped to ✔/✘ by on_tool_result / turn end.
+            a.start_tool_line(&line);
+            // Cap rendered diff rows so a large Write doesn't bury the
+            // conversation (these DiffLines are never sent to the model, so this
+            // is purely a view change). Indent 2 cols to nest under the header.
+            const MAX_DIFF_ROWS: usize = 40;
+            let total_diff = diff_lines.len();
+            for dl in diff_lines.iter().take(MAX_DIFF_ROWS) {
                 let (fg, bg) = match dl.kind.as_str() {
                     "+" => (theme::DIFF_ADD_FG, theme::DIFF_ADD_BG),
                     "-" => (theme::DIFF_DEL_FG, theme::DIFF_DEL_BG),
@@ -1252,8 +1539,11 @@ async fn handle_prompt_turn(
                     "-" => "-",
                     _ => " ",
                 };
-                let text = format!("{:>4} {prefix} {}", dl.line_no, dl.text);
+                let text = format!("  {:>4} {prefix} {}", dl.line_no, dl.text);
                 a.add_colored_line(text, fg, bg);
+            }
+            if let Some(summary) = origin_cli::tui::diff_elision_summary(total_diff, MAX_DIFF_ROWS) {
+                a.add_colored_line(summary, theme::MUTED, 0);
             }
             a.start_assistant_turn();
             // Drop the App guard before signalling the renderer so the lock
@@ -1282,6 +1572,8 @@ async fn handle_prompt_turn(
             // the start indicator followed by a silent gap.
             use origin_cli::theme;
             let mut a = app_for_result.lock();
+            // Flip the tool's ▸ running marker to ✔/✘.
+            a.finish_tool_line(ok);
             let header_fg = if ok { theme::MUTED } else { theme::RED };
             if !ok {
                 a.add_colored_line(format!("    \u{2718} {tool} failed"), header_fg, 0);
@@ -1408,6 +1700,10 @@ async fn call_daemon(
     attachments: Vec<origin_multimodal::ContentBlock>,
     // Session-wide extra workspace roots (`--root`); empty ⇒ single-root.
     roots: Vec<String>,
+    // Opt-in interactive permission prompting (`/permissions on`); false ⇒ the
+    // daemon stays on auto-allow, so the request and tool execution are
+    // byte-identical.
+    permission_ask: bool,
     // Bug #5: one-shot channel surfacing user Ctrl+C while a Prompt is in
     // flight. When a tick lands we write `ClientMessage::Interrupt` to
     // the same connection serving the prompt — the daemon's
@@ -1419,6 +1715,9 @@ async fn call_daemon(
     // EVERY Goal variant; non-Goal variants are dispatched in the match
     // below as before.
     mut on_goal: impl FnMut(&StreamEvent) + Send,
+    // Opt-in permission ask (id, tool, args_preview): surfaces the approval
+    // prompt; the event loop sends the decision back on a fresh connection.
+    mut on_permission_ask: impl FnMut(u64, &str, &str) + Send,
     mut on_delta: impl FnMut(&str) + Send,
     mut on_tool: impl FnMut(&str, &str, Vec<origin_daemon::protocol::DiffLine>) + Send,
     mut on_tool_chunk: impl FnMut(&str, &str) + Send,
@@ -1439,6 +1738,7 @@ async fn call_daemon(
         attachments,
         read_only,
         roots,
+        permission_ask,
     });
     let body = serde_json::to_vec(&msg)?;
     let frame = encode(1, FrameKind::Request, &body);
@@ -1538,6 +1838,11 @@ async fn call_daemon(
                     attempt,
                     max_attempts,
                 } => on_backoff(retry_in_secs, attempt, max_attempts),
+                StreamEvent::PermissionAsk {
+                    id,
+                    ref tool,
+                    ref args_preview,
+                } => on_permission_ask(id, tool, args_preview),
                 _ => {}
             }
             continue;

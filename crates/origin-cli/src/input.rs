@@ -4,6 +4,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use origin_daemon::protocol::{ClientMessage, MemoryAction};
 
+use crate::editor::Editor;
+
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum InputAction {
@@ -66,6 +68,84 @@ pub fn reduce(buffer: &mut String, ev: KeyEvent, op_in_flight: bool) -> InputAct
         }
         (KeyCode::Char(c), _) => {
             buffer.push(c);
+            InputAction::Insert(c)
+        }
+        _ => InputAction::Noop,
+    }
+}
+
+/// Reduce a key event against an [`Editor`] — cursor-aware editing.
+///
+/// Adds Home/End/Delete, arrow navigation, and prompt-history recall (Up/Down
+/// past the buffer edges). `op_in_flight` gates Ctrl+C (Interrupt vs Quit).
+/// `width` is the input card's text width, for visual Home/End and Up/Down
+/// across wrapped lines. Returns the same [`InputAction`]s as [`reduce`];
+/// cursor-only moves return `Noop` (the caller still redraws to move the caret).
+pub fn reduce_editor(editor: &mut Editor, ev: KeyEvent, op_in_flight: bool, width: usize) -> InputAction {
+    match (ev.code, ev.modifiers) {
+        (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+            if op_in_flight {
+                InputAction::Interrupt
+            } else {
+                InputAction::Quit
+            }
+        }
+        (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => InputAction::Quit,
+        (KeyCode::Esc, _) => InputAction::Quit,
+        (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => {
+            editor.insert_newline();
+            InputAction::Newline
+        }
+        (KeyCode::Enter, _) => {
+            if editor.is_empty() {
+                InputAction::Noop
+            } else {
+                let text = editor.buffer().to_string();
+                editor.push_history(&text);
+                editor.set_buffer(String::new());
+                InputAction::Submit(text)
+            }
+        }
+        (KeyCode::Backspace, _) => {
+            editor.backspace();
+            InputAction::Backspace
+        }
+        (KeyCode::Delete, _) => {
+            editor.delete();
+            InputAction::Backspace
+        }
+        (KeyCode::Left, _) => {
+            editor.move_left();
+            InputAction::Noop
+        }
+        (KeyCode::Right, _) => {
+            editor.move_right();
+            InputAction::Noop
+        }
+        (KeyCode::Home, _) => {
+            editor.move_home(width);
+            InputAction::Noop
+        }
+        (KeyCode::End, _) => {
+            editor.move_end(width);
+            InputAction::Noop
+        }
+        (KeyCode::Up, _) => {
+            // Move up a visual line; at the top, recall older history.
+            if !editor.move_up_visual(width) {
+                editor.history_up();
+            }
+            InputAction::Noop
+        }
+        (KeyCode::Down, _) => {
+            if !editor.move_down_visual(width) {
+                editor.history_down();
+            }
+            InputAction::Noop
+        }
+        // Plain typed character (no Ctrl/Alt) inserts at the cursor.
+        (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            editor.insert_char(c);
             InputAction::Insert(c)
         }
         _ => InputAction::Noop,
@@ -321,6 +401,18 @@ pub enum VimAction {
 ///   are [`VimAction::Pass`] (they do not insert text in Normal mode — the
 ///   caller drops them).
 ///
+/// Map a keypress to a permission decision while an interactive permission ask
+/// is pending: `y`/`Y` allows, `n`/`N` or `Esc` denies, anything else is not an
+/// answer (`None`) and falls through to normal input handling.
+#[must_use]
+pub const fn permission_answer(code: KeyCode) -> Option<bool> {
+    match code {
+        KeyCode::Char('y' | 'Y') => Some(true),
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(false),
+        _ => None,
+    }
+}
+
 /// Modifier chords (anything with `CONTROL`/`ALT`) always [`VimAction::Pass`]
 /// so the global `Ctrl+C`/`Ctrl+D` exits keep working in either mode.
 #[must_use]
@@ -385,6 +477,48 @@ mod tests {
             InputAction::Submit("hello".into())
         );
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn reduce_editor_inserts_and_submits() {
+        let mut ed = Editor::new();
+        assert_eq!(reduce_editor(&mut ed, k(KeyCode::Char('h')), false, 80), InputAction::Insert('h'));
+        assert_eq!(reduce_editor(&mut ed, k(KeyCode::Char('i')), false, 80), InputAction::Insert('i'));
+        assert_eq!(ed.buffer(), "hi");
+        assert_eq!(
+            reduce_editor(&mut ed, k(KeyCode::Enter), false, 80),
+            InputAction::Submit("hi".to_string())
+        );
+        assert!(ed.is_empty(), "submit clears the buffer");
+    }
+
+    #[test]
+    fn reduce_editor_inserts_at_the_cursor_not_the_end() {
+        let mut ed = Editor::new();
+        ed.set_buffer("ac".to_string()); // cursor at end
+        reduce_editor(&mut ed, k(KeyCode::Left), false, 80); // now between a and c
+        reduce_editor(&mut ed, k(KeyCode::Char('b')), false, 80);
+        assert_eq!(ed.buffer(), "abc", "mid-buffer insert");
+    }
+
+    #[test]
+    fn reduce_editor_up_recalls_history() {
+        let mut ed = Editor::new();
+        ed.set_buffer("first".to_string());
+        reduce_editor(&mut ed, k(KeyCode::Enter), false, 80); // submit → pushed to history
+        reduce_editor(&mut ed, k(KeyCode::Up), false, 80); // recall
+        assert_eq!(ed.buffer(), "first", "Up past the top recalls the previous prompt");
+    }
+
+    #[test]
+    fn permission_answer_maps_keys() {
+        assert_eq!(permission_answer(KeyCode::Char('y')), Some(true));
+        assert_eq!(permission_answer(KeyCode::Char('Y')), Some(true));
+        assert_eq!(permission_answer(KeyCode::Char('n')), Some(false));
+        assert_eq!(permission_answer(KeyCode::Char('N')), Some(false));
+        assert_eq!(permission_answer(KeyCode::Esc), Some(false), "Esc denies");
+        assert_eq!(permission_answer(KeyCode::Char('x')), None, "other keys not an answer");
+        assert_eq!(permission_answer(KeyCode::Enter), None);
     }
 
     #[test]

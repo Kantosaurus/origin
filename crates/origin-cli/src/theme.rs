@@ -120,6 +120,9 @@ pub struct Palette {
     pub rule: u32,
     pub panel_header: u32,
     pub panel_bg: u32,
+    pub h1: u32,
+    pub h2: u32,
+    pub h3: u32,
 }
 
 impl Default for Palette {
@@ -156,6 +159,9 @@ pub const fn palette(theme: Theme) -> Palette {
             rule: RULE,
             panel_header: PANEL_HEADER,
             panel_bg: PANEL_BG,
+            h1: H1,
+            h2: H2,
+            h3: H3,
         },
         Theme::Dark => Palette {
             surface: 0x00_06_07_0A,
@@ -177,6 +183,9 @@ pub const fn palette(theme: Theme) -> Palette {
             rule: 0x00_20_26_30,
             panel_header: 0x00_8A_98_AA,
             panel_bg: 0x00_09_0B_10,
+            h1: 0x00_DC_E6_F5,
+            h2: 0x00_A9_C8_F0,
+            h3: 0x00_7E_9A_C0,
         },
         Theme::Light => Palette {
             surface: 0x00_FA_F8_F4,
@@ -198,6 +207,9 @@ pub const fn palette(theme: Theme) -> Palette {
             rule: 0x00_D8_D2_C8,
             panel_header: 0x00_6A_5A_46,
             panel_bg: 0x00_F2_EF_E8,
+            h1: 0x00_10_0E_0B,
+            h2: 0x00_3A_30_28,
+            h3: 0x00_5A_4A_3A,
         },
         Theme::HighContrast => Palette {
             surface: 0x00_00_00_00,
@@ -219,6 +231,9 @@ pub const fn palette(theme: Theme) -> Palette {
             rule: 0x00_FF_FF_FF,
             panel_header: 0x00_FF_E0_00,
             panel_bg: 0x00_00_00_00,
+            h1: 0x00_FF_FF_FF,
+            h2: 0x00_FF_E0_00,
+            h3: 0x00_FF_FF_00,
         },
     }
 }
@@ -251,6 +266,9 @@ mod tests {
         assert_eq!(p.rule, RULE);
         assert_eq!(p.panel_header, PANEL_HEADER);
         assert_eq!(p.panel_bg, PANEL_BG);
+        assert_eq!(p.h1, H1);
+        assert_eq!(p.h2, H2);
+        assert_eq!(p.h3, H3);
     }
 
     #[test]
