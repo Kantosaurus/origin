@@ -12,6 +12,7 @@ pub mod default_workflow;
 pub mod goal_checkpoint;
 pub mod goal_clear_all;
 pub mod goal_driver;
+pub mod ipc_prompter;
 pub mod lsp_diagnostics;
 pub mod memory_wiring;
 pub mod pairing;
