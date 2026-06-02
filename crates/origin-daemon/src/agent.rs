@@ -4805,7 +4805,10 @@ mod bash_streaming_tests {
         });
 
         let start = Instant::now();
-        let driver = tokio::spawn(async move { run_bash_streaming(&args, Some(&tx)).await });
+        // Route through `spawn_in` like all daemon code (Realtime ≈ per-stream
+        // relay): keeps the no-raw-`tokio::spawn` invariant uniform, including
+        // in tests, so the spawn-audit stays green.
+        let driver = spawn_in(TaskClass::Realtime, async move { run_bash_streaming(&args, Some(&tx)).await });
 
         // The first chunk must arrive before the full sleep elapses.
         let first = tokio::time::timeout(Duration::from_millis(800), rx.recv())
