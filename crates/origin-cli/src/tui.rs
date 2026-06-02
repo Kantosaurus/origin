@@ -78,6 +78,18 @@ const SPINNER_INTERVAL_MS: u64 = 80;
 /// separation for persistent content while only costing 1 visible row.
 const INPUT_GAP_ROWS: u16 = 1;
 
+/// Hard cap on retained scrollback rows. A multi-hour session (esp. one with
+/// long streamed Bash output) would otherwise grow `scrollback` without bound —
+/// leaking RSS and making the per-frame wrap O(whole history), which degrades
+/// the CI-gated keystroke latency. Trimmed in batches (see [`SCROLLBACK_SLACK`])
+/// so the O(n) front-drain is rare.
+const MAX_SCROLLBACK: usize = 5000;
+
+/// Trim hysteresis: only trim once `scrollback` exceeds `MAX_SCROLLBACK +
+/// SCROLLBACK_SLACK`, dropping back to `MAX_SCROLLBACK`. Keeps the front-drain
+/// infrequent (once per `SCROLLBACK_SLACK` new rows) rather than per push.
+const SCROLLBACK_SLACK: usize = 1000;
+
 #[derive(Debug)]
 pub struct Spinner {
     pub active: bool,
@@ -618,6 +630,23 @@ impl App {
         // Pre-formatted (tool output, diff rows, streamed command lines): drawn
         // verbatim so embedded `**`/backticks aren't reinterpreted as markdown.
         self.scrollback.push(ScrollLine::verbatim(text, fg, bg));
+        // This is the high-volume append path (streamed Bash, diffs); cap here.
+        self.trim_scrollback();
+    }
+
+    /// Drop the oldest rows when scrollback exceeds [`MAX_SCROLLBACK`] (plus
+    /// slack), keeping the newest. Front-drains in a batch so the O(n) shift is
+    /// rare. Indices into scrollback are fixed up: the running-tool marker row
+    /// shifts down (or is forgotten if its line was trimmed). `scroll_offset` is
+    /// measured from the bottom, so trimming the front never invalidates it.
+    fn trim_scrollback(&mut self) {
+        if self.scrollback.len() <= MAX_SCROLLBACK + SCROLLBACK_SLACK {
+            return;
+        }
+        let drop_n = self.scrollback.len() - MAX_SCROLLBACK;
+        self.scrollback.drain(0..drop_n);
+        // `checked_sub` ⇒ `None` when the tracked tool line was itself trimmed.
+        self.running_tool_row = self.running_tool_row.and_then(|r| r.checked_sub(drop_n));
     }
 
     /// Bug #4: update the one-line goal status indicator. `None` clears it
@@ -1360,6 +1389,7 @@ impl crate::goal_render::GoalRender for App {
         // Goal/agent progress lines are pre-formatted status text → verbatim.
         self.scrollback.push(ScrollLine::verbatim(text, fg, 0));
         self.scroll_offset = 0;
+        self.trim_scrollback();
     }
     fn set_goal_status(&mut self, status: Option<String>) {
         self.goal_status = status;
@@ -2038,6 +2068,35 @@ mod tests {
         let s = diff_elision_summary(2000, 40).expect("large diff summarized");
         assert!(s.contains("1960"), "hidden count: {s}");
         assert!(s.contains("2000 total"), "total count: {s}");
+    }
+
+    #[test]
+    fn scrollback_is_bounded_and_keeps_newest() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        let total = MAX_SCROLLBACK + SCROLLBACK_SLACK + 200;
+        for i in 0..total {
+            app.add_colored_line(format!("line {i}"), 0, 0);
+        }
+        assert!(
+            app.scrollback.len() <= MAX_SCROLLBACK + SCROLLBACK_SLACK,
+            "scrollback must be capped, got {}",
+            app.scrollback.len()
+        );
+        assert!(
+            app.scrollback.last().is_some_and(|l| l.text == format!("line {}", total - 1)),
+            "the newest line must be retained"
+        );
+    }
+
+    #[test]
+    fn trim_forgets_running_tool_marker_when_its_line_is_dropped() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.start_tool_line("[Bash] big"); // row 0
+        for i in 0..(MAX_SCROLLBACK + SCROLLBACK_SLACK + 200) {
+            app.add_colored_line(format!("out {i}"), 0, 0);
+        }
+        // Row 0 was trimmed; finishing must not panic or mis-index a stale row.
+        app.finish_tool_line(true);
     }
 
     #[test]
