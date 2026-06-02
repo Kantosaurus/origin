@@ -1622,6 +1622,12 @@ pub async fn run_loop(
 
         // Dispatch each tool_use sequentially.
         let mut tool_results: Vec<Block> = Vec::with_capacity(tool_uses.len());
+        // Sub-agent (`Task`) parallelism: each Task is spawned during the loop —
+        // it starts running immediately on the swarm's independent pool — and its
+        // completion is deferred to AFTER the loop. So multiple Task calls in one
+        // turn run concurrently instead of one-at-a-time. Tuple: (result index to
+        // backfill, tool_use id, goal label, worker handle).
+        let mut pending_tasks: Vec<(usize, String, String, origin_swarm::WorkerHandle)> = Vec::new();
         for (id, name, input_bytes) in tool_uses {
             let Some(meta) = registry_iter().find(|m| m.name == name) else {
                 tracing::warn!(tool = %name, "unknown tool; returning error to model");
@@ -1739,6 +1745,51 @@ pub async fn run_loop(
                         diff_lines,
                     })
                     .await;
+            }
+
+            // Sub-agent parallelism: spawn the Task worker now (it runs at once
+            // on the swarm's independent pool) and defer awaiting it to after the
+            // loop, so sibling Task calls in this turn overlap. Permission and
+            // governance have already been enforced above; with no coordinator we
+            // fall through to the normal dispatch (a clear "not configured" error).
+            if name == "Task" {
+                if let Some(coord) = opts.coordinator.as_deref() {
+                    match serde_json::from_value::<origin_tools::builtins::task::TaskInput>(args.clone()) {
+                        Ok(input) => {
+                            let goal = input.goal.clone();
+                            match origin_tools::builtins::task::task_spawn(coord, input).await {
+                                Ok(handle) => {
+                                    let idx = tool_results.len();
+                                    tool_results.push(Block::ToolResult {
+                                        tool_use_id: id.clone(),
+                                        handle: None,
+                                        inline: Some(b"(sub-agent dispatched)".to_vec()),
+                                        cache_marker: None,
+                                    });
+                                    pending_tasks.push((idx, id, goal, handle));
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "Task spawn failed; returning error to model");
+                                    tool_results.push(Block::ToolResult {
+                                        tool_use_id: id,
+                                        handle: None,
+                                        inline: Some(format!("Error: {e}").into_bytes()),
+                                        cache_marker: None,
+                                    });
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tool_results.push(Block::ToolResult {
+                                tool_use_id: id,
+                                handle: None,
+                                inline: Some(format!("Error: Task: bad args: {e}").into_bytes()),
+                                cache_marker: None,
+                            });
+                        }
+                    }
+                    continue;
+                }
             }
 
             let result_bytes: Vec<u8> = if let Some(hit) = cache_hit {
@@ -1955,6 +2006,52 @@ pub async fn run_loop(
                     .await;
             }
             tool_results.push(block);
+        }
+
+        // Await the deferred sub-agents. They were spawned during the loop and
+        // run concurrently on the swarm pool, so awaiting them in sequence here
+        // resolves in ~max(worker) time, not the sum. Each result backfills the
+        // placeholder slot pushed during the loop (preserving tool_use order).
+        if let Some(coord) = opts.coordinator.as_deref() {
+            let task_ordinal = registry_iter()
+                .find(|m| m.name == "Task")
+                .map_or_else(|| origin_tools::ProfileOrdinal(0), |m| m.sandbox_profile.ordinal());
+            for (idx, id, goal, handle) in std::mem::take(&mut pending_tasks) {
+                let result_bytes = match origin_tools::builtins::task::task_await(coord, &handle, &goal).await {
+                    Ok(output) => serde_json::to_string(&output)
+                        .unwrap_or_else(|e| format!("{{\"status\":\"error\",\"summary\":\"Task json: {e}\"}}"))
+                        .into_bytes(),
+                    Err(e) => format!("Error: {e}").into_bytes(),
+                };
+                if let Some(tx) = &opts.event_tx {
+                    let (preview, elided) = build_tool_result_preview(&result_bytes);
+                    let _ = tx
+                        .send(StreamEvent::ToolResult {
+                            tool: "Task".to_string(),
+                            ok: true,
+                            preview,
+                            elided_bytes: elided,
+                        })
+                        .await;
+                }
+                if let Some(h) = &hooks {
+                    let _ = h
+                        .fire(&origin_hooks::LifecycleEvent::PostTool {
+                            tool: "Task".to_string(),
+                            phase: origin_hooks::ToolPhase::Ok,
+                            sandbox_ordinal: task_ordinal,
+                        })
+                        .await;
+                }
+                if let Some(slot) = tool_results.get_mut(idx) {
+                    *slot = Block::ToolResult {
+                        tool_use_id: id,
+                        handle: None,
+                        inline: Some(result_bytes),
+                        cache_marker: None,
+                    };
+                }
+            }
         }
 
         // Append tool results as a single Role::Tool message (provider crates

@@ -14,7 +14,7 @@
 // sibling builtin modules' types when re-exported.
 #![allow(clippy::module_name_repetitions)]
 
-use origin_swarm::{Budget, Coordinator, ReportStatus, SwarmError, WorkerSpec};
+use origin_swarm::{Budget, Coordinator, ReportStatus, SwarmError, WorkerHandle, WorkerSpec};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -103,19 +103,19 @@ pub enum TaskError {
     Json(String),
 }
 
-/// Spawn a worker for `input.goal`, await completion, return the actionable view.
+/// Spawn a worker for `input.goal` WITHOUT awaiting it, returning its handle.
 ///
-/// Forwards `allowed_tools` and `budget` verbatim into the [`WorkerSpec`]. The
-/// `parent_actor` is set to `ActorId::new(0)` — the agent loop (Phase 11) will
-/// thread the real parent through once daemons have per-actor identities.
+/// The worker begins running immediately on the coordinator's independent pool.
+/// This is the spawn half of [`task_tool`]: the agent loop spawns every `Task`
+/// in a turn up front, then [`task_await`]s them — so multiple sub-agents run
+/// concurrently instead of one-at-a-time. Pair every `task_spawn` with exactly
+/// one `task_await`.
 ///
 /// # Errors
-/// Returns [`TaskError::Swarm`] if spawn or `await_completion` fails.
-#[allow(clippy::module_name_repetitions)] // `task_tool` in module `task` — matches recall_tool / ask_tool precedent
-pub async fn task_tool(coord: &Coordinator, input: TaskInput) -> Result<TaskOutput, TaskError> {
-    let goal = input.goal.clone();
+/// Returns [`TaskError::Swarm`] if the spawn fails.
+pub async fn task_spawn(coord: &Coordinator, input: TaskInput) -> Result<WorkerHandle, TaskError> {
     let spec = WorkerSpec {
-        goal: goal.clone(),
+        goal: input.goal,
         allowed_tools: input.allowed_tools,
         budget: Budget {
             max_wall_ms: input.budget.max_wall_ms,
@@ -127,9 +127,17 @@ pub async fn task_tool(coord: &Coordinator, input: TaskInput) -> Result<TaskOutp
         parent_actor: origin_plan::ActorId::new(0),
         model: input.model,
     };
-    let handle = coord.spawn(spec).await?;
-    let report = coord.await_completion(&handle).await?;
+    Ok(coord.spawn(spec).await?)
+}
 
+/// Await a worker previously spawned by [`task_spawn`] and build its actionable
+/// view. `goal` is only used to label the summary.
+///
+/// # Errors
+/// Returns [`TaskError::Swarm`] if `await_completion` fails (e.g. the worker
+/// reported `Failed`).
+pub async fn task_await(coord: &Coordinator, handle: &WorkerHandle, goal: &str) -> Result<TaskOutput, TaskError> {
+    let report = coord.await_completion(handle).await?;
     let status = match report.status {
         ReportStatus::Completed => "completed",
         ReportStatus::GoalUnreachable => "goal_unreachable",
@@ -142,6 +150,20 @@ pub async fn task_tool(coord: &Coordinator, input: TaskInput) -> Result<TaskOutp
         files_touched: report.files_touched.iter().map(hex::encode).collect(),
         follow_ups: report.follow_ups.into_iter().map(|t| t.goal).collect(),
     })
+}
+
+/// Spawn a worker for `input.goal`, await completion, return the actionable view.
+///
+/// Convenience wrapper over [`task_spawn`] + [`task_await`] for the single-task
+/// and test paths; the agent loop splits the two halves to parallelise.
+///
+/// # Errors
+/// Returns [`TaskError::Swarm`] if spawn or `await_completion` fails.
+#[allow(clippy::module_name_repetitions)] // `task_tool` in module `task` — matches recall_tool / ask_tool precedent
+pub async fn task_tool(coord: &Coordinator, input: TaskInput) -> Result<TaskOutput, TaskError> {
+    let goal = input.goal.clone();
+    let handle = task_spawn(coord, input).await?;
+    task_await(coord, &handle, &goal).await
 }
 
 crate::origin_tool! {
