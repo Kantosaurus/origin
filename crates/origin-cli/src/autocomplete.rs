@@ -138,9 +138,14 @@ pub fn load_sources() -> CompletionSources {
     // because `~/.origin/skills/` exists but is empty after onboarding — the
     // bundled `superpowers` skills (systematic-debugging, impeccable, etc.)
     // never become discoverable through `/`.
-    let skills: Vec<String> = origin_skills::load_all(&skills_dir)
+    let mut skills: Vec<String> = origin_skills::load_all(&skills_dir)
         .map(|v| v.into_iter().map(|s| s.front.name).collect())
         .unwrap_or_default();
+    // `/clear` is a mechanical built-in verb (not a skill), but it shares the
+    // `/<name>` completion shape, so inject it so the `/` popup still offers it.
+    if !skills.iter().any(|s| s == "clear") {
+        skills.push("clear".to_string());
+    }
     let workflows: Vec<String> = crate::workflows::load_from(&workflows_path)
         .ok()
         .flatten()

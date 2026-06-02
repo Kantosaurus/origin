@@ -199,6 +199,16 @@ pub enum ClientMessage {
     /// When sent with no goal active the outer loop emits no event — the
     /// signal is harmless.
     Interrupt,
+    /// `/clear`: mechanically reset the in-session context. This is a
+    /// first-class admin verb, NOT a skill activation — it never touches the
+    /// per-connection skill stack or the skill catalog.
+    ///
+    /// The daemon terminates any active goal (emitting
+    /// [`StreamEvent::GoalCleared`] with [`origin_goal::ClearReasonWire::UserClearAll`]
+    /// and writing the terminal-status checkpoint so a crash cannot resurrect
+    /// the discarded goal), then replies with [`StreamEvent::AdminOk`]. With no
+    /// active goal it is a single `AdminOk`.
+    ClearAll,
 }
 
 impl ClientMessage {

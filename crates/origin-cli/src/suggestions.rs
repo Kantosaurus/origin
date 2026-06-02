@@ -12,7 +12,10 @@
 
 use crate::autocomplete::CompletionSources;
 
-const MAX_VISIBLE: usize = 6;
+/// Number of candidate rows visible in the popup at once. The full
+/// candidate list may be longer; navigation scrolls a window of this
+/// height through it (see [`visible_window`]).
+pub const MAX_VISIBLE: usize = 6;
 
 #[derive(Debug, Clone, Default)]
 pub struct SuggestionState {
@@ -82,8 +85,9 @@ fn match_candidates(
         .map(|m| wrap(m))
         .collect();
     matches.sort();
-    matches.truncate(MAX_VISIBLE);
 
+    // Keep the full match list so every skill is reachable; the popup
+    // renders a scrolling window of `MAX_VISIBLE` rows over it.
     // Ghost text mirrors `unique_match_produces_ghost`: only when there's
     // exactly one match AND it extends the current trailing token.
     let ghost = if matches.len() == 1 && matches[0].starts_with(token) && matches[0].len() > token.len() {
@@ -98,6 +102,25 @@ fn match_candidates(
         selected: 0,
         prefix_len,
     }
+}
+
+/// Compute the scroll offset for the popup viewport so the selected
+/// candidate is always visible within a window of [`MAX_VISIBLE`] rows.
+///
+/// Returns the index of the first candidate to render. The renderer then
+/// shows `candidates[offset .. offset + MAX_VISIBLE]`. When the full list
+/// fits in the window the offset is `0`. Otherwise the window scrolls just
+/// enough to keep `selected` on screen, clamped so it never runs past the
+/// end of the list.
+#[must_use]
+pub fn scroll_offset(len: usize, selected: usize) -> usize {
+    if len <= MAX_VISIBLE {
+        return 0;
+    }
+    let max_offset = len - MAX_VISIBLE;
+    // Anchor the window so `selected` sits at its bottom edge once we've
+    // scrolled past the first page, then clamp to the final page.
+    selected.saturating_sub(MAX_VISIBLE - 1).min(max_offset)
 }
 
 /// Apply the currently-selected candidate to `buffer`, replacing the
@@ -290,5 +313,69 @@ mod tests {
         select_next(&mut s);
         select_prev(&mut s);
         assert_eq!(s.selected, 0);
+    }
+
+    fn many_skills() -> CompletionSources {
+        // 10 skills sharing the `t` prefix so a `/t` query matches them all.
+        let skills = (0..10).map(|i| format!("task-{i:02}")).collect();
+        CompletionSources {
+            skills,
+            workflows: vec![],
+        }
+    }
+
+    /// Regression: the candidate list must retain *every* matching skill,
+    /// not just the first `MAX_VISIBLE`, so users can scroll to all of them.
+    #[test]
+    fn long_match_list_is_not_truncated() {
+        let s = suggest("/task", &many_skills());
+        assert_eq!(s.candidates.len(), 10);
+        assert_eq!(s.candidates.first().unwrap(), "/task-00");
+        assert_eq!(s.candidates.last().unwrap(), "/task-09");
+    }
+
+    /// Arrowing past the bottom of the viewport must still land on real
+    /// later candidates (the bug was that they didn't exist at all).
+    #[test]
+    fn can_select_candidates_beyond_the_window() {
+        let mut s = suggest("/task", &many_skills());
+        for _ in 0..9 {
+            select_next(&mut s);
+        }
+        assert_eq!(s.selected, 9);
+        accept_selected_check(&s, "/task-09");
+    }
+
+    fn accept_selected_check(s: &SuggestionState, expected: &str) {
+        let mut buf = "/task".to_string();
+        accept_selected(s, &mut buf);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn scroll_offset_short_list_does_not_scroll() {
+        // List fits entirely in the window → no scrolling regardless of cursor.
+        assert_eq!(scroll_offset(MAX_VISIBLE, 0), 0);
+        assert_eq!(scroll_offset(MAX_VISIBLE, MAX_VISIBLE - 1), 0);
+        assert_eq!(scroll_offset(3, 2), 0);
+    }
+
+    #[test]
+    fn scroll_offset_keeps_selection_visible() {
+        let len = 10;
+        // First page: cursor within the initial window → offset stays 0.
+        for sel in 0..MAX_VISIBLE {
+            assert_eq!(scroll_offset(len, sel), 0, "sel={sel}");
+        }
+        // Once the cursor passes the window bottom, scroll by one per step.
+        assert_eq!(scroll_offset(len, MAX_VISIBLE), 1);
+        assert_eq!(scroll_offset(len, MAX_VISIBLE + 1), 2);
+        // Clamp at the final page so the window never runs off the end.
+        assert_eq!(scroll_offset(len, len - 1), len - MAX_VISIBLE);
+        // Selected is always within [offset, offset + MAX_VISIBLE).
+        for sel in 0..len {
+            let off = scroll_offset(len, sel);
+            assert!(sel >= off && sel < off + MAX_VISIBLE, "sel={sel} off={off}");
+        }
     }
 }

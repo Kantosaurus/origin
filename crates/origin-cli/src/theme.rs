@@ -26,10 +26,13 @@ pub const TOOL: u32 = 0x00_9D_7C_D8;
 pub const CODE_FG: u32 = 0x00_B0_A8_9E;
 pub const CODE_BG: u32 = 0x00_16_13_11;
 
-pub const DIFF_ADD_FG: u32 = 0x00_7F_D8_8F;
-pub const DIFF_ADD_BG: u32 = 0x00_12_24_12;
-pub const DIFF_DEL_FG: u32 = 0x00_E0_6C_75;
-pub const DIFF_DEL_BG: u32 = 0x00_24_12_12;
+// Diff rows render the changed text in near-white (`BRIGHT`) for legibility,
+// highlighted with a saturated green (addition) or red (deletion) background so
+// the kind of change reads at a glance instead of relying on a dim foreground.
+pub const DIFF_ADD_FG: u32 = 0x00_F0_EB_E3;
+pub const DIFF_ADD_BG: u32 = 0x00_1E_4D_2A;
+pub const DIFF_DEL_FG: u32 = 0x00_F0_EB_E3;
+pub const DIFF_DEL_BG: u32 = 0x00_5A_1E_22;
 
 pub const GREEN: u32 = 0x00_7F_D8_8F;
 pub const YELLOW: u32 = 0x00_E5_C0_7B;

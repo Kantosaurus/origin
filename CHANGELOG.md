@@ -25,6 +25,9 @@ versions correspond to phase milestones from the implementation plan.
 - **SPDX headers** added to all first-party `.rs` files; `REUSE.toml` + `LICENSES/Apache-2.0.txt` for REUSE compliance.
 - **Community/security**: `GOVERNANCE.md`, `ROADMAP.md`, `SUPPORT.md`, an OpenSSF Scorecard workflow, Codecov upload, and an SBOM step on release; committed fuzz seed corpora for all six targets; winget manifests split into version/installer/locale.
 
+### Fixed
+- **Skill selector now scrolls through all skills**: pressing `/` previously truncated the suggestion list to the first 6 matches (alphabetically), so skills beyond that were unreachable. The full match list is now retained and the popup renders a scrolling window over it — arrowing up/down moves through every match, with `↑`/`↓` hints on the edge rows when there's more off-screen.
+
 ### Removed
 - Internal `docs/superpowers/` planning and spec docs, and `docs/why-origin.md`, are no longer published in the repository; references to them were removed.
 

@@ -102,7 +102,8 @@ fn client_message_prompt_round_trips() {
         | ClientMessage::ActivateWorkflow { .. }
         | ClientMessage::ExportSession { .. }
         | ClientMessage::ResumeForeign { .. }
-        | ClientMessage::Interrupt => unreachable!("expected Prompt variant"),
+        | ClientMessage::Interrupt
+        | ClientMessage::ClearAll => unreachable!("expected Prompt variant"),
     }
 }
 
@@ -141,7 +142,8 @@ fn client_message_switch_account_round_trips() {
         | ClientMessage::ActivateWorkflow { .. }
         | ClientMessage::ExportSession { .. }
         | ClientMessage::ResumeForeign { .. }
-        | ClientMessage::Interrupt => unreachable!("expected SwitchAccount variant"),
+        | ClientMessage::Interrupt
+        | ClientMessage::ClearAll => unreachable!("expected SwitchAccount variant"),
     }
 }
 

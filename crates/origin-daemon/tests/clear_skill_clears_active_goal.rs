@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Bug #10: `/clear` (the `clear` skill activation) must also clear an
-//! active goal, emitting `GoalCleared { UserClearAll }`. Without the
-//! coupling, a user who runs `/goal foo` and then `/clear` ends up with
-//! the goal still active in the per-connection slot — the next `Prompt`
-//! resumes the goal driver as if nothing had happened.
+//! Bug #10: `/clear` (the mechanical `ClientMessage::ClearAll` verb) must
+//! also clear an active goal, emitting `GoalCleared { UserClearAll }`.
+//! Without the coupling, a user who runs `/goal foo` and then `/clear` ends
+//! up with the goal still active in the per-connection slot — the next
+//! `Prompt` resumes the goal driver as if nothing had happened.
 //!
 //! The wire enum already had `ClearReasonWire::UserClearAll` reserved
 //! for exactly this case; before bug #10's fix no variant emitted it.
 //!
-//! This test exercises the pure helper the daemon's
-//! `ActivateSkill { name: "clear" }` arm now calls before falling through
-//! to the normal skill catalog handler. The IPC dispatch arm itself lives
-//! in `main.rs` (binary); integration coverage is provided by the
-//! end-to-end suite. Here we pin the contract:
-//!   * No active goal -> no event (clear is purely informational).
+//! This test exercises the pure helper the daemon's `ClearAll` arm now
+//! calls (via `handle_clear_all`) before acking with `AdminOk`. The IPC
+//! dispatch arm itself lives in `main.rs` (binary); integration coverage is
+//! provided by the end-to-end suite. Here we pin the contract:
+//!   * No active goal -> no event (clear is purely a context reset).
 //!   * Active goal -> exactly one `GoalCleared { UserClearAll }` carrying
 //!     the prior counters.
 

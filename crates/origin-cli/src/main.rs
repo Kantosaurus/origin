@@ -14,7 +14,8 @@ use origin_cli::cli_def::{Cli, Cmd, KeyringSub, PairSub, ProvidersSub, SessionsS
 // the `PluginSub` directly.
 use origin_cli::goal_render::render_goal_event;
 use origin_cli::input::{
-    parse_mem_command, parse_model_command, parse_skill_command, parse_workflow_command, reduce, InputAction,
+    parse_clear_command, parse_mem_command, parse_model_command, parse_skill_command, parse_workflow_command,
+    reduce, InputAction,
 };
 use origin_cli::plan_panel_wiring::Wiring as PlanPanelWiring;
 use origin_cli::tui::App;
@@ -878,6 +879,7 @@ fn is_slash_command(text: &str) -> bool {
     slash_model_args(text).is_some()
         || slash_account_args(text).is_some()
         || parse_mem_command(text).is_some()
+        || parse_clear_command(text).is_some()
         || parse_skill_command(text).is_some()
         || parse_workflow_command(text).is_some()
 }
@@ -1092,6 +1094,30 @@ async fn handle_submit(
         return;
     }
     // `/<name>` / `/<plugin>:<name>` activate; `/-<name>` deactivates.
+    // `/clear` is a mechanical context reset (not a skill): it tells the
+    // daemon to drop any active goal and wipes the in-session TUI view so the
+    // terminal looks as it did at launch. Must be checked BEFORE
+    // `parse_skill_command` since `clear` is a reserved slash verb there.
+    if let Some(msg) = parse_clear_command(text) {
+        {
+            let mut a = app.lock();
+            a.add_line("you> ", text);
+        }
+        handle.mark_dirty();
+        match send_skill_command(path, &msg).await {
+            Ok(line) => {
+                // Reset the view first, then surface the daemon's outcome on
+                // the fresh, banner-only screen.
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                let mut a = app.lock();
+                a.reset_to_login(cols, rows);
+                a.add_line("ok> ", &line);
+            }
+            Err(e) => app.lock().add_line("error> ", &format!("{e}")),
+        }
+        handle.mark_dirty();
+        return;
+    }
     // Route through a one-shot IPC connection just like /mem and /account.
     if let Some(msg) = parse_skill_command(text) {
         {
@@ -1238,12 +1264,14 @@ async fn handle_prompt_turn(
         },
         move |_tool: &str, content: &str| {
             // Live Bash output: render each incoming line under the tool
-            // header as a dim indented row so users see progress instead
-            // of a silent gap during long-running commands.
+            // header as an indented row so users see progress instead of a
+            // silent gap during long-running commands. Use the bright body
+            // color (not DIM) so generated output is clearly legible rather
+            // than washed out.
             use origin_cli::theme;
             let mut a = app_for_chunk.lock();
             for line in content.lines() {
-                a.add_colored_line(format!("    {line}"), theme::DIM, 0);
+                a.add_colored_line(format!("    {line}"), theme::BODY, 0);
             }
             drop(a);
             handle_for_chunk.mark_dirty();
@@ -1259,7 +1287,7 @@ async fn handle_prompt_turn(
                 a.add_colored_line(format!("    \u{2718} {tool} failed"), header_fg, 0);
             }
             for line in preview.lines() {
-                a.add_colored_line(format!("    {line}"), theme::DIM, 0);
+                a.add_colored_line(format!("    {line}"), theme::BODY, 0);
             }
             if elided_bytes > 0 {
                 a.add_colored_line(

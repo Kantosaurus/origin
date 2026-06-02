@@ -2974,69 +2974,189 @@ fn node_row_to_json(row: &origin_codegraph::index::NodeRow) -> serde_json::Value
     })
 }
 
-/// Dispatch the `Bash` tool via `bash_v2` and forward buffered output lines
-/// to `event_tx` as [`StreamEvent::ToolChunk`] events. Returns the
-/// serialised JSON result bytes so the LLM sees the full structured output.
+/// Dispatch the `Bash` tool and forward output to `event_tx` as
+/// [`StreamEvent::ToolChunk`] events **in real time** — each line is streamed
+/// to the user the instant the child writes it, not after the process exits.
+///
+/// This is the key difference from a buffered dispatch: a long-running (or
+/// stuck) command surfaces its output progressively, so the user can tell
+/// whether work is happening rather than staring at a silent gap and
+/// wondering if the command hung. The LLM still receives the fully
+/// accumulated structured body via the returned JSON bytes.
+///
 /// `event_tx` being `None` (unit tests, headless runs) is supported — chunks
-/// are skipped but execution still completes.
+/// are skipped but execution still completes and the full body is returned.
+#[allow(clippy::too_many_lines)] // real-time streaming poll loop; extracting sub-functions would fragment the line-buffer state and add allocations
 async fn run_bash_streaming(
     args: &Value,
     event_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
 ) -> Result<Vec<u8>, String> {
-    let bargs = origin_tools::builtins::bash::BashArgs {
-        command: args
-            .get("command")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "Bash: missing `command`".to_string())?
-            .to_string(),
-        timeout: args
-            .get("timeout")
-            .and_then(Value::as_u64)
-            .and_then(|n| u32::try_from(n).ok()),
-        cwd: args.get("cwd").and_then(Value::as_str).map(str::to_string),
-        env: args
-            .get("env")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|e| {
-                        let arr = e.as_array()?;
-                        Some((
-                            arr.first()?.as_str()?.to_string(),
-                            arr.get(1)?.as_str()?.to_string(),
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        run_in_background: args
-            .get("run_in_background")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    };
+    use origin_tools::proc_supervisor::{ProcStatus, SpawnOpts, Supervisor};
+    use std::time::Duration;
+
+    let command = args
+        .get("command")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Bash: missing `command`".to_string())?
+        .to_string();
+    let timeout_secs = args
+        .get("timeout")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(120)
+        .min(600);
+    let cwd = args.get("cwd").and_then(Value::as_str).map(str::to_string);
+    let env: Vec<(String, String)> = args
+        .get("env")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    let arr = e.as_array()?;
+                    Some((
+                        arr.first()?.as_str()?.to_string(),
+                        arr.get(1)?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let run_in_background = args
+        .get("run_in_background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
     // Per-call supervisor: run_in_background + Monitor across separate tool
     // invocations won't work via this legacy path (known limitation —
     // Phase 8 replaces with envelope-level shared supervisor).
-    let sup = origin_tools::proc_supervisor::Supervisor::new();
-    let result = origin_tools::builtins::bash::bash_v2(bargs, &sup)
-        .await
-        .map_err(|e| e.message)?;
+    let sup = Supervisor::new();
+    let opts = SpawnOpts {
+        timeout: Some(Duration::from_secs(u64::from(timeout_secs))),
+        cwd,
+        env,
+        buffer_cap_bytes: None,
+    };
+    let pid = sup.spawn(&command, &opts).map_err(|e| e.message)?;
 
-    // Forward stdout lines as ToolChunk events.
-    let stdout_str = result["stdout"].as_str().unwrap_or("");
-    let exit_code = result["exit_code"].as_i64().unwrap_or(-1);
+    // Background: return the pid immediately, exactly like the foreground-vs-
+    // background split in `bash_v2`. No streaming — the user tails via Monitor.
+    if run_in_background {
+        let result = serde_json::json!({"status": "started", "pid": pid});
+        return Ok(serde_json::to_string(&result)
+            .expect("BUG: bash result Value always serializes")
+            .into_bytes());
+    }
+
+    // Foreground: poll the supervisor's ring buffer and stream every complete
+    // line to the user as soon as it appears. We hold back a trailing partial
+    // line (no terminating newline yet) so chunks align to line boundaries;
+    // any remainder is flushed after the process terminates.
+    let mut next = 0u64;
+    let mut acc = String::new();
+    let mut pending = String::new();
     let mut chunk_count: u32 = 0;
-    if let Some(tx) = event_tx {
-        for line in stdout_str.lines() {
-            chunk_count += 1;
+    // Generous wall-clock ceiling: the supervisor enforces `timeout_secs` on
+    // the child; this only bounds our polling loop in the pathological case
+    // where status never flips terminal.
+    let deadline =
+        std::time::Instant::now() + Duration::from_secs(u64::from(timeout_secs) + 5);
+
+    let flush_lines =
+        |pending: &mut String, chunk_count: &mut u32| -> Vec<String> {
+            let mut lines = Vec::new();
+            while let Some(nl) = pending.find('\n') {
+                let line: String = pending.drain(..=nl).collect();
+                // Drop the trailing '\n' for display; ToolChunk is per-line.
+                let line = line.trim_end_matches('\n').to_string();
+                *chunk_count += 1;
+                lines.push(line);
+            }
+            lines
+        };
+
+    let (status_str, exit_code) = loop {
+        let chunk = sup
+            .read_since(pid, next, 64 * 1024)
+            .map_err(|e| e.message)?;
+        if !chunk.bytes.is_empty() {
+            acc.push_str(&chunk.bytes);
+            pending.push_str(&chunk.bytes);
+            next = chunk.next_offset;
+            if let Some(tx) = event_tx {
+                for line in flush_lines(&mut pending, &mut chunk_count) {
+                    let _ = tx
+                        .send(StreamEvent::ToolChunk {
+                            tool: "Bash".to_string(),
+                            content: line,
+                        })
+                        .await;
+                }
+            } else {
+                // No sink: still advance the line counter so the terminal
+                // "(no output)" affordance below stays accurate.
+                let _ = flush_lines(&mut pending, &mut chunk_count);
+            }
+            // Drain quickly when there is buffered output to stay real-time.
+            continue;
+        }
+
+        if chunk.status.is_terminal() {
+            // Drain any remaining buffered bytes the per-read cap left behind.
+            loop {
+                let more = sup
+                    .read_since(pid, next, 64 * 1024)
+                    .map_err(|e| e.message)?;
+                if more.bytes.is_empty() {
+                    break;
+                }
+                acc.push_str(&more.bytes);
+                pending.push_str(&more.bytes);
+                next = more.next_offset;
+            }
+            if let Some(tx) = event_tx {
+                for line in flush_lines(&mut pending, &mut chunk_count) {
+                    let _ = tx
+                        .send(StreamEvent::ToolChunk {
+                            tool: "Bash".to_string(),
+                            content: line,
+                        })
+                        .await;
+                }
+            } else {
+                let _ = flush_lines(&mut pending, &mut chunk_count);
+            }
+            break match chunk.status {
+                ProcStatus::Exited(c) => ("exited", c),
+                ProcStatus::TimedOut => ("timed_out", -1),
+                ProcStatus::Killed => ("killed", -1),
+                ProcStatus::Running => unreachable!(),
+            };
+        }
+
+        if std::time::Instant::now() > deadline {
+            break ("timed_out", -1);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    // Flush any trailing partial line (output without a terminating newline).
+    if !pending.is_empty() {
+        chunk_count += 1;
+        let trailing = std::mem::take(&mut pending);
+        if let Some(tx) = event_tx {
             let _ = tx
                 .send(StreamEvent::ToolChunk {
                     tool: "Bash".to_string(),
-                    content: line.to_string(),
+                    content: trailing,
                 })
                 .await;
         }
-        if chunk_count == 0 {
+    }
+
+    // Silent commands (write-only scripts, no stdout/stderr): emit a single
+    // terminal affordance so the user still sees the command completed.
+    if chunk_count == 0 {
+        if let Some(tx) = event_tx {
             let _ = tx
                 .send(StreamEvent::ToolResult {
                     tool: "Bash".to_string(),
@@ -3048,6 +3168,11 @@ async fn run_bash_streaming(
         }
     }
 
+    let result = serde_json::json!({
+        "status": status_str,
+        "exit_code": exit_code,
+        "stdout": acc,
+    });
     Ok(serde_json::to_string(&result)
         .expect("BUG: bash result Value always serializes")
         .into_bytes())
@@ -4559,5 +4684,126 @@ mod wiring_tests {
             "no screenshot ⇒ no image attachment"
         );
         assert!(v["visual"]["console"].as_str().expect("console").contains("[warn] slow"));
+    }
+}
+
+#[cfg(test)]
+mod bash_streaming_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The core guarantee of the streaming fix: output reaches the user **as it
+    /// is produced**, not in one burst after the process exits. A command that
+    /// prints an early line, then sleeps, then prints a late line must deliver
+    /// the first `ToolChunk` well before the command terminates — otherwise a
+    /// long-running (or stuck) command looks hung to the user.
+    #[allow(clippy::panic)] // test asserts the StreamEvent variant via a panicking else-arm
+    #[tokio::test]
+    async fn streams_output_in_real_time() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
+        let args = serde_json::json!({
+            // Print, flush via newline, sleep ~1s, print again, then exit.
+            "command": "echo early; sleep 1; echo late",
+            "timeout": 10,
+        });
+
+        let start = Instant::now();
+        let driver = tokio::spawn(async move { run_bash_streaming(&args, Some(&tx)).await });
+
+        // The first chunk must arrive before the full sleep elapses.
+        let first = tokio::time::timeout(Duration::from_millis(800), rx.recv())
+            .await
+            .expect("first ToolChunk must arrive before the command finishes")
+            .expect("channel open");
+        let first_at = start.elapsed();
+        match first {
+            StreamEvent::ToolChunk { tool, content } => {
+                assert_eq!(tool, "Bash");
+                assert_eq!(content, "early");
+            }
+            other => panic!("expected ToolChunk(early), got {other:?}"),
+        }
+        assert!(
+            first_at < Duration::from_millis(800),
+            "first chunk streamed at {first_at:?}; output was buffered, not real-time"
+        );
+
+        // Drain the rest; the late line must also arrive.
+        let mut saw_late = false;
+        while let Some(ev) = rx.recv().await {
+            if let StreamEvent::ToolChunk { content, .. } = ev {
+                if content == "late" {
+                    saw_late = true;
+                }
+            }
+        }
+        assert!(saw_late, "late line never streamed");
+
+        let bytes = driver.await.expect("task joined").expect("bash ok");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
+        assert_eq!(v["status"], "exited");
+        assert_eq!(v["exit_code"], 0);
+        // The LLM still receives the fully accumulated body.
+        let stdout = v["stdout"].as_str().expect("stdout");
+        assert!(stdout.contains("early") && stdout.contains("late"), "stdout: {stdout:?}");
+    }
+
+    /// Silent commands (no stdout/stderr) still surface a terminal affordance
+    /// so the user sees the command completed rather than a blank gap.
+    #[tokio::test]
+    async fn silent_command_emits_terminal_result() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(8);
+        let args = serde_json::json!({ "command": "true", "timeout": 5 });
+        let bytes = run_bash_streaming(&args, Some(&tx)).await.expect("bash ok");
+        drop(tx);
+
+        let mut saw_result = false;
+        while let Some(ev) = rx.recv().await {
+            if let StreamEvent::ToolResult { tool, ok, preview, .. } = ev {
+                assert_eq!(tool, "Bash");
+                assert!(ok);
+                assert!(preview.contains("no output"), "preview: {preview}");
+                saw_result = true;
+            }
+        }
+        assert!(saw_result, "silent command must emit a ToolResult affordance");
+
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
+        assert_eq!(v["status"], "exited");
+        assert_eq!(v["exit_code"], 0);
+    }
+
+    /// `run_in_background` returns the pid immediately without streaming, just
+    /// like the foreground/background split in `bash_v2`.
+    #[tokio::test]
+    async fn background_returns_pid_without_streaming() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(8);
+        let args = serde_json::json!({
+            "command": "echo hi; sleep 1",
+            "run_in_background": true,
+        });
+        let started = Instant::now();
+        let bytes = run_bash_streaming(&args, Some(&tx)).await.expect("bash ok");
+        assert!(started.elapsed() < Duration::from_millis(500), "background must return fast");
+        drop(tx);
+
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
+        assert_eq!(v["status"], "started");
+        assert!(v["pid"].as_u64().is_some());
+
+        // No chunks streamed for the background path.
+        assert!(rx.recv().await.is_none(), "background path must not stream chunks");
+    }
+
+    /// A `None` sink (headless runs, tests) still completes and returns the full
+    /// body — streaming is best-effort, execution is not.
+    #[tokio::test]
+    async fn no_sink_still_returns_full_body() {
+        let args = serde_json::json!({ "command": "echo a; echo b", "timeout": 5 });
+        let bytes = run_bash_streaming(&args, None).await.expect("bash ok");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
+        assert_eq!(v["status"], "exited");
+        let stdout = v["stdout"].as_str().expect("stdout");
+        assert!(stdout.contains('a') && stdout.contains('b'), "stdout: {stdout:?}");
     }
 }

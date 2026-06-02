@@ -436,6 +436,23 @@ impl App {
             .push(ScrollLine::styled(padded_tip, theme::MUTED, 0, false));
     }
 
+    /// Wipe the in-session TUI view and restore the just-launched look, so
+    /// `/clear` leaves the terminal as if origin had only just started.
+    ///
+    /// Drops all scrollback rows, any half-rendered assistant turn, the goal
+    /// indicator, and resets the scroll position before re-painting the
+    /// startup banner. Persistent/session config carried on `App` (effort,
+    /// output style, theme, workspace roots, …) is deliberately left intact —
+    /// `/clear` resets the *conversation view*, not the session's settings.
+    pub fn reset_to_login(&mut self, cols: u16, rows: u16) {
+        self.scrollback.clear();
+        self.current_assistant = None;
+        self.goal_status = None;
+        self.stall_secs = None;
+        self.scroll_offset = 0;
+        self.push_banner(cols, rows);
+    }
+
     pub fn set_model(&mut self, model: impl Into<String>) {
         self.usage.model = model.into();
     }
@@ -994,55 +1011,82 @@ impl App {
         }
     }
 
-    /// Render the autocomplete suggestions popup directly above the input card,
-    /// showing up to six candidates with the selected row highlighted.
+    /// Render the autocomplete suggestions popup directly above the input card.
+    /// Shows a scrolling window of up to [`suggestions::MAX_VISIBLE`] candidates
+    /// over the full match list, with the selected row highlighted, so every
+    /// skill is reachable by arrowing through the list.
     fn draw_suggestions_popup(&self, main: &mut Grid, layout: &CardLayout) {
-        if !self.suggestions.candidates.is_empty() {
-            let count = clamp_u16(self.suggestions.candidates.len().min(6));
-            let popup_bottom = layout.r_top.saturating_sub(1);
-            let popup_top = popup_bottom.saturating_sub(count);
-            let selected = self.suggestions.selected;
-            for (i, candidate) in self.suggestions.candidates.iter().take(6).enumerate() {
-                let r = popup_top + clamp_u16(i);
-                if r >= popup_bottom || r >= layout.rows {
-                    break;
-                }
-                for c in layout.cl..layout.cr.min(layout.cols) {
-                    main.put(r, c, Cell::new(' ', 0, theme::SURFACE_RAISED, Attr::PLAIN));
-                }
-                let (ind_fg, txt_fg) = if i == selected {
-                    (theme::ACCENT, theme::BODY)
-                } else {
-                    (theme::MUTED, theme::MUTED)
-                };
-                let ind = if i == selected { " \u{25B8} " } else { "   " };
-                let ps = layout.cl + 1;
-                write_str_styled(
-                    main,
-                    r,
-                    ps,
-                    ind,
-                    layout.cr,
-                    Style {
-                        fg: ind_fg,
-                        bg: theme::SURFACE_RAISED,
-                        bold: false,
-                    },
-                );
-                let ind_w = char_display_width(ind);
-                write_str_styled(
-                    main,
-                    r,
-                    ps + ind_w,
-                    candidate,
-                    layout.cr,
-                    Style {
-                        fg: txt_fg,
-                        bg: theme::SURFACE_RAISED,
-                        bold: false,
-                    },
-                );
+        let total = self.suggestions.candidates.len();
+        if total == 0 {
+            return;
+        }
+        let win = crate::suggestions::MAX_VISIBLE;
+        let offset = crate::suggestions::scroll_offset(total, self.suggestions.selected);
+        let visible = total.saturating_sub(offset).min(win);
+        let count = clamp_u16(visible);
+        let popup_bottom = layout.r_top.saturating_sub(1);
+        let popup_top = popup_bottom.saturating_sub(count);
+        let selected = self.suggestions.selected;
+        let more_above = offset > 0;
+        let more_below = offset + visible < total;
+        for (row, candidate) in self
+            .suggestions
+            .candidates
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(visible)
+        {
+            let i = row - offset;
+            let r = popup_top + clamp_u16(i);
+            if r >= popup_bottom || r >= layout.rows {
+                break;
             }
+            for c in layout.cl..layout.cr.min(layout.cols) {
+                main.put(r, c, Cell::new(' ', 0, theme::SURFACE_RAISED, Attr::PLAIN));
+            }
+            let (ind_fg, txt_fg) = if row == selected {
+                (theme::ACCENT, theme::BODY)
+            } else {
+                (theme::MUTED, theme::MUTED)
+            };
+            // Indicator column: selection arrow takes priority; otherwise
+            // show scroll hints on the top/bottom rows when the list overflows.
+            let ind = if row == selected {
+                " \u{25B8} "
+            } else if i == 0 && more_above {
+                " \u{2191} "
+            } else if i + 1 == visible && more_below {
+                " \u{2193} "
+            } else {
+                "   "
+            };
+            let ps = layout.cl + 1;
+            write_str_styled(
+                main,
+                r,
+                ps,
+                ind,
+                layout.cr,
+                Style {
+                    fg: ind_fg,
+                    bg: theme::SURFACE_RAISED,
+                    bold: false,
+                },
+            );
+            let ind_w = char_display_width(ind);
+            write_str_styled(
+                main,
+                r,
+                ps + ind_w,
+                candidate,
+                layout.cr,
+                Style {
+                    fg: txt_fg,
+                    bg: theme::SURFACE_RAISED,
+                    bold: false,
+                },
+            );
         }
     }
 }
@@ -1679,6 +1723,49 @@ mod tests {
         app.stall_secs = Some(90);
         app.stop_turn_timer();
         assert_eq!(app.stall_secs, None, "ending a turn must clear the stall notice");
+    }
+
+    #[test]
+    fn reset_to_login_wipes_conversation_and_restores_banner() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        // Simulate an in-flight session: scrollback, a half-rendered turn,
+        // a goal indicator, a stall notice, and a scrolled-up viewport.
+        app.add_line("you> ", "hello");
+        app.add_line("ok> ", "did a thing");
+        app.current_assistant = Some("partial reply".to_string());
+        app.goal_status = Some("goal active".to_string());
+        app.stall_secs = Some(42);
+        app.scroll_offset = 7;
+
+        app.reset_to_login(80, 24);
+
+        // The banner is re-pushed, so scrollback is non-empty but contains
+        // only freshly-painted launch rows — none of the conversation lines.
+        assert!(
+            !app.scrollback.is_empty(),
+            "reset must re-paint the startup banner"
+        );
+        assert!(
+            !app
+                .scrollback
+                .iter()
+                .any(|l| l.text.contains("hello") || l.text.contains("did a thing")),
+            "conversation rows must be gone after reset"
+        );
+        assert_eq!(app.current_assistant, None, "half-rendered turn cleared");
+        assert_eq!(app.goal_status, None, "goal indicator cleared");
+        assert_eq!(app.stall_secs, None, "stall notice cleared");
+        assert_eq!(app.scroll_offset, 0, "viewport snapped back to bottom");
+
+        // A fresh launch produces the same view as the reset one.
+        let mut fresh = App::new("anthropic", "m", CompletionSources::default());
+        fresh.push_banner(80, 24);
+        let reset_text: Vec<&String> = app.scrollback.iter().map(|l| &l.text).collect();
+        let fresh_text: Vec<&String> = fresh.scrollback.iter().map(|l| &l.text).collect();
+        assert_eq!(
+            reset_text, fresh_text,
+            "reset_to_login must match a just-launched banner view"
+        );
     }
 
     // Drive one turn through the cache-cold state machine with explicit

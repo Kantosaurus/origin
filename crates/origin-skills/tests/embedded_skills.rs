@@ -5,12 +5,11 @@ use origin_skills::{load_all, load_embedded};
 use tempfile::tempdir;
 
 #[test]
-fn embedded_includes_all_16_superpowers_skills() {
+fn embedded_includes_all_15_superpowers_skills() {
     let skills = load_embedded();
     let names: Vec<&str> = skills.iter().map(|s| s.front.name.as_str()).collect();
     let expected = [
         "brainstorming",
-        "clear",
         "dispatching-parallel-agents",
         "executing-plans",
         "finishing-a-development-branch",
@@ -34,8 +33,8 @@ fn embedded_includes_all_16_superpowers_skills() {
     }
     assert_eq!(
         skills.len(),
-        16,
-        "expected exactly 16 embedded skills, got {}",
+        15,
+        "expected exactly 15 embedded skills, got {}",
         skills.len()
     );
 }
@@ -57,7 +56,7 @@ fn user_skill_overrides_embedded_by_name() {
     assert_eq!(bs.front.description, "user override");
     assert_eq!(
         all.len(),
-        16,
+        15,
         "merging should not change count when override matches one embedded"
     );
 }

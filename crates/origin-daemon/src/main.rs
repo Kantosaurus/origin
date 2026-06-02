@@ -944,65 +944,6 @@ fn spawn_handler_task(
                         .await;
                         continue;
                     }
-                    // Bug #10: `/clear` documents itself as wiping the
-                    // in-session context. Before activating the (purely
-                    // informational) `clear` skill, terminate any active goal
-                    // with `UserClearAll` and write the same terminal-status
-                    // checkpoint the Interrupt arm does. Without this the
-                    // user's `/clear` leaves `active_goal` populated and the
-                    // next `Prompt` silently resumes the driver loop.
-                    if name == "clear" {
-                        let prior_opt = {
-                            let mut slot = active_goal.lock().await;
-                            slot.take()
-                        };
-                        if let Some(prior) = prior_opt {
-                            if let Some(ev) = origin_daemon::goal_clear_all::clear_all_event_for(Some(&prior))
-                            {
-                                // Terminal-status checkpoint so a crash between
-                                // /clear and the next Prompt cannot resurrect
-                                // the goal the user just discarded. Mirrors the
-                                // Interrupt arm's bug-#17 fix.
-                                let sid_opt = last_known_session_id.lock().await.clone();
-                                if let Some(sid) = sid_opt {
-                                    let snap = origin_goal::GoalSnapshot {
-                                        condition: prior.condition.clone(),
-                                        iter: prior.iter,
-                                        max_iter: prior.max_iter,
-                                        tokens_spent: prior.tokens_spent,
-                                        token_budget: prior.token_budget,
-                                        started_at_unix: prior
-                                            .started_at
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .map(|d| d.as_secs())
-                                            .unwrap_or(0),
-                                        status: origin_goal::GoalStatusWire::Cleared {
-                                            by: origin_goal::ClearReasonWire::UserClearAll,
-                                        },
-                                        last_status_tag: prior.last_status_tag.clone().map(Into::into),
-                                    };
-                                    let token = origin_resume_token::ResumeToken {
-                                        session_id: sid,
-                                        last_turn: 0,
-                                        cas_handle_root: [0u8; 32],
-                                        pending_tool_calls: Vec::new(),
-                                        plan_seq: 0,
-                                        goal: Some(snap),
-                                        detached_at_unix: None,
-                                        memory_estimate_bytes: None,
-                                    };
-                                    if let Err(e) = session_store.save_resume_token(&token) {
-                                        warn!(error = %e, "clear: terminal goal checkpoint save failed");
-                                    }
-                                }
-                                let body = serde_json::to_vec(&ev).unwrap_or_default();
-                                let _ = conn_clone.lock().await.write_frame(FrameKind::Event, &body).await;
-                            }
-                        }
-                        // Fall through to the catalog lookup so the `clear`
-                        // skill itself still pushes onto the skill stack
-                        // (matches every other documentation skill's UX).
-                    }
                     // Look up the skill in the daemon-wide catalog loaded at
                     // startup. The catalog is the single source of truth shared
                     // with the system-prompt injection (see agent.rs::run_loop).
@@ -1189,6 +1130,19 @@ fn spawn_handler_task(
                         }
                         let _ = write_event(&conn, &ev).await;
                     }
+                }
+                ClientMessage::ClearAll => {
+                    // `/clear` is mechanical: it resets the in-session context
+                    // without ever touching the skill stack or catalog. Its
+                    // only stateful effect is terminating any active goal
+                    // (bug #10), after which it acks with AdminOk.
+                    handle_clear_all(
+                        &conn,
+                        Arc::clone(&active_goal),
+                        Arc::clone(&session_store),
+                        Arc::clone(&last_known_session_id),
+                    )
+                    .await;
                 }
                 admin @ (ClientMessage::ListSessions
                 | ClientMessage::RemoveSession { .. }
@@ -1732,6 +1686,47 @@ async fn handle_goal_activation(
             let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
         }
     }
+}
+
+/// Handle the mechanical `/clear` admin verb ([`ClientMessage::ClearAll`]).
+///
+/// `/clear` is a first-class context reset, not a skill: it never touches the
+/// per-connection skill stack or the skill catalog. Its only stateful effect is
+/// terminating any active goal so the next `Prompt` cannot silently resume the
+/// driver loop (bug #10). The sequence is:
+///
+/// 1. Take the active-goal slot. If a goal was running, write the terminal
+///    `Cleared { UserClearAll }` checkpoint (so a crash between `/clear` and
+///    the next `Prompt` cannot resurrect it) and emit
+///    [`StreamEvent::GoalCleared`].
+/// 2. Always finish with [`StreamEvent::AdminOk`] so the CLI sees a terminal
+///    ack for the request — whether or not a goal was cleared.
+async fn handle_clear_all(
+    conn: &SharedConnection,
+    active_goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
+    session_store: Arc<SessionStore>,
+    last_known_session_id: Arc<tokio::sync::Mutex<Option<String>>>,
+) {
+    let prior_opt = {
+        let mut slot = active_goal.lock().await;
+        slot.take()
+    };
+    if let Some(prior) = prior_opt {
+        if let Some(ev) = origin_daemon::goal_clear_all::clear_all_event_for(Some(&prior)) {
+            // Terminal-status checkpoint so a crash between /clear and the next
+            // Prompt cannot resurrect the goal the user just discarded. Mirrors
+            // the Interrupt arm's bug-#17 fix.
+            let sid_opt = last_known_session_id.lock().await.clone();
+            if let Some(sid) = sid_opt {
+                let token = cleared_resume_token(&sid, 0, &prior, origin_goal::ClearReasonWire::UserClearAll);
+                if let Err(e) = session_store.save_resume_token(&token) {
+                    warn!(error = %e, "clear: terminal goal checkpoint save failed");
+                }
+            }
+            let _ = write_event(conn, &ev).await;
+        }
+    }
+    let _ = write_event(conn, &StreamEvent::AdminOk).await;
 }
 
 /// Pull the last assistant text out of `session` for tag parsing + verifier
@@ -2463,6 +2458,7 @@ async fn handle_admin(
         | ClientMessage::ResumeRequest { .. }
         | ClientMessage::SubscribePlan
         | ClientMessage::Interrupt
+        | ClientMessage::ClearAll
         | ClientMessage::ActivateSkill { .. }
         | ClientMessage::DeactivateSkill { .. }
         | ClientMessage::ActivateWorkflow { .. } => return true,

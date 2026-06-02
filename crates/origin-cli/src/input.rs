@@ -125,7 +125,7 @@ pub fn parse_mem_command(line: &str) -> Option<ClientMessage> {
 /// Slash verbs that already have dedicated handlers — they must not be
 /// re-routed through the skill parser even though they start with `/`.
 /// Update this list when a new slash verb is added.
-const RESERVED_SLASH_VERBS: &[&str] = &["mem", "account", "help", "model"];
+const RESERVED_SLASH_VERBS: &[&str] = &["mem", "account", "help", "model", "clear"];
 
 /// Parse `/<name>` (activate) and `/-<name>` (deactivate) into a
 /// [`ClientMessage::ActivateSkill`] or [`ClientMessage::DeactivateSkill`].
@@ -185,6 +185,21 @@ pub fn parse_skill_command(line: &str) -> Option<ClientMessage> {
         name: name_token.to_string(),
         args,
     })
+}
+
+/// Parse the mechanical `/clear` command into [`ClientMessage::ClearAll`].
+///
+/// `/clear` is NOT a skill — it resets the in-session context directly. The
+/// whole trimmed line must be exactly `/clear` (no args), so a prompt that
+/// merely mentions `/clear` mid-sentence is left as chat text. Returns `None`
+/// for anything else.
+#[must_use]
+pub fn parse_clear_command(line: &str) -> Option<ClientMessage> {
+    if line.trim() == "/clear" {
+        Some(ClientMessage::ClearAll)
+    } else {
+        None
+    }
 }
 
 /// Parse `{workflow:<name>}` (the whole trimmed line) into a
@@ -729,12 +744,35 @@ mod tests_args {
 
     #[test]
     fn slash_without_args_returns_none_args() {
-        let got = parse_skill_command("/clear");
+        let got = parse_skill_command("/brainstorming");
         assert!(matches!(
             got,
             Some(ClientMessage::ActivateSkill { ref name, args: None })
-                if name == "clear"
+                if name == "brainstorming"
         ));
+    }
+
+    #[test]
+    fn clear_is_not_a_skill() {
+        // `/clear` is a reserved verb; it must NOT parse as a skill activation.
+        assert!(
+            parse_skill_command("/clear").is_none(),
+            "/clear must route to the mechanical ClearAll path, not the skill parser"
+        );
+    }
+
+    #[test]
+    fn clear_parses_to_clear_all() {
+        assert!(matches!(parse_clear_command("/clear"), Some(ClientMessage::ClearAll)));
+        assert!(matches!(parse_clear_command("  /clear  "), Some(ClientMessage::ClearAll)));
+    }
+
+    #[test]
+    fn clear_command_rejects_args_and_chat() {
+        assert!(parse_clear_command("/clear now").is_none());
+        assert!(parse_clear_command("please /clear the screen").is_none());
+        assert!(parse_clear_command("/cleary").is_none());
+        assert!(parse_clear_command("clear").is_none());
     }
 
     #[test]
