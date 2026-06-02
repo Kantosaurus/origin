@@ -116,6 +116,18 @@ fn emit_translated(grid: &Grid, runs: &[Run], row_offset: u16, col_offset: u16) 
 }
 
 fn push_sgr(out: &mut Vec<u8>, fg: u32, bg: u32, attr: Attr) {
+    // Honor `NO_COLOR` via the same cached decision the `ansi` emit path uses,
+    // so both render paths stay byte-consistent.
+    push_sgr_inner(out, fg, bg, attr, crate::ansi::want_color_cached());
+}
+
+/// Emit the SGR sequence for a style, with the color decision passed in so the
+/// behavior is unit-testable without touching the process environment.
+///
+/// Attribute sequences (bold/italic/underline/reverse/dim) are always emitted
+/// so structure survives even with color off; only the 24-bit foreground and
+/// background sequences are gated behind `want_color`.
+fn push_sgr_inner(out: &mut Vec<u8>, fg: u32, bg: u32, attr: Attr, want_color: bool) {
     out.extend_from_slice(b"\x1b[0m");
     if attr.bits() & Attr::BOLD.bits() != 0 {
         out.extend_from_slice(b"\x1b[1m");
@@ -132,11 +144,11 @@ fn push_sgr(out: &mut Vec<u8>, fg: u32, bg: u32, attr: Attr) {
     if attr.bits() & Attr::DIM.bits() != 0 {
         out.extend_from_slice(b"\x1b[2m");
     }
-    if fg != 0 {
+    if want_color && fg != 0 {
         let (r, g, b) = unpack(fg);
         let _ = write!(out, "\x1b[38;2;{r};{g};{b}m");
     }
-    if bg != 0 {
+    if want_color && bg != 0 {
         let (r, g, b) = unpack(bg);
         let _ = write!(out, "\x1b[48;2;{r};{g};{b}m");
     }
@@ -272,5 +284,34 @@ impl Composer {
         out.extend_from_slice(&bytes_side);
         out.extend_from_slice(&bytes_prompt);
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_sgr_inner;
+    use crate::grid::Attr;
+
+    #[test]
+    fn disabled_color_keeps_attrs_drops_truecolor() {
+        // The translated emit path must honor `NO_COLOR` like `ansi::emit`:
+        // bold survives, 24-bit fg/bg are dropped.
+        let mut out: Vec<u8> = Vec::new();
+        push_sgr_inner(&mut out, 0x00FF_8040, 0x0010_2030, Attr::BOLD, false);
+        let s = String::from_utf8(out).expect("SGR bytes are valid UTF-8");
+        assert!(s.contains("\x1b[1m"), "bold attribute should still emit");
+        assert!(!s.contains("38;2"), "foreground truecolor must be skipped");
+        assert!(!s.contains("48;2"), "background truecolor must be skipped");
+    }
+
+    #[test]
+    fn enabled_color_emits_truecolor() {
+        // The default path stays byte-identical: color enabled → fg/bg present.
+        let mut out: Vec<u8> = Vec::new();
+        push_sgr_inner(&mut out, 0x00FF_8040, 0x0010_2030, Attr::BOLD, true);
+        let s = String::from_utf8(out).expect("SGR bytes are valid UTF-8");
+        assert!(s.contains("\x1b[1m"));
+        assert!(s.contains("\x1b[38;2;255;128;64m"));
+        assert!(s.contains("\x1b[48;2;16;32;48m"));
     }
 }
