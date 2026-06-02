@@ -15,7 +15,7 @@ use origin_cli::cli_def::{Cli, Cmd, KeyringSub, PairSub, ProvidersSub, SessionsS
 use origin_cli::goal_render::render_goal_event;
 use origin_cli::input::{
     parse_clear_command, parse_mem_command, parse_model_command, parse_skill_command, parse_workflow_command,
-    reduce, InputAction,
+    permission_answer, reduce, InputAction,
 };
 use origin_cli::plan_panel_wiring::Wiring as PlanPanelWiring;
 use origin_cli::tui::App;
@@ -644,6 +644,28 @@ async fn handle_key_event(
         return outcome;
     }
 
+    // Pending permission ask (opt-in `/permissions`): y/n/Esc answers it. The
+    // decision is sent on a FRESH connection so the daemon's registry can
+    // resolve it (the turn's connection is busy streaming). Other keys fall
+    // through to normal handling; a no-op when nothing is pending.
+    if app.lock().pending_permission.is_some() {
+        if let Some(allow) = permission_answer(ev.code) {
+            let pending = app.lock().pending_permission.take();
+            if let Some(p) = pending {
+                let _ = send_decision(
+                    path,
+                    &ClientMessage::PermissionDecision { id: p.id, allow },
+                )
+                .await;
+                let verb = if allow { "allowed" } else { "denied" };
+                app.lock()
+                    .add_line("system> ", &format!("{verb}: {} {}", p.tool, p.args));
+            }
+            handle.mark_dirty();
+            return KeyOutcome::Continue;
+        }
+    }
+
     if matches!(ev.code, crossterm::event::KeyCode::Tab) {
         let mut a = app.lock();
         if !a.suggestions.candidates.is_empty() {
@@ -1023,6 +1045,27 @@ async fn handle_submit(
         handle.mark_dirty();
         return;
     }
+    // `/permissions [on|off]` toggles opt-in interactive tool prompting. When
+    // ON, the daemon asks before running RequiresPermission tools (Bash/Write/
+    // Edit/…) and the user answers each with y/n. Default OFF keeps the historic
+    // auto-allow behaviour (byte-identical wire + tool execution).
+    if let Some(arg) = text
+        .trim()
+        .strip_prefix("/permissions")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        .map(str::trim)
+    {
+        app.lock().add_line("you> ", text);
+        let now_on = app.lock().set_permission_ask(arg);
+        let msg = if now_on {
+            "permission prompts ON \u{2014} approve Bash/Write/Edit before they run (y/n); /permissions off to disable"
+        } else {
+            "permission prompts OFF \u{2014} tools auto-run (default)"
+        };
+        app.lock().add_line("system> ", msg);
+        handle.mark_dirty();
+        return;
+    }
     // `/attach <path>` stages an image/PDF for the next prompt (interactive
     // parity with headless `origin run --attach`). The file is classified and
     // encoded CLI-side so the daemon never reads client paths.
@@ -1188,6 +1231,8 @@ async fn handle_prompt_turn(
     let handle_for_backoff = handle.clone();
     let app_for_goal = Arc::clone(app);
     let handle_for_goal = handle.clone();
+    let app_for_perm = Arc::clone(app);
+    let handle_for_perm = handle.clone();
     // Snapshot the session effort level so this turn carries `/effort`/`/fast`.
     let effort = app.lock().effort.clone();
     // Carry the startup `--thinking-tokens` budget on every turn (aider
@@ -1207,6 +1252,8 @@ async fn handle_prompt_turn(
     let attachments = std::mem::take(&mut app.lock().pending_attachments);
     // Session-wide multi-root list (from the startup `--root` flags).
     let roots = app.lock().workspace_roots.clone();
+    // Opt-in interactive permission prompting (`/permissions on`).
+    let permission_ask = app.lock().permission_ask;
     let reply = call_daemon(
         path,
         model,
@@ -1218,6 +1265,7 @@ async fn handle_prompt_turn(
         read_only,
         attachments,
         roots,
+        permission_ask,
         interrupt_rx,
         move |ev: &StreamEvent| {
             // Bug #4: route Goal* events through the dedicated renderer so
@@ -1226,6 +1274,16 @@ async fn handle_prompt_turn(
             render_goal_event(&mut *a, ev);
             drop(a);
             handle_for_goal.mark_dirty();
+        },
+        move |id, tool: &str, args: &str| {
+            // Surface the permission ask; the event loop's y/n handler reads
+            // `pending_permission` and sends the decision on a fresh connection.
+            app_for_perm.lock().pending_permission = Some(origin_cli::tui::PendingPermission {
+                id,
+                tool: tool.to_string(),
+                args: args.to_string(),
+            });
+            handle_for_perm.mark_dirty();
         },
         move |d| {
             app_for_delta.lock().append_to_current_assistant(d);
@@ -1408,6 +1466,10 @@ async fn call_daemon(
     attachments: Vec<origin_multimodal::ContentBlock>,
     // Session-wide extra workspace roots (`--root`); empty ⇒ single-root.
     roots: Vec<String>,
+    // Opt-in interactive permission prompting (`/permissions on`); false ⇒ the
+    // daemon stays on auto-allow, so the request and tool execution are
+    // byte-identical.
+    permission_ask: bool,
     // Bug #5: one-shot channel surfacing user Ctrl+C while a Prompt is in
     // flight. When a tick lands we write `ClientMessage::Interrupt` to
     // the same connection serving the prompt — the daemon's
@@ -1419,6 +1481,9 @@ async fn call_daemon(
     // EVERY Goal variant; non-Goal variants are dispatched in the match
     // below as before.
     mut on_goal: impl FnMut(&StreamEvent) + Send,
+    // Opt-in permission ask (id, tool, args_preview): surfaces the approval
+    // prompt; the event loop sends the decision back on a fresh connection.
+    mut on_permission_ask: impl FnMut(u64, &str, &str) + Send,
     mut on_delta: impl FnMut(&str) + Send,
     mut on_tool: impl FnMut(&str, &str, Vec<origin_daemon::protocol::DiffLine>) + Send,
     mut on_tool_chunk: impl FnMut(&str, &str) + Send,
@@ -1439,9 +1504,7 @@ async fn call_daemon(
         attachments,
         read_only,
         roots,
-        // Wired to the session opt-in in a later step; default off keeps the
-        // request byte-identical and the daemon on the auto-allow path.
-        permission_ask: false,
+        permission_ask,
     });
     let body = serde_json::to_vec(&msg)?;
     let frame = encode(1, FrameKind::Request, &body);
@@ -1541,6 +1604,11 @@ async fn call_daemon(
                     attempt,
                     max_attempts,
                 } => on_backoff(retry_in_secs, attempt, max_attempts),
+                StreamEvent::PermissionAsk {
+                    id,
+                    ref tool,
+                    ref args_preview,
+                } => on_permission_ask(id, tool, args_preview),
                 _ => {}
             }
             continue;

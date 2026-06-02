@@ -19,6 +19,17 @@ use crate::status::UsageSnapshot;
 use crate::suggestions::SuggestionState;
 use crate::theme::{self, Theme};
 
+/// An in-flight permission ask surfaced by the daemon (opt-in `/permissions`).
+///
+/// `Some` while the user is being asked to approve a tool; the next `y`/`n`
+/// answers it. Rendered as a prompt above the input card.
+#[derive(Debug, Clone)]
+pub struct PendingPermission {
+    pub id: u64,
+    pub tool: String,
+    pub args: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ScrollLine {
     pub text: String,
@@ -161,6 +172,10 @@ pub fn notify_turn_complete(enabled: bool, succeeded: bool) -> bool {
     true
 }
 
+// App-state aggregate: each bool is an independent, unrelated session toggle
+// (plan mode, vim, desktop notify, permission prompting). Grouping them into a
+// sub-struct would obscure rather than clarify.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct App {
     pub scrollback: Vec<ScrollLine>,
@@ -240,6 +255,15 @@ pub struct App {
     /// notification fires on successful turn completion via `origin-notify`.
     /// Default `false` ⇒ no spawn ⇒ byte-identical.
     pub notify_desktop: bool,
+    /// Opt-in interactive tool-permission prompting. When `true`, each
+    /// `PromptRequest` carries `permission_ask`, so the daemon asks before
+    /// running `RequiresPermission` tools. Default `false` ⇒ the daemon stays on
+    /// auto-allow ⇒ byte-identical. Toggled by the `/permissions` command.
+    pub permission_ask: bool,
+    /// The pending permission ask, if the daemon is currently waiting on the
+    /// user. `Some` ⇒ the next `y`/`n` (or `Esc`) answers it; rendered above the
+    /// input card. `None` in the common case.
+    pub pending_permission: Option<PendingPermission>,
 }
 
 /// State backing the live cache-cold status-line nudge. All times are
@@ -311,7 +335,20 @@ impl App {
             vim_active: false,
             theme: Theme::Default,
             notify_desktop: false,
+            permission_ask: false,
+            pending_permission: None,
         }
+    }
+
+    /// Apply a `/permissions [on|off]` toggle, returning the new state. No
+    /// argument flips the current state; `on`/`off` set it explicitly.
+    pub fn set_permission_ask(&mut self, arg: &str) -> bool {
+        self.permission_ask = match arg.trim() {
+            "on" => true,
+            "off" => false,
+            _ => !self.permission_ask,
+        };
+        self.permission_ask
     }
 
     /// Start the live turn timer. Called when a user submission begins.
@@ -830,6 +867,30 @@ impl App {
     /// breathing-room row just above the input card. The stall notice (when
     /// active) overpaints the goal status — a stall is the more urgent signal.
     fn draw_notices(&self, main: &mut Grid, layout: &CardLayout) {
+        // Highest-priority notice: a pending permission ask blocks the turn, so
+        // it overpaints the goal/stall row. The user answers with y / n.
+        if let Some(ref ask) = self.pending_permission {
+            let status_row = layout.at_bottom.saturating_sub(1);
+            if status_row < layout.rows {
+                let msg = format!(
+                    "\u{26A0} Allow {} {}?  y = allow \u{00B7} n = deny",
+                    ask.tool, ask.args
+                );
+                write_str_styled(
+                    main,
+                    status_row,
+                    layout.cl.saturating_add(2),
+                    &msg,
+                    layout.cr,
+                    Style {
+                        fg: theme::YELLOW,
+                        bg: 0,
+                        bold: true,
+                    },
+                );
+            }
+            return;
+        }
         // Bug #4: render the one-line goal-status indicator (when set)
         // on the breathing-room row just above the input card. Centered
         // inside the card width so it visually associates with the
@@ -2210,7 +2271,20 @@ mod tests {
         assert!(!app.vim_active);
         assert_eq!(app.vim_mode, VimMode::Insert);
         assert!(!app.notify_desktop);
+        assert!(!app.permission_ask, "permission prompting defaults off");
+        assert!(app.pending_permission.is_none());
         assert_eq!(app.palette(), theme::palette(Theme::Default));
+    }
+
+    #[test]
+    fn set_permission_ask_toggles_and_sets() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        assert!(!app.permission_ask, "default off");
+        assert!(app.set_permission_ask(""), "no arg flips on");
+        assert!(app.permission_ask);
+        assert!(!app.set_permission_ask(""), "no arg flips back off");
+        assert!(app.set_permission_ask("on"), "explicit on");
+        assert!(!app.set_permission_ask("off"), "explicit off");
     }
 
     #[test]

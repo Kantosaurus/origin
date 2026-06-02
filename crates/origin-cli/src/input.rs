@@ -321,6 +321,18 @@ pub enum VimAction {
 ///   are [`VimAction::Pass`] (they do not insert text in Normal mode — the
 ///   caller drops them).
 ///
+/// Map a keypress to a permission decision while an interactive permission ask
+/// is pending: `y`/`Y` allows, `n`/`N` or `Esc` denies, anything else is not an
+/// answer (`None`) and falls through to normal input handling.
+#[must_use]
+pub const fn permission_answer(code: KeyCode) -> Option<bool> {
+    match code {
+        KeyCode::Char('y' | 'Y') => Some(true),
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(false),
+        _ => None,
+    }
+}
+
 /// Modifier chords (anything with `CONTROL`/`ALT`) always [`VimAction::Pass`]
 /// so the global `Ctrl+C`/`Ctrl+D` exits keep working in either mode.
 #[must_use]
@@ -385,6 +397,17 @@ mod tests {
             InputAction::Submit("hello".into())
         );
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn permission_answer_maps_keys() {
+        assert_eq!(permission_answer(KeyCode::Char('y')), Some(true));
+        assert_eq!(permission_answer(KeyCode::Char('Y')), Some(true));
+        assert_eq!(permission_answer(KeyCode::Char('n')), Some(false));
+        assert_eq!(permission_answer(KeyCode::Char('N')), Some(false));
+        assert_eq!(permission_answer(KeyCode::Esc), Some(false), "Esc denies");
+        assert_eq!(permission_answer(KeyCode::Char('x')), None, "other keys not an answer");
+        assert_eq!(permission_answer(KeyCode::Enter), None);
     }
 
     #[test]
