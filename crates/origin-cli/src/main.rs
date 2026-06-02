@@ -6,7 +6,9 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, MouseEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt as _;
@@ -297,7 +299,13 @@ fn import_subcommand(a: &origin_cli::import::ImportArgs) -> Result<()> {
 /// screen + mouse capture + hidden cursor).
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen, Show);
+    let _ = execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
+    );
 }
 
 /// RAII guard that restores the terminal on drop — covering early `?` returns
@@ -418,7 +426,13 @@ async fn run() -> Result<()> {
     // `Hide` the hardware cursor: the renderer paints its own caret, and without
     // this the real cursor teleports to the last damage run (the status line)
     // and jitters there on every 80 ms heartbeat tick.
-    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
+    execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        Hide
+    )?;
 
     let (composer, widget, app) = setup_tui(default_provider, &model);
     // Seed the session reasoning-effort from the startup `--effort` flag.
@@ -636,6 +650,19 @@ async fn run_event_loop(
                 }
                 _ => {}
             }
+            continue;
+        }
+        // Bracketed paste: the terminal delivers the whole clipboard as one
+        // event, so a multi-line paste no longer streams key-by-key (where the
+        // first embedded newline would fire a truncated Submit). Append it
+        // verbatim (normalizing CR/CRLF to LF) in one shot, then one recompute.
+        if let crossterm::event::Event::Paste(pasted) = &event {
+            let normalized = pasted.replace("\r\n", "\n").replace('\r', "\n");
+            let mut a = app.lock();
+            a.input.push_str(&normalized);
+            a.recompute_suggestions();
+            drop(a);
+            handle.mark_dirty();
             continue;
         }
         if let crossterm::event::Event::Key(ev) = event {
