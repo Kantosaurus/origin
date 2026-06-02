@@ -461,6 +461,9 @@ async fn run() -> Result<()> {
     // `composer`/`widget` are not used after the render task takes them, so
     // move them in directly; `app`/`plan_panel`/`handle` are still needed
     // below, so those are cloned.
+    // Keep a composer handle for the event loop's resize arm; the render task
+    // takes its own clone (it's an Arc<Mutex<…>>, so both share one composer).
+    let composer_for_events = Arc::clone(&composer);
     let render_task = spawn_render_task(scheduler, composer, app.clone(), widget, plan_panel.clone());
 
     spawn_stall_watchdog(app.clone(), handle.clone());
@@ -468,7 +471,8 @@ async fn run() -> Result<()> {
     // Auto-fire the pending discovery prompt now that the TUI is wired up.
     fire_pending_prompt(pending_prompt, &app, &handle, &path, &mut model, &session_id).await;
 
-    let result = run_event_loop(app, handle, &path, &mut model, &session_id, plan_panel).await;
+    let result =
+        run_event_loop(app, handle, &path, &mut model, &session_id, plan_panel, composer_for_events).await;
 
     render_task.abort();
     // Restore now (before the farewell) so "bye" prints on the normal screen;
@@ -622,6 +626,7 @@ async fn run_event_loop(
     model: &mut String,
     session_id: &str,
     plan_panel: Arc<Mutex<PlanPanelWiring>>,
+    composer: SharedComposer,
 ) -> Result<()> {
     spawn_plan_subscription(path.to_string(), Arc::clone(&plan_panel), handle.clone());
     // Bug #5: shared slot holding the current `call_daemon`'s interrupt
@@ -635,6 +640,18 @@ async fn run_event_loop(
     let mut input_stream = crossterm::event::EventStream::new();
     while let Some(maybe_ev) = input_stream.next().await {
         let event = maybe_ev?;
+        // Terminal resize: reflow the composer's grids to the new size. Without
+        // this the grid stays frozen at launch size and scribbles past the new
+        // bounds. The draw routine re-wraps scrollback to the new width and
+        // clamps scroll on the next frame.
+        if let crossterm::event::Event::Resize(cols, rows) = event {
+            let mut c = composer.lock();
+            let side_visible = c.side_visible();
+            c.resize(cols, rows, side_visible);
+            drop(c);
+            handle.mark_dirty();
+            continue;
+        }
         // Mouse wheel scroll: drive the scrollback offset directly. Each
         // wheel tick advances by ~3 visual rows, matching the Shift+Arrow
         // handler below. Other mouse events (clicks, drag) are ignored.
