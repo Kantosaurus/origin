@@ -14,6 +14,7 @@ use origin_tui::widgets::plan_panel::PlanLine;
 use unicode_width::UnicodeWidthChar;
 
 use crate::autocomplete::CompletionSources;
+use crate::editor::Editor;
 use crate::input::VimMode;
 use crate::status::UsageSnapshot;
 use crate::suggestions::SuggestionState;
@@ -77,6 +78,18 @@ const SPINNER_INTERVAL_MS: u64 = 80;
 /// also appends a trailing blank line after each LLM message, giving 2 rows of
 /// separation for persistent content while only costing 1 visible row.
 const INPUT_GAP_ROWS: u16 = 1;
+
+/// Minimum number of text rows the input card reserves, even when the buffer
+/// holds a single (or zero) wrapped lines. A one-row card reads as cramped —
+/// the caret sits flush against the top and bottom borders. Reserving a few
+/// rows gives the composer visible breathing room without growing the card as
+/// the user types (it only matters below this floor).
+const MIN_INPUT_ROWS: u16 = 3;
+
+/// Hard cap on the input card's text rows. Beyond this the card stops growing
+/// and the buffer scrolls internally (only the last `MAX_INPUT_ROWS` wrapped
+/// lines render), so a long paste can't swallow the scrollback above.
+const MAX_INPUT_ROWS: u16 = 6;
 
 /// Hard cap on retained scrollback rows. A multi-hour session (esp. one with
 /// long streamed Bash output) would otherwise grow `scrollback` without bound —
@@ -206,7 +219,8 @@ pub fn notify_turn_complete(enabled: bool, succeeded: bool) -> bool {
 #[derive(Debug)]
 pub struct App {
     pub scrollback: Vec<ScrollLine>,
-    pub input: String,
+    /// Cursor-aware input editor (mid-buffer edit, Home/End, prompt history).
+    pub input: Editor,
     pub cursor: usize,
     pub current_assistant: Option<String>,
     pub usage: UsageSnapshot,
@@ -349,7 +363,7 @@ impl App {
     pub fn new(provider: &'static str, model: impl Into<String>, sources: CompletionSources) -> Self {
         Self {
             scrollback: Vec::new(),
-            input: String::new(),
+            input: Editor::new(),
             cursor: 0,
             current_assistant: None,
             usage: UsageSnapshot::new(provider, model),
@@ -506,7 +520,7 @@ impl App {
     }
 
     pub fn recompute_suggestions(&mut self) {
-        self.suggestions = crate::suggestions::suggest(&self.input, &self.sources);
+        self.suggestions = crate::suggestions::suggest(self.input.buffer(), &self.sources);
     }
 
     pub fn push_banner(&mut self, cols: u16, rows: u16) {
@@ -702,7 +716,7 @@ impl App {
         if action == A::Pass {
             return false;
         }
-        let len = self.input.chars().count();
+        let len = self.input.buffer().chars().count();
         // Resolve the action into an optional cursor target and an optional
         // mode switch, so each effect is expressed once and clippy sees no two
         // arms with identical bodies. `None` cursor ⇒ leave the cursor put.
@@ -901,8 +915,17 @@ impl App {
             let cs = cl + 2;
             let text_w = cr.saturating_sub(cs) as usize;
 
-            let wrapped = wrap_input_lines(&self.input, text_w);
-            let line_count = clamp_u16(wrapped.len()).min(6);
+            // Lay out the input with the cursor mapped into the wrapped grid, so
+            // the painted caret matches the rendered lines exactly.
+            let buf = self.input.buffer();
+            let input_layout = crate::editor::wrap_with_cursor(buf, text_w, self.input.cursor());
+            let wrapped: Vec<&str> = input_layout
+                .lines
+                .iter()
+                .map(|vl| &buf[vl.byte_start..vl.byte_end])
+                .collect();
+            let line_count = clamp_u16(wrapped.len())
+                .clamp(MIN_INPUT_ROWS, MAX_INPUT_ROWS);
             let card_h = line_count + 1;
             let card_total = card_h + 2;
             let at_bottom = rows.saturating_sub(card_total);
@@ -963,7 +986,7 @@ impl App {
             draw_scroll_indicator(main, &layout, offset);
             self.draw_notices(main, &layout);
             draw_input_card_bg(main, &layout);
-            self.draw_input_text(main, &layout, &wrapped);
+            self.draw_input_text(main, &layout, &wrapped, input_layout.cursor_row, input_layout.cursor_col);
             self.draw_status_line(main, &layout);
             draw_keybind_hint(main, &layout, self.spinner.active || self.goal_status.is_some());
             self.draw_suggestions_popup(main, &layout);
@@ -1053,7 +1076,17 @@ impl App {
 
     /// Render the input card's text: the muted placeholder when empty, or the
     /// (last six) wrapped input lines plus the ghost-suggestion completion.
-    fn draw_input_text(&self, main: &mut Grid, layout: &CardLayout, wrapped: &[&str]) {
+    fn draw_input_text(
+        &self,
+        main: &mut Grid,
+        layout: &CardLayout,
+        wrapped: &[&str],
+        cursor_row: usize,
+        cursor_col: usize,
+    ) {
+        // Show at most the last `MAX_INPUT_ROWS` wrapped rows (the card's
+        // text area caps there and scrolls internally beyond it).
+        let vis_start = wrapped.len().saturating_sub(MAX_INPUT_ROWS as usize);
         if self.input.is_empty() && self.current_assistant.is_none() {
             if layout.r_top < layout.rows {
                 write_str_styled(
@@ -1070,7 +1103,6 @@ impl App {
                 );
             }
         } else if !self.input.is_empty() {
-            let vis_start = if wrapped.len() > 6 { wrapped.len() - 6 } else { 0 };
             for (i, line) in wrapped[vis_start..].iter().enumerate() {
                 let r = layout.r_top + clamp_u16(i);
                 if r >= layout.r_status || r >= layout.rows {
@@ -1103,6 +1135,22 @@ impl App {
                         },
                     );
                 }
+            }
+        }
+        // Paint the caret (a reversed cell) at the insertion point, over the
+        // text/placeholder, so the user always sees where they are typing.
+        if cursor_row >= vis_start {
+            let r = layout.r_top + clamp_u16(cursor_row - vis_start);
+            let c = layout.cs + clamp_u16(cursor_col);
+            if r < layout.r_status && r < layout.rows && c < layout.cr {
+                let glyph = char::from_u32(main.get(r, c).glyph)
+                    .filter(|&g| g != ' ' && g != '\0')
+                    .unwrap_or(' ');
+                main.put(
+                    r,
+                    c,
+                    Cell::new(glyph, layout.palette.bright, layout.palette.surface_raised, Attr::REVERSE),
+                );
             }
         }
     }
@@ -1638,21 +1686,6 @@ fn wrap_segment(s: &str, width: usize) -> Vec<&str> {
         lines.push(&s[chars[start].0..]);
     } else if lines.is_empty() {
         lines.push("");
-    }
-    lines
-}
-
-fn wrap_input_lines(text: &str, width: usize) -> Vec<&str> {
-    if text.is_empty() {
-        return vec![""];
-    }
-    let mut lines = Vec::new();
-    for segment in text.split('\n') {
-        if segment.is_empty() || width == 0 {
-            lines.push(segment);
-            continue;
-        }
-        lines.extend(wrap_segment(segment, width));
     }
     lines
 }
@@ -2298,30 +2331,6 @@ mod tests {
     }
 
     #[test]
-    fn wrap_input_lines_single_line() {
-        let lines = wrap_input_lines("hello world", 20);
-        assert_eq!(lines, vec!["hello world"]);
-    }
-
-    #[test]
-    fn wrap_input_lines_wraps_at_width() {
-        let lines = wrap_input_lines("abcdefghij", 5);
-        assert_eq!(lines, vec!["abcde", "fghij"]);
-    }
-
-    #[test]
-    fn wrap_input_lines_preserves_newlines() {
-        let lines = wrap_input_lines("abc\ndef", 10);
-        assert_eq!(lines, vec!["abc", "def"]);
-    }
-
-    #[test]
-    fn wrap_input_lines_empty() {
-        let lines = wrap_input_lines("", 10);
-        assert_eq!(lines, vec![""]);
-    }
-
-    #[test]
     fn stall_tier_classifies_quiet_into_soft_and_hard() {
         let soft = Duration::from_secs(11);
         let hard = Duration::from_secs(28);
@@ -2666,7 +2675,7 @@ mod tests {
     #[test]
     fn apply_vim_action_moves_cursor_and_switches_mode() {
         let mut app = App::new("anthropic", "m", CompletionSources::default());
-        app.input = "hello".to_string();
+        app.input.set_buffer("hello".to_string());
         app.cursor = 2;
         app.vim_mode = VimMode::Normal;
         // h moves left, clamped at 0.

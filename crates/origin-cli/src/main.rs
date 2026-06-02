@@ -18,7 +18,7 @@ use origin_cli::cli_def::{Cli, Cmd, KeyringSub, PairSub, ProvidersSub, SessionsS
 use origin_cli::goal_render::render_goal_event;
 use origin_cli::input::{
     parse_clear_command, parse_mem_command, parse_model_command, parse_skill_command, parse_workflow_command,
-    permission_answer, reduce, InputAction,
+    permission_answer, reduce_editor, InputAction,
 };
 use origin_cli::plan_panel_wiring::Wiring as PlanPanelWiring;
 use origin_cli::tui::App;
@@ -679,7 +679,7 @@ async fn run_event_loop(
         if let crossterm::event::Event::Paste(pasted) = &event {
             let normalized = pasted.replace("\r\n", "\n").replace('\r', "\n");
             let mut a = app.lock();
-            a.input.push_str(&normalized);
+            a.input.insert_str(&normalized);
             a.recompute_suggestions();
             drop(a);
             handle.mark_dirty();
@@ -705,6 +705,15 @@ enum KeyOutcome {
 /// Handle one decoded key event. Returns [`KeyOutcome::Break`] only for the
 /// quit path; every other branch returns [`KeyOutcome::Continue`], matching
 /// the `continue`/fall-through behaviour of the original inline `match`.
+/// The input card's text width, derived from the current terminal size — used
+/// by the editor reducer for visual Home/End and Up/Down across wrapped lines.
+/// Mirrors the card geometry in `App::draw`.
+fn input_text_width() -> usize {
+    let cols = crossterm::terminal::size().map_or(80, |(c, _)| c);
+    let card_w = 75u16.min(cols.saturating_sub(4));
+    usize::from(card_w.saturating_sub(2))
+}
+
 async fn handle_key_event(
     ev: crossterm::event::KeyEvent,
     app: &SharedApp,
@@ -755,7 +764,11 @@ async fn handle_key_event(
         let mut a = app.lock();
         if !a.suggestions.candidates.is_empty() {
             let suggestions = a.suggestions.clone();
-            origin_cli::suggestions::accept_selected(&suggestions, &mut a.input);
+            // accept_selected works on a String; round-trip through the editor
+            // (set_buffer places the cursor at the end of the accepted text).
+            let mut buf = a.input.buffer().to_string();
+            origin_cli::suggestions::accept_selected(&suggestions, &mut buf);
+            a.input.set_buffer(buf);
             a.recompute_suggestions();
         }
         drop(a);
@@ -770,7 +783,7 @@ async fn handle_key_event(
         // or a goal indicator is visible. Either case means
         // Ctrl+C should send Interrupt instead of quitting.
         let op_in_flight = a.spinner.active || a.goal_status.is_some();
-        reduce(&mut a.input, ev, op_in_flight)
+        reduce_editor(&mut a.input, ev, op_in_flight, input_text_width())
     };
     handle_input_action(action, app, handle, interrupt_tx, path, model, session_id).await
 }
