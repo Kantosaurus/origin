@@ -1554,6 +1554,64 @@ fn char_display_width(s: &str) -> u16 {
     s.chars().map(char_cell_width).sum()
 }
 
+/// Word-boundary-wrap one logical line (no embedded `\n`) to `width` columns,
+/// returning the wrapped pieces as slices into `s`.
+///
+/// Breaks at the last space that fits rather than mid-word; a single word longer
+/// than `width` is hard-broken (unavoidable). Leading spaces on a continuation
+/// line are dropped. `width == 0` or an empty `s` yields `s` unwrapped.
+fn wrap_segment(s: &str, width: usize) -> Vec<&str> {
+    if width == 0 || s.is_empty() {
+        return vec![s];
+    }
+    // (byte offset, char, display width) per char.
+    let chars: Vec<(usize, char, usize)> = s
+        .char_indices()
+        .map(|(byte, ch)| (byte, ch, UnicodeWidthChar::width(ch).unwrap_or(1)))
+        .collect();
+    let len = chars.len();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut start = 0usize; // char index of the current line's first char
+    let mut col = 0usize; // accumulated display width of the current line
+    let mut last_space: Option<usize> = None; // char index of the last space seen
+    let mut i = 0usize;
+    while i < len {
+        let (byte, ch, cw) = chars[i];
+        // Record the FIRST space of a run as the break point, so breaking there
+        // drops the whole run and the wrapped line has no trailing space.
+        if ch.is_whitespace() && (i == 0 || !chars[i - 1].1.is_whitespace()) {
+            last_space = Some(i);
+        }
+        if col + cw > width && i > start {
+            if let Some(sp) = last_space.filter(|&sp| sp > start) {
+                // Break at the space: drop it; continuation skips further spaces.
+                lines.push(&s[chars[start].0..chars[sp].0]);
+                let mut ns = sp + 1;
+                while ns < len && chars[ns].1.is_whitespace() {
+                    ns += 1;
+                }
+                start = ns;
+                i = ns;
+            } else {
+                // No usable space (a word longer than the column): hard-break.
+                lines.push(&s[chars[start].0..byte]);
+                start = i;
+            }
+            col = 0;
+            last_space = None;
+            continue;
+        }
+        col += cw;
+        i += 1;
+    }
+    if start < len {
+        lines.push(&s[chars[start].0..]);
+    } else if lines.is_empty() {
+        lines.push("");
+    }
+    lines
+}
+
 fn wrap_input_lines(text: &str, width: usize) -> Vec<&str> {
     if text.is_empty() {
         return vec![""];
@@ -1564,22 +1622,7 @@ fn wrap_input_lines(text: &str, width: usize) -> Vec<&str> {
             lines.push(segment);
             continue;
         }
-        let chars: Vec<char> = segment.chars().collect();
-        let mut start = 0;
-        let mut col_w = 0usize;
-        for (idx, &ch) in chars.iter().enumerate() {
-            let w = UnicodeWidthChar::width(ch).unwrap_or(1);
-            if col_w + w > width && start < idx {
-                let bs: usize = chars[..start].iter().map(|c| c.len_utf8()).sum();
-                let be: usize = chars[..idx].iter().map(|c| c.len_utf8()).sum();
-                lines.push(&segment[bs..be]);
-                start = idx;
-                col_w = 0;
-            }
-            col_w += w;
-        }
-        let bs: usize = chars[..start].iter().map(|c| c.len_utf8()).sum();
-        lines.push(&segment[bs..]);
+        lines.extend(wrap_segment(segment, width));
     }
     lines
 }
@@ -1860,8 +1903,7 @@ fn wrap_into<'a>(
         if cols == 0 {
             continue;
         }
-        let chars: Vec<char> = sub.chars().collect();
-        if chars.is_empty() {
+        if sub.is_empty() {
             out.push(VisualLine {
                 text: "",
                 fg,
@@ -1871,31 +1913,10 @@ fn wrap_into<'a>(
             });
             continue;
         }
-        let mut start_idx = 0;
-        let mut col_width = 0usize;
-        let mut end_idx = 0;
-        while end_idx < chars.len() {
-            let w = UnicodeWidthChar::width(chars[end_idx]).unwrap_or(1);
-            if col_width + w > cols {
-                let byte_start: usize = chars[..start_idx].iter().map(|c| c.len_utf8()).sum();
-                let byte_end: usize = chars[..end_idx].iter().map(|c| c.len_utf8()).sum();
-                out.push(VisualLine {
-                    text: &sub[byte_start..byte_end],
-                    fg,
-                    bg,
-                    bold,
-                    literal,
-                });
-                start_idx = end_idx;
-                col_width = 0;
-            }
-            col_width += w;
-            end_idx += 1;
-        }
-        if start_idx < chars.len() {
-            let byte_start: usize = chars[..start_idx].iter().map(|c| c.len_utf8()).sum();
+        // Word-boundary wrap so prose breaks between words, not mid-word.
+        for piece in wrap_segment(sub, cols) {
             out.push(VisualLine {
-                text: &sub[byte_start..],
+                text: piece,
                 fg,
                 bg,
                 bold,
@@ -2157,6 +2178,27 @@ mod tests {
         );
         assert_eq!(g.get(0, 0).glyph, u32::from('e'), "base glyph preserved");
         assert_eq!(g.get(0, 1).glyph, u32::from('x'), "next char not drifted");
+    }
+
+    #[test]
+    fn wrap_segment_breaks_at_word_boundary() {
+        assert_eq!(wrap_segment("hello world", 20), vec!["hello world"], "fits on one line");
+        assert_eq!(wrap_segment("hello world", 7), vec!["hello", "world"], "break between words");
+        assert_eq!(wrap_segment("a b c d e", 5), vec!["a b c", "d e"], "pack greedily");
+    }
+
+    #[test]
+    fn wrap_segment_hard_breaks_overlong_word() {
+        assert_eq!(wrap_segment("abcdefghij", 4), vec!["abcd", "efgh", "ij"], "no spaces → hard break");
+    }
+
+    #[test]
+    fn wrap_segment_drops_space_run_at_break() {
+        assert_eq!(
+            wrap_segment("foo    bar", 4),
+            vec!["foo", "bar"],
+            "the whole space run is dropped, no trailing space"
+        );
     }
 
     #[test]
