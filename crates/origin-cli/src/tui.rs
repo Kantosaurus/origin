@@ -318,6 +318,13 @@ pub struct App {
     /// The most recent finalized assistant reply, for `/copy` (OSC 52). `None`
     /// until the first reply completes.
     pub last_assistant: Option<String>,
+    /// Total input tokens (uncached + cache-read + cache-write) of the most
+    /// recent turn — a proxy for how full the context window is. `0` before any
+    /// turn. Surfaced as `ctx N%` in the status line.
+    pub last_ctx_tokens: u32,
+    /// Cumulative input-token total snapshotted at turn start, so the turn's own
+    /// context size can be isolated as a delta at turn end.
+    ctx_at_start: u32,
 }
 
 /// State backing the live cache-cold status-line nudge. All times are
@@ -394,7 +401,29 @@ impl App {
             running_tool_row: None,
             mouse_capture: true,
             last_assistant: None,
+            last_ctx_tokens: 0,
+            ctx_at_start: 0,
         }
+    }
+
+    /// Total input tokens currently counted (uncached + cache-read + cache-write).
+    const fn ctx_total(&self) -> u32 {
+        self.usage
+            .input_tokens
+            .saturating_add(self.usage.cache_read_input_tokens)
+            .saturating_add(self.usage.cache_creation_input_tokens)
+    }
+
+    /// The context-window fill of the most recent turn as a percentage (0–100),
+    /// or `None` before any turn ran. Uses a per-model window estimate.
+    #[must_use]
+    pub fn ctx_pct(&self) -> Option<u8> {
+        if self.last_ctx_tokens == 0 {
+            return None;
+        }
+        let window = context_window_for(&self.usage.model);
+        let pct = u64::from(self.last_ctx_tokens) * 100 / u64::from(window.max(1));
+        Some(u8::try_from(pct.min(100)).unwrap_or(100))
     }
 
     /// Apply a `/permissions [on|off]` toggle, returning the new state. No
@@ -428,6 +457,9 @@ impl App {
         // cache reads for the cold-cache nudge.
         self.cache_cold.turn_start_ms = Some(now_wallclock_ms());
         self.cache_cold.cache_read_at_start = self.usage.cache_read_input_tokens;
+        // Snapshot the cumulative input total so this turn's context size (its
+        // delta) can be isolated for the `ctx N%` meter.
+        self.ctx_at_start = self.ctx_total();
     }
 
     /// Stop the live timer and fold the elapsed delta into `usage.elapsed`
@@ -442,6 +474,8 @@ impl App {
         // A streaming tool (e.g. Bash) may not signal completion explicitly;
         // resolve its running marker to ✔ now that the turn has ended.
         self.finish_tool_line(true);
+        // This turn's context size = the input-token delta since turn start.
+        self.last_ctx_tokens = self.ctx_total().saturating_sub(self.ctx_at_start);
         self.evaluate_cache_cold();
     }
 
@@ -1188,6 +1222,7 @@ impl App {
             &tokens,
             cost,
             secs,
+            self.ctx_pct(),
             self.cache_cold.cold,
         );
 
@@ -1766,6 +1801,7 @@ fn status_spans(
     tokens: &str,
     cost: f64,
     secs: f64,
+    ctx_pct: Option<u8>,
     cache_cold: bool,
 ) -> Vec<StatusSpan> {
     let mut spans = vec![StatusSpan {
@@ -1800,6 +1836,22 @@ fn status_spans(
         fg: pal.body,
         bold: false,
     });
+    if let Some(pct) = ctx_pct {
+        // Context-window fill, warming to yellow then red as it approaches the
+        // limit (and an eventual compaction).
+        let fg = if pct >= 90 {
+            pal.red
+        } else if pct >= 75 {
+            pal.yellow
+        } else {
+            pal.muted
+        };
+        spans.push(StatusSpan {
+            text: format!("ctx {pct}%"),
+            fg,
+            bold: false,
+        });
+    }
     if cache_cold {
         spans.push(StatusSpan {
             text: "\u{29D7} cache cold".to_string(),
@@ -1943,6 +1995,19 @@ fn format_tokens(n: u32) -> String {
         format!("{:.1}k", f64::from(n) / 1_000.0)
     } else {
         n.to_string()
+    }
+}
+
+/// A rough context-window size (tokens) for `model`, for the `ctx N%` meter.
+/// Heuristic by family — exact-enough to show how full the window is.
+fn context_window_for(model: &str) -> u32 {
+    let m = model.to_ascii_lowercase();
+    if m.contains("gemini") {
+        1_000_000
+    } else if m.contains("claude") || m.contains("opus") || m.contains("sonnet") || m.contains("haiku") {
+        200_000
+    } else {
+        128_000
     }
 }
 
@@ -2241,7 +2306,7 @@ mod tests {
 
     #[test]
     fn status_spans_have_legibility_hierarchy() {
-        let spans = status_spans(theme::Palette::default(), "Code", Some("Thinking"), "claude", "1.2k\u{2191} 300\u{2193}", 0.84, 3.4, false);
+        let spans = status_spans(theme::Palette::default(), "Code", Some("Thinking"), "claude", "1.2k\u{2191} 300\u{2193}", 0.84, 3.4, None, false);
         assert_eq!(spans[0].text, "Code");
         assert_eq!(spans[0].fg, theme::ACCENT);
         assert!(spans[0].bold, "workflow leads bold");
@@ -2254,8 +2319,24 @@ mod tests {
     }
 
     #[test]
+    fn ctx_meter_tracks_turn_input_and_warns_when_full() {
+        let mut app = App::new("anthropic", "claude-sonnet-4-6", CompletionSources::default());
+        assert_eq!(app.ctx_pct(), None, "no turn yet");
+        app.start_turn_timer();
+        app.record_usage_tokens(150_000, 10, 0, 0); // ~150k of a ~200k window
+        app.stop_turn_timer();
+        let pct = app.ctx_pct().expect("a turn ran");
+        assert!((70..=80).contains(&pct), "≈75% of 200k, got {pct}");
+        let spans = status_spans(theme::Palette::default(), "Code", None, "m", "0", 0.0, 0.0, Some(pct), false);
+        assert!(
+            spans.iter().any(|s| s.text == format!("ctx {pct}%") && s.fg == theme::YELLOW),
+            "ctx span warns yellow at >=75%"
+        );
+    }
+
+    #[test]
     fn status_spans_append_cold_nudge_in_yellow() {
-        let spans = status_spans(theme::Palette::default(), "Code", None, "m", "0\u{2191} 0\u{2193}", 0.0, 0.0, true);
+        let spans = status_spans(theme::Palette::default(), "Code", None, "m", "0\u{2191} 0\u{2193}", 0.0, 0.0, None, true);
         assert!(
             spans.last().is_some_and(|s| s.text.contains("cache cold") && s.fg == theme::YELLOW),
             "cold nudge trails in yellow"
