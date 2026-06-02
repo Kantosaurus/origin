@@ -549,18 +549,21 @@ fn spawn_stall_watchdog(app: SharedApp, handle: Handle) {
             let mut a = app.lock();
             if !a.spinner.active {
                 quiet_since = None;
-                a.stall_secs = None;
+                a.stall = None;
                 continue;
             }
             let sig = a.activity_signature();
             if sig == last_sig {
                 let since = *quiet_since.get_or_insert_with(std::time::Instant::now);
-                a.stall_secs =
-                    origin_cli::tui::stall_seconds(since.elapsed(), origin_cli::tui::STALL_WARN_AFTER);
+                a.stall = origin_cli::tui::stall_tier(
+                    since.elapsed(),
+                    origin_cli::tui::STALL_SOFT_AFTER,
+                    origin_cli::tui::STALL_WARN_AFTER,
+                );
             } else {
                 last_sig = sig;
                 quiet_since = Some(std::time::Instant::now());
-                a.stall_secs = None;
+                a.stall = None;
             }
             drop(a);
             handle.mark_dirty();

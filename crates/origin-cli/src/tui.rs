@@ -111,22 +111,37 @@ impl Spinner {
     }
 }
 
-/// How long the daemon may go without emitting a single stream event during an
-/// in-flight turn before the status line surfaces a stall warning.
+/// Quiet time before the soft "still working…" reassurance tier appears.
 ///
-/// Deliberately generous: extended-thinking turns and long non-streaming tools
-/// can be quiet for a while, so this only fires on genuine, sustained silence.
-pub const STALL_WARN_AFTER: Duration = Duration::from_secs(60);
+/// Short enough to answer the "is this still going?" doubt that creeps in after
+/// ~10s of a silent spinner, without the alarm of the hard tier.
+pub const STALL_SOFT_AFTER: Duration = Duration::from_secs(11);
 
-/// Pure stall decision.
+/// Quiet time before the hard "no daemon activity" alarm (with the interrupt
+/// hint). Was 60s — a full silent minute is well past the doubt threshold, so
+/// the watchdog fired too late to be reassuring.
+pub const STALL_WARN_AFTER: Duration = Duration::from_secs(28);
+
+/// Which stall notice (if any) to show after `quiet` seconds of daemon silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StallTier {
+    /// Gentle reassurance — a long turn may just be thinking. No interrupt hint.
+    Soft(u64),
+    /// Sustained silence — likely wedged; surface the Ctrl+C interrupt hint.
+    Hard(u64),
+}
+
+/// Pure stall decision: classify `quiet` against the soft/hard thresholds.
 ///
-/// Given how long the turn has been quiet (no new daemon events) and the
-/// warning threshold, return `Some(seconds_quiet)` to warn, or `None`. Kept
-/// free of `Instant` so it is deterministically testable.
+/// `None` below `soft`, `Soft` between, `Hard` at/above `hard`. Kept free of
+/// `Instant` so it is deterministically testable.
 #[must_use]
-pub fn stall_seconds(quiet: Duration, threshold: Duration) -> Option<u64> {
-    if quiet >= threshold {
-        Some(quiet.as_secs())
+pub fn stall_tier(quiet: Duration, soft: Duration, hard: Duration) -> Option<StallTier> {
+    let secs = quiet.as_secs();
+    if quiet >= hard {
+        Some(StallTier::Hard(secs))
+    } else if quiet >= soft {
+        Some(StallTier::Soft(secs))
     } else {
         None
     }
@@ -196,12 +211,12 @@ pub struct App {
     /// while a goal is running; `None` when cleared. Rendered above the
     /// input card by `draw`.
     pub goal_status: Option<String>,
-    /// Stall watchdog: `Some(seconds_quiet)` when the render heartbeat has seen
-    /// no daemon activity for [`STALL_WARN_AFTER`] during an in-flight turn.
-    /// `None` whenever the daemon is producing output or no turn is running.
-    /// Rendered as a high-visibility notice so a wedged daemon stops looking
+    /// Stall watchdog: the [`StallTier`] when the render heartbeat has seen no
+    /// daemon activity for [`STALL_SOFT_AFTER`]/[`STALL_WARN_AFTER`] during an
+    /// in-flight turn. `None` whenever the daemon is producing output or no turn
+    /// is running. Rendered as a notice so a quiet/wedged daemon stops looking
     /// like an indefinitely-spinning spinner.
-    pub stall_secs: Option<u64>,
+    pub stall: Option<StallTier>,
     /// Session reasoning-effort level (`fast`/`low`/`medium`/`high`/`max`) as a
     /// canonical wire token, or `None` to leave the provider wire unchanged.
     /// Seeded from the startup `--effort` flag and mutated mid-session by the
@@ -328,7 +343,7 @@ impl App {
             spinner: Spinner::new(),
             turn_started: None,
             goal_status: None,
-            stall_secs: None,
+            stall: None,
             effort: None,
             output_style: None,
             steering: origin_steering::SteeringQueue::new(),
@@ -375,7 +390,7 @@ impl App {
             self.usage.elapsed += start.elapsed();
         }
         // No turn in flight => no stall possible; clear any lingering notice.
-        self.stall_secs = None;
+        self.stall = None;
         // A streaming tool (e.g. Bash) may not signal completion explicitly;
         // resolve its running marker to ✔ now that the turn has ended.
         self.finish_tool_line(true);
@@ -506,7 +521,7 @@ impl App {
         self.scrollback.clear();
         self.current_assistant = None;
         self.goal_status = None;
-        self.stall_secs = None;
+        self.stall = None;
         self.scroll_offset = 0;
         self.push_banner(cols, rows);
     }
@@ -952,26 +967,30 @@ impl App {
             }
         }
 
-        // Stall watchdog notice. When the render heartbeat has seen no
-        // daemon activity for `STALL_WARN_AFTER`, surface a high-visibility
-        // warning so a wedged daemon reads as "possibly stuck" instead of an
-        // indefinitely-spinning spinner. Takes the row the goal status would
-        // use — a stall is the more urgent signal.
-        if let Some(secs) = self.stall_secs {
+        // Stall watchdog notice. A soft tier reassures ("still working…") after
+        // a short quiet; the hard tier alarms (red + interrupt hint) on
+        // sustained silence so a wedged daemon reads as "possibly stuck" instead
+        // of an indefinitely-spinning spinner. Takes the row the goal status
+        // would use — a stall is the more urgent signal.
+        if let Some(tier) = self.stall {
             let status_row = layout.at_bottom.saturating_sub(1);
             if status_row < layout.rows {
-                let msg = format!("\u{26A0} no daemon activity for {secs}s \u{2014} Ctrl+C to interrupt");
+                let (msg, fg) = match tier {
+                    StallTier::Soft(secs) => {
+                        (format!("\u{2026} still working\u{2026} {secs}s"), theme::MUTED)
+                    }
+                    StallTier::Hard(secs) => (
+                        format!("\u{26A0} no daemon activity for {secs}s \u{2014} Ctrl+C to interrupt"),
+                        theme::RED,
+                    ),
+                };
                 write_str_styled(
                     main,
                     status_row,
                     layout.cl.saturating_add(2),
                     &msg,
                     layout.cr,
-                    Style {
-                        fg: theme::RED,
-                        bg: 0,
-                        bold: false,
-                    },
+                    Style { fg, bg: 0, bold: false },
                 );
             }
         }
@@ -2139,23 +2158,26 @@ mod tests {
     }
 
     #[test]
-    fn stall_seconds_none_below_threshold() {
+    fn stall_tier_classifies_quiet_into_soft_and_hard() {
+        let soft = Duration::from_secs(11);
+        let hard = Duration::from_secs(28);
+        assert_eq!(stall_tier(Duration::from_secs(5), soft, hard), None, "below soft: nothing");
         assert_eq!(
-            stall_seconds(Duration::from_secs(59), Duration::from_secs(60)),
-            None
-        );
-    }
-
-    #[test]
-    fn stall_seconds_some_at_and_above_threshold() {
-        assert_eq!(
-            stall_seconds(Duration::from_secs(60), Duration::from_secs(60)),
-            Some(60)
+            stall_tier(Duration::from_secs(11), soft, hard),
+            Some(StallTier::Soft(11)),
+            "at soft threshold"
         );
         assert_eq!(
-            stall_seconds(Duration::from_secs(125), Duration::from_secs(60)),
-            Some(125)
+            stall_tier(Duration::from_secs(27), soft, hard),
+            Some(StallTier::Soft(27)),
+            "between thresholds stays soft"
         );
+        assert_eq!(
+            stall_tier(Duration::from_secs(28), soft, hard),
+            Some(StallTier::Hard(28)),
+            "at hard threshold escalates"
+        );
+        assert_eq!(stall_tier(Duration::from_secs(90), soft, hard), Some(StallTier::Hard(90)));
     }
 
     #[test]
@@ -2186,9 +2208,9 @@ mod tests {
     fn stop_turn_timer_clears_stall_notice() {
         let mut app = App::new("anthropic", "m", CompletionSources::default());
         app.start_turn_timer();
-        app.stall_secs = Some(90);
+        app.stall = Some(StallTier::Hard(90));
         app.stop_turn_timer();
-        assert_eq!(app.stall_secs, None, "ending a turn must clear the stall notice");
+        assert_eq!(app.stall, None, "ending a turn must clear the stall notice");
     }
 
     #[test]
@@ -2200,7 +2222,7 @@ mod tests {
         app.add_line("ok> ", "did a thing");
         app.current_assistant = Some("partial reply".to_string());
         app.goal_status = Some("goal active".to_string());
-        app.stall_secs = Some(42);
+        app.stall = Some(StallTier::Hard(42));
         app.scroll_offset = 7;
 
         app.reset_to_login(80, 24);
@@ -2220,7 +2242,7 @@ mod tests {
         );
         assert_eq!(app.current_assistant, None, "half-rendered turn cleared");
         assert_eq!(app.goal_status, None, "goal indicator cleared");
-        assert_eq!(app.stall_secs, None, "stall notice cleared");
+        assert_eq!(app.stall, None, "stall notice cleared");
         assert_eq!(app.scroll_offset, 0, "viewport snapped back to bottom");
 
         // A fresh launch produces the same view as the reset one.
