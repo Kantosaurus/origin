@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture, MouseEventKind};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -290,6 +291,27 @@ fn import_subcommand(a: &origin_cli::import::ImportArgs) -> Result<()> {
     Ok(())
 }
 
+/// Best-effort restore of the terminal to its pre-TUI state. Idempotent and
+/// error-swallowing so it is safe to call from a panic hook, a `Drop` guard, and
+/// the normal exit path. Reverses the setup in [`run`] (raw mode + alternate
+/// screen + mouse capture + hidden cursor).
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen, Show);
+}
+
+/// RAII guard that restores the terminal on drop — covering early `?` returns
+/// and unwinding panics, which the linear teardown at the end of [`run`] would
+/// otherwise skip (leaving the shell in raw mode / alt screen / mouse capture,
+/// forcing the user to blindly type `reset`).
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
 async fn run() -> Result<()> {
     run_self_update().await?;
 
@@ -383,8 +405,20 @@ async fn run() -> Result<()> {
     // (Doing this before `enable_raw_mode` keeps spawn errors readable.)
     ensure_daemon_running(&path, &default_provider, &default_account).await?;
 
+    // Restore the terminal before the default panic handler prints, so a
+    // backtrace lands on the normal screen instead of a corrupted raw-mode one.
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_panic(info);
+    }));
     enable_raw_mode()?;
-    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    // Guard restores the terminal on ANY scope exit (early `?`, panic, normal).
+    let terminal_guard = TerminalGuard;
+    // `Hide` the hardware cursor: the renderer paints its own caret, and without
+    // this the real cursor teleports to the last damage run (the status line)
+    // and jitters there on every 80 ms heartbeat tick.
+    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
 
     let (composer, widget, app) = setup_tui(default_provider, &model);
     // Seed the session reasoning-effort from the startup `--effort` flag.
@@ -423,8 +457,9 @@ async fn run() -> Result<()> {
     let result = run_event_loop(app, handle, &path, &mut model, &session_id, plan_panel).await;
 
     render_task.abort();
-    disable_raw_mode()?;
-    execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+    // Restore now (before the farewell) so "bye" prints on the normal screen;
+    // the guard's `Drop` afterward is then an idempotent no-op safety net.
+    drop(terminal_guard);
     // Localized farewell on a clean TUI exit (item A; origin-i18n locale from
     // $LC_ALL/$LANG, English fallback). Only on the Ok path so error output is
     // unchanged.
