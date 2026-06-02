@@ -820,7 +820,7 @@ impl App {
             draw_input_card_bg(main, &layout);
             self.draw_input_text(main, &layout, &wrapped);
             self.draw_status_line(main, &layout);
-            draw_keybind_hint(main, &layout);
+            draw_keybind_hint(main, &layout, self.spinner.active || self.goal_status.is_some());
             self.draw_suggestions_popup(main, &layout);
         }
         clear_prompt_grid(composer.prompt_grid());
@@ -934,100 +934,65 @@ impl App {
         }
     }
 
-    /// Render the status line: spinner frame, workflow name, model, token
-    /// counts, cost, and elapsed seconds, with the spinner glyph and workflow
-    /// label overpainted in their accent colors.
+    /// Render the status line as ordered styled spans: the spinner glyph and
+    /// workflow lead in accent, a Thinking/Responding phase follows while a turn
+    /// is in flight, the live cost and elapsed are body-bright (the numbers a
+    /// user watches), token counts are muted, and the static model name is dim —
+    /// so the line has a focal point instead of a flat, near-invisible DIM wall.
     fn draw_status_line(&self, main: &mut Grid, layout: &CardLayout) {
-        if layout.r_status < layout.rows {
-            let cost = crate::status::cost_usd(&self.usage);
-            let live_elapsed = self
-                .turn_started
-                .map_or(self.usage.elapsed, |t| self.usage.elapsed + t.elapsed());
-            let secs = live_elapsed.as_secs_f64();
-            let tok_in = format_tokens(self.usage.input_tokens);
-            let tok_out = format_tokens(self.usage.output_tokens);
+        if layout.r_status >= layout.rows {
+            return;
+        }
+        let cost = crate::status::cost_usd(&self.usage);
+        let live_elapsed = self
+            .turn_started
+            .map_or(self.usage.elapsed, |t| self.usage.elapsed + t.elapsed());
+        let secs = live_elapsed.as_secs_f64();
+        let tok_in = format_tokens(self.usage.input_tokens);
+        let tok_out = format_tokens(self.usage.output_tokens);
+        let phase = turn_phase(self.spinner.active, self.current_assistant.as_deref());
+        let tokens = format!("{tok_in}\u{2191} {tok_out}\u{2193}");
+        let spans = status_spans(
+            &self.workflow,
+            phase,
+            &self.usage.model,
+            &tokens,
+            cost,
+            secs,
+            self.cache_cold.cold,
+        );
 
-            // Brief, non-intrusive cache-cold nudge (jcode parity). Empty when
-            // the cache is warm or no turn has run, so the line is byte-identical
-            // in the common case. `⧗` (U+29D7) reads as a "stale hourglass".
-            let cold_marker = if self.cache_cold.cold {
-                " \u{00B7} \u{29D7} cache cold"
-            } else {
-                ""
-            };
-
-            let (prefix, status) = if self.spinner.active {
-                let sc = self.spinner.frame_char();
-                (
-                    Some(sc),
-                    format!(
-                        "{sc} {} \u{00B7} {} \u{00B7} {tok_in}\u{2191} {tok_out}\u{2193} \u{00B7} ${cost:.3} \u{00B7} {secs:.1}s{cold_marker}",
-                        self.workflow, self.usage.model,
+        let mut c = layout.cs;
+        // The animated spinner glyph leads in accent while a turn is in flight.
+        if self.spinner.active {
+            if c < layout.cr {
+                main.put(
+                    layout.r_status,
+                    c,
+                    Cell::new(
+                        self.spinner.frame_char(),
+                        theme::ACCENT,
+                        theme::SURFACE_RAISED,
+                        Attr::PLAIN,
                     ),
-                )
-            } else {
-                (
-                    None,
-                    format!(
-                        "{} \u{00B7} {} \u{00B7} {tok_in}\u{2191} {tok_out}\u{2193} \u{00B7} ${cost:.3} \u{00B7} {secs:.1}s{cold_marker}",
-                        self.workflow, self.usage.model,
-                    ),
-                )
-            };
-            write_str_styled(
-                main,
-                layout.r_status,
-                layout.cs,
-                &status,
-                layout.cr,
-                Style {
-                    fg: theme::DIM,
-                    bg: theme::SURFACE_RAISED,
-                    bold: false,
-                },
-            );
-            if let Some(sc) = prefix {
-                if let Some(pos) = status.find(sc) {
-                    let c = layout.cs + clamp_u16(pos);
-                    if c < layout.cr {
-                        main.put(
-                            layout.r_status,
-                            c,
-                            Cell::new(sc, theme::ACCENT, theme::SURFACE_RAISED, Attr::PLAIN),
-                        );
-                    }
-                }
+                );
             }
-            let wf_offset = if prefix.is_some() { 2u16 } else { 0u16 };
-            for (i, ch) in self.workflow.chars().enumerate() {
-                let c = layout.cs + wf_offset + clamp_u16(i);
-                if c < layout.cr {
-                    main.put(
-                        layout.r_status,
-                        c,
-                        Cell::new(ch, theme::ACCENT, theme::SURFACE_RAISED, Attr::BOLD),
-                    );
-                }
+            c = c.saturating_add(2);
+        }
+        for (i, span) in spans.iter().enumerate() {
+            if i > 0 {
+                c = write_span(main, layout.r_status, c, " \u{00B7} ", layout.cr, theme::DIM, false);
             }
-            // Overpaint the cache-cold nudge in a gentle yellow so it reads as a
-            // hint rather than an error. Skipped entirely when warm (the marker
-            // is empty and `find` yields `None`).
-            if self.cache_cold.cold {
-                if let Some(pos) = status.find('\u{29D7}') {
-                    let display_col = char_display_width(&status[..pos]);
-                    for (i, ch) in status[pos..].chars().enumerate() {
-                        let c = layout.cs + display_col + clamp_u16(i);
-                        if c >= layout.cr {
-                            break;
-                        }
-                        main.put(
-                            layout.r_status,
-                            c,
-                            Cell::new(ch, theme::YELLOW, theme::SURFACE_RAISED, Attr::PLAIN),
-                        );
-                    }
-                }
+            c = write_span(main, layout.r_status, c, &span.text, layout.cr, span.fg, span.bold);
+            if c >= layout.cr {
+                break;
             }
+        }
+        // Fill the remainder with the raised surface so the status line spans the
+        // full card width like the input rows above it.
+        while c < layout.cr {
+            main.put(layout.r_status, c, Cell::new(' ', 0, theme::SURFACE_RAISED, Attr::PLAIN));
+            c = c.saturating_add(1);
         }
     }
 
@@ -1173,9 +1138,25 @@ fn draw_input_card_bg(main: &mut Grid, layout: &CardLayout) {
     }
 }
 
+/// The right-aligned keybind hint segments. While a turn is in flight the
+/// trailing `ctrl+c quit` becomes `ctrl+c interrupt`, matching the reducer
+/// (which remaps Ctrl+C to Interrupt during a turn) — so the hint never claims
+/// it will quit at the exact moment it will actually interrupt.
+const fn keybind_hint_parts(in_flight: bool) -> [(&'static str, u32); 6] {
+    let last_label = if in_flight { " interrupt" } else { " quit" };
+    [
+        ("shift+enter", theme::BODY),
+        (" newline  ", theme::MUTED),
+        ("tab", theme::BODY),
+        (" skills  ", theme::MUTED),
+        ("ctrl+c", theme::BODY),
+        (last_label, theme::MUTED),
+    ]
+}
+
 /// Render the keybind hint line beneath the input card (and the card's bottom
 /// accent corner), right-aligned within the card width.
-fn draw_keybind_hint(main: &mut Grid, layout: &CardLayout) {
+fn draw_keybind_hint(main: &mut Grid, layout: &CardLayout, in_flight: bool) {
     if layout.r_cap < layout.rows {
         if layout.cl < layout.cols {
             main.put(
@@ -1184,17 +1165,10 @@ fn draw_keybind_hint(main: &mut Grid, layout: &CardLayout) {
                 Cell::new('\u{2579}', theme::ACCENT, 0, Attr::PLAIN),
             );
         }
-        let hint_parts: &[(&str, u32)] = &[
-            ("shift+enter", theme::BODY),
-            (" newline  ", theme::MUTED),
-            ("tab", theme::BODY),
-            (" skills  ", theme::MUTED),
-            ("ctrl+c", theme::BODY),
-            (" quit", theme::MUTED),
-        ];
+        let hint_parts = keybind_hint_parts(in_flight);
         let total_hw: u16 = hint_parts.iter().map(|(s, _)| char_display_width(s)).sum();
         let mut hc = layout.cr.saturating_sub(total_hw);
-        for (text, fg) in hint_parts {
+        for (text, fg) in &hint_parts {
             let tw = char_display_width(text);
             write_str_styled(
                 main,
@@ -1489,6 +1463,103 @@ fn md_line_style(line: &str) -> (u32, bool) {
     } else {
         (theme::BODY, false)
     }
+}
+
+/// One styled segment of the status line.
+struct StatusSpan {
+    text: String,
+    fg: u32,
+    bold: bool,
+}
+
+/// The status phase label while a turn is active: `"Thinking"` before any
+/// assistant text has streamed, `"Responding"` once it has. `None` when idle —
+/// so a long pre-token think no longer looks identical to streaming or a stall.
+fn turn_phase(spinner_active: bool, assistant: Option<&str>) -> Option<&'static str> {
+    if !spinner_active {
+        return None;
+    }
+    if assistant.is_none_or(str::is_empty) {
+        Some("Thinking")
+    } else {
+        Some("Responding")
+    }
+}
+
+/// Build the ordered status-line segments (excluding the animated spinner glyph,
+/// which the caller prepends). Pure, for testability. Hierarchy: workflow leads
+/// in accent+bold, an optional phase follows in dimmed accent, the model name is
+/// dim, token counts muted, and the live cost/elapsed are body-bright. A cold
+/// nudge, when present, trails in yellow.
+fn status_spans(
+    workflow: &str,
+    phase: Option<&str>,
+    model: &str,
+    tokens: &str,
+    cost: f64,
+    secs: f64,
+    cache_cold: bool,
+) -> Vec<StatusSpan> {
+    let mut spans = vec![StatusSpan {
+        text: workflow.to_string(),
+        fg: theme::ACCENT,
+        bold: true,
+    }];
+    if let Some(p) = phase {
+        spans.push(StatusSpan {
+            text: p.to_string(),
+            fg: theme::ACCENT_DIM,
+            bold: false,
+        });
+    }
+    spans.push(StatusSpan {
+        text: model.to_string(),
+        fg: theme::DIM,
+        bold: false,
+    });
+    spans.push(StatusSpan {
+        text: tokens.to_string(),
+        fg: theme::MUTED,
+        bold: false,
+    });
+    spans.push(StatusSpan {
+        text: format!("${cost:.3}"),
+        fg: theme::BODY,
+        bold: false,
+    });
+    spans.push(StatusSpan {
+        text: format!("{secs:.1}s"),
+        fg: theme::BODY,
+        bold: false,
+    });
+    if cache_cold {
+        spans.push(StatusSpan {
+            text: "\u{29D7} cache cold".to_string(),
+            fg: theme::YELLOW,
+            bold: false,
+        });
+    }
+    spans
+}
+
+/// Write `s` at (`row`, `col`) on the raised-surface background and return the
+/// next free column. Unlike [`write_str_styled`] it does not bg-fill to the row
+/// end, so spans can be chained left-to-right.
+fn write_span(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16, fg: u32, bold: bool) -> u16 {
+    let attr = if bold { Attr::BOLD } else { Attr::PLAIN };
+    let mut c = col;
+    for ch in s.chars() {
+        let w = char_cell_width(ch);
+        if w == 0 {
+            continue;
+        }
+        if c + w > max_cols {
+            break;
+        }
+        grid.put(row, c, Cell::new(ch, fg, theme::SURFACE_RAISED, attr));
+        c += w;
+    }
+    c
 }
 
 /// Render one wrapped visual line into the grid.
@@ -1809,6 +1880,48 @@ mod tests {
             !app.scrollback.iter().any(|l| l.text.contains("##")),
             "no literal ## remains"
         );
+    }
+
+    #[test]
+    fn turn_phase_distinguishes_thinking_and_responding() {
+        assert_eq!(turn_phase(false, None), None);
+        assert_eq!(turn_phase(false, Some("hi")), None);
+        assert_eq!(turn_phase(true, None), Some("Thinking"));
+        assert_eq!(turn_phase(true, Some("")), Some("Thinking"));
+        assert_eq!(turn_phase(true, Some("partial")), Some("Responding"));
+    }
+
+    #[test]
+    fn status_spans_have_legibility_hierarchy() {
+        let spans = status_spans("Code", Some("Thinking"), "claude", "1.2k\u{2191} 300\u{2193}", 0.84, 3.4, false);
+        assert_eq!(spans[0].text, "Code");
+        assert_eq!(spans[0].fg, theme::ACCENT);
+        assert!(spans[0].bold, "workflow leads bold");
+        assert!(spans.iter().any(|s| s.text == "Thinking" && s.fg == theme::ACCENT_DIM));
+        assert!(spans.iter().any(|s| s.text == "claude" && s.fg == theme::DIM), "model is dim");
+        assert!(spans.iter().any(|s| s.text == "$0.840" && s.fg == theme::BODY), "cost is body-bright");
+        assert!(spans.iter().any(|s| s.text == "3.4s" && s.fg == theme::BODY), "elapsed is body-bright");
+        assert!(spans.iter().any(|s| s.text.contains('\u{2191}') && s.fg == theme::MUTED), "tokens muted");
+        assert!(!spans.iter().any(|s| s.text.contains("cache cold")));
+    }
+
+    #[test]
+    fn status_spans_append_cold_nudge_in_yellow() {
+        let spans = status_spans("Code", None, "m", "0\u{2191} 0\u{2193}", 0.0, 0.0, true);
+        assert!(
+            spans.last().is_some_and(|s| s.text.contains("cache cold") && s.fg == theme::YELLOW),
+            "cold nudge trails in yellow"
+        );
+    }
+
+    #[test]
+    fn keybind_hint_shows_interrupt_while_in_flight() {
+        let idle = keybind_hint_parts(false);
+        assert!(idle.iter().any(|(t, _)| *t == " quit"));
+        assert!(!idle.iter().any(|(t, _)| t.contains("interrupt")));
+        let busy = keybind_hint_parts(true);
+        assert!(busy.iter().any(|(t, _)| *t == " interrupt"));
+        assert!(!busy.iter().any(|(t, _)| *t == " quit"));
     }
 
     #[test]
