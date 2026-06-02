@@ -25,11 +25,23 @@ pub struct ScrollLine {
     pub fg: u32,
     pub bg: u32,
     pub bold: bool,
+    /// When `true`, the line is drawn verbatim with no inline-markdown parsing.
+    /// Set for pre-formatted tool/diff/command output so source bytes that
+    /// contain `**` or backticks are never reinterpreted as bold/code styling
+    /// (a diff must show the literal bytes). Prose (assistant turns) stays
+    /// `false` so markdown still renders.
+    pub literal: bool,
 }
 
 impl ScrollLine {
     const fn styled(text: String, fg: u32, bg: u32, bold: bool) -> Self {
-        Self { text, fg, bg, bold }
+        Self { text, fg, bg, bold, literal: false }
+    }
+
+    /// A pre-formatted line drawn verbatim (no markdown parsing). Used for
+    /// tool headers, diff rows, and streamed command output.
+    const fn verbatim(text: String, fg: u32, bg: u32) -> Self {
+        Self { text, fg, bg, bold: false, literal: true }
     }
 }
 
@@ -524,7 +536,9 @@ impl App {
     }
 
     pub fn add_colored_line(&mut self, text: String, fg: u32, bg: u32) {
-        self.scrollback.push(ScrollLine::styled(text, fg, bg, false));
+        // Pre-formatted (tool output, diff rows, streamed command lines): drawn
+        // verbatim so embedded `**`/backticks aren't reinterpreted as markdown.
+        self.scrollback.push(ScrollLine::verbatim(text, fg, bg));
     }
 
     /// Bug #4: update the one-line goal status indicator. `None` clears it
@@ -606,8 +620,7 @@ impl App {
     }
 
     pub fn add_tool_line(&mut self, text: String) {
-        self.scrollback
-            .push(ScrollLine::styled(text, theme::TOOL, 0, false));
+        self.scrollback.push(ScrollLine::verbatim(text, theme::TOOL, 0));
     }
 
     pub fn start_assistant_turn(&mut self) {
@@ -687,8 +700,13 @@ impl App {
                             .push(ScrollLine::styled(format!("  {task}"), theme::BODY, 0, false));
                     } else {
                         let (fg, bold) = md_line_style(line);
+                        // Strip ATX heading markers (`## `) — the color/weight
+                        // from `md_line_style` already conveys the hierarchy, so
+                        // the literal hashes are clutter. Non-headings unchanged.
+                        let rendered =
+                            strip_heading_markers(line).unwrap_or_else(|| line.to_string());
                         self.scrollback
-                            .push(ScrollLine::styled(format!("  {line}"), fg, 0, bold));
+                            .push(ScrollLine::styled(format!("  {rendered}"), fg, 0, bold));
                     }
                 }
                 // Trailing blank line so the next user turn (or the input
@@ -755,6 +773,7 @@ impl App {
                     entry.fg,
                     entry.bg,
                     entry.bold,
+                    entry.literal,
                     cols_usize,
                     &mut visual_lines,
                 );
@@ -762,7 +781,8 @@ impl App {
             let live_buf;
             if let Some(buf) = self.current_assistant.as_ref() {
                 live_buf = format!("  {buf}");
-                wrap_into(&live_buf, theme::BODY, 0, false, cols_usize, &mut visual_lines);
+                // Live assistant text is prose → markdown-parsed (literal=false).
+                wrap_into(&live_buf, theme::BODY, 0, false, false, cols_usize, &mut visual_lines);
             }
 
             let total = visual_lines.len();
@@ -776,7 +796,7 @@ impl App {
                 if row >= at_bottom {
                     break;
                 }
-                render_md_line(main, row, vl.text, cols, vl.fg, vl.bg, vl.bold);
+                render_scroll_line(main, row, vl, cols);
                 row = row.saturating_add(1);
             }
 
@@ -1209,7 +1229,8 @@ fn clear_prompt_grid(prompt: &mut Grid) {
 // instead of a duplicated match on every Goal* variant.
 impl crate::goal_render::GoalRender for App {
     fn push_colored(&mut self, text: String, fg: u32, _bg: u32) {
-        self.scrollback.push(ScrollLine::styled(text, fg, 0, false));
+        // Goal/agent progress lines are pre-formatted status text → verbatim.
+        self.scrollback.push(ScrollLine::verbatim(text, fg, 0));
         self.scroll_offset = 0;
     }
     fn set_goal_status(&mut self, status: Option<String>) {
@@ -1435,6 +1456,22 @@ fn wrap_input_lines(text: &str, width: usize) -> Vec<&str> {
     lines
 }
 
+/// If `line` is an ATX markdown heading (`# `/`## `/`### ` after optional
+/// leading whitespace), return the text with the `#` markers and the one
+/// following space removed. Hierarchy is conveyed by [`md_line_style`]'s color
+/// and weight, so the literal hashes are visual clutter. Non-headings (and
+/// `#hashtag` with no space, or 4+ hashes) return `None` and render verbatim.
+fn strip_heading_markers(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+    // `#` is ASCII so byte-indexing at `hashes` is a valid char boundary.
+    if (1..=3).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
+        Some(trimmed[hashes + 1..].to_string())
+    } else {
+        None
+    }
+}
+
 fn md_line_style(line: &str) -> (u32, bool) {
     let trimmed = line.trim_start();
     if trimmed.starts_with("### ") {
@@ -1451,6 +1488,30 @@ fn md_line_style(line: &str) -> (u32, bool) {
         (theme::ACCENT_DIM, false)
     } else {
         (theme::BODY, false)
+    }
+}
+
+/// Render one wrapped visual line into the grid.
+///
+/// Literal lines (pre-formatted tool/diff/command output) are written verbatim
+/// so `**`/backticks survive; prose lines go through the inline-markdown
+/// renderer so `**bold**` and `` `code` `` style correctly.
+fn render_scroll_line(grid: &mut Grid, row: u16, vl: &VisualLine<'_>, cols: u16) {
+    if vl.literal {
+        write_str_styled(
+            grid,
+            row,
+            0,
+            vl.text,
+            cols,
+            Style {
+                fg: vl.fg,
+                bg: vl.bg,
+                bold: vl.bold,
+            },
+        );
+    } else {
+        render_md_line(grid, row, vl.text, cols, vl.fg, vl.bg, vl.bold);
     }
 }
 
@@ -1551,9 +1612,20 @@ struct VisualLine<'a> {
     fg: u32,
     bg: u32,
     bold: bool,
+    /// Carries [`ScrollLine::literal`] through wrapping so the draw loop knows
+    /// whether to markdown-parse this row or write it verbatim.
+    literal: bool,
 }
 
-fn wrap_into<'a>(text: &'a str, fg: u32, bg: u32, bold: bool, cols: usize, out: &mut Vec<VisualLine<'a>>) {
+fn wrap_into<'a>(
+    text: &'a str,
+    fg: u32,
+    bg: u32,
+    bold: bool,
+    literal: bool,
+    cols: usize,
+    out: &mut Vec<VisualLine<'a>>,
+) {
     for sub in text.split('\n') {
         if cols == 0 {
             continue;
@@ -1565,6 +1637,7 @@ fn wrap_into<'a>(text: &'a str, fg: u32, bg: u32, bold: bool, cols: usize, out: 
                 fg,
                 bg,
                 bold,
+                literal,
             });
             continue;
         }
@@ -1581,6 +1654,7 @@ fn wrap_into<'a>(text: &'a str, fg: u32, bg: u32, bold: bool, cols: usize, out: 
                     fg,
                     bg,
                     bold,
+                    literal,
                 });
                 start_idx = end_idx;
                 col_width = 0;
@@ -1595,6 +1669,7 @@ fn wrap_into<'a>(text: &'a str, fg: u32, bg: u32, bold: bool, cols: usize, out: 
                 fg,
                 bg,
                 bold,
+                literal,
             });
         }
     }
@@ -1605,6 +1680,12 @@ fn write_str_styled(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16,
     let mut c = col;
     for ch in s.chars() {
         let w = char_cell_width(ch);
+        // Zero-width combining marks (e.g. a base char + U+0301) get no cell of
+        // their own — emitting one would overwrite the base glyph or drift the
+        // rest of the row. Skip them so the base stays intact.
+        if w == 0 {
+            continue;
+        }
         if c + w > max_cols {
             break;
         }
@@ -1644,8 +1725,111 @@ mod tests {
     #[test]
     fn wrap_respects_unicode_width() {
         let mut lines = Vec::new();
-        wrap_into("ab\u{276F}cd", 0, 0, false, 4, &mut lines);
+        wrap_into("ab\u{276F}cd", 0, 0, false, false, 4, &mut lines);
         assert_eq!(lines.len(), 2, "wide char should cause wrap at col 4");
+    }
+
+    #[test]
+    fn tool_and_diff_lines_are_literal() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.add_colored_line("**not bold**".to_string(), theme::BODY, 0);
+        assert!(
+            matches!(app.scrollback.last(), Some(l) if l.literal),
+            "tool/diff/command output must be drawn verbatim"
+        );
+        app.add_tool_line("[Bash] echo **x**".to_string());
+        assert!(matches!(app.scrollback.last(), Some(l) if l.literal));
+    }
+
+    #[test]
+    fn assistant_prose_lines_are_not_literal() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.start_assistant_turn();
+        app.append_to_current_assistant("**bold** prose");
+        app.finalize_assistant_turn(0);
+        assert!(
+            app.scrollback
+                .iter()
+                .any(|l| !l.literal && l.text.contains("bold")),
+            "assistant prose must stay markdown-parsed (literal=false)"
+        );
+    }
+
+    #[test]
+    fn verbatim_line_keeps_markdown_glyphs_but_prose_parses_them() {
+        let mut g = Grid::new(12, 1);
+        let lit = VisualLine {
+            text: "**x**",
+            fg: theme::BODY,
+            bg: 0,
+            bold: false,
+            literal: true,
+        };
+        render_scroll_line(&mut g, 0, &lit, 12);
+        assert_eq!(g.get(0, 0).glyph, u32::from('*'), "literal line keeps leading *");
+
+        let mut g2 = Grid::new(12, 1);
+        let prose = VisualLine {
+            text: "**x**",
+            fg: theme::BODY,
+            bg: 0,
+            bold: false,
+            literal: false,
+        };
+        render_scroll_line(&mut g2, 0, &prose, 12);
+        assert_eq!(
+            g2.get(0, 0).glyph,
+            u32::from('x'),
+            "prose line parses **bold**, dropping the markers"
+        );
+    }
+
+    #[test]
+    fn strip_heading_markers_strips_leading_hashes() {
+        assert_eq!(strip_heading_markers("# Title").as_deref(), Some("Title"));
+        assert_eq!(strip_heading_markers("## Section").as_deref(), Some("Section"));
+        assert_eq!(strip_heading_markers("### Sub").as_deref(), Some("Sub"));
+        assert_eq!(strip_heading_markers("plain text"), None);
+        assert_eq!(strip_heading_markers("#hashtag"), None);
+        assert_eq!(strip_heading_markers("#### four"), None);
+    }
+
+    #[test]
+    fn finalize_strips_heading_hashes_from_scrollback() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.start_assistant_turn();
+        app.append_to_current_assistant("## Heading\nbody");
+        app.finalize_assistant_turn(0);
+        assert!(
+            app.scrollback.iter().any(|l| l.text == "  Heading"),
+            "heading hashes stripped, got {:?}",
+            app.scrollback.iter().map(|l| l.text.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            !app.scrollback.iter().any(|l| l.text.contains("##")),
+            "no literal ## remains"
+        );
+    }
+
+    #[test]
+    fn zero_width_combining_mark_keeps_base_glyph() {
+        // "e" + U+0301 (combining acute): the mark must not overwrite the base
+        // 'e' nor shift the following 'x'.
+        let mut g = Grid::new(8, 1);
+        write_str_styled(
+            &mut g,
+            0,
+            0,
+            "e\u{0301}x",
+            8,
+            Style {
+                fg: theme::BODY,
+                bg: 0,
+                bold: false,
+            },
+        );
+        assert_eq!(g.get(0, 0).glyph, u32::from('e'), "base glyph preserved");
+        assert_eq!(g.get(0, 1).glyph, u32::from('x'), "next char not drifted");
     }
 
     #[test]
