@@ -1335,7 +1335,12 @@ async fn handle_prompt_turn(
             a.finalize_assistant_turn(0);
             // ▸ running marker; flipped to ✔/✘ by on_tool_result / turn end.
             a.start_tool_line(&line);
-            for dl in &diff_lines {
+            // Cap rendered diff rows so a large Write doesn't bury the
+            // conversation (these DiffLines are never sent to the model, so this
+            // is purely a view change). Indent 2 cols to nest under the header.
+            const MAX_DIFF_ROWS: usize = 40;
+            let total_diff = diff_lines.len();
+            for dl in diff_lines.iter().take(MAX_DIFF_ROWS) {
                 let (fg, bg) = match dl.kind.as_str() {
                     "+" => (theme::DIFF_ADD_FG, theme::DIFF_ADD_BG),
                     "-" => (theme::DIFF_DEL_FG, theme::DIFF_DEL_BG),
@@ -1346,8 +1351,11 @@ async fn handle_prompt_turn(
                     "-" => "-",
                     _ => " ",
                 };
-                let text = format!("{:>4} {prefix} {}", dl.line_no, dl.text);
+                let text = format!("  {:>4} {prefix} {}", dl.line_no, dl.text);
                 a.add_colored_line(text, fg, bg);
+            }
+            if let Some(summary) = origin_cli::tui::diff_elision_summary(total_diff, MAX_DIFF_ROWS) {
+                a.add_colored_line(summary, theme::MUTED, 0);
             }
             a.start_assistant_turn();
             // Drop the App guard before signalling the renderer so the lock

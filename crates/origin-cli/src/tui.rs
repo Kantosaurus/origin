@@ -1777,6 +1777,21 @@ fn format_tokens(n: u32) -> String {
     }
 }
 
+/// Summary line for a diff truncated to `shown` of `total` rows, or `None` when
+/// nothing was elided (`total <= shown`).
+///
+/// Lets the tool view render the first `shown` changed rows then one muted line
+/// instead of dumping a 2000-line `Write` and burying the conversation. The
+/// 2-space indent nests it under the tool header.
+#[must_use]
+pub fn diff_elision_summary(total: usize, shown: usize) -> Option<String> {
+    if total <= shown {
+        return None;
+    }
+    let hidden = total - shown;
+    Some(format!("  \u{2026} +{hidden} more diff lines ({total} total)"))
+}
+
 struct VisualLine<'a> {
     text: &'a str,
     fg: u32,
@@ -1948,6 +1963,15 @@ mod tests {
         let arrows = app.scrollback.iter().filter(|l| l.text.contains('\u{25B8}')).count();
         assert_eq!(ticks, 1, "previous tool resolved to ✔");
         assert_eq!(arrows, 1, "only the current tool still shows ▸");
+    }
+
+    #[test]
+    fn diff_elision_summary_only_when_truncated() {
+        assert_eq!(diff_elision_summary(10, 40), None, "small diff: no summary");
+        assert_eq!(diff_elision_summary(40, 40), None, "exactly at cap: no summary");
+        let s = diff_elision_summary(2000, 40).expect("large diff summarized");
+        assert!(s.contains("1960"), "hidden count: {s}");
+        assert!(s.contains("2000 total"), "total count: {s}");
     }
 
     #[test]
