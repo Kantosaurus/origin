@@ -30,7 +30,8 @@ use origin_ipc::transport::{Listener, SharedConnection};
 use origin_keyvault::{KeyVault, Secret};
 use origin_mem::{Embedder, MemIndex};
 use origin_metrics::Metrics;
-use origin_permission::prompt::AlwaysAllow;
+use origin_daemon::ipc_prompter::{IpcPrompter, PermissionRegistry};
+use origin_permission::prompt::{AlwaysAllow, Prompter};
 use origin_provider::catalog::Catalog;
 use origin_provider::Provider;
 use origin_provider_anthropic::Anthropic;
@@ -291,6 +292,10 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     // Daemon-wide pending-proposal registry — lets `MemoryDecision::Accept`
     // resolve a proposal recorded by an earlier prompt-turn handler.
     let proposal_registry = Arc::new(ProposalRegistry::new());
+    // Daemon-wide pending permission-ask registry (opt-in interactive prompts).
+    // Shared across connections so a `PermissionDecision` arriving on a fresh
+    // connection resolves an ask emitted on the turn's (busy) connection.
+    let permission_registry = Arc::new(PermissionRegistry::new());
     // Daemon-wide plan-op broadcast bus. IPC clients subscribe via
     // `ClientMessage::SubscribePlan`; swarm coordinators publish via
     // `bus.publish(envelope)` when their PlanHandle::apply succeeds.
@@ -623,6 +628,7 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
             vault.clone(),
             Arc::clone(&metrics),
             Arc::clone(&proposal_registry),
+            Arc::clone(&permission_registry),
             plan_bus.clone(),
             Arc::clone(&skill_catalog),
             Arc::clone(&workflows_catalog),
@@ -722,6 +728,7 @@ fn spawn_handler_task(
     vault: KeyVault,
     metrics: Arc<Metrics>,
     proposal_registry: Arc<ProposalRegistry>,
+    permission_registry: Arc<PermissionRegistry>,
     plan_bus: PlanBus,
     skill_catalog: Arc<SkillCatalog>,
     workflows_catalog: Arc<origin_daemon::workflows::WorkflowsFile>,
@@ -837,6 +844,7 @@ fn spawn_handler_task(
                         memory.as_ref(),
                         memory_handle.clone(),
                         Arc::clone(&proposal_registry),
+                        Arc::clone(&permission_registry),
                         Arc::clone(&skill_catalog),
                         Arc::clone(&workflows_catalog),
                         Arc::clone(&active_skills),
@@ -1071,11 +1079,12 @@ fn spawn_handler_task(
                 ClientMessage::SubscribePlan => {
                     spawn_plan_relay(plan_bus.subscribe(), Arc::clone(&conn));
                 }
-                ClientMessage::PermissionDecision { .. } => {
-                    // A decision reaching the OUTER loop has no in-flight ask to
-                    // resolve (the mid-turn case is routed by the prompt driver's
-                    // frame peek). Drop a stray/late decision so it can never
-                    // block or mis-resolve a future ask.
+                ClientMessage::PermissionDecision { id, allow } => {
+                    // Cross-connection resolution: the client sends its decision
+                    // on a FRESH connection (the turn's connection is busy
+                    // streaming), so it lands here. Resolve the waiting ask in
+                    // the daemon-wide registry. Unknown ids are ignored.
+                    permission_registry.resolve(id, allow);
                 }
                 ClientMessage::Interrupt => {
                     // When `Interrupt` lands in the OUTER loop it means
@@ -1379,6 +1388,7 @@ async fn handle_request(
     memory: Option<&MemoryWiring>,
     memory_handle: Option<Arc<dyn MemoryHandleTrait>>,
     proposal_registry: Arc<ProposalRegistry>,
+    permission_registry: Arc<PermissionRegistry>,
     skill_catalog: Arc<SkillCatalog>,
     workflows_catalog: Arc<origin_daemon::workflows::WorkflowsFile>,
     active_skills: Arc<tokio::sync::Mutex<SkillRegistry>>,
@@ -1537,6 +1547,19 @@ async fn handle_request(
             // uses session.model, byte-identical). Per-turn phase selection +
             // health/quota feedback live inside `run_loop`.
         };
+        // Opt-in interactive prompting: when the turn requested it, route
+        // RequiresPermission tools through the IPC prompter (asks the client and
+        // blocks on the daemon-wide registry). Default (off) keeps `AlwaysAllow`,
+        // so tool execution is byte-identical. Both owners are locals so the
+        // `&dyn Prompter` borrow outlives the `drive_goal_loop` await.
+        let always_allow = AlwaysAllow;
+        let ipc_prompter;
+        let prompter: &dyn Prompter = if req.permission_ask {
+            ipc_prompter = IpcPrompter::new(event_tx.clone(), Arc::clone(&permission_registry));
+            &ipc_prompter
+        } else {
+            &always_allow
+        };
         drive_goal_loop(
             conn,
             &mut session,
@@ -1548,6 +1571,7 @@ async fn handle_request(
             Arc::clone(&session_store),
             verifier.as_ref(),
             event_tx.clone(),
+            prompter,
         )
         .await
     };
@@ -2100,6 +2124,7 @@ async fn drive_goal_loop(
     session_store: Arc<SessionStore>,
     verifier: &dyn origin_goal::verifier::Verifier,
     event_tx: tokio::sync::mpsc::Sender<StreamEvent>,
+    prompter: &dyn Prompter,
 ) -> Result<origin_daemon::agent::LoopSummary, origin_daemon::agent::LoopError> {
     use origin_daemon::goal_checkpoint::make_goal_checkpoint_token;
     use origin_daemon::goal_driver::DriverDecision;
@@ -2147,7 +2172,7 @@ async fn drive_goal_loop(
             // user's prompt is never silently dropped.
             GoalCapOutcome::ClearedFirstIter => {
                 let summary =
-                    origin_daemon::agent::run_loop(session, &next_text, provider, &AlwaysAllow, opts).await?;
+                    origin_daemon::agent::run_loop(session, &next_text, provider, prompter, opts).await?;
                 return Ok(summary);
             }
         }
