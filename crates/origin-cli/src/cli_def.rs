@@ -31,6 +31,11 @@ pub struct Cli {
     /// `Run`-level `--root`.
     #[arg(long = "root")]
     pub root: Vec<String>,
+    /// Resume a previous session by id: reuse it so the daemon rehydrates that
+    /// session's transcript (the model picks up where you left off). Find ids
+    /// with `origin sessions list`. Defaults to a fresh random session.
+    #[arg(long = "resume")]
+    pub resume: Option<String>,
     #[command(subcommand)]
     pub cmd: Option<Cmd>,
 }

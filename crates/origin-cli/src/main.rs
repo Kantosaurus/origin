@@ -405,7 +405,13 @@ async fn run() -> Result<()> {
         || raw_model.clone(),
         |c| origin_cli::config::resolve_alias(&c.aliases, &raw_model),
     );
-    let session_id = format!("{:032x}", rand::random::<u128>());
+    // `--resume <id>` reuses a prior session id; the daemon rehydrates that
+    // session's transcript on the first prompt (see handle_request →
+    // load_messages), so the model picks up where it left off. Default: fresh.
+    let resuming = cli.resume.clone();
+    let session_id = resuming
+        .clone()
+        .unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
 
     // Quickstart docs promise auto-spawn: stand up `origin-daemon` as a
     // detached child if nothing is listening on the IPC path yet, and wait
@@ -442,6 +448,15 @@ async fn run() -> Result<()> {
     // Seed extra workspace roots from the startup `--root` flags (cline multi-root).
     if !cli.root.is_empty() {
         app.lock().workspace_roots.clone_from(&cli.root);
+    }
+    // Note a resumed session so the empty scrollback doesn't look like a fresh
+    // start — the daemon will rehydrate the transcript on the first prompt.
+    if let Some(id) = &resuming {
+        let short: String = id.chars().take(8).collect();
+        app.lock().add_line(
+            "system> ",
+            &format!("resumed session {short}\u{2026} \u{2014} the model will recall the earlier conversation"),
+        );
     }
 
     // First-run discovery: if `origin init`'s welcome flow queued a pending
