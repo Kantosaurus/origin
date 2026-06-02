@@ -1786,6 +1786,9 @@ fn write_span(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16, style
             break;
         }
         grid.put(row, c, Cell::new(ch, style.fg, style.bg, attr));
+        if w == 2 {
+            grid.put(row, c + 1, Cell::continuation(style.bg));
+        }
         c += w;
     }
     c
@@ -1829,6 +1832,9 @@ fn render_md_line(grid: &mut Grid, row: u16, text: &str, max_cols: u16, style: S
                         break;
                     }
                     grid.put(row, col, Cell::new(chars[i], pal.bright, bg, Attr::BOLD));
+                    if w == 2 {
+                        grid.put(row, col + 1, Cell::continuation(bg));
+                    }
                     col += w;
                     i += 1;
                 }
@@ -1849,6 +1855,9 @@ fn render_md_line(grid: &mut Grid, row: u16, text: &str, max_cols: u16, style: S
                         col,
                         Cell::new(chars[i], pal.code_fg, pal.code_bg, Attr::PLAIN),
                     );
+                    if w == 2 {
+                        grid.put(row, col + 1, Cell::continuation(pal.code_bg));
+                    }
                     col += w;
                     i += 1;
                 }
@@ -1862,6 +1871,9 @@ fn render_md_line(grid: &mut Grid, row: u16, text: &str, max_cols: u16, style: S
             break;
         }
         grid.put(row, col, Cell::new(chars[i], base_fg, bg, attr_plain));
+        if w == 2 {
+            grid.put(row, col + 1, Cell::continuation(bg));
+        }
         col += w;
         i += 1;
     }
@@ -1971,6 +1983,9 @@ fn write_str_styled(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16,
             break;
         }
         grid.put(row, c, Cell::new(ch, style.fg, style.bg, attr));
+        if w == 2 {
+            grid.put(row, c + 1, Cell::continuation(style.bg));
+        }
         c += w;
     }
     if style.bg != 0 {
@@ -2216,6 +2231,28 @@ mod tests {
         let busy = keybind_hint_parts(true, theme::Palette::default());
         assert!(busy.iter().any(|(t, _)| *t == " interrupt"));
         assert!(!busy.iter().any(|(t, _)| *t == " quit"));
+    }
+
+    #[test]
+    fn wide_glyph_writes_continuation_cell_without_drift() {
+        // '世' (U+4E16) is double-width: the cell after it must be a continuation
+        // marker, and the following 'x' must land at column +2 (no drift).
+        let mut g = Grid::new(8, 1);
+        write_str_styled(
+            &mut g,
+            0,
+            0,
+            "\u{4e16}x",
+            8,
+            Style {
+                fg: theme::BODY,
+                bg: 0,
+                bold: false,
+            },
+        );
+        assert_eq!(g.get(0, 0).glyph, u32::from('\u{4e16}'), "wide glyph at col 0");
+        assert!(g.get(0, 1).is_continuation(), "col 1 is a continuation cell");
+        assert_eq!(g.get(0, 2).glyph, u32::from('x'), "next char at col 2, not drifted");
     }
 
     #[test]

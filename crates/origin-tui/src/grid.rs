@@ -67,6 +67,30 @@ impl Cell {
     pub const fn glyph(ch: char) -> Self {
         Self::new(ch, 0, 0, Attr::PLAIN)
     }
+
+    /// Sentinel glyph for the right-hand half of a wide (double-width) cell.
+    /// `0xFFFF_FFFF` is not a valid Unicode scalar, so `char::from_u32` yields
+    /// `None` and the emitter writes no character for it — the wide glyph in the
+    /// preceding cell already advanced the terminal cursor by two columns.
+    pub const CONTINUATION_GLYPH: u32 = 0xFFFF_FFFF;
+
+    /// The trailing half of a wide glyph. Carries `bg` so the cell still diffs
+    /// and repaints correctly, but emits no character.
+    #[must_use]
+    pub const fn continuation(bg: u32) -> Self {
+        Self {
+            glyph: Self::CONTINUATION_GLYPH,
+            fg: 0,
+            bg,
+            attr: 0,
+        }
+    }
+
+    /// Whether this is a wide-glyph continuation cell (no character emitted).
+    #[must_use]
+    pub const fn is_continuation(self) -> bool {
+        self.glyph == Self::CONTINUATION_GLYPH
+    }
 }
 
 // `GridError` is the public error type and is re-exported at the crate root

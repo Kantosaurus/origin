@@ -103,6 +103,12 @@ fn emit_translated(grid: &Grid, runs: &[Run], row_offset: u16, col_offset: u16) 
         for i in 0..orig.len {
             // Cell lookup uses pane-relative coords.
             let cell = grid.get(orig.row, orig.col + i);
+            // The continuation half of a wide glyph emits nothing: the wide glyph
+            // already advanced the terminal cursor by two columns, so writing
+            // here would shift the rest of the row right by one.
+            if cell.is_continuation() {
+                continue;
+            }
             let style = (cell.fg, cell.bg, cell.attr);
             if Some(style) != current_style {
                 push_sgr(&mut out, cell.fg, cell.bg, Attr(cell.attr));
@@ -301,7 +307,26 @@ impl Composer {
 #[cfg(test)]
 mod tests {
     use super::{push_sgr_inner, Composer};
-    use crate::grid::Attr;
+    use crate::grid::{Attr, Cell};
+
+    #[test]
+    fn emit_skips_wide_glyph_continuation_cell() {
+        // A wide glyph followed by its continuation must emit ONE glyph, so the
+        // terminal cursor isn't double-advanced (which would drift the row).
+        let mut c = Composer::new(10, 2);
+        {
+            let g = c.main_grid();
+            g.put(0, 0, Cell::new('\u{4e16}', 0, 0, Attr::PLAIN));
+            g.put(0, 1, Cell::continuation(0));
+            g.put(0, 2, Cell::new('x', 0, 0, Attr::PLAIN));
+        }
+        let bytes = c.frame();
+        let s = String::from_utf8(bytes).expect("utf-8");
+        assert!(
+            s.contains("\u{4e16}x"),
+            "wide glyph and next char must be adjacent (continuation emitted nothing): {s:?}"
+        );
+    }
 
     #[test]
     fn set_side_visible_toggles_only_on_change() {
