@@ -513,7 +513,7 @@ impl App {
             let pad = (cols as usize).saturating_sub(w) / 2;
             let padded = format!("{:>width$}{line}", "", width = pad);
             self.scrollback
-                .push(ScrollLine::styled(padded, theme::ACCENT_DIM, 0, false));
+                .push(ScrollLine::styled(padded, self.palette().accent_dim, 0, false));
         }
         for _ in 0..3 {
             self.scrollback
@@ -524,7 +524,7 @@ impl App {
         let tpad = (cols as usize).saturating_sub(tw) / 2;
         let padded_tip = format!("{:>width$}{tip}", "", width = tpad);
         self.scrollback
-            .push(ScrollLine::styled(padded_tip, theme::MUTED, 0, false));
+            .push(ScrollLine::styled(padded_tip, self.palette().muted, 0, false));
     }
 
     /// Wipe the in-session TUI view and restore the just-launched look, so
@@ -567,7 +567,7 @@ impl App {
                     .push(ScrollLine::styled(String::new(), 0, 0, false));
                 self.scrollback.push(ScrollLine::styled(
                     format!("\u{276F} {body}"),
-                    theme::USER,
+                    self.palette().user,
                     0,
                     true,
                 ));
@@ -577,19 +577,19 @@ impl App {
             "error> " => {
                 self.scrollback.push(ScrollLine::styled(
                     format!("  \u{2718} {body}"),
-                    theme::RED,
+                    self.palette().red,
                     0,
                     false,
                 ));
             }
             "system> " => {
                 self.scrollback
-                    .push(ScrollLine::styled(format!("  {body}"), theme::MUTED, 0, false));
+                    .push(ScrollLine::styled(format!("  {body}"), self.palette().muted, 0, false));
             }
             "ok> " => {
                 self.scrollback.push(ScrollLine::styled(
                     format!("  \u{2714} {body}"),
-                    theme::GREEN,
+                    self.palette().green,
                     0,
                     false,
                 ));
@@ -597,18 +597,18 @@ impl App {
             "mem> " => {
                 self.scrollback.push(ScrollLine::styled(
                     format!("  {body}"),
-                    theme::ACCENT_DIM,
+                    self.palette().accent_dim,
                     0,
                     false,
                 ));
             }
             "tab> " => {
                 self.scrollback
-                    .push(ScrollLine::styled(format!("    {body}"), theme::MUTED, 0, false));
+                    .push(ScrollLine::styled(format!("    {body}"), self.palette().muted, 0, false));
             }
             _ => {
                 self.scrollback
-                    .push(ScrollLine::styled(format!("  {body}"), theme::BODY, 0, false));
+                    .push(ScrollLine::styled(format!("  {body}"), self.palette().body, 0, false));
             }
         }
         self.scroll_offset = 0;
@@ -699,7 +699,7 @@ impl App {
     }
 
     pub fn add_tool_line(&mut self, text: String) {
-        self.scrollback.push(ScrollLine::verbatim(text, theme::TOOL, 0));
+        self.scrollback.push(ScrollLine::verbatim(text, self.palette().tool, 0));
     }
 
     /// Push a tool-activity line with a leading `▸` "running" marker, recording
@@ -711,7 +711,7 @@ impl App {
         self.finish_tool_line(true);
         self.running_tool_row = Some(self.scrollback.len());
         self.scrollback
-            .push(ScrollLine::verbatim(format!("  \u{25B8} {text}"), theme::TOOL, 0));
+            .push(ScrollLine::verbatim(format!("  \u{25B8} {text}"), self.palette().tool, 0));
         self.scroll_offset = 0;
     }
 
@@ -722,11 +722,13 @@ impl App {
         let Some(row) = self.running_tool_row.take() else {
             return;
         };
+        // Resolve the color before the mutable scrollback borrow below.
+        let red = self.palette().red;
         if let Some(line) = self.scrollback.get_mut(row) {
             let glyph = if ok { '\u{2714}' } else { '\u{2718}' };
             line.text = line.text.replacen('\u{25B8}', &glyph.to_string(), 1);
             if !ok {
-                line.fg = theme::RED;
+                line.fg = red;
             }
         }
     }
@@ -786,8 +788,8 @@ impl App {
                         in_code_block = !in_code_block;
                         self.scrollback.push(ScrollLine::styled(
                             format!("  {line}"),
-                            theme::MUTED,
-                            if in_code_block { theme::CODE_BG } else { 0 },
+                            self.palette().muted,
+                            if in_code_block { self.palette().code_bg } else { 0 },
                             false,
                         ));
                         continue;
@@ -795,8 +797,8 @@ impl App {
                     if in_code_block {
                         self.scrollback.push(ScrollLine::styled(
                             format!("  {line}"),
-                            theme::CODE_FG,
-                            theme::CODE_BG,
+                            self.palette().code_fg,
+                            self.palette().code_bg,
                             false,
                         ));
                     } else if let Some(task) = crate::markdown_tasks::render_gfm_task_line(line) {
@@ -805,9 +807,9 @@ impl App {
                         // fall-through: non-task lines yield `None` and keep the
                         // byte-identical default styling below.
                         self.scrollback
-                            .push(ScrollLine::styled(format!("  {task}"), theme::BODY, 0, false));
+                            .push(ScrollLine::styled(format!("  {task}"), self.palette().body, 0, false));
                     } else {
-                        let (fg, bold) = md_line_style(line);
+                        let (fg, bold) = md_line_style(line, self.palette());
                         // Strip ATX heading markers (`## `) — the color/weight
                         // from `md_line_style` already conveys the hierarchy, so
                         // the literal hashes are clutter. Non-headings unchanged.
@@ -859,6 +861,11 @@ impl App {
                 }
             }
 
+            // Snapshot the active palette once per frame; every chrome helper
+            // reads it (via CardLayout or a `pal` arg), so a `/theme` switch
+            // re-themes the chrome immediately. Default ⇒ the legacy constants.
+            let pal = self.palette();
+
             let card_w = 75u16.min(cols.saturating_sub(4));
             let cl = cols.saturating_sub(card_w) / 2;
             let cr = cl + card_w;
@@ -890,7 +897,7 @@ impl App {
             if let Some(buf) = self.current_assistant.as_ref() {
                 live_buf = format!("  {buf}");
                 // Live assistant text is prose → markdown-parsed (literal=false).
-                wrap_into(&live_buf, theme::BODY, 0, false, false, cols_usize, &mut visual_lines);
+                wrap_into(&live_buf, pal.body, 0, false, false, cols_usize, &mut visual_lines);
             }
 
             let total = visual_lines.len();
@@ -904,7 +911,7 @@ impl App {
                 if row >= at_bottom {
                     break;
                 }
-                render_scroll_line(main, row, vl, cols);
+                render_scroll_line(main, row, vl, cols, pal);
                 row = row.saturating_add(1);
             }
 
@@ -921,6 +928,7 @@ impl App {
                 r_top,
                 r_status,
                 r_cap,
+                palette: pal,
             };
 
             draw_scroll_indicator(main, &layout, offset);
@@ -931,7 +939,7 @@ impl App {
             draw_keybind_hint(main, &layout, self.spinner.active || self.goal_status.is_some());
             self.draw_suggestions_popup(main, &layout);
         }
-        clear_prompt_grid(composer.prompt_grid());
+        clear_prompt_grid(composer.prompt_grid(), self.palette());
     }
 
     /// Render the goal-status indicator and stall-watchdog notice on the
@@ -954,7 +962,7 @@ impl App {
                     &msg,
                     layout.cr,
                     Style {
-                        fg: theme::YELLOW,
+                        fg: layout.palette.yellow,
                         bg: 0,
                         bold: true,
                     },
@@ -977,7 +985,7 @@ impl App {
                     status,
                     layout.cr,
                     Style {
-                        fg: theme::ACCENT,
+                        fg: layout.palette.accent,
                         bg: 0,
                         bold: false,
                     },
@@ -995,11 +1003,11 @@ impl App {
             if status_row < layout.rows {
                 let (msg, fg) = match tier {
                     StallTier::Soft(secs) => {
-                        (format!("\u{2026} still working\u{2026} {secs}s"), theme::MUTED)
+                        (format!("\u{2026} still working\u{2026} {secs}s"), layout.palette.muted)
                     }
                     StallTier::Hard(secs) => (
                         format!("\u{26A0} no daemon activity for {secs}s \u{2014} Ctrl+C to interrupt"),
-                        theme::RED,
+                        layout.palette.red,
                     ),
                 };
                 write_str_styled(
@@ -1026,8 +1034,8 @@ impl App {
                     "Ask anything...",
                     layout.cr,
                     Style {
-                        fg: theme::MUTED,
-                        bg: theme::SURFACE_RAISED,
+                        fg: layout.palette.muted,
+                        bg: layout.palette.surface_raised,
                         bold: false,
                     },
                 );
@@ -1046,8 +1054,8 @@ impl App {
                     line,
                     layout.cr,
                     Style {
-                        fg: theme::BRIGHT,
-                        bg: theme::SURFACE_RAISED,
+                        fg: layout.palette.bright,
+                        bg: layout.palette.surface_raised,
                         bold: false,
                     },
                 );
@@ -1060,8 +1068,8 @@ impl App {
                         &self.suggestions.ghost,
                         layout.cr,
                         Style {
-                            fg: theme::DIM,
-                            bg: theme::SURFACE_RAISED,
+                            fg: layout.palette.dim,
+                            bg: layout.palette.surface_raised,
                             bold: false,
                         },
                     );
@@ -1088,7 +1096,9 @@ impl App {
         let tok_out = format_tokens(self.usage.output_tokens);
         let phase = turn_phase(self.spinner.active, self.current_assistant.as_deref());
         let tokens = format!("{tok_in}\u{2191} {tok_out}\u{2193}");
+        let pal = layout.palette;
         let spans = status_spans(
+            pal,
             &self.workflow,
             phase,
             &self.usage.model,
@@ -1105,21 +1115,26 @@ impl App {
                 main.put(
                     layout.r_status,
                     c,
-                    Cell::new(
-                        self.spinner.frame_char(),
-                        theme::ACCENT,
-                        theme::SURFACE_RAISED,
-                        Attr::PLAIN,
-                    ),
+                    Cell::new(self.spinner.frame_char(), pal.accent, pal.surface_raised, Attr::PLAIN),
                 );
             }
             c = c.saturating_add(2);
         }
         for (i, span) in spans.iter().enumerate() {
             if i > 0 {
-                c = write_span(main, layout.r_status, c, " \u{00B7} ", layout.cr, theme::DIM, false);
+                let sep = Style {
+                    fg: pal.dim,
+                    bg: pal.surface_raised,
+                    bold: false,
+                };
+                c = write_span(main, layout.r_status, c, " \u{00B7} ", layout.cr, sep);
             }
-            c = write_span(main, layout.r_status, c, &span.text, layout.cr, span.fg, span.bold);
+            let span_style = Style {
+                fg: span.fg,
+                bg: pal.surface_raised,
+                bold: span.bold,
+            };
+            c = write_span(main, layout.r_status, c, &span.text, layout.cr, span_style);
             if c >= layout.cr {
                 break;
             }
@@ -1127,7 +1142,7 @@ impl App {
         // Fill the remainder with the raised surface so the status line spans the
         // full card width like the input rows above it.
         while c < layout.cr {
-            main.put(layout.r_status, c, Cell::new(' ', 0, theme::SURFACE_RAISED, Attr::PLAIN));
+            main.put(layout.r_status, c, Cell::new(' ', 0, pal.surface_raised, Attr::PLAIN));
             c = c.saturating_add(1);
         }
     }
@@ -1164,12 +1179,12 @@ impl App {
                 break;
             }
             for c in layout.cl..layout.cr.min(layout.cols) {
-                main.put(r, c, Cell::new(' ', 0, theme::SURFACE_RAISED, Attr::PLAIN));
+                main.put(r, c, Cell::new(' ', 0, layout.palette.surface_raised, Attr::PLAIN));
             }
             let (ind_fg, txt_fg) = if row == selected {
-                (theme::ACCENT, theme::BODY)
+                (layout.palette.accent, layout.palette.body)
             } else {
-                (theme::MUTED, theme::MUTED)
+                (layout.palette.muted, layout.palette.muted)
             };
             // Indicator column: selection arrow takes priority; otherwise
             // show scroll hints on the top/bottom rows when the list overflows.
@@ -1191,7 +1206,7 @@ impl App {
                 layout.cr,
                 Style {
                     fg: ind_fg,
-                    bg: theme::SURFACE_RAISED,
+                    bg: layout.palette.surface_raised,
                     bold: false,
                 },
             );
@@ -1204,7 +1219,7 @@ impl App {
                 layout.cr,
                 Style {
                     fg: txt_fg,
-                    bg: theme::SURFACE_RAISED,
+                    bg: layout.palette.surface_raised,
                     bold: false,
                 },
             );
@@ -1225,6 +1240,9 @@ struct CardLayout {
     r_top: u16,
     r_status: u16,
     r_cap: u16,
+    /// Active theme palette, snapshotted once per frame so every chrome helper
+    /// taking `&CardLayout` re-themes without a separate parameter.
+    palette: theme::Palette,
 }
 
 /// Render the "N more" scrollback indicator in the top-right corner when the
@@ -1249,8 +1267,8 @@ fn draw_scroll_indicator(main: &mut Grid, layout: &CardLayout, offset: usize) {
             &indicator,
             layout.cols,
             Style {
-                fg: theme::ACCENT,
-                bg: theme::SURFACE_RAISED,
+                fg: layout.palette.accent,
+                bg: layout.palette.surface_raised,
                 bold: false,
             },
         );
@@ -1262,13 +1280,13 @@ fn draw_scroll_indicator(main: &mut Grid, layout: &CardLayout, offset: usize) {
 fn draw_input_card_bg(main: &mut Grid, layout: &CardLayout) {
     for r in layout.r_top..=layout.r_status.min(layout.rows.saturating_sub(1)) {
         for c in layout.cl..layout.cr.min(layout.cols) {
-            main.put(r, c, Cell::new(' ', 0, theme::SURFACE_RAISED, Attr::PLAIN));
+            main.put(r, c, Cell::new(' ', 0, layout.palette.surface_raised, Attr::PLAIN));
         }
         if layout.cl < layout.cols {
             main.put(
                 r,
                 layout.cl,
-                Cell::new('\u{2503}', theme::ACCENT, theme::SURFACE_RAISED, Attr::PLAIN),
+                Cell::new('\u{2503}', layout.palette.accent, layout.palette.surface_raised, Attr::PLAIN),
             );
         }
     }
@@ -1278,15 +1296,15 @@ fn draw_input_card_bg(main: &mut Grid, layout: &CardLayout) {
 /// trailing `ctrl+c quit` becomes `ctrl+c interrupt`, matching the reducer
 /// (which remaps Ctrl+C to Interrupt during a turn) — so the hint never claims
 /// it will quit at the exact moment it will actually interrupt.
-const fn keybind_hint_parts(in_flight: bool) -> [(&'static str, u32); 6] {
+const fn keybind_hint_parts(in_flight: bool, pal: theme::Palette) -> [(&'static str, u32); 6] {
     let last_label = if in_flight { " interrupt" } else { " quit" };
     [
-        ("shift+enter", theme::BODY),
-        (" newline  ", theme::MUTED),
-        ("tab", theme::BODY),
-        (" skills  ", theme::MUTED),
-        ("ctrl+c", theme::BODY),
-        (last_label, theme::MUTED),
+        ("shift+enter", pal.body),
+        (" newline  ", pal.muted),
+        ("tab", pal.body),
+        (" skills  ", pal.muted),
+        ("ctrl+c", pal.body),
+        (last_label, pal.muted),
     ]
 }
 
@@ -1298,10 +1316,10 @@ fn draw_keybind_hint(main: &mut Grid, layout: &CardLayout, in_flight: bool) {
             main.put(
                 layout.r_cap,
                 layout.cl,
-                Cell::new('\u{2579}', theme::ACCENT, 0, Attr::PLAIN),
+                Cell::new('\u{2579}', layout.palette.accent, 0, Attr::PLAIN),
             );
         }
-        let hint_parts = keybind_hint_parts(in_flight);
+        let hint_parts = keybind_hint_parts(in_flight, layout.palette);
         let total_hw: u16 = hint_parts.iter().map(|(s, _)| char_display_width(s)).sum();
         let mut hc = layout.cr.saturating_sub(total_hw);
         for (text, fg) in &hint_parts {
@@ -1326,10 +1344,10 @@ fn draw_keybind_hint(main: &mut Grid, layout: &CardLayout, in_flight: bool) {
 /// Clear the (unused) prompt grid to the base surface color. The composer keeps
 /// a second grid for a separate prompt region; the TUI renders everything into
 /// the main grid, so this just blanks it each frame.
-fn clear_prompt_grid(prompt: &mut Grid) {
+fn clear_prompt_grid(prompt: &mut Grid, pal: theme::Palette) {
     for r in 0..prompt.rows() {
         for c in 0..prompt.cols() {
-            prompt.put(r, c, Cell::new(' ', 0, theme::SURFACE, Attr::PLAIN));
+            prompt.put(r, c, Cell::new(' ', 0, pal.surface, Attr::PLAIN));
         }
     }
 }
@@ -1349,13 +1367,13 @@ impl crate::goal_render::GoalRender for App {
 }
 
 /// Render plan steps and a vertical divider into the side panel grid.
-pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
+pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine], pal: theme::Palette) {
     let cols = side.cols();
     let rows = side.rows();
 
     for r in 0..rows {
         for c in 0..cols {
-            side.put(r, c, Cell::new(' ', 0, theme::PANEL_BG, Attr::PLAIN));
+            side.put(r, c, Cell::new(' ', 0, pal.panel_bg, Attr::PLAIN));
         }
     }
 
@@ -1363,7 +1381,7 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
         side.put(
             r,
             0,
-            Cell::new('\u{2502}', theme::BORDER, theme::PANEL_BG, Attr::PLAIN),
+            Cell::new('\u{2502}', pal.border, pal.panel_bg, Attr::PLAIN),
         );
     }
 
@@ -1376,8 +1394,8 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
             label,
             cols.saturating_sub(1),
             Style {
-                fg: theme::MUTED,
-                bg: theme::PANEL_BG,
+                fg: pal.muted,
+                bg: pal.panel_bg,
                 bold: false,
             },
         );
@@ -1392,8 +1410,8 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
         header,
         cols.saturating_sub(1),
         Style {
-            fg: theme::PANEL_HEADER,
-            bg: theme::PANEL_BG,
+            fg: pal.panel_header,
+            bg: pal.panel_bg,
             bold: true,
         },
     );
@@ -1402,13 +1420,13 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
         side.put(
             1,
             c,
-            Cell::new('\u{2500}', theme::BORDER, theme::PANEL_BG, Attr::PLAIN),
+            Cell::new('\u{2500}', pal.border, pal.panel_bg, Attr::PLAIN),
         );
     }
     side.put(
         1,
         0,
-        Cell::new('\u{251C}', theme::BORDER, theme::PANEL_BG, Attr::PLAIN),
+        Cell::new('\u{251C}', pal.border, pal.panel_bg, Attr::PLAIN),
     );
 
     // cline L171: render the plan as a live focus-chain checkbox todo list.
@@ -1422,16 +1440,16 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
             break;
         }
         let glyph_fg = match pl.status_glyph {
-            '\u{25CB}' => theme::MUTED,
-            '\u{25D0}' => theme::ACCENT,
-            '\u{25CF}' => theme::GREEN,
-            '\u{2715}' => theme::RED,
-            _ => theme::BODY,
+            '\u{25CB}' => pal.muted,
+            '\u{25D0}' => pal.accent,
+            '\u{25CF}' => pal.green,
+            '\u{2715}' => pal.red,
+            _ => pal.body,
         };
         side.put(
             row,
             2,
-            Cell::new(pl.status_glyph, glyph_fg, theme::PANEL_BG, Attr::PLAIN),
+            Cell::new(pl.status_glyph, glyph_fg, pal.panel_bg, Attr::PLAIN),
         );
         write_str_styled(
             side,
@@ -1440,8 +1458,8 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
             checkbox,
             cols.saturating_sub(4),
             Style {
-                fg: theme::BODY,
-                bg: theme::PANEL_BG,
+                fg: pal.body,
+                bg: pal.panel_bg,
                 bold: false,
             },
         );
@@ -1582,22 +1600,22 @@ fn strip_heading_markers(line: &str) -> Option<String> {
     }
 }
 
-fn md_line_style(line: &str) -> (u32, bool) {
+fn md_line_style(line: &str, pal: theme::Palette) -> (u32, bool) {
     let trimmed = line.trim_start();
     if trimmed.starts_with("### ") {
-        (theme::H3, true)
+        (pal.h3, true)
     } else if trimmed.starts_with("## ") {
-        (theme::H2, true)
+        (pal.h2, true)
     } else if trimmed.starts_with("# ") {
-        (theme::H1, true)
+        (pal.h1, true)
     } else if trimmed.starts_with("---") && trimmed.chars().all(|c| c == '-' || c == ' ') {
-        (theme::RULE, false)
+        (pal.rule, false)
     } else if trimmed.starts_with("```") {
-        (theme::MUTED, false)
+        (pal.muted, false)
     } else if trimmed.starts_with("> ") {
-        (theme::ACCENT_DIM, false)
+        (pal.accent_dim, false)
     } else {
-        (theme::BODY, false)
+        (pal.body, false)
     }
 }
 
@@ -1627,7 +1645,9 @@ fn turn_phase(spinner_active: bool, assistant: Option<&str>) -> Option<&'static 
 /// in accent+bold, an optional phase follows in dimmed accent, the model name is
 /// dim, token counts muted, and the live cost/elapsed are body-bright. A cold
 /// nudge, when present, trails in yellow.
+#[allow(clippy::too_many_arguments)] // each is a distinct status segment; bundling would obscure
 fn status_spans(
+    pal: theme::Palette,
     workflow: &str,
     phase: Option<&str>,
     model: &str,
@@ -1638,40 +1658,40 @@ fn status_spans(
 ) -> Vec<StatusSpan> {
     let mut spans = vec![StatusSpan {
         text: workflow.to_string(),
-        fg: theme::ACCENT,
+        fg: pal.accent,
         bold: true,
     }];
     if let Some(p) = phase {
         spans.push(StatusSpan {
             text: p.to_string(),
-            fg: theme::ACCENT_DIM,
+            fg: pal.accent_dim,
             bold: false,
         });
     }
     spans.push(StatusSpan {
         text: model.to_string(),
-        fg: theme::DIM,
+        fg: pal.dim,
         bold: false,
     });
     spans.push(StatusSpan {
         text: tokens.to_string(),
-        fg: theme::MUTED,
+        fg: pal.muted,
         bold: false,
     });
     spans.push(StatusSpan {
         text: format!("${cost:.3}"),
-        fg: theme::BODY,
+        fg: pal.body,
         bold: false,
     });
     spans.push(StatusSpan {
         text: format!("{secs:.1}s"),
-        fg: theme::BODY,
+        fg: pal.body,
         bold: false,
     });
     if cache_cold {
         spans.push(StatusSpan {
             text: "\u{29D7} cache cold".to_string(),
-            fg: theme::YELLOW,
+            fg: pal.yellow,
             bold: false,
         });
     }
@@ -1681,8 +1701,8 @@ fn status_spans(
 /// Write `s` at (`row`, `col`) on the raised-surface background and return the
 /// next free column. Unlike [`write_str_styled`] it does not bg-fill to the row
 /// end, so spans can be chained left-to-right.
-fn write_span(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16, fg: u32, bold: bool) -> u16 {
-    let attr = if bold { Attr::BOLD } else { Attr::PLAIN };
+fn write_span(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16, style: Style) -> u16 {
+    let attr = if style.bold { Attr::BOLD } else { Attr::PLAIN };
     let mut c = col;
     for ch in s.chars() {
         let w = char_cell_width(ch);
@@ -1692,7 +1712,7 @@ fn write_span(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16, fg: u
         if c + w > max_cols {
             break;
         }
-        grid.put(row, c, Cell::new(ch, fg, theme::SURFACE_RAISED, attr));
+        grid.put(row, c, Cell::new(ch, style.fg, style.bg, attr));
         c += w;
     }
     c
@@ -1703,35 +1723,23 @@ fn write_span(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16, fg: u
 /// Literal lines (pre-formatted tool/diff/command output) are written verbatim
 /// so `**`/backticks survive; prose lines go through the inline-markdown
 /// renderer so `**bold**` and `` `code` `` style correctly.
-fn render_scroll_line(grid: &mut Grid, row: u16, vl: &VisualLine<'_>, cols: u16) {
+fn render_scroll_line(grid: &mut Grid, row: u16, vl: &VisualLine<'_>, cols: u16, pal: theme::Palette) {
+    let style = Style {
+        fg: vl.fg,
+        bg: vl.bg,
+        bold: vl.bold,
+    };
     if vl.literal {
-        write_str_styled(
-            grid,
-            row,
-            0,
-            vl.text,
-            cols,
-            Style {
-                fg: vl.fg,
-                bg: vl.bg,
-                bold: vl.bold,
-            },
-        );
+        write_str_styled(grid, row, 0, vl.text, cols, style);
     } else {
-        render_md_line(grid, row, vl.text, cols, vl.fg, vl.bg, vl.bold);
+        render_md_line(grid, row, vl.text, cols, style, pal);
     }
 }
 
-fn render_md_line(
-    grid: &mut Grid,
-    row: u16,
-    text: &str,
-    max_cols: u16,
-    base_fg: u32,
-    bg: u32,
-    base_bold: bool,
-) {
-    let attr_plain = if base_bold { Attr::BOLD } else { Attr::PLAIN };
+fn render_md_line(grid: &mut Grid, row: u16, text: &str, max_cols: u16, style: Style, pal: theme::Palette) {
+    let base_fg = style.fg;
+    let bg = style.bg;
+    let attr_plain = if style.bold { Attr::BOLD } else { Attr::PLAIN };
     let mut col: u16 = 0;
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
@@ -1747,7 +1755,7 @@ fn render_md_line(
                     if col + w > max_cols {
                         break;
                     }
-                    grid.put(row, col, Cell::new(chars[i], theme::BRIGHT, bg, Attr::BOLD));
+                    grid.put(row, col, Cell::new(chars[i], pal.bright, bg, Attr::BOLD));
                     col += w;
                     i += 1;
                 }
@@ -1766,7 +1774,7 @@ fn render_md_line(
                     grid.put(
                         row,
                         col,
-                        Cell::new(chars[i], theme::CODE_FG, theme::CODE_BG, Attr::PLAIN),
+                        Cell::new(chars[i], pal.code_fg, pal.code_bg, Attr::PLAIN),
                     );
                     col += w;
                     i += 1;
@@ -2042,7 +2050,7 @@ mod tests {
             bold: false,
             literal: true,
         };
-        render_scroll_line(&mut g, 0, &lit, 12);
+        render_scroll_line(&mut g, 0, &lit, 12, theme::Palette::default());
         assert_eq!(g.get(0, 0).glyph, u32::from('*'), "literal line keeps leading *");
 
         let mut g2 = Grid::new(12, 1);
@@ -2053,7 +2061,7 @@ mod tests {
             bold: false,
             literal: false,
         };
-        render_scroll_line(&mut g2, 0, &prose, 12);
+        render_scroll_line(&mut g2, 0, &prose, 12, theme::Palette::default());
         assert_eq!(
             g2.get(0, 0).glyph,
             u32::from('x'),
@@ -2099,7 +2107,7 @@ mod tests {
 
     #[test]
     fn status_spans_have_legibility_hierarchy() {
-        let spans = status_spans("Code", Some("Thinking"), "claude", "1.2k\u{2191} 300\u{2193}", 0.84, 3.4, false);
+        let spans = status_spans(theme::Palette::default(), "Code", Some("Thinking"), "claude", "1.2k\u{2191} 300\u{2193}", 0.84, 3.4, false);
         assert_eq!(spans[0].text, "Code");
         assert_eq!(spans[0].fg, theme::ACCENT);
         assert!(spans[0].bold, "workflow leads bold");
@@ -2113,7 +2121,7 @@ mod tests {
 
     #[test]
     fn status_spans_append_cold_nudge_in_yellow() {
-        let spans = status_spans("Code", None, "m", "0\u{2191} 0\u{2193}", 0.0, 0.0, true);
+        let spans = status_spans(theme::Palette::default(), "Code", None, "m", "0\u{2191} 0\u{2193}", 0.0, 0.0, true);
         assert!(
             spans.last().is_some_and(|s| s.text.contains("cache cold") && s.fg == theme::YELLOW),
             "cold nudge trails in yellow"
@@ -2122,10 +2130,10 @@ mod tests {
 
     #[test]
     fn keybind_hint_shows_interrupt_while_in_flight() {
-        let idle = keybind_hint_parts(false);
+        let idle = keybind_hint_parts(false, theme::Palette::default());
         assert!(idle.iter().any(|(t, _)| *t == " quit"));
         assert!(!idle.iter().any(|(t, _)| t.contains("interrupt")));
-        let busy = keybind_hint_parts(true);
+        let busy = keybind_hint_parts(true, theme::Palette::default());
         assert!(busy.iter().any(|(t, _)| *t == " interrupt"));
         assert!(!busy.iter().any(|(t, _)| *t == " quit"));
     }
@@ -2443,6 +2451,56 @@ mod tests {
         assert!(app.set_mouse_capture(""), "no arg flips back on");
         assert!(!app.set_mouse_capture("off"), "explicit off");
         assert!(app.set_mouse_capture("on"), "explicit on");
+    }
+
+    #[test]
+    fn chrome_is_byte_identical_for_default_then_re_themes() {
+        use origin_tui::composer::Composer;
+        use origin_tui::stream_widget::{Rect, StreamWidget};
+
+        // Draw `app` and return the first chrome cell painted in the active
+        // `surface_raised` (the input-card background), with its coordinate.
+        fn card_bg(app: &App) -> (u16, u16) {
+            let mut composer = Composer::new(60, 12);
+            let mut widget = StreamWidget::new(Rect { row: 0, col: 0, cols: 60, rows: 6 });
+            app.draw(&mut composer, &mut widget);
+            let want = app.palette().surface_raised;
+            let grid = composer.main_grid();
+            for r in 0..grid.rows() {
+                for c in 0..grid.cols() {
+                    if grid.get(r, c).bg == want {
+                        return (r, c);
+                    }
+                }
+            }
+            panic!("no surface_raised chrome cell found");
+        }
+
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        let (row, col) = card_bg(&app);
+        // Default: that cell equals the legacy constant — chrome is byte-identical.
+        {
+            let mut composer = Composer::new(60, 12);
+            let mut widget = StreamWidget::new(Rect { row: 0, col: 0, cols: 60, rows: 6 });
+            app.draw(&mut composer, &mut widget);
+            assert_eq!(
+                composer.main_grid().get(row, col).bg,
+                theme::SURFACE_RAISED,
+                "Default chrome must be byte-identical to the legacy constant"
+            );
+        }
+        // Switch to a distinctly different theme; the SAME cell must re-theme.
+        assert!(app.set_theme_by_name("high-contrast"));
+        let hc = theme::palette(Theme::HighContrast).surface_raised;
+        assert_ne!(hc, theme::SURFACE_RAISED, "HighContrast must differ from Default");
+        let mut composer = Composer::new(60, 12);
+        let mut widget = StreamWidget::new(Rect { row: 0, col: 0, cols: 60, rows: 6 });
+        app.draw(&mut composer, &mut widget);
+        assert_eq!(
+            composer.main_grid().get(row, col).bg,
+            hc,
+            "switching theme must re-theme the chrome"
+        );
     }
 
     #[test]

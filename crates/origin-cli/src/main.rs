@@ -531,13 +531,14 @@ fn spawn_render_task(
                 let bytes = {
                     let mut c = composer.lock();
                     let mut w = widget.lock();
+                    let pal = app.lock().palette();
                     app.lock().draw(&mut c, &mut w);
                     if c.side_visible() {
                         // Hold the plan-panel guard only for `render()` (it
                         // drops at the end of this statement, before draw_side)
                         // to keep lock contention off the hot render path.
                         let lines = plan_panel.lock().render();
-                        origin_cli::tui::draw_side(c.side_grid(), &lines);
+                        origin_cli::tui::draw_side(c.side_grid(), &lines, pal);
                     }
                     c.frame()
                 };
@@ -1185,6 +1186,28 @@ async fn handle_submit(
             "mouse capture OFF \u{2014} drag to select & copy; scroll with PageUp/Shift+\u{2191}\u{2193} (/mouse on to re-enable)"
         };
         app.lock().add_line("system> ", msg);
+        handle.mark_dirty();
+        return;
+    }
+    // `/theme [name]` switches the color palette (default/dark/light/high-contrast).
+    // The chrome re-themes immediately; scrollback already on screen keeps its
+    // baked colors (only new lines pick up the new theme).
+    if let Some(arg) = text
+        .trim()
+        .strip_prefix("/theme")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        .map(str::trim)
+    {
+        let msg = {
+            let mut a = app.lock();
+            a.add_line("you> ", text);
+            if a.set_theme_by_name(arg) {
+                format!("theme: {}", a.theme.name())
+            } else {
+                "usage: /theme default | dark | light | high-contrast".to_string()
+            }
+        };
+        app.lock().add_line("system> ", &msg);
         handle.mark_dirty();
         return;
     }
