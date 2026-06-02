@@ -529,15 +529,17 @@ fn spawn_render_task(
         scheduler
             .run(move || {
                 let bytes = {
+                    // Snapshot the plan first; the side panel is shown exactly
+                    // when there is a plan to show (the panel was wired but
+                    // `side_visible` stayed false forever, so it never appeared).
+                    let lines = plan_panel.lock().render();
+                    let pal = app.lock().palette();
                     let mut c = composer.lock();
                     let mut w = widget.lock();
-                    let pal = app.lock().palette();
+                    // Reflows only on the hidden↔visible transition.
+                    c.set_side_visible(!lines.is_empty());
                     app.lock().draw(&mut c, &mut w);
                     if c.side_visible() {
-                        // Hold the plan-panel guard only for `render()` (it
-                        // drops at the end of this statement, before draw_side)
-                        // to keep lock contention off the hot render path.
-                        let lines = plan_panel.lock().render();
                         origin_cli::tui::draw_side(c.side_grid(), &lines, pal);
                     }
                     c.frame()

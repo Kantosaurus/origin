@@ -232,6 +232,17 @@ impl Composer {
         self.scratch_prompt = Grid::new_filled(cols, PROMPT_ROWS, SCRATCH_SENTINEL);
     }
 
+    /// Show or hide the side panel, reflowing the panes only on a state change.
+    ///
+    /// A no-op when already in the requested state, so callers can drive it from
+    /// the render loop every frame cheaply; the (re)allocation only happens on
+    /// the visible↔hidden transition. Reuses the current `cols`/`rows`.
+    pub fn set_side_visible(&mut self, visible: bool) {
+        if self.side_visible != visible {
+            self.resize(self.cols, self.rows, visible);
+        }
+    }
+
     /// Mutable reference to the main pane grid.
     pub fn main_grid(&mut self) -> &mut Grid {
         &mut self.main
@@ -289,8 +300,22 @@ impl Composer {
 
 #[cfg(test)]
 mod tests {
-    use super::push_sgr_inner;
+    use super::{push_sgr_inner, Composer};
     use crate::grid::Attr;
+
+    #[test]
+    fn set_side_visible_toggles_only_on_change() {
+        let mut c = Composer::new(80, 24);
+        assert!(!c.side_visible(), "hidden by default");
+        c.set_side_visible(true);
+        assert!(c.side_visible());
+        let cols_with_side = c.side_grid().cols();
+        c.set_side_visible(true); // no-op
+        assert!(c.side_visible());
+        assert_eq!(c.side_grid().cols(), cols_with_side, "no reallocation on no-op");
+        c.set_side_visible(false);
+        assert!(!c.side_visible());
+    }
 
     #[test]
     fn disabled_color_keeps_attrs_drops_truecolor() {
