@@ -1163,6 +1163,31 @@ async fn handle_submit(
         handle.mark_dirty();
         return;
     }
+    // `/mouse [on|off]` toggles terminal mouse capture. ON (default) gives wheel
+    // scrolling but intercepts the terminal's native drag-select/copy; OFF
+    // releases capture so the user can select & copy (scroll via PageUp/Shift+↑↓).
+    if let Some(arg) = text
+        .trim()
+        .strip_prefix("/mouse")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        .map(str::trim)
+    {
+        app.lock().add_line("you> ", text);
+        let now_on = app.lock().set_mouse_capture(arg);
+        if now_on {
+            let _ = execute!(std::io::stdout(), EnableMouseCapture);
+        } else {
+            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        }
+        let msg = if now_on {
+            "mouse capture ON \u{2014} wheel scrolls; terminal select/copy is intercepted (/mouse off to copy)"
+        } else {
+            "mouse capture OFF \u{2014} drag to select & copy; scroll with PageUp/Shift+\u{2191}\u{2193} (/mouse on to re-enable)"
+        };
+        app.lock().add_line("system> ", msg);
+        handle.mark_dirty();
+        return;
+    }
     // `/attach <path>` stages an image/PDF for the next prompt (interactive
     // parity with headless `origin run --attach`). The file is classified and
     // encoded CLI-side so the daemon never reads client paths.

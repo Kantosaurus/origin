@@ -284,6 +284,11 @@ pub struct App {
     /// flip it to `✔`/`✘` when the tool completes. `None` when no tool is in
     /// flight.
     running_tool_row: Option<usize>,
+    /// Whether terminal mouse capture is on. Default `true` (wheel scrolls, but
+    /// the terminal's native drag-select/copy is intercepted) — byte-identical
+    /// with the historic behaviour. `/mouse off` releases capture so the user
+    /// can select & copy; scrollback stays reachable via PageUp/Shift+arrows.
+    pub mouse_capture: bool,
 }
 
 /// State backing the live cache-cold status-line nudge. All times are
@@ -358,6 +363,7 @@ impl App {
             permission_ask: false,
             pending_permission: None,
             running_tool_row: None,
+            mouse_capture: true,
         }
     }
 
@@ -370,6 +376,18 @@ impl App {
             _ => !self.permission_ask,
         };
         self.permission_ask
+    }
+
+    /// Apply a `/mouse [on|off]` toggle, returning the new capture state. No
+    /// argument flips; `on`/`off` set it explicitly. The caller is responsible
+    /// for issuing the matching `EnableMouseCapture`/`DisableMouseCapture`.
+    pub fn set_mouse_capture(&mut self, arg: &str) -> bool {
+        self.mouse_capture = match arg.trim() {
+            "on" => true,
+            "off" => false,
+            _ => !self.mouse_capture,
+        };
+        self.mouse_capture
     }
 
     /// Start the live turn timer. Called when a user submission begins.
@@ -2415,6 +2433,16 @@ mod tests {
         assert!(!app.set_permission_ask(""), "no arg flips back off");
         assert!(app.set_permission_ask("on"), "explicit on");
         assert!(!app.set_permission_ask("off"), "explicit off");
+    }
+
+    #[test]
+    fn set_mouse_capture_defaults_on_and_toggles() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        assert!(app.mouse_capture, "mouse capture on by default (byte-identical)");
+        assert!(!app.set_mouse_capture(""), "no arg flips off");
+        assert!(app.set_mouse_capture(""), "no arg flips back on");
+        assert!(!app.set_mouse_capture("off"), "explicit off");
+        assert!(app.set_mouse_capture("on"), "explicit on");
     }
 
     #[test]

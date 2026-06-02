@@ -87,6 +87,8 @@ const BUILTIN_VERBS: &[(&str, &str)] = &[
     ("attach", "stage an image/PDF for the next prompt"),
     ("account", "switch the active provider account"),
     ("mem", "manage proposed memories"),
+    ("permissions", "toggle approving tools before they run"),
+    ("mouse", "toggle mouse capture (off to select & copy)"),
     ("clear", "clear the conversation and goal"),
 ];
 
