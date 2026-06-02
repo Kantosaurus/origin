@@ -264,6 +264,11 @@ pub struct App {
     /// user. `Some` ⇒ the next `y`/`n` (or `Esc`) answers it; rendered above the
     /// input card. `None` in the common case.
     pub pending_permission: Option<PendingPermission>,
+    /// Scrollback row of the tool-activity line currently showing a `▸`
+    /// "running" marker, so [`finish_tool_line`](Self::finish_tool_line) can
+    /// flip it to `✔`/`✘` when the tool completes. `None` when no tool is in
+    /// flight.
+    running_tool_row: Option<usize>,
 }
 
 /// State backing the live cache-cold status-line nudge. All times are
@@ -337,6 +342,7 @@ impl App {
             notify_desktop: false,
             permission_ask: false,
             pending_permission: None,
+            running_tool_row: None,
         }
     }
 
@@ -370,6 +376,9 @@ impl App {
         }
         // No turn in flight => no stall possible; clear any lingering notice.
         self.stall_secs = None;
+        // A streaming tool (e.g. Bash) may not signal completion explicitly;
+        // resolve its running marker to ✔ now that the turn has ended.
+        self.finish_tool_line(true);
         self.evaluate_cache_cold();
     }
 
@@ -658,6 +667,35 @@ impl App {
 
     pub fn add_tool_line(&mut self, text: String) {
         self.scrollback.push(ScrollLine::verbatim(text, theme::TOOL, 0));
+    }
+
+    /// Push a tool-activity line with a leading `▸` "running" marker, recording
+    /// its row so [`finish_tool_line`](Self::finish_tool_line) can flip it to
+    /// `✔`/`✘`. If a previous tool is still marked running (e.g. a streaming
+    /// Bash whose completion isn't signalled explicitly), assume it finished OK
+    /// before starting the new one — so at most one `▸` is ever visible.
+    pub fn start_tool_line(&mut self, text: &str) {
+        self.finish_tool_line(true);
+        self.running_tool_row = Some(self.scrollback.len());
+        self.scrollback
+            .push(ScrollLine::verbatim(format!("  \u{25B8} {text}"), theme::TOOL, 0));
+        self.scroll_offset = 0;
+    }
+
+    /// Flip the tracked running tool line's `▸` to `✔` (ok) or `✘` (failure, in
+    /// red) and stop tracking it. No-op when no tool line is being tracked, so
+    /// it is safe to call on every result and at turn end.
+    pub fn finish_tool_line(&mut self, ok: bool) {
+        let Some(row) = self.running_tool_row.take() else {
+            return;
+        };
+        if let Some(line) = self.scrollback.get_mut(row) {
+            let glyph = if ok { '\u{2714}' } else { '\u{2718}' };
+            line.text = line.text.replacen('\u{25B8}', &glyph.to_string(), 1);
+            if !ok {
+                line.fg = theme::RED;
+            }
+        }
     }
 
     pub fn start_assistant_turn(&mut self) {
@@ -1871,6 +1909,52 @@ mod tests {
         );
         app.add_tool_line("[Bash] echo **x**".to_string());
         assert!(matches!(app.scrollback.last(), Some(l) if l.literal));
+    }
+
+    #[test]
+    fn tool_line_marks_running_then_done() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.start_tool_line("[Write] src/x.rs");
+        assert!(
+            app.scrollback.last().is_some_and(|l| l.text.contains('\u{25B8}')),
+            "running line shows the ▸ marker"
+        );
+        app.finish_tool_line(true);
+        assert!(
+            app.scrollback
+                .last()
+                .is_some_and(|l| l.text.contains('\u{2714}') && !l.text.contains('\u{25B8}')),
+            "completed-ok shows ✔ and no ▸"
+        );
+    }
+
+    #[test]
+    fn tool_line_failure_is_cross_and_red() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.start_tool_line("[Bash] false");
+        app.finish_tool_line(false);
+        assert!(
+            app.scrollback.last().is_some_and(|l| l.text.contains('\u{2718}') && l.fg == theme::RED),
+            "failure shows ✘ in red"
+        );
+    }
+
+    #[test]
+    fn starting_next_tool_resolves_previous_running_marker() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.start_tool_line("[Bash] first");
+        app.start_tool_line("[Bash] second");
+        let ticks = app.scrollback.iter().filter(|l| l.text.contains('\u{2714}')).count();
+        let arrows = app.scrollback.iter().filter(|l| l.text.contains('\u{25B8}')).count();
+        assert_eq!(ticks, 1, "previous tool resolved to ✔");
+        assert_eq!(arrows, 1, "only the current tool still shows ▸");
+    }
+
+    #[test]
+    fn finish_tool_line_without_running_is_noop() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.finish_tool_line(true);
+        assert!(app.scrollback.is_empty(), "no tool line, nothing happens");
     }
 
     #[test]

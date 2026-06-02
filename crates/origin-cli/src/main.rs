@@ -1333,7 +1333,8 @@ async fn handle_prompt_turn(
             };
             let mut a = app_for_tool.lock();
             a.finalize_assistant_turn(0);
-            a.add_tool_line(format!("  {line}"));
+            // ▸ running marker; flipped to ✔/✘ by on_tool_result / turn end.
+            a.start_tool_line(&line);
             for dl in &diff_lines {
                 let (fg, bg) = match dl.kind.as_str() {
                     "+" => (theme::DIFF_ADD_FG, theme::DIFF_ADD_BG),
@@ -1375,6 +1376,8 @@ async fn handle_prompt_turn(
             // the start indicator followed by a silent gap.
             use origin_cli::theme;
             let mut a = app_for_result.lock();
+            // Flip the tool's ▸ running marker to ✔/✘.
+            a.finish_tool_line(ok);
             let header_fg = if ok { theme::MUTED } else { theme::RED };
             if !ok {
                 a.add_colored_line(format!("    \u{2718} {tool} failed"), header_fg, 0);
