@@ -90,6 +90,8 @@ const BUILTIN_VERBS: &[(&str, &str)] = &[
     ("permissions", "toggle approving tools before they run"),
     ("mouse", "toggle mouse capture (off to select & copy)"),
     ("theme", "switch palette (default/dark/light/high-contrast)"),
+    ("copy", "copy the last reply to the clipboard (OSC 52)"),
+    ("help", "show the command + keybinding cheatsheet"),
     ("clear", "clear the conversation and goal"),
 ];
 
@@ -392,20 +394,19 @@ mod tests {
         assert_eq!(buf, "/effort");
     }
 
-    /// The still-non-dispatched verbs `vim`/`help` must NOT be injected yet —
-    /// a later wave wires them up. (`theme` IS dispatched now, so it belongs.)
+    /// The still-non-dispatched verb `vim` must NOT be injected yet — a later
+    /// wave wires it up. (`theme`/`help` ARE dispatched now, so they belong.)
     #[test]
     fn undispatched_verbs_are_absent() {
         let sources = load_sources();
-        for absent in ["vim", "help"] {
-            assert!(
-                !sources.verbs.iter().any(|v| v == absent),
-                "did not expect `{absent}` among built-in verbs: {:?}",
-                sources.verbs
-            );
+        assert!(
+            !sources.verbs.iter().any(|v| v == "vim"),
+            "did not expect `vim` among built-in verbs: {:?}",
+            sources.verbs
+        );
+        for present in ["theme", "help"] {
+            assert!(sources.verbs.iter().any(|v| v == present), "`{present}` should be a built-in verb");
         }
-        // `theme` is dispatched, so it must be present.
-        assert!(sources.verbs.iter().any(|v| v == "theme"), "theme should be a built-in verb");
     }
 
     /// Built-in verbs participate in the same `/<partial>` match as skills.

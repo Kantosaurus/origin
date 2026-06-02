@@ -1010,6 +1010,12 @@ fn spawn_plan_subscription(path: String, wiring: Arc<Mutex<PlanPanelWiring>>, re
 /// (and which may mutate `model`), rather than an assistant prompt. Mirrors the
 /// detection order in `handle_submit`; an unrecognized `/foo` is NOT a command
 /// here (it is sent to the daemon as a prompt, matching `handle_submit`).
+/// Whether `text` is the help command (`/help` or `/?`).
+fn is_help_command(text: &str) -> bool {
+    let t = text.trim();
+    t == "/help" || t == "/?"
+}
+
 fn is_slash_command(text: &str) -> bool {
     slash_model_args(text).is_some()
         || slash_account_args(text).is_some()
@@ -1223,6 +1229,51 @@ async fn handle_submit(
             }
         };
         app.lock().add_line("system> ", &msg);
+        handle.mark_dirty();
+        return;
+    }
+    // `/help` prints a command + keybinding cheatsheet to the scrollback. The
+    // power keystrokes (history recall, scroll, Home/End) are otherwise
+    // undiscoverable, and most slash commands are only found by typing `/`.
+    if is_help_command(text) {
+        let mut a = app.lock();
+        a.add_line("you> ", text);
+        a.add_line("system> ", "commands:");
+        a.add_line(
+            "tab> ",
+            "/model /effort /fast /output-style /steer /plan /attach /account /mem",
+        );
+        a.add_line("tab> ", "/theme /permissions /mouse /copy /clear /help");
+        a.add_line("system> ", "keys:");
+        a.add_line("tab> ", "Enter submit \u{00B7} Shift+Enter newline \u{00B7} Tab complete");
+        a.add_line("tab> ", "\u{2190}/\u{2192} move \u{00B7} Home/End line \u{00B7} \u{2191}/\u{2193} history \u{00B7} Backspace/Delete");
+        a.add_line("tab> ", "PageUp/PageDown \u{00B7} Shift+\u{2191}/\u{2193} scroll \u{00B7} End jump to bottom");
+        a.add_line("tab> ", "Ctrl+C interrupt/quit \u{00B7} Ctrl+D exit \u{00B7} Esc dismiss popup");
+        drop(a);
+        handle.mark_dirty();
+        return;
+    }
+    // `/copy` copies the last assistant reply to the system clipboard via an
+    // OSC 52 escape (works over SSH — the terminal owns the clipboard). This is
+    // the only in-TUI copy path; mouse capture otherwise intercepts selection.
+    if text.trim() == "/copy" {
+        let mut a = app.lock();
+        a.add_line("you> ", text);
+        let seq = a
+            .last_assistant
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .map(origin_cli::clipboard::osc52_sequence);
+        if let Some(seq) = seq {
+            a.add_line("ok> ", "copied the last reply to the clipboard");
+            drop(a);
+            use std::io::Write as _;
+            let _ = std::io::stdout().write_all(seq.as_bytes());
+            let _ = std::io::stdout().flush();
+        } else {
+            a.add_line("system> ", "nothing to copy yet");
+            drop(a);
+        }
         handle.mark_dirty();
         return;
     }

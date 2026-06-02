@@ -315,6 +315,9 @@ pub struct App {
     /// with the historic behaviour. `/mouse off` releases capture so the user
     /// can select & copy; scrollback stays reachable via PageUp/Shift+arrows.
     pub mouse_capture: bool,
+    /// The most recent finalized assistant reply, for `/copy` (OSC 52). `None`
+    /// until the first reply completes.
+    pub last_assistant: Option<String>,
 }
 
 /// State backing the live cache-cold status-line nudge. All times are
@@ -390,6 +393,7 @@ impl App {
             pending_permission: None,
             running_tool_row: None,
             mouse_capture: true,
+            last_assistant: None,
         }
     }
 
@@ -867,6 +871,8 @@ impl App {
                 self.scrollback
                     .push(ScrollLine::styled(String::new(), 0, 0, false));
             }
+            // Remember the rendered reply for `/copy` (OSC 52).
+            self.last_assistant = Some(text);
             // aider L107 OS-notification: best-effort desktop chime on turn
             // completion. Gated by the opt-in flag (default-off ⇒ no spawn ⇒
             // byte-identical) and best-effort — a missing notifier never
