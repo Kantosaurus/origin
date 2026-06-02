@@ -851,6 +851,18 @@ async fn handle_input_action(
 /// polling input and can deliver a Ctrl+C interrupt while the turn is live.
 /// Installs the interrupt sender into `interrupt_tx` and clears it (plus the
 /// spinner) when the turn completes.
+/// Commit a user prompt to the view synchronously: echo the `you>` line, open
+/// the assistant buffer, and start the turn timer. Called by both prompt paths
+/// BEFORE the (possibly spawned) turn runs, so the very next 6 ms frame shows
+/// the committed prompt + spinner + live timer instead of an empty card — the
+/// "did it take my input?" dead window after pressing Enter.
+fn begin_prompt_turn(app: &SharedApp, text: &str) {
+    let mut a = app.lock();
+    a.add_line("you> ", text);
+    a.start_assistant_turn();
+    a.start_turn_timer();
+}
+
 async fn spawn_prompt_turn(
     text: String,
     app: &SharedApp,
@@ -872,6 +884,9 @@ async fn spawn_prompt_turn(
         a.recompute_suggestions();
         a.spinner.start();
     }
+    // Commit the prompt synchronously so the first frame after Enter shows it,
+    // independent of the spawn/connect hop below.
+    begin_prompt_turn(app, &text);
     handle.mark_dirty();
     let app_for_turn = Arc::clone(app);
     let handle_for_turn = handle.clone();
@@ -1229,6 +1244,8 @@ async fn handle_submit(
         return;
     }
 
+    begin_prompt_turn(app, text);
+    handle.mark_dirty();
     handle_prompt_turn(app, handle, path, model.as_str(), text, session_id, interrupt_rx).await;
 }
 
@@ -1246,14 +1263,9 @@ async fn handle_prompt_turn(
     session_id: &str,
     interrupt_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
 ) {
-    {
-        let mut a = app.lock();
-        a.add_line("you> ", text);
-        a.start_assistant_turn();
-        a.start_turn_timer();
-    }
-    handle.mark_dirty();
-
+    // The user line is echoed + the turn timer started synchronously by the
+    // caller (`begin_prompt_turn`) before this (possibly spawned) task runs, so
+    // the first frame after Enter is never empty.
     let mut proposals: Vec<(u32, String, Vec<String>)> = Vec::new();
     let app_for_delta = Arc::clone(app);
     let handle_for_delta = handle.clone();
