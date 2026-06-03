@@ -21,10 +21,16 @@ pub enum TaskClass {
     /// Initial code-graph build; bulk MCP discovery. Paused when `Critical`
     /// has any in-flight work.
     Bulk = 4,
+    /// Swarm sub-agent worker bodies. An isolated permit pool (so swarm
+    /// concurrency neither starves nor is starved by the shared `Sidecar`
+    /// users) sized as a coarse runaway backstop; the real limiter is the
+    /// memory-governed `AdmissionGate` in `origin-swarm`. Non-`Critical` and
+    /// non-`Bulk`, so a parent awaiting a child never deadlocks.
+    Swarm = 5,
 }
 
 impl TaskClass {
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 6;
 
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -34,6 +40,7 @@ impl TaskClass {
             Self::Sidecar => "sidecar",
             Self::Background => "background",
             Self::Bulk => "bulk",
+            Self::Swarm => "swarm",
         }
     }
 }

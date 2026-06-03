@@ -101,7 +101,10 @@ async fn two_task_calls_in_one_turn_run_concurrently() {
             })
         })
     });
-    let mut coord = Coordinator::new(plan, "parallel-dispatch-test");
+    // Unlimited memory gate so this test isolates the agent-loop's parallel
+    // dispatch from the memory-admission policy (covered in origin-swarm).
+    let mut coord =
+        Coordinator::new(plan, "parallel-dispatch-test").with_memory_gate(origin_swarm::AdmissionGate::unlimited_for_test());
     coord.set_default_worker(worker);
 
     let provider = TwoTaskProvider {

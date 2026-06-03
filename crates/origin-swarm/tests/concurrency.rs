@@ -10,7 +10,8 @@ use std::time::Duration;
 use origin_cas::{Store as CasStore, StoreConfig};
 use origin_plan::{ActorId, Plan, PlanStore};
 use origin_swarm::{
-    Budget, CompletionReport, Coordinator, PlanHandle, ReportStatus, Usage, WorkerContext, WorkerFn, WorkerSpec,
+    AdmissionGate, Budget, CompletionReport, Coordinator, PlanHandle, ReportStatus, Usage, WorkerContext, WorkerFn,
+    WorkerSpec,
 };
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -48,7 +49,10 @@ async fn spawned_workers_run_concurrently_not_serially() {
     let cas = Arc::new(open_cas(tmp.path().join("cas")));
     let plan_store = Arc::new(PlanStore::open(Arc::clone(&store), Arc::clone(&cas)).expect("plan store"));
     let plan = PlanHandle::new(Arc::new(Mutex::new(Plan::default())), plan_store);
-    let coord = Coordinator::new(plan, format!("origin-swarm-conc-{}", std::process::id()));
+    // Inject an unlimited gate so this test isolates EXECUTION concurrency from
+    // the memory-admission policy (covered separately in tests/admission.rs).
+    let coord = Coordinator::new(plan, format!("origin-swarm-conc-{}", std::process::id()))
+        .with_memory_gate(AdmissionGate::unlimited_for_test());
 
     // Each worker bumps a shared "currently running" counter, records the max
     // ever seen, then holds the slot long enough that all three overlap.
