@@ -10,4 +10,10 @@
 #![forbid(unsafe_code)]
 
 pub mod ipc_resume;
+pub mod lifecycle;
 pub mod resume_token;
+
+pub use lifecycle::{
+    AttachState, Decision, HandoffKind, LifecycleConfig, LifecyclePolicy, MemReading, RetireReason,
+    SessionClass, SessionState,
+};
