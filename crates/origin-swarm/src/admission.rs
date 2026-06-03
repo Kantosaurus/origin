@@ -492,7 +492,7 @@ impl Drop for AdmissionTicket {
 mod tests {
     use super::*;
 
-    fn cfg(reserve: u64, headroom: u64, static_ceiling: u32) -> GateCfg {
+    const fn cfg(reserve: u64, headroom: u64, static_ceiling: u32) -> GateCfg {
         GateCfg {
             reserve_bytes: reserve,
             headroom_bytes: headroom,
