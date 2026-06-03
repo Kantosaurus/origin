@@ -22,6 +22,7 @@ use origin_runtime::{spawn_in, TaskClass};
 use tokio::sync::{watch, Mutex};
 use ulid::Ulid;
 
+use crate::admission::AdmissionGate;
 use crate::error::SwarmError;
 use crate::lifecycle::Lifecycle;
 use crate::prefix_inherit::PrefixSnapshot;
@@ -95,6 +96,11 @@ pub struct Coordinator {
     /// `WorkerContext::inherited_ledger` on spawn (`Vec<(SectionId, Band)>`
     /// clone — both `Copy` payloads).
     parent_snapshot: Option<PrefixSnapshot>,
+    /// Memory-governed admission gate. Defaults to the process-shared gate so
+    /// every room draws on one authoritative RAM budget; spawn admits through
+    /// it (parking, holding nothing) before launching the worker, so the swarm
+    /// runs as many sub-agents as fit and backs off before OOM.
+    gate: Arc<AdmissionGate>,
 }
 
 impl Coordinator {
@@ -112,6 +118,7 @@ impl Coordinator {
             last_completion: Arc::new(Mutex::new(None)),
             parent_ledger: None,
             parent_snapshot: None,
+            gate: AdmissionGate::shared(),
         }
     }
 
@@ -119,6 +126,16 @@ impl Coordinator {
     #[must_use]
     pub fn ring_name(&self) -> &str {
         &self.ring_name
+    }
+
+    /// Override the memory-admission gate (test injection). Production uses the
+    /// process-shared gate from [`Coordinator::new`]; tests pass an isolated
+    /// gate built with a [`crate::ScriptedProbe`] so admission is deterministic
+    /// without real allocation.
+    #[must_use]
+    pub fn with_memory_gate(mut self, gate: Arc<AdmissionGate>) -> Self {
+        self.gate = gate;
+        self
     }
 
     /// Builder-style setter for the parent's `PrefixLedger`.
@@ -184,13 +201,26 @@ impl Coordinator {
         let last = Arc::clone(&self.last_completion);
         let lc_tx_for_spawn = lc_tx.clone();
         let per_worker_slot = Arc::clone(&report_slot);
-        // Worker bodies run in `Sidecar`, NOT `Critical`. A parent agent holds a
-        // `Critical` permit while it awaits a child (`Task` → `await_completion`);
-        // spawning the child in `Critical` too would deadlock once the fixed
-        // `Critical` pool is exhausted (parent waits for child, child waits for a
-        // permit the parent holds). `Sidecar` has an independent permit pool and
-        // is not gated on Critical-idle, breaking the circular wait.
-        spawn_in(TaskClass::Sidecar, async move {
+
+        // Acquire memory admission BEFORE spawning. A parked admit holds NOTHING
+        // (no execution permit, no task), so it can never be the resource a
+        // running worker needs — load-bearing for deadlock-freedom. The gate's
+        // `>= 1` floor guarantees the first worker always proceeds.
+        let ticket = self.gate.admit().await;
+
+        // Worker bodies run in the dedicated `Swarm` lane — NOT `Critical` and
+        // NOT `Bulk`. A parent agent holds a `Critical` permit while it awaits a
+        // child (`Task` → `await_completion`); a `Critical` child would deadlock
+        // once the fixed `Critical` pool is exhausted, and a `Bulk` child would
+        // be parked by the `BulkGate` while the parent (Critical) is in flight.
+        // `Swarm` has an independent permit pool gated only by the memory
+        // `AdmissionGate`, breaking the circular wait while letting concurrency
+        // scale with available RAM.
+        spawn_in(TaskClass::Swarm, async move {
+            // Move the admission ticket into the task: its RAII `Drop` releases
+            // the reserve and wakes parked admits on EVERY exit path (return,
+            // panic unwind, cancellation), so the gate can never leak a slot.
+            let _ticket = ticket;
             // We immediately publish `Running` so spawn callers can rely on
             // observing it (the test only awaits `Done` / `Failed`, but
             // future P9.8 paths need the transition to be observable).

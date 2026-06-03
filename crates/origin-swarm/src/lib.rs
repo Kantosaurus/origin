@@ -29,6 +29,7 @@
 //!   [`Coordinator::set_default_worker`] with the real agent-loop closure.
 //! - **P9.9:** subscribes the TUI plan panel to [`PlanHandle::subscribe`].
 
+pub mod admission;
 pub mod collab;
 pub mod coordinator;
 pub mod credit;
@@ -41,6 +42,9 @@ pub mod spec;
 pub mod team;
 pub mod worker;
 
+pub use admission::{
+    default_probe, AdmissionGate, AdmissionTicket, GateCfg, MemReading, MemoryProbe, NullProbe, ScriptedProbe,
+};
 pub use collab::{FileRegistry, FileShiftNotice, Mailbox, Message, MsgScope};
 pub use coordinator::{Coordinator, WorkerHandle, WorkerId};
 pub use error::SwarmError;
