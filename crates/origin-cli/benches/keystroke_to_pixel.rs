@@ -27,7 +27,7 @@ fn bench_keystroke_to_pixel(c: &mut Criterion) {
                 (app, composer, widget)
             },
             |(mut app, mut composer, mut widget)| {
-                app.input.push('x');
+                app.input.insert_char('x');
                 app.draw(&mut composer, &mut widget);
                 black_box(composer.frame());
             },

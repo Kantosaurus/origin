@@ -43,6 +43,11 @@ type SharedApp = Arc<Mutex<App>>;
 type SharedComposer = Arc<Mutex<Composer>>;
 type SharedWidget = Arc<Mutex<StreamWidget>>;
 
+/// Cap on rendered diff rows for a single Write/Edit tool result so a large
+/// patch doesn't bury the conversation. These `DiffLine`s are view-only (never
+/// sent to the model), so the cap is purely cosmetic.
+const MAX_DIFF_ROWS: usize = 40;
+
 /// Process-wide extended-thinking budget (in tokens) seeded from the startup
 /// `--thinking-tokens` flag. `None` (the default) ⇒ no thinking budget on any
 /// `PromptRequest`, keeping the provider wire byte-identical.
@@ -270,6 +275,16 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
         Cmd::Ambient { sub } => origin_cli::ambient::run(&sub),
         Cmd::Bench { samples, json, from } => origin_cli::bench::run(samples, json, from),
         Cmd::Review { strictness } => origin_cli::review::run(&strictness),
+        Cmd::Gmail {
+            op,
+            query,
+            id,
+            max,
+            include_body,
+        } => origin_cli::gaps_cmds::gmail(op, query, id, max, include_body).await,
+        Cmd::Workflow { sub } => origin_cli::gaps_cmds::workflow(sub),
+        Cmd::Selfdev { sub } => origin_cli::gaps_cmds::selfdev(sub).await,
+        Cmd::Team { sub } => origin_cli::gaps_cmds::team(sub).await,
     })
 }
 
@@ -320,6 +335,7 @@ impl Drop for TerminalGuard {
     }
 }
 
+#[allow(clippy::too_many_lines)] // linear startup wiring; splitting hurts readability
 async fn run() -> Result<()> {
     run_self_update().await?;
 
@@ -525,6 +541,15 @@ fn setup_tui(default_provider: String, model: &str) -> (SharedComposer, SharedWi
     let provider_static: &'static str = Box::leak(default_provider.into_boxed_str());
     let sources = origin_cli::autocomplete::load_sources();
     let app: SharedApp = Arc::new(Mutex::new(App::new(provider_static, model.to_string(), sources)));
+    {
+        let mut a = app.lock();
+        // Seed the opt-in vim layer from `ORIGIN_VIM=1` so the session can begin
+        // in vim Normal mode; default-off ⇒ byte-identical direct insert.
+        a.set_vim_active(origin_cli::input::vim_active_default());
+        // Load the customizable composer keymap once (builtin defaults overlaid
+        // with `~/.origin/keybindings.toml`). Absent file ⇒ builtin ⇒ unchanged.
+        a.set_keymap(origin_cli::keybindings::KeyMap::load());
+    }
     app.lock().push_banner(cols, rows);
     (composer, widget, app)
 }
@@ -747,6 +772,13 @@ async fn handle_key_event(
     ) {
         return KeyOutcome::Continue;
     }
+    // claude-code L147: route the raw event through the session keymap so a
+    // user `~/.origin/keybindings.toml` rebind reaches the existing handlers.
+    // `canonicalize` rewrites a user-bound chord to the builtin event the
+    // legacy reducer/scrollback path already understands; with the builtin
+    // (default) map every event maps to itself, so the key path is
+    // byte-identical when no override file is present.
+    let ev = app.lock().keymap().canonicalize(ev);
     // Scrollback navigation — intercept before the buffer reducer. Returns
     // `Some` when the key was a navigation key we fully handled.
     if let Some(outcome) = handle_scrollback_key(ev, app, handle) {
@@ -775,6 +807,27 @@ async fn handle_key_event(
         }
     }
 
+    // claude-code L147 keymap `Clear` action: the builtin chord is `Ctrl+U`,
+    // which the legacy reducer leaves as a no-op. Wiring it makes a *rebind* of
+    // `clear` actually wipe the composer buffer. Gated on `is_overridden` so the
+    // pure builtin map's Ctrl+U stays the historic no-op (byte-identical
+    // default); only a loaded `keybindings.toml` activates this additive action.
+    {
+        let is_clear = app.lock().keymap().is_overridden()
+            && origin_cli::keybindings::KeyMap::builtin_event(origin_cli::keybindings::Action::Clear)
+                .is_some_and(|c| c.code == ev.code && c.modifiers == ev.modifiers);
+        if is_clear {
+            let mut a = app.lock();
+            if !a.input.is_empty() {
+                a.input.set_buffer(String::new());
+                a.recompute_suggestions();
+                drop(a);
+                handle.mark_dirty();
+            }
+            return KeyOutcome::Continue;
+        }
+    }
+
     if matches!(ev.code, crossterm::event::KeyCode::Tab) {
         let mut a = app.lock();
         if !a.suggestions.candidates.is_empty() {
@@ -789,6 +842,32 @@ async fn handle_key_event(
         drop(a);
         handle.mark_dirty();
         return KeyOutcome::Continue;
+    }
+
+    // aider L107 opt-in vim layer: when active, route the key through the pure
+    // `vim_key` reducer → `App::apply_vim_action` instead of straight to
+    // `reduce_editor`. A consumed key (mode switch / motion) marks the frame
+    // dirty and stops here. A `Pass` falls through to the normal reducer in
+    // Insert mode (so typing is byte-identical) and is dropped in Normal mode —
+    // except modifier chords (Ctrl/Alt), which always fall through so the global
+    // Ctrl+C/Ctrl+D exits keep working. Default sessions (`vim_active == false`)
+    // skip this block entirely ⇒ byte-identical key handling.
+    if app.lock().vim_active() {
+        use crossterm::event::KeyModifiers;
+        let mode = app.lock().vim_mode();
+        let vim_action = origin_cli::input::vim_key(mode, ev);
+        let consumed = app.lock().apply_vim_action(vim_action);
+        if consumed {
+            app.lock().recompute_suggestions();
+            handle.mark_dirty();
+            return KeyOutcome::Continue;
+        }
+        // Not a vim binding (`Pass`). In Normal mode, drop non-chord keys (vim
+        // Normal never inserts text); chords fall through to the exit reducer.
+        let is_chord = ev.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if app.lock().vim_mode() == origin_cli::input::VimMode::Normal && !is_chord {
+            return KeyOutcome::Continue;
+        }
     }
 
     let action = {
@@ -1040,7 +1119,16 @@ fn is_slash_command(text: &str) -> bool {
         || parse_workflow_command(text).is_some()
 }
 
-#[allow(clippy::too_many_lines)] // Single linear dispatch over many slash commands; splitting hurts readability.
+// `too_many_lines`: single linear dispatch over many slash commands; splitting
+// hurts readability. The other three are localized, pre-existing idioms inside
+// this long dispatch (a scoped `app.lock()` guard feeding a rendered message; a
+// block-local `use`/`const` next to its sole use) that read more clearly inline
+// than hoisted to the function top.
+#[allow(
+    clippy::too_many_lines,
+    clippy::significant_drop_tightening,
+    clippy::items_after_statements
+)]
 async fn handle_submit(
     app: &SharedApp,
     handle: &Handle,
@@ -1174,6 +1262,25 @@ async fn handle_submit(
             "plan mode ON — mutating tools (Edit/Write/Bash/…) are disabled until /plan off"
         } else {
             "plan mode OFF — edits and commands re-enabled"
+        };
+        app.lock().add_line("system> ", msg);
+        handle.mark_dirty();
+        return;
+    }
+    // `/vim` toggles the opt-in vim input layer (aider L107). With it OFF (the
+    // default) the composer is direct-insert (byte-identical); ON starts in vim
+    // Normal mode (hjkl/0/$/w/b move, i/a/A/I enter insert, Esc → Normal).
+    if text
+        .trim()
+        .strip_prefix("/vim")
+        .is_some_and(|rest| rest.trim().is_empty())
+    {
+        app.lock().add_line("you> ", text);
+        let now_on = app.lock().toggle_vim();
+        let msg = if now_on {
+            "vim mode ON \u{2014} Normal mode (i to insert, Esc to return); /vim to disable"
+        } else {
+            "vim mode OFF \u{2014} direct insert (default)"
         };
         app.lock().add_line("system> ", msg);
         handle.mark_dirty();
@@ -1526,7 +1633,6 @@ async fn handle_prompt_turn(
             // Cap rendered diff rows so a large Write doesn't bury the
             // conversation (these DiffLines are never sent to the model, so this
             // is purely a view change). Indent 2 cols to nest under the header.
-            const MAX_DIFF_ROWS: usize = 40;
             let total_diff = diff_lines.len();
             for dl in diff_lines.iter().take(MAX_DIFF_ROWS) {
                 let (fg, bg) = match dl.kind.as_str() {
@@ -1681,7 +1787,7 @@ fn attach_file(path: &str) -> anyhow::Result<origin_multimodal::ContentBlock> {
 // `redundant_pub_crate`: the `tokio::select!` below expands to `pub(crate)`
 // helper items; in this bin crate (a private-module root) that trips the lint —
 // a known macro false positive, not author-written `pub(crate)` visibility.
-#[allow(clippy::too_many_arguments, clippy::redundant_pub_crate)]
+#[allow(clippy::too_many_arguments, clippy::redundant_pub_crate, clippy::too_many_lines)]
 async fn call_daemon(
     path: &str,
     model: &str,

@@ -155,6 +155,12 @@ fn parse_key(key: &str) -> Option<KeyCode> {
 #[derive(Debug, Clone)]
 pub struct KeyMap {
     bindings: Vec<(Chord, Action)>,
+    /// `true` once at least one user override has actually been applied (via
+    /// [`KeyMap::from_toml_str`]/[`KeyMap::load`]). The pure builtin map leaves
+    /// this `false`, letting the caller gate *additive* behaviour (e.g. wiring
+    /// the otherwise-no-op `Clear` chord) so the default key path stays
+    /// byte-identical when no `keybindings.toml` is present.
+    overridden: bool,
 }
 
 impl Default for KeyMap {
@@ -186,7 +192,18 @@ impl KeyMap {
                     Action::Clear,
                 ),
             ],
+            overridden: false,
         }
+    }
+
+    /// Whether a user override has been applied on top of the builtin map.
+    ///
+    /// `false` for the pure builtin/default map; `true` after a non-empty
+    /// `keybindings.toml` rebinds at least one action. Callers gate additive
+    /// behaviour on this so an absent config leaves the key path byte-identical.
+    #[must_use]
+    pub const fn is_overridden(&self) -> bool {
+        self.overridden
     }
 
     /// Overlay parsed override entries onto this map.
@@ -199,6 +216,7 @@ impl KeyMap {
         for &(action, chord) in overrides {
             self.bindings.retain(|(c, a)| *a != action && *c != chord);
             self.bindings.push((chord, action));
+            self.overridden = true;
         }
     }
 
@@ -210,6 +228,39 @@ impl KeyMap {
             .iter()
             .find_map(|(c, a)| (*c == chord).then_some(*a))
             .unwrap_or(Action::None)
+    }
+
+    /// The *builtin* (default) key event that triggers `action`, used to
+    /// canonicalize a user-rebound chord back to the event the legacy reducer
+    /// already understands. Returns `None` for [`Action::None`] and for any
+    /// action without a builtin chord. Kept independent of `self` so the
+    /// translation target is always the legacy default, regardless of overrides.
+    #[must_use]
+    pub fn builtin_event(action: Action) -> Option<KeyEvent> {
+        let chord = Self::builtin()
+            .bindings
+            .into_iter()
+            .find_map(|(c, a)| (a == action).then_some(c))?;
+        Some(KeyEvent::new(chord.code, chord.mods))
+    }
+
+    /// Translate an incoming key event through this map into the *canonical*
+    /// builtin event the legacy reducer/scrollback path expects.
+    ///
+    /// - With the **builtin** map, a bound chord resolves to its own action
+    ///   whose builtin event is the same chord, so the returned event equals
+    ///   the input (byte-identical). An unbound event also returns unchanged.
+    /// - With a **user override**, a rebound chord (e.g. `ctrl+p` →
+    ///   `HistoryPrev`) resolves to the action and is rewritten to the builtin
+    ///   event (`Up`), so the existing reducer fires the action as if the
+    ///   default key was pressed. The freed default chord no longer resolves
+    ///   (it returns [`Action::None`]) and passes through unchanged.
+    #[must_use]
+    pub fn canonicalize(&self, ev: KeyEvent) -> KeyEvent {
+        match self.resolve(ev) {
+            Action::None => ev,
+            action => Self::builtin_event(action).unwrap_or(ev),
+        }
     }
 
     /// Build a map from the builtin defaults overlaid with a TOML override
@@ -378,5 +429,95 @@ mod tests {
         let km = KeyMap::builtin();
         let noisy = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(km.resolve(noisy), Action::Submit);
+    }
+
+    #[test]
+    fn builtin_is_not_overridden_and_canonicalizes_to_identity() {
+        // The default/builtin map reports no overrides, and canonicalize is the
+        // identity for every event — so the live key path is byte-identical when
+        // no `keybindings.toml` is present.
+        let km = KeyMap::builtin();
+        assert!(!km.is_overridden());
+        for ev in [
+            ev(KeyCode::Enter, KeyModifiers::NONE),
+            ev(KeyCode::Up, KeyModifiers::NONE),
+            ev(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            ev(KeyCode::Char('x'), KeyModifiers::NONE),
+            ev(KeyCode::Esc, KeyModifiers::NONE),
+        ] {
+            assert_eq!(km.canonicalize(ev), ev, "builtin canonicalize is identity");
+        }
+    }
+
+    #[test]
+    fn override_marks_overridden() {
+        let km = KeyMap::from_toml_str("history-prev = \"ctrl+p\"\n").unwrap();
+        assert!(km.is_overridden(), "a loaded rebind marks the map overridden");
+        // Empty toml leaves the pure builtin map (not overridden).
+        let empty = KeyMap::from_toml_str("   ").unwrap();
+        assert!(!empty.is_overridden());
+    }
+
+    #[test]
+    fn canonicalize_rewrites_rebound_chord_to_builtin_event() {
+        // Rebinding history-prev to ctrl+p must canonicalize ctrl+p to the
+        // builtin Up event (so the existing reducer fires HistoryPrev), and the
+        // freed Up chord passes through unchanged (it now resolves to None).
+        let km = KeyMap::from_toml_str("history-prev = \"ctrl+p\"\n").unwrap();
+        let ctrl_p = ev(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert_eq!(
+            km.canonicalize(ctrl_p),
+            ev(KeyCode::Up, KeyModifiers::NONE),
+            "rebound chord canonicalizes to the builtin event"
+        );
+        let up = ev(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(km.canonicalize(up), up, "freed default chord passes through unchanged");
+        // Untouched defaults still canonicalize to themselves.
+        let enter = ev(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(km.canonicalize(enter), enter);
+    }
+
+    #[test]
+    fn builtin_event_maps_actions_to_default_chords() {
+        assert_eq!(
+            KeyMap::builtin_event(Action::Submit),
+            Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        );
+        assert_eq!(
+            KeyMap::builtin_event(Action::HistoryPrev),
+            Some(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        );
+        assert_eq!(
+            KeyMap::builtin_event(Action::Clear),
+            Some(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+        );
+        assert_eq!(KeyMap::builtin_event(Action::None), None);
+    }
+
+    #[test]
+    fn absent_file_is_builtin_defaults() {
+        // The `load()` contract: a missing/empty `keybindings.toml` yields the
+        // pure builtin map. `from_toml_str("")` is the in-memory equivalent of
+        // the empty-config path `load` takes, asserted here without mutating the
+        // shared process env (which would race other tests in this binary).
+        let km = KeyMap::from_toml_str("").unwrap();
+        assert!(!km.is_overridden(), "absent/empty file ⇒ builtin (not overridden)");
+        assert_eq!(km.resolve(ev(KeyCode::Enter, KeyModifiers::NONE)), Action::Submit);
+        assert_eq!(km.resolve(ev(KeyCode::Up, KeyModifiers::NONE)), Action::HistoryPrev);
+    }
+
+    #[test]
+    fn custom_toml_rebinds_action() {
+        // A custom keybindings.toml rebinds an action; the loaded map picks it up
+        // and marks itself overridden so the caller enables additive behaviour.
+        let km = KeyMap::from_toml_str("history-prev = \"ctrl+p\"\n").unwrap();
+        assert!(km.is_overridden());
+        assert_eq!(
+            km.resolve(ev(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            Action::HistoryPrev,
+            "custom toml rebinds history-prev to ctrl+p"
+        );
+        // The freed default Up chord no longer fires history-prev.
+        assert_eq!(km.resolve(ev(KeyCode::Up, KeyModifiers::NONE)), Action::None);
     }
 }
