@@ -4882,6 +4882,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-workflowgen"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "ort"
 version = "2.0.0-rc.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
