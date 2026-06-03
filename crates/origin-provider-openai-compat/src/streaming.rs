@@ -7,8 +7,24 @@
 use futures_util::StreamExt;
 use origin_provider::sse;
 use origin_provider::{ProviderError, Usage};
+use origin_shimquirks::{detect_truncation, Backend};
 use origin_stream::{Ring, TokenEvent, TokenKind};
 use serde::Deserialize;
+
+/// `TurnEnd` payload marker emitted when a quirky (non-`OpenAI`) backend ends a
+/// turn because it hit a length/`max_tokens` limit (i.e. the completion was
+/// truncated rather than allowed to stop naturally).
+///
+/// The streaming wire has no dedicated truncation channel — `TokenKind` is a
+/// fixed enum shared across providers — so truncation is surfaced *on the
+/// existing finish/stop boundary*: the otherwise-empty [`TokenKind::TurnEnd`]
+/// payload carries this marker. Consumers that ignore the payload (the daemon
+/// agent loop and CLI stream relay both match on `kind()` only) are unaffected,
+/// so the change is backward-compatible. A clean stop — and EVERY `OpenAI`
+/// backend, where truncation detection is a deliberate no-op — still emits an
+/// empty `TurnEnd` payload, keeping the wire byte-identical for well-behaved
+/// providers.
+pub const TURNEND_TRUNCATED_MARKER: &[u8] = b"truncated";
 
 #[derive(Deserialize)]
 struct WireStreamChunk {
@@ -65,13 +81,24 @@ struct WireStreamToolFnDelta {
 
 /// Drive the SSE stream from `resp` and publish into `ring`.
 ///
+/// `backend` selects the truncation-detection quirk: for any non-[`Backend::OpenAi`]
+/// backend, a `finish_reason` of `length`/`max_tokens` (see
+/// [`origin_shimquirks::detect_truncation`]) tags the terminal
+/// [`TokenKind::TurnEnd`] with [`TURNEND_TRUNCATED_MARKER`] and logs a
+/// `tracing::warn!`. For [`Backend::OpenAi`] (and any clean stop) the `TurnEnd`
+/// payload stays empty, so the streamed wire is byte-identical to before.
+///
 /// Stops when a `data: [DONE]` sentinel is received or the stream ends. Does
 /// not call `ring.close()` — the caller controls ring lifecycle.
 ///
 /// # Errors
 /// Returns `ProviderError::Api` on JSON or ring failures and propagates
 /// `ProviderError` from the SSE pump.
-pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(), ProviderError> {
+pub async fn parse_into_ring(
+    resp: reqwest::Response,
+    ring: &Ring,
+    backend: Backend,
+) -> Result<(), ProviderError> {
     let stream = sse::from_reqwest(resp);
     pin_utils::pin_mut!(stream);
 
@@ -139,8 +166,24 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
                         .map_err(|e| ProviderError::Api(e.to_string()))?;
                 }
             }
-            if choice.finish_reason.is_some() {
-                ring.publish(&TokenEvent::new(TokenKind::TurnEnd, Vec::new()))
+            if let Some(reason) = &choice.finish_reason {
+                // Truncation is a non-OpenAi quirk: well-behaved OpenAI streams
+                // get the canonical empty `TurnEnd` payload. For other backends a
+                // `length`/`max_tokens` finish means the model was cut off, which
+                // the empty-payload `TurnEnd` cannot distinguish from a clean
+                // stop — so tag the boundary and warn.
+                let truncated = backend != Backend::OpenAi && detect_truncation(Some(reason.as_str()));
+                let payload = if truncated {
+                    tracing::warn!(
+                        finish_reason = reason.as_str(),
+                        ?backend,
+                        "completion truncated at a length limit; output is incomplete"
+                    );
+                    TURNEND_TRUNCATED_MARKER.to_vec()
+                } else {
+                    Vec::new()
+                };
+                ring.publish(&TokenEvent::new(TokenKind::TurnEnd, payload))
                     .map_err(|e| ProviderError::Api(e.to_string()))?;
             }
         }

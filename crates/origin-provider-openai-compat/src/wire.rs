@@ -90,8 +90,9 @@ pub struct WireResponse {
 #[derive(Deserialize)]
 pub struct WireChoice {
     pub message: WireRespMessage,
+    /// Consumed by the response decode path to recognise a length-limit
+    /// truncation on non-`OpenAI` backends (see `decode_response`).
     #[serde(default)]
-    #[allow(dead_code)]
     pub finish_reason: Option<String>,
 }
 
