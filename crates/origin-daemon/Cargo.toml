@@ -54,6 +54,7 @@ origin-metrics          = { path = "../origin-metrics" }
 origin-runtime          = { path = "../origin-runtime" }
 origin-alloc            = { path = "../origin-alloc" }
 origin-resume-token     = { path = "../origin-resume-token" }
+origin-supervisor       = { path = "../origin-supervisor" }
 origin-goal             = { path = "../origin-goal" }
 origin-cost             = { path = "../origin-cost" }
 origin-export           = { path = "../origin-export" }

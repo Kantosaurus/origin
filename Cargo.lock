@@ -4030,6 +4030,7 @@ dependencies = [
  "origin-skills",
  "origin-store",
  "origin-stream",
+ "origin-supervisor",
  "origin-swarm",
  "origin-telemetry",
  "origin-tools",

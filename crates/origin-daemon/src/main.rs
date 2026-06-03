@@ -614,6 +614,13 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     // session transcripts on an idle cadence into a secret-redacted review inbox
     // at ~/.origin/memory-inbox/ for the user to accept/reject.
     origin_daemon::mem_garden::maybe_spawn(Arc::clone(&session_store));
+    // Supervisor lifecycle policy (origin-supervisor): construct from env with
+    // conservative defaults (5-min idle / 30-min detached grace / 1 GiB budget
+    // / shed @ 90%) and start the periodic tick. Always-on but never acts on a
+    // normal short session; the destructive shed/retire teardown is itself
+    // opt-in via `ORIGIN_SUPERVISOR_ENFORCE=1`. Idempotent and safe to call
+    // unconditionally — see `supervisor::init`.
+    origin_daemon::supervisor::init();
 
     // Populate the shared `DaemonState` so the cooperative shutdown driver
     // can bind real per-phase callbacks. We do this AFTER each subsystem is
@@ -1207,9 +1214,29 @@ fn spawn_handler_task(
         // a connection that only issued admin verbs (or none) does not emit a
         // spurious end. Routed through the same process-wide hooks runtime as
         // `SessionStart`; a no-op without `~/.origin/hooks.json` (the default).
-        if last_known_session_id.lock().await.is_some() {
+        let ended_session_id = last_known_session_id.lock().await.clone();
+        if let Some(sid) = ended_session_id {
             origin_daemon::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::SessionEnd)
                 .await;
+
+            // Supervisor lifecycle (origin-supervisor): the client disconnected
+            // but the daemon process stays alive, so move this session to
+            // `Detached` and persist the annotated resume token. The session is
+            // kept warm (re-attachable) until its detached grace lapses; the
+            // periodic tick retires it only then. A no-op when the supervisor
+            // never tracked this id or it was already detached. We build the
+            // base token from the (possibly active) goal checkpoint so a
+            // detached goal can still be resumed.
+            let base_token = {
+                use origin_daemon::goal_checkpoint::make_goal_checkpoint_token;
+                let guard = active_goal.lock().await;
+                make_goal_checkpoint_token(&sid, 0, &guard)
+            };
+            if let Some(token) = origin_daemon::supervisor::on_detach(&sid, base_token) {
+                if let Err(e) = session_store.save_resume_token(&token) {
+                    warn!(error = %e, session = %sid, "supervisor: could not persist detach token");
+                }
+            }
         }
     });
 }
@@ -1234,6 +1261,12 @@ async fn handle_resume_request(
     if let Err(e) = session_store.save_resume_token(&token) {
         warn!(error = %e, session = %session_id, "resume: could not persist token");
     }
+    // Supervisor lifecycle (origin-supervisor): a client is re-attaching to a
+    // still-live detached session. Reset its idle timers so any pending
+    // detached-grace retirement is cancelled. A no-op when the supervisor never
+    // tracked this id or it was not currently detached (e.g. a cold resume
+    // after the daemon restarted, which the existing replay path below handles).
+    let _ = origin_daemon::supervisor::on_reattach(&session_id);
     // Hydrate a previously-active goal back into the per-connection slot.
     // Only `Active` or `Verifying` snapshots are restored — terminal
     // statuses (`Met`/`Cleared`) carry their own outcomes that the CLI

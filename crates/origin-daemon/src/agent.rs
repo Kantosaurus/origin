@@ -637,19 +637,26 @@ fn deliver_file_shift(collab: &SwarmCollab, notice: &origin_swarm::FileShiftNoti
         );
         return;
     };
-    for reader in &notice.readers {
-        if let Some(mbox) = mailboxes.get(reader) {
-            mbox.push(origin_swarm::Message::new(
-                notice.editor,
-                origin_swarm::MsgScope::Direct(*reader),
-                body.clone(),
-            ));
-        } else {
-            tracing::info!(
-                reader = %format!("{:032x}", reader.value()),
-                "swarm collab: file-shift reader has no mailbox; dropping notice"
-            );
-        }
+    // The map is live behind a `Mutex` (a later-spawned sibling registers into
+    // the same map), so lock for the minimum span — clone out each reader's
+    // `Arc<Mailbox>`, then drop the guard before pushing so no lock is held
+    // across the loop body. A poisoned lock is recovered, never propagated:
+    // collab delivery is advisory and must not tear down the turn.
+    let targets: Vec<(origin_swarm::WorkerId, Arc<origin_swarm::Mailbox>)> = {
+        let map = mailboxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        notice
+            .readers
+            .iter()
+            .map(|reader| (*reader, map.get(reader).map(Arc::clone)))
+            .filter_map(|(reader, mbox)| mbox.map(|m| (reader, m)))
+            .collect()
+    };
+    for (reader, mbox) in targets {
+        mbox.push(origin_swarm::Message::new(
+            notice.editor,
+            origin_swarm::MsgScope::Direct(reader),
+            body.clone(),
+        ));
     }
 }
 
@@ -693,11 +700,13 @@ pub struct SwarmCollab {
     /// Shared, room-wide file-read registry. All workers in one swarm room
     /// share a single `Arc<FileRegistry>`.
     pub registry: Arc<origin_swarm::FileRegistry>,
-    /// Optional shared map `WorkerId → Mailbox`. When present, a file-shift
-    /// notice is delivered as a [`origin_swarm::Message`] into each affected
-    /// reader's mailbox. When `None`, the notice is logged instead (the
-    /// "mailbox plumbing isn't reachable" fallback).
-    pub mailboxes: Option<Arc<std::collections::HashMap<origin_swarm::WorkerId, Arc<origin_swarm::Mailbox>>>>,
+    /// Optional **live** shared map `WorkerId → Mailbox`. When present, a
+    /// file-shift notice is delivered as a [`origin_swarm::Message`] into each
+    /// affected reader's mailbox. The map is live (behind a `Mutex`) so a
+    /// worker spawned *after* this one is still visible for delivery. When
+    /// `None`, the notice is logged instead (the "mailbox plumbing isn't
+    /// reachable" fallback).
+    pub mailboxes: Option<origin_swarm::SharedMailboxes>,
 }
 
 tokio::task_local! {
@@ -719,6 +728,136 @@ where
     F: std::future::Future<Output = T> + Send,
 {
     SWARM_COLLAB.scope(collab, fut).await
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    // The ENV_LOCK guard intentionally spans the awaited collab scopes so the
+    // process-global `ORIGIN_SWARM_COLLAB` mutation is serialized against the
+    // sibling test; the lock is uncontended otherwise.
+    clippy::await_holding_lock,
+    // The mailbox/registry guards are short-lived assertion reads at the end of
+    // each test; tightening them buys nothing in test code.
+    clippy::significant_drop_tightening
+)]
+mod swarm_collab_wiring_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::PoisonError;
+
+    /// Serializes tests that toggle the process-global `ORIGIN_SWARM_COLLAB`
+    /// env var so the parallel runner cannot interleave a `set_var` in one test
+    /// with a read in another.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Build a live shared mailbox map registering both workers, mirroring what
+    /// `Coordinator::spawn_with` does per worker under the collab gate.
+    fn shared_map(
+        ids: &[origin_swarm::WorkerId],
+    ) -> origin_swarm::SharedMailboxes {
+        let mut map: HashMap<origin_swarm::WorkerId, Arc<origin_swarm::Mailbox>> = HashMap::new();
+        for id in ids {
+            map.insert(*id, Arc::new(origin_swarm::Mailbox::new()));
+        }
+        Arc::new(std::sync::Mutex::new(map))
+    }
+
+    /// End-to-end wiring proof (WS-L, jcode L238): with the gate SET, a worker
+    /// (B) that edits a path another worker (A) previously read must leave a
+    /// file-shift notice in A's mailbox — exercising `scope_swarm_collab` +
+    /// the same `record_swarm_collab` hook the run_loop fires per tool call.
+    #[tokio::test]
+    async fn editor_notifies_prior_reader_under_gate() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        std::env::set_var("ORIGIN_SWARM_COLLAB", "1");
+
+        let reader = origin_swarm::WorkerId::generate();
+        let editor = origin_swarm::WorkerId::generate();
+        let registry = Arc::new(origin_swarm::FileRegistry::new());
+        let mailboxes = shared_map(&[reader, editor]);
+
+        // Worker A reads `src/lib.rs` inside its own collab scope.
+        let collab_a = SwarmCollab {
+            worker_id: reader,
+            registry: Arc::clone(&registry),
+            mailboxes: Some(Arc::clone(&mailboxes)),
+        };
+        let read_args = serde_json::json!({ "file_path": "src/lib.rs" });
+        scope_swarm_collab(collab_a, async {
+            let _ = SWARM_COLLAB.try_with(|c| record_swarm_collab(c, "Read", &read_args));
+        })
+        .await;
+
+        // Worker B edits the same path inside ITS scope.
+        let collab_b = SwarmCollab {
+            worker_id: editor,
+            registry: Arc::clone(&registry),
+            mailboxes: Some(Arc::clone(&mailboxes)),
+        };
+        let edit_args = serde_json::json!({ "file_path": "src/lib.rs", "old": "a", "new": "b" });
+        scope_swarm_collab(collab_b, async {
+            let _ = SWARM_COLLAB.try_with(|c| record_swarm_collab(c, "Edit", &edit_args));
+        })
+        .await;
+
+        // A's mailbox holds exactly one Direct notice from B about the path;
+        // B's own mailbox stays empty (no self-notify).
+        let map = mailboxes.lock().unwrap_or_else(PoisonError::into_inner);
+        let a_box = map.get(&reader).expect("reader mailbox present");
+        let b_box = map.get(&editor).expect("editor mailbox present");
+        let a_msgs = a_box.drain();
+        assert_eq!(a_msgs.len(), 1, "reader must receive exactly one file-shift notice");
+        assert_eq!(a_msgs[0].from, editor, "notice is from the editor");
+        assert_eq!(a_msgs[0].scope, origin_swarm::MsgScope::Direct(reader));
+        assert!(a_msgs[0].body.contains("src/lib.rs"), "notice names the edited path");
+        assert!(b_box.is_empty(), "editor must not notify itself");
+
+        std::env::remove_var("ORIGIN_SWARM_COLLAB");
+    }
+
+    /// Default-off discipline: with the gate UNSET, the same read+edit sequence
+    /// records nothing and delivers no notice — byte-identical to before.
+    #[tokio::test]
+    async fn no_notice_when_gate_unset() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        std::env::remove_var("ORIGIN_SWARM_COLLAB");
+
+        let reader = origin_swarm::WorkerId::generate();
+        let editor = origin_swarm::WorkerId::generate();
+        let registry = Arc::new(origin_swarm::FileRegistry::new());
+        let mailboxes = shared_map(&[reader, editor]);
+
+        let collab_a = SwarmCollab {
+            worker_id: reader,
+            registry: Arc::clone(&registry),
+            mailboxes: Some(Arc::clone(&mailboxes)),
+        };
+        let read_args = serde_json::json!({ "file_path": "src/lib.rs" });
+        scope_swarm_collab(collab_a, async {
+            let _ = SWARM_COLLAB.try_with(|c| record_swarm_collab(c, "Read", &read_args));
+        })
+        .await;
+
+        let collab_b = SwarmCollab {
+            worker_id: editor,
+            registry: Arc::clone(&registry),
+            mailboxes: Some(Arc::clone(&mailboxes)),
+        };
+        let edit_args = serde_json::json!({ "file_path": "src/lib.rs" });
+        scope_swarm_collab(collab_b, async {
+            let _ = SWARM_COLLAB.try_with(|c| record_swarm_collab(c, "Edit", &edit_args));
+        })
+        .await;
+
+        let map = mailboxes.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            map.get(&reader).expect("reader mailbox").is_empty(),
+            "gate unset ⇒ no notice ⇒ byte-identical"
+        );
+        assert_eq!(registry.tracked_paths(), 0, "gate unset ⇒ nothing recorded");
+    }
 }
 
 #[derive(Clone)]
@@ -1188,6 +1327,23 @@ pub async fn run_loop(
     // session id each loop stamps, so we skip the bump for those prefixes.
     if !is_self_dispatch_session(&session.id) {
         crate::ambient::note_user_activity();
+    }
+
+    // Supervisor lifecycle (origin-supervisor): record this turn as activity on
+    // the session so the periodic tick's idle clock is refreshed and the
+    // session is registered if new. A genuine user prompt is the foreground
+    // `Interactive` class (never shed, short idle grace); a daemon
+    // self-dispatch (ambient/scheduler/overnight/webhook/Task) is `Detached`
+    // (shed first under memory pressure, longer grace). A no-op when the
+    // supervisor module was never initialised, so default builds are
+    // byte-identical.
+    {
+        let class = if is_self_dispatch_session(&session.id) {
+            origin_supervisor::SessionClass::Detached
+        } else {
+            origin_supervisor::SessionClass::Interactive
+        };
+        crate::supervisor::note_activity(&session.id, class);
     }
 
     // Live lifecycle hooks (gemini): loaded once from ~/.origin/hooks.json.

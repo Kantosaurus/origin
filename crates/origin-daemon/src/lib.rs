@@ -43,3 +43,4 @@ pub mod mem_garden;
 pub mod hooks_runtime;
 pub mod swarm_worker;
 pub mod subagents_md;
+pub mod supervisor;

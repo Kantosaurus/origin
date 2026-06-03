@@ -57,4 +57,4 @@ pub use team::{
     report_summary, MissionEntry, MissionEvent, MissionLog, Team, TeamError, TeamEvent, TeamRegistry,
     Teammate, TeammateStatus,
 };
-pub use worker::{default_noop_worker, WorkerContext, WorkerFn};
+pub use worker::{default_noop_worker, SharedMailboxes, WorkerCollab, WorkerContext, WorkerFn};
