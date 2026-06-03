@@ -219,7 +219,9 @@ impl GateCfg {
 
         let governor = env_flag("ORIGIN_SWARM_MEM_GOVERNOR", true);
 
-        let poll = Duration::from_millis(env_u64("ORIGIN_SWARM_POLL_MS").unwrap_or(250));
+        // Clamped `> 0` like the other knobs: a `0` poll would make a parked
+        // admit busy-spin (re-probe every scheduler tick) instead of waiting.
+        let poll = Duration::from_millis(env_u64("ORIGIN_SWARM_POLL_MS").filter(|n| *n > 0).unwrap_or(250));
 
         let headroom_bytes = resolve_headroom(total);
 
@@ -290,21 +292,25 @@ struct GateInner {
 ///  (admitted == 0 OR Unavailable OR
 ///   (admitted < static_ceiling AND available - outstanding - reserve >= headroom))`.
 fn decide(g: &mut GateInner, cfg: &GateCfg, reading: MemReading) -> bool {
-    // (a) Hard ceilings first — cheap, need no memory figure.
-    if g.admitted >= cfg.lane_ceiling {
-        return false;
-    }
-    if let Some(m) = cfg.hard_max {
-        if g.admitted >= m.max(1) {
-            return false;
-        }
-    }
-    // (b) Forward-progress floor: with nothing in flight, ALWAYS admit — before
-    // the memory test and the static ceiling — so the gate can never deadlock.
+    // (a) Forward-progress floor FIRST: with nothing in flight, ALWAYS admit —
+    // before EVERY ceiling and the memory test — so the gate can never deadlock
+    // for ANY `GateCfg`. A misconfigured ceiling (`lane_ceiling`/`hard_max`/
+    // `static_ceiling` == 0) can therefore never wedge the first worker; it only
+    // serializes subsequent ones. (The env path additionally clamps the knobs,
+    // but the floor must hold for direct/test construction too.)
     if g.admitted == 0 {
         g.admitted = 1;
         g.outstanding_reserve = cfg.reserve_bytes;
         return true;
+    }
+    // (b) Hard ceilings — cheap, need no memory figure.
+    if g.admitted >= cfg.lane_ceiling {
+        return false;
+    }
+    if let Some(m) = cfg.hard_max {
+        if g.admitted >= m {
+            return false;
+        }
     }
     if g.admitted >= cfg.static_ceiling {
         return false;

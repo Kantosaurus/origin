@@ -59,6 +59,27 @@ async fn always_admits_one_under_pressure() {
     assert_eq!(g.in_flight(), 1);
 }
 
+// A pathological `lane_ceiling`/`static_ceiling` of 0 must NOT wedge the >=1
+// forward-progress floor: the first worker still admits, subsequent ones
+// serialize. (Regression for the floor-ordering audit finding.)
+#[tokio::test]
+async fn zero_ceilings_serialize_never_deadlock() {
+    let g = Arc::new(AdmissionGate::with_probe(
+        Arc::new(ScriptedProbe::constant(64 * GIB, 64 * GIB)),
+        GateCfg {
+            reserve_bytes: GIB,
+            headroom_bytes: 0,
+            hard_max: None,
+            lane_ceiling: 0,
+            static_ceiling: 0,
+            governor: true,
+            poll: NEVER,
+        },
+    ));
+    let held = collect_until_park(&g, Duration::from_millis(100)).await;
+    assert_eq!(held.len(), 1, "the floor must admit the first worker even when every ceiling is 0");
+}
+
 // RED 3 — admitted concurrency tracks live free memory: 8 GiB free, 1 GiB
 // reserve, 1 GiB headroom ⇒ 7 fit (keep 1 GiB back), the 8th parks.
 #[tokio::test]
