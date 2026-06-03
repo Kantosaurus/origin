@@ -16,6 +16,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::autocomplete::CompletionSources;
 use crate::editor::Editor;
 use crate::input::VimMode;
+use crate::keybindings::KeyMap;
 use crate::status::UsageSnapshot;
 use crate::suggestions::SuggestionState;
 use crate::theme::{self, Theme};
@@ -325,6 +326,13 @@ pub struct App {
     /// Cumulative input-token total snapshotted at turn start, so the turn's own
     /// context size can be isolated as a delta at turn end.
     ctx_at_start: u32,
+    /// Customizable composer keybindings (claude-code L147). Seeded once at
+    /// startup from [`KeyMap::load`] (builtin defaults overlaid with
+    /// `~/.origin/keybindings.toml`). The default builtin map reports the same
+    /// chords the legacy reducer already owns, so an absent override file leaves
+    /// the key path byte-identical. The live key handler consults it via
+    /// [`Self::keymap`] before the default reducer.
+    keymap: KeyMap,
 }
 
 /// State backing the live cache-cold status-line nudge. All times are
@@ -403,7 +411,49 @@ impl App {
             last_assistant: None,
             last_ctx_tokens: 0,
             ctx_at_start: 0,
+            keymap: KeyMap::default(),
         }
+    }
+
+    /// The session's composer [`KeyMap`]. Defaults to the builtin map (==
+    /// current behaviour); replaced once at startup via [`Self::set_keymap`]
+    /// with the user's `~/.origin/keybindings.toml` overlay.
+    #[must_use]
+    pub const fn keymap(&self) -> &KeyMap {
+        &self.keymap
+    }
+
+    /// Install the session keymap (called once at startup with [`KeyMap::load`]).
+    pub fn set_keymap(&mut self, keymap: KeyMap) {
+        self.keymap = keymap;
+    }
+
+    /// Seed the opt-in vim layer's active state at startup.
+    ///
+    /// Passed [`crate::input::vim_active_default`] so `ORIGIN_VIM=1` starts the
+    /// session in vim Normal mode; `false` (the default) leaves the composer in
+    /// direct-insert mode so the key path is byte-identical. Enabling starts in
+    /// [`VimMode::Normal`] (vim convention), matching [`Self::toggle_vim`].
+    pub fn set_vim_active(&mut self, active: bool) {
+        self.vim_active = active;
+        self.vim_mode = if active {
+            VimMode::Normal
+        } else {
+            VimMode::Insert
+        };
+    }
+
+    /// Whether the opt-in vim layer is active this session. `false` ⇒ the vim
+    /// reducer is never consulted (byte-identical input handling).
+    #[must_use]
+    pub const fn vim_active(&self) -> bool {
+        self.vim_active
+    }
+
+    /// The current vim input mode (only meaningful when [`Self::vim_active`]).
+    #[must_use]
+    pub const fn vim_mode(&self) -> VimMode {
+        self.vim_mode
     }
 
     /// Total input tokens currently counted (uncached + cache-read + cache-write).
@@ -754,6 +804,11 @@ impl App {
         if action == A::Pass {
             return false;
         }
+        // Seed the working cursor (char-indexed) from the editor's live caret so
+        // motions chain across consecutive vim keys and the visible caret moves.
+        // `self.cursor` is the char-indexed scratch the motion arithmetic uses;
+        // it is mirrored back onto the byte-indexed editor cursor below.
+        self.cursor = self.input.cursor_chars();
         let len = self.input.buffer().chars().count();
         // Resolve the action into an optional cursor target and an optional
         // mode switch, so each effect is expressed once and clippy sees no two
@@ -772,6 +827,9 @@ impl App {
         };
         if let Some(c) = cursor {
             self.cursor = c;
+            // Mirror the char-indexed motion onto the byte-indexed editor caret
+            // so the rendered caret (which reads `input.cursor()`) tracks it.
+            self.input.set_cursor_chars(c);
         }
         if let Some(m) = mode {
             self.vim_mode = m;
@@ -2101,6 +2159,7 @@ fn write_str_styled(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16,
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)] // panic!/unwrap are idiomatic test assertions
 mod tests {
     use super::*;
 
@@ -2762,20 +2821,51 @@ mod tests {
     #[test]
     fn apply_vim_action_moves_cursor_and_switches_mode() {
         let mut app = App::new("anthropic", "m", CompletionSources::default());
-        app.input.set_buffer("hello".to_string());
-        app.cursor = 2;
+        app.input.set_buffer("hello".to_string()); // editor caret at end (char 5)
+        // Drive the editor caret to char 2 so the vim layer (which seeds from the
+        // editor caret) starts there.
+        app.input.move_left();
+        app.input.move_left();
+        app.input.move_left(); // 5 -> 2
         app.vim_mode = VimMode::Normal;
-        // h moves left, clamped at 0.
+        // h moves left: both the App scratch cursor and the editor caret track it.
         assert!(app.apply_vim_action(crate::input::VimAction::MoveLeft));
         assert_eq!(app.cursor, 1);
+        assert_eq!(app.input.cursor_chars(), 1, "editor caret follows the motion");
         // $ jumps to end (char count).
         assert!(app.apply_vim_action(crate::input::VimAction::LineEnd));
         assert_eq!(app.cursor, 5);
+        assert_eq!(app.input.cursor_chars(), 5);
         // i switches to Insert and is consumed.
         assert!(app.apply_vim_action(crate::input::VimAction::SwitchMode(VimMode::Insert)));
         assert_eq!(app.vim_mode, VimMode::Insert);
         // Pass is not consumed.
         assert!(!app.apply_vim_action(crate::input::VimAction::Pass));
+    }
+
+    #[test]
+    fn set_vim_active_seeds_mode() {
+        // The startup seed point: active ⇒ Normal mode (vim convention),
+        // inactive ⇒ Insert (byte-identical direct insert).
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.set_vim_active(true);
+        assert!(app.vim_active());
+        assert_eq!(app.vim_mode(), VimMode::Normal);
+        app.set_vim_active(false);
+        assert!(!app.vim_active());
+        assert_eq!(app.vim_mode(), VimMode::Insert);
+    }
+
+    #[test]
+    fn set_keymap_installs_override() {
+        // The session keymap defaults to builtin and can be replaced once at
+        // startup with a user override.
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        assert!(!app.keymap().is_overridden(), "defaults to builtin");
+        let km = crate::keybindings::KeyMap::from_toml_str("history-prev = \"ctrl+p\"")
+            .expect("parse");
+        app.set_keymap(km);
+        assert!(app.keymap().is_overridden());
     }
 
     #[test]

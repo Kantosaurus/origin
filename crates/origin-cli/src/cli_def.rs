@@ -320,6 +320,106 @@ pub enum Cmd {
         #[arg(long, default_value = "balanced")]
         strictness: String,
     },
+    /// First-class Gmail tool over Google OAuth. Loads credentials from the
+    /// keyvault (`google`/`gmail`), runs one operation, and prints the JSON
+    /// result. OP is `search`, `get`, or `list_threads`.
+    Gmail {
+        /// The operation: `search`, `get`, or `list_threads`.
+        op: String,
+        /// Gmail search expression (for `search` / `list_threads`).
+        #[arg(long)]
+        query: Option<String>,
+        /// Message id (for `get`).
+        #[arg(long)]
+        id: Option<String>,
+        /// Max results for list operations (clamped to 1..=500).
+        #[arg(long)]
+        max: Option<u32>,
+        /// For `get`: fetch the full message and decode its text body (costs
+        /// more tokens). Defaults to metadata-only.
+        #[arg(long = "include-body")]
+        include_body: bool,
+    },
+    /// Dynamic workflow authoring + run substrate.
+    Workflow {
+        #[command(subcommand)]
+        sub: WorkflowSub,
+    },
+    /// Supervised binary self-development (gated `ORIGIN_SELFDEV=1`). Drives the
+    /// daemon's edit → checkpoint → build → test → restart cycle.
+    Selfdev {
+        #[command(subcommand)]
+        sub: SelfdevSub,
+    },
+    /// Named agent teams: register teams, assign tasks to teammates, and render
+    /// a team's mission log + teammate statuses (origin-swarm control plane).
+    Team {
+        #[command(subcommand)]
+        sub: TeamSub,
+    },
+}
+
+/// `origin workflow …` subcommands.
+#[derive(Subcommand)]
+pub enum WorkflowSub {
+    /// Author a workflow from a natural-language goal, render its TOML, and
+    /// persist it to `~/.origin/workflows.toml` so it is runnable via
+    /// `{workflow:<name>}`.
+    Author {
+        /// Natural-language description of what the workflow should accomplish.
+        #[arg(required = true)]
+        goal: Vec<String>,
+        /// Optional explicit workflow name (overrides the slug derived from the
+        /// goal).
+        #[arg(long)]
+        name: Option<String>,
+    },
+}
+
+/// `origin selfdev …` subcommands.
+#[derive(Subcommand)]
+pub enum SelfdevSub {
+    /// Queue a self-modification job and begin the supervised cycle.
+    Start {
+        /// Human description of the change (also the prompt driven onto the
+        /// agent for the self-edit step).
+        #[arg(required = true)]
+        description: Vec<String>,
+        /// Source path the job intends to touch (repeatable; empty ⇒ unscoped).
+        #[arg(long = "path")]
+        path: Vec<String>,
+    },
+    /// Query the self-dev driver's current state.
+    Status,
+    /// Approve the in-flight self-dev restart.
+    Approve,
+    /// Reset the storm guard after acknowledging repeated failures.
+    Reset,
+}
+
+/// `origin team …` subcommands.
+#[derive(Subcommand)]
+pub enum TeamSub {
+    /// Register a named team (idempotent-by-replace).
+    Create {
+        /// Team name (unique within the daemon-wide registry).
+        name: String,
+    },
+    /// Assign a task to a (possibly new) named teammate within a team.
+    Assign {
+        /// The team the teammate belongs to.
+        team: String,
+        /// Human-facing teammate name (created on first assign).
+        teammate: String,
+        /// The task description handed to the teammate.
+        #[arg(required = true)]
+        task: Vec<String>,
+    },
+    /// Render a team's mission log + per-teammate statuses.
+    Status {
+        /// The team to render.
+        team: String,
+    },
 }
 
 /// `origin ambient …` subcommands.

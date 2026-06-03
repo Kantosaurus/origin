@@ -137,15 +137,21 @@ fn due_triggers(window_start: u64, now: u64) -> Vec<DueTrigger> {
 }
 
 /// Open a fresh client connection to the daemon's own IPC socket and submit
-/// `prompt` as a `ClientMessage::Prompt`, then drain the response stream to
-/// completion. Best-effort: any transport error is returned to the caller for
-/// logging without crashing the tick loop. Shared with the ambient loop so a
-/// fired trigger / ambient task runs through the real agent path.
+/// `prompt` as a `Prompt`.
+///
+/// Drains the response stream to completion. Best-effort: any transport error is
+/// returned to the caller for logging without crashing the tick loop. Shared
+/// with the ambient / webhook / self-dev paths so a fired trigger / ambient task
+/// / self-edit runs through the real agent loop.
 ///
 /// Behaviourally identical to (and a thin wrapper over)
 /// [`dispatch_prompt_with_usage`]; the accumulated turn usage is discarded so
 /// the ambient/webhook/scheduler callers keep their `Result<(), String>` shape.
-pub(crate) async fn dispatch_prompt(
+///
+/// # Errors
+/// Returns the rendered transport / provider / loop error string when the
+/// connection cannot be opened or the daemon emits an error frame for the turn.
+pub async fn dispatch_prompt(
     sock_path: &str,
     model: &str,
     session_id: String,

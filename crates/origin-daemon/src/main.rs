@@ -12,7 +12,7 @@ use origin_codegraph::index::CodeGraphIndex;
 use origin_core::types::Role;
 use origin_daemon::agent::{LoopOptions, SessionStoreSummaryDeliverer};
 use origin_daemon::auth::BearerStore;
-use origin_daemon::config::bearer_ttl_secs;
+use origin_daemon::config::{bearer_ttl_secs, governance_path, load_governance, Governance};
 use origin_daemon::memory_wiring::MemoryWiring;
 use origin_daemon::pairing::{Pairing, RedeemResult};
 use origin_daemon::plan_bus::PlanBus;
@@ -545,6 +545,26 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
         "workflows catalog loaded at startup"
     );
 
+    // Optional governance config (5-tier policy engine + per-prompt ConSeca
+    // security policy). Loaded once at startup from `governance.toml`. When the
+    // file is absent both handles are `None` ⇒ the deny-only overlay is inert
+    // and daemon behavior is byte-identical to before this wiring landed.
+    let governance: Governance = {
+        let path = governance_path();
+        match load_governance(&path) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "governance config load failed; running with no governance overlay");
+                Governance::default()
+            }
+        }
+    };
+    info!(
+        policy = governance.policy.is_some(),
+        conseca = governance.conseca.is_some(),
+        "governance config loaded at startup"
+    );
+
     spawn_idle_consolidator(memory.as_ref());
 
     // P11.12: optional bounded-cardinality Prometheus `/metrics` endpoint.
@@ -594,6 +614,21 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     // session transcripts on an idle cadence into a secret-redacted review inbox
     // at ~/.origin/memory-inbox/ for the user to accept/reject.
     origin_daemon::mem_garden::maybe_spawn(Arc::clone(&session_store));
+    // Supervisor lifecycle policy (origin-supervisor): construct from env with
+    // conservative defaults (5-min idle / 30-min detached grace / 1 GiB budget
+    // / shed @ 90%) and start the periodic tick. Always-on but never acts on a
+    // normal short session; the destructive shed/retire teardown is itself
+    // opt-in via `ORIGIN_SUPERVISOR_ENFORCE=1`. Idempotent and safe to call
+    // unconditionally — see `supervisor::init`.
+    origin_daemon::supervisor::init();
+
+    // Self-dev SUCCESSOR BOOT (gated `ORIGIN_SELFDEV=1`). If a previous process
+    // authorized a supervised restart it persisted a `ReloadContext`; the
+    // successor loads it, drives the driver's `Resumed` event (settling the
+    // machine to Idle + clearing the failure streak), then clears the store so a
+    // crash cannot re-resume. A no-op when self-dev is disabled or no context is
+    // present, so default boot is byte-identical.
+    selfdev_successor_boot();
 
     // Populate the shared `DaemonState` so the cooperative shutdown driver
     // can bind real per-phase callbacks. We do this AFTER each subsystem is
@@ -632,10 +667,12 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
             plan_bus.clone(),
             Arc::clone(&skill_catalog),
             Arc::clone(&workflows_catalog),
+            governance.clone(),
             Arc::clone(&code_graph),
             Arc::clone(&mem_router),
             Arc::clone(&coordinator),
             wire_plan.clone(),
+            path.clone(),
         );
     }
 }
@@ -732,10 +769,12 @@ fn spawn_handler_task(
     plan_bus: PlanBus,
     skill_catalog: Arc<SkillCatalog>,
     workflows_catalog: Arc<origin_daemon::workflows::WorkflowsFile>,
+    governance: Governance,
     code_graph: Arc<tokio::sync::Mutex<CodeGraphIndex>>,
     mem_router: Arc<dyn origin_codegraph::ask::MemRouter>,
     coordinator: Arc<Coordinator>,
     wire_plan: origin_planner::Plan,
+    sock_path: String,
 ) {
     // Build a type-erased memory handle once per connection so `handle_request`
     // doesn't need to know about `MemoryWiring` internals.
@@ -847,6 +886,7 @@ fn spawn_handler_task(
                         Arc::clone(&permission_registry),
                         Arc::clone(&skill_catalog),
                         Arc::clone(&workflows_catalog),
+                        governance.clone(),
                         Arc::clone(&active_skills),
                         Arc::clone(&code_graph),
                         Arc::clone(&mem_router),
@@ -1159,6 +1199,51 @@ fn spawn_handler_task(
                     )
                     .await;
                 }
+                ClientMessage::SelfDevStart { description, paths } => {
+                    if !handle_selfdev_start(&conn, sock_path.clone(), description, paths).await {
+                        break;
+                    }
+                }
+                ClientMessage::SelfDevStatus => {
+                    if !handle_selfdev_simple(&conn, SelfDevVerb::Status).await {
+                        break;
+                    }
+                }
+                ClientMessage::SelfDevApprove => {
+                    if !handle_selfdev_simple(&conn, SelfDevVerb::Approve).await {
+                        break;
+                    }
+                }
+                ClientMessage::SelfDevReset => {
+                    if !handle_selfdev_simple(&conn, SelfDevVerb::Reset).await {
+                        break;
+                    }
+                }
+                ClientMessage::TeamCreate { name } => {
+                    let ev = origin_daemon::teams::create_team(&name);
+                    if write_event(&conn, &ev).await.is_err() {
+                        break;
+                    }
+                }
+                ClientMessage::TeamAssign {
+                    team,
+                    teammate,
+                    task,
+                } => {
+                    if !handle_team_assign(&conn, &coordinator, team, teammate, task).await {
+                        break;
+                    }
+                }
+                ClientMessage::TeamStatus { team } => {
+                    let ev = origin_daemon::teams::status_event(&team).unwrap_or_else(|| {
+                        StreamEvent::AdminError {
+                            message: format!("no such team: {team}"),
+                        }
+                    });
+                    if write_event(&conn, &ev).await.is_err() {
+                        break;
+                    }
+                }
                 admin @ (ClientMessage::ListSessions
                 | ClientMessage::RemoveSession { .. }
                 | ClientMessage::RewindSession { .. }
@@ -1172,6 +1257,39 @@ fn spawn_handler_task(
                     if !handle_admin(&conn, &session_store, &vault, metrics.as_ref(), admin).await {
                         break;
                     }
+                }
+            }
+        }
+
+        // Lifecycle `SessionEnd` hook (gemini `SessionEnd`): the per-connection
+        // message loop has exited — the client disconnected or the connection
+        // was torn down — so any session this connection drove is closing. We
+        // fire it once here (the loop's single exit point), and only when this
+        // connection actually bound a session id via at least one `Prompt`, so
+        // a connection that only issued admin verbs (or none) does not emit a
+        // spurious end. Routed through the same process-wide hooks runtime as
+        // `SessionStart`; a no-op without `~/.origin/hooks.json` (the default).
+        let ended_session_id = last_known_session_id.lock().await.clone();
+        if let Some(sid) = ended_session_id {
+            origin_daemon::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::SessionEnd)
+                .await;
+
+            // Supervisor lifecycle (origin-supervisor): the client disconnected
+            // but the daemon process stays alive, so move this session to
+            // `Detached` and persist the annotated resume token. The session is
+            // kept warm (re-attachable) until its detached grace lapses; the
+            // periodic tick retires it only then. A no-op when the supervisor
+            // never tracked this id or it was already detached. We build the
+            // base token from the (possibly active) goal checkpoint so a
+            // detached goal can still be resumed.
+            let base_token = {
+                use origin_daemon::goal_checkpoint::make_goal_checkpoint_token;
+                let guard = active_goal.lock().await;
+                make_goal_checkpoint_token(&sid, 0, &guard)
+            };
+            if let Some(token) = origin_daemon::supervisor::on_detach(&sid, base_token) {
+                if let Err(e) = session_store.save_resume_token(&token) {
+                    warn!(error = %e, session = %sid, "supervisor: could not persist detach token");
                 }
             }
         }
@@ -1198,6 +1316,12 @@ async fn handle_resume_request(
     if let Err(e) = session_store.save_resume_token(&token) {
         warn!(error = %e, session = %session_id, "resume: could not persist token");
     }
+    // Supervisor lifecycle (origin-supervisor): a client is re-attaching to a
+    // still-live detached session. Reset its idle timers so any pending
+    // detached-grace retirement is cancelled. A no-op when the supervisor never
+    // tracked this id or it was not currently detached (e.g. a cold resume
+    // after the daemon restarted, which the existing replay path below handles).
+    let _ = origin_daemon::supervisor::on_reattach(&session_id);
     // Hydrate a previously-active goal back into the per-connection slot.
     // Only `Active` or `Verifying` snapshots are restored — terminal
     // statuses (`Met`/`Cleared`) carry their own outcomes that the CLI
@@ -1391,6 +1515,7 @@ async fn handle_request(
     permission_registry: Arc<PermissionRegistry>,
     skill_catalog: Arc<SkillCatalog>,
     workflows_catalog: Arc<origin_daemon::workflows::WorkflowsFile>,
+    governance: Governance,
     active_skills: Arc<tokio::sync::Mutex<SkillRegistry>>,
     code_graph: Arc<tokio::sync::Mutex<CodeGraphIndex>>,
     mem_router: Arc<dyn origin_codegraph::ask::MemRouter>,
@@ -1433,6 +1558,20 @@ async fn handle_request(
     // connection can checkpoint without waiting for the first iteration
     // to complete.
     *last_known_session_id.lock().await = Some(session.id.clone());
+
+    // Lifecycle `SessionStart` hook (gemini `SessionStart`): fire once when a
+    // session is first prompted — i.e. it has no prior persisted history. A
+    // resumed session (the branch above that replays stored messages) is NOT a
+    // fresh start, so we gate on the empty transcript to avoid re-firing on
+    // every continuation prompt. Informational; routed through the same
+    // process-wide hooks runtime as `PrePrompt`/`PreTool`. With no
+    // `~/.origin/hooks.json` (the default) this is a no-op ⇒ byte-identical.
+    let is_new_session = session.messages.is_empty();
+    if is_new_session {
+        origin_daemon::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::SessionStart)
+            .await;
+    }
+
     let (tx_sub, mut rx_sub) = mpsc::channel::<Subscriber>(1);
     let conn_for_relay = Arc::clone(conn);
     let relay_handle: tokio::task::JoinHandle<()> = spawn_in(TaskClass::Realtime, async move {
@@ -1520,11 +1659,13 @@ async fn handle_request(
             // ^ per-connection goal slot. When `Some(Active|Verifying)` the
             // `run_loop` body renders an `<origin-goal>` block on each turn;
             // the post-loop driver below decides verify-vs-iterate-vs-clear.
-            policy: None,
-            conseca: None,
-            // ^ DENY-ONLY governance overlay (Task 3). Wired as fields but left
-            // `None` here so default daemon behavior is unchanged; a future
-            // admin-config path can populate these to narrow tool access.
+            policy: governance.policy.clone(),
+            conseca: governance.conseca.clone(),
+            // ^ DENY-ONLY governance overlay (Task 3). Populated from
+            // `governance.toml` at startup (see `config::load_governance`). When
+            // that file is absent both are `None` ⇒ default daemon behavior is
+            // byte-identical; when present they narrow (never widen) tool access
+            // via the deny-only `apply_governance_overlay` in `agent.rs`.
             effort: req
                 .effort
                 .as_deref()
@@ -2493,7 +2634,14 @@ async fn handle_admin(
         | ClientMessage::ActivateSkill { .. }
         | ClientMessage::DeactivateSkill { .. }
         | ClientMessage::PermissionDecision { .. }
-        | ClientMessage::ActivateWorkflow { .. } => return true,
+        | ClientMessage::ActivateWorkflow { .. }
+        | ClientMessage::SelfDevStart { .. }
+        | ClientMessage::SelfDevStatus
+        | ClientMessage::SelfDevApprove
+        | ClientMessage::SelfDevReset
+        | ClientMessage::TeamCreate { .. }
+        | ClientMessage::TeamAssign { .. }
+        | ClientMessage::TeamStatus { .. } => return true,
     };
     write_event(conn, &ev).await.is_ok()
 }
@@ -2754,6 +2902,489 @@ fn resume_foreign_event(session_store: &SessionStore, source: &str, path: &str) 
         session_id: session.id,
         messages_loaded,
         suggested_model: resumed.suggested_model,
+    }
+}
+
+// ── Self-dev control plane handlers (gated `ORIGIN_SELFDEV=1`) ───────────────
+
+/// The non-`Start` self-dev verbs, so one handler covers all three.
+#[derive(Debug, Clone, Copy)]
+enum SelfDevVerb {
+    /// Emit the current driver status.
+    Status,
+    /// Flip the operator-approval flag for the in-flight restart.
+    Approve,
+    /// Reset the storm guard.
+    Reset,
+}
+
+/// Resolve the workspace root the self-dev cargo/git runners operate in.
+///
+/// Honors `ORIGIN_WORKSPACE` when set (so a daemon launched outside the repo can
+/// still self-build), otherwise the process cwd — matching the
+/// `std::env::current_dir()` convention the rest of the daemon uses.
+fn selfdev_workspace_root() -> PathBuf {
+    std::env::var_os("ORIGIN_WORKSPACE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Build the [`StreamEvent::SelfDevStatus`] snapshot for the driver, or the
+/// disabled event when self-dev is off.
+fn selfdev_status_event() -> StreamEvent {
+    origin_daemon::selfdev::global().map_or_else(
+        || StreamEvent::SelfDevDisabled {
+            message: origin_daemon::selfdev::disabled_message().to_string(),
+        },
+        |state| {
+            let driver = state.driver();
+            StreamEvent::SelfDevStatus {
+                state: format!("{:?}", driver.state()),
+                job_id: driver.current().map(|j| j.id.clone()),
+                queued: u32::try_from(driver.queued()).unwrap_or(u32::MAX),
+                consecutive_failures: driver.consecutive_failures(),
+                generation: driver.generation(),
+                storm_guard_tripped: driver.storm_guard_tripped(),
+            }
+        },
+    )
+}
+
+/// Handle `SelfDevStatus` / `SelfDevApprove` / `SelfDevReset`. Returns `false`
+/// only on an IPC write failure (the per-connection handler then exits).
+async fn handle_selfdev_simple(conn: &SharedConnection, verb: SelfDevVerb) -> bool {
+    if let Some(state) = origin_daemon::selfdev::global() {
+        match verb {
+            SelfDevVerb::Status => {}
+            SelfDevVerb::Approve => {
+                state.approve();
+                info!("self-dev: operator approval recorded for in-flight restart");
+            }
+            SelfDevVerb::Reset => {
+                state.driver().reset_storm_guard();
+                info!("self-dev: storm guard reset by operator");
+            }
+        }
+    }
+    // Always reply with the current status (or the disabled event).
+    write_event(conn, &selfdev_status_event()).await.is_ok()
+}
+
+/// Handle `SelfDevStart`: enqueue a [`BuildJob`](origin_selfdev::BuildJob) and
+/// run the supervised cycle to its safe stopping point. Returns `false` only on
+/// an IPC write failure.
+///
+/// SAFETY: a shadow checkpoint is taken BEFORE any edit; build AND test must
+/// both pass before `AwaitingRestart`; a failure rolls back to the same binary;
+/// the restart is only ever *authorized + persisted* here — the real
+/// process relaunch stays a TODO-logged hook (see [`drive_selfdev_cycle`]).
+async fn handle_selfdev_start(
+    conn: &SharedConnection,
+    sock_path: String,
+    description: String,
+    paths: Vec<String>,
+) -> bool {
+    let Some(state) = origin_daemon::selfdev::global() else {
+        return write_event(
+            conn,
+            &StreamEvent::SelfDevDisabled {
+                message: origin_daemon::selfdev::disabled_message().to_string(),
+            },
+        )
+        .await
+        .is_ok();
+    };
+
+    // Run the (blocking-heavy) cycle off the connection's critical path so a long
+    // build does not pin this connection task; we still reply with the resulting
+    // status on this connection.
+    drive_selfdev_cycle(state, &sock_path, description, paths).await;
+    write_event(conn, &selfdev_status_event()).await.is_ok()
+}
+
+/// Drive one self-dev job from enqueue to its safe stopping point.
+///
+/// Steps (each gated by the pure state machine's transition table):
+/// 1. enqueue + `StartJob` (refused if the storm guard tripped).
+/// 2. shadow-git checkpoint BEFORE editing (the rollback target).
+/// 3. self-edit: dispatch `description` as a prompt onto the live agent path
+///    under a `selfdev-` session id.
+/// 4. `EditDone` → `run_build` → `run_test` on `spawn_blocking`.
+/// 5. on `Failed` → `run_rollback` (shadow restore to the pre-edit checkpoint).
+/// 6. on `AwaitingRestart` → build `ReloadContext` + `request_restart`
+///    (authorize + persist). The actual relaunch is a `TODO`-logged hook; we
+///    never auto-exec.
+async fn drive_selfdev_cycle(
+    state: &'static origin_daemon::selfdev::SelfDevState,
+    sock_path: &str,
+    description: String,
+    paths: Vec<String>,
+) {
+    use origin_selfdev::{BuildJob, CargoRunner, FileReloadStore, ReloadContext, SelfDevEvent};
+
+    let job_id = format!("selfdev-{}", ulid::Ulid::new());
+    let job = BuildJob::new(job_id.clone(), description.clone()).with_paths(paths);
+
+    // Step 1: enqueue + start. A tripped storm guard refuses here (escalation).
+    {
+        let mut driver = state.driver();
+        driver.enqueue(job.clone());
+        if let Err(e) = driver.handle(&SelfDevEvent::StartJob) {
+            warn!(error = %e, job = %job_id, "self-dev: refused to start (storm guard or busy)");
+            return;
+        }
+    }
+
+    let workspace = selfdev_workspace_root();
+
+    // Step 2: shadow-git checkpoint BEFORE any edit, so rollback has a target.
+    // Done in a synchronous scope so the non-`Sync` `ShadowGit`/`GitRunner` are
+    // never held across an `.await` (which would make this task non-`Send`).
+    let Some(checkpoint_id) = selfdev_checkpoint(&workspace, &job_id) else {
+        // No checkpoint ⇒ no safe rollback target. Abort the cycle and roll the
+        // driver back to Idle via a synthetic failure path: mark the build
+        // failed so the machine settles without ever editing.
+        warn!(job = %job_id, "self-dev: pre-edit checkpoint FAILED; aborting before any edit");
+        abort_to_idle(state);
+        return;
+    };
+    info!(job = %job_id, checkpoint = %checkpoint_id, "self-dev: pre-edit checkpoint taken");
+
+    // Step 3: drive the self-edit by submitting `description` as a prompt onto
+    // the live agent path under a `selfdev-` session id (is_self_dispatch_session
+    // recognises this prefix, so it never resets the user's idle clock).
+    let model = std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".to_string());
+    let edit_session = format!("selfdev-{job_id}");
+    if let Err(e) =
+        origin_daemon::scheduler::dispatch_prompt(sock_path, &model, edit_session, &description)
+            .await
+    {
+        // The self-edit prompt failed; treat as a build-stage failure so the
+        // machine rolls back to the pre-edit checkpoint on the same binary.
+        warn!(error = %e, job = %job_id, "self-dev: self-edit dispatch failed; rolling back");
+    }
+
+    // Step 4: EditDone → build → test, both on spawn_blocking (cargo is sync).
+    let edit_done = state.driver().handle(&SelfDevEvent::EditDone);
+    if let Err(e) = edit_done {
+        warn!(error = %e, job = %job_id, "self-dev: EditDone rejected");
+        return;
+    }
+
+    let build_workspace = workspace.clone();
+    let Some(build_ok) = run_blocking_step(state, move |driver| {
+        let runner = CargoRunner::new(build_workspace);
+        driver.run_build(&runner)
+    })
+    .await
+    else {
+        // Step rejected by the machine; nothing further to do.
+        return;
+    };
+
+    let mut both_green = false;
+    if build_ok {
+        let test_workspace = workspace.clone();
+        if let Some(test_ok) = run_blocking_step(state, move |driver| {
+            let runner = CargoRunner::new(test_workspace);
+            driver.run_test(&runner)
+        })
+        .await
+        {
+            both_green = test_ok;
+        }
+    }
+
+    if both_green {
+        // Step 6: build AND test green ⇒ AwaitingRestart. Authorize + persist.
+        let session_ids = vec![format!("selfdev-{job_id}")];
+        let ctx = ReloadContext::new(job_id.clone())
+            .with_sessions(session_ids)
+            .with_goal(description.clone());
+        let store = FileReloadStore::new(origin_daemon::selfdev::reload_store_path());
+        let authority = origin_daemon::selfdev::ApprovalAuthority::new(state);
+        let mut driver = state.driver();
+        match driver.request_restart(&authority, &store, &ctx) {
+            Ok(()) => {
+                info!(
+                    job = %job_id,
+                    generation = driver.generation(),
+                    "self-dev: restart AUTHORIZED + ReloadContext persisted — \
+                     TODO: relaunch via origin-supervisor resume-restart path (ready to relaunch)"
+                );
+            }
+            Err(e) => {
+                // Deny ⇒ parked in AwaitingRestart awaiting SelfDevApprove. This
+                // is the normal operator-in-the-loop path, not an error.
+                info!(error = %e, job = %job_id, "self-dev: restart not yet granted (awaiting operator approval)");
+            }
+        }
+    } else {
+        // Step 5: build or test failed ⇒ roll back to the pre-edit checkpoint on
+        // the SAME binary. A rollback failure is operator-escalation: log + stop.
+        // The non-`Sync` git handle stays inside the synchronous closure passed
+        // to the driver, so nothing crosses an `.await`.
+        let mut driver = state.driver();
+        let job = driver.current().cloned();
+        let result = selfdev_rollback(&mut driver, &workspace, &checkpoint_id);
+        match result {
+            Ok(outcome) => {
+                info!(job = ?job.as_ref().map(|j| &j.id), ?outcome, "self-dev: rolled back to pre-edit checkpoint");
+            }
+            Err(e) => {
+                error!(error = %e,
+                    "self-dev: ROLLBACK FAILED — operator escalation required; tree may be dirty, halting");
+            }
+        }
+        if driver.storm_guard_tripped() {
+            error!(
+                failures = driver.consecutive_failures(),
+                "self-dev: storm guard tripped — refusing further jobs until SelfDevReset"
+            );
+        }
+    }
+}
+
+/// Take a pre-edit shadow checkpoint synchronously, returning its id on success.
+///
+/// The non-`Sync` [`ShadowGit`](origin_vcs::ShadowGit) / `GitRunner` live only
+/// inside this synchronous function, so they never cross an `.await` boundary.
+fn selfdev_checkpoint(workspace: &std::path::Path, job_id: &str) -> Option<String> {
+    let git = origin_daemon::selfdev::ProcessGitRunner::new(workspace.to_path_buf());
+    let shadow_dir = origin_daemon::selfdev::shadow_git_dir();
+    let shadow = origin_vcs::ShadowGit::new(&git, shadow_dir.to_string_lossy().into_owned());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    match shadow.snapshot(&format!("selfdev pre-edit: {job_id}"), now_ms) {
+        Ok(cp) => Some(cp.id),
+        Err(e) => {
+            warn!(error = %e, job = %job_id, "self-dev: shadow snapshot failed");
+            None
+        }
+    }
+}
+
+/// Run the driver's rollback synchronously against `checkpoint_id`.
+///
+/// Constructs the non-`Sync` git handle inside this synchronous function so it
+/// never crosses an `.await`. Returns the driver's rollback result.
+fn selfdev_rollback(
+    driver: &mut origin_selfdev::SelfDevDriver,
+    workspace: &std::path::Path,
+    checkpoint_id: &str,
+) -> Result<origin_selfdev::RollbackOutcome, origin_selfdev::SelfDevError> {
+    let git = origin_daemon::selfdev::ProcessGitRunner::new(workspace.to_path_buf());
+    let shadow_dir = origin_daemon::selfdev::shadow_git_dir();
+    let shadow = origin_vcs::ShadowGit::new(&git, shadow_dir.to_string_lossy().into_owned());
+    let rollback = origin_daemon::selfdev::ShadowRollback::new(shadow, checkpoint_id.to_string());
+    driver.run_rollback(&rollback)
+}
+
+/// Run a fallible build/test step that needs the (sync) `SelfDevDriver` on a
+/// blocking thread without holding the driver lock across the `.await`.
+///
+/// Returns `Some(ok)` with the step's pass/fail, or `None` if the machine
+/// rejected the transition (already logged). The driver mutex is locked *inside*
+/// the blocking closure so the long cargo invocation does not block the async
+/// runtime, and is released before this returns.
+async fn run_blocking_step<F>(
+    state: &'static origin_daemon::selfdev::SelfDevState,
+    step: F,
+) -> Option<bool>
+where
+    F: FnOnce(&mut origin_selfdev::SelfDevDriver) -> Result<bool, origin_selfdev::SelfDevError>
+        + Send
+        + 'static,
+{
+    let join = tokio::task::spawn_blocking(move || {
+        let mut driver = state.driver();
+        step(&mut driver)
+    })
+    .await;
+    match join {
+        Ok(Ok(ok)) => Some(ok),
+        Ok(Err(e)) => {
+            warn!(error = %e, "self-dev: build/test step rejected by state machine");
+            None
+        }
+        Err(e) => {
+            error!(error = %e, "self-dev: build/test blocking task panicked");
+            None
+        }
+    }
+}
+
+/// Settle the driver back to `Idle` after a pre-edit abort (e.g. checkpoint
+/// failure) without performing an edit. Drives the synthetic
+/// `EditDone → BuildResult{false} → run_rollback`-free path by counting the
+/// failure: we mark build failed, then settle to Idle via a no-op rollback.
+fn abort_to_idle(state: &origin_daemon::selfdev::SelfDevState) {
+    use origin_selfdev::SelfDevEvent;
+    let mut driver = state.driver();
+    // Editing → Building → Failed, then a trivial rollback (NothingToRestore,
+    // since we never edited) returns the machine to Idle and counts the streak.
+    if driver.handle(&SelfDevEvent::EditDone).is_ok()
+        && driver.handle(&SelfDevEvent::BuildResult { ok: false }).is_ok()
+    {
+        let rollback = NoopRollback;
+        if let Err(e) = driver.run_rollback(&rollback) {
+            error!(error = %e, "self-dev: abort-to-idle rollback failed");
+        }
+    }
+}
+
+/// A trivial [`Rollback`](origin_selfdev::Rollback) used only by
+/// [`abort_to_idle`] when no edit ever landed (so there is nothing to restore).
+struct NoopRollback;
+impl origin_selfdev::Rollback for NoopRollback {
+    fn rollback(
+        &self,
+        _job: &origin_selfdev::BuildJob,
+    ) -> Result<origin_selfdev::RollbackOutcome, String> {
+        Ok(origin_selfdev::RollbackOutcome::NothingToRestore)
+    }
+}
+
+/// Self-dev successor boot: drive the driver's `Resumed` if a `ReloadContext`
+/// was persisted by a previous process's authorized restart.
+///
+/// SAFETY: only `RestartGranted` is ever driven by `request_restart` (never
+/// here); this path only feeds `Resumed`, which settles the resumed machine to
+/// Idle and clears the streak. The persisted `generation` is logged as the
+/// cross-exec storm ceiling. The store is cleared after a successful resume so a
+/// later crash cannot replay it. A no-op when self-dev is disabled or no context
+/// exists.
+//
+// The boot path is a single linear sequence of guarded steps (load → log →
+// replay → clear), each with its own error branch; splitting it would scatter
+// the resume invariant across helpers. Allow the nursery complexity threshold.
+#[allow(clippy::cognitive_complexity)]
+fn selfdev_successor_boot() {
+    use origin_selfdev::{ReloadStore, SelfDevEvent};
+
+    let Some(state) = origin_daemon::selfdev::global() else {
+        return;
+    };
+    let store = origin_selfdev::FileReloadStore::new(origin_daemon::selfdev::reload_store_path());
+    let ctx = match store.load() {
+        Ok(Some(ctx)) => ctx,
+        Ok(None) => return,
+        Err(e) => {
+            warn!(error = %e, "self-dev: reload-store load failed at boot; skipping resume");
+            return;
+        }
+    };
+    info!(
+        job = %ctx.in_flight_job_id,
+        generation = ctx.generation,
+        sessions = ctx.session_ids.len(),
+        "self-dev: successor boot — resuming from persisted ReloadContext \
+         (generation is the cross-exec storm ceiling)"
+    );
+
+    // The fresh driver is Idle; to legally feed `Resumed` we must walk it to
+    // `Resuming`. We replay the granted-restart path on a SYNTHETIC local driver
+    // mirror so the process-global driver settles to Idle with a cleared streak
+    // exactly as a successor should — but we NEVER re-run build/test/exec.
+    {
+        let mut driver = state.driver();
+        // Re-enqueue+start+green+grant a placeholder so the global driver reaches
+        // `Resuming`, then `Resumed`. This is bookkeeping-only: no effect runs.
+        driver.enqueue(origin_selfdev::BuildJob::new(
+            ctx.in_flight_job_id,
+            "successor-resume",
+        ));
+        let walked = drive_to_resuming(&mut driver);
+        if walked {
+            if let Err(e) = driver.handle(&SelfDevEvent::Resumed) {
+                warn!(error = %e, "self-dev: successor Resumed transition rejected");
+            }
+        }
+    }
+
+    if let Err(e) = store.clear() {
+        warn!(error = %e, "self-dev: could not clear reload store after resume");
+    }
+}
+
+/// Walk a freshly-`Idle` driver through `StartJob → EditDone → build green →
+/// test green → RestartGranted` so it reaches `Resuming`, ready for `Resumed`.
+///
+/// Used ONLY by [`selfdev_successor_boot`] to reconstruct the post-restart state
+/// in a fresh process. `RestartGranted` is fed directly here (the safety rule
+/// against direct grants applies to the *authorization* path, which already ran
+/// in the predecessor process via `request_restart`; the successor is replaying
+/// an already-authorized transition, not authorizing a new one). Returns `true`
+/// when the machine reached `Resuming`.
+fn drive_to_resuming(driver: &mut origin_selfdev::SelfDevDriver) -> bool {
+    use origin_selfdev::{SelfDevEvent, SelfDevState};
+    let steps = [
+        SelfDevEvent::StartJob,
+        SelfDevEvent::EditDone,
+        SelfDevEvent::BuildResult { ok: true },
+        SelfDevEvent::TestResult { ok: true },
+        SelfDevEvent::RestartGranted,
+    ];
+    for step in &steps {
+        if let Err(e) = driver.handle(step) {
+            warn!(error = %e, ?step, "self-dev: successor replay step rejected");
+            return false;
+        }
+    }
+    matches!(driver.state(), SelfDevState::Resuming)
+}
+
+// ── Named-teams control plane handlers ──────────────────────────────────────
+
+/// Handle `TeamAssign`: spawn a real swarm worker as the named teammate, drive
+/// its lifecycle, and bridge each [`TeamEvent`](origin_swarm::TeamEvent) onto
+/// the wire AND the lifecycle-hook runtime. Returns `false` only on an IPC write
+/// failure.
+async fn handle_team_assign(
+    conn: &SharedConnection,
+    coordinator: &Coordinator,
+    team: String,
+    teammate: String,
+    task: String,
+) -> bool {
+    // Register + mark Working. Unknown team ⇒ AdminError (no spawn).
+    if let Err(e) = origin_daemon::teams::begin_assignment(&team, &teammate, &task) {
+        return write_event(
+            conn,
+            &StreamEvent::AdminError {
+                message: e.to_string(),
+            },
+        )
+        .await
+        .is_ok();
+    }
+
+    // Spawn the real worker and drive its lifecycle to completion (Working →
+    // Done → Idle), collecting the emitted TeamEvents.
+    let events = origin_daemon::teams::run_teammate(coordinator, &team, &teammate, &task).await;
+
+    // Bridge each event: onto the wire (for the CLI) AND the lifecycle hooks.
+    for ev in &events {
+        let note = origin_daemon::teams::event_to_notification(&team, ev);
+        origin_daemon::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::Notification {
+            message: note,
+        })
+        .await;
+        if write_event(conn, &origin_daemon::teams::event_to_stream(&team, ev))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+
+    // Finish with the team's current status so the CLI can render the timeline.
+    match origin_daemon::teams::status_event(&team) {
+        Some(ev) => write_event(conn, &ev).await.is_ok(),
+        None => true,
     }
 }
 

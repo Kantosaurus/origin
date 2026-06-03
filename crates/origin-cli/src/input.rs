@@ -460,6 +460,31 @@ pub fn vim_enabled(config_flag: bool) -> bool {
     config_flag || std::env::var("ORIGIN_VIM").as_deref() == Ok("1")
 }
 
+/// The vim layer's startup-active state with no config flag.
+///
+/// `ORIGIN_VIM=1` alone — a convenience wrapper over [`vim_enabled`] for the TUI
+/// seed point, so a session begins in vim Normal mode when the env opt-in is
+/// set. Default-off (`ORIGIN_VIM` unset/!="1") ⇒ `false` ⇒ byte-identical direct
+/// insert.
+#[must_use]
+pub fn vim_active_default() -> bool {
+    vim_enabled(false)
+}
+
+/// Pure routing decision for the live key path: should this key event be routed
+/// through the vim reducer, or fall straight through to the legacy editor
+/// reducer?
+///
+/// Returns `true` only when the vim layer is active for the session. When
+/// `false` the caller MUST use its unchanged `reduce_editor` path, so a default
+/// session (no `ORIGIN_VIM`, no `/vim`) is byte-identical. This is split out as
+/// a pure predicate so the routing decision is deterministically unit-testable
+/// without standing up a full TUI.
+#[must_use]
+pub const fn route_through_vim(vim_active: bool) -> bool {
+    vim_active
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unreachable)] // panic! is the idiomatic mismatched-variant assertion in test code
 mod tests {
@@ -858,6 +883,26 @@ mod tests {
         // env in a shared test binary; the env arm is exercised via the OR.)
         assert!(!vim_enabled(false) || std::env::var("ORIGIN_VIM").as_deref() == Ok("1"));
         assert!(vim_enabled(true));
+    }
+
+    #[test]
+    fn route_through_vim_only_when_active() {
+        // The live key path consults the vim reducer only when the session has
+        // the vim layer active. Inactive ⇒ the caller MUST use its unchanged
+        // direct path (byte-identical default).
+        assert!(route_through_vim(true), "active session routes through vim");
+        assert!(
+            !route_through_vim(false),
+            "inactive session must NOT route through vim (byte-identical default)"
+        );
+    }
+
+    #[test]
+    fn vim_active_default_matches_env_opt_in() {
+        // The startup seed is exactly the no-config-flag `vim_enabled`: it is on
+        // iff `ORIGIN_VIM=1`. We assert the equivalence rather than the absolute
+        // value to avoid depending on the shared test binary's env.
+        assert_eq!(vim_active_default(), vim_enabled(false));
     }
 }
 

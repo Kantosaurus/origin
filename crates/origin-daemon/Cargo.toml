@@ -54,12 +54,14 @@ origin-metrics          = { path = "../origin-metrics" }
 origin-runtime          = { path = "../origin-runtime" }
 origin-alloc            = { path = "../origin-alloc" }
 origin-resume-token     = { path = "../origin-resume-token" }
+origin-supervisor       = { path = "../origin-supervisor" }
 origin-goal             = { path = "../origin-goal" }
 origin-cost             = { path = "../origin-cost" }
 origin-export           = { path = "../origin-export" }
 origin-plan             = { path = "../origin-plan" }
 origin-planner          = { path = "../origin-planner" }
 origin-swarm            = { path = "../origin-swarm" }
+origin-selfdev          = { path = "../origin-selfdev" }
 origin-browser          = { path = "../origin-browser" }
 origin-lsp-client       = { path = "../origin-lsp-client" }
 # Wave-1/2 subsystem crates wired into the daemon (all default-off / available).
@@ -80,6 +82,8 @@ origin-ambient          = { path = "../origin-ambient" }
 origin-editfmt          = { path = "../origin-editfmt" }
 origin-hooks            = { path = "../origin-hooks" }
 origin-migrate          = { path = "../origin-migrate" }
+origin-gmail            = { path = "../origin-gmail" }
+origin-workflowgen      = { path = "../origin-workflowgen" }
 ctrlc                   = "3"
 dirs                    = "5"
 which                   = "8"

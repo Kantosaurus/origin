@@ -57,10 +57,12 @@ impl origin_vcs::GitRunner for CmdGit {
 /// swallowed: a checkpoint must never fail the turn that produced it. The
 /// caller-supplied `label` becomes the checkpoint's commit subject, so it is
 /// what distinguishes entries in `origin checkpoints`.
-fn checkpoint_with_label(label: &str) {
-    let Ok(cwd) = std::env::current_dir() else {
-        return;
-    };
+///
+/// Returns the created checkpoint's commit `id` (the shadow-git SHA) on success
+/// so the caller can fire a `PostCommit` hook with it; `None` when the snapshot
+/// could not be taken (no cwd / git failure — both already logged + swallowed).
+fn checkpoint_with_label(label: &str) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
     let shadow_dir = cwd.join(".origin").join("shadow.git");
     let shadow = shadow_dir.to_string_lossy().into_owned();
     let now_ms = std::time::SystemTime::now()
@@ -68,19 +70,56 @@ fn checkpoint_with_label(label: &str) {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     let runner = CmdGit;
     let sg = origin_vcs::ShadowGit::new(&runner, shadow);
-    if let Err(e) = sg.snapshot(label, now_ms) {
-        tracing::debug!(error = %e, "shadow-git checkpoint failed (ignored)");
+    match sg.snapshot(label, now_ms) {
+        Ok(checkpoint) => Some(checkpoint.id),
+        Err(e) => {
+            tracing::debug!(error = %e, "shadow-git checkpoint failed (ignored)");
+            None
+        }
     }
 }
 
-/// Best-effort per-turn shadow-git checkpoint. No-op unless
-/// `ORIGIN_CHECKPOINTS=1`. Every failure is swallowed — a checkpoint must
-/// never fail the turn that produced it. Default-off ⇒ byte-identical behavior.
-fn maybe_checkpoint_turn() {
+/// Fire `PreCommit` (informational), take a shadow-git checkpoint via
+/// [`checkpoint_with_label`], then fire `PostCommit` with the resulting SHA.
+///
+/// This is the live `PreCommit`/`PostCommit` firing site: the daemon's only
+/// "commit" operation at runtime is the optional shadow-git checkpoint, so the
+/// commit hooks bracket exactly that write. The hooks are informational (their
+/// overrides are ignored) and `PostCommit` is fired only when a checkpoint was
+/// actually created. With no `hooks.json` (the default) [`fire_global`] is a
+/// no-op, so this differs from the bare [`checkpoint_with_label`] only by the
+/// two no-op awaits — byte-identical observable behavior.
+///
+/// The shadow-git checkpoint is a standalone repo with no user-facing branch;
+/// `PreCommit.branch` carries the checkpoint `label` as the closest available
+/// "what is being committed" string.
+async fn checkpoint_with_commit_hooks(label: &str) -> Option<String> {
+    crate::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::PreCommit {
+        branch: label.to_string(),
+    })
+    .await;
+    let sha = checkpoint_with_label(label);
+    if let Some(sha) = sha.as_ref() {
+        crate::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::PostCommit {
+            sha: sha.clone(),
+        })
+        .await;
+    }
+    sha
+}
+
+/// Per-turn shadow-git checkpoint that brackets the snapshot with the
+/// `PreCommit`/`PostCommit` lifecycle hooks (see [`checkpoint_with_commit_hooks`]).
+///
+/// No-op unless `ORIGIN_CHECKPOINTS=1` — the per-turn checkpoint gate. This is
+/// the hook-firing async counterpart used by the live loop. The
+/// commit hooks fire only inside the gated branch, so when checkpoints are off
+/// (the default) no hook fires and behavior is byte-identical.
+async fn maybe_checkpoint_turn_with_hooks() {
     if std::env::var("ORIGIN_CHECKPOINTS").as_deref() != Ok("1") {
         return;
     }
-    checkpoint_with_label("turn");
+    let _ = checkpoint_with_commit_hooks("turn").await;
 }
 
 /// Whether the per-tool-use checkpoint feature is enabled.
@@ -91,6 +130,70 @@ fn maybe_checkpoint_turn() {
 /// snapshots. Unset (the default) ⇒ `false` ⇒ byte-identical behavior.
 fn per_tool_checkpoints_enabled() -> bool {
     std::env::var("ORIGIN_CHECKPOINTS_PER_TOOL").as_deref() == Ok("1")
+}
+
+/// The transcript-byte soft cap above which the live in-loop compactor folds the
+/// oldest summarized turns into their summaries (firing `PreCompress`).
+///
+/// Defaults to [`crate::compactor::DEFAULT_SOFT_CAP_BYTES`] (200 KiB). The
+/// `ORIGIN_COMPACT_SOFT_CAP` env var overrides it with a decimal byte count for
+/// tuning/tests; an unset or unparseable value falls back to the default. The
+/// default cap is large enough that a short interactive session never reaches
+/// it, so the live compaction call-site is a no-op (byte-identical) by default.
+fn compaction_soft_cap() -> usize {
+    std::env::var("ORIGIN_COMPACT_SOFT_CAP")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(crate::compactor::DEFAULT_SOFT_CAP_BYTES)
+}
+
+/// Live, in-loop transcript compaction (P5.4 runtime wiring).
+///
+/// Called once per agentic turn AFTER the freshly-closed turn is appended, so
+/// the NEXT turn's `ChatRequest` is built from the compacted transcript. When
+/// the accumulated context crosses [`compaction_soft_cap`], it folds the oldest
+/// summarized turns into their summaries via
+/// [`crate::compactor::maybe_compact_transcript`] (which fires the `PreCompress`
+/// lifecycle hook) and replaces `session.messages` with the result.
+///
+/// Summaries come from the wired [`SessionStore`] (eager per-turn summaries,
+/// P5.2) keyed by `turn_index == message index`. When no store is wired, an
+/// empty-summary vector is passed: the cap check + `PreCompress` fire still
+/// happen, but no turn has a summary so the transcript is returned unchanged.
+///
+/// **Default-off / byte-identical:** below the (200 KiB) cap this returns
+/// immediately without firing the hook or touching `session.messages`, so a
+/// short session is unaffected. Compaction never errors — a missing summary just
+/// leaves that turn intact.
+async fn maybe_compact_session(session: &mut Session, opts: &LoopOptions) {
+    let cap = compaction_soft_cap();
+    // Cheap pre-check before building the summaries vector: if we are under the
+    // cap there is nothing to do and we must not allocate or fire a hook.
+    if crate::compactor::estimate_transcript_bytes(&session.messages) <= cap {
+        return;
+    }
+    // Build the per-message summary vector aligned to `session.messages` by
+    // index. Eager summaries (P5.2) are keyed by `turn_index`; we materialize a
+    // dense `Vec<Option<String>>` so `compact` can index it directly. Absent a
+    // store (the live `LoopOptions` default) every entry is `None`.
+    let mut summaries: Vec<Option<String>> = vec![None; session.messages.len()];
+    if let Some(store) = opts.session_store.as_ref() {
+        if let Ok(rows) = store.load_summaries(&session.id) {
+            for (turn_index, summary) in rows {
+                if let Some(slot) = usize::try_from(turn_index)
+                    .ok()
+                    .and_then(|i| summaries.get_mut(i))
+                {
+                    *slot = summary;
+                }
+            }
+        }
+    }
+    if let Some(compacted) =
+        crate::compactor::maybe_compact_transcript(&session.messages, &summaries, cap).await
+    {
+        session.messages = compacted;
+    }
 }
 
 /// Build the commit-subject label for a per-tool checkpoint.
@@ -108,20 +211,21 @@ fn per_tool_checkpoint_label(tool: &str, edited: &[String]) -> String {
     }
 }
 
-/// Best-effort per-tool-use shadow-git checkpoint (cline L163 follow-up).
+/// Best-effort per-tool-use shadow-git checkpoint (cline L163 follow-up),
+/// bracketed by the `PreCommit`/`PostCommit` lifecycle hooks.
 ///
 /// No-op unless `ORIGIN_CHECKPOINTS_PER_TOOL=1`. Called after a SUCCESSFUL
 /// mutating tool dispatch with the tool name and its parsed args; snapshots the
-/// workspace via the same [`checkpoint_with_label`] machinery the per-turn path
-/// uses, labelled by [`per_tool_checkpoint_label`] so the entries are
+/// workspace via the [`checkpoint_with_commit_hooks`] machinery the per-turn
+/// path also uses, labelled by [`per_tool_checkpoint_label`] so the entries are
 /// distinguishable. Every failure is swallowed and the gate is default-off, so
-/// the default code path is byte-identical.
-fn maybe_checkpoint_per_tool(tool: &str, args: &Value) {
+/// the default code path — and the commit hooks — are byte-identical.
+async fn maybe_checkpoint_per_tool_with_hooks(tool: &str, args: &Value) {
     if !per_tool_checkpoints_enabled() {
         return;
     }
     let edited = edited_paths_from_tool(tool, args);
-    checkpoint_with_label(&per_tool_checkpoint_label(tool, &edited));
+    let _ = checkpoint_with_commit_hooks(&per_tool_checkpoint_label(tool, &edited)).await;
 }
 
 /// DENY-ONLY governance overlay (Task 3).
@@ -234,27 +338,95 @@ fn apply_read_only_overlay(
     decision
 }
 
-/// Best-effort end-of-turn side effects (Tasks 1, 4, 5).
+/// Best-effort end-of-turn / loop-end side effects.
 ///
-/// Each sub-step is independently env-gated and default-off:
-/// - `ORIGIN_CHECKPOINTS=1` ⇒ shadow-git snapshot, only if `mutated`.
+/// Each sub-step is independently env-gated or feature-gated and default-off:
 /// - `ORIGIN_TELEMETRY=1` ⇒ append one redacted JSONL `turn` event.
 /// - `ORIGIN_NOTIFY=1` ⇒ spawn a desktop completion notification.
+/// - `--features otel` + `ORIGIN_OTLP_ENDPOINT` ⇒ the `gen_ai` usage record
+///   lands on the OTLP pipeline (a const no-op in the default build).
 ///
-/// With no env flags set (the default) this function does nothing observable,
-/// so default behavior and every existing test stay byte-identical.
+/// The `ORIGIN_CHECKPOINTS=1` shadow-git snapshot is fired separately by the
+/// caller via [`maybe_checkpoint_turn_with_hooks`] (it is async because it
+/// brackets the snapshot with the `PreCommit`/`PostCommit` lifecycle hooks).
+///
+/// With no env flags / features set (the default) this function does nothing
+/// observable, so default behavior and every existing test stay byte-identical.
 fn run_turn_end_effects(
-    mutated: bool,
     provider: &str,
     model: &str,
     input_tokens: u64,
     output_tokens: u64,
+    latency_ms: f64,
+    tool_calls: u64,
 ) {
-    if mutated {
-        maybe_checkpoint_turn();
-    }
     maybe_record_turn_telemetry(provider, model, input_tokens, output_tokens);
     maybe_notify_completion();
+    // Task 3 (gen_ai metrics emit). Unconditional by design: this is a cheap
+    // `const` no-op unless the daemon is built `--features otel` AND the OTLP
+    // exporter has been installed (which requires `ORIGIN_OTLP_ENDPOINT`). The
+    // response model is reported equal to the request model here — the loop does
+    // not surface a distinct response-model string — matching the convention of
+    // passing an empty string only when truly unknown.
+    origin_metrics::instruments::record_gen_ai_usage(
+        provider,
+        model,
+        model,
+        input_tokens,
+        output_tokens,
+        latency_ms,
+        tool_calls,
+    );
+}
+
+/// Best-effort opt-in session-stop pain telemetry (Task 4). No-op unless
+/// `ORIGIN_TELEMETRY=1` (opt-in) and `DO_NOT_TRACK` is unset — the same guard
+/// the per-turn `turn` events use — and routed through the same redacting,
+/// sampling [`origin_telemetry::Pipeline`] and JSONL sink.
+///
+/// Emits one `session_stop` event carrying the [`origin_telemetry::PainMetrics`]
+/// bucket ([`origin_telemetry::SessionStopReason`], total agent time, and turn
+/// count). Default-off ⇒ no event, no file, byte-identical.
+fn maybe_record_session_stop_telemetry(
+    stop_reason: origin_telemetry::SessionStopReason,
+    agent_time_ms: u64,
+    turn_count: u32,
+) {
+    use std::io::Write as _;
+    let do_not_track = std::env::var_os("DO_NOT_TRACK").is_some();
+    let opt_in = std::env::var("ORIGIN_TELEMETRY").as_deref() == Ok("1");
+    let cfg = origin_telemetry::Config::from_env(do_not_track, opt_in, 1.0);
+    let mut pipeline = origin_telemetry::Pipeline::new(cfg);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    // The split is reported as model time; the loop does not separate model vs
+    // tool wall-clock, so `tool_time_ms` stays unset (the schema is partial).
+    let metrics = origin_telemetry::PainMetrics::new()
+        .with_stop_reason(stop_reason)
+        .with_agent_time_split(agent_time_ms, 0)
+        .with_turns(turn_count, turn_count);
+    let Ok(event) = metrics.into_event("session_stop".to_string(), now_ms) else {
+        return;
+    };
+    pipeline.record(event);
+    let lines = pipeline.drain();
+    if lines.is_empty() {
+        return; // disabled or sampled out — never touch the filesystem.
+    }
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let dir = home.join(".origin").join("telemetry");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("turns.jsonl");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        for line in lines {
+            let _ = writeln!(f, "{line}");
+        }
+    }
 }
 
 /// Best-effort opt-in telemetry (Task 4). No-op unless `ORIGIN_TELEMETRY=1`
@@ -465,19 +637,26 @@ fn deliver_file_shift(collab: &SwarmCollab, notice: &origin_swarm::FileShiftNoti
         );
         return;
     };
-    for reader in &notice.readers {
-        if let Some(mbox) = mailboxes.get(reader) {
-            mbox.push(origin_swarm::Message::new(
-                notice.editor,
-                origin_swarm::MsgScope::Direct(*reader),
-                body.clone(),
-            ));
-        } else {
-            tracing::info!(
-                reader = %format!("{:032x}", reader.value()),
-                "swarm collab: file-shift reader has no mailbox; dropping notice"
-            );
-        }
+    // The map is live behind a `Mutex` (a later-spawned sibling registers into
+    // the same map), so lock for the minimum span — clone out each reader's
+    // `Arc<Mailbox>`, then drop the guard before pushing so no lock is held
+    // across the loop body. A poisoned lock is recovered, never propagated:
+    // collab delivery is advisory and must not tear down the turn.
+    let targets: Vec<(origin_swarm::WorkerId, Arc<origin_swarm::Mailbox>)> = {
+        let map = mailboxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        notice
+            .readers
+            .iter()
+            .map(|reader| (*reader, map.get(reader).map(Arc::clone)))
+            .filter_map(|(reader, mbox)| mbox.map(|m| (reader, m)))
+            .collect()
+    };
+    for (reader, mbox) in targets {
+        mbox.push(origin_swarm::Message::new(
+            notice.editor,
+            origin_swarm::MsgScope::Direct(reader),
+            body.clone(),
+        ));
     }
 }
 
@@ -521,11 +700,13 @@ pub struct SwarmCollab {
     /// Shared, room-wide file-read registry. All workers in one swarm room
     /// share a single `Arc<FileRegistry>`.
     pub registry: Arc<origin_swarm::FileRegistry>,
-    /// Optional shared map `WorkerId → Mailbox`. When present, a file-shift
-    /// notice is delivered as a [`origin_swarm::Message`] into each affected
-    /// reader's mailbox. When `None`, the notice is logged instead (the
-    /// "mailbox plumbing isn't reachable" fallback).
-    pub mailboxes: Option<Arc<std::collections::HashMap<origin_swarm::WorkerId, Arc<origin_swarm::Mailbox>>>>,
+    /// Optional **live** shared map `WorkerId → Mailbox`. When present, a
+    /// file-shift notice is delivered as a [`origin_swarm::Message`] into each
+    /// affected reader's mailbox. The map is live (behind a `Mutex`) so a
+    /// worker spawned *after* this one is still visible for delivery. When
+    /// `None`, the notice is logged instead (the "mailbox plumbing isn't
+    /// reachable" fallback).
+    pub mailboxes: Option<origin_swarm::SharedMailboxes>,
 }
 
 tokio::task_local! {
@@ -547,6 +728,136 @@ where
     F: std::future::Future<Output = T> + Send,
 {
     SWARM_COLLAB.scope(collab, fut).await
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    // The ENV_LOCK guard intentionally spans the awaited collab scopes so the
+    // process-global `ORIGIN_SWARM_COLLAB` mutation is serialized against the
+    // sibling test; the lock is uncontended otherwise.
+    clippy::await_holding_lock,
+    // The mailbox/registry guards are short-lived assertion reads at the end of
+    // each test; tightening them buys nothing in test code.
+    clippy::significant_drop_tightening
+)]
+mod swarm_collab_wiring_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::PoisonError;
+
+    /// Serializes tests that toggle the process-global `ORIGIN_SWARM_COLLAB`
+    /// env var so the parallel runner cannot interleave a `set_var` in one test
+    /// with a read in another.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Build a live shared mailbox map registering both workers, mirroring what
+    /// `Coordinator::spawn_with` does per worker under the collab gate.
+    fn shared_map(
+        ids: &[origin_swarm::WorkerId],
+    ) -> origin_swarm::SharedMailboxes {
+        let mut map: HashMap<origin_swarm::WorkerId, Arc<origin_swarm::Mailbox>> = HashMap::new();
+        for id in ids {
+            map.insert(*id, Arc::new(origin_swarm::Mailbox::new()));
+        }
+        Arc::new(std::sync::Mutex::new(map))
+    }
+
+    /// End-to-end wiring proof (WS-L, jcode L238): with the gate SET, a worker
+    /// (B) that edits a path another worker (A) previously read must leave a
+    /// file-shift notice in A's mailbox — exercising `scope_swarm_collab` +
+    /// the same `record_swarm_collab` hook the run_loop fires per tool call.
+    #[tokio::test]
+    async fn editor_notifies_prior_reader_under_gate() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        std::env::set_var("ORIGIN_SWARM_COLLAB", "1");
+
+        let reader = origin_swarm::WorkerId::generate();
+        let editor = origin_swarm::WorkerId::generate();
+        let registry = Arc::new(origin_swarm::FileRegistry::new());
+        let mailboxes = shared_map(&[reader, editor]);
+
+        // Worker A reads `src/lib.rs` inside its own collab scope.
+        let collab_a = SwarmCollab {
+            worker_id: reader,
+            registry: Arc::clone(&registry),
+            mailboxes: Some(Arc::clone(&mailboxes)),
+        };
+        let read_args = serde_json::json!({ "file_path": "src/lib.rs" });
+        scope_swarm_collab(collab_a, async {
+            let _ = SWARM_COLLAB.try_with(|c| record_swarm_collab(c, "Read", &read_args));
+        })
+        .await;
+
+        // Worker B edits the same path inside ITS scope.
+        let collab_b = SwarmCollab {
+            worker_id: editor,
+            registry: Arc::clone(&registry),
+            mailboxes: Some(Arc::clone(&mailboxes)),
+        };
+        let edit_args = serde_json::json!({ "file_path": "src/lib.rs", "old": "a", "new": "b" });
+        scope_swarm_collab(collab_b, async {
+            let _ = SWARM_COLLAB.try_with(|c| record_swarm_collab(c, "Edit", &edit_args));
+        })
+        .await;
+
+        // A's mailbox holds exactly one Direct notice from B about the path;
+        // B's own mailbox stays empty (no self-notify).
+        let map = mailboxes.lock().unwrap_or_else(PoisonError::into_inner);
+        let a_box = map.get(&reader).expect("reader mailbox present");
+        let b_box = map.get(&editor).expect("editor mailbox present");
+        let a_msgs = a_box.drain();
+        assert_eq!(a_msgs.len(), 1, "reader must receive exactly one file-shift notice");
+        assert_eq!(a_msgs[0].from, editor, "notice is from the editor");
+        assert_eq!(a_msgs[0].scope, origin_swarm::MsgScope::Direct(reader));
+        assert!(a_msgs[0].body.contains("src/lib.rs"), "notice names the edited path");
+        assert!(b_box.is_empty(), "editor must not notify itself");
+
+        std::env::remove_var("ORIGIN_SWARM_COLLAB");
+    }
+
+    /// Default-off discipline: with the gate UNSET, the same read+edit sequence
+    /// records nothing and delivers no notice — byte-identical to before.
+    #[tokio::test]
+    async fn no_notice_when_gate_unset() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        std::env::remove_var("ORIGIN_SWARM_COLLAB");
+
+        let reader = origin_swarm::WorkerId::generate();
+        let editor = origin_swarm::WorkerId::generate();
+        let registry = Arc::new(origin_swarm::FileRegistry::new());
+        let mailboxes = shared_map(&[reader, editor]);
+
+        let collab_a = SwarmCollab {
+            worker_id: reader,
+            registry: Arc::clone(&registry),
+            mailboxes: Some(Arc::clone(&mailboxes)),
+        };
+        let read_args = serde_json::json!({ "file_path": "src/lib.rs" });
+        scope_swarm_collab(collab_a, async {
+            let _ = SWARM_COLLAB.try_with(|c| record_swarm_collab(c, "Read", &read_args));
+        })
+        .await;
+
+        let collab_b = SwarmCollab {
+            worker_id: editor,
+            registry: Arc::clone(&registry),
+            mailboxes: Some(Arc::clone(&mailboxes)),
+        };
+        let edit_args = serde_json::json!({ "file_path": "src/lib.rs" });
+        scope_swarm_collab(collab_b, async {
+            let _ = SWARM_COLLAB.try_with(|c| record_swarm_collab(c, "Edit", &edit_args));
+        })
+        .await;
+
+        let map = mailboxes.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            map.get(&reader).expect("reader mailbox").is_empty(),
+            "gate unset ⇒ no notice ⇒ byte-identical"
+        );
+        assert_eq!(registry.tracked_paths(), 0, "gate unset ⇒ nothing recorded");
+    }
 }
 
 #[derive(Clone)]
@@ -897,7 +1208,7 @@ impl SpeculativeRegistry {
             // through the main dispatch path. Task is Mutating so it never
             // speculatively dispatches anyway; the None for coordinator here
             // is API consistency.
-            let text = dispatch_tool(meta, &args, cas.as_deref(), None, None, None, None).await?;
+            let text = dispatch_tool(meta, &args, cas.as_deref(), None, None, None, None, None, None).await?;
             Ok::<_, LoopError>(text.into_bytes())
         });
         self.in_flight.insert(tool_use_id, handle);
@@ -920,11 +1231,13 @@ pub(crate) struct StreamingTurn {
 }
 
 /// Session-id prefixes reserved for the daemon's own self-dispatched prompts
-/// (ambient / scheduler / overnight / webhook). These loops connect back to the
-/// daemon's IPC socket as ordinary clients, so their turns flow through
-/// [`run_loop`] exactly like an interactive prompt — the only in-band signal that
-/// tells them apart here is the synthetic `session_id` each loop stamps.
-const SELF_DISPATCH_SESSION_PREFIXES: [&str; 4] = ["ambient-", "sched-", "overnight-", "webhook-"];
+/// (ambient / scheduler / overnight / webhook / self-dev). These loops connect
+/// back to the daemon's IPC socket as ordinary clients, so their turns flow
+/// through [`run_loop`] exactly like an interactive prompt — the only in-band
+/// signal that tells them apart here is the synthetic `session_id` each loop
+/// stamps.
+const SELF_DISPATCH_SESSION_PREFIXES: [&str; 5] =
+    ["ambient-", "sched-", "overnight-", "webhook-", "selfdev-"];
 
 /// Whether `session_id` belongs to a daemon self-dispatch (ambient / scheduler /
 /// overnight / webhook) rather than a genuine interactive/headless user prompt.
@@ -950,6 +1263,7 @@ mod self_dispatch_session_tests {
             "sched-1717000000000",
             "overnight-docs",
             "webhook-1717000000000",
+            "selfdev-job-1",
         ] {
             assert!(
                 is_self_dispatch_session(id),
@@ -1016,6 +1330,23 @@ pub async fn run_loop(
     // session id each loop stamps, so we skip the bump for those prefixes.
     if !is_self_dispatch_session(&session.id) {
         crate::ambient::note_user_activity();
+    }
+
+    // Supervisor lifecycle (origin-supervisor): record this turn as activity on
+    // the session so the periodic tick's idle clock is refreshed and the
+    // session is registered if new. A genuine user prompt is the foreground
+    // `Interactive` class (never shed, short idle grace); a daemon
+    // self-dispatch (ambient/scheduler/overnight/webhook/Task) is `Detached`
+    // (shed first under memory pressure, longer grace). A no-op when the
+    // supervisor module was never initialised, so default builds are
+    // byte-identical.
+    {
+        let class = if is_self_dispatch_session(&session.id) {
+            origin_supervisor::SessionClass::Detached
+        } else {
+            origin_supervisor::SessionClass::Interactive
+        };
+        crate::supervisor::note_activity(&session.id, class);
     }
 
     // Live lifecycle hooks (gemini): loaded once from ~/.origin/hooks.json.
@@ -1298,6 +1629,25 @@ pub async fn run_loop(
     let mut lsp_diag_block = String::new();
     let lsp_diag_enabled = crate::lsp_diagnostics::enabled();
 
+    // Task 1 (agentgrep exposure-truncation). Already-seen `(file, line)`
+    // regions accumulated across this `run_loop` from prior `content`-mode
+    // `Grep` results, keyed/folded per path. Populated and consulted only when
+    // `ORIGIN_AGENTGREP_TRUNCATE=1`; otherwise it stays empty and the Grep
+    // dispatch passes `None`, so the loop is byte-identical to before. On the
+    // next `Grep`, every prior line is elided so a re-run never re-spends tokens
+    // on regions the model has already seen.
+    let grep_truncate_enabled =
+        std::env::var("ORIGIN_AGENTGREP_TRUNCATE").as_deref() == Ok("1");
+    let mut grep_exposure: Vec<origin_tools::builtins::grep_tool::ExposureWindow> = Vec::new();
+
+    // Task 3/4 (metrics + pain telemetry). Session-wide latency clock and tool
+    // counter, used by the `gen_ai` usage record (a no-op without the `otel`
+    // feature) and the opt-in pain-bucket telemetry (off without
+    // `ORIGIN_TELEMETRY=1`). Both are cheap to maintain and never alter the
+    // default-build behavior.
+    let loop_start = std::time::Instant::now();
+    let mut total_tool_calls: u64 = 0;
+
     for turn in 1..=opts.max_turns {
         // Distinct files this turn mutated (for the post-edit diagnostics probe).
         // Always empty unless the feature is enabled, so it allocates nothing on
@@ -1537,6 +1887,11 @@ pub async fn run_loop(
             })
             .collect();
 
+        // Task 3/4: count the model-issued tool calls this turn for the
+        // `gen_ai` usage record (no-op without `otel`) and the opt-in pain
+        // telemetry. Saturating so a pathological session can never overflow.
+        total_tool_calls = total_tool_calls.saturating_add(tool_uses.len() as u64);
+
         if tool_uses.is_empty() {
             let text = resp
                 .assistant
@@ -1547,6 +1902,19 @@ pub async fn run_loop(
                     _ => None,
                 })
                 .collect::<String>();
+
+            // Task 2 (editfmt parse/apply). When `ORIGIN_EDITFMT=1` and the model
+            // emitted an edit block in prose (search/replace, udiff, or a
+            // diff-fenced block) INSTEAD of a structured Edit tool call, parse it
+            // via `origin_editfmt` and apply it to the named file(s) on disk. The
+            // model reached this branch precisely because it produced no tool
+            // call, so applying the prose edit is the only way the change lands.
+            // Default/unset ⇒ this is skipped entirely and the turn is
+            // byte-identical. A best-effort apply: any parse/apply failure is
+            // logged and the file is left untouched, never failing the turn.
+            if std::env::var("ORIGIN_EDITFMT").as_deref() == Ok("1") {
+                apply_prose_edits(&text, &session.model, &mut turn_mutated);
+            }
 
             // P6.7: optional proposer pass at turn end. Proposals are surfaced
             // as side-band StreamEvents for the CLI to render AND recorded in
@@ -1602,14 +1970,32 @@ pub async fn run_loop(
                     .await;
             }
 
-            // End-of-turn side effects (Tasks 1, 4, 5). All are best-effort and
-            // default-off (env-gated); none can fail the turn.
+            // End-of-turn / loop-end side effects. All are best-effort and
+            // default-off (env- or feature-gated); none can fail the turn.
+            let agent_time_ms =
+                u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            // Per-turn shadow-git checkpoint, bracketed by the PreCommit/PostCommit
+            // lifecycle hooks. Fired only when this loop mutated the workspace and
+            // `ORIGIN_CHECKPOINTS=1`; with the gate unset (the default) it — and
+            // the commit hooks — are a no-op, so behavior is byte-identical.
+            if turn_mutated {
+                maybe_checkpoint_turn_with_hooks().await;
+            }
             run_turn_end_effects(
-                turn_mutated,
                 provider.name(),
                 &session.model,
                 total_input_tokens,
                 total_output_tokens,
+                loop_start.elapsed().as_secs_f64() * 1_000.0,
+                total_tool_calls,
+            );
+            // Task 4: the loop reached a clean assistant turn with no further
+            // tool calls — the agent finished the requested work. Emit the
+            // `Completed` pain bucket. Default-off ⇒ no event.
+            maybe_record_session_stop_telemetry(
+                origin_telemetry::SessionStopReason::Completed,
+                agent_time_ms,
+                turn,
             );
 
             return Ok(LoopSummary {
@@ -1858,6 +2244,17 @@ pub async fn run_loop(
                         }
                     }
                 } else {
+                    // Task 1: when the exposure-truncation gate is on, hand the
+                    // accumulated prior `(file, line)` regions to the Grep arm so
+                    // a re-run elides already-seen lines. Gate off ⇒ `None`,
+                    // byte-identical. The borrow ends before the result harvest
+                    // below mutates `grep_exposure`.
+                    let exposure_arg: Option<&[origin_tools::builtins::grep_tool::ExposureWindow]> =
+                        if grep_truncate_enabled && meta.name == "Grep" {
+                            Some(grep_exposure.as_slice())
+                        } else {
+                            None
+                        };
                     match dispatch_tool(
                         meta,
                         &args,
@@ -1866,10 +2263,21 @@ pub async fn run_loop(
                         opts.mem_router.as_ref().map(Arc::as_ref),
                         opts.memory_handle.as_deref(),
                         opts.coordinator.as_deref(),
+                        exposure_arg,
+                        opts.skill_catalog.as_deref(),
                     )
                     .await
                     {
-                        Ok(s) => s.into_bytes(),
+                        Ok(s) => {
+                            // Harvest the `content`-mode `(file, line)` matches
+                            // this Grep returned so the NEXT Grep this loop can
+                            // elide them. Gate off ⇒ never touched. Parse failures
+                            // are ignored (the result still flows to the model).
+                            if grep_truncate_enabled && meta.name == "Grep" {
+                                harvest_grep_exposure(&s, &mut grep_exposure);
+                            }
+                            s.into_bytes()
+                        }
                         Err(LoopError::BadArgs(msg) | LoopError::ToolFailure(msg)) => {
                             tracing::warn!(tool = %name, %msg, "tool dispatch failed; returning error to model");
                             // Surface the error to the CLI so the user sees
@@ -1913,9 +2321,11 @@ pub async fn run_loop(
             // tools produce a snapshot, and only when ORIGIN_CHECKPOINTS_PER_TOOL
             // is set — independent of the per-turn ORIGIN_CHECKPOINTS gate, so
             // per-turn stays the default granularity. Best-effort and
-            // default-off ⇒ byte-identical when the gate is unset.
+            // default-off ⇒ byte-identical when the gate is unset. The snapshot
+            // is bracketed by the PreCommit/PostCommit lifecycle hooks, which
+            // also no-op without a configured hooks.json.
             if matches!(meta.side_effects, SideEffects::Mutating) {
-                maybe_checkpoint_per_tool(&name, &args);
+                maybe_checkpoint_per_tool_with_hooks(&name, &args).await;
             }
 
             // Stream a truncated preview of the result back to the CLI so the
@@ -2060,6 +2470,16 @@ pub async fn run_loop(
         tool_msg.blocks = tool_results;
         session.push(tool_msg);
 
+        // Live transcript compaction (P5.4 runtime wiring). With the freshly
+        // closed turn now appended, fold the oldest summarized turns into their
+        // summaries when the accumulated context has crossed the soft cap, so
+        // the NEXT iteration's `ChatRequest` is built from the compacted
+        // transcript and `PreCompress` fires for any configured hook. Runs
+        // BEFORE the cache-marker pass below so the breakpoints land on the
+        // post-compaction transcript. Below the cap (the default for short
+        // sessions) this is a no-op ⇒ byte-identical.
+        maybe_compact_session(session, opts).await;
+
         // Place a prompt-cache breakpoint at the freshly closed turn boundary
         // so the next iteration's `ChatRequest` (which re-sends the full
         // `session.snapshot()`) is billed against Anthropic's prompt cache
@@ -2084,6 +2504,16 @@ pub async fn run_loop(
             };
         }
     }
+    // Task 4: the loop exhausted its `max_turns` budget without the model
+    // settling on a tool-free final answer — the turn budget is the exhausted
+    // resource. Emit the `BudgetExhausted` pain bucket before propagating the
+    // error. Default-off ⇒ no event.
+    let agent_time_ms = u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    maybe_record_session_stop_telemetry(
+        origin_telemetry::SessionStopReason::BudgetExhausted,
+        agent_time_ms,
+        opts.max_turns,
+    );
     Err(LoopError::MaxTurns(opts.max_turns))
 }
 
@@ -2295,6 +2725,127 @@ mod cache_marker_tests {
     }
 }
 
+/// Fold a `content`-mode `Grep` result's `(file, line)` matches into the
+/// running exposure set (Task 1).
+///
+/// `result_json` is the serialized [`origin_tools::builtins::grep_tool`] result
+/// (`{"matches": [{"file": …, "line": …, …}, …]}`). Each match contributes a
+/// single-line [`ExposureWindow`] so a later `Grep` in the same `run_loop` can
+/// elide it. Non-`content` results carry no `matches` array and add nothing.
+/// Any parse failure is ignored — the model still received the full result, and
+/// missing exposures only mean a future re-run shows more, never less.
+///
+/// This is only ever called when `ORIGIN_AGENTGREP_TRUNCATE=1`; with the gate
+/// unset it is never reached, so the default loop is byte-identical.
+fn harvest_grep_exposure(
+    result_json: &str,
+    exposure: &mut Vec<origin_tools::builtins::grep_tool::ExposureWindow>,
+) {
+    use origin_tools::builtins::grep_tool::ExposureWindow;
+    let Ok(value) = serde_json::from_str::<Value>(result_json) else {
+        return;
+    };
+    let Some(matches) = value.get("matches").and_then(Value::as_array) else {
+        return;
+    };
+    for m in matches {
+        let (Some(file), Some(line)) = (
+            m.get("file").and_then(Value::as_str),
+            m.get("line").and_then(Value::as_u64),
+        ) else {
+            continue;
+        };
+        // De-dup exact repeats so a re-run over the same region doesn't grow the
+        // set unbounded across many turns.
+        let window = ExposureWindow {
+            file: file.to_string(),
+            start_line: line,
+            end_line: line,
+        };
+        if !exposure.contains(&window) {
+            exposure.push(window);
+        }
+    }
+}
+
+/// Parse and apply model-emitted prose edit blocks to disk (Task 2).
+///
+/// Only ever called when `ORIGIN_EDITFMT=1`. The model reached this path having
+/// emitted prose with no structured Edit tool call, so `origin_editfmt` is used
+/// to recover the intended edit: [`origin_editfmt::extract_all_hunks`]
+/// auto-detects the format (search/replace, diff-fenced, udiff, or whole-file,
+/// falling back to the model's best format) and yields normalized hunks. Each
+/// hunk is applied to the file it names via [`origin_editfmt::apply`] and the
+/// result written back.
+///
+/// `turn_mutated` is set to `true` if any hunk is successfully applied, so the
+/// optional end-of-turn shadow-git checkpoint snapshots the change exactly as it
+/// would for a structured Edit. Every failure (no parseable block, an empty or
+/// flag-like path, a missing/ambiguous match, or an I/O error) is logged and
+/// skipped — a malformed prose edit must never fail the turn.
+fn apply_prose_edits(text: &str, model: &str, turn_mutated: &mut bool) {
+    let hunks = match origin_editfmt::extract_all_hunks(text, model) {
+        Ok(h) => h,
+        Err(e) => {
+            // The common case (no edit block in the prose) lands here; keep it
+            // at debug so a chatty model doesn't spam warnings every turn.
+            tracing::debug!(error = %e, "editfmt: no applicable edit block in assistant prose");
+            return;
+        }
+    };
+    for hunk in hunks {
+        if apply_one_prose_hunk(&hunk) {
+            *turn_mutated = true;
+        }
+    }
+}
+
+/// Apply a single normalized [`origin_editfmt::Hunk`] to disk (Task 2 helper).
+///
+/// Returns `true` only when the file was successfully written. Every guard or
+/// failure (empty/flag-like path, unreadable target, no/ambiguous match, or a
+/// write error) is logged once and yields `false`, so a malformed prose edit
+/// can never fail the turn. The fallible work is funneled through
+/// [`try_apply_one_prose_hunk`] so this wrapper has a single log/return site.
+fn apply_one_prose_hunk(hunk: &origin_editfmt::Hunk) -> bool {
+    match try_apply_one_prose_hunk(hunk) {
+        Ok(()) => {
+            tracing::info!(file = %hunk.file, "editfmt: applied prose edit");
+            true
+        }
+        Err(reason) => {
+            tracing::warn!(file = %hunk.file, %reason, "editfmt: skipped prose edit");
+            false
+        }
+    }
+}
+
+/// Fallible core of [`apply_one_prose_hunk`]: validate, apply, and write.
+///
+/// Returns a short human reason on any guard/failure so the caller emits a
+/// single structured log line. Linear control flow via `?` keeps the cognitive
+/// complexity low.
+fn try_apply_one_prose_hunk(hunk: &origin_editfmt::Hunk) -> Result<(), String> {
+    if hunk.file.is_empty() {
+        return Err("no file path".to_string());
+    }
+    // Reuse the same flag-smuggling guard the autoformat path uses: refuse a
+    // path the OS could parse as an option.
+    if hunk.file.starts_with('-') {
+        return Err("path looks like a flag".to_string());
+    }
+    // Whole-file hunks (`before` empty) write `after` verbatim even when the
+    // file does not yet exist; in-place hunks need the current contents.
+    let original = if hunk.before.is_empty() {
+        String::new()
+    } else {
+        std::fs::read_to_string(&hunk.file).map_err(|e| format!("cannot read target: {e}"))?
+    };
+    let updated = origin_editfmt::apply(hunk, &original).map_err(|e| e.to_string())?;
+    std::fs::write(&hunk.file, updated).map_err(|e| format!("write failed: {e}"))?;
+    Ok(())
+}
+
 /// Rebuild entry-point invoked by the future IPC handler / git hook.
 ///
 /// P7.8 ships the free function; P10 wires it into the daemon's `Frame`
@@ -2319,11 +2870,11 @@ pub fn rebuild_codegraph(
 
 #[tracing::instrument(
     level = "info",
-    skip(args, cas, code_graph, mem_router, memory, coordinator),
+    skip(args, cas, code_graph, mem_router, memory, coordinator, grep_exposure),
     fields(kind = "tool", tool = meta.name)
 )]
 // dispatch arm-per-tool registry; splitting would obscure tool->arm mapping.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn dispatch_tool(
     meta: &ToolMeta,
     args: &Value,
@@ -2332,6 +2883,18 @@ async fn dispatch_tool(
     mem_router: Option<&dyn origin_codegraph::ask::MemRouter>,
     memory: Option<&dyn MemoryHandle>,
     coordinator: Option<&origin_swarm::Coordinator>,
+    // Task 1 (agentgrep exposure-truncation): already-seen `(file, line)`
+    // regions to elide from a `content`-mode `Grep`. `None` (every caller but
+    // the gated main-loop site) ⇒ the Grep arm passes `exposure: None`, so the
+    // result is byte-identical to before. Only consulted by `grep_v2` when
+    // `ORIGIN_AGENTGREP_TRUNCATE=1`.
+    grep_exposure: Option<&[origin_tools::builtins::grep_tool::ExposureWindow]>,
+    // Live skill catalog used by the `AuthorWorkflow` tool to build the
+    // `origin_workflowgen::SkillCatalog` it plans over. `None` (every caller but
+    // the main-loop site) ⇒ the `AuthorWorkflow` arm reports a clear
+    // "not configured" `ToolFailure`; no other arm consults it, so the result is
+    // byte-identical to before for every other tool.
+    skill_catalog: Option<&SkillCatalog>,
 ) -> Result<String, LoopError> {
     match meta.name {
         "Read" => {
@@ -2403,9 +2966,11 @@ async fn dispatch_tool(
                     .unwrap_or(0),
                 line_numbers: args.get("line_numbers").and_then(Value::as_bool).unwrap_or(false),
                 multiline: args.get("multiline").and_then(Value::as_bool).unwrap_or(false),
-                // Exposure-aware truncation is wired in a later step; the
-                // default-off path passes no exposure (byte-identical).
-                exposure: None,
+                // Task 1: thread the caller-supplied prior exposure so `grep_v2`
+                // can elide already-seen regions when `ORIGIN_AGENTGREP_TRUNCATE=1`.
+                // `grep_exposure` is `None` for every caller except the gated
+                // main-loop dispatch site, so the default path stays byte-identical.
+                exposure: grep_exposure.map(<[_]>::to_vec),
             };
             origin_tools::builtins::grep_tool::grep_v2(gargs)
                 .map(|v| serde_json::to_string(&v).expect("BUG: GrepResult always serializes"))
@@ -2964,8 +3529,108 @@ async fn dispatch_tool(
                 .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
             serde_json::to_string(&output).map_err(|e| LoopError::ToolFailure(format!("Task: json: {e}")))
         }
+        // ── Gmail (read-only; permission-gated) ──
+        // Loads Google creds from the keyvault, mints a token, and runs the
+        // requested op (search | get | list_threads). Mirrors WebFetch's error
+        // mapping: bad arguments → BadArgs, everything else → ToolFailure.
+        "gmail" => {
+            let a = origin_gmail::GmailArgs::from_value(args)
+                .map_err(|e| LoopError::BadArgs(e.to_string()))?;
+            origin_gmail::run_tool(a)
+                .await
+                .map_err(|e| LoopError::ToolFailure(e.to_string()))
+        }
+        // ── AuthorWorkflow (mutating; persists ~/.origin/workflows.toml) ──
+        // Synthesises a runnable workflow from a natural-language `goal` over the
+        // live skill catalog, persists it (replacing any same-named workflow),
+        // and returns the rendered TOML + chosen name so the model sees what it
+        // created. The result is then runnable via the existing `{workflow:<name>}`
+        // path, which this arm does not touch.
+        "AuthorWorkflow" => author_workflow_tool(args, skill_catalog),
         other => Err(LoopError::UnknownTool(other.into())),
     }
+}
+
+/// Execute the `AuthorWorkflow` tool.
+///
+/// Builds an [`origin_workflowgen::SkillCatalog`] from the live daemon skill
+/// catalog (mapping each skill → `SkillInfo { name, description }` using the
+/// SAME fully-qualified names the `Skill` tool accepts), authors + renders a
+/// workflow for `goal`, optionally overrides its name, persists it into
+/// `~/.origin/workflows.toml` (load → push-or-replace by name → atomic save),
+/// and returns the rendered TOML plus the chosen name.
+///
+/// Errors map to `BadArgs` (missing/empty `goal`) or `ToolFailure` (no skill
+/// catalog configured, authoring failure, or persistence I/O).
+fn author_workflow_tool(
+    args: &Value,
+    skill_catalog: Option<&SkillCatalog>,
+) -> Result<String, LoopError> {
+    let goal = args
+        .get("goal")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LoopError::BadArgs("AuthorWorkflow: missing `goal`".into()))?;
+    let override_name = args.get("name").and_then(Value::as_str);
+
+    let catalog = skill_catalog
+        .ok_or_else(|| LoopError::ToolFailure("AuthorWorkflow: skill catalog not configured".into()))?;
+
+    // Map the live skill catalog → the workflowgen catalog, preserving order so
+    // the deterministic planner's tie-breaks stay stable. The names are the
+    // fully-qualified `front.name`s the `Skill` tool (and `{workflow:<name>}`
+    // runner) accept verbatim.
+    let infos: Vec<origin_workflowgen::SkillInfo> = catalog
+        .iter()
+        .map(|s| origin_workflowgen::SkillInfo::new(s.front.name.clone(), s.front.description.clone()))
+        .collect();
+    let wf_catalog = origin_workflowgen::SkillCatalog::new(infos);
+
+    let (mut spec, mut toml) = origin_workflowgen::author_and_render(goal, &wf_catalog)
+        .map_err(|e| LoopError::ToolFailure(format!("AuthorWorkflow: {e}")))?;
+
+    // An explicit `name` overrides the auto-derived slug. Re-render so the
+    // returned TOML carries the chosen name too.
+    if let Some(name) = override_name.map(str::trim).filter(|n| !n.is_empty()) {
+        spec.name = name.to_string();
+        toml = spec
+            .to_toml()
+            .map_err(|e| LoopError::ToolFailure(format!("AuthorWorkflow: {e}")))?;
+    }
+    let chosen_name = spec.name.clone();
+
+    // Map WorkflowSpec → the daemon's on-disk Workflow (empty args → None) and
+    // persist: load existing file, replace any same-named workflow (else push),
+    // atomic save.
+    let workflow = crate::workflows::Workflow {
+        name: spec.name,
+        description: Some(spec.description),
+        steps: spec
+            .steps
+            .into_iter()
+            .map(|st| crate::workflows::WorkflowStep {
+                skill: st.skill,
+                args: if st.args.is_empty() { None } else { Some(st.args) },
+            })
+            .collect(),
+    };
+
+    let path = crate::workflows::path()
+        .map_err(|e| LoopError::ToolFailure(format!("AuthorWorkflow: resolve path: {e}")))?;
+    let mut file = crate::workflows::load_from(&path)
+        .map_err(|e| LoopError::ToolFailure(format!("AuthorWorkflow: load: {e}")))?;
+    if file.schema_version == 0 {
+        file.schema_version = crate::workflows::SCHEMA_VERSION;
+    }
+    match file.workflows.iter_mut().find(|w| w.name == chosen_name) {
+        Some(existing) => *existing = workflow,
+        None => file.workflows.push(workflow),
+    }
+    crate::workflows::save_to(&path, &file)
+        .map_err(|e| LoopError::ToolFailure(format!("AuthorWorkflow: save: {e}")))?;
+
+    Ok(format!(
+        "Authored workflow `{chosen_name}` (run with `{{workflow:{chosen_name}}}`):\n\n{toml}"
+    ))
 }
 
 /// The filesystem path a [`origin_browser::Verb`] asked the browser to write a
@@ -3368,6 +4033,13 @@ fn tool_activity_summary(name: &str, args: &Value) -> String {
             cmd.chars().take(80).collect()
         }
         "WebFetch" => args.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
+        // PII-safe preview: surface only the `op`, never the `query` (a Gmail
+        // search expression) or `id` — both can carry sensitive content.
+        "gmail" => args.get("op").and_then(Value::as_str).unwrap_or("").to_string(),
+        "AuthorWorkflow" => {
+            let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
+            goal.chars().take(60).collect()
+        }
         _ => {
             let s = args.to_string();
             s.chars().take(60).collect()
@@ -3949,7 +4621,7 @@ mod dispatch_table_tests {
         let empty = serde_json::Value::Object(serde_json::Map::new());
         let mut unrecognized: Vec<String> = Vec::new();
         for meta in registry_iter() {
-            let result = dispatch_tool(meta, &empty, None, None, None, None, None).await;
+            let result = dispatch_tool(meta, &empty, None, None, None, None, None, None, None).await;
             if let Err(LoopError::UnknownTool(name)) = &result {
                 unrecognized.push(name.clone());
             }
@@ -3969,7 +4641,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_explain")
             .expect("graph_explain registered");
         let args = serde_json::json!({"kind": "communities"});
-        let out = dispatch_tool(meta, &args, None, None, None, None, None)
+        let out = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
             .await
             .expect("communities dispatch");
         assert_eq!(out, "all detected communities");
@@ -3978,14 +4650,14 @@ mod dispatch_table_tests {
             "kind": "recent_changes",
             "args": {"since_ms": 1_700_000_000_000_i64}
         });
-        let out = dispatch_tool(meta, &args, None, None, None, None, None)
+        let out = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
             .await
             .expect("recent_changes dispatch");
         assert!(out.contains("1700000000000"), "got: {out}");
 
         // Unknown kind surfaces as BadArgs, not ToolFailure or UnknownTool.
         let args = serde_json::json!({"kind": "bogus"});
-        let err = dispatch_tool(meta, &args, None, None, None, None, None)
+        let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
             .await
             .expect_err("bogus must fail");
         assert!(matches!(err, LoopError::BadArgs(_)));
@@ -4010,7 +4682,7 @@ mod dispatch_table_tests {
             let meta = registry_iter()
                 .find(|m| m.name == name)
                 .unwrap_or_else(|| panic!("{name} not registered"));
-            let err = dispatch_tool(meta, &args, None, None, None, None, None)
+            let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
                 .await
                 .expect_err(name);
             match err {
@@ -4039,7 +4711,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_query")
             .expect("graph_query registered");
         let args = serde_json::json!({"kind": "communities"});
-        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None, None)
+        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None, None, None, None)
             .await
             .expect("graph_query dispatch");
         // Empty edge table yields an empty Partitions list.
@@ -4066,6 +4738,8 @@ mod dispatch_table_tests {
             Some(&null_router as &dyn origin_codegraph::ask::MemRouter),
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect("ask dispatch");
@@ -4083,7 +4757,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_rebuild")
             .expect("graph_rebuild registered");
         let args = serde_json::json!({"paths": []});
-        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None, None)
+        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None, None, None, None)
             .await
             .expect("graph_rebuild dispatch");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
@@ -4161,7 +4835,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "mem_search")
             .expect("mem_search registered");
         let args = serde_json::json!({"query": "anything"});
-        let err = dispatch_tool(meta, &args, None, None, None, None, None)
+        let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
             .await
             .expect_err("must fail without handle");
         match err {
@@ -4188,7 +4862,7 @@ mod dispatch_table_tests {
             "body": "the quick brown fox",
             "tags": ["test", "roundtrip"]
         });
-        let save_out = dispatch_tool(save_meta, &save_args, None, None, None, Some(&handle), None)
+        let save_out = dispatch_tool(save_meta, &save_args, None, None, None, Some(&handle), None, None, None)
             .await
             .expect("mem_save must succeed");
         let save_json: serde_json::Value =
@@ -4202,7 +4876,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "mem_search")
             .expect("mem_search registered");
         let search_args = serde_json::json!({"query": "quick brown", "k": 5});
-        let search_out = dispatch_tool(search_meta, &search_args, None, None, None, Some(&handle), None)
+        let search_out = dispatch_tool(search_meta, &search_args, None, None, None, Some(&handle), None, None, None)
             .await
             .expect("mem_search must succeed");
         let hits: serde_json::Value =
@@ -4235,7 +4909,7 @@ mod dispatch_table_tests {
             "goal": "do something",
             "allowed_tools": []
         });
-        let err = dispatch_tool(meta, &args, None, None, None, None, None)
+        let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
             .await
             .expect_err("Task without coordinator must fail");
         match err {
@@ -4289,7 +4963,7 @@ mod dispatch_table_tests {
             "allowed_tools": []
         });
 
-        let out = dispatch_tool(meta, &args, None, None, None, None, Some(coordinator.as_ref()))
+        let out = dispatch_tool(meta, &args, None, None, None, None, Some(coordinator.as_ref()), None, None)
             .await
             .expect("Task with coordinator must succeed");
 
@@ -4353,13 +5027,13 @@ mod wiring_tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Task 1: the checkpoint gate is OFF by default. With `ORIGIN_CHECKPOINTS`
-    /// unset, the gate reads false and `maybe_checkpoint_turn` performs no git
-    /// work (and must not panic).
-    #[test]
-    fn checkpoint_gate_off_by_default() {
+    /// unset, the gate reads false and `maybe_checkpoint_turn_with_hooks`
+    /// performs no git work and fires no commit hooks (and must not panic).
+    #[tokio::test]
+    async fn checkpoint_gate_off_by_default() {
         let enabled = std::env::var("ORIGIN_CHECKPOINTS").as_deref() == Ok("1");
         assert!(!enabled, "checkpoints must be opt-in via ORIGIN_CHECKPOINTS=1");
-        maybe_checkpoint_turn();
+        maybe_checkpoint_turn_with_hooks().await;
     }
 
     /// WS-S: the per-tool checkpoint gate is OFF by default and INDEPENDENT of
@@ -4606,6 +5280,163 @@ mod wiring_tests {
         let enabled = std::env::var("ORIGIN_NOTIFY").as_deref() == Ok("1");
         assert!(!enabled, "notifications must be opt-in via ORIGIN_NOTIFY=1");
         maybe_notify_completion();
+    }
+
+    /// AGENT-LOOP Task 1: the exposure-truncation gate is OFF by default, and
+    /// `harvest_grep_exposure` folds a `content`-mode result's `(file, line)`
+    /// matches into the running set, de-duping exact repeats and ignoring
+    /// non-`content` shapes.
+    #[test]
+    fn grep_exposure_truncate_gate_off_by_default_and_harvest_works() {
+        let enabled = std::env::var("ORIGIN_AGENTGREP_TRUNCATE").as_deref() == Ok("1");
+        assert!(
+            !enabled,
+            "exposure-truncation must be opt-in via ORIGIN_AGENTGREP_TRUNCATE=1"
+        );
+
+        let mut exposure: Vec<origin_tools::builtins::grep_tool::ExposureWindow> = Vec::new();
+        // A `files_with_matches`-shaped result has no `matches` array ⇒ no-op.
+        harvest_grep_exposure(r#"{"files":["a.rs"]}"#, &mut exposure);
+        assert!(exposure.is_empty(), "non-content result adds nothing");
+
+        // A `content`-shaped result contributes one window per (file, line).
+        let content = r#"{"matches":[
+            {"file":"src/a.rs","line":10,"text":"x"},
+            {"file":"src/a.rs","line":11,"text":"y"},
+            {"file":"src/b.rs","line":3,"text":"z"}
+        ]}"#;
+        harvest_grep_exposure(content, &mut exposure);
+        assert_eq!(exposure.len(), 3, "three distinct matches harvested");
+
+        // Re-harvesting the same matches de-dups (no unbounded growth).
+        harvest_grep_exposure(content, &mut exposure);
+        assert_eq!(exposure.len(), 3, "exact repeats are de-duped");
+
+        // Malformed JSON is ignored, not panicked on.
+        harvest_grep_exposure("not json", &mut exposure);
+        assert_eq!(exposure.len(), 3);
+
+        // The harvested windows are exactly what `grep_v2` consults to elide a
+        // re-run's already-seen lines.
+        assert!(exposure.iter().any(|w| w.file == "src/a.rs"
+            && w.start_line == 10
+            && w.end_line == 10));
+    }
+
+    /// AGENT-LOOP Task 2: the editfmt apply path is OFF by default, and when a
+    /// model emits a search/replace block in prose, `apply_prose_edits` parses
+    /// it via `origin_editfmt` and writes the edit to disk, flagging the turn as
+    /// mutated. Both halves of the round-trip (parse → apply) are exercised.
+    #[test]
+    fn editfmt_apply_gate_off_by_default_and_round_trips() {
+        let enabled = std::env::var("ORIGIN_EDITFMT").as_deref() == Ok("1");
+        assert!(!enabled, "editfmt must be opt-in via ORIGIN_EDITFMT=1");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("target.txt");
+        std::fs::write(&file, "let x = 1;\n").expect("seed file");
+
+        // A search/replace block naming the file (path on the line above).
+        let prose = format!(
+            "Here is the change you asked for:\n\n\
+             {}\n\
+             <<<<<<< SEARCH\n\
+             let x = 1;\n\
+             =======\n\
+             let x = 2;\n\
+             >>>>>>> REPLACE\n",
+            file.display()
+        );
+
+        let mut mutated = false;
+        apply_prose_edits(&prose, "claude-opus-4", &mut mutated);
+        assert!(mutated, "a successful prose edit flags the turn as mutated");
+        let after = std::fs::read_to_string(&file).expect("read back");
+        assert_eq!(after, "let x = 2;\n", "the edit was applied to disk");
+
+        // Plain prose with no edit block is a no-op (no parse, no mutation).
+        let mut mutated2 = false;
+        apply_prose_edits("just chatting, no edits here", "claude-opus-4", &mut mutated2);
+        assert!(!mutated2, "prose without an edit block changes nothing");
+    }
+
+    /// AGENT-LOOP Task 2: an edit block whose `before` text is absent in the
+    /// target leaves the file untouched and never flags a mutation (best-effort:
+    /// a no-match must not fail the turn).
+    #[test]
+    fn editfmt_apply_no_match_is_a_noop() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("nomatch.txt");
+        std::fs::write(&file, "original contents\n").expect("seed file");
+
+        let prose = format!(
+            "{}\n\
+             <<<<<<< SEARCH\n\
+             this text is not in the file\n\
+             =======\n\
+             replacement\n\
+             >>>>>>> REPLACE\n",
+            file.display()
+        );
+        let mut mutated = false;
+        apply_prose_edits(&prose, "claude-opus-4", &mut mutated);
+        assert!(!mutated, "a no-match apply must not flag a mutation");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read back"),
+            "original contents\n",
+            "the file is left untouched on a no-match"
+        );
+    }
+
+    /// AGENT-LOOP Task 3: the `gen_ai` usage record is callable unconditionally
+    /// and is a cheap no-op in the default (non-`otel`) build — it must not
+    /// panic and must not require the exporter to be installed.
+    #[test]
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "with `--features otel` the call is not const; the const no-op is build-specific"
+    )]
+    fn record_gen_ai_usage_is_a_noop_without_otel() {
+        origin_metrics::instruments::record_gen_ai_usage(
+            "anthropic",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6",
+            1_234,
+            567,
+            42.0,
+            3,
+        );
+        // Reaching here without a panic is the assertion.
+    }
+
+    /// AGENT-LOOP Task 4: session-stop pain telemetry is disabled by default
+    /// (no opt-in), so the helper drains nothing and writes no file. Also
+    /// verifies the `PainMetrics` it would build folds into a redactable event.
+    #[test]
+    fn session_stop_telemetry_disabled_by_default() {
+        let opt_in = std::env::var("ORIGIN_TELEMETRY").as_deref() == Ok("1");
+        assert!(!opt_in, "telemetry must be opt-in via ORIGIN_TELEMETRY=1");
+
+        // The disabled pipeline drains nothing even for a populated event.
+        let cfg = origin_telemetry::Config::from_env(false, false, 1.0);
+        assert!(!cfg.enabled);
+        let metrics = origin_telemetry::PainMetrics::new()
+            .with_stop_reason(origin_telemetry::SessionStopReason::Completed)
+            .with_agent_time_split(1_000, 0)
+            .with_turns(4, 4);
+        let event = metrics
+            .into_event("session_stop".to_string(), 0)
+            .expect("pain metrics serialize");
+        let mut pipe = origin_telemetry::Pipeline::new(cfg);
+        pipe.record(event);
+        assert!(pipe.drain().is_empty(), "disabled pipeline emits no lines");
+
+        // No-op with the gate off (no panic, no file).
+        maybe_record_session_stop_telemetry(
+            origin_telemetry::SessionStopReason::BudgetExhausted,
+            5_000,
+            8,
+        );
     }
 
     /// cmdparse cmd-guard: with `ORIGIN_CMD_GUARD` unset (the default) even a

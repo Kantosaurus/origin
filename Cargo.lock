@@ -3843,6 +3843,7 @@ dependencies = [
  "origin-daemon",
  "origin-doctor",
  "origin-export",
+ "origin-gmail",
  "origin-goal",
  "origin-hooks",
  "origin-i18n",
@@ -3877,6 +3878,7 @@ dependencies = [
  "origin-voice",
  "origin-watch",
  "origin-websearch",
+ "origin-workflowgen",
  "parking_lot",
  "rand 0.8.6",
  "reqwest",
@@ -3994,6 +3996,7 @@ dependencies = [
  "origin-cost",
  "origin-editfmt",
  "origin-export",
+ "origin-gmail",
  "origin-goal",
  "origin-hooks",
  "origin-ipc",
@@ -4026,15 +4029,18 @@ dependencies = [
  "origin-router",
  "origin-runtime",
  "origin-schedule",
+ "origin-selfdev",
  "origin-sidecar",
  "origin-skills",
  "origin-store",
  "origin-stream",
+ "origin-supervisor",
  "origin-swarm",
  "origin-telemetry",
  "origin-tools",
  "origin-trace",
  "origin-vcs",
+ "origin-workflowgen",
  "parking_lot",
  "proptest",
  "rand 0.8.6",
@@ -4078,6 +4084,19 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "origin-gmail"
+version = "0.0.1"
+dependencies = [
+ "base64 0.22.1",
+ "origin-keyvault",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -4530,6 +4549,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "wiremock",
 ]
 
@@ -4641,6 +4661,16 @@ version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "origin-selfdev"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 
@@ -4789,10 +4819,12 @@ dependencies = [
  "origin-cas",
  "origin-codegraph",
  "origin-core",
+ "origin-gmail",
  "origin-plan",
  "origin-sandbox",
  "origin-store",
  "origin-swarm",
+ "origin-workflowgen",
  "pdf-extract",
  "proptest",
  "regex",
@@ -4879,6 +4911,16 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "origin-workflowgen"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "toml 0.8.23",
 ]
 
 [[package]]

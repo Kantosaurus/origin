@@ -28,7 +28,7 @@ use origin_swarm::{CompletionReport, ReportStatus, Usage, WorkerContext, WorkerF
 use origin_tools::ToolMeta;
 use tokio::sync::RwLock;
 
-use crate::agent::{run_loop, LoopOptions};
+use crate::agent::{run_loop, scope_swarm_collab, LoopOptions, SwarmCollab};
 use crate::session::Session;
 
 /// The daemon's live provider handle (swappable via `/account`). The worker
@@ -102,7 +102,29 @@ async fn run_worker(
     };
 
     let goal = ctx.spec.goal.clone();
-    let report = match run_loop(&mut session, &goal, provider.as_ref(), &prompter, &opts).await {
+    // Real-time swarm collaboration (WS-L, jcode L238). When the coordinator
+    // handed this worker a collab handle (only when `ORIGIN_SWARM_COLLAB` was
+    // set at coordinator construction), install it as the daemon's per-worker
+    // task-local for the duration of `run_loop`: the per-tool hook then records
+    // this worker's reads/edits and pushes a file-shift notice into the mailbox
+    // of every sibling that had read a path this worker just edited. When the
+    // handle is absent (the default) we call the bare `run_loop`, so the loop
+    // sees an unset task-local and behaves exactly as before — byte-identical.
+    let run = async {
+        run_loop(&mut session, &goal, provider.as_ref(), &prompter, &opts).await
+    };
+    let loop_result = match ctx.collab.clone() {
+        Some(wc) => {
+            let collab = SwarmCollab {
+                worker_id: wc.worker_id,
+                registry: wc.registry,
+                mailboxes: Some(wc.mailboxes),
+            };
+            scope_swarm_collab(collab, run).await
+        }
+        None => run.await,
+    };
+    let report = match loop_result {
         Ok(summary) => CompletionReport {
             goal,
             status: ReportStatus::Completed,

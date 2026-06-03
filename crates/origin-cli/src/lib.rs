@@ -32,6 +32,7 @@ pub mod voice;
 pub mod watch;
 pub mod editor;
 pub mod first_run_prompt;
+pub mod gaps_cmds;
 pub mod goal_render;
 pub mod headless;
 pub mod import;

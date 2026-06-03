@@ -74,6 +74,8 @@ origin-bench    = { path = "../origin-bench" }
 origin-review   = { path = "../origin-review" }
 origin-notify   = { path = "../origin-notify" }
 origin-multimodal = { path = "../origin-multimodal" }
+origin-gmail    = { path = "../origin-gmail" }
+origin-workflowgen = { path = "../origin-workflowgen" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 which = "8"
 rand = "0.8"

@@ -60,6 +60,29 @@ impl Editor {
         self.cursor
     }
 
+    /// The cursor position as a **character** count (not byte offset).
+    ///
+    /// The opt-in vim layer reasons in character units (its motions operate on
+    /// `chars().count()`), so this and [`set_cursor_chars`](Self::set_cursor_chars)
+    /// are the char-indexed bridge between the vim reducer and the byte-indexed
+    /// editor cursor.
+    #[must_use]
+    pub fn cursor_chars(&self) -> usize {
+        self.buffer[..self.cursor].chars().count()
+    }
+
+    /// Set the cursor from a **character** index, clamped to `0..=len_chars` and
+    /// snapped to the matching UTF-8 byte boundary. Used by the vim layer to map
+    /// a char-indexed motion result back onto the byte-indexed cursor.
+    pub fn set_cursor_chars(&mut self, char_idx: usize) {
+        self.cursor = self
+            .buffer
+            .char_indices()
+            .map(|(i, _)| i)
+            .nth(char_idx)
+            .unwrap_or(self.buffer.len());
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
