@@ -84,6 +84,12 @@ pub mod otel {
 
         global::set_meter_provider(provider.clone());
 
+        // Now that the real meter provider is the process global, (re)bind the
+        // GenAI metric instruments so daemon recordings via
+        // `crate::instruments::record_gen_ai_usage` land on this OTLP pipeline
+        // instead of the no-op provider that was current before install.
+        crate::instruments::init_instruments();
+
         // Best-effort: also stand up the trace (span) pipeline against the same
         // endpoint and install it as the global tracer provider. A failure here
         // must not tear down the already-installed metrics pipeline, so the

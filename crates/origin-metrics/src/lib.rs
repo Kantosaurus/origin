@@ -25,6 +25,7 @@
 //! threshold the plan calls for.
 
 pub mod exporter;
+pub mod instruments;
 pub mod keys;
 
 use std::collections::HashMap;
