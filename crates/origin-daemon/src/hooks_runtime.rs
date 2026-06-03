@@ -110,3 +110,17 @@ pub async fn global() -> Option<Arc<HooksState>> {
     static CELL: OnceCell<Option<Arc<HooksState>>> = OnceCell::const_new();
     CELL.get_or_init(HooksState::build).await.clone()
 }
+
+/// Fire `event` through the process-wide hooks runtime, ignoring the override.
+///
+/// Convenience for the informational lifecycle points (`SessionStart`,
+/// `SessionEnd`, `PreCommit`, `PostCommit`) whose callers do not act on a hook's
+/// `Allow`/`Deny`/`Mutate` decision. It resolves [`global`] and dispatches via
+/// the same [`HooksState::fire`] mechanism the agent loop uses for `PrePrompt` /
+/// `PreTool`; with no `hooks.json` configured (the default) [`global`] is `None`
+/// and this is a no-op — byte-identical to never calling it.
+pub async fn fire_global(event: &LifecycleEvent) {
+    if let Some(h) = global().await {
+        let _ = h.fire(event).await;
+    }
+}

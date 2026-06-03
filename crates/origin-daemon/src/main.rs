@@ -1198,6 +1198,19 @@ fn spawn_handler_task(
                 }
             }
         }
+
+        // Lifecycle `SessionEnd` hook (gemini `SessionEnd`): the per-connection
+        // message loop has exited — the client disconnected or the connection
+        // was torn down — so any session this connection drove is closing. We
+        // fire it once here (the loop's single exit point), and only when this
+        // connection actually bound a session id via at least one `Prompt`, so
+        // a connection that only issued admin verbs (or none) does not emit a
+        // spurious end. Routed through the same process-wide hooks runtime as
+        // `SessionStart`; a no-op without `~/.origin/hooks.json` (the default).
+        if last_known_session_id.lock().await.is_some() {
+            origin_daemon::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::SessionEnd)
+                .await;
+        }
     });
 }
 
@@ -1457,6 +1470,20 @@ async fn handle_request(
     // connection can checkpoint without waiting for the first iteration
     // to complete.
     *last_known_session_id.lock().await = Some(session.id.clone());
+
+    // Lifecycle `SessionStart` hook (gemini `SessionStart`): fire once when a
+    // session is first prompted — i.e. it has no prior persisted history. A
+    // resumed session (the branch above that replays stored messages) is NOT a
+    // fresh start, so we gate on the empty transcript to avoid re-firing on
+    // every continuation prompt. Informational; routed through the same
+    // process-wide hooks runtime as `PrePrompt`/`PreTool`. With no
+    // `~/.origin/hooks.json` (the default) this is a no-op ⇒ byte-identical.
+    let is_new_session = session.messages.is_empty();
+    if is_new_session {
+        origin_daemon::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::SessionStart)
+            .await;
+    }
+
     let (tx_sub, mut rx_sub) = mpsc::channel::<Subscriber>(1);
     let conn_for_relay = Arc::clone(conn);
     let relay_handle: tokio::task::JoinHandle<()> = spawn_in(TaskClass::Realtime, async move {

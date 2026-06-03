@@ -57,10 +57,12 @@ impl origin_vcs::GitRunner for CmdGit {
 /// swallowed: a checkpoint must never fail the turn that produced it. The
 /// caller-supplied `label` becomes the checkpoint's commit subject, so it is
 /// what distinguishes entries in `origin checkpoints`.
-fn checkpoint_with_label(label: &str) {
-    let Ok(cwd) = std::env::current_dir() else {
-        return;
-    };
+///
+/// Returns the created checkpoint's commit `id` (the shadow-git SHA) on success
+/// so the caller can fire a `PostCommit` hook with it; `None` when the snapshot
+/// could not be taken (no cwd / git failure — both already logged + swallowed).
+fn checkpoint_with_label(label: &str) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
     let shadow_dir = cwd.join(".origin").join("shadow.git");
     let shadow = shadow_dir.to_string_lossy().into_owned();
     let now_ms = std::time::SystemTime::now()
@@ -68,19 +70,56 @@ fn checkpoint_with_label(label: &str) {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     let runner = CmdGit;
     let sg = origin_vcs::ShadowGit::new(&runner, shadow);
-    if let Err(e) = sg.snapshot(label, now_ms) {
-        tracing::debug!(error = %e, "shadow-git checkpoint failed (ignored)");
+    match sg.snapshot(label, now_ms) {
+        Ok(checkpoint) => Some(checkpoint.id),
+        Err(e) => {
+            tracing::debug!(error = %e, "shadow-git checkpoint failed (ignored)");
+            None
+        }
     }
 }
 
-/// Best-effort per-turn shadow-git checkpoint. No-op unless
-/// `ORIGIN_CHECKPOINTS=1`. Every failure is swallowed — a checkpoint must
-/// never fail the turn that produced it. Default-off ⇒ byte-identical behavior.
-fn maybe_checkpoint_turn() {
+/// Fire `PreCommit` (informational), take a shadow-git checkpoint via
+/// [`checkpoint_with_label`], then fire `PostCommit` with the resulting SHA.
+///
+/// This is the live `PreCommit`/`PostCommit` firing site: the daemon's only
+/// "commit" operation at runtime is the optional shadow-git checkpoint, so the
+/// commit hooks bracket exactly that write. The hooks are informational (their
+/// overrides are ignored) and `PostCommit` is fired only when a checkpoint was
+/// actually created. With no `hooks.json` (the default) [`fire_global`] is a
+/// no-op, so this differs from the bare [`checkpoint_with_label`] only by the
+/// two no-op awaits — byte-identical observable behavior.
+///
+/// The shadow-git checkpoint is a standalone repo with no user-facing branch;
+/// `PreCommit.branch` carries the checkpoint `label` as the closest available
+/// "what is being committed" string.
+async fn checkpoint_with_commit_hooks(label: &str) -> Option<String> {
+    crate::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::PreCommit {
+        branch: label.to_string(),
+    })
+    .await;
+    let sha = checkpoint_with_label(label);
+    if let Some(sha) = sha.as_ref() {
+        crate::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::PostCommit {
+            sha: sha.clone(),
+        })
+        .await;
+    }
+    sha
+}
+
+/// Per-turn shadow-git checkpoint that brackets the snapshot with the
+/// `PreCommit`/`PostCommit` lifecycle hooks (see [`checkpoint_with_commit_hooks`]).
+///
+/// No-op unless `ORIGIN_CHECKPOINTS=1` — the per-turn checkpoint gate. This is
+/// the hook-firing async counterpart used by the live loop. The
+/// commit hooks fire only inside the gated branch, so when checkpoints are off
+/// (the default) no hook fires and behavior is byte-identical.
+async fn maybe_checkpoint_turn_with_hooks() {
     if std::env::var("ORIGIN_CHECKPOINTS").as_deref() != Ok("1") {
         return;
     }
-    checkpoint_with_label("turn");
+    let _ = checkpoint_with_commit_hooks("turn").await;
 }
 
 /// Whether the per-tool-use checkpoint feature is enabled.
@@ -91,6 +130,70 @@ fn maybe_checkpoint_turn() {
 /// snapshots. Unset (the default) ⇒ `false` ⇒ byte-identical behavior.
 fn per_tool_checkpoints_enabled() -> bool {
     std::env::var("ORIGIN_CHECKPOINTS_PER_TOOL").as_deref() == Ok("1")
+}
+
+/// The transcript-byte soft cap above which the live in-loop compactor folds the
+/// oldest summarized turns into their summaries (firing `PreCompress`).
+///
+/// Defaults to [`crate::compactor::DEFAULT_SOFT_CAP_BYTES`] (200 KiB). The
+/// `ORIGIN_COMPACT_SOFT_CAP` env var overrides it with a decimal byte count for
+/// tuning/tests; an unset or unparseable value falls back to the default. The
+/// default cap is large enough that a short interactive session never reaches
+/// it, so the live compaction call-site is a no-op (byte-identical) by default.
+fn compaction_soft_cap() -> usize {
+    std::env::var("ORIGIN_COMPACT_SOFT_CAP")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(crate::compactor::DEFAULT_SOFT_CAP_BYTES)
+}
+
+/// Live, in-loop transcript compaction (P5.4 runtime wiring).
+///
+/// Called once per agentic turn AFTER the freshly-closed turn is appended, so
+/// the NEXT turn's `ChatRequest` is built from the compacted transcript. When
+/// the accumulated context crosses [`compaction_soft_cap`], it folds the oldest
+/// summarized turns into their summaries via
+/// [`crate::compactor::maybe_compact_transcript`] (which fires the `PreCompress`
+/// lifecycle hook) and replaces `session.messages` with the result.
+///
+/// Summaries come from the wired [`SessionStore`] (eager per-turn summaries,
+/// P5.2) keyed by `turn_index == message index`. When no store is wired, an
+/// empty-summary vector is passed: the cap check + `PreCompress` fire still
+/// happen, but no turn has a summary so the transcript is returned unchanged.
+///
+/// **Default-off / byte-identical:** below the (200 KiB) cap this returns
+/// immediately without firing the hook or touching `session.messages`, so a
+/// short session is unaffected. Compaction never errors — a missing summary just
+/// leaves that turn intact.
+async fn maybe_compact_session(session: &mut Session, opts: &LoopOptions) {
+    let cap = compaction_soft_cap();
+    // Cheap pre-check before building the summaries vector: if we are under the
+    // cap there is nothing to do and we must not allocate or fire a hook.
+    if crate::compactor::estimate_transcript_bytes(&session.messages) <= cap {
+        return;
+    }
+    // Build the per-message summary vector aligned to `session.messages` by
+    // index. Eager summaries (P5.2) are keyed by `turn_index`; we materialize a
+    // dense `Vec<Option<String>>` so `compact` can index it directly. Absent a
+    // store (the live `LoopOptions` default) every entry is `None`.
+    let mut summaries: Vec<Option<String>> = vec![None; session.messages.len()];
+    if let Some(store) = opts.session_store.as_ref() {
+        if let Ok(rows) = store.load_summaries(&session.id) {
+            for (turn_index, summary) in rows {
+                if let Some(slot) = usize::try_from(turn_index)
+                    .ok()
+                    .and_then(|i| summaries.get_mut(i))
+                {
+                    *slot = summary;
+                }
+            }
+        }
+    }
+    if let Some(compacted) =
+        crate::compactor::maybe_compact_transcript(&session.messages, &summaries, cap).await
+    {
+        session.messages = compacted;
+    }
 }
 
 /// Build the commit-subject label for a per-tool checkpoint.
@@ -108,20 +211,21 @@ fn per_tool_checkpoint_label(tool: &str, edited: &[String]) -> String {
     }
 }
 
-/// Best-effort per-tool-use shadow-git checkpoint (cline L163 follow-up).
+/// Best-effort per-tool-use shadow-git checkpoint (cline L163 follow-up),
+/// bracketed by the `PreCommit`/`PostCommit` lifecycle hooks.
 ///
 /// No-op unless `ORIGIN_CHECKPOINTS_PER_TOOL=1`. Called after a SUCCESSFUL
 /// mutating tool dispatch with the tool name and its parsed args; snapshots the
-/// workspace via the same [`checkpoint_with_label`] machinery the per-turn path
-/// uses, labelled by [`per_tool_checkpoint_label`] so the entries are
+/// workspace via the [`checkpoint_with_commit_hooks`] machinery the per-turn
+/// path also uses, labelled by [`per_tool_checkpoint_label`] so the entries are
 /// distinguishable. Every failure is swallowed and the gate is default-off, so
-/// the default code path is byte-identical.
-fn maybe_checkpoint_per_tool(tool: &str, args: &Value) {
+/// the default code path — and the commit hooks — are byte-identical.
+async fn maybe_checkpoint_per_tool_with_hooks(tool: &str, args: &Value) {
     if !per_tool_checkpoints_enabled() {
         return;
     }
     let edited = edited_paths_from_tool(tool, args);
-    checkpoint_with_label(&per_tool_checkpoint_label(tool, &edited));
+    let _ = checkpoint_with_commit_hooks(&per_tool_checkpoint_label(tool, &edited)).await;
 }
 
 /// DENY-ONLY governance overlay (Task 3).
@@ -237,17 +341,18 @@ fn apply_read_only_overlay(
 /// Best-effort end-of-turn / loop-end side effects.
 ///
 /// Each sub-step is independently env-gated or feature-gated and default-off:
-/// - `ORIGIN_CHECKPOINTS=1` ⇒ shadow-git snapshot, only if `mutated`.
 /// - `ORIGIN_TELEMETRY=1` ⇒ append one redacted JSONL `turn` event.
 /// - `ORIGIN_NOTIFY=1` ⇒ spawn a desktop completion notification.
 /// - `--features otel` + `ORIGIN_OTLP_ENDPOINT` ⇒ the `gen_ai` usage record
 ///   lands on the OTLP pipeline (a const no-op in the default build).
 ///
+/// The `ORIGIN_CHECKPOINTS=1` shadow-git snapshot is fired separately by the
+/// caller via [`maybe_checkpoint_turn_with_hooks`] (it is async because it
+/// brackets the snapshot with the `PreCommit`/`PostCommit` lifecycle hooks).
+///
 /// With no env flags / features set (the default) this function does nothing
 /// observable, so default behavior and every existing test stay byte-identical.
-#[allow(clippy::too_many_arguments)]
 fn run_turn_end_effects(
-    mutated: bool,
     provider: &str,
     model: &str,
     input_tokens: u64,
@@ -255,9 +360,6 @@ fn run_turn_end_effects(
     latency_ms: f64,
     tool_calls: u64,
 ) {
-    if mutated {
-        maybe_checkpoint_turn();
-    }
     maybe_record_turn_telemetry(provider, model, input_tokens, output_tokens);
     maybe_notify_completion();
     // Task 3 (gen_ai metrics emit). Unconditional by design: this is a cheap
@@ -1713,8 +1815,14 @@ pub async fn run_loop(
             // default-off (env- or feature-gated); none can fail the turn.
             let agent_time_ms =
                 u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            // Per-turn shadow-git checkpoint, bracketed by the PreCommit/PostCommit
+            // lifecycle hooks. Fired only when this loop mutated the workspace and
+            // `ORIGIN_CHECKPOINTS=1`; with the gate unset (the default) it — and
+            // the commit hooks — are a no-op, so behavior is byte-identical.
+            if turn_mutated {
+                maybe_checkpoint_turn_with_hooks().await;
+            }
             run_turn_end_effects(
-                turn_mutated,
                 provider.name(),
                 &session.model,
                 total_input_tokens,
@@ -2053,9 +2161,11 @@ pub async fn run_loop(
             // tools produce a snapshot, and only when ORIGIN_CHECKPOINTS_PER_TOOL
             // is set — independent of the per-turn ORIGIN_CHECKPOINTS gate, so
             // per-turn stays the default granularity. Best-effort and
-            // default-off ⇒ byte-identical when the gate is unset.
+            // default-off ⇒ byte-identical when the gate is unset. The snapshot
+            // is bracketed by the PreCommit/PostCommit lifecycle hooks, which
+            // also no-op without a configured hooks.json.
             if matches!(meta.side_effects, SideEffects::Mutating) {
-                maybe_checkpoint_per_tool(&name, &args);
+                maybe_checkpoint_per_tool_with_hooks(&name, &args).await;
             }
 
             // Stream a truncated preview of the result back to the CLI so the
@@ -2199,6 +2309,16 @@ pub async fn run_loop(
         let mut tool_msg = Message::new(Role::Tool);
         tool_msg.blocks = tool_results;
         session.push(tool_msg);
+
+        // Live transcript compaction (P5.4 runtime wiring). With the freshly
+        // closed turn now appended, fold the oldest summarized turns into their
+        // summaries when the accumulated context has crossed the soft cap, so
+        // the NEXT iteration's `ChatRequest` is built from the compacted
+        // transcript and `PreCompress` fires for any configured hook. Runs
+        // BEFORE the cache-marker pass below so the breakpoints land on the
+        // post-compaction transcript. Below the cap (the default for short
+        // sessions) this is a no-op ⇒ byte-identical.
+        maybe_compact_session(session, opts).await;
 
         // Place a prompt-cache breakpoint at the freshly closed turn boundary
         // so the next iteration's `ChatRequest` (which re-sends the full
@@ -4633,13 +4753,13 @@ mod wiring_tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Task 1: the checkpoint gate is OFF by default. With `ORIGIN_CHECKPOINTS`
-    /// unset, the gate reads false and `maybe_checkpoint_turn` performs no git
-    /// work (and must not panic).
-    #[test]
-    fn checkpoint_gate_off_by_default() {
+    /// unset, the gate reads false and `maybe_checkpoint_turn_with_hooks`
+    /// performs no git work and fires no commit hooks (and must not panic).
+    #[tokio::test]
+    async fn checkpoint_gate_off_by_default() {
         let enabled = std::env::var("ORIGIN_CHECKPOINTS").as_deref() == Ok("1");
         assert!(!enabled, "checkpoints must be opt-in via ORIGIN_CHECKPOINTS=1");
-        maybe_checkpoint_turn();
+        maybe_checkpoint_turn_with_hooks().await;
     }
 
     /// WS-S: the per-tool checkpoint gate is OFF by default and INDEPENDENT of
