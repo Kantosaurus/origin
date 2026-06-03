@@ -12,7 +12,7 @@ use origin_codegraph::index::CodeGraphIndex;
 use origin_core::types::Role;
 use origin_daemon::agent::{LoopOptions, SessionStoreSummaryDeliverer};
 use origin_daemon::auth::BearerStore;
-use origin_daemon::config::bearer_ttl_secs;
+use origin_daemon::config::{bearer_ttl_secs, governance_path, load_governance, Governance};
 use origin_daemon::memory_wiring::MemoryWiring;
 use origin_daemon::pairing::{Pairing, RedeemResult};
 use origin_daemon::plan_bus::PlanBus;
@@ -545,6 +545,26 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
         "workflows catalog loaded at startup"
     );
 
+    // Optional governance config (5-tier policy engine + per-prompt ConSeca
+    // security policy). Loaded once at startup from `governance.toml`. When the
+    // file is absent both handles are `None` ⇒ the deny-only overlay is inert
+    // and daemon behavior is byte-identical to before this wiring landed.
+    let governance: Governance = {
+        let path = governance_path();
+        match load_governance(&path) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "governance config load failed; running with no governance overlay");
+                Governance::default()
+            }
+        }
+    };
+    info!(
+        policy = governance.policy.is_some(),
+        conseca = governance.conseca.is_some(),
+        "governance config loaded at startup"
+    );
+
     spawn_idle_consolidator(memory.as_ref());
 
     // P11.12: optional bounded-cardinality Prometheus `/metrics` endpoint.
@@ -632,6 +652,7 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
             plan_bus.clone(),
             Arc::clone(&skill_catalog),
             Arc::clone(&workflows_catalog),
+            governance.clone(),
             Arc::clone(&code_graph),
             Arc::clone(&mem_router),
             Arc::clone(&coordinator),
@@ -732,6 +753,7 @@ fn spawn_handler_task(
     plan_bus: PlanBus,
     skill_catalog: Arc<SkillCatalog>,
     workflows_catalog: Arc<origin_daemon::workflows::WorkflowsFile>,
+    governance: Governance,
     code_graph: Arc<tokio::sync::Mutex<CodeGraphIndex>>,
     mem_router: Arc<dyn origin_codegraph::ask::MemRouter>,
     coordinator: Arc<Coordinator>,
@@ -847,6 +869,7 @@ fn spawn_handler_task(
                         Arc::clone(&permission_registry),
                         Arc::clone(&skill_catalog),
                         Arc::clone(&workflows_catalog),
+                        governance.clone(),
                         Arc::clone(&active_skills),
                         Arc::clone(&code_graph),
                         Arc::clone(&mem_router),
@@ -1391,6 +1414,7 @@ async fn handle_request(
     permission_registry: Arc<PermissionRegistry>,
     skill_catalog: Arc<SkillCatalog>,
     workflows_catalog: Arc<origin_daemon::workflows::WorkflowsFile>,
+    governance: Governance,
     active_skills: Arc<tokio::sync::Mutex<SkillRegistry>>,
     code_graph: Arc<tokio::sync::Mutex<CodeGraphIndex>>,
     mem_router: Arc<dyn origin_codegraph::ask::MemRouter>,
@@ -1520,11 +1544,13 @@ async fn handle_request(
             // ^ per-connection goal slot. When `Some(Active|Verifying)` the
             // `run_loop` body renders an `<origin-goal>` block on each turn;
             // the post-loop driver below decides verify-vs-iterate-vs-clear.
-            policy: None,
-            conseca: None,
-            // ^ DENY-ONLY governance overlay (Task 3). Wired as fields but left
-            // `None` here so default daemon behavior is unchanged; a future
-            // admin-config path can populate these to narrow tool access.
+            policy: governance.policy.clone(),
+            conseca: governance.conseca.clone(),
+            // ^ DENY-ONLY governance overlay (Task 3). Populated from
+            // `governance.toml` at startup (see `config::load_governance`). When
+            // that file is absent both are `None` ⇒ default daemon behavior is
+            // byte-identical; when present they narrow (never widen) tool access
+            // via the deny-only `apply_governance_overlay` in `agent.rs`.
             effort: req
                 .effort
                 .as_deref()

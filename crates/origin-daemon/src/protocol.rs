@@ -564,6 +564,7 @@ pub enum ServerMessage {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic)]
 mod permission_wire_tests {
     use super::*;
 

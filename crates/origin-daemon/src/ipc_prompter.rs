@@ -119,6 +119,7 @@ impl Prompter for IpcPrompter {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic)]
 mod tests {
     use std::sync::Arc;
 
