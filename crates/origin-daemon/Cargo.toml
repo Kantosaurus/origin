@@ -81,6 +81,8 @@ origin-ambient          = { path = "../origin-ambient" }
 origin-editfmt          = { path = "../origin-editfmt" }
 origin-hooks            = { path = "../origin-hooks" }
 origin-migrate          = { path = "../origin-migrate" }
+origin-gmail            = { path = "../origin-gmail" }
+origin-workflowgen      = { path = "../origin-workflowgen" }
 ctrlc                   = "3"
 dirs                    = "5"
 which                   = "8"

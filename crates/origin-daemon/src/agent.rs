@@ -1208,7 +1208,7 @@ impl SpeculativeRegistry {
             // through the main dispatch path. Task is Mutating so it never
             // speculatively dispatches anyway; the None for coordinator here
             // is API consistency.
-            let text = dispatch_tool(meta, &args, cas.as_deref(), None, None, None, None, None).await?;
+            let text = dispatch_tool(meta, &args, cas.as_deref(), None, None, None, None, None, None).await?;
             Ok::<_, LoopError>(text.into_bytes())
         });
         self.in_flight.insert(tool_use_id, handle);
@@ -2261,6 +2261,7 @@ pub async fn run_loop(
                         opts.memory_handle.as_deref(),
                         opts.coordinator.as_deref(),
                         exposure_arg,
+                        opts.skill_catalog.as_deref(),
                     )
                     .await
                     {
@@ -2885,6 +2886,12 @@ async fn dispatch_tool(
     // result is byte-identical to before. Only consulted by `grep_v2` when
     // `ORIGIN_AGENTGREP_TRUNCATE=1`.
     grep_exposure: Option<&[origin_tools::builtins::grep_tool::ExposureWindow]>,
+    // Live skill catalog used by the `AuthorWorkflow` tool to build the
+    // `origin_workflowgen::SkillCatalog` it plans over. `None` (every caller but
+    // the main-loop site) ⇒ the `AuthorWorkflow` arm reports a clear
+    // "not configured" `ToolFailure`; no other arm consults it, so the result is
+    // byte-identical to before for every other tool.
+    skill_catalog: Option<&SkillCatalog>,
 ) -> Result<String, LoopError> {
     match meta.name {
         "Read" => {
@@ -3519,8 +3526,108 @@ async fn dispatch_tool(
                 .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
             serde_json::to_string(&output).map_err(|e| LoopError::ToolFailure(format!("Task: json: {e}")))
         }
+        // ── Gmail (read-only; permission-gated) ──
+        // Loads Google creds from the keyvault, mints a token, and runs the
+        // requested op (search | get | list_threads). Mirrors WebFetch's error
+        // mapping: bad arguments → BadArgs, everything else → ToolFailure.
+        "gmail" => {
+            let a = origin_gmail::GmailArgs::from_value(args)
+                .map_err(|e| LoopError::BadArgs(e.to_string()))?;
+            origin_gmail::run_tool(a)
+                .await
+                .map_err(|e| LoopError::ToolFailure(e.to_string()))
+        }
+        // ── AuthorWorkflow (mutating; persists ~/.origin/workflows.toml) ──
+        // Synthesises a runnable workflow from a natural-language `goal` over the
+        // live skill catalog, persists it (replacing any same-named workflow),
+        // and returns the rendered TOML + chosen name so the model sees what it
+        // created. The result is then runnable via the existing `{workflow:<name>}`
+        // path, which this arm does not touch.
+        "AuthorWorkflow" => author_workflow_tool(args, skill_catalog),
         other => Err(LoopError::UnknownTool(other.into())),
     }
+}
+
+/// Execute the `AuthorWorkflow` tool.
+///
+/// Builds an [`origin_workflowgen::SkillCatalog`] from the live daemon skill
+/// catalog (mapping each skill → `SkillInfo { name, description }` using the
+/// SAME fully-qualified names the `Skill` tool accepts), authors + renders a
+/// workflow for `goal`, optionally overrides its name, persists it into
+/// `~/.origin/workflows.toml` (load → push-or-replace by name → atomic save),
+/// and returns the rendered TOML plus the chosen name.
+///
+/// Errors map to `BadArgs` (missing/empty `goal`) or `ToolFailure` (no skill
+/// catalog configured, authoring failure, or persistence I/O).
+fn author_workflow_tool(
+    args: &Value,
+    skill_catalog: Option<&SkillCatalog>,
+) -> Result<String, LoopError> {
+    let goal = args
+        .get("goal")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LoopError::BadArgs("AuthorWorkflow: missing `goal`".into()))?;
+    let override_name = args.get("name").and_then(Value::as_str);
+
+    let catalog = skill_catalog
+        .ok_or_else(|| LoopError::ToolFailure("AuthorWorkflow: skill catalog not configured".into()))?;
+
+    // Map the live skill catalog → the workflowgen catalog, preserving order so
+    // the deterministic planner's tie-breaks stay stable. The names are the
+    // fully-qualified `front.name`s the `Skill` tool (and `{workflow:<name>}`
+    // runner) accept verbatim.
+    let infos: Vec<origin_workflowgen::SkillInfo> = catalog
+        .iter()
+        .map(|s| origin_workflowgen::SkillInfo::new(s.front.name.clone(), s.front.description.clone()))
+        .collect();
+    let wf_catalog = origin_workflowgen::SkillCatalog::new(infos);
+
+    let (mut spec, mut toml) = origin_workflowgen::author_and_render(goal, &wf_catalog)
+        .map_err(|e| LoopError::ToolFailure(format!("AuthorWorkflow: {e}")))?;
+
+    // An explicit `name` overrides the auto-derived slug. Re-render so the
+    // returned TOML carries the chosen name too.
+    if let Some(name) = override_name.map(str::trim).filter(|n| !n.is_empty()) {
+        spec.name = name.to_string();
+        toml = spec
+            .to_toml()
+            .map_err(|e| LoopError::ToolFailure(format!("AuthorWorkflow: {e}")))?;
+    }
+    let chosen_name = spec.name.clone();
+
+    // Map WorkflowSpec → the daemon's on-disk Workflow (empty args → None) and
+    // persist: load existing file, replace any same-named workflow (else push),
+    // atomic save.
+    let workflow = crate::workflows::Workflow {
+        name: spec.name,
+        description: Some(spec.description),
+        steps: spec
+            .steps
+            .into_iter()
+            .map(|st| crate::workflows::WorkflowStep {
+                skill: st.skill,
+                args: if st.args.is_empty() { None } else { Some(st.args) },
+            })
+            .collect(),
+    };
+
+    let path = crate::workflows::path()
+        .map_err(|e| LoopError::ToolFailure(format!("AuthorWorkflow: resolve path: {e}")))?;
+    let mut file = crate::workflows::load_from(&path)
+        .map_err(|e| LoopError::ToolFailure(format!("AuthorWorkflow: load: {e}")))?;
+    if file.schema_version == 0 {
+        file.schema_version = crate::workflows::SCHEMA_VERSION;
+    }
+    match file.workflows.iter_mut().find(|w| w.name == chosen_name) {
+        Some(existing) => *existing = workflow,
+        None => file.workflows.push(workflow),
+    }
+    crate::workflows::save_to(&path, &file)
+        .map_err(|e| LoopError::ToolFailure(format!("AuthorWorkflow: save: {e}")))?;
+
+    Ok(format!(
+        "Authored workflow `{chosen_name}` (run with `{{workflow:{chosen_name}}}`):\n\n{toml}"
+    ))
 }
 
 /// The filesystem path a [`origin_browser::Verb`] asked the browser to write a
@@ -3923,6 +4030,13 @@ fn tool_activity_summary(name: &str, args: &Value) -> String {
             cmd.chars().take(80).collect()
         }
         "WebFetch" => args.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
+        // PII-safe preview: surface only the `op`, never the `query` (a Gmail
+        // search expression) or `id` — both can carry sensitive content.
+        "gmail" => args.get("op").and_then(Value::as_str).unwrap_or("").to_string(),
+        "AuthorWorkflow" => {
+            let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
+            goal.chars().take(60).collect()
+        }
         _ => {
             let s = args.to_string();
             s.chars().take(60).collect()
@@ -4504,7 +4618,7 @@ mod dispatch_table_tests {
         let empty = serde_json::Value::Object(serde_json::Map::new());
         let mut unrecognized: Vec<String> = Vec::new();
         for meta in registry_iter() {
-            let result = dispatch_tool(meta, &empty, None, None, None, None, None, None).await;
+            let result = dispatch_tool(meta, &empty, None, None, None, None, None, None, None).await;
             if let Err(LoopError::UnknownTool(name)) = &result {
                 unrecognized.push(name.clone());
             }
@@ -4524,7 +4638,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_explain")
             .expect("graph_explain registered");
         let args = serde_json::json!({"kind": "communities"});
-        let out = dispatch_tool(meta, &args, None, None, None, None, None, None)
+        let out = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
             .await
             .expect("communities dispatch");
         assert_eq!(out, "all detected communities");
@@ -4533,14 +4647,14 @@ mod dispatch_table_tests {
             "kind": "recent_changes",
             "args": {"since_ms": 1_700_000_000_000_i64}
         });
-        let out = dispatch_tool(meta, &args, None, None, None, None, None, None)
+        let out = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
             .await
             .expect("recent_changes dispatch");
         assert!(out.contains("1700000000000"), "got: {out}");
 
         // Unknown kind surfaces as BadArgs, not ToolFailure or UnknownTool.
         let args = serde_json::json!({"kind": "bogus"});
-        let err = dispatch_tool(meta, &args, None, None, None, None, None, None)
+        let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
             .await
             .expect_err("bogus must fail");
         assert!(matches!(err, LoopError::BadArgs(_)));
@@ -4565,7 +4679,7 @@ mod dispatch_table_tests {
             let meta = registry_iter()
                 .find(|m| m.name == name)
                 .unwrap_or_else(|| panic!("{name} not registered"));
-            let err = dispatch_tool(meta, &args, None, None, None, None, None, None)
+            let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
                 .await
                 .expect_err(name);
             match err {
@@ -4594,7 +4708,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_query")
             .expect("graph_query registered");
         let args = serde_json::json!({"kind": "communities"});
-        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None, None, None)
+        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None, None, None, None)
             .await
             .expect("graph_query dispatch");
         // Empty edge table yields an empty Partitions list.
@@ -4622,6 +4736,7 @@ mod dispatch_table_tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("ask dispatch");
@@ -4639,7 +4754,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_rebuild")
             .expect("graph_rebuild registered");
         let args = serde_json::json!({"paths": []});
-        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None, None, None)
+        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None, None, None, None)
             .await
             .expect("graph_rebuild dispatch");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
@@ -4717,7 +4832,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "mem_search")
             .expect("mem_search registered");
         let args = serde_json::json!({"query": "anything"});
-        let err = dispatch_tool(meta, &args, None, None, None, None, None, None)
+        let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
             .await
             .expect_err("must fail without handle");
         match err {
@@ -4744,7 +4859,7 @@ mod dispatch_table_tests {
             "body": "the quick brown fox",
             "tags": ["test", "roundtrip"]
         });
-        let save_out = dispatch_tool(save_meta, &save_args, None, None, None, Some(&handle), None, None)
+        let save_out = dispatch_tool(save_meta, &save_args, None, None, None, Some(&handle), None, None, None)
             .await
             .expect("mem_save must succeed");
         let save_json: serde_json::Value =
@@ -4758,7 +4873,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "mem_search")
             .expect("mem_search registered");
         let search_args = serde_json::json!({"query": "quick brown", "k": 5});
-        let search_out = dispatch_tool(search_meta, &search_args, None, None, None, Some(&handle), None, None)
+        let search_out = dispatch_tool(search_meta, &search_args, None, None, None, Some(&handle), None, None, None)
             .await
             .expect("mem_search must succeed");
         let hits: serde_json::Value =
@@ -4791,7 +4906,7 @@ mod dispatch_table_tests {
             "goal": "do something",
             "allowed_tools": []
         });
-        let err = dispatch_tool(meta, &args, None, None, None, None, None, None)
+        let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
             .await
             .expect_err("Task without coordinator must fail");
         match err {
@@ -4845,7 +4960,7 @@ mod dispatch_table_tests {
             "allowed_tools": []
         });
 
-        let out = dispatch_tool(meta, &args, None, None, None, None, Some(coordinator.as_ref()), None)
+        let out = dispatch_tool(meta, &args, None, None, None, None, Some(coordinator.as_ref()), None, None)
             .await
             .expect("Task with coordinator must succeed");
 

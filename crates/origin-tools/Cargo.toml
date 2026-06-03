@@ -41,6 +41,13 @@ fs4          = "0.12"
 
 [dev-dependencies]
 origin-store = { path = "../origin-store" }
+# Used only by the schema drift-guard tests in builtins/gmail.rs and
+# builtins/author_workflow.rs: they assert the inlined `&'static str` schema
+# literals parse to the exact `serde_json::Value` these crates produce. The
+# tool registration itself uses only the string literals, so these are not
+# build-time deps of the library.
+origin-gmail = { path = "../origin-gmail" }
+origin-workflowgen = { path = "../origin-workflowgen" }
 tempfile = "3"
 proptest = { workspace = true }
 fs4 = "0.12"
