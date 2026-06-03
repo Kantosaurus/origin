@@ -3,18 +3,18 @@
 //! on disk. `interprocess`'s Drop-time unlink never ran, so the path exists
 //! but no listener owns it. A fresh `Listener::bind` to the same path must
 //! reclaim the stale file instead of failing with `AddrInUse`.
+// These transport types and the path helper are exercised only by the
+// `#[cfg(unix)]` regression tests below (the stale-socket-file failure mode is
+// specific to Unix-domain sockets; Windows named pipes have no on-disk inode to
+// leave behind). Gating them to `unix` keeps `clippy --all-targets -D warnings`
+// clean on Windows, where the tests themselves are compiled out.
+#[cfg(unix)]
 use origin_ipc::transport::{Connector, Listener};
 
+#[cfg(unix)]
 fn unique_socket_path() -> String {
     let id = ulid::Ulid::new();
-    #[cfg(unix)]
-    {
-        format!("{}/origin-stale-{id}.sock", std::env::temp_dir().display())
-    }
-    #[cfg(windows)]
-    {
-        format!(r"\\.\pipe\origin-stale-{id}")
-    }
+    format!("{}/origin-stale-{id}.sock", std::env::temp_dir().display())
 }
 
 #[cfg(unix)]
