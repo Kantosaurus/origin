@@ -104,7 +104,14 @@ fn client_message_prompt_round_trips() {
         | ClientMessage::ResumeForeign { .. }
         | ClientMessage::Interrupt
         | ClientMessage::PermissionDecision { .. }
-        | ClientMessage::ClearAll => unreachable!("expected Prompt variant"),
+        | ClientMessage::ClearAll
+        | ClientMessage::SelfDevStart { .. }
+        | ClientMessage::SelfDevStatus
+        | ClientMessage::SelfDevApprove
+        | ClientMessage::SelfDevReset
+        | ClientMessage::TeamCreate { .. }
+        | ClientMessage::TeamAssign { .. }
+        | ClientMessage::TeamStatus { .. } => unreachable!("expected Prompt variant"),
     }
 }
 
@@ -145,7 +152,14 @@ fn client_message_switch_account_round_trips() {
         | ClientMessage::ResumeForeign { .. }
         | ClientMessage::Interrupt
         | ClientMessage::PermissionDecision { .. }
-        | ClientMessage::ClearAll => unreachable!("expected SwitchAccount variant"),
+        | ClientMessage::ClearAll
+        | ClientMessage::SelfDevStart { .. }
+        | ClientMessage::SelfDevStatus
+        | ClientMessage::SelfDevApprove
+        | ClientMessage::SelfDevReset
+        | ClientMessage::TeamCreate { .. }
+        | ClientMessage::TeamAssign { .. }
+        | ClientMessage::TeamStatus { .. } => unreachable!("expected SwitchAccount variant"),
     }
 }
 

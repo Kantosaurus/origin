@@ -4027,6 +4027,7 @@ dependencies = [
  "origin-router",
  "origin-runtime",
  "origin-schedule",
+ "origin-selfdev",
  "origin-sidecar",
  "origin-skills",
  "origin-store",

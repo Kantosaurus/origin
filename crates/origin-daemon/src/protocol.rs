@@ -222,6 +222,65 @@ pub enum ClientMessage {
     /// the discarded goal), then replies with [`StreamEvent::AdminOk`]. With no
     /// active goal it is a single `AdminOk`.
     ClearAll,
+    // ── Binary self-development control plane (gated `ORIGIN_SELFDEV=1`) ──────
+    //
+    // All four verbs are no-ops returning a clear "self-dev disabled" message
+    // unless the daemon was started with `ORIGIN_SELFDEV=1`; the variants are
+    // APPENDED here so the wire layout of every pre-existing variant is
+    // preserved. *Closes: binary self-development orchestration.*
+    /// Enqueue a self-modification [`BuildJob`](origin_selfdev::BuildJob) and
+    /// begin the supervised edit → checkpoint → build → test → restart cycle.
+    /// `description` is both the job description and the prompt driven onto the
+    /// live agent path for the self-edit step; `paths` scopes the edit and the
+    /// rollback. The daemon emits [`StreamEvent::SelfDevStatus`] as the cycle
+    /// advances. Disabled (returns [`StreamEvent::SelfDevDisabled`]) unless
+    /// `ORIGIN_SELFDEV=1`.
+    SelfDevStart {
+        /// Human description of what the self-modification should accomplish.
+        description: String,
+        /// Source paths the job intends to touch (empty ⇒ unscoped).
+        paths: Vec<String>,
+    },
+    /// Query the self-dev driver's current state. The daemon replies with a
+    /// [`StreamEvent::SelfDevStatus`] (or [`StreamEvent::SelfDevDisabled`]).
+    SelfDevStatus,
+    /// Operator approval for the in-flight self-dev restart. Flips the approval
+    /// flag so the next `request_restart` returns `Grant`. Replies with
+    /// [`StreamEvent::SelfDevStatus`] (or [`StreamEvent::SelfDevDisabled`]).
+    SelfDevApprove,
+    /// Reset the storm guard after an operator has acknowledged repeated
+    /// self-dev failures, re-enabling new jobs. Replies with
+    /// [`StreamEvent::SelfDevStatus`] (or [`StreamEvent::SelfDevDisabled`]).
+    SelfDevReset,
+    // ── Named agent teams control plane (origin-swarm::team) ─────────────────
+    //
+    // APPENDED to preserve wire layout. No team exists unless a client sends
+    // `TeamCreate`, so default behaviour is byte-identical.
+    /// Register a named team (idempotent-by-replace). Replies with a
+    /// [`StreamEvent::TeamStatus`] for the freshly created team.
+    TeamCreate {
+        /// Team name (unique within the daemon-wide registry).
+        name: String,
+    },
+    /// Assign `task` to a (possibly new) named teammate within `team`, spawning
+    /// a real swarm worker as that teammate. The daemon emits a
+    /// [`StreamEvent::TeamEventFired`] as the teammate transitions
+    /// Working → Done → Idle, each journaled to the team's `MissionLog`.
+    TeamAssign {
+        /// The team the teammate belongs to.
+        team: String,
+        /// Human-facing teammate name (created on first assign).
+        teammate: String,
+        /// The task description the teammate should pursue.
+        task: String,
+    },
+    /// Render a team's `MissionLog` + per-teammate statuses. The daemon replies
+    /// with [`StreamEvent::TeamStatus`] (or [`StreamEvent::AdminError`] when the
+    /// team is unknown).
+    TeamStatus {
+        /// The team to render.
+        team: String,
+    },
 }
 
 impl ClientMessage {
@@ -503,6 +562,59 @@ pub enum StreamEvent {
         reason: origin_goal::ClearReasonWire,
         iter: u32,
         tokens_spent: u64,
+    },
+    // ── Binary self-development (gated `ORIGIN_SELFDEV=1`) ────────────────────
+    /// Snapshot of the self-dev driver after a `SelfDev*` verb. Carries the
+    /// state label, the number of queued jobs, the consecutive-failure streak,
+    /// the granted-restart generation counter, and whether the storm guard has
+    /// tripped. APPENDED to preserve the wire layout of every prior variant.
+    SelfDevStatus {
+        /// Debug label of the current [`SelfDevState`](origin_selfdev::SelfDevState).
+        state: String,
+        /// Id of the in-flight job, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_id: Option<String>,
+        /// Jobs waiting in the queue (excludes the in-flight job).
+        queued: u32,
+        /// Consecutive failed generations since the last success.
+        consecutive_failures: u32,
+        /// Number of generations that reached a granted restart.
+        generation: u64,
+        /// Whether the storm guard has tripped (self-dev disabled until reset).
+        storm_guard_tripped: bool,
+    },
+    /// Emitted for every `SelfDev*` verb when the daemon was NOT started with
+    /// `ORIGIN_SELFDEV=1`. The `message` is the operator-facing hint.
+    SelfDevDisabled {
+        /// Human-readable "self-dev disabled (set `ORIGIN_SELFDEV=1`)" message.
+        message: String,
+    },
+    // ── Named agent teams (origin-swarm::team) ───────────────────────────────
+    /// One [`TeamEvent`](origin_swarm::TeamEvent) bridged onto the wire so the
+    /// CLI can render teammate lifecycle transitions. `event_kind` is
+    /// `teammate_idle` | `task_completed`; `teammate` is the worker-id hex.
+    /// (The field is `event_kind`, not `kind`, because the enum is internally
+    /// tagged on `kind`.)
+    TeamEventFired {
+        /// The team the event belongs to.
+        team: String,
+        /// Event kind label (`teammate_idle` / `task_completed`).
+        event_kind: String,
+        /// The teammate's [`WorkerId`](origin_swarm::WorkerId) as 32-hex.
+        teammate: String,
+        /// For `task_completed`, the prose-free report summary; empty otherwise.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        summary: String,
+    },
+    /// Response to [`ClientMessage::TeamCreate`] / [`ClientMessage::TeamStatus`]:
+    /// the rendered `MissionLog` plus a one-line-per-teammate status block.
+    TeamStatus {
+        /// The team name.
+        team: String,
+        /// Plain-text [`MissionLog::render`](origin_swarm::MissionLog::render).
+        mission_log: String,
+        /// One `name: status` line per teammate, in registration order.
+        teammates: Vec<String>,
     },
 }
 

@@ -44,3 +44,5 @@ pub mod hooks_runtime;
 pub mod swarm_worker;
 pub mod subagents_md;
 pub mod supervisor;
+pub mod selfdev;
+pub mod teams;

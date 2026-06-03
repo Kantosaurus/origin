@@ -1231,11 +1231,13 @@ pub(crate) struct StreamingTurn {
 }
 
 /// Session-id prefixes reserved for the daemon's own self-dispatched prompts
-/// (ambient / scheduler / overnight / webhook). These loops connect back to the
-/// daemon's IPC socket as ordinary clients, so their turns flow through
-/// [`run_loop`] exactly like an interactive prompt — the only in-band signal that
-/// tells them apart here is the synthetic `session_id` each loop stamps.
-const SELF_DISPATCH_SESSION_PREFIXES: [&str; 4] = ["ambient-", "sched-", "overnight-", "webhook-"];
+/// (ambient / scheduler / overnight / webhook / self-dev). These loops connect
+/// back to the daemon's IPC socket as ordinary clients, so their turns flow
+/// through [`run_loop`] exactly like an interactive prompt — the only in-band
+/// signal that tells them apart here is the synthetic `session_id` each loop
+/// stamps.
+const SELF_DISPATCH_SESSION_PREFIXES: [&str; 5] =
+    ["ambient-", "sched-", "overnight-", "webhook-", "selfdev-"];
 
 /// Whether `session_id` belongs to a daemon self-dispatch (ambient / scheduler /
 /// overnight / webhook) rather than a genuine interactive/headless user prompt.
@@ -1261,6 +1263,7 @@ mod self_dispatch_session_tests {
             "sched-1717000000000",
             "overnight-docs",
             "webhook-1717000000000",
+            "selfdev-job-1",
         ] {
             assert!(
                 is_self_dispatch_session(id),

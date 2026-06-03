@@ -61,6 +61,7 @@ origin-export           = { path = "../origin-export" }
 origin-plan             = { path = "../origin-plan" }
 origin-planner          = { path = "../origin-planner" }
 origin-swarm            = { path = "../origin-swarm" }
+origin-selfdev          = { path = "../origin-selfdev" }
 origin-browser          = { path = "../origin-browser" }
 origin-lsp-client       = { path = "../origin-lsp-client" }
 # Wave-1/2 subsystem crates wired into the daemon (all default-off / available).
