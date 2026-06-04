@@ -15,6 +15,11 @@ pub enum Language {
     Python,
     Go,
     Java,
+    C,
+    Cpp,
+    CSharp,
+    Ruby,
+    Bash,
 }
 
 /// Errors produced when configuring or running a tree-sitter parser.
@@ -42,6 +47,13 @@ impl Language {
             "py" | "pyi" => Some(Self::Python),
             "go" => Some(Self::Go),
             "java" => Some(Self::Java),
+            // `.h` is ambiguous (C or C++); route it to the C grammar, which
+            // parses the bulk of header content acceptably.
+            "c" | "h" => Some(Self::C),
+            "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Self::Cpp),
+            "cs" => Some(Self::CSharp),
+            "rb" => Some(Self::Ruby),
+            "sh" | "bash" => Some(Self::Bash),
             _ => None,
         }
     }
@@ -66,6 +78,11 @@ impl Language {
             Self::Python => tree_sitter_python::language(),
             Self::Go => tree_sitter_go::language(),
             Self::Java => tree_sitter_java::language(),
+            Self::C => tree_sitter_c::language(),
+            Self::Cpp => tree_sitter_cpp::language(),
+            Self::CSharp => tree_sitter_c_sharp::language(),
+            Self::Ruby => tree_sitter_ruby::language(),
+            Self::Bash => tree_sitter_bash::language(),
         }
     }
 

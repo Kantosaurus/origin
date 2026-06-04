@@ -1,0 +1,9 @@
+{
+  "id": "13-java-class",
+  "prompt": "In a Java file, add a final class `Counter` with a private int field, an `increment()` method, and a `get()` accessor returning the current value. Include a JUnit test asserting two increments yield 2.",
+  "expected_tools_min": ["Edit"],
+  "expected_tool_calls_max": 6,
+  "max_turn_latency_ms": 6000,
+  "max_input_tokens": 4000,
+  "max_output_tokens": 1200
+}

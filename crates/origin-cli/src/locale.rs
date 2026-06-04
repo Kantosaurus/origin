@@ -124,6 +124,49 @@ mod tests {
         assert_eq!(t(Lang::En, "goal.active"), "goal active: {condition}");
         assert_eq!(t(Lang::En, "goal.done"), "done: {reason}");
         assert_eq!(t(Lang::En, "permission.ask"), "Allow {tool} {args}?");
+        // In-session command chrome routed this pass — En must equal the exact
+        // pre-routing literal so the default-English output is byte-identical.
+        assert_eq!(t(Lang::En, "cmd.model.usage"), "usage: /model <name>");
+        assert_eq!(
+            t(Lang::En, "cmd.effort.usage"),
+            "usage: /effort <fast|low|medium|high|max>"
+        );
+        assert_eq!(
+            t(Lang::En, "cmd.outputstyle.usage"),
+            "usage: /output-style <default|explanatory|learning|concise>"
+        );
+        assert_eq!(
+            t(Lang::En, "cmd.steer.usage"),
+            "usage: /steer <hint to inject into the next turn>"
+        );
+        assert_eq!(t(Lang::En, "cmd.copy.ok"), "copied the last reply to the clipboard");
+        assert_eq!(t(Lang::En, "cmd.copy.empty"), "nothing to copy yet");
+        assert_eq!(
+            t(Lang::En, "cmd.turn.busy"),
+            "a turn is already running (Ctrl+C to interrupt it)"
+        );
+        // `linef()`-routed command chrome rendered with the call site's args:
+        assert_eq!(tf(Lang::En, "cmd.model.set", &[("name", "opus")]), "model set: opus");
+        assert_eq!(
+            tf(Lang::En, "cmd.effort.set", &[("token", "high")]),
+            "reasoning effort: high"
+        );
+        assert_eq!(
+            tf(Lang::En, "cmd.outputstyle.set", &[("label", "concise")]),
+            "output style: concise"
+        );
+        assert_eq!(
+            tf(Lang::En, "cmd.steer.queued", &[("pending", "2")]),
+            "steering hint queued (2 pending)"
+        );
+        assert_eq!(
+            tf(
+                Lang::En,
+                "cmd.account.active",
+                &[("provider", "anthropic"), ("account", "default")]
+            ),
+            "provider active: anthropic/default"
+        );
     }
 
     // A sample substitution under default English must reproduce the EXACT
@@ -167,5 +210,11 @@ mod tests {
             fr_goal,
             tf(Lang::Fr, "goal.active", &[("condition", "réparer la compilation")])
         );
+        // A newly-routed command-chrome key also renders in French under --lang.
+        assert_eq!(line("cmd.turn.busy"), t(Lang::Fr, "cmd.turn.busy"));
+        assert_ne!(line("cmd.turn.busy"), t(Lang::En, "cmd.turn.busy"));
+        let fr_model = linef("cmd.model.set", &[("name", "opus")]);
+        assert_eq!(fr_model, tf(Lang::Fr, "cmd.model.set", &[("name", "opus")]));
+        assert!(fr_model.contains("opus"));
     }
 }

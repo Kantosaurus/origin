@@ -1,0 +1,9 @@
+{
+  "id": "10-ts-types",
+  "prompt": "In a TypeScript module, add an exported interface `User { id: number; name: string }` and a function `greet(u: User): string` returning `Hello, ${u.name}`. Keep it strict-mode clean (no `any`).",
+  "expected_tools_min": ["Edit"],
+  "expected_tool_calls_max": 5,
+  "max_turn_latency_ms": 6000,
+  "max_input_tokens": 4000,
+  "max_output_tokens": 1200
+}

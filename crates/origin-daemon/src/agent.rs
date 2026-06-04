@@ -2291,7 +2291,7 @@ async fn run_loop_inner(
         // `--features otel` AND a tracer provider is installed, so the default
         // path is byte-identical. Attaches gen_ai.system / gen_ai.request.model
         // / gen_ai.operation.name (relabeled inside origin-metrics).
-        let gen_ai_span = origin_metrics::instruments::gen_ai_span(
+        let mut gen_ai_span = origin_metrics::instruments::gen_ai_span(
             turn_provider.name(),
             &turn_model,
             origin_metrics::keys::genai::OPERATION_CHAT,
@@ -2448,6 +2448,11 @@ async fn run_loop_inner(
                 tpot_ms,
             );
         }
+        // Attach the convention response attributes the daemon has real data for
+        // (prompt-cache read tokens → `gen_ai.usage.cached_input_tokens`). No
+        // response id is plumbed today, so it is omitted. No-op without
+        // `--features otel`, so the default path is byte-identical.
+        gen_ai_span.set_response_attributes("", u64::from(resp.usage.cache_read_input_tokens));
         // End the `gen_ai` span now that the call (and its latency recordings)
         // are complete. Explicit drop documents the span's scope; the guard's
         // Drop ends the span (a no-op without `--features otel`).

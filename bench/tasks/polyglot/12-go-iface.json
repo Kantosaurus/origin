@@ -1,0 +1,9 @@
+{
+  "id": "12-go-iface",
+  "prompt": "In a Go package, define an interface `Stringer { String() string }` and a struct `Point{X, Y int}` that implements it as \"(X, Y)\". Add a table-driven test for String().",
+  "expected_tools_min": ["Edit"],
+  "expected_tool_calls_max": 6,
+  "max_turn_latency_ms": 6000,
+  "max_input_tokens": 4000,
+  "max_output_tokens": 1200
+}

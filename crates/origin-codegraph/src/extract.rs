@@ -187,11 +187,45 @@ fn classify(node: Node, lang: Language, src: &[u8]) -> Result<Option<(String, No
     let Some(kind) = node_kind_for(lang, node.kind()) else {
         return Ok(None);
     };
-    let Some(name_node) = node.child_by_field_name("name") else {
-        return Ok(None);
+    // Most declarations expose a `name` field. C and C++ `function_definition`
+    // do not — the name lives at the end of a `declarator` chain — so fall back
+    // to a declarator walk for those.
+    let name_node = match node.child_by_field_name("name") {
+        Some(n) => n,
+        None => match c_cpp_declarator_name(node, lang) {
+            Some(n) => n,
+            None => return Ok(None),
+        },
     };
     let name = std::str::from_utf8(&src[name_node.start_byte()..name_node.end_byte()])?.to_owned();
     Ok(Some((name, kind)))
+}
+
+/// Recover a C/C++ function name by walking the `declarator` field chain
+/// (`function_declarator` → `pointer_declarator` → … → `identifier`). Returns
+/// `None` for any other language, or when no name-bearing node is reached.
+fn c_cpp_declarator_name(node: Node, lang: Language) -> Option<Node> {
+    if !matches!(lang, Language::C | Language::Cpp) {
+        return None;
+    }
+    let mut cur = node.child_by_field_name("declarator")?;
+    loop {
+        if matches!(
+            cur.kind(),
+            "identifier"
+                | "field_identifier"
+                | "qualified_identifier"
+                | "destructor_name"
+                | "operator_name"
+        ) {
+            return Some(cur);
+        }
+        match cur.child_by_field_name("declarator") {
+            // Always descends to a child, so the walk terminates.
+            Some(next) => cur = next,
+            None => return cur.child_by_field_name("name"),
+        }
+    }
 }
 
 /// Map a `(Language, ts_kind)` pair to a `NodeKind`. Grouped by `NodeKind` to
@@ -203,7 +237,10 @@ fn node_kind_for(lang: Language, ts_kind: &str) -> Option<NodeKind> {
         (lang, ts_kind),
         (Language::Rust, "function_item")
             | (Language::TypeScript | Language::Go, "function_declaration")
-            | (Language::Python, "function_definition"),
+            | (
+                Language::Python | Language::C | Language::Cpp | Language::Bash,
+                "function_definition"
+            ),
     );
     if is_function {
         return Some(NodeKind::Function);
@@ -211,7 +248,12 @@ fn node_kind_for(lang: Language, ts_kind: &str) -> Option<NodeKind> {
     // Methods across languages.
     let is_method = matches!(
         (lang, ts_kind),
-        (Language::TypeScript, "method_definition") | (Language::Go | Language::Java, "method_declaration"),
+        (Language::TypeScript, "method_definition")
+            | (
+                Language::Go | Language::Java | Language::CSharp,
+                "method_declaration"
+            )
+            | (Language::Ruby, "method" | "singleton_method"),
     );
     if is_method {
         return Some(NodeKind::Method);
@@ -219,15 +261,25 @@ fn node_kind_for(lang: Language, ts_kind: &str) -> Option<NodeKind> {
     // Structs / record-shaped declarations.
     let is_struct = matches!(
         (lang, ts_kind),
-        (Language::Rust, "struct_item") | (Language::Go, "type_declaration"),
+        (Language::Rust, "struct_item")
+            | (Language::Go, "type_declaration")
+            | (Language::C | Language::Cpp, "struct_specifier")
+            | (Language::C, "enum_specifier" | "type_definition")
+            | (Language::CSharp, "struct_declaration"),
     );
     if is_struct {
         return Some(NodeKind::Struct);
     }
-    // Classes (TS / Python / Java).
+    // Classes.
     let is_class = matches!(
         (lang, ts_kind),
-        (Language::TypeScript | Language::Java, "class_declaration") | (Language::Python, "class_definition"),
+        (
+            Language::TypeScript | Language::Java | Language::CSharp,
+            "class_declaration"
+        ) | (Language::Python, "class_definition")
+            | (Language::Cpp, "class_specifier")
+            | (Language::CSharp, "record_declaration" | "enum_declaration")
+            | (Language::Ruby, "class"),
     );
     if is_class {
         return Some(NodeKind::Class);
@@ -236,15 +288,24 @@ fn node_kind_for(lang: Language, ts_kind: &str) -> Option<NodeKind> {
     if matches!((lang, ts_kind), (Language::Rust, "trait_item")) {
         return Some(NodeKind::Trait);
     }
-    // Interfaces (TS / Java).
+    // Interfaces (TS / Java / C#).
     if matches!(
         (lang, ts_kind),
-        (Language::TypeScript | Language::Java, "interface_declaration"),
+        (
+            Language::TypeScript | Language::Java | Language::CSharp,
+            "interface_declaration"
+        ),
     ) {
         return Some(NodeKind::Interface);
     }
-    // Modules (Rust only at P7.1).
-    if matches!((lang, ts_kind), (Language::Rust, "mod_item")) {
+    // Modules / namespaces.
+    if matches!(
+        (lang, ts_kind),
+        (Language::Rust, "mod_item")
+            | (Language::Cpp, "namespace_definition")
+            | (Language::CSharp, "namespace_declaration")
+            | (Language::Ruby, "module"),
+    ) {
         return Some(NodeKind::Module);
     }
     None

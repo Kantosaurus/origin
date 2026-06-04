@@ -174,6 +174,46 @@ fn tasks_root() -> PathBuf {
         .map_or_else(|| PathBuf::from("bench/tasks"), PathBuf::from)
 }
 
+/// Aggregate one or more recorded `TaskResult` files into a ranked
+/// [`origin_bench::leaderboard::Leaderboard`] for `k`.
+///
+/// Each `--from` file may be a different model/contestant's results; rows are
+/// concatenated and grouped per `(contestant, task)` inside the leaderboard
+/// builder. Returned (rather than printed) so it is unit-testable.
+///
+/// # Errors
+/// Returns an error if no paths are given, `k` is out of range, or any file
+/// cannot be read/parsed (or exceeds the size cap).
+fn leaderboard_from(from: &[String], k: u32) -> Result<origin_bench::leaderboard::Leaderboard> {
+    if from.is_empty() {
+        anyhow::bail!("--leaderboard needs at least one --from <results.json>");
+    }
+    if k == 0 || k > MAX_SAMPLES {
+        anyhow::bail!("--samples must be in 1..={MAX_SAMPLES} (got {k})");
+    }
+    let mut all: Vec<TaskResult> = Vec::new();
+    for path in from {
+        all.extend(read_recorded_results(path)?);
+    }
+    Ok(origin_bench::leaderboard::build(&all, k))
+}
+
+/// Run `origin bench --leaderboard`: aggregate the `--from` files into a ranked
+/// leaderboard and print it (Markdown unless `json`). `k` is `samples`.
+///
+/// # Errors
+/// Propagates [`leaderboard_from`] failures.
+pub fn run_leaderboard(from: &[String], json: bool, k: u32) -> Result<()> {
+    let lb = leaderboard_from(from, k)?;
+    let rendered = if json {
+        origin_bench::leaderboard::render_json(&lb)
+    } else {
+        origin_bench::leaderboard::render_markdown(&lb)
+    };
+    println!("{rendered}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +305,58 @@ mod tests {
     fn run_rejects_out_of_range_samples() {
         assert!(run(0, false, None).is_err());
         assert!(run(MAX_SAMPLES + 1, false, None).is_err());
+    }
+
+    fn result_w(contestant: &str, task: &str, passed: bool, wall_ms: u64) -> TaskResult {
+        TaskResult {
+            contestant: contestant.to_string(),
+            task_id: task.to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            wall_ms,
+            tool_calls: 0,
+            passed,
+        }
+    }
+
+    #[test]
+    fn leaderboard_aggregates_multiple_from_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a.json");
+        let b = dir.path().join("b.json");
+        // model "A" passes both tasks; model "B" fails both.
+        let rows_a = vec![
+            result_w("A", "t1", true, 10),
+            result_w("A", "t2", true, 10),
+        ];
+        let rows_b = vec![
+            result_w("B", "t1", false, 10),
+            result_w("B", "t2", false, 10),
+        ];
+        std::fs::write(&a, serde_json::to_string(&rows_a).expect("ser")).expect("write a");
+        std::fs::write(&b, serde_json::to_string(&rows_b).expect("ser")).expect("write b");
+
+        let paths = vec![
+            a.to_str().expect("utf8").to_string(),
+            b.to_str().expect("utf8").to_string(),
+        ];
+        let lb = leaderboard_from(&paths, 2).expect("build leaderboard");
+        assert_eq!(lb.entries.len(), 2);
+        assert_eq!(lb.entries[0].contestant, "A");
+        assert_eq!(lb.entries[0].rank, 1);
+        assert_eq!(lb.entries[1].contestant, "B");
+    }
+
+    #[test]
+    fn leaderboard_rejects_missing_from() {
+        let err = leaderboard_from(&["definitely-not-real.json".to_string()], 2)
+            .expect_err("should fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("definitely-not-real.json"), "got: {msg}");
+    }
+
+    #[test]
+    fn leaderboard_rejects_empty_from() {
+        assert!(leaderboard_from(&[], 2).is_err());
     }
 }
