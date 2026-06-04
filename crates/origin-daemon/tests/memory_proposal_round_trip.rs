@@ -119,6 +119,7 @@ async fn memory_proposed_round_trip_via_stub_provider() {
             read_only: false,
             router: None,
             browser_rate_limit: None,
+            session_account: None,
         };
         let summary = run_loop(&mut session, &prompt.user_text, &provider, &AlwaysAllow, &opts)
             .await

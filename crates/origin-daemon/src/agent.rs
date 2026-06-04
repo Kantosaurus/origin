@@ -1516,6 +1516,17 @@ pub struct LoopOptions {
     /// from the optional `[browser] max_actions_per_session` governance knob (see
     /// [`crate::config::load_governance`]).
     pub browser_rate_limit: Option<u32>,
+    /// Optional per-connection (per-session) active account used to resolve
+    /// credentials for a **cross-provider** mid-loop rebuild. When `Some`, a
+    /// cross-provider routing pick rebuilds the provider against THIS account
+    /// via [`crate::provider_factory::build_provider_for_account`], so a
+    /// `/account` switch on one connection cannot leak into a concurrent
+    /// connection's rebuild. When `None` (the default everywhere), the loop
+    /// falls back to the process-wide global account slot via
+    /// [`crate::provider_factory::build_provider_for`] — byte-identical to the
+    /// pre-per-connection wire. Set from the per-connection account slot in
+    /// `handle_request`.
+    pub session_account: Option<Arc<str>>,
 }
 
 impl Default for LoopOptions {
@@ -1549,6 +1560,7 @@ impl Default for LoopOptions {
             read_only: false,
             router: None,
             browser_rate_limit: None,
+            session_account: None,
         }
     }
 }
@@ -2444,11 +2456,28 @@ async fn run_loop_inner(
         let turn_model = match opts.router.as_ref().and_then(|lr| lr.choose_model_ref(turn)) {
             Some(pick) if pick.provider.as_str() == provider.name() => pick.model,
             Some(pick) => {
-                // Cross-provider pick: try to rebuild. `build_provider_for`
-                // reaches the registered factory + credentials; `None` ⇒ fall
-                // back to the active provider with the session model.
-                match crate::provider_factory::build_provider_for(&pick.provider, &pick.model).await
-                {
+                // Cross-provider pick: try to rebuild. When this session carries
+                // its OWN account (per-connection multi-account isolation) we
+                // resolve credentials against THAT account so a concurrent
+                // connection's `/account` switch cannot leak in; otherwise we
+                // fall back to the process-wide global account slot (the
+                // pre-per-connection default, byte-identical). Either way `None`
+                // ⇒ fall back to the active provider with the session model.
+                let built = match opts.session_account.as_deref() {
+                    Some(acct) => {
+                        crate::provider_factory::build_provider_for_account(
+                            &pick.provider,
+                            &pick.model,
+                            acct,
+                        )
+                        .await
+                    }
+                    None => {
+                        crate::provider_factory::build_provider_for(&pick.provider, &pick.model)
+                            .await
+                    }
+                };
+                match built {
                     Some(p) => {
                         rebuilt = Some(p);
                         pick.model

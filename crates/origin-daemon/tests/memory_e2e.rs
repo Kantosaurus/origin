@@ -116,6 +116,7 @@ async fn memory_e2e_proposer_to_store_via_wiremock() {
         read_only: false,
         router: None,
         browser_rate_limit: None,
+        session_account: None,
     };
     let _summary = run_loop(
         &mut session,
