@@ -18,6 +18,16 @@ path = "src/lib.rs"
 name = "origin-supervisor"
 path = "src/main.rs"
 
+# Test-only stand-in for `origin-daemon`, driven by the self-dev relaunch
+# round-trip integration test (`tests/relaunch_e2e.rs`). `cargo` exposes its
+# path to the test via `CARGO_BIN_EXE_selfdev-fixture-daemon`.
+[[bin]]
+name = "selfdev-fixture-daemon"
+path = "tests/fixtures/selfdev_fixture_daemon.rs"
+test = false
+bench = false
+doc = false
+
 [dependencies]
 origin-resume-token = { path = "../origin-resume-token" }
 origin-ipc = { path = "../origin-ipc" }

@@ -46,8 +46,64 @@ fn from_extension_maps_python_go_java() {
 #[test]
 fn from_extension_unknown_is_none() {
     assert_eq!(Language::from_extension("txt"), None);
-    assert_eq!(Language::from_extension("cpp"), None);
+    // `cpp` now maps to C++ (see from_extension_maps_new_languages); use a
+    // genuinely unknown extension to assert the fall-through arm.
+    assert_eq!(Language::from_extension("qzx"), None);
     assert_eq!(Language::from_extension(""), None);
+}
+
+#[test]
+fn parses_minimal_c_cpp_csharp_ruby_bash() {
+    let c = Language::C.parse(b"int main(void){return 0;}").expect("parse c");
+    assert_eq!(c.root_node().kind(), "translation_unit");
+    let cpp = Language::Cpp
+        .parse(b"int main(){return 0;}")
+        .expect("parse cpp");
+    assert_eq!(cpp.root_node().kind(), "translation_unit");
+    let cs = Language::CSharp
+        .parse(b"class C { void M() {} }")
+        .expect("parse c#");
+    assert_eq!(cs.root_node().kind(), "compilation_unit");
+    let rb = Language::Ruby.parse(b"def hi\nend\n").expect("parse ruby");
+    assert_eq!(rb.root_node().kind(), "program");
+    let sh = Language::Bash.parse(b"echo hi\n").expect("parse bash");
+    assert_eq!(sh.root_node().kind(), "program");
+}
+
+#[test]
+fn from_extension_maps_new_languages() {
+    assert_eq!(Language::from_extension("c"), Some(Language::C));
+    assert_eq!(Language::from_extension("h"), Some(Language::C));
+    for ext in ["cpp", "cc", "cxx", "hpp", "hh", "hxx"] {
+        assert_eq!(
+            Language::from_extension(ext),
+            Some(Language::Cpp),
+            "ext {ext} should map to C++"
+        );
+    }
+    assert_eq!(Language::from_extension("cs"), Some(Language::CSharp));
+    assert_eq!(Language::from_extension("rb"), Some(Language::Ruby));
+    assert_eq!(Language::from_extension("sh"), Some(Language::Bash));
+    assert_eq!(Language::from_extension("bash"), Some(Language::Bash));
+    // Case-insensitive, like the original five.
+    assert_eq!(Language::from_extension("CPP"), Some(Language::Cpp));
+    assert_eq!(Language::from_extension("RB"), Some(Language::Ruby));
+}
+
+#[test]
+fn as_discriminant_is_stable_and_appended() {
+    // Existing discriminants are a persisted SQL contract and MUST NOT change.
+    assert_eq!(Language::Rust.as_discriminant(), 0);
+    assert_eq!(Language::TypeScript.as_discriminant(), 1);
+    assert_eq!(Language::Python.as_discriminant(), 2);
+    assert_eq!(Language::Go.as_discriminant(), 3);
+    assert_eq!(Language::Java.as_discriminant(), 4);
+    // New languages are appended, never interleaved.
+    assert_eq!(Language::C.as_discriminant(), 5);
+    assert_eq!(Language::Cpp.as_discriminant(), 6);
+    assert_eq!(Language::CSharp.as_discriminant(), 7);
+    assert_eq!(Language::Ruby.as_discriminant(), 8);
+    assert_eq!(Language::Bash.as_discriminant(), 9);
 }
 
 #[test]

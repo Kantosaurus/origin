@@ -96,6 +96,13 @@ impl Language {
             Self::Python => 2,
             Self::Go => 3,
             Self::Java => 4,
+            // Appended for the curated grammar additions; never interleave the
+            // above (the discriminant is a persisted SQL contract).
+            Self::C => 5,
+            Self::Cpp => 6,
+            Self::CSharp => 7,
+            Self::Ruby => 8,
+            Self::Bash => 9,
         }
     }
 }

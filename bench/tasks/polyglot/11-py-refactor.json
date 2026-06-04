@@ -1,0 +1,9 @@
+{
+  "id": "11-py-refactor",
+  "prompt": "In a Python module, refactor a loop that builds a list of squares into a list comprehension, keeping behavior identical, and add a docstring to the enclosing function.",
+  "expected_tools_min": ["Edit"],
+  "expected_tool_calls_max": 5,
+  "max_turn_latency_ms": 6000,
+  "max_input_tokens": 4000,
+  "max_output_tokens": 1200
+}

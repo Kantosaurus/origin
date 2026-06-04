@@ -6,6 +6,7 @@
 //! and rendering Markdown/JSON [`report`]s. Repeated runs feed the
 //! multi-sample pass@k / pass^k / flakiness metrics in [`reliability`].
 
+pub mod leaderboard;
 pub mod metrics;
 pub mod reliability;
 pub mod report;

@@ -73,3 +73,68 @@ class Gamma {}
     assert!(names.contains(&"beta"));
     assert!(names.contains(&"Gamma"));
 }
+
+// --- Curated grammar additions (C / C++ / C# / Ruby / Bash) ---
+
+fn names_of(lang: Language, src: &[u8]) -> Vec<String> {
+    extract_nodes(lang, src)
+        .expect("extract")
+        .into_iter()
+        .map(|n| n.name)
+        .collect()
+}
+
+#[test]
+fn extracts_c_functions_and_structs() {
+    // C `function_definition` has no `name` field (only a `declarator` chain),
+    // so this exercises the declarator-walk fallback in `classify`.
+    let names = names_of(
+        Language::C,
+        b"int alpha(void) { return 0; }\nstruct Gamma { int x; };\n",
+    );
+    assert!(names.iter().any(|n| n == "alpha"), "names={names:?}");
+    assert!(names.iter().any(|n| n == "Gamma"), "names={names:?}");
+}
+
+#[test]
+fn extracts_cpp_class_and_function() {
+    let names = names_of(
+        Language::Cpp,
+        b"namespace ns { class Widget { public: void run() {} }; int beta(int x) { return x + 1; } }\n",
+    );
+    assert!(names.iter().any(|n| n == "Widget"), "names={names:?}");
+    assert!(names.iter().any(|n| n == "beta"), "names={names:?}");
+    assert!(names.iter().any(|n| n == "ns"), "names={names:?}");
+}
+
+#[test]
+fn extracts_csharp_class_and_method() {
+    let names = names_of(
+        Language::CSharp,
+        b"namespace N { class Foo { public int Bar() { return 1; } } }",
+    );
+    assert!(names.iter().any(|n| n == "Foo"), "names={names:?}");
+    assert!(names.iter().any(|n| n == "Bar"), "names={names:?}");
+    assert!(names.iter().any(|n| n == "N"), "names={names:?}");
+}
+
+#[test]
+fn extracts_ruby_class_method_module() {
+    let names = names_of(
+        Language::Ruby,
+        b"module M\n  class Foo\n    def bar\n    end\n  end\nend\n",
+    );
+    assert!(names.iter().any(|n| n == "M"), "names={names:?}");
+    assert!(names.iter().any(|n| n == "Foo"), "names={names:?}");
+    assert!(names.iter().any(|n| n == "bar"), "names={names:?}");
+}
+
+#[test]
+fn extracts_bash_function() {
+    let names = names_of(
+        Language::Bash,
+        b"alpha() {\n  echo hi\n}\nfunction beta {\n  echo yo\n}\n",
+    );
+    assert!(names.iter().any(|n| n == "alpha"), "names={names:?}");
+    assert!(names.iter().any(|n| n == "beta"), "names={names:?}");
+}

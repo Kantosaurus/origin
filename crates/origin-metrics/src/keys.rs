@@ -220,6 +220,34 @@ pub mod genai {
 
     /// `gen_ai.operation.name` value: agent invocation.
     pub const OPERATION_INVOKE_AGENT: &str = "invoke_agent";
+
+    // -- Event names (GenAI semantic-convention message/choice events) -------
+
+    /// Event name for a system-role message turned into a span event.
+    pub const EVENT_SYSTEM_MESSAGE: &str = "gen_ai.system.message";
+
+    /// Event name for a user-role message turned into a span event.
+    pub const EVENT_USER_MESSAGE: &str = "gen_ai.user.message";
+
+    /// Event name for an assistant-role message turned into a span event.
+    pub const EVENT_ASSISTANT_MESSAGE: &str = "gen_ai.assistant.message";
+
+    /// Event name for a tool-result message turned into a span event.
+    pub const EVENT_TOOL_MESSAGE: &str = "gen_ai.tool.message";
+
+    /// Event name for a single generated choice.
+    pub const EVENT_CHOICE: &str = "gen_ai.choice";
+
+    // -- Event body fields ---------------------------------------------------
+
+    /// `gen_ai.message.role` attribute on a message event: the message role.
+    pub const MESSAGE_ROLE: &str = "gen_ai.message.role";
+
+    /// `gen_ai.message.content` attribute on a message event: the message body.
+    pub const MESSAGE_CONTENT: &str = "gen_ai.message.content";
+
+    /// `gen_ai.choice.index` attribute on a choice event: the 0-based index.
+    pub const CHOICE_INDEX: &str = "gen_ai.choice.index";
 }
 
 /// Convention-mapped name for one of origin's internal metric families.

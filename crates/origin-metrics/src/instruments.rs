@@ -150,6 +150,16 @@ impl Drop for GenAiSpanGuard {
     }
 }
 
+#[cfg(not(feature = "otel"))]
+impl GenAiSpanGuard {
+    /// No-op in the default build. Mirrors the `otel` method the daemon calls
+    /// live so the call site is feature-agnostic and the default path stays
+    /// byte-identical.
+    #[inline]
+    #[allow(clippy::unused_self, clippy::module_name_repetitions)]
+    pub const fn set_response_attributes(&mut self, _response_id: &str, _cached_input_tokens: u64) {}
+}
+
 /// Open a `gen_ai` client span around a provider call.
 ///
 /// In the default (non-`otel`) build this returns a zero-size
@@ -233,6 +243,21 @@ mod noop_tests {
         // The Default impl yields the same no-op guard.
         let _default = super::GenAiSpanGuard;
     }
+
+    /// In the default build the daemon-facing `set_response_attributes` is a
+    /// no-op `&mut self` method: calling it links, runs, and justifies the
+    /// daemon's `let mut` binding without any otel dependency.
+    #[test]
+    fn set_response_attributes_is_a_noop_without_otel() {
+        use std::hint::black_box;
+        let mut guard = super::gen_ai_span(
+            black_box("anthropic"),
+            black_box("claude-sonnet-4-6"),
+            black_box("chat"),
+        );
+        guard.set_response_attributes(black_box("resp_1"), black_box(64));
+        drop(guard);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +268,7 @@ mod noop_tests {
 #[allow(clippy::module_name_repetitions)]
 pub use otel_impl::{
     gen_ai_span, init_instruments, record_gen_ai_usage, record_time_per_output_token,
-    record_time_to_first_token, GenAiSpanGuard, Outcome,
+    record_time_to_first_token, GenAiSpanGuard, Outcome, RequestParams,
 };
 
 #[cfg(feature = "otel")]
@@ -273,6 +298,8 @@ mod otel_impl {
         operation_duration: Histogram<f64>,
         time_to_first_token: Histogram<f64>,
         time_per_output_token: Histogram<f64>,
+        client_token_usage: Histogram<u64>,
+        server_request_duration: Histogram<f64>,
     }
 
     impl GenAiInstruments {
@@ -314,6 +341,16 @@ mod otel_impl {
                 .with_description("GenAI average inter-token (per-output-token) latency")
                 .with_unit("ms")
                 .try_init()?;
+            let client_token_usage = meter
+                .u64_histogram(genai::CLIENT_TOKEN_USAGE)
+                .with_description("GenAI client-side token usage distribution (input + output)")
+                .with_unit("{token}")
+                .try_init()?;
+            let server_request_duration = meter
+                .f64_histogram(genai::SERVER_REQUEST_DURATION)
+                .with_description("GenAI server-side request duration")
+                .with_unit("ms")
+                .try_init()?;
             Ok(Self {
                 input_tokens,
                 output_tokens,
@@ -321,6 +358,8 @@ mod otel_impl {
                 operation_duration,
                 time_to_first_token,
                 time_per_output_token,
+                client_token_usage,
+                server_request_duration,
             })
         }
     }
@@ -377,6 +416,11 @@ mod otel_impl {
         inst.output_tokens.add(output_tokens, &attrs);
         inst.tool_calls.add(tool_calls, &attrs);
         inst.operation_duration.record(latency_ms, &attrs);
+        // Convention distributions alongside the additive counters: the total
+        // token usage and the request duration as histograms.
+        inst.client_token_usage
+            .record(input_tokens.saturating_add(output_tokens), &attrs);
+        inst.server_request_duration.record(latency_ms, &attrs);
     }
 
     /// Build the `gen_ai.*` attribute set for a recording, **deriving** every
@@ -469,6 +513,173 @@ mod otel_impl {
         attrs
     }
 
+    /// Push a non-empty string attribute (the omit-if-empty pattern shared by
+    /// all the convention builders, so a blank field never emits an attribute).
+    fn push_str_attr(attrs: &mut Vec<KeyValue>, key: &'static str, value: &str) {
+        if !value.is_empty() {
+            attrs.push(KeyValue::new(key, value.to_owned()));
+        }
+    }
+
+    /// Build a `GenAI` message span-event: the event name (`gen_ai.{role}.message`)
+    /// and its role + (optional) content attributes. Pure and total.
+    fn gen_ai_message_event(role: &str, content: &str) -> (&'static str, Vec<KeyValue>) {
+        let name = match role {
+            "system" => genai::EVENT_SYSTEM_MESSAGE,
+            "assistant" => genai::EVENT_ASSISTANT_MESSAGE,
+            "tool" => genai::EVENT_TOOL_MESSAGE,
+            _ => genai::EVENT_USER_MESSAGE,
+        };
+        let mut attrs = Vec::with_capacity(2);
+        attrs.push(KeyValue::new(genai::MESSAGE_ROLE, role.to_owned()));
+        push_str_attr(&mut attrs, genai::MESSAGE_CONTENT, content);
+        (name, attrs)
+    }
+
+    /// Build a `gen_ai.choice` event: 0-based index + (optional) finish reason.
+    fn gen_ai_choice_event(index: i64, finish_reason: &str) -> (&'static str, Vec<KeyValue>) {
+        let mut attrs = Vec::with_capacity(2);
+        attrs.push(KeyValue::new(genai::CHOICE_INDEX, index));
+        push_str_attr(&mut attrs, genai::RESPONSE_FINISH_REASONS, finish_reason);
+        (genai::EVENT_CHOICE, attrs)
+    }
+
+    /// Build a `gen_ai.tool.message` event: tool-call id + (optional) content.
+    fn gen_ai_tool_message_event(
+        tool_call_id: &str,
+        content: &str,
+    ) -> (&'static str, Vec<KeyValue>) {
+        let mut attrs = Vec::with_capacity(2);
+        push_str_attr(&mut attrs, genai::TOOL_CALL_ID, tool_call_id);
+        push_str_attr(&mut attrs, genai::MESSAGE_CONTENT, content);
+        (genai::EVENT_TOOL_MESSAGE, attrs)
+    }
+
+    /// Requested sampling / generation parameters for a turn. Every field is
+    /// optional; `None`/empty fields are omitted from the built attribute set.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct RequestParams<'a> {
+        pub temperature: Option<f64>,
+        pub top_p: Option<f64>,
+        pub top_k: Option<i64>,
+        pub max_tokens: Option<i64>,
+        pub frequency_penalty: Option<f64>,
+        pub presence_penalty: Option<f64>,
+        pub seed: Option<i64>,
+        pub choice_count: Option<i64>,
+        pub stop_sequences: &'a [String],
+        pub encoding_formats: &'a [String],
+    }
+
+    fn push_str_array(attrs: &mut Vec<KeyValue>, key: &'static str, values: &[String]) {
+        if !values.is_empty() {
+            let arr: Vec<opentelemetry::StringValue> =
+                values.iter().map(|s| s.clone().into()).collect();
+            attrs.push(KeyValue::new(
+                key,
+                opentelemetry::Value::Array(opentelemetry::Array::String(arr)),
+            ));
+        }
+    }
+
+    /// Build the `gen_ai.request.*` sampling attribute set from [`RequestParams`].
+    /// Pure and total: every unset field is omitted. Uses each convention
+    /// constant directly so the keys are the single source of truth.
+    fn gen_ai_request_attributes(p: RequestParams<'_>) -> Vec<KeyValue> {
+        let mut attrs = Vec::new();
+        if let Some(v) = p.temperature {
+            attrs.push(KeyValue::new(genai::REQUEST_TEMPERATURE, v));
+        }
+        if let Some(v) = p.top_p {
+            attrs.push(KeyValue::new(genai::REQUEST_TOP_P, v));
+        }
+        if let Some(v) = p.top_k {
+            attrs.push(KeyValue::new(genai::REQUEST_TOP_K, v));
+        }
+        if let Some(v) = p.max_tokens {
+            attrs.push(KeyValue::new(genai::REQUEST_MAX_TOKENS, v));
+        }
+        if let Some(v) = p.frequency_penalty {
+            attrs.push(KeyValue::new(genai::REQUEST_FREQUENCY_PENALTY, v));
+        }
+        if let Some(v) = p.presence_penalty {
+            attrs.push(KeyValue::new(genai::REQUEST_PRESENCE_PENALTY, v));
+        }
+        if let Some(v) = p.seed {
+            attrs.push(KeyValue::new(genai::REQUEST_SEED, v));
+        }
+        if let Some(v) = p.choice_count {
+            attrs.push(KeyValue::new(genai::REQUEST_CHOICE_COUNT, v));
+        }
+        push_str_array(&mut attrs, genai::REQUEST_STOP_SEQUENCES, p.stop_sequences);
+        push_str_array(&mut attrs, genai::REQUEST_ENCODING_FORMATS, p.encoding_formats);
+        attrs
+    }
+
+    /// Build the `gen_ai.response.*` / cached-usage attribute set. Empty id and
+    /// zero cached tokens are omitted.
+    fn gen_ai_response_attributes(response_id: &str, cached_input_tokens: u64) -> Vec<KeyValue> {
+        let mut attrs = Vec::with_capacity(2);
+        push_str_attr(&mut attrs, genai::RESPONSE_ID, response_id);
+        if cached_input_tokens > 0 {
+            attrs.push(KeyValue::new(
+                genai::USAGE_CACHED_INPUT_TOKENS,
+                i64::try_from(cached_input_tokens).unwrap_or(i64::MAX),
+            ));
+        }
+        attrs
+    }
+
+    /// Build the `gen_ai.agent.*` / conversation / data-source attribute set.
+    /// Each empty field is omitted.
+    fn gen_ai_agent_attributes(
+        agent_id: &str,
+        agent_name: &str,
+        agent_description: &str,
+        conversation_id: &str,
+        data_source_id: &str,
+    ) -> Vec<KeyValue> {
+        let mut attrs = Vec::with_capacity(5);
+        push_str_attr(&mut attrs, genai::AGENT_ID, agent_id);
+        push_str_attr(&mut attrs, genai::AGENT_NAME, agent_name);
+        push_str_attr(&mut attrs, genai::AGENT_DESCRIPTION, agent_description);
+        push_str_attr(&mut attrs, genai::CONVERSATION_ID, conversation_id);
+        push_str_attr(&mut attrs, genai::DATA_SOURCE_ID, data_source_id);
+        attrs
+    }
+
+    /// Build the provider/server attribute set (`gen_ai.provider.name`,
+    /// `server.address`, `server.port`). Empty/`None` fields are omitted.
+    fn gen_ai_server_attributes(
+        provider_name: &str,
+        server_address: &str,
+        server_port: Option<i64>,
+    ) -> Vec<KeyValue> {
+        let mut attrs = Vec::with_capacity(3);
+        push_str_attr(&mut attrs, genai::PROVIDER_NAME, provider_name);
+        push_str_attr(&mut attrs, genai::SERVER_ADDRESS, server_address);
+        if let Some(port) = server_port {
+            attrs.push(KeyValue::new(genai::SERVER_PORT, port));
+        }
+        attrs
+    }
+
+    /// Build the `gen_ai.tool.*` attribute set for an executed tool. Empty
+    /// fields are omitted.
+    fn gen_ai_tool_attributes(
+        tool_name: &str,
+        tool_call_id: &str,
+        tool_description: &str,
+        tool_type: &str,
+    ) -> Vec<KeyValue> {
+        let mut attrs = Vec::with_capacity(4);
+        push_str_attr(&mut attrs, genai::TOOL_NAME, tool_name);
+        push_str_attr(&mut attrs, genai::TOOL_CALL_ID, tool_call_id);
+        push_str_attr(&mut attrs, genai::TOOL_DESCRIPTION, tool_description);
+        push_str_attr(&mut attrs, genai::TOOL_TYPE, tool_type);
+        attrs
+    }
+
     /// See the crate-level [`crate::instruments::record_time_to_first_token`].
     ///
     /// Records `ttft_ms` to the `gen_ai.server.time_to_first_token` histogram
@@ -540,6 +751,111 @@ mod otel_impl {
             if let Some(mut span) = self.span.take() {
                 span.end();
             }
+        }
+    }
+
+    impl GenAiSpanGuard {
+        /// Attach a built attribute set to the live span (no-op when no span /
+        /// no attributes).
+        fn set_attributes(&mut self, attrs: Vec<KeyValue>) {
+            use opentelemetry::trace::Span as _;
+            if attrs.is_empty() {
+                return;
+            }
+            if let Some(span) = self.span.as_mut() {
+                for kv in attrs {
+                    span.set_attribute(kv);
+                }
+            }
+        }
+
+        /// Add a named span event with `attrs` (no-op when no span).
+        fn add_event(&mut self, name: &'static str, attrs: Vec<KeyValue>) {
+            use opentelemetry::trace::Span as _;
+            if let Some(span) = self.span.as_mut() {
+                span.add_event(name, attrs);
+            }
+        }
+
+        /// Attach the requested sampling/generation parameters
+        /// (`gen_ai.request.*`) to the span.
+        pub fn set_request_params(&mut self, params: RequestParams<'_>) {
+            self.set_attributes(gen_ai_request_attributes(params));
+        }
+
+        /// Attach the response id + cached-input-token usage to the span.
+        pub fn set_response_attributes(&mut self, response_id: &str, cached_input_tokens: u64) {
+            self.set_attributes(gen_ai_response_attributes(response_id, cached_input_tokens));
+        }
+
+        /// Attach the agent / conversation / data-source attributes to the span.
+        pub fn set_agent_attributes(
+            &mut self,
+            agent_id: &str,
+            agent_name: &str,
+            agent_description: &str,
+            conversation_id: &str,
+            data_source_id: &str,
+        ) {
+            self.set_attributes(gen_ai_agent_attributes(
+                agent_id,
+                agent_name,
+                agent_description,
+                conversation_id,
+                data_source_id,
+            ));
+        }
+
+        /// Attach provider/server (`gen_ai.provider.name`, `server.*`) attributes.
+        pub fn set_server_attributes(
+            &mut self,
+            provider_name: &str,
+            server_address: &str,
+            server_port: Option<i64>,
+        ) {
+            self.set_attributes(gen_ai_server_attributes(
+                provider_name,
+                server_address,
+                server_port,
+            ));
+        }
+
+        /// Attach `gen_ai.tool.*` attributes for an executed tool.
+        pub fn set_tool_attributes(
+            &mut self,
+            tool_name: &str,
+            tool_call_id: &str,
+            tool_description: &str,
+            tool_type: &str,
+        ) {
+            self.set_attributes(gen_ai_tool_attributes(
+                tool_name,
+                tool_call_id,
+                tool_description,
+                tool_type,
+            ));
+        }
+
+        /// Record a `GenAI` message (`gen_ai.{role}.message`) span event. Carries
+        /// the message body, so callers should gate this on a content-capture
+        /// opt-in (the convention treats message content as opt-in / PII).
+        pub fn record_message(&mut self, role: &str, content: &str) {
+            let (name, attrs) = gen_ai_message_event(role, content);
+            self.add_event(name, attrs);
+        }
+
+        /// Record a `gen_ai.choice` span event (index + optional finish reason).
+        pub fn record_choice(&mut self, index: i64, finish_reason: &str) {
+            let (name, attrs) = gen_ai_choice_event(index, finish_reason);
+            self.add_event(name, attrs);
+        }
+
+        /// Record a `gen_ai.tool.message` span event. Carries tool-result
+        /// content, so it should be gated on the same content opt-in as
+        /// [`Self::record_message`].
+        pub fn record_tool_message(&mut self, tool_call_id: &str, content: &str) {
+            let (name, attrs) = gen_ai_tool_message_event(tool_call_id, content);
+            self.add_event(name, attrs);
         }
     }
 
@@ -808,6 +1124,144 @@ mod otel_impl {
             })
             .await;
             built.expect("gen_ai_span path must not hang");
+        }
+
+        /// Find an attribute value by its convention key.
+        fn find<'a>(attrs: &'a [opentelemetry::KeyValue], key: &str) -> Option<&'a Value> {
+            attrs
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| &kv.value)
+        }
+
+        #[test]
+        fn message_event_builders_emit_correct_names_and_keys() {
+            let (name, attrs) = super::gen_ai_message_event("user", "hi");
+            assert_eq!(name, genai::EVENT_USER_MESSAGE);
+            assert_eq!(find(&attrs, genai::MESSAGE_ROLE), Some(&Value::from("user")));
+            assert_eq!(find(&attrs, genai::MESSAGE_CONTENT), Some(&Value::from("hi")));
+            assert_eq!(
+                super::gen_ai_message_event("system", "x").0,
+                genai::EVENT_SYSTEM_MESSAGE
+            );
+            assert_eq!(
+                super::gen_ai_message_event("assistant", "x").0,
+                genai::EVENT_ASSISTANT_MESSAGE
+            );
+            // Empty content omits the content attribute (no blank attribute).
+            let (_, empty_content) = super::gen_ai_message_event("user", "");
+            assert!(find(&empty_content, genai::MESSAGE_CONTENT).is_none());
+        }
+
+        #[test]
+        fn choice_event_carries_finish_reason_and_index() {
+            let (name, attrs) = super::gen_ai_choice_event(0, "stop");
+            assert_eq!(name, genai::EVENT_CHOICE);
+            assert_eq!(find(&attrs, genai::CHOICE_INDEX), Some(&Value::I64(0)));
+            assert_eq!(
+                find(&attrs, genai::RESPONSE_FINISH_REASONS),
+                Some(&Value::from("stop"))
+            );
+            // An empty finish reason is omitted (the index stays).
+            let (_, no_reason) = super::gen_ai_choice_event(1, "");
+            assert_eq!(find(&no_reason, genai::CHOICE_INDEX), Some(&Value::I64(1)));
+            assert!(find(&no_reason, genai::RESPONSE_FINISH_REASONS).is_none());
+        }
+
+        #[test]
+        fn tool_message_event_uses_tool_call_id() {
+            let (name, attrs) = super::gen_ai_tool_message_event("call_123", "result");
+            assert_eq!(name, genai::EVENT_TOOL_MESSAGE);
+            assert_eq!(find(&attrs, genai::TOOL_CALL_ID), Some(&Value::from("call_123")));
+            assert_eq!(find(&attrs, genai::MESSAGE_CONTENT), Some(&Value::from("result")));
+            assert!(super::gen_ai_tool_message_event("", "").1.is_empty());
+        }
+
+        #[test]
+        fn request_attributes_pin_sampling_keys() {
+            let stop = vec!["X".to_string(), "Y".to_string()];
+            let attrs = super::gen_ai_request_attributes(super::RequestParams {
+                temperature: Some(0.7),
+                top_p: Some(0.9),
+                top_k: Some(40),
+                max_tokens: Some(1000),
+                frequency_penalty: Some(0.1),
+                presence_penalty: Some(0.2),
+                seed: Some(7),
+                choice_count: Some(1),
+                stop_sequences: &stop,
+                encoding_formats: &[],
+            });
+            assert_eq!(find(&attrs, genai::REQUEST_TEMPERATURE), Some(&Value::F64(0.7)));
+            assert_eq!(find(&attrs, genai::REQUEST_MAX_TOKENS), Some(&Value::I64(1000)));
+            assert_eq!(find(&attrs, genai::REQUEST_SEED), Some(&Value::I64(7)));
+            assert_eq!(find(&attrs, genai::REQUEST_CHOICE_COUNT), Some(&Value::I64(1)));
+            assert!(
+                matches!(find(&attrs, genai::REQUEST_STOP_SEQUENCES), Some(Value::Array(_))),
+                "expected a stop-sequence string array"
+            );
+            // The default (all unset) yields no attributes.
+            assert!(super::gen_ai_request_attributes(super::RequestParams::default()).is_empty());
+        }
+
+        #[test]
+        fn response_attributes_include_cached_tokens_and_id() {
+            let attrs = super::gen_ai_response_attributes("resp_42", 128);
+            assert_eq!(find(&attrs, genai::RESPONSE_ID), Some(&Value::from("resp_42")));
+            assert_eq!(
+                find(&attrs, genai::USAGE_CACHED_INPUT_TOKENS),
+                Some(&Value::I64(128))
+            );
+            // Empty id + zero cached tokens => nothing emitted.
+            assert!(super::gen_ai_response_attributes("", 0).is_empty());
+        }
+
+        #[test]
+        fn agent_server_and_tool_attributes_pin_keys() {
+            let a = super::gen_ai_agent_attributes("id1", "origin", "desc", "conv1", "ds1");
+            assert_eq!(find(&a, genai::AGENT_ID), Some(&Value::from("id1")));
+            assert_eq!(find(&a, genai::AGENT_NAME), Some(&Value::from("origin")));
+            assert_eq!(find(&a, genai::CONVERSATION_ID), Some(&Value::from("conv1")));
+            assert_eq!(find(&a, genai::DATA_SOURCE_ID), Some(&Value::from("ds1")));
+            assert!(super::gen_ai_agent_attributes("", "", "", "", "").is_empty());
+
+            let s = super::gen_ai_server_attributes("anthropic", "api.host", Some(443));
+            assert_eq!(find(&s, genai::PROVIDER_NAME), Some(&Value::from("anthropic")));
+            assert_eq!(find(&s, genai::SERVER_ADDRESS), Some(&Value::from("api.host")));
+            assert_eq!(find(&s, genai::SERVER_PORT), Some(&Value::I64(443)));
+
+            let t = super::gen_ai_tool_attributes("Bash", "tc1", "run shell", "function");
+            assert_eq!(find(&t, genai::TOOL_NAME), Some(&Value::from("Bash")));
+            assert_eq!(find(&t, genai::TOOL_TYPE), Some(&Value::from("function")));
+        }
+
+        /// Exercise the live `GenAiSpanGuard` recording methods end-to-end on a
+        /// real span so they are not dead code and never panic. Bounded by a
+        /// timeout; the provider is `mem::forget`-ed to avoid a teardown flush.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn span_record_methods_run_without_panicking() {
+            let built = tokio::time::timeout(Duration::from_secs(20), async {
+                let provider =
+                    crate::exporter::otel::install(crate::exporter::otel::DEFAULT_ENDPOINT)
+                        .expect("install");
+                {
+                    let mut span = gen_ai_span("anthropic", "m", genai::OPERATION_CHAT);
+                    span.set_request_params(super::RequestParams {
+                        max_tokens: Some(100),
+                        ..Default::default()
+                    });
+                    span.set_response_attributes("resp_1", 64);
+                    span.set_agent_attributes("a", "origin", "d", "conv", "ds");
+                    span.set_server_attributes("anthropic", "host", Some(443));
+                    span.set_tool_attributes("Bash", "tc", "desc", "function");
+                    span.record_message("user", "hi");
+                    span.record_choice(0, "stop");
+                    span.record_tool_message("tc", "ok");
+                }
+                std::mem::forget(provider);
+            })
+            .await;
+            built.expect("span record methods must not hang");
         }
     }
 }

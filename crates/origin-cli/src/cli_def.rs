@@ -312,9 +312,14 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
         /// Compute the report from a recorded `TaskResult` JSON array at this
-        /// path (offline) instead of running the task set live.
+        /// path (offline) instead of running the task set live. Repeatable: with
+        /// `--leaderboard`, pass one `--from` per model to rank them together.
         #[arg(long)]
-        from: Option<String>,
+        from: Vec<String>,
+        /// Aggregate every `--from` file into a ranked cross-model leaderboard
+        /// (best mean pass@k first) instead of a single reliability report.
+        #[arg(long)]
+        leaderboard: bool,
     },
     /// Confidence-scored, multi-dimension review of the working-tree diff vs
     /// `HEAD`. Runs fully local static heuristics through `origin-review`'s

@@ -273,7 +273,20 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
         Cmd::Plugin { sub } => origin_cli::plugin::run(sub),
         Cmd::Lsp { sub } => origin_cli::lsp::run(&sub),
         Cmd::Ambient { sub } => origin_cli::ambient::run(&sub),
-        Cmd::Bench { samples, json, from } => origin_cli::bench::run(samples, json, from),
+        Cmd::Bench {
+            samples,
+            json,
+            from,
+            leaderboard,
+        } => {
+            if leaderboard {
+                origin_cli::bench::run_leaderboard(&from, json, samples)
+            } else {
+                // Single-file reliability path (unchanged): the first --from
+                // selects the recorded results; None runs the task set live.
+                origin_cli::bench::run(samples, json, from.into_iter().next())
+            }
+        }
         Cmd::Review { strictness } => origin_cli::review::run(&strictness),
         Cmd::Gmail {
             op,
@@ -1019,7 +1032,7 @@ async fn handle_input_action(
                 // A prompt turn is already streaming on this connection;
                 // don't start a second concurrent turn on the same session.
                 app.lock()
-                    .add_line("system> ", "a turn is already running (Ctrl+C to interrupt it)");
+                    .add_line("system> ", origin_cli::locale::line("cmd.turn.busy"));
                 handle.mark_dirty();
             } else {
                 spawn_prompt_turn(text, app, handle, interrupt_tx, path, model, session_id).await;
@@ -1152,6 +1165,28 @@ fn is_slash_command(text: &str) -> bool {
         || parse_clear_command(text).is_some()
         || parse_skill_command(text).is_some()
         || parse_workflow_command(text).is_some()
+        // Reserved slash verbs with inline handlers in `handle_submit` that
+        // `parse_skill_command` rejects (so they'd otherwise reach the model):
+        // `/help` and `/knowledge`. `/vim` and `/permissions` are non-reserved
+        // and pass today only via the skill catch-all — named here too so the
+        // gate stays authoritative if `RESERVED_SLASH_VERBS` changes. Each
+        // predicate mirrors its handler's word-boundary in `handle_submit`.
+        || is_help_command(text)
+        || slash_verb_boundary(text, "/knowledge")
+        || slash_verb_boundary(text, "/permissions")
+        || text
+            .trim()
+            .strip_prefix("/vim")
+            .is_some_and(|rest| rest.trim().is_empty())
+}
+
+/// True if `text` (trimmed) is exactly `cmd` or `cmd` followed by whitespace —
+/// the word-boundary shape the `/knowledge` / `/permissions` handlers use, so
+/// `/knowledgefoo` (a skill name) is not matched as the command.
+fn slash_verb_boundary(text: &str, cmd: &str) -> bool {
+    text.trim()
+        .strip_prefix(cmd)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
 }
 
 // `too_many_lines`: single linear dispatch over many slash commands; splitting
@@ -1192,11 +1227,15 @@ async fn handle_submit(
             model.push_str(&name);
             let mut a = app.lock();
             a.set_model(name.clone());
-            a.add_line("system> ", &format!("model set: {name}"));
+            a.add_line(
+                "system> ",
+                &origin_cli::locale::linef("cmd.model.set", &[("name", name.as_str())]),
+            );
             drop(a);
         } else {
             let _ = rest; // unused when usage hint fires; matches `/account`'s shape
-            app.lock().add_line("error> ", "usage: /model <name>");
+            app.lock()
+                .add_line("error> ", origin_cli::locale::line("cmd.model.usage"));
         }
         handle.mark_dirty();
         return;
@@ -1213,12 +1252,14 @@ async fn handle_submit(
             Some(level) => {
                 let token = level.as_str();
                 app.lock().effort = Some(token.to_string());
-                app.lock()
-                    .add_line("system> ", &format!("reasoning effort: {token}"));
+                app.lock().add_line(
+                    "system> ",
+                    &origin_cli::locale::linef("cmd.effort.set", &[("token", token)]),
+                );
             }
             None => app
                 .lock()
-                .add_line("error> ", "usage: /effort <fast|low|medium|high|max>"),
+                .add_line("error> ", origin_cli::locale::line("cmd.effort.usage")),
         }
         handle.mark_dirty();
         return;
@@ -1238,12 +1279,14 @@ async fn handle_submit(
         match origin_outputstyle::Style::from_str_opt(arg.trim()) {
             Some(style) => {
                 app.lock().output_style = Some(style);
-                app.lock()
-                    .add_line("system> ", &format!("output style: {}", style.label()));
+                app.lock().add_line(
+                    "system> ",
+                    &origin_cli::locale::linef("cmd.outputstyle.set", &[("label", style.label())]),
+                );
             }
             None => app.lock().add_line(
                 "error> ",
-                "usage: /output-style <default|explanatory|learning|concise>",
+                origin_cli::locale::line("cmd.outputstyle.usage"),
             ),
         }
         handle.mark_dirty();
@@ -1261,15 +1304,18 @@ async fn handle_submit(
         app.lock().add_line("you> ", text);
         if hint.is_empty() {
             app.lock()
-                .add_line("error> ", "usage: /steer <hint to inject into the next turn>");
+                .add_line("error> ", origin_cli::locale::line("cmd.steer.usage"));
         } else {
             let pending = {
                 let mut a = app.lock();
                 a.steering.push(hint);
                 a.steering.len()
             };
-            app.lock()
-                .add_line("system> ", &format!("steering hint queued ({pending} pending)"));
+            let pending = pending.to_string();
+            app.lock().add_line(
+                "system> ",
+                &origin_cli::locale::linef("cmd.steer.queued", &[("pending", pending.as_str())]),
+            );
         }
         handle.mark_dirty();
         return;
@@ -1450,13 +1496,13 @@ async fn handle_submit(
             .filter(|t| !t.is_empty())
             .map(origin_cli::clipboard::osc52_sequence);
         if let Some(seq) = seq {
-            a.add_line("ok> ", "copied the last reply to the clipboard");
+            a.add_line("ok> ", origin_cli::locale::line("cmd.copy.ok"));
             drop(a);
             use std::io::Write as _;
             let _ = std::io::stdout().write_all(seq.as_bytes());
             let _ = std::io::stdout().flush();
         } else {
-            a.add_line("system> ", "nothing to copy yet");
+            a.add_line("system> ", origin_cli::locale::line("cmd.copy.empty"));
             drop(a);
         }
         handle.mark_dirty();
@@ -1503,8 +1549,11 @@ async fn handle_submit(
         match parse_account_command(rest) {
             Ok((provider, account_id)) => match switch_account(path, &provider, &account_id).await {
                 Ok((p, a)) => {
-                    app.lock()
-                        .add_line("system> ", &format!("provider active: {p}/{a}"));
+                    let line = origin_cli::locale::linef(
+                        "cmd.account.active",
+                        &[("provider", p.as_str()), ("account", a.as_str())],
+                    );
+                    app.lock().add_line("system> ", &line);
                 }
                 Err(e) => {
                     app.lock().add_line("error> ", &format!("{e}"));
@@ -2582,4 +2631,33 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
          for the daemon's stderr (it likely panicked during startup)",
         STARTUP_DEADLINE.as_secs()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: `is_slash_command` is the gate that decides whether a Submit
+    // routes to `handle_submit` (inline) or to the model. Reserved slash verbs
+    // (`RESERVED_SLASH_VERBS`) are rejected by `parse_skill_command`, so a
+    // reserved verb with an inline handler but no explicit gate predicate —
+    // `/knowledge` and `/help` — silently fell through to the model. `/vim` and
+    // `/permissions` are non-reserved and were recognized only via the skill
+    // catch-all; the gate now names them explicitly so it stays authoritative.
+    #[test]
+    fn is_slash_command_recognizes_composer_commands() {
+        assert!(is_slash_command("/knowledge ls"));
+        assert!(is_slash_command("/knowledge"));
+        assert!(is_slash_command("/knowledge add foo bar baz"));
+        assert!(is_slash_command("/help"));
+        assert!(is_slash_command("/?"));
+        assert!(is_slash_command("/vim"));
+        assert!(is_slash_command("/permissions"));
+        assert!(is_slash_command("/permissions on"));
+        // Genuine non-commands must still reach the model.
+        assert!(!is_slash_command("knowledge foo"));
+        assert!(!is_slash_command("please run /vim"));
+        assert!(!is_slash_command("/"));
+        assert!(!is_slash_command("just a normal prompt"));
+    }
 }
