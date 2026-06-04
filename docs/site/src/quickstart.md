@@ -40,19 +40,19 @@ The `--locked` flag matters: `origin`'s transitive deps are pinned through
 
 ## Start the daemon
 
-`origin-cli` will auto-spawn `origin-daemon` on first use, but you can also
-start it explicitly — useful when attaching from multiple clients or running
-headless on a build server:
+`origin-cli` auto-spawns the daemon the first time you run `origin` — and by
+default it routes through `origin-supervisor`, which owns `origin-daemon`,
+restarts it on panic, and applies self-dev binary hot-swaps (the exit-86
+relaunch sentinel). There is nothing to start by hand:
 
 ```bash
-origin daemon start          # background, supervised by origin-supervisor
-origin daemon status         # health, uptime, session count
-origin daemon logs --follow  # streamed from origin-trace parquet ring
+origin                       # launches the TUI; the supervised daemon comes up on demand
 ```
 
-The supervisor restarts the daemon on panic; in-flight sessions resume from
-SQLite + the WAL checkpoint (see [Architecture](architecture.md) for the
-runtime split).
+Set `ORIGIN_NO_SUPERVISOR=1` to spawn `origin-daemon` directly instead — no
+crash-restart and no self-dev hot-reload, useful when debugging a daemon panic.
+Across a supervised restart, in-flight sessions resume from SQLite + the WAL
+checkpoint (see [Architecture](architecture.md) for the runtime split).
 
 ## Run your first prompt
 

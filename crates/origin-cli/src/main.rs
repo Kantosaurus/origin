@@ -525,6 +525,9 @@ async fn run() -> Result<()> {
     // Auto-fire the pending discovery prompt now that the TUI is wired up.
     fire_pending_prompt(pending_prompt, &app, &handle, &path, &mut model, &session_id).await;
 
+    // Keep a handle to read the cumulative usage for the farewell summary after
+    // the event loop consumes its own `app` handle.
+    let app_for_summary = app.clone();
     let result =
         run_event_loop(app, handle, &path, &mut model, &session_id, plan_panel, composer_for_events).await;
 
@@ -533,9 +536,17 @@ async fn run() -> Result<()> {
     // the guard's `Drop` afterward is then an idempotent no-op safety net.
     drop(terminal_guard);
     // Localized farewell on a clean TUI exit (item A; origin-i18n locale from
-    // $LC_ALL/$LANG, English fallback). Only on the Ok path so error output is
-    // unchanged.
+    // `--lang`/$LC_ALL/$LANG, English fallback). Only on the Ok path so error
+    // output is unchanged. A priced session also prints a localized
+    // "Session total: $X" line (the `cost.session` catalog key); unpriced /
+    // zero-spend sessions print nothing extra.
     if result.is_ok() {
+        // Compute before the `if let` so the usage lock guard is released
+        // immediately (not held across the println! body).
+        let total_line = origin_cli::status::session_total_line(&app_for_summary.lock().usage);
+        if let Some(total) = total_line {
+            println!("{total}");
+        }
         println!("{}", origin_cli::locale::line("bye"));
     }
     result
@@ -1307,6 +1318,34 @@ async fn handle_submit(
             "vim mode OFF \u{2014} direct insert (default)"
         };
         app.lock().add_line("system> ", msg);
+        handle.mark_dirty();
+        return;
+    }
+    // `/knowledge <add|search|ls|rm> …` runs the local knowledge index in-session
+    // (openclaude `/knowledge` parity), pushing results into the scrollback. The
+    // standalone `origin knowledge` subcommand remains; this gives the TUI parity.
+    if text
+        .trim()
+        .strip_prefix("/knowledge")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        app.lock().add_line("you> ", text);
+        match origin_cli::input::parse_knowledge_command(text) {
+            Some(sub) => match origin_cli::knowledge::run_to_string(sub) {
+                Ok(out) if out.is_empty() => app.lock().add_line("knowledge> ", "(no output)"),
+                Ok(out) => {
+                    let mut a = app.lock();
+                    for line in out.lines() {
+                        a.add_line("knowledge> ", line);
+                    }
+                }
+                Err(e) => app.lock().add_line("error> ", &format!("knowledge: {e}")),
+            },
+            None => app.lock().add_line(
+                "error> ",
+                "usage: /knowledge <add <id> <text…> | search <query…> | ls | rm <id>>",
+            ),
+        }
         handle.mark_dirty();
         return;
     }
@@ -2325,6 +2364,28 @@ fn resolve_daemon_binary() -> Result<(std::ffi::OsString, Option<std::path::Path
     Ok((cmd_path, sibling))
 }
 
+/// Resolve the supervisor binary: sibling of the current exe.
+///
+/// Returns the command path plus whether it is **available** (the sibling
+/// exists on disk). When it is absent we fall back to a direct daemon spawn, so
+/// bring-up never fails for lack of the supervisor. Unlike the daemon, we do not
+/// fall back to a bare-name PATH lookup for availability: a supervised launch is
+/// only chosen when we can point to a concrete binary.
+fn resolve_supervisor_binary() -> (std::ffi::OsString, bool) {
+    let name = if cfg!(windows) {
+        "origin-supervisor.exe"
+    } else {
+        "origin-supervisor"
+    };
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.join(name)));
+    match sibling {
+        Some(p) if p.exists() => (p.into_os_string(), true),
+        _ => (name.into(), false),
+    }
+}
+
 /// Path to the stamp file written each time we spawn a daemon.
 fn daemon_stamp_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".origin").join("daemon.stamp"))
@@ -2375,6 +2436,33 @@ fn kill_stale_daemon() {
     }
 }
 
+/// Kill any running `origin-supervisor` processes.
+///
+/// Used before a fresh supervised launch when the daemon binary is newer: the
+/// running supervisor would otherwise immediately respawn the daemon we are
+/// about to replace, so we tear it down first. (Killing the supervisor does not
+/// reap its daemon child today, so callers pair this with [`kill_stale_daemon`].)
+fn kill_stale_supervisor() {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/IM", "origin-supervisor.exe"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "origin-supervisor"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
 /// How long [`ensure_daemon_running`] waits for a freshly spawned daemon to
 /// bind the IPC path before giving up.
 const STARTUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -2391,10 +2479,27 @@ const STARTUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 /// daemon is killed and a fresh one is spawned.
 async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Result<()> {
     let (cmd_path, sibling) = resolve_daemon_binary()?;
+    // Supervised launch is the default: route the daemon through
+    // origin-supervisor so the self-dev relaunch sentinel (exit 86) has a
+    // runtime consumer that hot-swaps the freshly built binary. Opt out with
+    // ORIGIN_NO_SUPERVISOR=1, and fall back to a direct spawn when the
+    // supervisor binary isn't shipped alongside us.
+    let (supervisor_path, supervisor_available) = resolve_supervisor_binary();
+    let launcher = origin_cli::daemon_launch::select_launcher(
+        origin_cli::daemon_launch::no_supervisor_env(),
+        supervisor_available,
+    );
+    let supervised = launcher == origin_cli::daemon_launch::Launcher::Supervisor;
 
     if daemon_reachable(path).await {
         if daemon_binary_is_newer(&cmd_path) {
             tracing::info!("daemon binary is newer than running daemon — restarting");
+            // Under supervision the running supervisor would immediately respawn
+            // the daemon we are about to kill; tear it down first so the fresh
+            // launch below is the sole owner.
+            if supervised {
+                kill_stale_supervisor();
+            }
             kill_stale_daemon();
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         } else {
@@ -2423,7 +2528,16 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
     // resolves the initial provider purely from env vars today; without this
     // the auto-spawned daemon would always try `anthropic/default` even when
     // the user picked `anthropic-oauth` (or any other id) in onboarding.
-    let mut command = std::process::Command::new(&cmd_path);
+    // Supervised: spawn origin-supervisor pointed at the daemon binary (it owns
+    // and restarts the daemon, inheriting ORIGIN_PROVIDER/ACCOUNT below for the
+    // daemon child). Direct: spawn origin-daemon itself (legacy path).
+    let mut command = if supervised {
+        let mut c = std::process::Command::new(&supervisor_path);
+        c.args(origin_cli::daemon_launch::supervisor_args(&cmd_path));
+        c
+    } else {
+        std::process::Command::new(&cmd_path)
+    };
     command
         .env("ORIGIN_PROVIDER", provider)
         .env("ORIGIN_ACCOUNT", account)
@@ -2436,7 +2550,7 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
         use std::os::windows::process::CommandExt as _;
         // CREATE_NEW_PROCESS_GROUP (0x200) | DETACHED_PROCESS (0x08):
         // detach from the parent console so Ctrl-C in the TUI doesn't take
-        // the daemon down with it, and the daemon survives this process.
+        // the daemon (or supervisor) down with it, and it survives this process.
         command.creation_flags(0x0000_0208);
     }
 
@@ -2444,11 +2558,13 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
         let searched = sibling
             .as_ref()
             .map_or_else(|| "<no exe dir>".to_string(), |p| p.display().to_string());
+        let what = if supervised { "origin-supervisor" } else { "origin-daemon" };
         anyhow::anyhow!(
-            "could not spawn origin-daemon: {e}\n\
-             searched: {searched}, then PATH for `origin-daemon`\n\
-             build it with `cargo build --release -p origin-daemon` and place the binary \
-             next to origin, or set ORIGIN_SOCK to an existing daemon's pipe path"
+            "could not spawn {what}: {e}\n\
+             daemon searched: {searched}, then PATH for `origin-daemon`\n\
+             build it with `cargo build --release -p {what}` and place the binary \
+             next to origin, set ORIGIN_NO_SUPERVISOR=1 to launch the daemon directly, \
+             or set ORIGIN_SOCK to an existing daemon's pipe path"
         )
     })?;
     drop(child);

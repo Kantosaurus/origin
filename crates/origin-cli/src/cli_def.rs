@@ -570,7 +570,8 @@ pub enum TraceSub {
 pub enum SessionsSub {
     /// List recent sessions (most-recent first).
     Ls,
-    /// Resume a session by id (currently a no-op acknowledgement).
+    /// Resume a session by id: reloads its transcript so the model recalls the
+    /// earlier conversation (real `ResumeSession` round-trip to the daemon).
     Resume { session_id: String },
     /// Delete a session and all its messages.
     Rm { session_id: String },
