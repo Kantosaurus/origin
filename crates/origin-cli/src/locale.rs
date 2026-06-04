@@ -167,6 +167,76 @@ mod tests {
             ),
             "provider active: anthropic/default"
         );
+
+        // The seven previously-unrouted keys, now wired to live call sites. Each
+        // En literal is reconciled to the EXACT current call-site text so the
+        // default-English output is byte-identical after routing.
+        // `thinking` -> tui::localize_phase's "Thinking" status label (no ellipsis).
+        assert_eq!(t(Lang::En, "thinking"), "Thinking");
+        // `tool.running` -> main.rs tool-activity header `[tool]` (summary appended
+        // in code).
+        assert_eq!(tf(Lang::En, "tool.running", &[("tool", "Bash")]), "[Bash]");
+        // `tool.done` -> main.rs tool-failure line "{tool} failed" (✘ glyph in code).
+        assert_eq!(tf(Lang::En, "tool.done", &[("tool", "Edit")]), "Edit failed");
+        // `permission.denied` -> main.rs y/n deny verb "denied".
+        assert_eq!(t(Lang::En, "permission.denied"), "denied");
+        // `cost.turn` -> status::format_turn_cost (opt-in `ORIGIN_TURN_COST=1`).
+        assert_eq!(
+            tf(Lang::En, "cost.turn", &[("usd", "$0.01")]),
+            "This turn cost $0.01"
+        );
+        // `error.generic` -> main.rs turn-error line; bare `{message}` passthrough.
+        assert_eq!(tf(Lang::En, "error.generic", &[("message", "boom")]), "boom");
+        // `session.saved` -> admin::export_session "wrote {path}" confirmation.
+        assert_eq!(
+            tf(Lang::En, "session.saved", &[("path", "/tmp/s.md")]),
+            "wrote /tmp/s.md"
+        );
+    }
+
+    // Each newly-routed key, when accessed via the locale chrome helpers, resolves
+    // to the catalog (not the literal key) and — under a non-English `--lang`
+    // override — renders the localized template. The process-global override is set
+    // in `process_override_flows_through_resolve_none`; here we assert against the
+    // catalog directly so this test is order-independent: `line`/`linef` must equal
+    // the resolved-locale catalog text for the key (proving they route, not hardcode).
+    #[test]
+    fn newly_routed_keys_route_through_locale_helpers() {
+        let lang = resolve(None);
+        assert_eq!(line("thinking"), t(lang, "thinking"));
+        assert_eq!(line("permission.denied"), t(lang, "permission.denied"));
+        assert_eq!(
+            linef("tool.running", &[("tool", "Bash")]),
+            tf(lang, "tool.running", &[("tool", "Bash")])
+        );
+        assert_eq!(
+            linef("tool.done", &[("tool", "Edit")]),
+            tf(lang, "tool.done", &[("tool", "Edit")])
+        );
+        assert_eq!(
+            linef("cost.turn", &[("usd", "$0.01")]),
+            tf(lang, "cost.turn", &[("usd", "$0.01")])
+        );
+        assert_eq!(
+            linef("error.generic", &[("message", "boom")]),
+            tf(lang, "error.generic", &[("message", "boom")])
+        );
+        assert_eq!(
+            linef("session.saved", &[("path", "/x")]),
+            tf(lang, "session.saved", &[("path", "/x")])
+        );
+        // None of them collapse to the bare key (which would mean an unrouted miss).
+        for k in [
+            "thinking",
+            "tool.running",
+            "tool.done",
+            "permission.denied",
+            "cost.turn",
+            "error.generic",
+            "session.saved",
+        ] {
+            assert_ne!(line(k), k, "key {k} must resolve to catalog text, not the key");
+        }
     }
 
     // A sample substitution under default English must reproduce the EXACT
@@ -216,5 +286,14 @@ mod tests {
         let fr_model = linef("cmd.model.set", &[("name", "opus")]);
         assert_eq!(fr_model, tf(Lang::Fr, "cmd.model.set", &[("name", "opus")]));
         assert!(fr_model.contains("opus"));
+        // A newly-routed key (`thinking`) also localizes under the override and
+        // differs from English — proving the wiring reaches these call sites.
+        assert_eq!(line("thinking"), t(Lang::Fr, "thinking"));
+        assert_ne!(line("thinking"), t(Lang::En, "thinking"));
+        // And a newly-routed `linef()` key (`tool.done`) substitutes into the
+        // French template under the override.
+        let fr_done = linef("tool.done", &[("tool", "Edit")]);
+        assert_eq!(fr_done, tf(Lang::Fr, "tool.done", &[("tool", "Edit")]));
+        assert!(fr_done.contains("Edit"));
     }
 }

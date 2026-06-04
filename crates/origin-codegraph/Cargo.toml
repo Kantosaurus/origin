@@ -35,6 +35,22 @@ tree-sitter-cpp = "=0.22.3"
 tree-sitter-c-sharp = "=0.21.3"
 tree-sitter-ruby = "=0.21.0"
 tree-sitter-bash = "=0.21.0"
+# Extended grammars (codegraph parity with the repomap heuristic scanner).
+# All pinned to the generation that links the tree-sitter 0.22.x core directly
+# via `language()` and is MSRV-1.83 / edition2021 safe.
+tree-sitter-php = "=0.23.0"
+tree-sitter-swift = "=0.5.0"
+tree-sitter-kotlin = "=0.3.8"
+tree-sitter-scala = "=0.22.1"
+tree-sitter-haskell = "=0.21.0"
+tree-sitter-elixir = "=0.2.0"
+# Lua 0.1.0 is the last release that exposes the classic `language()` ABI
+# against the tree-sitter 0.21+/0.22 core; 0.2.0+ switched to the
+# `tree-sitter-language` LanguageFn ABI which our pinned 0.22.6 core cannot
+# convert from (no `From<LanguageFn>` until tree-sitter 0.23). Zig is omitted:
+# every published `tree-sitter-zig` (1.0.0+) uses the LanguageFn ABI, so none
+# is compatible with the 0.22.6 core.
+tree-sitter-lua = "=0.1.0"
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["html_reports"] }

@@ -31,6 +31,10 @@ doc = false
 [dependencies]
 origin-resume-token = { path = "../origin-resume-token" }
 origin-ipc = { path = "../origin-ipc" }
+# Single source of truth for the self-dev relaunch sentinel exit code, which the
+# supervisor must recognize exactly as the daemon emits it. `origin-selfdev` is a
+# pure leaf crate (no daemon/supervisor edges), so this introduces no cycle.
+origin-selfdev = { path = "../origin-selfdev" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "time"] }

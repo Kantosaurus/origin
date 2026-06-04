@@ -221,6 +221,14 @@ pub mod genai {
     /// `gen_ai.operation.name` value: agent invocation.
     pub const OPERATION_INVOKE_AGENT: &str = "invoke_agent";
 
+    // -- Standard `gen_ai.response.finish_reasons` values --------------------
+
+    /// `gen_ai.response.finish_reasons` value: the model stopped naturally.
+    pub const FINISH_STOP: &str = "stop";
+
+    /// `gen_ai.response.finish_reasons` value: the model issued tool calls.
+    pub const FINISH_TOOL_CALLS: &str = "tool_calls";
+
     // -- Event names (GenAI semantic-convention message/choice events) -------
 
     /// Event name for a system-role message turned into a span event.

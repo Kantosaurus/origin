@@ -17,9 +17,13 @@ use serde::{Deserialize, Serialize};
 /// Exit code the daemon uses to signal "I have written a relaunch manifest and
 /// want the supervisor to swap me for the new binary" (rather than a crash).
 ///
-/// Chosen to sit outside the common signal-derived (`128 + signo`) range and
-/// the conventional `0..=2` success/usage range so it is unambiguous.
-pub const SELFDEV_RELAUNCH_EXIT_CODE: i32 = 86;
+/// Re-exported from the leaf crate `origin-selfdev`, which owns the binary-swap
+/// contract and is the single source of truth for this sentinel. Kept as a
+/// `pub use` here so existing call sites
+/// (`origin_supervisor::relaunch::SELFDEV_RELAUNCH_EXIT_CODE`) and the crate-root
+/// re-export continue to resolve; a cross-crate sync test
+/// (`relaunch_sentinel_matches_canonical`) guards against drift.
+pub use origin_selfdev::SELFDEV_RELAUNCH_EXIT_CODE;
 
 /// The on-disk handoff the daemon writes (as `relaunch.json`) immediately
 /// before exiting with [`SELFDEV_RELAUNCH_EXIT_CODE`].
@@ -288,8 +292,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sentinel_exit_code_is_86() {
-        assert_eq!(SELFDEV_RELAUNCH_EXIT_CODE, 86);
+    fn relaunch_sentinel_matches_canonical() {
+        // Cross-crate drift guard: the sentinel the supervisor recognizes MUST
+        // equal the canonical value owned by `origin-selfdev` (the same value the
+        // daemon exits with). Because the supervisor re-exports the const this is
+        // structurally true, but the assertion bites if a divergent local literal
+        // is ever reintroduced. The literal `86` itself lives in exactly one place
+        // (the `origin-selfdev` definition).
+        assert_eq!(
+            SELFDEV_RELAUNCH_EXIT_CODE,
+            origin_selfdev::SELFDEV_RELAUNCH_EXIT_CODE
+        );
     }
 
     #[test]

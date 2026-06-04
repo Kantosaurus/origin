@@ -88,7 +88,10 @@ pub async fn export_session(session_id: String, json: bool, out: Option<String>)
         StreamEvent::SessionExport { content } => {
             if let Some(path) = out {
                 std::fs::write(&path, content)?;
-                println!("wrote {path}");
+                // The session-export confirmation routes through the `session.saved`
+                // catalog key (En "wrote {path}" — byte-identical); localized under
+                // `--lang`/`$LANG`.
+                println!("{}", crate::locale::linef("session.saved", &[("path", &path)]));
             } else {
                 print!("{content}");
             }

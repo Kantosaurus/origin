@@ -6,8 +6,13 @@ use std::path::Path;
 use thiserror::Error;
 use tree_sitter::{Parser as TsParser, Tree};
 
-/// Supported source languages. The variants are exhaustive over what
-/// Phase 7 ships; further grammars land in P10 polish.
+/// Supported source languages.
+///
+/// The original five shipped in Phase 7; the extended set (PHP … Lua) lands
+/// later to reach parity with the `origin-repomap` heuristic scanner. Variant
+/// order is load-bearing: the `as_discriminant` mapping in `record.rs` keys the
+/// SQL `language` column off it and MUST stay stable, so new variants are
+/// appended, never interleaved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     Rust,
@@ -20,6 +25,14 @@ pub enum Language {
     CSharp,
     Ruby,
     Bash,
+    // --- Extended grammars (codegraph ⇄ repomap parity) ---
+    Php,
+    Swift,
+    Kotlin,
+    Scala,
+    Haskell,
+    Elixir,
+    Lua,
 }
 
 /// Errors produced when configuring or running a tree-sitter parser.
@@ -38,7 +51,8 @@ impl Language {
     /// Detect a [`Language`] from a file extension (without the leading dot).
     ///
     /// The match is case-insensitive. Returns `None` for any extension that
-    /// does not correspond to one of the five supported grammars.
+    /// does not correspond to one of the supported grammars (callers fall back
+    /// to the `origin-repomap` heuristic scanner for those).
     #[must_use]
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_ascii_lowercase().as_str() {
@@ -54,6 +68,14 @@ impl Language {
             "cs" => Some(Self::CSharp),
             "rb" => Some(Self::Ruby),
             "sh" | "bash" => Some(Self::Bash),
+            // --- Extended grammars (codegraph ⇄ repomap parity) ---
+            "php" => Some(Self::Php),
+            "swift" => Some(Self::Swift),
+            "kt" | "kts" => Some(Self::Kotlin),
+            "scala" | "sc" => Some(Self::Scala),
+            "hs" => Some(Self::Haskell),
+            "ex" | "exs" => Some(Self::Elixir),
+            "lua" => Some(Self::Lua),
             _ => None,
         }
     }
@@ -83,6 +105,13 @@ impl Language {
             Self::CSharp => tree_sitter_c_sharp::language(),
             Self::Ruby => tree_sitter_ruby::language(),
             Self::Bash => tree_sitter_bash::language(),
+            Self::Php => tree_sitter_php::language_php(),
+            Self::Swift => tree_sitter_swift::language(),
+            Self::Kotlin => tree_sitter_kotlin::language(),
+            Self::Scala => tree_sitter_scala::language(),
+            Self::Haskell => tree_sitter_haskell::language(),
+            Self::Elixir => tree_sitter_elixir::language(),
+            Self::Lua => tree_sitter_lua::language(),
         }
     }
 

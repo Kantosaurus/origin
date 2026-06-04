@@ -78,6 +78,22 @@ struct GovernanceConfig {
     /// fields mirror [`origin_conseca::SecurityPolicy`].
     #[serde(default)]
     conseca: Option<SecurityPolicy>,
+    /// Optional `[browser]` section carrying browser-security knobs. Absent ⇒
+    /// `None` ⇒ no browser rate limit (byte-identical default).
+    #[serde(default)]
+    browser: Option<BrowserConfig>,
+}
+
+/// On-disk `[browser]` section. Currently a single optional knob: the enforced
+/// per-session cap on browser-class actions. An absent section (or an omitted
+/// field) contributes `None`, so the default daemon path is byte-identical.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserConfig {
+    /// ENFORCED maximum number of browser-class actions
+    /// (`Browser`/`WebFetch`/`WebSearch`) per `run_loop`. `None` ⇒ unlimited.
+    #[serde(default)]
+    max_actions_per_session: Option<u32>,
 }
 
 /// Errors raised while loading governance configuration.
@@ -119,6 +135,9 @@ pub struct Governance {
     pub policy: Option<Arc<PolicyEngine>>,
     /// Per-prompt security policy, or `None` when no `[conseca]` is set.
     pub conseca: Option<Arc<SecurityPolicy>>,
+    /// ENFORCED per-session browser-action cap, or `None` when no
+    /// `[browser] max_actions_per_session` is set (byte-identical default).
+    pub browser_max_actions: Option<u32>,
 }
 
 /// Resolve the on-disk governance config path.
@@ -191,7 +210,12 @@ fn governance_from_config(
         Some(Arc::new(PolicyEngine::new(layers)))
     };
     let conseca = cfg.conseca.map(Arc::new);
-    Ok(Governance { policy, conseca })
+    let browser_max_actions = cfg.browser.and_then(|b| b.max_actions_per_session);
+    Ok(Governance {
+        policy,
+        conseca,
+        browser_max_actions,
+    })
 }
 
 #[cfg(test)]
@@ -310,6 +334,33 @@ mod tests {
         std::fs::write(&path, "polcy_layers = []\n").unwrap();
         let err = load_governance(&path).unwrap_err();
         assert!(matches!(err, GovernanceError::Parse { .. }));
+    }
+
+    #[test]
+    fn browser_section_parses_max_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governance.toml");
+        std::fs::write(
+            &path,
+            "[browser]\nmax_actions_per_session = 5\n",
+        )
+        .unwrap();
+        let gov = load_governance(&path).unwrap();
+        assert_eq!(gov.browser_max_actions, Some(5));
+        assert!(gov.policy.is_none());
+        assert!(gov.conseca.is_none());
+    }
+
+    #[test]
+    fn absent_browser_section_yields_no_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governance.toml");
+        std::fs::write(&path, "[conseca]\nallow_tools = [\"Read\"]\n").unwrap();
+        let gov = load_governance(&path).unwrap();
+        assert_eq!(
+            gov.browser_max_actions, None,
+            "no [browser] section ⇒ no cap (byte-identical default)"
+        );
     }
 
     #[test]

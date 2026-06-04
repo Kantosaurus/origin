@@ -81,4 +81,7 @@ pub use driver::{
     SelfDevEvent, SelfDevState, RestartAuthority, RestartDecision, TestRunner,
 };
 pub use queue::{BuildJob, BuildQueue};
-pub use relaunch::{FileRelaunchStore, RelaunchManifest, RelaunchRequest, RelaunchStore};
+pub use relaunch::{
+    FileRelaunchStore, RelaunchManifest, RelaunchRequest, RelaunchStore,
+    SELFDEV_RELAUNCH_EXIT_CODE,
+};

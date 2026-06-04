@@ -816,6 +816,18 @@ fn spawn_handler_task(
         // the goal in).
         let last_known_session_id: Arc<tokio::sync::Mutex<Option<String>>> =
             Arc::new(tokio::sync::Mutex::new(None));
+        // Per-connection active account for CROSS-PROVIDER mid-loop rebuilds
+        // (multi-account credential isolation). `None` (the default, until this
+        // connection issues a `/account` switch) ⇒ a cross-provider rebuild
+        // falls back to the process-wide global account slot, byte-identical to
+        // the pre-per-connection wire. A `SwitchAccount` on THIS connection sets
+        // it (see `handle_switch`), so the rebuild resolves credentials for the
+        // account this connection chose — a `/account` switch on a different
+        // connection cannot leak in. Wrapped in `Arc<Mutex<…>>` so the switch
+        // handler and the per-request `LoopOptions` build can share it without
+        // rebuilding the per-connection state.
+        let active_account: Arc<tokio::sync::Mutex<Option<Arc<str>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
 
         loop {
             // Step 1: drain any pushed-back message left by the goal driver
@@ -895,6 +907,7 @@ fn spawn_handler_task(
                         Arc::clone(&active_goal),
                         Arc::clone(&pending_message),
                         Arc::clone(&last_known_session_id),
+                        Arc::clone(&active_account),
                         verifier,
                         req,
                     )
@@ -919,7 +932,16 @@ fn spawn_handler_task(
                     }
                 }
                 ClientMessage::SwitchAccount { provider, account_id } => {
-                    if !handle_switch(&conn, &active, &factory, &provider, &account_id).await {
+                    if !handle_switch(
+                        &conn,
+                        &active,
+                        &factory,
+                        &active_account,
+                        &provider,
+                        &account_id,
+                    )
+                    .await
+                    {
                         break;
                     }
                 }
@@ -1542,6 +1564,7 @@ async fn handle_request(
     active_goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
     pending_message: Arc<tokio::sync::Mutex<Option<ClientMessage>>>,
     last_known_session_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    active_account: Arc<tokio::sync::Mutex<Option<Arc<str>>>>,
     verifier: Arc<dyn origin_goal::verifier::Verifier>,
     req: PromptRequest,
 ) -> PromptOutcome {
@@ -1631,6 +1654,11 @@ async fn handle_request(
     // this line — otherwise the channels have TWO senders each and
     // `rx.recv()` never returns None, so the relay tasks hang forever.
     let loop_result = {
+        // Snapshot THIS connection's active account (set by `/account` on this
+        // connection) for the cross-provider rebuild. `None` (no switch on this
+        // connection yet) ⇒ the loop falls back to the global account slot,
+        // byte-identical to the pre-per-connection wire.
+        let session_account: Option<Arc<str>> = active_account.lock().await.clone();
         let opts = LoopOptions {
             max_turns: 200,
             cas: Some(cas),
@@ -1705,6 +1733,15 @@ async fn handle_request(
             // router built once from `ORIGIN_ROUTER` (unset ⇒ None ⇒ each turn
             // uses session.model, byte-identical). Per-turn phase selection +
             // health/quota feedback live inside `run_loop`.
+            browser_rate_limit: governance.browser_max_actions,
+            // ^ browser-security (B): ENFORCED per-session browser-action cap
+            // from `[browser] max_actions_per_session` in `governance.toml`.
+            // Absent (the default) ⇒ `None` ⇒ no cap, byte-identical.
+            session_account,
+            // ^ per-connection multi-account isolation: when this connection has
+            // switched accounts (`/account`), a cross-provider mid-loop rebuild
+            // resolves credentials for THIS account; `None` ⇒ global-slot
+            // fallback, byte-identical to the pre-per-connection wire.
         };
         // Opt-in interactive prompting: when the turn requested it, route
         // RequiresPermission tools through the IPC prompter (asks the client and
@@ -2528,6 +2565,7 @@ async fn handle_switch(
     conn: &SharedConnection,
     active: &ActiveProvider,
     factory: &ProviderFactory,
+    active_account: &Arc<Mutex<Option<Arc<str>>>>,
     provider_str: &str,
     account: &str,
 ) -> bool {
@@ -2545,11 +2583,18 @@ async fn handle_switch(
         *g = new_provider;
     }
 
-    // Keep the process-wide factory's account in sync so a subsequent
-    // CROSS-provider router rebuild (`provider_factory::build_provider_for`)
-    // resolves credentials for the freshly-switched account rather than the
-    // startup default. No-op unless `set_global` was called at startup (i.e.
-    // cross-provider routing is active), so the default path is unchanged.
+    // Set THIS connection's active account so a subsequent CROSS-provider router
+    // rebuild on this connection resolves credentials for the freshly-switched
+    // account — and a `/account` switch on a *different* connection cannot leak
+    // in (per-connection multi-account isolation). The per-request
+    // `LoopOptions.session_account` is read from this slot in `handle_request`.
+    *active_account.lock().await = Some(Arc::from(account));
+
+    // Also keep the process-wide factory's account in sync as the DEFAULT/fallback
+    // for any connection that has not switched (its `session_account` is `None`),
+    // and for back-compat with the single-account wire. No-op unless `set_global`
+    // was called at startup (i.e. cross-provider routing is active), so the
+    // default path is unchanged.
     origin_daemon::provider_factory::update_global_account(account);
 
     let ev = StreamEvent::ProviderActive {
