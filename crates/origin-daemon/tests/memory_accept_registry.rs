@@ -107,6 +107,7 @@ async fn accept_persists_via_proposal_registry() {
         system_suffix: None,
         read_only: false,
         router: None,
+        browser_rate_limit: None,
     };
     let _summary = run_loop(
         &mut session,

@@ -1705,6 +1705,10 @@ async fn handle_request(
             // router built once from `ORIGIN_ROUTER` (unset ⇒ None ⇒ each turn
             // uses session.model, byte-identical). Per-turn phase selection +
             // health/quota feedback live inside `run_loop`.
+            browser_rate_limit: governance.browser_max_actions,
+            // ^ browser-security (B): ENFORCED per-session browser-action cap
+            // from `[browser] max_actions_per_session` in `governance.toml`.
+            // Absent (the default) ⇒ `None` ⇒ no cap, byte-identical.
         };
         // Opt-in interactive prompting: when the turn requested it, route
         // RequiresPermission tools through the IPC prompter (asks the client and
