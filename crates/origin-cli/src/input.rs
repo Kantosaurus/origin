@@ -4,6 +4,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use origin_daemon::protocol::{ClientMessage, MemoryAction};
 
+use crate::cli_def::KnowledgeSub;
 use crate::editor::Editor;
 
 #[allow(clippy::module_name_repetitions)]
@@ -205,7 +206,7 @@ pub fn parse_mem_command(line: &str) -> Option<ClientMessage> {
 /// Slash verbs that already have dedicated handlers — they must not be
 /// re-routed through the skill parser even though they start with `/`.
 /// Update this list when a new slash verb is added.
-const RESERVED_SLASH_VERBS: &[&str] = &["mem", "account", "help", "model", "clear"];
+const RESERVED_SLASH_VERBS: &[&str] = &["mem", "account", "help", "model", "clear", "knowledge"];
 
 /// Parse `/<name>` (activate) and `/-<name>` (deactivate) into a
 /// [`ClientMessage::ActivateSkill`] or [`ClientMessage::DeactivateSkill`].
@@ -330,6 +331,75 @@ pub fn parse_model_command(line: &str) -> Option<String> {
         return None;
     }
     Some(name.to_string())
+}
+
+/// Parse a `/knowledge <add|search|ls|rm> …` composer command into a
+/// [`KnowledgeSub`], giving the in-session TUI parity with the top-level
+/// `origin knowledge` subcommand (openclaude `/knowledge`).
+///
+/// Recognized forms (verb case-insensitive):
+/// - `/knowledge add <id> <text…>` — index `text` under `id` (both required).
+/// - `/knowledge search <query…>` — search; `k` defaults to 5 (the subcommand
+///   default), since the composer takes no `--k` flag.
+/// - `/knowledge ls` — list every indexed id (no args).
+/// - `/knowledge rm <id>` — remove `id` (a single token).
+///
+/// Returns `None` for any non-`/knowledge` line (so the caller falls through to
+/// its other handlers) and for malformed `/knowledge` invocations (so the
+/// caller, having already matched the `/knowledge` prefix, can surface a usage
+/// hint). A `/knowledgefoo` token without a word boundary is not matched.
+#[must_use]
+pub fn parse_knowledge_command(line: &str) -> Option<KnowledgeSub> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("/knowledge")?;
+    // Require a word boundary so `/knowledgefoo` is not treated as `/knowledge`.
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim();
+    let verb_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let verb = &rest[..verb_end];
+    let args = rest[verb_end..].trim();
+    match verb.to_ascii_lowercase().as_str() {
+        "add" => {
+            // Split the first token as the id; the remainder (with its internal
+            // spacing collapsed to single spaces is unnecessary) is the text.
+            let id_end = args.find(char::is_whitespace)?;
+            let id = &args[..id_end];
+            let text = args[id_end..].trim();
+            if id.is_empty() || text.is_empty() {
+                return None;
+            }
+            Some(KnowledgeSub::Add {
+                id: id.to_string(),
+                text: text.to_string(),
+            })
+        }
+        "search" => {
+            if args.is_empty() {
+                return None;
+            }
+            Some(KnowledgeSub::Search {
+                query: args.to_string(),
+                k: 5,
+            })
+        }
+        "ls" => {
+            if args.is_empty() {
+                Some(KnowledgeSub::Ls)
+            } else {
+                None
+            }
+        }
+        "rm" => {
+            if args.is_empty() || args.contains(char::is_whitespace) {
+                None
+            } else {
+                Some(KnowledgeSub::Rm { id: args.to_string() })
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Modal input mode for the opt-in vim layer (aider L107 parity).
@@ -903,6 +973,53 @@ mod tests {
         // iff `ORIGIN_VIM=1`. We assert the equivalence rather than the absolute
         // value to avoid depending on the shared test binary's env.
         assert_eq!(vim_active_default(), vim_enabled(false));
+    }
+
+    // ---- /knowledge composer command (openclaude /knowledge parity in-session) ----
+
+    #[test]
+    fn parse_knowledge_add_takes_id_and_text() {
+        match parse_knowledge_command("/knowledge add rust-async tokio is a runtime") {
+            Some(KnowledgeSub::Add { id, text }) => {
+                assert_eq!(id, "rust-async");
+                assert_eq!(text, "tokio is a runtime");
+            }
+            _ => panic!("expected Add"),
+        }
+    }
+
+    #[test]
+    fn parse_knowledge_search_defaults_k_to_five() {
+        match parse_knowledge_command("/knowledge search rust async runtime") {
+            Some(KnowledgeSub::Search { query, k }) => {
+                assert_eq!(query, "rust async runtime");
+                assert_eq!(k, 5, "in-session search uses the subcommand's default k");
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn parse_knowledge_ls_and_rm() {
+        assert!(matches!(parse_knowledge_command("/knowledge ls"), Some(KnowledgeSub::Ls)));
+        match parse_knowledge_command("/knowledge rm foo") {
+            Some(KnowledgeSub::Rm { id }) => assert_eq!(id, "foo"),
+            _ => panic!("expected Rm"),
+        }
+    }
+
+    #[test]
+    fn parse_knowledge_rejects_malformed_and_non_knowledge() {
+        // Not a `/knowledge` line at all.
+        assert!(parse_knowledge_command("hello world").is_none());
+        assert!(parse_knowledge_command("/knowledgefoo").is_none(), "word boundary required");
+        // Malformed `/knowledge` invocations.
+        assert!(parse_knowledge_command("/knowledge").is_none(), "no verb");
+        assert!(parse_knowledge_command("/knowledge add foo").is_none(), "add needs text");
+        assert!(parse_knowledge_command("/knowledge search").is_none(), "search needs a query");
+        assert!(parse_knowledge_command("/knowledge rm").is_none(), "rm needs an id");
+        assert!(parse_knowledge_command("/knowledge rm foo bar").is_none(), "rm id is one token");
+        assert!(parse_knowledge_command("/knowledge bogus x").is_none(), "unknown verb");
     }
 }
 

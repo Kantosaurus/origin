@@ -30,6 +30,23 @@ use crate::cli_def::KnowledgeSub;
 /// # Errors
 /// Returns on filesystem or JSON (de)serialization failure.
 pub fn run(sub: KnowledgeSub) -> Result<()> {
+    let out = run_to_string(sub)?;
+    if !out.is_empty() {
+        println!("{out}");
+    }
+    Ok(())
+}
+
+/// Dispatch a `knowledge` subcommand, returning the rendered output as a string
+/// instead of printing it.
+///
+/// This is what the in-session `/knowledge` composer command calls so it can
+/// push results into the TUI scrollback rather than writing to `stdout` (which
+/// would corrupt the alternate screen). [`run`] is a thin `println!` wrapper.
+///
+/// # Errors
+/// Returns on filesystem or JSON (de)serialization failure.
+pub fn run_to_string(sub: KnowledgeSub) -> Result<String> {
     match sub {
         KnowledgeSub::Add { id, text } => add(&id, &text),
         KnowledgeSub::Search { query, k } => search(&query, k),
@@ -99,7 +116,7 @@ fn embed_or_empty(embedder: Option<&Embedder>, text: &str) -> Vec<f32> {
         .unwrap_or_default()
 }
 
-fn add(id: &str, text: &str) -> Result<()> {
+fn add(id: &str, text: &str) -> Result<String> {
     let mut kb = load()?;
     let embedding = embed_or_empty(try_load_embedder().as_ref(), text);
     // A real embedding makes the document cosine-searchable; an empty one keeps
@@ -107,21 +124,20 @@ fn add(id: &str, text: &str) -> Result<()> {
     // `Doc::text`).
     kb.add(Doc::new(id, text, embedding));
     save(&kb)?;
-    println!("indexed `{id}` ({} docs total)", kb.len());
-    Ok(())
+    Ok(format!("indexed `{id}` ({} docs total)", kb.len()))
 }
 
-fn search(query: &str, k: usize) -> Result<()> {
+fn search(query: &str, k: usize) -> Result<String> {
     let kb = load()?;
     let hits = run_search(&kb, try_load_embedder().as_ref(), query, k);
     if hits.is_empty() {
-        println!("no matches for {query:?}");
-        return Ok(());
+        return Ok(format!("no matches for {query:?}"));
     }
-    for h in hits {
-        println!("{:>6.3}  {}", h.score, h.id);
-    }
-    Ok(())
+    let lines: Vec<String> = hits
+        .iter()
+        .map(|h| format!("{:>6.3}  {}", h.score, h.id))
+        .collect();
+    Ok(lines.join("\n"))
 }
 
 /// Run a hybrid search: lexical always, cosine when an embedder is available.
@@ -205,35 +221,34 @@ fn normalize(hits: &[Hit]) -> impl Iterator<Item = (&str, f32)> {
     })
 }
 
-fn remove(id: &str) -> Result<()> {
+fn remove(id: &str) -> Result<String> {
     let mut kb = load()?;
     if kb.remove(id) {
         save(&kb)?;
-        println!("removed `{id}`");
+        Ok(format!("removed `{id}`"))
     } else {
-        println!("no such document: `{id}`");
+        Ok(format!("no such document: `{id}`"))
     }
-    Ok(())
 }
 
-fn list() -> Result<()> {
+fn list() -> Result<String> {
     let kb = load()?;
     if kb.is_empty() {
-        println!("knowledge index is empty");
-        return Ok(());
+        return Ok("knowledge index is empty".to_string());
     }
     // Surface ids by searching with an empty query falls short; instead list via
     // a wildcard-ish scan: re-serialize and read ids back.
     let json = kb.to_json().map_err(|e| anyhow::anyhow!("{e}"))?;
     let parsed: serde_json::Value = serde_json::from_str(&json)?;
+    let mut ids = Vec::new();
     if let Some(docs) = parsed.get("docs").and_then(|d| d.as_array()) {
         for d in docs {
             if let Some(id) = d.get("id").and_then(|i| i.as_str()) {
-                println!("{id}");
+                ids.push(id.to_string());
             }
         }
     }
-    Ok(())
+    Ok(ids.join("\n"))
 }
 
 #[cfg(test)]

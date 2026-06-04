@@ -63,3 +63,55 @@ pub fn render_line(snap: &UsageSnapshot) -> String {
         secs,
     )
 }
+
+/// The localized "session total" line for a cumulative USD figure, or `None`
+/// when the figure is zero/negative (an unpriced model or no spend) so we never
+/// print a misleading `$0.00`.
+///
+/// Routes through the `cost.session` catalog key ("Session total: {usd}" in
+/// English), so the farewell summary localizes with `--lang`/`$LANG`.
+#[must_use]
+pub fn format_session_total(total_usd: f64) -> Option<String> {
+    if total_usd <= 0.0 {
+        return None;
+    }
+    Some(crate::locale::linef(
+        "cost.session",
+        &[("usd", &origin_cost::fmt_usd(total_usd))],
+    ))
+}
+
+/// As [`format_session_total`], computing the cumulative cost from a snapshot.
+#[must_use]
+pub fn session_total_line(snap: &UsageSnapshot) -> Option<String> {
+    format_session_total(cost_usd(snap))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_session_total_routes_through_cost_session_catalog_key() {
+        // Zero / negative spend prints nothing (an unpriced model would
+        // otherwise show a misleading $0.00 session total).
+        assert!(format_session_total(0.0).is_none());
+        assert!(format_session_total(-1.0).is_none());
+        // A real figure renders. Assert locale-ROBUSTLY (the test binary is
+        // shared and another test may have pinned a non-English locale override,
+        // which is a process-global OnceLock that cannot be reset): the output
+        // must equal the localized `cost.session` template with the figure
+        // substituted — a wrong key (e.g. `cost.turn`) renders different text in
+        // the active locale and fails this. We do not assume the English literal.
+        let usd = origin_cost::fmt_usd(0.0123);
+        let line = format_session_total(0.0123).expect("nonzero figure renders a line");
+        assert_eq!(
+            line,
+            crate::locale::linef("cost.session", &[("usd", &usd)]),
+            "must route through the cost.session catalog key"
+        );
+        assert!(line.contains(&usd), "must embed the formatted usd: {line}");
+        assert!(line.len() > usd.len(), "a catalog template wraps the figure: {line}");
+    }
+}

@@ -15,6 +15,7 @@ pub mod bench;
 pub mod cli_def;
 pub mod clipboard;
 pub mod config;
+pub mod daemon_launch;
 pub mod display_hook;
 pub mod doctor;
 pub mod knowledge;

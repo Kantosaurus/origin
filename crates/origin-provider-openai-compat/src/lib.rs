@@ -84,6 +84,26 @@ impl Provider for OpenAiCompat {
             self.cfg.base_url.trim_end_matches('/'),
             self.cfg.chat_path
         );
+
+        // Optional cassette tap on the NON-STREAMING path (env
+        // `ORIGIN_CASSETTE=record:<path>|replay:<path>`). Default (unset) returns
+        // `None`, so the network path below is unchanged and byte-identical to
+        // the pre-cassette behavior. Mirrors the streaming tap above and the
+        // Anthropic non-streaming `chat()` tap: replay serves the recorded JSON
+        // body with zero network I/O; record scrubs secrets + is save-gated.
+        let cassette_mode = cassette::Mode::from_env();
+        let req_body_text = serde_json::to_string(&body).unwrap_or_default();
+
+        // Replay mode: serve the recorded response body from disk with no network
+        // I/O, decoding it through the same `wire::WireResponse` → `decode_response`
+        // path a live response uses.
+        if let Some(cassette::Mode::Replay(path)) = &cassette_mode {
+            let text = cassette::replay(path, "POST", &url, &req_body_text)?;
+            let wire: wire::WireResponse = serde_json::from_str(&text)
+                .map_err(|e| ProviderError::Api(format!("cassette decode: {e}")))?;
+            return Ok(decode_response(wire, backend));
+        }
+
         let mut builder = self
             .client
             .post(&url)
@@ -101,6 +121,19 @@ impl Provider for OpenAiCompat {
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
         if resp.status() == StatusCode::OK {
+            // Record mode: capture the raw body text so it can be replayed later
+            // (after secret scrubbing + the save gate), then decode it; otherwise
+            // decode the response directly.
+            if let Some(cassette::Mode::Record(path)) = &cassette_mode {
+                let text = resp
+                    .text()
+                    .await
+                    .map_err(|e| ProviderError::Api(format!("decode: {e}")))?;
+                cassette::record(path, "POST", &url, &req_body_text, 200, &text)?;
+                let wire: wire::WireResponse = serde_json::from_str(&text)
+                    .map_err(|e| ProviderError::Api(format!("decode: {e}")))?;
+                return Ok(decode_response(wire, backend));
+            }
             let wire: wire::WireResponse = resp
                 .json()
                 .await

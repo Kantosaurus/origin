@@ -674,6 +674,28 @@ fn maybe_autoformat(path: &str) {
         .spawn();
 }
 
+/// Pure predicate: does a successful `name` tool call trigger post-edit
+/// auto-formatting? True for the file-mutating builtins whose result is a
+/// concrete on-disk edit (`Edit`/`Write`/`MultiEdit`/`ApplyPatch`); false for
+/// every read-class or non-edit tool. This is the single source of truth the
+/// dispatch arms consult via [`post_mutation_autoformat`], so the set of
+/// autoformatting tools cannot drift between call sites.
+fn autoformats(name: &str) -> bool {
+    matches!(name, "Edit" | "Write" | "MultiEdit" | "ApplyPatch")
+}
+
+/// Shared post-mutation autoformat hook (Task 2). Invoked from each mutating
+/// dispatch arm after a successful edit; no-ops unless [`autoformats`] accepts
+/// the tool, then delegates to [`maybe_autoformat`] (itself gated on
+/// `ORIGIN_AUTOFORMAT=1`). Centralizing the call removes the per-arm
+/// duplication and guarantees `Edit` is treated exactly like `Write`.
+/// Default-off ⇒ no spawn, behavior unchanged.
+fn post_mutation_autoformat(name: &str, path: &str) {
+    if autoformats(name) {
+        maybe_autoformat(path);
+    }
+}
+
 /// Extract candidate target file paths from a patch body for auto-formatting.
 ///
 /// Recognizes both unified-diff `+++ b/<path>` headers and the apply-patch
@@ -3611,9 +3633,14 @@ async fn dispatch_tool(
                     .to_string(),
                 replace_all: args.get("replace_all").and_then(Value::as_bool).unwrap_or(false),
             };
-            origin_tools::builtins::edit::edit_v2(args)
+            let fmt_path = args.file_path.clone();
+            let res = origin_tools::builtins::edit::edit_v2(args)
                 .map(|v| serde_json::to_string(&v).expect("BUG: EditResult always serializes"))
-                .map_err(|e| LoopError::ToolFailure(e.message))
+                .map_err(|e| LoopError::ToolFailure(e.message));
+            if res.is_ok() {
+                post_mutation_autoformat("Edit", &fmt_path);
+            }
+            res
         }
         "MultiEdit" => {
             let edits_v = args
@@ -3645,7 +3672,7 @@ async fn dispatch_tool(
                 .map(|v| serde_json::to_string(&v).expect("BUG: MultiEditResult always serializes"))
                 .map_err(|e| LoopError::ToolFailure(e.message));
             if res.is_ok() {
-                maybe_autoformat(&margs.file_path);
+                post_mutation_autoformat("MultiEdit", &margs.file_path);
             }
             res
         }
@@ -3663,7 +3690,7 @@ async fn dispatch_tool(
                 .map_err(|e| LoopError::ToolFailure(e.message));
             if res.is_ok() {
                 for p in &fmt_paths {
-                    maybe_autoformat(p);
+                    post_mutation_autoformat("ApplyPatch", p);
                 }
             }
             res
@@ -3690,7 +3717,7 @@ async fn dispatch_tool(
                 .map(|()| "write ok".to_string())
                 .map_err(|e| LoopError::ToolFailure(e.message));
             if res.is_ok() {
-                maybe_autoformat(&fmt_path);
+                post_mutation_autoformat("Write", &fmt_path);
             }
             res
         }
@@ -5829,6 +5856,20 @@ mod wiring_tests {
         assert_eq!(origin_postedit::formatter_for("README"), None);
         // No-op with the gate off (no panic, no spawn).
         maybe_autoformat("src/main.rs");
+    }
+
+    /// Task 2 (Edit fix): every file-mutating builtin must trigger post-edit
+    /// autoformatting, and read-class / non-edit tools must not. Regression
+    /// guard for the defect where the plain `Edit` arm skipped autoformat while
+    /// `Write`/`MultiEdit`/`ApplyPatch` did not.
+    #[test]
+    fn autoformats_covers_all_mutating_tools_including_edit() {
+        for tool in ["Edit", "Write", "MultiEdit", "ApplyPatch"] {
+            assert!(autoformats(tool), "{tool} edits files and must autoformat");
+        }
+        for tool in ["Read", "Grep", "Glob", "Bash"] {
+            assert!(!autoformats(tool), "{tool} must not trigger autoformat");
+        }
     }
 
     /// Task 2: patch target extraction handles both unified-diff and

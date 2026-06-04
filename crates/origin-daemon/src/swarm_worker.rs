@@ -12,11 +12,12 @@
 //! [`CompletionReport`](origin_swarm::CompletionReport).
 //!
 //! **Deadlock safety:** the coordinator spawns worker bodies in
-//! [`TaskClass::Sidecar`](origin_runtime::TaskClass) (an independent permit pool,
-//! not gated on Critical-idle), so a parent agent — which holds a `Critical`
-//! permit while it awaits the child — never contends with the child for the same
-//! pool. Combined with stripping `Task` from the child's tools, this prevents the
-//! parent↔child circular-wait the `Critical`-on-`Critical` design would cause.
+//! [`TaskClass::Swarm`](origin_runtime::TaskClass) (an independent, RAM-admission
+//! permit pool, not gated on Critical-idle), so a parent agent — which holds a
+//! `Critical` permit while it awaits the child — never contends with the child
+//! for the same pool. Combined with stripping `Task` from the child's tools, this
+//! prevents the parent↔child circular-wait the `Critical`-on-`Critical` design
+//! would cause.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -82,7 +83,7 @@ async fn run_worker(
     let mut session = Session::new(provider.name(), &model);
 
     // Narrow the child's tools to its allow-list, and never `Task` (a child that
-    // could spawn its own children would re-enter the Sidecar pool and risk the
+    // could spawn its own children would re-enter the Swarm pool and risk the
     // same circular wait this design avoids).
     let mut allowed: HashSet<String> = ctx.spec.allowed_tools.iter().cloned().collect();
     allowed.remove("Task");
