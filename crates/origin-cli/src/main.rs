@@ -1694,9 +1694,11 @@ async fn handle_prompt_turn(
         .output_style
         .map(|s| s.system_suffix().to_string())
         .unwrap_or_default();
-    // Drain any `/steer` hints and merge them ahead of the user text (gemini
-    // model steering). Empty queue ⇒ `user_text == text` (byte-identical).
-    let user_text = origin_cli::steering::next_turn_prompt(&mut app.lock().steering, text);
+    // Force `@subagent` delegation when the turn opens with a mention (gap 9c),
+    // then drain any `/steer` hints and append them as a cache-safe suffix
+    // (gemini model steering). No mention + empty queue ⇒ byte-identical to `text`.
+    let directed = origin_cli::mentions::force_subagent(text);
+    let user_text = origin_cli::steering::next_turn_prompt(&mut app.lock().steering, &directed);
     let read_only = app.lock().plan_mode;
     // Drain any `/attach`-staged attachments for this turn (empty ⇒ text-only).
     let attachments = std::mem::take(&mut app.lock().pending_attachments);

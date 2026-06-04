@@ -20,6 +20,7 @@ pub mod display_hook;
 pub mod doctor;
 pub mod knowledge;
 pub mod memory_inbox;
+pub mod mentions;
 pub mod markdown_tasks;
 pub mod mermaid;
 pub mod oidc;
