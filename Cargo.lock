@@ -4767,6 +4767,7 @@ dependencies = [
  "nix 0.29.0",
  "origin-ipc",
  "origin-resume-token",
+ "origin-selfdev",
  "serde",
  "serde_json",
  "tempfile",

@@ -59,11 +59,12 @@ const SELFDEV_RELAUNCH_ENV: &str = "ORIGIN_SELFDEV_RELAUNCH";
 /// Exit code the daemon uses to ask the supervisor to swap it for the freshly
 /// self-built binary (rather than treating the exit as a crash).
 ///
-/// This MUST stay in sync with `origin_supervisor::relaunch::SELFDEV_RELAUNCH_EXIT_CODE`.
-/// It is duplicated as a local constant (instead of importing the supervisor)
-/// so the daemon's relaunch path does not depend on the supervisor binary's
-/// internals; the value is asserted against the contract in tests there.
-pub const SELFDEV_RELAUNCH_EXIT_CODE: i32 = 86;
+/// Re-exported from the leaf crate [`origin_selfdev`], which owns the
+/// binary-swap contract and is therefore the single source of truth for the
+/// sentinel. The daemon already depends on `origin-selfdev`, so this is a
+/// zero-cost re-export rather than a duplicated literal; a cross-crate sync
+/// test (`relaunch_sentinel_matches_canonical`) guards against drift.
+pub use origin_selfdev::SELFDEV_RELAUNCH_EXIT_CODE;
 
 /// Default storm-guard ceiling (consecutive failed generations before self-dev
 /// refuses new jobs until [`SelfDevDriver::reset_storm_guard`]).
@@ -385,6 +386,18 @@ mod tests {
                 .pop_front()
                 .unwrap_or_else(|| Ok(String::new()))
         }
+    }
+
+    #[test]
+    fn relaunch_sentinel_matches_canonical() {
+        // Cross-crate drift guard: the sentinel the daemon exits with MUST equal
+        // the canonical value owned by `origin-selfdev`. Because the daemon now
+        // re-exports the const this is structurally true, but the assertion bites
+        // if someone reintroduces a local literal that diverges.
+        assert_eq!(
+            super::SELFDEV_RELAUNCH_EXIT_CODE,
+            origin_selfdev::SELFDEV_RELAUNCH_EXIT_CODE
+        );
     }
 
     #[test]
