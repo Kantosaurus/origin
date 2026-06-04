@@ -674,6 +674,51 @@ fn gen_ai_latencies(
     GenAiLatencies { ttft_ms, tpot_ms }
 }
 
+/// Map a turn's [`origin_provider::ChatRequest`] onto the `OTel`
+/// [`origin_metrics::instruments::RequestParams`] sampling attribute set
+/// (Stage C4, full `gen_ai.request.*`).
+///
+/// The agentic loop does not surface explicit temperature / top-p / top-k /
+/// penalties / seed / stop-sequences — those provider knobs are not part of
+/// origin's [`origin_provider::ChatRequest`]. The one sampling parameter the
+/// request *does* carry is the optional extended-thinking budget
+/// (`thinking_tokens`), which the Anthropic encoder turns into the wire
+/// `max_tokens` floor; we map it onto `gen_ai.request.max_tokens` so the span
+/// records the real requested generation ceiling. Every unset field is `None`,
+/// so [`origin_metrics::instruments::RequestParams`]'s omit-if-`None` builder
+/// emits *only* the attributes we have honest values for.
+///
+/// `#[cfg(feature = "otel")]` because [`origin_metrics::instruments::RequestParams`]
+/// only exists in the `otel` build; the default build never references it.
+#[cfg(feature = "otel")]
+fn request_params_from_req(
+    req: &origin_provider::ChatRequest,
+) -> origin_metrics::instruments::RequestParams<'static> {
+    origin_metrics::instruments::RequestParams {
+        max_tokens: req.thinking_tokens.map(i64::from),
+        ..Default::default()
+    }
+}
+
+/// Synthesize a stable `gen_ai.response.id` for one turn from the session id and
+/// the 1-based turn number (Stage C4).
+///
+/// origin's [`origin_provider::ChatResponse`] does not carry the upstream
+/// provider's response-object id (no provider decoder threads it through), so
+/// the truly-provider-assigned id is not reachable from the loop without a
+/// cross-crate wire change. The daemon *does* own a real, unique identifier for
+/// each completion: the conversation/session id plus the turn ordinal. We emit
+/// that as the response id (`"{session_id}#t{turn}"`) — a genuine, stable,
+/// per-completion identifier rather than the previous hard-coded empty string —
+/// so `gen_ai.response.id` actually appears on the span and correlates each
+/// completion back to its conversation and position.
+///
+/// `#[cfg(feature = "otel")]`: only the otel build attaches response attributes.
+#[cfg(feature = "otel")]
+fn turn_response_id(session_id: &str, turn: u32) -> String {
+    format!("{session_id}#t{turn}")
+}
+
 /// Compute the autonomy streak for a single `run_loop` invocation (Stage C5
 /// Task 3).
 ///
@@ -1763,6 +1808,8 @@ mod self_dispatch_session_tests {
 #[cfg(test)]
 mod pain_bucket_helper_tests {
     use super::{autonomy_streak_for, gen_ai_latencies, select_ttfua, split_agent_time};
+    #[cfg(feature = "otel")]
+    use super::{request_params_from_req, turn_response_id};
 
     #[test]
     fn split_subtracts_tool_from_total() {
@@ -1870,6 +1917,56 @@ mod pain_bucket_helper_tests {
         assert_eq!(l.tpot_ms, None);
         // TTFT is still defined (the streamed first token).
         assert!((l.ttft_ms - 50.0).abs() < f64::EPSILON);
+    }
+
+    // --- Stage C4: full gen_ai semantic-convention wiring (otel-gated) ------
+    //
+    // These pin the daemon-side pure mappers the live turn loop feeds into the
+    // `gen_ai` span (request params + a real per-turn response id). They are
+    // `#[cfg(feature = "otel")]` because `RequestParams` — and the response-id
+    // mapper that exists only to feed it — are compiled only in the otel build;
+    // in the default build neither the mappers nor the span methods exist, so
+    // the loop is byte-identical. The actual `span.set_*` / `record_*` calls
+    // are exercised end-to-end by origin-metrics'
+    // `span_record_methods_run_without_panicking` against a real span.
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn request_params_map_thinking_budget_to_max_tokens() {
+        // The only sampling knob the loop's ChatRequest carries is the
+        // extended-thinking budget, which maps onto gen_ai.request.max_tokens.
+        let req = origin_provider::ChatRequest {
+            thinking_tokens: Some(8192),
+            ..Default::default()
+        };
+        let p = request_params_from_req(&req);
+        assert_eq!(p.max_tokens, Some(8192));
+        // Nothing the request doesn't carry is fabricated.
+        assert_eq!(p.temperature, None);
+        assert_eq!(p.top_p, None);
+        assert_eq!(p.seed, None);
+        assert!(p.stop_sequences.is_empty());
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn request_params_omit_max_tokens_when_no_thinking_budget() {
+        // No thinking budget ⇒ no max_tokens ⇒ the builder emits nothing.
+        let req = origin_provider::ChatRequest::default();
+        let p = request_params_from_req(&req);
+        assert_eq!(p.max_tokens, None);
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn turn_response_id_is_a_real_stable_per_turn_id() {
+        // The synthesized response id is a genuine, unique-per-completion string
+        // (session id + turn ordinal) — never the old hard-coded empty string.
+        assert_eq!(turn_response_id("sess-abc", 1), "sess-abc#t1");
+        assert_eq!(turn_response_id("sess-abc", 7), "sess-abc#t7");
+        assert!(!turn_response_id("sess-abc", 1).is_empty());
+        // Distinct turns yield distinct ids.
+        assert_ne!(turn_response_id("s", 1), turn_response_id("s", 2));
     }
 }
 
@@ -2287,6 +2384,18 @@ async fn run_loop_inner(
     let loop_start = std::time::Instant::now();
     let mut total_tool_calls: u64 = 0;
 
+    // Stage C4: opt-in capture of message / tool-result *content* on the
+    // `gen_ai` span events. The OpenTelemetry GenAI convention treats prompt and
+    // completion content as opt-in (it can carry PII), so by default we record
+    // the message/choice/tool *structure* (roles, indices, ids, finish reasons)
+    // but NOT the bodies. Set `ORIGIN_OTEL_CAPTURE_CONTENT=1` to also attach the
+    // text. Read once per loop; only consulted on the otel build, so the default
+    // build never even evaluates it (kept `#[cfg]`-gated to avoid an unused
+    // binding).
+    #[cfg(feature = "otel")]
+    let gen_ai_capture_content =
+        std::env::var("ORIGIN_OTEL_CAPTURE_CONTENT").as_deref() == Ok("1");
+
     // Browser-security (B): ENFORCED per-session browser-action counter. Counts
     // dispatched browser-class tools (`Browser`/`WebFetch`/`WebSearch`) so the
     // optional `opts.browser_rate_limit` cap can deny once exceeded. Stays at 0
@@ -2419,11 +2528,34 @@ async fn run_loop_inner(
         // `--features otel` AND a tracer provider is installed, so the default
         // path is byte-identical. Attaches gen_ai.system / gen_ai.request.model
         // / gen_ai.operation.name (relabeled inside origin-metrics).
+        //
+        // The binding is `mut` because the otel build mutates it via the
+        // `set_*`/`record_*` span methods below; the default build never calls
+        // those (they live in `#[cfg(feature = "otel")]` blocks) and the stub
+        // guard is moved-then-dropped, so the `mut` is unused there — silence the
+        // warning rather than diverge the two feature paths.
+        #[cfg_attr(not(feature = "otel"), allow(unused_mut))]
         let mut gen_ai_span = origin_metrics::instruments::gen_ai_span(
             turn_provider.name(),
             &turn_model,
             origin_metrics::keys::genai::OPERATION_CHAT,
         );
+        // Stage C4: attach the full request-side `gen_ai.*` convention set to the
+        // span before the provider call. All of these compile to no-ops in the
+        // default build (the `GenAiSpanGuard` methods are `const fn` no-ops
+        // without `--features otel`), so the default path is byte-identical.
+        //   * request sampling params — the real max_tokens floor from the turn's
+        //     extended-thinking budget (`request_params_from_req`).
+        //   * provider/server — the provider name reachable through the trait
+        //     (`server.address`/`server.port` are private to each provider impl
+        //     and not exposed, so they are omitted rather than faked).
+        //   * agent/conversation — the session id as `gen_ai.conversation.id`.
+        #[cfg(feature = "otel")]
+        {
+            gen_ai_span.set_request_params(request_params_from_req(&req));
+            gen_ai_span.set_server_attributes(turn_provider.name(), "", None);
+            gen_ai_span.set_agent_attributes("", "", "", &session.id, "");
+        }
         let (resp, mut speculative, stream_first_token_ms) = {
             let mut attempt: u32 = 0;
             loop {
@@ -2576,11 +2708,81 @@ async fn run_loop_inner(
                 tpot_ms,
             );
         }
-        // Attach the convention response attributes the daemon has real data for
-        // (prompt-cache read tokens → `gen_ai.usage.cached_input_tokens`). No
-        // response id is plumbed today, so it is omitted. No-op without
-        // `--features otel`, so the default path is byte-identical.
-        gen_ai_span.set_response_attributes("", u64::from(resp.usage.cache_read_input_tokens));
+        // Stage C4: attach the response-side `gen_ai.*` convention set, then the
+        // message / choice / tool-call span events, then end the span. Every call
+        // below is a `const` no-op without `--features otel`, so the default
+        // build is byte-identical. The whole block is `#[cfg(feature = "otel")]`
+        // so the response-id derivation + the resp scan never run in the default
+        // build.
+        //   * response attributes — the REAL per-turn response id
+        //     (`gen_ai.response.id`, derived from session id + turn) plus the
+        //     prompt-cache read count (`gen_ai.usage.cached_input_tokens`). This
+        //     replaces the previous hard-coded empty id.
+        //   * one `gen_ai.{user,assistant}.message` event for the prompt + the
+        //     assistant reply (content attached only under the opt-in capture
+        //     gate, per the convention's PII stance).
+        //   * one `gen_ai.choice` event carrying the finish reason inferred from
+        //     the response shape (`tool_calls` when the model issued tool calls,
+        //     else `stop`).
+        //   * one `gen_ai.tool.*` attribute set + `gen_ai.tool.message` event per
+        //     tool call the model issued this turn (id/name/description; input as
+        //     content under the same capture gate).
+        #[cfg(feature = "otel")]
+        {
+            gen_ai_span.set_response_attributes(
+                &turn_response_id(&session.id, turn),
+                u64::from(resp.usage.cache_read_input_tokens),
+            );
+            // The assistant text this turn (concatenated Text blocks).
+            let assistant_text: String = resp
+                .assistant
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            // Content is opt-in (PII); record an empty body unless the capture
+            // gate is set, so the message/choice *structure* always emits but the
+            // text only when explicitly enabled.
+            let user_content = if gen_ai_capture_content { user_text } else { "" };
+            let assistant_content = if gen_ai_capture_content { assistant_text.as_str() } else { "" };
+            gen_ai_span.record_message("user", user_content);
+            gen_ai_span.record_message("assistant", assistant_content);
+            // Finish reason: the model issued tool calls iff any ToolUse block is
+            // present; otherwise the turn stops.
+            let issued_tool_calls = resp
+                .assistant
+                .blocks
+                .iter()
+                .any(|b| matches!(b, Block::ToolUse { .. }));
+            let finish_reason = if issued_tool_calls {
+                origin_metrics::keys::genai::FINISH_TOOL_CALLS
+            } else {
+                origin_metrics::keys::genai::FINISH_STOP
+            };
+            gen_ai_span.record_choice(0, finish_reason);
+            // One tool-attribute set + tool-call message per tool the model
+            // issued this turn. The result body is not yet available at span
+            // close (the span brackets the provider call; tools dispatch after),
+            // so the `gen_ai.tool.message` carries the tool-call *input* (gated)
+            // rather than the result — the call structure that the span owns.
+            for b in &resp.assistant.blocks {
+                if let Block::ToolUse { id, name, input_json, .. } = b {
+                    let description = registry_iter()
+                        .find(|m| m.name == name.as_str())
+                        .map_or("", |m| m.description);
+                    gen_ai_span.set_tool_attributes(name, id, description, "function");
+                    let input_content = if gen_ai_capture_content {
+                        std::str::from_utf8(input_json).unwrap_or("")
+                    } else {
+                        ""
+                    };
+                    gen_ai_span.record_tool_message(id, input_content);
+                }
+            }
+        }
         // End the `gen_ai` span now that the call (and its latency recordings)
         // are complete. Explicit drop documents the span's scope; the guard's
         // Drop ends the span (a no-op without `--features otel`).
