@@ -123,12 +123,16 @@ async fn system_prompt_lists_workflows_by_name() {
             ),
             steps: vec![
                 WorkflowStep {
+                    id: 0,
                     skill: "frontend-design:frontend-design".into(),
                     args: None,
+                    depends_on: Vec::new(),
                 },
                 WorkflowStep {
+                    id: 1,
                     skill: "impeccable".into(),
                     args: Some("teach".into()),
+                    depends_on: vec![0],
                 },
             ],
         }],
@@ -168,8 +172,10 @@ async fn system_prompt_combines_directive_skills_and_workflows() {
             name: "ship-it".into(),
             description: Some("plan then merge".into()),
             steps: vec![WorkflowStep {
+                id: 0,
                 skill: "writing-plans".into(),
                 args: None,
+                depends_on: Vec::new(),
             }],
         }],
     });

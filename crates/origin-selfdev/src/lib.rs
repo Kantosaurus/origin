@@ -45,6 +45,10 @@
 //! * [`cargo`] — a *real* default [`BuildRunner`]/[`TestRunner`] that shells
 //!   `cargo build` / `cargo test`. Clearly named and opt-in; Phase 2 chooses it,
 //!   tests never touch it.
+//! * [`RelaunchManifest`] / [`RelaunchRequest`] / [`RelaunchStore`] — the
+//!   binary-swap contract the daemon writes after a granted restart so the
+//!   *supervisor* (which does NOT depend on this crate) can exec the new binary.
+//!   This is a separate slot from the reload context's `reload.json`.
 //!
 //! ```
 //! use origin_selfdev::{
@@ -68,6 +72,7 @@ pub mod cargo;
 mod context;
 mod driver;
 mod queue;
+mod relaunch;
 
 pub use cargo::CargoRunner;
 pub use context::{FileReloadStore, ReloadContext, ReloadStore, StoreError};
@@ -76,3 +81,4 @@ pub use driver::{
     SelfDevEvent, SelfDevState, RestartAuthority, RestartDecision, TestRunner,
 };
 pub use queue::{BuildJob, BuildQueue};
+pub use relaunch::{FileRelaunchStore, RelaunchManifest, RelaunchRequest, RelaunchStore};

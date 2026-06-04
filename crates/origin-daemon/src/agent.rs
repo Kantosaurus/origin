@@ -379,19 +379,83 @@ fn run_turn_end_effects(
     );
 }
 
-/// Best-effort opt-in session-stop pain telemetry (Task 4). No-op unless
-/// `ORIGIN_TELEMETRY=1` (opt-in) and `DO_NOT_TRACK` is unset — the same guard
-/// the per-turn `turn` events use — and routed through the same redacting,
-/// sampling [`origin_telemetry::Pipeline`] and JSONL sink.
+/// Measured pain-bucket inputs for one session-stop record (Stage C5).
 ///
-/// Emits one `session_stop` event carrying the [`origin_telemetry::PainMetrics`]
-/// bucket ([`origin_telemetry::SessionStopReason`], total agent time, and turn
-/// count). Default-off ⇒ no event, no file, byte-identical.
-fn maybe_record_session_stop_telemetry(
+/// A plain data carrier assembled at an emit site and handed to
+/// [`record_session_stop_pain`]. Every field is a *measured* quantity: the
+/// stop reason, the split agent time, the optional time-to-first-useful-action,
+/// the turn count, and the autonomy streak. Constructed via
+/// [`SessionStopPain::from_loop`] (the in-loop emit sites, which have a full
+/// time split) or [`SessionStopPain::reason_only`] (cross-module sites such as
+/// the client-disconnect `Abandoned` and supervisor idle-`Retire`, which know
+/// only the reason).
+#[derive(Debug, Clone, Copy)]
+pub struct SessionStopPain {
     stop_reason: origin_telemetry::SessionStopReason,
-    agent_time_ms: u64,
+    model_time_ms: u64,
+    tool_time_ms: u64,
+    ttfua_ms: Option<u64>,
     turn_count: u32,
-) {
+    autonomy_streak: u32,
+}
+
+impl SessionStopPain {
+    /// Build a fully-measured record from the in-`run_loop` accumulators.
+    ///
+    /// `total_agent_time_ms` is the elapsed loop clock and `tool_time_ms` the
+    /// summed tool-dispatch wall-clock; the two are reconciled by
+    /// [`split_agent_time`] so `model_time_ms + tool_time_ms` always equals the
+    /// total. `first_tool_ms`/`first_token_ms` feed [`select_ttfua`], and the
+    /// autonomy streak is derived from `turn_count` by [`autonomy_streak_for`].
+    #[must_use]
+    pub const fn from_loop(
+        stop_reason: origin_telemetry::SessionStopReason,
+        total_agent_time_ms: u64,
+        tool_time_ms: u64,
+        first_tool_ms: Option<u64>,
+        first_token_ms: Option<u64>,
+        turn_count: u32,
+    ) -> Self {
+        let (model_ms, tool_ms) = split_agent_time(total_agent_time_ms, tool_time_ms);
+        Self {
+            stop_reason,
+            model_time_ms: model_ms,
+            tool_time_ms: tool_ms,
+            ttfua_ms: select_ttfua(first_tool_ms, first_token_ms),
+            turn_count,
+            autonomy_streak: autonomy_streak_for(turn_count),
+        }
+    }
+
+    /// Build a reason-only record for a cross-module emit site that has no
+    /// in-loop time split (client disconnect ⇒ `Abandoned`, supervisor idle
+    /// retire ⇒ `Idle`). The numeric fields are left unmeasured (zero time
+    /// split, no ttfua, zero turns/streak) so only the stop reason is asserted.
+    #[must_use]
+    pub const fn reason_only(stop_reason: origin_telemetry::SessionStopReason) -> Self {
+        Self {
+            stop_reason,
+            model_time_ms: 0,
+            tool_time_ms: 0,
+            ttfua_ms: None,
+            turn_count: 0,
+            autonomy_streak: 0,
+        }
+    }
+}
+
+/// Best-effort opt-in session-stop pain telemetry (Task 4 / Stage C5).
+///
+/// No-op unless `ORIGIN_TELEMETRY=1` (opt-in) and `DO_NOT_TRACK` is unset — the
+/// same guard the per-turn `turn` events use — and routed through the same
+/// redacting, sampling [`origin_telemetry::Pipeline`] and JSONL sink.
+///
+/// Emits one `session_stop` event carrying the full
+/// [`origin_telemetry::PainMetrics`] bucket: the
+/// [`origin_telemetry::SessionStopReason`], the real model-vs-tool time split,
+/// the time-to-first-useful-action (when observed), the turn count, and the
+/// autonomy streak. Default-off ⇒ no event, no file, byte-identical.
+pub fn record_session_stop_pain(pain: SessionStopPain) {
     use std::io::Write as _;
     let do_not_track = std::env::var_os("DO_NOT_TRACK").is_some();
     let opt_in = std::env::var("ORIGIN_TELEMETRY").as_deref() == Ok("1");
@@ -400,12 +464,13 @@ fn maybe_record_session_stop_telemetry(
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-    // The split is reported as model time; the loop does not separate model vs
-    // tool wall-clock, so `tool_time_ms` stays unset (the schema is partial).
-    let metrics = origin_telemetry::PainMetrics::new()
-        .with_stop_reason(stop_reason)
-        .with_agent_time_split(agent_time_ms, 0)
-        .with_turns(turn_count, turn_count);
+    let mut metrics = origin_telemetry::PainMetrics::new()
+        .with_stop_reason(pain.stop_reason)
+        .with_agent_time_split(pain.model_time_ms, pain.tool_time_ms)
+        .with_turns(pain.turn_count, pain.autonomy_streak);
+    if let Some(ttfua) = pain.ttfua_ms {
+        metrics = metrics.with_time_to_first_useful_action_ms(ttfua);
+    }
     let Ok(event) = metrics.into_event("session_stop".to_string(), now_ms) else {
         return;
     };
@@ -427,6 +492,100 @@ fn maybe_record_session_stop_telemetry(
             let _ = writeln!(f, "{line}");
         }
     }
+}
+
+/// Split the loop's total wall-clock agent time into `(model_ms, tool_ms)`
+/// (Stage C5 Task 1).
+///
+/// `total_ms` is the elapsed `run_loop` clock; `tool_ms` is the summed
+/// wall-clock spent inside tool dispatch. Model time is the remainder
+/// (`total - tool`), clamped to zero so a measurement skew — the tool clock
+/// summed wider than the loop clock, e.g. overlapping speculative work — can
+/// never underflow. The returned `tool_ms` is itself clamped to `total_ms` so
+/// the invariant `model_ms + tool_ms == total_ms` always holds.
+#[must_use]
+const fn split_agent_time(total_ms: u64, tool_ms: u64) -> (u64, u64) {
+    let clamped_tool = if tool_ms > total_ms { total_ms } else { tool_ms };
+    let model_ms = total_ms - clamped_tool;
+    (model_ms, clamped_tool)
+}
+
+/// Select the time-to-first-useful-action from the two observed signals
+/// (Stage C5 Task 2).
+///
+/// A successful tool call is the canonical "useful action", so when one was
+/// observed its elapsed-from-loop-start wins. Failing that (a purely
+/// conversational turn that never dispatched a tool) the first assistant token
+/// is the earliest useful signal. `None` only when neither was observed.
+#[must_use]
+const fn select_ttfua(first_tool_ms: Option<u64>, first_token_ms: Option<u64>) -> Option<u64> {
+    match first_tool_ms {
+        Some(ms) => Some(ms),
+        None => first_token_ms,
+    }
+}
+
+/// The two `OTel` `gen_ai` latency measurements for one provider call (Stage C4).
+///
+/// A plain data carrier produced by [`gen_ai_latencies`] and fanned out to the
+/// `gen_ai.server.time_to_first_token` / `gen_ai.server.time_per_output_token`
+/// instruments. `tpot_ms` is `None` when the call produced zero output tokens
+/// (no per-token rate is defined), so the caller skips that recording rather
+/// than emitting a divide-by-zero artefact.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GenAiLatencies {
+    /// Time-to-first-token in milliseconds.
+    ttft_ms: f64,
+    /// Average per-output-token latency in milliseconds, or `None` when the
+    /// call emitted no output tokens.
+    tpot_ms: Option<f64>,
+}
+
+/// Derive the `gen_ai` time-to-first-token and time-per-output-token for one
+/// provider call (Stage C4).
+///
+/// - **TTFT**: the real first-streamed-token elapsed (`stream_first_token_ms`)
+///   when the streaming path observed a token; otherwise — the non-streaming
+///   path, or a stream that ended with no content — the full call latency
+///   (`provider_call_ms`), which is the tightest first-token bound available.
+/// - **TPOT**: total generation time (`provider_call_ms`) divided by
+///   `output_tokens`, guarding divide-by-zero by returning `None` when the call
+///   produced no output tokens.
+///
+/// Pure and total over its inputs (no I/O, no globals), so the wiring's timing
+/// decision is unit-testable without standing up a provider or an exporter.
+#[must_use]
+fn gen_ai_latencies(
+    provider_call_ms: u64,
+    stream_first_token_ms: Option<u64>,
+    output_tokens: u64,
+) -> GenAiLatencies {
+    // Prefer the measured first-token instant; fall back to the full call
+    // latency when no streamed token was observed.
+    #[allow(clippy::cast_precision_loss)]
+    let ttft_ms = stream_first_token_ms.unwrap_or(provider_call_ms) as f64;
+    let tpot_ms = if output_tokens == 0 {
+        None
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        Some(provider_call_ms as f64 / output_tokens as f64)
+    };
+    GenAiLatencies { ttft_ms, tpot_ms }
+}
+
+/// Compute the autonomy streak for a single `run_loop` invocation (Stage C5
+/// Task 3).
+///
+/// One `run_loop` call processes exactly one user prompt: turn 1 is the
+/// directly user-prompted turn, and every later turn (2..=N) ran on the
+/// model's own initiative with no new user input. The autonomy streak is
+/// therefore the count of those self-driven continuation turns, `N - 1`,
+/// saturating at 0 for a single-turn (or empty) loop. This is deliberately
+/// distinct from the raw `turn_count` so a one-shot answer reports zero
+/// autonomy rather than mislabelling the user's own turn as autonomous.
+#[must_use]
+const fn autonomy_streak_for(turn_count: u32) -> u32 {
+    turn_count.saturating_sub(1)
 }
 
 /// Best-effort opt-in telemetry (Task 4). No-op unless `ORIGIN_TELEMETRY=1`
@@ -660,6 +819,56 @@ fn deliver_file_shift(collab: &SwarmCollab, notice: &origin_swarm::FileShiftNoti
     }
 }
 
+/// Render the messages a worker drained from its OWN mailbox into a
+/// `<swarm-notices>` system block for injection into the next turn (A4).
+///
+/// Each message's body is already a human-readable line (e.g. the
+/// `file-shift: <path> was edited by worker <id>; re-check your view` text built
+/// by [`deliver_file_shift`]), so we list one bullet per message inside a single
+/// block. An EMPTY slice yields an EMPTY string so the caller appends nothing and
+/// the turn — and thus the prompt-cache breakpoints — stay byte-identical; this
+/// is the steady state once a worker has no pending sibling notices.
+fn render_swarm_notices(msgs: &[origin_swarm::Message]) -> String {
+    if msgs.is_empty() {
+        return String::new();
+    }
+    let mut block = String::from(
+        "<swarm-notices>\nSibling workers changed shared state since your last turn. \
+         Re-check any affected files before relying on a stale view.\n",
+    );
+    for msg in msgs {
+        block.push_str("- ");
+        block.push_str(msg.body.trim());
+        block.push('\n');
+    }
+    block.push_str("</swarm-notices>");
+    block
+}
+
+/// Drain THIS worker's own mailbox and render the pending notices into a
+/// `<swarm-notices>` block for the next turn (A4).
+///
+/// Locks the shared `mailboxes` map for the minimum span — clones out this
+/// worker's `Arc<Mailbox>`, drops the guard, then drains. Draining empties the
+/// inbox so each notice is surfaced exactly once. Returns an EMPTY string when
+/// there is no mailbox plumbing, no entry for this worker, or nothing pending —
+/// in which case the caller appends nothing and the turn stays byte-identical. A
+/// poisoned lock is recovered, never propagated: collab delivery is advisory and
+/// must not tear down the turn.
+fn drain_own_swarm_notices(collab: &SwarmCollab) -> String {
+    let Some(mailboxes) = collab.mailboxes.as_ref() else {
+        return String::new();
+    };
+    let own = {
+        let map = mailboxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(&collab.worker_id).map(Arc::clone)
+    };
+    let Some(own) = own else {
+        return String::new();
+    };
+    render_swarm_notices(&own.drain())
+}
+
 /// When the primary model is rate-limited and all retries are exhausted,
 /// try a cheaper model from the same family before killing the turn.
 fn rate_limit_fallback(model: &str) -> Option<&'static str> {
@@ -857,6 +1066,126 @@ mod swarm_collab_wiring_tests {
             "gate unset ⇒ no notice ⇒ byte-identical"
         );
         assert_eq!(registry.tracked_paths(), 0, "gate unset ⇒ nothing recorded");
+    }
+
+    /// `render_swarm_notices` (A4): empty slice ⇒ empty string (no block, so the
+    /// turn stays byte-identical); a single Direct file-shift message ⇒ a
+    /// `<swarm-notices>` block naming the shifted path and the editor worker; many
+    /// messages ⇒ each one is listed.
+    #[test]
+    fn render_swarm_notices_block_shapes() {
+        // Empty ⇒ empty string (no `<swarm-notices>` block emitted).
+        assert!(
+            render_swarm_notices(&[]).is_empty(),
+            "no pending messages ⇒ no block ⇒ byte-identical turn"
+        );
+
+        let editor = origin_swarm::WorkerId::generate();
+        let me = origin_swarm::WorkerId::generate();
+        let body = format!(
+            "file-shift: {} was edited by worker {:032x}; re-check your view",
+            "src/lib.rs",
+            editor.value()
+        );
+        let one = [origin_swarm::Message::new(
+            editor,
+            origin_swarm::MsgScope::Direct(me),
+            body.clone(),
+        )];
+        let rendered = render_swarm_notices(&one);
+        assert!(
+            rendered.starts_with("<swarm-notices>"),
+            "single message opens a <swarm-notices> block: {rendered}"
+        );
+        assert!(
+            rendered.trim_end().ends_with("</swarm-notices>"),
+            "single message closes the block: {rendered}"
+        );
+        assert!(
+            rendered.contains("src/lib.rs"),
+            "block names the shifted path: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("{:032x}", editor.value())),
+            "block names the editor worker: {rendered}"
+        );
+
+        // Multiple messages ⇒ every body is listed inside the one block.
+        let other_editor = origin_swarm::WorkerId::generate();
+        let body2 = format!(
+            "file-shift: {} was edited by worker {:032x}; re-check your view",
+            "src/main.rs",
+            other_editor.value()
+        );
+        let many = [
+            origin_swarm::Message::new(editor, origin_swarm::MsgScope::Direct(me), body),
+            origin_swarm::Message::new(
+                other_editor,
+                origin_swarm::MsgScope::Broadcast,
+                body2,
+            ),
+        ];
+        let rendered_many = render_swarm_notices(&many);
+        assert_eq!(
+            rendered_many.matches("<swarm-notices>").count(),
+            1,
+            "all messages share one block: {rendered_many}"
+        );
+        assert!(
+            rendered_many.contains("src/lib.rs") && rendered_many.contains("src/main.rs"),
+            "every message is listed: {rendered_many}"
+        );
+    }
+
+    /// `drain_own_swarm_notices` (A4): the drain→render step a worker runs at the
+    /// turn boundary. With no `mailboxes` map ⇒ empty (nothing to drain). With a
+    /// map whose entry holds a pending notice ⇒ a `<swarm-notices>` block AND the
+    /// mailbox is left empty (drain consumed it, so the notice is shown once). A
+    /// second call with the now-empty box ⇒ empty string again.
+    #[test]
+    fn drain_own_swarm_notices_consumes_and_renders() {
+        let me = origin_swarm::WorkerId::generate();
+        let editor = origin_swarm::WorkerId::generate();
+        let registry = Arc::new(origin_swarm::FileRegistry::new());
+
+        // No mailbox map ⇒ nothing to drain ⇒ empty.
+        let no_box = SwarmCollab {
+            worker_id: me,
+            registry: Arc::clone(&registry),
+            mailboxes: None,
+        };
+        assert!(
+            drain_own_swarm_notices(&no_box).is_empty(),
+            "no mailbox plumbing ⇒ no block"
+        );
+
+        // A live map with a pending Direct notice in MY box.
+        let mailboxes = shared_map(&[me, editor]);
+        {
+            let map = mailboxes.lock().unwrap_or_else(PoisonError::into_inner);
+            map.get(&me).expect("my mailbox present").push(
+                origin_swarm::Message::new(
+                    editor,
+                    origin_swarm::MsgScope::Direct(me),
+                    "file-shift: src/lib.rs was edited by worker; re-check your view",
+                ),
+            );
+        }
+        let collab = SwarmCollab {
+            worker_id: me,
+            registry: Arc::clone(&registry),
+            mailboxes: Some(Arc::clone(&mailboxes)),
+        };
+        let first = drain_own_swarm_notices(&collab);
+        assert!(
+            first.contains("<swarm-notices>") && first.contains("src/lib.rs"),
+            "pending notice renders a block: {first}"
+        );
+        // Drain consumed it: a second call sees an empty box ⇒ empty string.
+        assert!(
+            drain_own_swarm_notices(&collab).is_empty(),
+            "drain consumes the notice so it is shown exactly once"
+        );
     }
 }
 
@@ -1228,6 +1557,13 @@ impl SpeculativeRegistry {
 pub(crate) struct StreamingTurn {
     pub response: origin_provider::ChatResponse,
     pub speculative: SpeculativeRegistry,
+    /// Milliseconds from the start of stream consumption to the FIRST streamed
+    /// content event (text / thinking / tool-use). `None` when the stream
+    /// produced no content event before `TurnEnd` (e.g. an empty turn). This is
+    /// the real time-to-first-token surfaced to the `OTel` `gen_ai` latency
+    /// instruments; the non-streaming path has no streamed tokens and so leaves
+    /// this `None` (the caller falls back to the full call latency there).
+    pub first_token_ms: Option<u64>,
 }
 
 /// Session-id prefixes reserved for the daemon's own self-dispatched prompts
@@ -1291,19 +1627,174 @@ mod self_dispatch_session_tests {
     }
 }
 
+#[cfg(test)]
+mod pain_bucket_helper_tests {
+    use super::{autonomy_streak_for, gen_ai_latencies, select_ttfua, split_agent_time};
+
+    #[test]
+    fn split_subtracts_tool_from_total() {
+        // model = total - tool; tool unchanged when it fits inside total.
+        assert_eq!(split_agent_time(1_000, 300), (700, 300));
+    }
+
+    #[test]
+    fn split_clamps_when_tool_exceeds_total() {
+        // A timing skew (tool clock measured wider than the loop clock) must
+        // never produce a negative/underflowed model time. model clamps to 0
+        // and the reported tool time is itself clamped to the total so
+        // model + tool == total holds.
+        assert_eq!(split_agent_time(500, 900), (0, 500));
+    }
+
+    #[test]
+    fn split_handles_zero_tool_time() {
+        // A tool-free turn reports the whole budget as model time.
+        assert_eq!(split_agent_time(1_234, 0), (1_234, 0));
+    }
+
+    #[test]
+    fn split_handles_exact_equality() {
+        assert_eq!(split_agent_time(800, 800), (0, 800));
+    }
+
+    #[test]
+    fn ttfua_prefers_first_tool_over_first_token() {
+        // A successful tool call is the canonical "useful action"; when both
+        // are present the tool timestamp wins even if the token came earlier.
+        assert_eq!(select_ttfua(Some(420), Some(110)), Some(420));
+    }
+
+    #[test]
+    fn ttfua_falls_back_to_first_token_when_no_tool() {
+        // No tool ran (pure conversational turn) ⇒ first assistant token is
+        // the earliest useful signal we have.
+        assert_eq!(select_ttfua(None, Some(90)), Some(90));
+    }
+
+    #[test]
+    fn ttfua_is_none_when_neither_observed() {
+        assert_eq!(select_ttfua(None, None), None);
+    }
+
+    #[test]
+    fn ttfua_uses_tool_even_without_a_token() {
+        assert_eq!(select_ttfua(Some(7), None), Some(7));
+    }
+
+    #[test]
+    fn autonomy_streak_is_turns_minus_first_user_turn() {
+        // Turn 1 is the directly user-prompted turn; turns 2..=N ran with no
+        // new user input, so the autonomous streak is N-1 — distinct from the
+        // raw turn_count.
+        assert_eq!(autonomy_streak_for(5), 4);
+        assert_eq!(autonomy_streak_for(2), 1);
+    }
+
+    #[test]
+    fn autonomy_streak_single_turn_is_zero() {
+        // A one-turn loop never continued without the user ⇒ no autonomy.
+        assert_eq!(autonomy_streak_for(1), 0);
+    }
+
+    #[test]
+    fn autonomy_streak_zero_turns_is_zero() {
+        // Defensive: an empty loop (no turn executed) has no streak and must
+        // not underflow.
+        assert_eq!(autonomy_streak_for(0), 0);
+    }
+
+    // --- Stage C4: gen_ai TTFT / TPOT derivation ---------------------------
+
+    #[test]
+    fn gen_ai_latencies_prefer_streamed_first_token_for_ttft() {
+        // When the streaming path observed a real first token, TTFT is that
+        // measured instant — NOT the full call latency.
+        let l = gen_ai_latencies(2_000, Some(120), 50);
+        assert!((l.ttft_ms - 120.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn gen_ai_latencies_fall_back_to_call_latency_without_a_streamed_token() {
+        // Non-streaming path (or an empty stream): no first-token signal, so
+        // TTFT is the full provider-call latency.
+        let l = gen_ai_latencies(800, None, 10);
+        assert!((l.ttft_ms - 800.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn gen_ai_latencies_compute_per_output_token_rate() {
+        // TPOT = total generation ms / output tokens.
+        let l = gen_ai_latencies(1_000, Some(100), 40);
+        let tpot = l.tpot_ms.expect("a nonzero output-token count yields a TPOT");
+        assert!((tpot - 25.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn gen_ai_latencies_guard_divide_by_zero_for_tpot() {
+        // Zero output tokens ⇒ no per-token rate is defined; TPOT is None so
+        // the caller skips the recording rather than emitting inf/NaN.
+        let l = gen_ai_latencies(500, Some(50), 0);
+        assert_eq!(l.tpot_ms, None);
+        // TTFT is still defined (the streamed first token).
+        assert!((l.ttft_ms - 50.0).abs() < f64::EPSILON);
+    }
+}
+
 /// Run the agent loop until the assistant emits a turn without any `tool_use`
 /// blocks, or until `max_turns` is reached.
+///
+/// Thin wrapper over [`run_loop_inner`] that owns the Stage C5 `Error`
+/// pain-bucket emit: the inner loop already emits `Completed` (clean finish)
+/// and `BudgetExhausted` (its `MaxTurns` exit) at their precise sites with the
+/// real model-vs-tool split, so this wrapper only tags the *remaining* fatal
+/// `Err` exits (provider failure, permission denial, unknown/failed tool,
+/// malformed input) with the generic [`origin_telemetry::SessionStopReason::Error`]
+/// bucket — never double-emitting on the `MaxTurns` path. Default-off ⇒ no
+/// event, byte-identical.
 ///
 /// # Errors
 /// Returns `LoopError` for provider failures, permission denial, unknown tools,
 /// tool execution failures, malformed tool inputs, or hitting `max_turns`.
+pub async fn run_loop(
+    session: &mut Session,
+    user_text: &str,
+    provider: &dyn Provider,
+    prompter: &dyn Prompter,
+    opts: &LoopOptions,
+) -> Result<LoopSummary, LoopError> {
+    let started = std::time::Instant::now();
+    let result = run_loop_inner(session, user_text, provider, prompter, opts).await;
+    if let Err(e) = &result {
+        // `MaxTurns` already emitted its own `BudgetExhausted` bucket inside
+        // the inner loop; every other error is a fatal, unrecovered exit ⇒
+        // `Error`. The inner loop holds the model/tool split, which is not
+        // visible here, so the wrapper reports total elapsed as the agent time
+        // (reason-correct; the split is best-effort and partial by design).
+        if !matches!(e, LoopError::MaxTurns(_)) {
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            record_session_stop_pain(SessionStopPain::from_loop(
+                origin_telemetry::SessionStopReason::Error,
+                elapsed_ms,
+                0,
+                None,
+                None,
+                0,
+            ));
+        }
+    }
+    result
+}
+
+/// The agent turn loop proper. See [`run_loop`] for the public contract; this
+/// inner function carries the loop body and emits the `Completed` /
+/// `BudgetExhausted` pain buckets at their exact sites.
 #[allow(clippy::too_many_lines)] // turn loop + memoization path; extraction would require extra allocations
 #[tracing::instrument(
     level = "info",
     skip(session, user_text, provider, prompter, opts),
     fields(kind = "turn", provider = provider.name())
 )]
-pub async fn run_loop(
+async fn run_loop_inner(
     session: &mut Session,
     user_text: &str,
     provider: &dyn Provider,
@@ -1558,10 +2049,15 @@ pub async fn run_loop(
     // the flag unset this stays `String::new()` and the assembled prompt — and
     // thus the prompt cache breakpoints — are byte-identical to before.
     let repo_map_block = if std::env::var("ORIGIN_REPOMAP").as_deref() == Ok("1") {
-        std::env::current_dir()
-            .ok()
-            .and_then(|cwd| crate::subsystems::repo_map_block(&cwd))
-            .unwrap_or_default()
+        // Map spans every session root (multi-root cross-references are honoured
+        // by the ranker); default to the current dir when the session opened
+        // with no explicit roots.
+        let roots: Vec<std::path::PathBuf> = if session.roots.is_empty() {
+            std::env::current_dir().ok().into_iter().collect()
+        } else {
+            session.roots.clone()
+        };
+        crate::subsystems::repo_map_block(&roots).unwrap_or_default()
     } else {
         String::new()
     };
@@ -1648,6 +2144,20 @@ pub async fn run_loop(
     let loop_start = std::time::Instant::now();
     let mut total_tool_calls: u64 = 0;
 
+    // Stage C5 pain-bucket accumulators. All are pure measurement and feed only
+    // the opt-in `session_stop` telemetry (off without `ORIGIN_TELEMETRY=1`), so
+    // maintaining them never alters the default path.
+    //   * `tool_time_ms`   — summed wall-clock spent inside tool dispatch this
+    //                        run; subtracted from the loop clock to recover the
+    //                        model-call time (Task 1).
+    //   * `first_tool_ms`  — elapsed from loop start to the FIRST successful
+    //                        tool dispatch (Task 2).
+    //   * `first_token_ms` — elapsed from loop start to the FIRST assistant
+    //                        response, the ttfua fallback when no tool ran.
+    let mut tool_time_ms: u64 = 0;
+    let mut first_tool_ms: Option<u64> = None;
+    let mut first_token_ms: Option<u64> = None;
+
     for turn in 1..=opts.max_turns {
         // Distinct files this turn mutated (for the post-edit diagnostics probe).
         // Always empty unless the feature is enabled, so it allocates nothing on
@@ -1692,15 +2202,33 @@ pub async fn run_loop(
         // The provider this turn's chat call uses: the freshly-built owned one
         // for a cross-provider pick, otherwise the borrowed active provider.
         let turn_provider: &dyn Provider = rebuilt.as_deref().unwrap_or(provider);
+        // Swarm collaboration inbound (A4): when a `SwarmCollab` is in scope
+        // (swarm workers only), drain THIS worker's own mailbox at the turn
+        // boundary and fold any pending sibling notices into this turn's prompt
+        // as a `<swarm-notices>` block. No collab context, or an empty drain ⇒
+        // empty string ⇒ nothing appended ⇒ byte-identical turn. Draining
+        // consumes the notices so each is shown exactly once.
+        let swarm_notices_block = SWARM_COLLAB
+            .try_with(drain_own_swarm_notices)
+            .unwrap_or_default();
         // Per-turn system prompt. When the optional post-edit LSP-diagnostics
         // feature produced a block on the previous turn, append it here so the
-        // model sees the feedback its edit generated. Empty block (the default,
-        // and the steady state once issues are fixed) ⇒ `recalled_system` is
-        // reused verbatim, keeping the wire — and the prompt cache — unchanged.
-        let turn_system = if lsp_diag_block.is_empty() {
-            recalled_system.clone()
-        } else {
-            format!("{recalled_system}\n\n{lsp_diag_block}")
+        // model sees the feedback its edit generated. The swarm-notices block (if
+        // any) is appended likewise. Both empty (the default, and the steady
+        // state once issues are fixed and there are no pending sibling notices) ⇒
+        // `recalled_system` is reused verbatim, keeping the wire — and the prompt
+        // cache — unchanged.
+        let turn_system = {
+            let mut s = recalled_system.clone();
+            if !lsp_diag_block.is_empty() {
+                s.push_str("\n\n");
+                s.push_str(&lsp_diag_block);
+            }
+            if !swarm_notices_block.is_empty() {
+                s.push_str("\n\n");
+                s.push_str(&swarm_notices_block);
+            }
+            s
         };
         let req = ChatRequest {
             system: turn_system,
@@ -1734,21 +2262,38 @@ pub async fn run_loop(
                 })
                 .await;
         }
-        let (resp, mut speculative) = {
+        // Stage C4: open a `gen_ai` client span bracketing the whole provider
+        // interaction for this turn (including any rate-limit retries/fallback).
+        // The guard ends the span on drop at the close of the call block below.
+        // This is a zero-size no-op guard unless the daemon is built
+        // `--features otel` AND a tracer provider is installed, so the default
+        // path is byte-identical. Attaches gen_ai.system / gen_ai.request.model
+        // / gen_ai.operation.name (relabeled inside origin-metrics).
+        let gen_ai_span = origin_metrics::instruments::gen_ai_span(
+            turn_provider.name(),
+            &turn_model,
+            origin_metrics::keys::genai::OPERATION_CHAT,
+        );
+        let (resp, mut speculative, stream_first_token_ms) = {
             let mut attempt: u32 = 0;
             loop {
-                let result: Result<(origin_provider::ChatResponse, SpeculativeRegistry), LoopError> =
-                    if opts.streaming_disabled {
-                        turn_provider
-                            .chat(req.clone())
-                            .await
-                            .map(|r| (r, SpeculativeRegistry::default()))
-                            .map_err(LoopError::Provider)
-                    } else {
-                        run_streaming_turn(turn_provider, req.clone(), opts)
-                            .await
-                            .map(|st| (st.response, st.speculative))
-                    };
+                let result: Result<
+                    (origin_provider::ChatResponse, SpeculativeRegistry, Option<u64>),
+                    LoopError,
+                > = if opts.streaming_disabled {
+                    turn_provider
+                        .chat(req.clone())
+                        .await
+                        // Non-streaming: no per-token stream, so there is no
+                        // distinct first-token signal — the caller falls back to
+                        // the full call latency for TTFT.
+                        .map(|r| (r, SpeculativeRegistry::default(), None))
+                        .map_err(LoopError::Provider)
+                } else {
+                    run_streaming_turn(turn_provider, req.clone(), opts)
+                        .await
+                        .map(|st| (st.response, st.speculative, st.first_token_ms))
+                };
                 match result {
                     Err(LoopError::Provider(origin_provider::ProviderError::RateLimit {
                         retry_after_secs,
@@ -1807,12 +2352,12 @@ pub async fn run_loop(
                                 turn_provider
                                     .chat(fb_req)
                                     .await
-                                    .map(|r| (r, SpeculativeRegistry::default()))
+                                    .map(|r| (r, SpeculativeRegistry::default(), None))
                                     .map_err(LoopError::Provider)
                             } else {
                                 run_streaming_turn(turn_provider, fb_req, opts)
                                     .await
-                                    .map(|st| (st.response, st.speculative))
+                                    .map(|st| (st.response, st.speculative, st.first_token_ms))
                             };
                             match fb_result {
                                 Ok(r) => {
@@ -1852,6 +2397,40 @@ pub async fn run_loop(
                 .await;
         }
 
+        // Stage C4: emit the OTel `gen_ai` latency instruments for this turn's
+        // provider call with REAL values, then end the span. `provider_call_ms`
+        // is the measured call window (start before the BeforeModel hook to here,
+        // covering any rate-limit retries/fallback); `stream_first_token_ms` is
+        // the streaming path's real first-token elapsed (None on the
+        // non-streaming path). The TPOT divisor is this turn's output tokens,
+        // with divide-by-zero guarded inside `gen_ai_latencies`. All record
+        // calls are const no-ops unless the daemon is built `--features otel`
+        // AND the exporter is installed, so the default path is byte-identical.
+        let provider_call_ms = elapsed_ms_since(provider_call_start);
+        let latencies = gen_ai_latencies(
+            provider_call_ms,
+            stream_first_token_ms,
+            u64::from(resp.usage.output_tokens),
+        );
+        origin_metrics::instruments::record_time_to_first_token(
+            turn_provider.name(),
+            &turn_model,
+            origin_metrics::keys::genai::OPERATION_CHAT,
+            latencies.ttft_ms,
+        );
+        if let Some(tpot_ms) = latencies.tpot_ms {
+            origin_metrics::instruments::record_time_per_output_token(
+                turn_provider.name(),
+                &turn_model,
+                origin_metrics::keys::genai::OPERATION_CHAT,
+                tpot_ms,
+            );
+        }
+        // End the `gen_ai` span now that the call (and its latency recordings)
+        // are complete. Explicit drop documents the span's scope; the guard's
+        // Drop ends the span (a no-op without `--features otel`).
+        drop(gen_ai_span);
+
         // Live router (openclaude SmartRouter / Scored EMA): fold this turn's
         // provider latency + success into the router's health so future turns /
         // prompts rank this model on measured signal. A success also clears any
@@ -1863,6 +2442,14 @@ pub async fn run_loop(
             // cross-provider pick) so health/quota signal is attributed to the
             // right `provider/model`, exactly as the same-provider path does.
             lr.record(turn_provider.name(), &turn_model, latency_ms, true);
+        }
+
+        // Stage C5 Task 2: the first provider response of this run is the
+        // earliest assistant signal — the ttfua fallback used when the turn
+        // never dispatches a tool. Recorded once; later turns leave it.
+        if first_token_ms.is_none() {
+            first_token_ms =
+                Some(u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX));
         }
 
         // Charge this turn's provider call against the cumulative counters
@@ -1989,14 +2576,18 @@ pub async fn run_loop(
                 loop_start.elapsed().as_secs_f64() * 1_000.0,
                 total_tool_calls,
             );
-            // Task 4: the loop reached a clean assistant turn with no further
-            // tool calls — the agent finished the requested work. Emit the
-            // `Completed` pain bucket. Default-off ⇒ no event.
-            maybe_record_session_stop_telemetry(
+            // Task 4 / Stage C5: the loop reached a clean assistant turn with
+            // no further tool calls — the agent finished the requested work.
+            // Emit the `Completed` pain bucket with the REAL model-vs-tool split
+            // and time-to-first-useful-action. Default-off ⇒ no event.
+            record_session_stop_pain(SessionStopPain::from_loop(
                 origin_telemetry::SessionStopReason::Completed,
                 agent_time_ms,
+                tool_time_ms,
+                first_tool_ms,
+                first_token_ms,
                 turn,
-            );
+            ));
 
             return Ok(LoopSummary {
                 assistant_text: text,
@@ -2178,6 +2769,13 @@ pub async fn run_loop(
                 }
             }
 
+            // Stage C5 Task 1/2: time the tool-execution wall-clock. The clock
+            // starts here, before the cache/speculative/Bash/dispatch fan-out,
+            // and is folded into `tool_time_ms` only on the SUCCESS path below
+            // (a failed tool `continue`s past the fold, so its time is left in
+            // the model-time remainder rather than miscredited as useful tool
+            // work). Pure measurement; default path is byte-identical.
+            let dispatch_start = std::time::Instant::now();
             let result_bytes: Vec<u8> = if let Some(hit) = cache_hit {
                 // Serve the cached body annotated with the originating turn.
                 let store = opts.cas.as_ref().ok_or_else(|| {
@@ -2304,6 +2902,18 @@ pub async fn run_loop(
                     }
                 }
             };
+
+            // Stage C5 Task 1/2: reaching here means the tool produced a result
+            // (every failure path `continue`d above). Fold this dispatch's
+            // wall-clock into the tool-time accumulator and, the first time,
+            // capture the elapsed-from-loop-start as the time-to-first-useful-
+            // action. Saturating so a pathological run can never overflow.
+            tool_time_ms = tool_time_ms
+                .saturating_add(u64::try_from(dispatch_start.elapsed().as_millis()).unwrap_or(u64::MAX));
+            if first_tool_ms.is_none() {
+                first_tool_ms =
+                    Some(u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX));
+            }
 
             // Real-time swarm collaboration (WS-L, jcode L238). Reaching here
             // means the tool succeeded (failures `continue` above). When a
@@ -2504,16 +3114,22 @@ pub async fn run_loop(
             };
         }
     }
-    // Task 4: the loop exhausted its `max_turns` budget without the model
-    // settling on a tool-free final answer — the turn budget is the exhausted
-    // resource. Emit the `BudgetExhausted` pain bucket before propagating the
-    // error. Default-off ⇒ no event.
+    // Task 4 / Stage C5: the loop exhausted its `max_turns` budget without the
+    // model settling on a tool-free final answer — the turn budget is the
+    // exhausted resource. Emit the `BudgetExhausted` pain bucket (with the real
+    // time split + ttfua) before propagating the error. This is the budget
+    // exit, NOT a fatal-error exit, so it owns the more-specific
+    // `BudgetExhausted` reason rather than the generic `Error` the fallback
+    // wrapper tags other `Err` returns with. Default-off ⇒ no event.
     let agent_time_ms = u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX);
-    maybe_record_session_stop_telemetry(
+    record_session_stop_pain(SessionStopPain::from_loop(
         origin_telemetry::SessionStopReason::BudgetExhausted,
         agent_time_ms,
+        tool_time_ms,
+        first_tool_ms,
+        first_token_ms,
         opts.max_turns,
-    );
+    ));
     Err(LoopError::MaxTurns(opts.max_turns))
 }
 
@@ -3295,12 +3911,14 @@ async fn dispatch_tool(
                 .map(|cid| cid.to_string())
                 .or_else(|| args.get("node").and_then(Value::as_str).map(ToString::to_string))
                 .unwrap_or_default();
-            // graph_summarize_tool always returns QueryResult::Empty at P7.8.
-            {
+            // Summarize the target node's immediate neighbourhood (target +
+            // direct callees/refs) and return it as the tool's JSON output.
+            let result = {
                 let idx = idx_arc.lock().await;
-                let _result = origin_tools::builtins::graph_summarize::graph_summarize_tool(&idx, target);
-            }
-            Ok("{}".to_string())
+                origin_tools::builtins::graph_summarize::graph_summarize_tool(&idx, &target)
+                    .map_err(|e| LoopError::ToolFailure(e.to_string()))?
+            };
+            Ok(serialize_query_result(&result))
         }
         "graph_rebuild" => {
             use std::path::PathBuf;
@@ -3315,18 +3933,21 @@ async fn dispatch_tool(
                 .and_then(Value::as_array)
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(PathBuf::from)).collect())
                 .unwrap_or_default();
-            // Lock, mutate, then release before returning — don't hold across any await.
-            let report = {
-                let mut idx = idx_arc.lock().await;
-                origin_tools::builtins::graph_rebuild::graph_rebuild_tool(
-                    &mut idx,
-                    paths,
-                    origin_codegraph::Language::Rust,
-                )
-                .map_err(|e| LoopError::ToolFailure(e.to_string()))?
-            };
+            // Detect each path's language per-file (skipping files with no
+            // codegraph-supported grammar) and rebuild once per language group,
+            // instead of forcing every file through a single hardcoded grammar.
+            let groups = crate::subsystems::group_paths_by_language(&paths);
+            // `paths_seen` counts every requested path, including ones skipped
+            // because their language is unsupported, so the caller can see the
+            // gap between requested and rebuilt.
+            let paths_seen = paths.len();
+            // Lock once, rebuild every group under the same guard, then release.
+            // The guard is a single-use temporary handed to the helper, so it is
+            // never held across an await.
+            let report = rebuild_groups(&mut *idx_arc.lock().await, groups)
+                .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
             Ok(serde_json::json!({
-                "paths_seen": report.paths_seen,
+                "paths_seen": paths_seen,
                 "nodes_added": report.nodes_added,
                 "nodes_updated": report.nodes_updated,
                 "errors": report.errors,
@@ -3547,8 +4168,65 @@ async fn dispatch_tool(
         // created. The result is then runnable via the existing `{workflow:<name>}`
         // path, which this arm does not touch.
         "AuthorWorkflow" => author_workflow_tool(args, skill_catalog),
+        // ── RunWorkflow (mutating; spawns sub-agents) ──
+        // Loads the named workflow from `~/.origin/workflows.toml` and runs it as
+        // a phase-layered parallel DAG of real swarm workers via the daemon-wide
+        // Coordinator (one sub-agent per step, independent same-layer steps
+        // concurrent). Returns a JSON run summary. This is the FAN-OUT complement
+        // to the linear `{workflow:<name>}` skill-mask activation path, which this
+        // arm does not touch.
+        "RunWorkflow" => {
+            let coord = coordinator
+                .ok_or_else(|| LoopError::ToolFailure("RunWorkflow: swarm coordinator not configured".into()))?;
+            run_workflow_tool(args, coord, skill_catalog).await
+        }
         other => Err(LoopError::UnknownTool(other.into())),
     }
+}
+
+/// Execute the `RunWorkflow` tool.
+///
+/// Reads the `name` argument, loads that workflow from
+/// `~/.origin/workflows.toml`, and runs it through
+/// [`crate::workflow_runner::run_workflow`] against the daemon-wide swarm
+/// `coordinator`. The workflow's steps fan out per dependency layer (one
+/// sub-agent per step, independent steps concurrent). Returns the
+/// [`RunReport`](crate::workflow_runner::RunReport) serialized as JSON.
+///
+/// Errors map to `BadArgs` (missing/empty `name`) or `ToolFailure` (no such
+/// workflow, load I/O, layering failure, or a swarm-layer error).
+async fn run_workflow_tool(
+    args: &Value,
+    coordinator: &origin_swarm::Coordinator,
+    skill_catalog: Option<&SkillCatalog>,
+) -> Result<String, LoopError> {
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| LoopError::BadArgs("RunWorkflow: missing `name`".into()))?;
+
+    let path = crate::workflows::path()
+        .map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: resolve path: {e}")))?;
+    let file = crate::workflows::load_from(&path)
+        .map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: load: {e}")))?;
+    let workflow = file
+        .workflows
+        .iter()
+        .find(|w| w.name == name)
+        .ok_or_else(|| LoopError::ToolFailure(format!("RunWorkflow: no such workflow `{name}`")))?;
+
+    // An empty/missing catalog still runs: the runner falls back to each step's
+    // `args` as the worker goal and a default read+edit tool set.
+    let empty_catalog = SkillCatalog::default();
+    let catalog = skill_catalog.unwrap_or(&empty_catalog);
+
+    let report = crate::workflow_runner::run_workflow(workflow, coordinator, catalog)
+        .await
+        .map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: {e}")))?;
+    serde_json::to_string(&report)
+        .map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: json: {e}")))
 }
 
 /// Execute the `AuthorWorkflow` tool.
@@ -3608,8 +4286,13 @@ fn author_workflow_tool(
             .steps
             .into_iter()
             .map(|st| crate::workflows::WorkflowStep {
+                // Carry the authored phase-layered DAG (id + depends_on) onto the
+                // on-disk form so `RunWorkflow` can fan steps out in dependency
+                // order at run time, not just sequence them linearly.
+                id: st.id.index(),
                 skill: st.skill,
                 args: if st.args.is_empty() { None } else { Some(st.args) },
+                depends_on: st.depends_on.iter().map(|d| d.index()).collect(),
             })
             .collect(),
     };
@@ -3694,6 +4377,37 @@ fn browser_visual_result(
     });
     serde_json::to_string(&envelope)
         .map_err(|e| LoopError::ToolFailure(format!("Browser: json: {e}")))
+}
+
+/// Rebuild the code graph for each detected-language group, aggregating the
+/// per-group [`RebuildReport`]s into one.
+///
+/// `groups` is the per-language path bucketing produced by
+/// [`crate::subsystems::group_paths_by_language`]: each entry rebuilds under its
+/// own grammar via [`origin_tools::builtins::graph_rebuild::graph_rebuild_tool`].
+/// `nodes_added` / `nodes_updated` are summed and `errors` concatenated across
+/// groups; `paths_seen` is left at zero here because the caller already knows the
+/// requested total (grouping drops unsupported files, so it would undercount).
+///
+/// Taking `idx` as a plain `&mut` reference keeps the lock guard at the call site
+/// a single-use temporary, so it is never held across an await.
+///
+/// # Errors
+/// Propagates the first fatal [`origin_codegraph::rebuild::RebuildError`]
+/// (CAS / `SQLite`) from any group.
+fn rebuild_groups(
+    idx: &mut origin_codegraph::index::CodeGraphIndex,
+    groups: Vec<(origin_codegraph::Language, Vec<std::path::PathBuf>)>,
+) -> Result<origin_codegraph::rebuild::RebuildReport, origin_codegraph::rebuild::RebuildError> {
+    let mut agg = origin_codegraph::rebuild::RebuildReport::default();
+    for (lang, group_paths) in groups {
+        let report =
+            origin_tools::builtins::graph_rebuild::graph_rebuild_tool(idx, group_paths, lang)?;
+        agg.nodes_added += report.nodes_added;
+        agg.nodes_updated += report.nodes_updated;
+        agg.errors.extend(report.errors);
+    }
+    Ok(agg)
 }
 
 /// Serialize a [`origin_codegraph::query::QueryResult`] as a JSON string.
@@ -4040,6 +4754,7 @@ fn tool_activity_summary(name: &str, args: &Value) -> String {
             let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
             goal.chars().take(60).collect()
         }
+        "RunWorkflow" => args.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
         _ => {
             let s = args.to_string();
             s.chars().take(60).collect()
@@ -4439,6 +5154,16 @@ async fn drain_subscriber_into_response(
     let mut registry = SpeculativeRegistry::default();
     let mut speculative_spawned: HashSet<String> = HashSet::new();
 
+    // Time-to-first-token clock. Started when we begin awaiting stream events
+    // (the earliest moment this consumer can observe the provider's output) and
+    // sampled exactly once, at the FIRST content-bearing event — a text or
+    // thinking delta, or a tool-use start. Pure local measurement: it feeds the
+    // OTel `gen_ai` TTFT instrument (a no-op without `--features otel`) and
+    // never alters the reconstructed response, so the default path is
+    // byte-identical.
+    let stream_start = std::time::Instant::now();
+    let mut first_token_ms: Option<u64> = None;
+
     while let Some(ev) = sub
         .next()
         .await
@@ -4446,9 +5171,15 @@ async fn drain_subscriber_into_response(
     {
         match ev.kind() {
             origin_stream::TokenKind::TextDelta => {
+                if first_token_ms.is_none() {
+                    first_token_ms = Some(elapsed_ms_since(stream_start));
+                }
                 text.push_str(&String::from_utf8_lossy(ev.payload()));
             }
             origin_stream::TokenKind::ToolUseStart => {
+                if first_token_ms.is_none() {
+                    first_token_ms = Some(elapsed_ms_since(stream_start));
+                }
                 if let Some((index, id, name)) = decode_tool_use_start(ev.payload()) {
                     let mut parser = ToolUseParser::new();
                     parser.begin_tool_use(name);
@@ -4549,7 +5280,14 @@ async fn drain_subscriber_into_response(
                 }
             }
             origin_stream::TokenKind::TurnEnd => break,
-            origin_stream::TokenKind::ThinkingDelta => {}
+            origin_stream::TokenKind::ThinkingDelta => {
+                // A thinking delta is the model's first emitted token on
+                // reasoning models, so it counts toward time-to-first-token
+                // even though its content is not folded into the response.
+                if first_token_ms.is_none() {
+                    first_token_ms = Some(elapsed_ms_since(stream_start));
+                }
+            }
         }
     }
 
@@ -4578,7 +5316,18 @@ async fn drain_subscriber_into_response(
     Ok(StreamingTurn {
         response: origin_provider::ChatResponse { assistant, usage },
         speculative: registry,
+        first_token_ms,
     })
+}
+
+/// Milliseconds elapsed since `start`, saturating at `u64::MAX`.
+///
+/// A tiny pure helper extracted so the time-to-first-token / latency clocks in
+/// the agent loop format their elapsed window identically (and so the cast is
+/// fallible-checked in exactly one place rather than at every call site).
+#[inline]
+fn elapsed_ms_since(start: std::time::Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -5431,12 +6180,20 @@ mod wiring_tests {
         pipe.record(event);
         assert!(pipe.drain().is_empty(), "disabled pipeline emits no lines");
 
-        // No-op with the gate off (no panic, no file).
-        maybe_record_session_stop_telemetry(
+        // No-op with the gate off (no panic, no file). Exercises both the
+        // full-split `from_loop` constructor and the reason-only one used by
+        // the cross-module Abandoned/Idle emit sites.
+        record_session_stop_pain(SessionStopPain::from_loop(
             origin_telemetry::SessionStopReason::BudgetExhausted,
             5_000,
+            1_200,
+            Some(300),
+            Some(150),
             8,
-        );
+        ));
+        record_session_stop_pain(SessionStopPain::reason_only(
+            origin_telemetry::SessionStopReason::Abandoned,
+        ));
     }
 
     /// cmdparse cmd-guard: with `ORIGIN_CMD_GUARD` unset (the default) even a

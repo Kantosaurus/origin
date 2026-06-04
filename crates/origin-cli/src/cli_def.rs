@@ -36,6 +36,13 @@ pub struct Cli {
     /// with `origin sessions list`. Defaults to a fresh random session.
     #[arg(long = "resume")]
     pub resume: Option<String>,
+    /// UI locale override for terminal chrome (`en`/`es`/`fr`/`de`/`ja`/`zh`).
+    /// Tolerant of region subtags (e.g. `fr-FR`, `zh-Hans`). When set it takes
+    /// precedence over `$LC_ALL`/`$LANG`; an unrecognized code is ignored and
+    /// resolution falls through to the environment, then English. Default-off:
+    /// unset leaves chrome rendering exactly as before.
+    #[arg(long = "lang")]
+    pub lang: Option<String>,
     #[command(subcommand)]
     pub cmd: Option<Cmd>,
 }
@@ -322,9 +329,10 @@ pub enum Cmd {
     },
     /// First-class Gmail tool over Google OAuth. Loads credentials from the
     /// keyvault (`google`/`gmail`), runs one operation, and prints the JSON
-    /// result. OP is `search`, `get`, or `list_threads`.
+    /// result. OP is `search`, `get`, `list_threads`, or `login` (run the
+    /// interactive loopback OAuth flow to mint and store the refresh token).
     Gmail {
-        /// The operation: `search`, `get`, or `list_threads`.
+        /// The operation: `search`, `get`, `list_threads`, or `login`.
         op: String,
         /// Gmail search expression (for `search` / `list_threads`).
         #[arg(long)]
@@ -339,6 +347,17 @@ pub enum Cmd {
         /// more tokens). Defaults to metadata-only.
         #[arg(long = "include-body")]
         include_body: bool,
+        /// OAuth client id (for `login`). Falls back to `GMAIL_CLIENT_ID`.
+        #[arg(long = "client-id")]
+        client_id: Option<String>,
+        /// OAuth client secret (for `login`). Falls back to
+        /// `GMAIL_CLIENT_SECRET`.
+        #[arg(long = "client-secret")]
+        client_secret: Option<String>,
+        /// Loopback redirect port (for `login`). `0` (default) lets the OS pick
+        /// an ephemeral port; the chosen port must be an authorized redirect.
+        #[arg(long, default_value_t = 0)]
+        port: u16,
     },
     /// Dynamic workflow authoring + run substrate.
     Workflow {
@@ -373,6 +392,14 @@ pub enum WorkflowSub {
         /// goal).
         #[arg(long)]
         name: Option<String>,
+    },
+    /// Run an authored workflow by name as a phase-layered parallel DAG of
+    /// sub-agents (the daemon dispatches one swarm worker per step per layer,
+    /// independent same-layer steps concurrently), then print the run summary.
+    Run {
+        /// Name of an authored workflow in `~/.origin/workflows.toml`.
+        #[arg(required = true)]
+        name: String,
     },
 }
 

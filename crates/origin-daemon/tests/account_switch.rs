@@ -111,7 +111,8 @@ fn client_message_prompt_round_trips() {
         | ClientMessage::SelfDevReset
         | ClientMessage::TeamCreate { .. }
         | ClientMessage::TeamAssign { .. }
-        | ClientMessage::TeamStatus { .. } => unreachable!("expected Prompt variant"),
+        | ClientMessage::TeamStatus { .. }
+        | ClientMessage::RunWorkflow { .. } => unreachable!("expected Prompt variant"),
     }
 }
 
@@ -159,7 +160,8 @@ fn client_message_switch_account_round_trips() {
         | ClientMessage::SelfDevReset
         | ClientMessage::TeamCreate { .. }
         | ClientMessage::TeamAssign { .. }
-        | ClientMessage::TeamStatus { .. } => unreachable!("expected SwitchAccount variant"),
+        | ClientMessage::TeamStatus { .. }
+        | ClientMessage::RunWorkflow { .. } => unreachable!("expected SwitchAccount variant"),
     }
 }
 

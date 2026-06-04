@@ -22,6 +22,12 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowStep {
+    /// Stable identifier of this step within its workflow (zero-based index).
+    /// Carries the authored phase-layered DAG to the daemon's `workflow_runner`
+    /// so a workflow can fan out in dependency order at run time. Serde-default
+    /// `0` so a pre-DAG `workflows.toml` still parses.
+    #[serde(default)]
+    pub id: usize,
     /// Fully-qualified skill name, e.g. `"frontend-design:frontend-design"`
     /// or a bare `"impeccable"` for top-level skills.
     pub skill: String,
@@ -29,6 +35,11 @@ pub struct WorkflowStep {
     /// Matches the `args` parameter of the `Skill` tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<String>,
+    /// Ids of the steps that must complete before this one may run. Empty for
+    /// first-layer steps; omitted from the serialised TOML when empty so a
+    /// pre-DAG file round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,12 +142,16 @@ pub fn example_workflow() -> Workflow {
         ),
         steps: vec![
             WorkflowStep {
+                id: 0,
                 skill: "frontend-design:frontend-design".into(),
                 args: None,
+                depends_on: Vec::new(),
             },
             WorkflowStep {
+                id: 1,
                 skill: "impeccable".into(),
                 args: Some("teach".into()),
+                depends_on: vec![0],
             },
         ],
     }
@@ -210,8 +225,10 @@ mod tests {
                 name: "x".into(),
                 description: None,
                 steps: vec![WorkflowStep {
+                    id: 0,
                     skill: "y".into(),
                     args: None,
+                    depends_on: Vec::new(),
                 }],
             }],
         };

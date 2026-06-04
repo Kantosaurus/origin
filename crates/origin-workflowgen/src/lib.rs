@@ -80,6 +80,14 @@ const MAX_ARG_LEN: usize = 240;
 /// `skip_serializing_if = "Option::is_none"` behaviour.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowStep {
+    /// Stable identifier of this step within its workflow. Assigned during
+    /// authoring as the step's zero-based position in the original `steps`
+    /// vector, and referenced by other steps' [`depends_on`](WorkflowStep::depends_on).
+    ///
+    /// It is serialised so the dependency graph survives a `to_toml` →
+    /// parse round-trip. The daemon (which keys steps positionally) ignores it.
+    #[serde(default)]
+    pub id: StepId,
     /// Fully-qualified skill name, exactly as it appears in the [`SkillCatalog`]
     /// (e.g. `"frontend-design:frontend-design"` or a bare `"impeccable"`).
     pub skill: String,
@@ -87,14 +95,52 @@ pub struct WorkflowStep {
     /// and is omitted from the serialised TOML.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub args: String,
+    /// Ids of the steps that must complete before this one may run.
+    ///
+    /// Assigned by *phase layer* during authoring: every step in phase `P`
+    /// depends on **all** steps of the immediately-preceding non-empty phase,
+    /// and on no step within its own phase — so same-phase steps are
+    /// parallelizable. Empty for steps in the first non-empty phase. Omitted
+    /// from the serialised TOML when empty to keep the document clean.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<StepId>,
+}
+
+/// Stable identifier of a [`WorkflowStep`] within its workflow.
+///
+/// A transparent newtype over the step's zero-based position in the authored
+/// `steps` vector. Used both as a step's own [`id`](WorkflowStep::id) and inside
+/// other steps' [`depends_on`](WorkflowStep::depends_on) edges.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct StepId(pub usize);
+
+impl StepId {
+    /// The underlying index value.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for StepId {
+    fn from(v: usize) -> Self {
+        Self(v)
+    }
 }
 
 impl WorkflowStep {
-    /// Construct a step from any string-like skill name and args.
+    /// Construct a step from any string-like skill name and args, with id `0`
+    /// and no dependencies. Authoring overwrites `id`/`depends_on`; tests and
+    /// the daemon mapping can set them explicitly via the public fields.
     pub fn new(skill: impl Into<String>, args: impl Into<String>) -> Self {
         Self {
+            id: StepId(0),
             skill: skill.into(),
             args: args.into(),
+            depends_on: Vec::new(),
         }
     }
 }
@@ -139,6 +185,17 @@ pub enum WorkflowGenError {
     /// Serialising the spec to TOML failed.
     #[error("toml serialize: {0}")]
     Serialize(String),
+    /// A step's `depends_on` referenced an id not present in the workflow.
+    #[error("step {from} depends on unknown step id {to}")]
+    UnknownDependency {
+        /// Id of the step carrying the dangling edge.
+        from: usize,
+        /// The referenced id that does not exist in the workflow.
+        to: usize,
+    },
+    /// The dependency graph contains a cycle, so no topological layering exists.
+    #[error("workflow dependency graph has a cycle among step ids {0:?}")]
+    CyclicDependency(Vec<usize>),
 }
 
 /// Result alias for this crate.
@@ -465,6 +522,9 @@ pub fn author_workflow(goal: &str, catalog: &SkillCatalog) -> Result<WorkflowSpe
     let arg = truncate_arg(goal);
     let mut steps: Vec<WorkflowStep> = Vec::new();
     let mut used_idx: Vec<usize> = Vec::new();
+    // Ids of the steps emitted by the most recent *non-empty* phase. Every step
+    // of the next non-empty phase depends on all of these — phase-layered DAG.
+    let mut prev_layer: Vec<StepId> = Vec::new();
 
     for phase in phases {
         // Query = phase lexemes + meaningful goal tokens, so a skill is judged
@@ -475,10 +535,22 @@ pub fn author_workflow(goal: &str, catalog: &SkillCatalog) -> Result<WorkflowSpe
         if let Some((idx, _score)) = best_skill_excluding(catalog, &query, &used_idx) {
             used_idx.push(idx);
             let skill_name = catalog.skills[idx].name.clone();
-            steps.push(WorkflowStep::new(skill_name, arg.clone()));
+            let id = StepId(steps.len());
+            steps.push(WorkflowStep {
+                id,
+                skill: skill_name,
+                args: arg.clone(),
+                // Depend on the whole previous non-empty layer; steps within
+                // this same phase do not depend on each other.
+                depends_on: prev_layer.clone(),
+            });
+            // This phase emitted exactly one step; it becomes the layer the next
+            // non-empty phase depends on.
+            prev_layer = vec![id];
         }
         // Phase with no positive match is silently skipped — we never invent a
-        // skill that isn't in the catalog.
+        // skill that isn't in the catalog, and an empty phase does not reset the
+        // "previous non-empty layer".
     }
 
     // Guarantee non-empty: if phase matching produced nothing (e.g. skills whose
@@ -488,7 +560,12 @@ pub fn author_workflow(goal: &str, catalog: &SkillCatalog) -> Result<WorkflowSpe
         match best_skill(catalog, &meaningful) {
             Some((idx, _)) => {
                 let skill_name = catalog.skills[idx].name.clone();
-                steps.push(WorkflowStep::new(skill_name, arg.clone()));
+                steps.push(WorkflowStep {
+                    id: StepId(0),
+                    skill: skill_name,
+                    args: arg.clone(),
+                    depends_on: Vec::new(),
+                });
             }
             None => return Err(WorkflowGenError::NoMatch(goal.trim().to_string())),
         }
@@ -527,6 +604,89 @@ fn best_skill_excluding(
         }
     }
     best
+}
+
+/// Compute the topological *execution layers* of a workflow's dependency graph.
+///
+/// Layer 0 is every step with no unmet dependencies (its `depends_on` is empty);
+/// each subsequent layer is the set of steps whose dependencies are *all*
+/// satisfied by strictly-earlier layers. Steps within one layer have no edges
+/// between them, so they are safe to run concurrently — this is exactly the
+/// phase-layered parallelism `author_workflow` encodes.
+///
+/// This is Kahn's algorithm grouped by layer: repeatedly emit the set of
+/// not-yet-scheduled steps whose every dependency is already scheduled. Within a
+/// layer, steps are returned in the order they appear in `spec.steps`, so the
+/// output is deterministic.
+///
+/// # Errors
+/// - [`WorkflowGenError::UnknownDependency`] if a step depends on an id that is
+///   not present in the workflow.
+/// - [`WorkflowGenError::CyclicDependency`] if the graph contains a cycle (no
+///   layering exists); the error carries the ids still unscheduled.
+pub fn execution_layers(spec: &WorkflowSpec) -> Result<Vec<Vec<StepId>>> {
+    // Validate every dependency edge points at a real step id first, so a
+    // dangling edge is reported distinctly from a genuine cycle.
+    let present: Vec<StepId> = spec.steps.iter().map(|s| s.id).collect();
+    for step in &spec.steps {
+        for dep in &step.depends_on {
+            if !present.contains(dep) {
+                return Err(WorkflowGenError::UnknownDependency {
+                    from: step.id.index(),
+                    to: dep.index(),
+                });
+            }
+        }
+    }
+
+    let total = spec.steps.len();
+    // `scheduled[i]` == true once `spec.steps[i]` has been placed in a layer.
+    let mut scheduled = vec![false; total];
+    let mut placed = 0usize;
+    let mut layers: Vec<Vec<StepId>> = Vec::new();
+
+    while placed < total {
+        // A step is ready when it is not yet scheduled and all of its deps are
+        // already scheduled (in some earlier layer).
+        let mut layer: Vec<StepId> = Vec::new();
+        let mut ready_positions: Vec<usize> = Vec::new();
+        for (pos, step) in spec.steps.iter().enumerate() {
+            if scheduled[pos] {
+                continue;
+            }
+            let deps_done = step.depends_on.iter().all(|dep| {
+                spec.steps
+                    .iter()
+                    .position(|s| s.id == *dep)
+                    .is_some_and(|dpos| scheduled[dpos])
+            });
+            if deps_done {
+                ready_positions.push(pos);
+                layer.push(step.id);
+            }
+        }
+
+        if layer.is_empty() {
+            // Nothing became ready yet steps remain -> the unscheduled set forms
+            // (or feeds into) a cycle. Report the remaining ids.
+            let remaining: Vec<usize> = spec
+                .steps
+                .iter()
+                .enumerate()
+                .filter(|(pos, _)| !scheduled[*pos])
+                .map(|(_, s)| s.id.index())
+                .collect();
+            return Err(WorkflowGenError::CyclicDependency(remaining));
+        }
+
+        for pos in ready_positions {
+            scheduled[pos] = true;
+            placed += 1;
+        }
+        layers.push(layer);
+    }
+
+    Ok(layers)
 }
 
 impl WorkflowSpec {
@@ -865,6 +1025,161 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["required"][0], "goal");
         assert!(schema["properties"]["goal"].is_object());
+    }
+
+    #[test]
+    fn linear_pipeline_yields_four_singleton_layers() {
+        let cat = sample_catalog();
+        let spec = author_workflow(
+            "explore the auth module, plan the change, implement login, and test it",
+            &cat,
+        )
+        .unwrap();
+        // 4 phases -> 4 steps; phase-layered deps make each step depend on the
+        // single prior step, so execution_layers is 4 layers of 1 step each.
+        assert_eq!(spec.steps.len(), 4);
+        let layers = execution_layers(&spec).unwrap();
+        assert_eq!(layers.len(), 4, "expected 4 layers, got {layers:?}");
+        for layer in &layers {
+            assert_eq!(layer.len(), 1, "expected singleton layers, got {layers:?}");
+        }
+    }
+
+    #[test]
+    fn same_phase_steps_share_one_layer() {
+        // Phase layout: 1 explore step, then TWO implement steps that both
+        // depend only on the explore step and NOT on each other. The two
+        // implement steps must land together in a single execution layer,
+        // proving they are parallelizable.
+        let spec = WorkflowSpec {
+            name: "parallel".into(),
+            description: "d".into(),
+            steps: vec![
+                WorkflowStep {
+                    id: StepId(0),
+                    skill: "scout".into(),
+                    args: "g".into(),
+                    depends_on: vec![],
+                },
+                WorkflowStep {
+                    id: StepId(1),
+                    skill: "impeccable".into(),
+                    args: "g".into(),
+                    depends_on: vec![StepId(0)],
+                },
+                WorkflowStep {
+                    id: StepId(2),
+                    skill: "frontend-design".into(),
+                    args: "g".into(),
+                    depends_on: vec![StepId(0)],
+                },
+            ],
+        };
+        let layers = execution_layers(&spec).unwrap();
+        assert_eq!(layers.len(), 2, "expected 2 layers, got {layers:?}");
+        assert_eq!(layers[0], vec![StepId(0)]);
+        // Both implement steps in the same layer (order = vector order).
+        assert_eq!(layers[1], vec![StepId(1), StepId(2)]);
+    }
+
+    #[test]
+    fn depends_on_round_trips_through_toml() {
+        let cat = sample_catalog();
+        let spec = author_workflow(
+            "explore the auth module, plan the change, implement login, and test it",
+            &cat,
+        )
+        .unwrap();
+        // Authored 4-phase pipeline => step N depends on step N-1.
+        assert_eq!(spec.steps[0].depends_on, Vec::<StepId>::new());
+        assert_eq!(spec.steps[1].depends_on, vec![StepId(0)]);
+        assert_eq!(spec.steps[2].depends_on, vec![StepId(1)]);
+        assert_eq!(spec.steps[3].depends_on, vec![StepId(2)]);
+
+        let toml_text = spec.to_toml().unwrap();
+        // The dependency metadata must be present in the serialised form.
+        assert!(toml_text.contains("depends_on"), "depends_on missing:\n{toml_text}");
+
+        // Round-trip back into the same WorkflowSpec, ids/deps intact.
+        let reparsed: WorkflowsFileShape = toml::from_str(&toml_text).expect("parse");
+        assert_eq!(reparsed.workflows.len(), 1);
+        assert_eq!(reparsed.workflows[0], spec);
+        // And the recovered graph layers identically.
+        assert_eq!(
+            execution_layers(&reparsed.workflows[0]).unwrap(),
+            execution_layers(&spec).unwrap()
+        );
+    }
+
+    #[test]
+    fn cyclic_spec_errors() {
+        // Two steps that depend on each other: 0 -> 1 -> 0. No topological
+        // layering exists, so execution_layers must return Err(CyclicDependency).
+        let spec = WorkflowSpec {
+            name: "cycle".into(),
+            description: "d".into(),
+            steps: vec![
+                WorkflowStep {
+                    id: StepId(0),
+                    skill: "scout".into(),
+                    args: "g".into(),
+                    depends_on: vec![StepId(1)],
+                },
+                WorkflowStep {
+                    id: StepId(1),
+                    skill: "impeccable".into(),
+                    args: "g".into(),
+                    depends_on: vec![StepId(0)],
+                },
+            ],
+        };
+        let res = execution_layers(&spec);
+        assert!(
+            matches!(&res, Err(WorkflowGenError::CyclicDependency(_))),
+            "expected CyclicDependency, got {res:?}"
+        );
+        if let Err(WorkflowGenError::CyclicDependency(ids)) = res {
+            assert!(ids.contains(&0) && ids.contains(&1), "unexpected ids {ids:?}");
+        }
+    }
+
+    #[test]
+    fn dangling_dependency_errors() {
+        // A step depends on an id that no step carries -> UnknownDependency,
+        // reported distinctly from a genuine cycle.
+        let spec = WorkflowSpec {
+            name: "dangling".into(),
+            description: "d".into(),
+            steps: vec![WorkflowStep {
+                id: StepId(0),
+                skill: "scout".into(),
+                args: "g".into(),
+                depends_on: vec![StepId::from(99usize)],
+            }],
+        };
+        assert_eq!(
+            execution_layers(&spec),
+            Err(WorkflowGenError::UnknownDependency { from: 0, to: 99 })
+        );
+    }
+
+    #[test]
+    fn step_id_index_and_from() {
+        let id = StepId::from(7usize);
+        assert_eq!(id.index(), 7);
+        assert_eq!(StepId(0).index(), 0);
+        // Default is StepId(0).
+        assert_eq!(StepId::default(), StepId(0));
+    }
+
+    #[test]
+    fn empty_workflow_layers_is_empty() {
+        let spec = WorkflowSpec {
+            name: "empty".into(),
+            description: "d".into(),
+            steps: vec![],
+        };
+        assert_eq!(execution_layers(&spec).unwrap(), Vec::<Vec<StepId>>::new());
     }
 
     #[test]

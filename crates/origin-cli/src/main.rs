@@ -281,8 +281,23 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
             id,
             max,
             include_body,
-        } => origin_cli::gaps_cmds::gmail(op, query, id, max, include_body).await,
-        Cmd::Workflow { sub } => origin_cli::gaps_cmds::workflow(sub),
+            client_id,
+            client_secret,
+            port,
+        } => {
+            origin_cli::gaps_cmds::gmail(
+                op,
+                query,
+                id,
+                max,
+                include_body,
+                client_id,
+                client_secret,
+                port,
+            )
+            .await
+        }
+        Cmd::Workflow { sub } => origin_cli::gaps_cmds::workflow(sub).await,
         Cmd::Selfdev { sub } => origin_cli::gaps_cmds::selfdev(sub).await,
         Cmd::Team { sub } => origin_cli::gaps_cmds::team(sub).await,
     })
@@ -342,6 +357,14 @@ async fn run() -> Result<()> {
     // Dispatch a subcommand if one was given, otherwise fall through to the
     // TUI entry path (preserves the existing env-driven invocation).
     let cli = Cli::parse();
+    // Record the optional UI-locale override (`--lang <code>`) before any chrome
+    // renders, so localized strings (welcome/bye/...) pick it up via the
+    // process-global override that `locale::resolve(None)` consults first.
+    // Default-off: when `--lang` is unset, nothing is stored and chrome resolves
+    // exactly as before (env locale, else English).
+    if let Some(code) = cli.lang.as_deref() {
+        origin_cli::locale::set_locale_override(code);
+    }
     // Resolve the optional reasoning-effort flag (item H). Default-off: when
     // `--effort` is unset this is `None` and nothing about the wire changes.
     // A valid level becomes the session's starting effort token (seeded onto
@@ -471,7 +494,7 @@ async fn run() -> Result<()> {
         let short: String = id.chars().take(8).collect();
         app.lock().add_line(
             "system> ",
-            &format!("resumed session {short}\u{2026} \u{2014} the model will recall the earlier conversation"),
+            &origin_cli::locale::linef("session.resumed", &[("short", &short)]),
         );
     }
 
@@ -970,7 +993,8 @@ async fn handle_input_action(
             if let Some(tx) = tx {
                 let _ = tx.send(());
             }
-            app.lock().add_line("system> ", "interrupt sent (Ctrl+D to exit)");
+            app.lock()
+                .add_line("system> ", origin_cli::locale::line("interrupt"));
             handle.mark_dirty();
         }
         InputAction::Submit(text) => {

@@ -16,9 +16,23 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowStep {
+    /// Stable identifier of this step within its workflow. A zero-based index
+    /// referenced by other steps' [`depends_on`](WorkflowStep::depends_on).
+    ///
+    /// Carries the phase-layered DAG authored by `origin_workflowgen` from
+    /// author time to run time so [`crate::workflow_runner`] can fan steps out
+    /// in dependency order. Serde-default `0` so a pre-DAG `workflows.toml` (no
+    /// `id` field) still parses; the linear skill-mask sequencer ignores it.
+    #[serde(default)]
+    pub id: usize,
     pub skill: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<String>,
+    /// Ids of the steps that must complete before this one may run. Empty for
+    /// steps in the first layer. Omitted from the serialised TOML when empty so
+    /// pre-DAG files round-trip byte-identically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,12 +137,16 @@ mod tests {
                 description: Some("explore then implement".into()),
                 steps: vec![
                     WorkflowStep {
+                        id: 0,
                         skill: "scout".into(),
                         args: Some("look around".into()),
+                        depends_on: Vec::new(),
                     },
                     WorkflowStep {
+                        id: 1,
                         skill: "impeccable".into(),
                         args: None,
+                        depends_on: vec![0],
                     },
                 ],
             }],
@@ -141,6 +159,12 @@ mod tests {
         assert_eq!(loaded.workflows[0].steps.len(), 2);
         assert_eq!(loaded.workflows[0].steps[0].args.as_deref(), Some("look around"));
         assert!(loaded.workflows[0].steps[1].args.is_none());
+        // The phase-layered DAG (id + depends_on) survives the save→load round
+        // trip so `workflow_runner` can fan out in dependency order.
+        assert_eq!(loaded.workflows[0].steps[0].id, 0);
+        assert!(loaded.workflows[0].steps[0].depends_on.is_empty());
+        assert_eq!(loaded.workflows[0].steps[1].id, 1);
+        assert_eq!(loaded.workflows[0].steps[1].depends_on, vec![0]);
         // None args / description must not leak an empty field into the file.
         let raw = std::fs::read_to_string(&p).expect("read back");
         assert!(raw.contains("skill = \"impeccable\""), "missing step:\n{raw}");

@@ -281,6 +281,23 @@ pub enum ClientMessage {
         /// The team to render.
         team: String,
     },
+    // ── Workflow fan-out (origin-daemon::workflow_runner) ────────────────────
+    //
+    // APPENDED to preserve wire layout. The default behaviour (linear
+    // `ActivateWorkflow` skill-mask walk) is unchanged: a client must explicitly
+    // send `RunWorkflow` to fan out.
+    /// Run `name`'s authored workflow as a phase-layered parallel DAG of real
+    /// swarm workers (the FAN-OUT complement to [`ClientMessage::ActivateWorkflow`],
+    /// which only walks skill masks linearly). The daemon loads the workflow,
+    /// dispatches one sub-agent per step per dependency layer (independent
+    /// same-layer steps concurrent), and replies with a single
+    /// [`StreamEvent::WorkflowRunComplete`] summarising the run, or
+    /// [`StreamEvent::SkillError`] when the workflow name isn't found / the run
+    /// fails.
+    RunWorkflow {
+        /// Name of an authored workflow in `~/.origin/workflows.toml`.
+        name: String,
+    },
 }
 
 impl ClientMessage {
@@ -616,6 +633,36 @@ pub enum StreamEvent {
         /// One `name: status` line per teammate, in registration order.
         teammates: Vec<String>,
     },
+    // ── Workflow fan-out (origin-daemon::workflow_runner) ────────────────────
+    /// Response to [`ClientMessage::RunWorkflow`]: the result of running a
+    /// workflow as a phase-layered parallel DAG. Carries the run summary so the
+    /// CLI can render the layering + per-step outcomes from one frame. APPENDED
+    /// to preserve the wire layout of every prior variant.
+    WorkflowRunComplete {
+        /// The workflow name that ran.
+        name: String,
+        /// Number of dependency layers executed.
+        layers: u32,
+        /// One `index|skill|layer|status` row per step, in execution order.
+        steps: Vec<WorkflowRunStep>,
+    },
+}
+
+/// One step's outcome inside a [`StreamEvent::WorkflowRunComplete`].
+///
+/// Wire-shape projection of `workflow_runner::StepReport`, kept distinct so the
+/// runner's in-process type can evolve without breaking IPC compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowRunStep {
+    /// Zero-based position of the step in the workflow.
+    pub index: u32,
+    /// The step's skill name.
+    pub skill: String,
+    /// The dependency layer the step ran in (0 == first).
+    pub layer: u32,
+    /// Terminal status, lower-snake-cased (`completed`, `goal_unreachable`,
+    /// `budget_exhausted`, `aborted`).
+    pub status: String,
 }
 
 /// A single line in a unified diff view.
