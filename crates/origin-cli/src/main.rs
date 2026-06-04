@@ -845,7 +845,14 @@ async fn handle_key_event(
                     &ClientMessage::PermissionDecision { id: p.id, allow },
                 )
                 .await;
-                let verb = if allow { "allowed" } else { "denied" };
+                // The deny verb routes through the `permission.denied` catalog key
+                // (En "denied" — byte-identical); the allow verb has no key and
+                // stays in code. The `<tool> <args>` suffix is unchanged.
+                let verb = if allow {
+                    "allowed".to_string()
+                } else {
+                    origin_cli::locale::line("permission.denied").to_string()
+                };
                 app.lock()
                     .add_line("system> ", &format!("{verb}: {} {}", p.tool, p.args));
             }
@@ -1696,6 +1703,11 @@ async fn handle_prompt_turn(
     let roots = app.lock().workspace_roots.clone();
     // Opt-in interactive permission prompting (`/permissions on`).
     let permission_ask = app.lock().permission_ask;
+    // Opt-in per-turn cost line (`ORIGIN_TURN_COST=1`): snapshot the cumulative
+    // USD before the turn so we can render its delta afterward. Default-off: when
+    // the env var is unset we never read this value and emit no extra line, so the
+    // output is byte-identical.
+    let cost_before = origin_cli::status::cost_usd(&app.lock().usage);
     let reply = call_daemon(
         path,
         model,
@@ -1733,10 +1745,14 @@ async fn handle_prompt_turn(
         },
         move |tool, summary, diff_lines: Vec<origin_daemon::protocol::DiffLine>| {
             use origin_cli::theme;
+            // Tool-activity header. The `[tool]` bracket marker routes through the
+            // `tool.running` catalog key (En "[{tool}]" — byte-identical); the
+            // optional summary stays appended in code.
+            let head = origin_cli::locale::linef("tool.running", &[("tool", tool)]);
             let line = if summary.is_empty() {
-                format!("[{tool}]")
+                head
             } else {
-                format!("[{tool}] {summary}")
+                format!("{head} {summary}")
             };
             let mut a = app_for_tool.lock();
             a.finalize_assistant_turn(0);
@@ -1794,7 +1810,11 @@ async fn handle_prompt_turn(
             a.finish_tool_line(ok);
             let header_fg = if ok { theme::MUTED } else { theme::RED };
             if !ok {
-                a.add_colored_line(format!("    \u{2718} {tool} failed"), header_fg, 0);
+                // Tool-failure line. The "{tool} failed" sentence routes through
+                // the `tool.done` catalog key (En "{tool} failed" — byte-identical);
+                // the ✘ glyph and indent stay in code.
+                let failed = origin_cli::locale::linef("tool.done", &[("tool", tool)]);
+                a.add_colored_line(format!("    \u{2718} {failed}"), header_fg, 0);
             }
             for line in preview.lines() {
                 a.add_colored_line(format!("    {line}"), theme::BODY, 0);
@@ -1864,10 +1884,27 @@ async fn handle_prompt_turn(
                     ),
                 );
             }
+            // Opt-in per-turn cost line (`ORIGIN_TURN_COST=1`). Default-off ⇒ no
+            // line ⇒ byte-identical. Routes through the `cost.turn` catalog key
+            // ("This turn cost {usd}"), localizing under `--lang`/`$LANG`.
+            if origin_cli::status::turn_cost_enabled() {
+                let cost_after = origin_cli::status::cost_usd(&a.usage);
+                if let Some(line) = origin_cli::status::format_turn_cost(cost_after - cost_before) {
+                    a.add_line("system> ", &line);
+                }
+            }
         }
         Err(e) => {
             a.current_assistant = None;
-            a.add_line("error> ", &format!("{e}"));
+            // The turn-error line routes through the `error.generic` catalog key.
+            // En is the bare `{message}` passthrough, so the rendered body equals
+            // `format!("{e}")` byte-for-byte; other locales wrap it with a localized
+            // prefix (e.g. "Algo salió mal: <error>").
+            let msg = format!("{e}");
+            a.add_line(
+                "error> ",
+                &origin_cli::locale::linef("error.generic", &[("message", &msg)]),
+            );
         }
     }
     drop(a);

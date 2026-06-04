@@ -87,6 +87,33 @@ pub fn session_total_line(snap: &UsageSnapshot) -> Option<String> {
     format_session_total(cost_usd(snap))
 }
 
+/// Whether the opt-in per-turn cost line is enabled (`ORIGIN_TURN_COST=1`).
+///
+/// Default-off: when the env var is unset (or not `1`) this is `false`, so the
+/// caller emits no extra line and the turn output stays byte-identical.
+#[must_use]
+pub fn turn_cost_enabled() -> bool {
+    std::env::var("ORIGIN_TURN_COST").as_deref() == Ok("1")
+}
+
+/// The localized "this turn cost" line for a single turn's USD figure, or `None`
+/// when the figure is zero/negative (an unpriced model or no spend) so we never
+/// print a misleading `$0.00`.
+///
+/// Routes through the `cost.turn` catalog key ("This turn cost {usd}" in
+/// English), so the per-turn line localizes with `--lang`/`$LANG`. Gated by
+/// [`turn_cost_enabled`] at the call site (default-off ⇒ byte-identical).
+#[must_use]
+pub fn format_turn_cost(turn_usd: f64) -> Option<String> {
+    if turn_usd <= 0.0 {
+        return None;
+    }
+    Some(crate::locale::linef(
+        "cost.turn",
+        &[("usd", &origin_cost::fmt_usd(turn_usd))],
+    ))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -110,6 +137,27 @@ mod tests {
             line,
             crate::locale::linef("cost.session", &[("usd", &usd)]),
             "must route through the cost.session catalog key"
+        );
+        assert!(line.contains(&usd), "must embed the formatted usd: {line}");
+        assert!(line.len() > usd.len(), "a catalog template wraps the figure: {line}");
+    }
+
+    #[test]
+    fn format_turn_cost_routes_through_cost_turn_catalog_key() {
+        // Zero / negative spend prints nothing.
+        assert!(format_turn_cost(0.0).is_none());
+        assert!(format_turn_cost(-0.5).is_none());
+        // A real figure renders through the `cost.turn` key. Assert locale-robustly
+        // (the test binary is shared; another test may have pinned a non-English
+        // override on the process-global OnceLock): the output must equal the
+        // localized `cost.turn` template with the figure substituted — a wrong key
+        // (e.g. `cost.session`) renders different text and fails this.
+        let usd = origin_cost::fmt_usd(0.0042);
+        let line = format_turn_cost(0.0042).expect("nonzero figure renders a line");
+        assert_eq!(
+            line,
+            crate::locale::linef("cost.turn", &[("usd", &usd)]),
+            "must route through the cost.turn catalog key"
         );
         assert!(line.contains(&usd), "must embed the formatted usd: {line}");
         assert!(line.len() > usd.len(), "a catalog template wraps the figure: {line}");
