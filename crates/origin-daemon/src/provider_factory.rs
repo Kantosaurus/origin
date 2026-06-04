@@ -560,6 +560,33 @@ pub async fn build_provider_for(provider_id: &str, model: &str) -> Option<Arc<dy
     g.factory.build_provider_for(provider_id, model, &account).await
 }
 
+/// Build a provider for a cross-provider routing pick against an **explicit**
+/// account, using the process-wide factory registered via [`set_global`].
+///
+/// This is the per-connection (multi-account) seam: the agent loop passes the
+/// account that belongs to *its own* session/connection rather than reading the
+/// single process-wide account slot. As a result a `/account` switch on one
+/// connection no longer leaks into a concurrent connection's cross-provider
+/// rebuild — each connection resolves its own credentials.
+///
+/// The shared [`ProviderFactory`] (vault + catalog) still comes from the global
+/// registration; only the *account* is supplied by the caller. Returns `None` —
+/// never panics — when no factory is registered, the `provider_id` is unknown,
+/// or the credential is missing for `(provider, account)`, so the loop can fall
+/// back to the active provider for that turn.
+///
+/// [`build_provider_for`] is the thin default wrapper over this that reads the
+/// global account slot; callers with no per-session account keep using it and
+/// stay byte-identical.
+pub async fn build_provider_for_account(
+    provider_id: &str,
+    model: &str,
+    account: &str,
+) -> Option<Arc<dyn Provider>> {
+    let g = global()?;
+    g.factory.build_provider_for(provider_id, model, account).await
+}
+
 /// Intern a provider id into a process-static `&'static str`, leaking each
 /// distinct id at most once. Bounds the leak to the finite catalog regardless
 /// of how many provider rebuilds (account switches) occur.

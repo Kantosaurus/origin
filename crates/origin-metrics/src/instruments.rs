@@ -1235,6 +1235,62 @@ mod otel_impl {
             assert_eq!(find(&t, genai::TOOL_TYPE), Some(&Value::from("function")));
         }
 
+        /// The *daemon-emitted* server-attribute shape: the daemon only has the
+        /// provider name reachable through the `Provider` trait (no base URL /
+        /// port), so it passes a non-empty provider name with an empty address
+        /// and `None` port. The builder must then emit exactly one attribute —
+        /// `gen_ai.provider.name` — and omit the unreachable `server.*` fields
+        /// rather than emitting blanks. This pins the exact set the live loop
+        /// produces via `GenAiSpanGuard::set_server_attributes`.
+        #[test]
+        fn server_attributes_provider_name_only_is_the_daemon_shape() {
+            let s = super::gen_ai_server_attributes("anthropic", "", None);
+            assert_eq!(s.len(), 1, "only the provider name is emitted");
+            assert_eq!(find(&s, genai::PROVIDER_NAME), Some(&Value::from("anthropic")));
+            assert!(find(&s, genai::SERVER_ADDRESS).is_none());
+            assert!(find(&s, genai::SERVER_PORT).is_none());
+        }
+
+        /// The *daemon-emitted* agent-attribute shape: the daemon threads the
+        /// session id as `gen_ai.conversation.id` and leaves the agent/data-source
+        /// fields empty, so exactly one attribute is produced.
+        #[test]
+        fn agent_attributes_conversation_only_is_the_daemon_shape() {
+            let a = super::gen_ai_agent_attributes("", "", "", "sess-123", "");
+            assert_eq!(a.len(), 1, "only the conversation id is emitted");
+            assert_eq!(find(&a, genai::CONVERSATION_ID), Some(&Value::from("sess-123")));
+            assert!(find(&a, genai::AGENT_ID).is_none());
+        }
+
+        /// The *daemon-emitted* request-param shape: the loop has no explicit
+        /// sampling knobs, only an extended-thinking budget it maps onto
+        /// `gen_ai.request.max_tokens`. So a `RequestParams` carrying only
+        /// `max_tokens` must produce exactly the one `gen_ai.request.max_tokens`
+        /// attribute (every other field omitted).
+        #[test]
+        fn request_attributes_max_tokens_only_is_the_daemon_shape() {
+            let attrs = super::gen_ai_request_attributes(super::RequestParams {
+                max_tokens: Some(8192),
+                ..Default::default()
+            });
+            assert_eq!(attrs.len(), 1, "only max_tokens is emitted");
+            assert_eq!(find(&attrs, genai::REQUEST_MAX_TOKENS), Some(&Value::I64(8192)));
+        }
+
+        /// The *daemon-emitted* response-attribute shape: the loop now threads a
+        /// real, non-empty per-turn response id (derived from the session id +
+        /// turn) plus the prompt-cache read count, so BOTH `gen_ai.response.id`
+        /// and `gen_ai.usage.cached_input_tokens` are present.
+        #[test]
+        fn response_attributes_carry_real_id_and_cached_tokens() {
+            let attrs = super::gen_ai_response_attributes("sess-123#t2", 256);
+            assert_eq!(find(&attrs, genai::RESPONSE_ID), Some(&Value::from("sess-123#t2")));
+            assert_eq!(
+                find(&attrs, genai::USAGE_CACHED_INPUT_TOKENS),
+                Some(&Value::I64(256))
+            );
+        }
+
         /// Exercise the live `GenAiSpanGuard` recording methods end-to-end on a
         /// real span so they are not dead code and never panic. Bounded by a
         /// timeout; the provider is `mem::forget`-ed to avoid a teardown flush.

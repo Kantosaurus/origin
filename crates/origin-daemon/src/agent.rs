@@ -338,6 +338,107 @@ fn apply_read_only_overlay(
     decision
 }
 
+/// Returns `true` for the network-capable browser-class tools subject to the
+/// browser-security overlays (domain allowlist + per-session rate limit).
+///
+/// Exactly `Browser`, `WebFetch`, and `WebSearch`; every other tool is left
+/// untouched so the overlays only ever observe these three.
+fn is_browser_action(tool: &str) -> bool {
+    matches!(tool, "Browser" | "WebFetch" | "WebSearch")
+}
+
+/// Collect the candidate target URLs a browser-class tool would contact, from
+/// its parsed JSON `args`.
+///
+/// - `Browser` only carries a URL on a navigating verb (`open`), in the `url`
+///   field; non-navigating verbs (`click`/`snapshot`/…) contact no new host and
+///   yield nothing.
+/// - `WebFetch` carries a single `url` and/or a `urls` array (reused via
+///   [`origin_tools::builtins::web_fetch::parse_urls`]).
+/// - `WebSearch` posts a query to a fixed provider endpoint and carries no
+///   per-call target host, so it yields nothing (there is nothing to gate at the
+///   per-request granularity; tool-level gating still applies via conseca
+///   `allow_tools`/`deny_tools`).
+fn browser_target_urls(tool: &str, args: &Value) -> Vec<String> {
+    match tool {
+        "Browser" => {
+            let verb = args.get("v").and_then(Value::as_str).unwrap_or_default();
+            if verb == "open" {
+                args.get("url")
+                    .and_then(Value::as_str)
+                    .map(|u| vec![u.to_owned()])
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        "WebFetch" => origin_tools::builtins::web_fetch::parse_urls(args),
+        // WebSearch has no per-call target host.
+        _ => Vec::new(),
+    }
+}
+
+/// DENY-ONLY conseca domain-allowlist overlay (browser-security A).
+///
+/// Given a base `decision` that is already `Allow`, gate the network-capable
+/// browser-class tools (`Browser` open / `WebFetch`) against the active
+/// [`origin_conseca::SecurityPolicy`]'s `allow_domains`. Every target URL the
+/// call would contact is checked with [`origin_conseca::check_domain`]; if any
+/// host is not on the allowlist the Allow is downgraded to Deny. Like the other
+/// overlays this can only narrow an Allow, never widen a Deny.
+///
+/// **Default-off / byte-identical:** the overlay is a no-op unless a conseca
+/// policy is present AND its `allow_domains` list is non-empty. With no
+/// `[conseca]` section (the default) `opts.conseca` is `None`; with a `[conseca]`
+/// section that omits `allow_domains` the list is empty and the allowlist is
+/// treated as unconfigured. In both cases `decision` is returned unchanged.
+fn apply_domain_overlay(
+    decision: origin_permission::Decision,
+    tool: &str,
+    args: &Value,
+    opts: &LoopOptions,
+) -> origin_permission::Decision {
+    if !is_browser_action(tool) {
+        return decision;
+    }
+    let Some(policy) = opts.conseca.as_ref() else {
+        return decision;
+    };
+    // Opt-in: an empty allowlist means "not configured", not "deny all", so the
+    // default path (and a tool-only conseca policy) stays byte-identical.
+    if policy.allow_domains.is_empty() {
+        return decision;
+    }
+    for url in browser_target_urls(tool, args) {
+        if let origin_conseca::Decision::Deny(why) = origin_conseca::check_domain(policy, &url) {
+            return origin_permission::Decision {
+                outcome: Outcome::Deny,
+                reason: format!("conseca: browser domain blocked for `{tool}`: {why}"),
+            };
+        }
+    }
+    decision
+}
+
+/// ENFORCED per-session browser-action rate-limit check (browser-security B).
+///
+/// `cap` is the configured maximum number of browser-class actions allowed in a
+/// single `run_loop`, and `count_so_far` is how many have already been
+/// dispatched (the 0-based ordinal of the action about to run). Returns `true`
+/// when the action is permitted.
+///
+/// **Default-off / byte-identical:** `cap == None` means no cap is configured
+/// and the function always returns `true` — the loop never tracks or gates
+/// browser actions, so behavior is identical to before. A configured `cap`
+/// permits ordinals `0..cap` and denies the rest (so a cap of `N` permits `N`
+/// actions); a `cap` of `0` denies the very first action.
+const fn browser_rate_limit_ok(cap: Option<u32>, count_so_far: u32) -> bool {
+    match cap {
+        None => true,
+        Some(limit) => count_so_far < limit,
+    }
+}
+
 /// Best-effort end-of-turn / loop-end side effects.
 ///
 /// Each sub-step is independently env-gated or feature-gated and default-off:
@@ -571,6 +672,51 @@ fn gen_ai_latencies(
         Some(provider_call_ms as f64 / output_tokens as f64)
     };
     GenAiLatencies { ttft_ms, tpot_ms }
+}
+
+/// Map a turn's [`origin_provider::ChatRequest`] onto the `OTel`
+/// [`origin_metrics::instruments::RequestParams`] sampling attribute set
+/// (Stage C4, full `gen_ai.request.*`).
+///
+/// The agentic loop does not surface explicit temperature / top-p / top-k /
+/// penalties / seed / stop-sequences — those provider knobs are not part of
+/// origin's [`origin_provider::ChatRequest`]. The one sampling parameter the
+/// request *does* carry is the optional extended-thinking budget
+/// (`thinking_tokens`), which the Anthropic encoder turns into the wire
+/// `max_tokens` floor; we map it onto `gen_ai.request.max_tokens` so the span
+/// records the real requested generation ceiling. Every unset field is `None`,
+/// so [`origin_metrics::instruments::RequestParams`]'s omit-if-`None` builder
+/// emits *only* the attributes we have honest values for.
+///
+/// `#[cfg(feature = "otel")]` because [`origin_metrics::instruments::RequestParams`]
+/// only exists in the `otel` build; the default build never references it.
+#[cfg(feature = "otel")]
+fn request_params_from_req(
+    req: &origin_provider::ChatRequest,
+) -> origin_metrics::instruments::RequestParams<'static> {
+    origin_metrics::instruments::RequestParams {
+        max_tokens: req.thinking_tokens.map(i64::from),
+        ..Default::default()
+    }
+}
+
+/// Synthesize a stable `gen_ai.response.id` for one turn from the session id and
+/// the 1-based turn number (Stage C4).
+///
+/// origin's [`origin_provider::ChatResponse`] does not carry the upstream
+/// provider's response-object id (no provider decoder threads it through), so
+/// the truly-provider-assigned id is not reachable from the loop without a
+/// cross-crate wire change. The daemon *does* own a real, unique identifier for
+/// each completion: the conversation/session id plus the turn ordinal. We emit
+/// that as the response id (`"{session_id}#t{turn}"`) — a genuine, stable,
+/// per-completion identifier rather than the previous hard-coded empty string —
+/// so `gen_ai.response.id` actually appears on the span and correlates each
+/// completion back to its conversation and position.
+///
+/// `#[cfg(feature = "otel")]`: only the otel build attaches response attributes.
+#[cfg(feature = "otel")]
+fn turn_response_id(session_id: &str, turn: u32) -> String {
+    format!("{session_id}#t{turn}")
 }
 
 /// Compute the autonomy streak for a single `run_loop` invocation (Stage C5
@@ -1361,6 +1507,26 @@ pub struct LoopOptions {
     /// *Closes: aider architect/editor; gemini phase-aware; kilo quota-fallback;
     /// openclaude `SmartRouter` (the live agent-loop wire).*
     pub router: Option<Arc<crate::routing::LiveRouter>>,
+    /// Optional ENFORCED per-session cap on browser-class actions
+    /// (`Browser`/`WebFetch`/`WebSearch`) for this `run_loop` (browser-security
+    /// B). When `Some(n)`, the loop counts each browser action and denies the
+    /// `n+1`-th with a clear "rate limit exceeded" tool error — distinct from the
+    /// HTTP-429 *classifier* in `origin_browser::detectors`. `None` (the default
+    /// everywhere) ⇒ no counting and no cap, byte-identical to before. Sourced
+    /// from the optional `[browser] max_actions_per_session` governance knob (see
+    /// [`crate::config::load_governance`]).
+    pub browser_rate_limit: Option<u32>,
+    /// Optional per-connection (per-session) active account used to resolve
+    /// credentials for a **cross-provider** mid-loop rebuild. When `Some`, a
+    /// cross-provider routing pick rebuilds the provider against THIS account
+    /// via [`crate::provider_factory::build_provider_for_account`], so a
+    /// `/account` switch on one connection cannot leak into a concurrent
+    /// connection's rebuild. When `None` (the default everywhere), the loop
+    /// falls back to the process-wide global account slot via
+    /// [`crate::provider_factory::build_provider_for`] — byte-identical to the
+    /// pre-per-connection wire. Set from the per-connection account slot in
+    /// `handle_request`.
+    pub session_account: Option<Arc<str>>,
 }
 
 impl Default for LoopOptions {
@@ -1393,6 +1559,8 @@ impl Default for LoopOptions {
             system_suffix: None,
             read_only: false,
             router: None,
+            browser_rate_limit: None,
+            session_account: None,
         }
     }
 }
@@ -1652,6 +1820,8 @@ mod self_dispatch_session_tests {
 #[cfg(test)]
 mod pain_bucket_helper_tests {
     use super::{autonomy_streak_for, gen_ai_latencies, select_ttfua, split_agent_time};
+    #[cfg(feature = "otel")]
+    use super::{request_params_from_req, turn_response_id};
 
     #[test]
     fn split_subtracts_tool_from_total() {
@@ -1759,6 +1929,56 @@ mod pain_bucket_helper_tests {
         assert_eq!(l.tpot_ms, None);
         // TTFT is still defined (the streamed first token).
         assert!((l.ttft_ms - 50.0).abs() < f64::EPSILON);
+    }
+
+    // --- Stage C4: full gen_ai semantic-convention wiring (otel-gated) ------
+    //
+    // These pin the daemon-side pure mappers the live turn loop feeds into the
+    // `gen_ai` span (request params + a real per-turn response id). They are
+    // `#[cfg(feature = "otel")]` because `RequestParams` — and the response-id
+    // mapper that exists only to feed it — are compiled only in the otel build;
+    // in the default build neither the mappers nor the span methods exist, so
+    // the loop is byte-identical. The actual `span.set_*` / `record_*` calls
+    // are exercised end-to-end by origin-metrics'
+    // `span_record_methods_run_without_panicking` against a real span.
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn request_params_map_thinking_budget_to_max_tokens() {
+        // The only sampling knob the loop's ChatRequest carries is the
+        // extended-thinking budget, which maps onto gen_ai.request.max_tokens.
+        let req = origin_provider::ChatRequest {
+            thinking_tokens: Some(8192),
+            ..Default::default()
+        };
+        let p = request_params_from_req(&req);
+        assert_eq!(p.max_tokens, Some(8192));
+        // Nothing the request doesn't carry is fabricated.
+        assert_eq!(p.temperature, None);
+        assert_eq!(p.top_p, None);
+        assert_eq!(p.seed, None);
+        assert!(p.stop_sequences.is_empty());
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn request_params_omit_max_tokens_when_no_thinking_budget() {
+        // No thinking budget ⇒ no max_tokens ⇒ the builder emits nothing.
+        let req = origin_provider::ChatRequest::default();
+        let p = request_params_from_req(&req);
+        assert_eq!(p.max_tokens, None);
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn turn_response_id_is_a_real_stable_per_turn_id() {
+        // The synthesized response id is a genuine, unique-per-completion string
+        // (session id + turn ordinal) — never the old hard-coded empty string.
+        assert_eq!(turn_response_id("sess-abc", 1), "sess-abc#t1");
+        assert_eq!(turn_response_id("sess-abc", 7), "sess-abc#t7");
+        assert!(!turn_response_id("sess-abc", 1).is_empty());
+        // Distinct turns yield distinct ids.
+        assert_ne!(turn_response_id("s", 1), turn_response_id("s", 2));
     }
 }
 
@@ -2097,7 +2317,17 @@ async fn run_loop_inner(
     // declarative sub-agents so the model can launch them via the Task tool
     // (the real worker enforces their allow-list). Built once + cached; empty
     // when there is no subagents dir ⇒ byte-identical system prompt.
-    let subagents_block = crate::subagents_md::global_block();
+    //
+    // Browser-security (C): when a conseca domain-allowlist is configured, also
+    // inject a first-class, built-in `browser` named subagent scoped to the
+    // browse/read tools and carrying that allowlist. With no allowlist (the
+    // default) `block_with_builtins(&[])` is byte-identical to `global_block()`.
+    let browser_allow_domains: Vec<String> = opts
+        .conseca
+        .as_ref()
+        .map(|p| p.allow_domains.clone())
+        .unwrap_or_default();
+    let subagents_block = crate::subagents_md::block_with_builtins(&browser_allow_domains);
     // Optional output-style addendum (claude-code output styles). Default-off:
     // `None`/empty appends nothing, leaving the assembled prompt — and the
     // prompt-cache breakpoints — byte-identical to before.
@@ -2117,7 +2347,7 @@ async fn run_loop_inner(
             &style_block,
             &roots_block,
             &edit_format_block,
-            subagents_block,
+            &subagents_block,
         ];
         parts
             .iter()
@@ -2166,6 +2396,25 @@ async fn run_loop_inner(
     let loop_start = std::time::Instant::now();
     let mut total_tool_calls: u64 = 0;
 
+    // Stage C4: opt-in capture of message / tool-result *content* on the
+    // `gen_ai` span events. The OpenTelemetry GenAI convention treats prompt and
+    // completion content as opt-in (it can carry PII), so by default we record
+    // the message/choice/tool *structure* (roles, indices, ids, finish reasons)
+    // but NOT the bodies. Set `ORIGIN_OTEL_CAPTURE_CONTENT=1` to also attach the
+    // text. Read once per loop; only consulted on the otel build, so the default
+    // build never even evaluates it (kept `#[cfg]`-gated to avoid an unused
+    // binding).
+    #[cfg(feature = "otel")]
+    let gen_ai_capture_content =
+        std::env::var("ORIGIN_OTEL_CAPTURE_CONTENT").as_deref() == Ok("1");
+
+    // Browser-security (B): ENFORCED per-session browser-action counter. Counts
+    // dispatched browser-class tools (`Browser`/`WebFetch`/`WebSearch`) so the
+    // optional `opts.browser_rate_limit` cap can deny once exceeded. Stays at 0
+    // and is never consulted when no cap is configured (the default), so the
+    // default path is byte-identical.
+    let mut browser_action_count: u32 = 0;
+
     // Stage C5 pain-bucket accumulators. All are pure measurement and feed only
     // the opt-in `session_stop` telemetry (off without `ORIGIN_TELEMETRY=1`), so
     // maintaining them never alters the default path.
@@ -2207,11 +2456,28 @@ async fn run_loop_inner(
         let turn_model = match opts.router.as_ref().and_then(|lr| lr.choose_model_ref(turn)) {
             Some(pick) if pick.provider.as_str() == provider.name() => pick.model,
             Some(pick) => {
-                // Cross-provider pick: try to rebuild. `build_provider_for`
-                // reaches the registered factory + credentials; `None` ⇒ fall
-                // back to the active provider with the session model.
-                match crate::provider_factory::build_provider_for(&pick.provider, &pick.model).await
-                {
+                // Cross-provider pick: try to rebuild. When this session carries
+                // its OWN account (per-connection multi-account isolation) we
+                // resolve credentials against THAT account so a concurrent
+                // connection's `/account` switch cannot leak in; otherwise we
+                // fall back to the process-wide global account slot (the
+                // pre-per-connection default, byte-identical). Either way `None`
+                // ⇒ fall back to the active provider with the session model.
+                let built = match opts.session_account.as_deref() {
+                    Some(acct) => {
+                        crate::provider_factory::build_provider_for_account(
+                            &pick.provider,
+                            &pick.model,
+                            acct,
+                        )
+                        .await
+                    }
+                    None => {
+                        crate::provider_factory::build_provider_for(&pick.provider, &pick.model)
+                            .await
+                    }
+                };
+                match built {
                     Some(p) => {
                         rebuilt = Some(p);
                         pick.model
@@ -2291,11 +2557,34 @@ async fn run_loop_inner(
         // `--features otel` AND a tracer provider is installed, so the default
         // path is byte-identical. Attaches gen_ai.system / gen_ai.request.model
         // / gen_ai.operation.name (relabeled inside origin-metrics).
+        //
+        // The binding is `mut` because the otel build mutates it via the
+        // `set_*`/`record_*` span methods below; the default build never calls
+        // those (they live in `#[cfg(feature = "otel")]` blocks) and the stub
+        // guard is moved-then-dropped, so the `mut` is unused there — silence the
+        // warning rather than diverge the two feature paths.
+        #[cfg_attr(not(feature = "otel"), allow(unused_mut))]
         let mut gen_ai_span = origin_metrics::instruments::gen_ai_span(
             turn_provider.name(),
             &turn_model,
             origin_metrics::keys::genai::OPERATION_CHAT,
         );
+        // Stage C4: attach the full request-side `gen_ai.*` convention set to the
+        // span before the provider call. All of these compile to no-ops in the
+        // default build (the `GenAiSpanGuard` methods are `const fn` no-ops
+        // without `--features otel`), so the default path is byte-identical.
+        //   * request sampling params — the real max_tokens floor from the turn's
+        //     extended-thinking budget (`request_params_from_req`).
+        //   * provider/server — the provider name reachable through the trait
+        //     (`server.address`/`server.port` are private to each provider impl
+        //     and not exposed, so they are omitted rather than faked).
+        //   * agent/conversation — the session id as `gen_ai.conversation.id`.
+        #[cfg(feature = "otel")]
+        {
+            gen_ai_span.set_request_params(request_params_from_req(&req));
+            gen_ai_span.set_server_attributes(turn_provider.name(), "", None);
+            gen_ai_span.set_agent_attributes("", "", "", &session.id, "");
+        }
         let (resp, mut speculative, stream_first_token_ms) = {
             let mut attempt: u32 = 0;
             loop {
@@ -2448,11 +2737,81 @@ async fn run_loop_inner(
                 tpot_ms,
             );
         }
-        // Attach the convention response attributes the daemon has real data for
-        // (prompt-cache read tokens → `gen_ai.usage.cached_input_tokens`). No
-        // response id is plumbed today, so it is omitted. No-op without
-        // `--features otel`, so the default path is byte-identical.
-        gen_ai_span.set_response_attributes("", u64::from(resp.usage.cache_read_input_tokens));
+        // Stage C4: attach the response-side `gen_ai.*` convention set, then the
+        // message / choice / tool-call span events, then end the span. Every call
+        // below is a `const` no-op without `--features otel`, so the default
+        // build is byte-identical. The whole block is `#[cfg(feature = "otel")]`
+        // so the response-id derivation + the resp scan never run in the default
+        // build.
+        //   * response attributes — the REAL per-turn response id
+        //     (`gen_ai.response.id`, derived from session id + turn) plus the
+        //     prompt-cache read count (`gen_ai.usage.cached_input_tokens`). This
+        //     replaces the previous hard-coded empty id.
+        //   * one `gen_ai.{user,assistant}.message` event for the prompt + the
+        //     assistant reply (content attached only under the opt-in capture
+        //     gate, per the convention's PII stance).
+        //   * one `gen_ai.choice` event carrying the finish reason inferred from
+        //     the response shape (`tool_calls` when the model issued tool calls,
+        //     else `stop`).
+        //   * one `gen_ai.tool.*` attribute set + `gen_ai.tool.message` event per
+        //     tool call the model issued this turn (id/name/description; input as
+        //     content under the same capture gate).
+        #[cfg(feature = "otel")]
+        {
+            gen_ai_span.set_response_attributes(
+                &turn_response_id(&session.id, turn),
+                u64::from(resp.usage.cache_read_input_tokens),
+            );
+            // The assistant text this turn (concatenated Text blocks).
+            let assistant_text: String = resp
+                .assistant
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            // Content is opt-in (PII); record an empty body unless the capture
+            // gate is set, so the message/choice *structure* always emits but the
+            // text only when explicitly enabled.
+            let user_content = if gen_ai_capture_content { user_text } else { "" };
+            let assistant_content = if gen_ai_capture_content { assistant_text.as_str() } else { "" };
+            gen_ai_span.record_message("user", user_content);
+            gen_ai_span.record_message("assistant", assistant_content);
+            // Finish reason: the model issued tool calls iff any ToolUse block is
+            // present; otherwise the turn stops.
+            let issued_tool_calls = resp
+                .assistant
+                .blocks
+                .iter()
+                .any(|b| matches!(b, Block::ToolUse { .. }));
+            let finish_reason = if issued_tool_calls {
+                origin_metrics::keys::genai::FINISH_TOOL_CALLS
+            } else {
+                origin_metrics::keys::genai::FINISH_STOP
+            };
+            gen_ai_span.record_choice(0, finish_reason);
+            // One tool-attribute set + tool-call message per tool the model
+            // issued this turn. The result body is not yet available at span
+            // close (the span brackets the provider call; tools dispatch after),
+            // so the `gen_ai.tool.message` carries the tool-call *input* (gated)
+            // rather than the result — the call structure that the span owns.
+            for b in &resp.assistant.blocks {
+                if let Block::ToolUse { id, name, input_json, .. } = b {
+                    let description = registry_iter()
+                        .find(|m| m.name == name.as_str())
+                        .map_or("", |m| m.description);
+                    gen_ai_span.set_tool_attributes(name, id, description, "function");
+                    let input_content = if gen_ai_capture_content {
+                        std::str::from_utf8(input_json).unwrap_or("")
+                    } else {
+                        ""
+                    };
+                    gen_ai_span.record_tool_message(id, input_content);
+                }
+            }
+        }
         // End the `gen_ai` span now that the call (and its latency recordings)
         // are complete. Explicit drop documents the span's scope; the guard's
         // Drop ends the span (a no-op without `--features otel`).
@@ -2694,6 +3053,38 @@ async fn run_loop_inner(
             if decision.outcome == Outcome::Allow {
                 decision =
                     apply_read_only_overlay(decision, opts.read_only, meta.side_effects, meta.name);
+            }
+
+            // Browser-security (A) — conseca domain-allowlist overlay. Same
+            // deny-only contract: a navigating `Browser`/`WebFetch` call whose
+            // target host is not on the active policy's `allow_domains` is
+            // downgraded Allow→Deny. No conseca policy or an empty allowlist (the
+            // default) ⇒ no effect.
+            if decision.outcome == Outcome::Allow {
+                decision = apply_domain_overlay(decision, meta.name, &args, opts);
+            }
+
+            // Browser-security (B) — ENFORCED per-session rate limit. Same
+            // deny-only contract: once the configured cap is exceeded, the next
+            // browser-class action is denied with a clear "rate limit exceeded"
+            // error. `opts.browser_rate_limit == None` (the default) ⇒ no cap, no
+            // counting, byte-identical. The counter is bumped only for an action
+            // that actually passes the cap, so a denied action does not consume a
+            // slot.
+            if decision.outcome == Outcome::Allow && is_browser_action(meta.name) {
+                if browser_rate_limit_ok(opts.browser_rate_limit, browser_action_count) {
+                    browser_action_count = browser_action_count.saturating_add(1);
+                } else {
+                    decision = origin_permission::Decision {
+                        outcome: Outcome::Deny,
+                        reason: format!(
+                            "browser rate limit exceeded: at most {} browser action(s) are \
+                             permitted per session (tool `{}`)",
+                            opts.browser_rate_limit.unwrap_or(0),
+                            meta.name
+                        ),
+                    };
+                }
             }
 
             // gemini PreTool lifecycle hook. Same deny-only contract as the
@@ -6052,6 +6443,135 @@ mod wiring_tests {
             Outcome::Allow,
             "a base Deny is never routed through the overlay, so it can never widen"
         );
+    }
+
+    /// Browser-security (A) — domain allowlist: with no conseca policy (the
+    /// default) the domain overlay never gates, returning the base Allow
+    /// unchanged (byte-identical default).
+    #[test]
+    fn domain_overlay_no_policy_is_byte_identical() {
+        let opts = LoopOptions::default();
+        assert!(opts.conseca.is_none());
+        let allow = Decision {
+            outcome: Outcome::Allow,
+            reason: "base".into(),
+        };
+        let args = serde_json::json!({ "v": "open", "session": "s", "url": "https://evil.com" });
+        let out = apply_domain_overlay(allow, "Browser", &args, &opts);
+        assert_eq!(out.outcome, Outcome::Allow, "no policy ⇒ not gated");
+    }
+
+    /// Browser-security (A): a conseca policy with an EMPTY `allow_domains` does
+    /// not gate either — the gap spec requires the allowlist be opt-in, so an
+    /// empty list is treated as "unconfigured" rather than "deny all".
+    #[test]
+    fn domain_overlay_empty_allow_domains_not_gated() {
+        let opts = LoopOptions {
+            conseca: Some(Arc::new(origin_conseca::SecurityPolicy::default())),
+            ..LoopOptions::default()
+        };
+        let allow = Decision {
+            outcome: Outcome::Allow,
+            reason: "base".into(),
+        };
+        let args = serde_json::json!({ "v": "open", "session": "s", "url": "https://evil.com" });
+        let out = apply_domain_overlay(allow, "Browser", &args, &opts);
+        assert_eq!(
+            out.outcome,
+            Outcome::Allow,
+            "empty allow_domains ⇒ allowlist unconfigured ⇒ not gated"
+        );
+    }
+
+    /// Browser-security (A): an allowed host passes, a disallowed host is denied,
+    /// for both the `Browser` `open` verb and `WebFetch` `url`/`urls`.
+    #[test]
+    fn domain_overlay_allows_listed_denies_unlisted() {
+        let policy = origin_conseca::SecurityPolicy {
+            allow_domains: vec!["example.com".to_string()],
+            ..origin_conseca::SecurityPolicy::default()
+        };
+        let opts = LoopOptions {
+            conseca: Some(Arc::new(policy)),
+            ..LoopOptions::default()
+        };
+        let allow = || Decision {
+            outcome: Outcome::Allow,
+            reason: "base".into(),
+        };
+
+        // Browser open → allowed subdomain passes.
+        let ok = serde_json::json!({ "v": "open", "session": "s", "url": "https://api.example.com/x" });
+        assert_eq!(
+            apply_domain_overlay(allow(), "Browser", &ok, &opts).outcome,
+            Outcome::Allow
+        );
+        // Browser open → disallowed host denied.
+        let bad = serde_json::json!({ "v": "open", "session": "s", "url": "https://evil.com" });
+        assert_eq!(
+            apply_domain_overlay(allow(), "Browser", &bad, &opts).outcome,
+            Outcome::Deny
+        );
+        // A non-navigating Browser verb (no url) is never gated.
+        let snap = serde_json::json!({ "v": "snapshot", "session": "s" });
+        assert_eq!(
+            apply_domain_overlay(allow(), "Browser", &snap, &opts).outcome,
+            Outcome::Allow
+        );
+        // WebFetch single url → disallowed denied.
+        let wf_bad = serde_json::json!({ "url": "https://evil.com/page" });
+        assert_eq!(
+            apply_domain_overlay(allow(), "WebFetch", &wf_bad, &opts).outcome,
+            Outcome::Deny
+        );
+        // WebFetch urls array → all-allowed passes.
+        let wf_ok = serde_json::json!({ "urls": ["https://example.com/a", "https://example.com/b"] });
+        assert_eq!(
+            apply_domain_overlay(allow(), "WebFetch", &wf_ok, &opts).outcome,
+            Outcome::Allow
+        );
+        // WebFetch urls array → one disallowed denies the whole batch.
+        let wf_mixed = serde_json::json!({ "urls": ["https://example.com/a", "https://evil.com/b"] });
+        assert_eq!(
+            apply_domain_overlay(allow(), "WebFetch", &wf_mixed, &opts).outcome,
+            Outcome::Deny
+        );
+        // A non-network tool is never gated.
+        let edit = serde_json::json!({ "file_path": "/x", "old_string": "a", "new_string": "b" });
+        assert_eq!(
+            apply_domain_overlay(allow(), "Edit", &edit, &opts).outcome,
+            Outcome::Allow
+        );
+    }
+
+    /// Browser-security (B) — rate limit: unset cap ⇒ unlimited (byte-identical
+    /// default); a set cap permits the first N actions and denies the N+1th.
+    #[test]
+    fn browser_rate_limit_unset_unlimited_set_caps() {
+        // Unset ⇒ unlimited regardless of count.
+        assert!(browser_rate_limit_ok(None, 0));
+        assert!(browser_rate_limit_ok(None, 1_000_000));
+
+        // Cap of 2: action ordinals 0 and 1 are OK (the 1st and 2nd actions),
+        // the 3rd (ordinal 2) is denied.
+        assert!(browser_rate_limit_ok(Some(2), 0), "1st action under cap");
+        assert!(browser_rate_limit_ok(Some(2), 1), "2nd action at cap");
+        assert!(!browser_rate_limit_ok(Some(2), 2), "3rd action over cap");
+
+        // A cap of 0 denies the very first action.
+        assert!(!browser_rate_limit_ok(Some(0), 0));
+    }
+
+    /// Browser-security (B): `is_browser_action` recognises exactly the
+    /// network-capable browser-class tools and nothing else.
+    #[test]
+    fn browser_action_classification() {
+        assert!(is_browser_action("Browser"));
+        assert!(is_browser_action("WebFetch"));
+        assert!(is_browser_action("WebSearch"));
+        assert!(!is_browser_action("Read"));
+        assert!(!is_browser_action("Edit"));
+        assert!(!is_browser_action("Bash"));
     }
 
     /// Task 4: telemetry is disabled by default (no opt-in), so the pipeline

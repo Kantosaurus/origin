@@ -7,6 +7,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::StoreError;
 
+/// Exit code the daemon uses to signal "I have written a relaunch manifest and
+/// want the supervisor to swap me for the freshly self-built binary" — as
+/// opposed to a crash or a clean exit.
+///
+/// This crate owns the binary-swap contract ([`RelaunchManifest`]), so it is
+/// the single source of truth for the sentinel too: the daemon
+/// (`origin-daemon`) exits with this value and the supervisor
+/// (`origin-supervisor`) recognizes it, both re-exporting this one constant so
+/// the two sides cannot drift.
+///
+/// Chosen to sit outside the common signal-derived (`128 + signo`) range and
+/// the conventional `0..=2` success/usage range so it is unambiguous.
+pub const SELFDEV_RELAUNCH_EXIT_CODE: i32 = 86;
+
 /// The on-disk contract the daemon writes after a green build+test so the
 /// supervisor can swap binaries and relaunch.
 #[allow(clippy::module_name_repetitions)] // `RelaunchManifest` is the documented public type re-exported at the crate root.
@@ -200,6 +214,15 @@ impl RelaunchStore for FileRelaunchStore {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relaunch_sentinel_is_canonical_value() {
+        // The ONE place the literal sentinel value is asserted. Every other
+        // crate (origin-daemon, origin-supervisor) references this constant and
+        // a cross-crate sync test there guards against drift, so the literal
+        // `86` appears in exactly one location: the definition above.
+        assert_eq!(SELFDEV_RELAUNCH_EXIT_CODE, 86);
+    }
 
     #[test]
     fn manifest_json_has_exact_snake_case_field_names() {

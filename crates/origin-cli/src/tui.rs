@@ -1270,12 +1270,16 @@ impl App {
         let tok_in = format_tokens(self.usage.input_tokens);
         let tok_out = format_tokens(self.usage.output_tokens);
         let phase = turn_phase(self.spinner.active, self.current_assistant.as_deref());
+        // Localize the phase label: the "Thinking" pre-token state routes through
+        // the `thinking` catalog key (En "Thinking" — byte-identical). "Responding"
+        // has no catalog key and stays in code. `None` (idle) renders nothing.
+        let phase_owned = localize_phase(phase);
         let tokens = format!("{tok_in}\u{2191} {tok_out}\u{2193}");
         let pal = layout.palette;
         let spans = status_spans(
             pal,
             &self.workflow,
-            phase,
+            phase_owned.as_deref(),
             &self.usage.model,
             &tokens,
             cost,
@@ -1845,6 +1849,21 @@ fn turn_phase(spinner_active: bool, assistant: Option<&str>) -> Option<&'static 
     }
 }
 
+/// Localize a [`turn_phase`] label for display.
+///
+/// The pre-token `"Thinking"` state routes through the `thinking` catalog key,
+/// whose English literal is exactly `"Thinking"` — so the default-locale output
+/// is byte-identical, while `--lang`/`$LANG` renders e.g. "Pensando". The
+/// `"Responding"` state has no catalog key and passes through unchanged. `None`
+/// (idle) yields `None`.
+fn localize_phase(phase: Option<&str>) -> Option<String> {
+    match phase {
+        Some("Thinking") => Some(crate::locale::line("thinking").to_string()),
+        Some(other) => Some(other.to_string()),
+        None => None,
+    }
+}
+
 /// Build the ordered status-line segments (excluding the animated spinner glyph,
 /// which the caller prepends). Pure, for testability. Hierarchy: workflow leads
 /// in accent+bold, an optional phase follows in dimmed accent, the model name is
@@ -2361,6 +2380,20 @@ mod tests {
         assert_eq!(turn_phase(true, None), Some("Thinking"));
         assert_eq!(turn_phase(true, Some("")), Some("Thinking"));
         assert_eq!(turn_phase(true, Some("partial")), Some("Responding"));
+    }
+
+    #[test]
+    fn localize_phase_routes_thinking_through_catalog_byte_identical() {
+        // The "Thinking" label routes through the `thinking` catalog key; in
+        // English it is byte-identical ("Thinking", no ellipsis), and it must
+        // equal what the catalog resolves so a `--lang` override localizes it.
+        let thinking = localize_phase(Some("Thinking")).expect("thinking yields a label");
+        assert_eq!(thinking, crate::locale::line("thinking"));
+        assert_eq!(origin_i18n::t(origin_i18n::Lang::En, "thinking"), "Thinking");
+        // "Responding" has no catalog key and passes through unchanged.
+        assert_eq!(localize_phase(Some("Responding")).as_deref(), Some("Responding"));
+        // Idle yields nothing.
+        assert_eq!(localize_phase(None), None);
     }
 
     #[test]

@@ -215,18 +215,33 @@ fn lookup(lang: Lang, key: &str) -> Option<&'static str> {
 fn en(key: &str) -> Option<&'static str> {
     Some(match key {
         "welcome" => "Welcome to origin",
-        "thinking" => "Thinking...",
-        "tool.running" => "Running {tool}",
-        "tool.done" => "{tool} finished",
+        // Routed to the live status-line phase label (`turn_phase`), which renders
+        // a bare "Thinking" with no trailing ellipsis — En reconciled to match.
+        "thinking" => "Thinking",
+        // Routed to the live tool-activity header (`[tool]`); the `{tool}` slot is
+        // filled at the call site. En reconciled to the exact bracket marker so the
+        // default output is byte-identical.
+        "tool.running" => "[{tool}]",
+        // Routed to the live tool-failure line ("{tool} failed"); the ✘ glyph and
+        // indent stay in code. En reconciled to the exact failure literal.
+        "tool.done" => "{tool} failed",
         "permission.ask" => "Allow {tool} {args}?",
-        "permission.denied" => "Permission denied",
+        // Routed to the live permission y/n deny verb ("denied: <tool> <args>");
+        // only the verb word localizes. En reconciled to the exact verb literal.
+        "permission.denied" => "denied",
         "cost.turn" => "This turn cost {usd}",
         "cost.session" => "Session total: {usd}",
-        "error.generic" => "Something went wrong: {message}",
+        // Routed to the live turn-error line, which prints the raw error verbatim.
+        // En is the bare `{message}` passthrough (byte-identical); other locales
+        // wrap it with a localized prefix.
+        "error.generic" => "{message}",
         "goal.active" => "goal active: {condition}",
         "goal.done" => "done: {reason}",
         "session.resumed" => "resumed session {short}\u{2026} \u{2014} the model will recall the earlier conversation",
-        "session.saved" => "Session saved",
+        // Routed to the live `origin export-session --out <path>` confirmation,
+        // which prints `wrote <path>`. En reconciled to the exact literal (with the
+        // `{path}` slot) so the default output is byte-identical.
+        "session.saved" => "wrote {path}",
         "interrupt" => "interrupt sent (Ctrl+D to exit)",
         "bye" => "Goodbye",
         "cmd.model.set" => "model set: {name}",
@@ -248,18 +263,18 @@ fn en(key: &str) -> Option<&'static str> {
 fn es(key: &str) -> Option<&'static str> {
     Some(match key {
         "welcome" => "Bienvenido a origin",
-        "thinking" => "Pensando...",
-        "tool.running" => "Ejecutando {tool}",
-        "tool.done" => "{tool} ha terminado",
+        "thinking" => "Pensando",
+        "tool.running" => "[{tool}]",
+        "tool.done" => "{tool} falló",
         "permission.ask" => "¿Permitir {tool} {args}?",
-        "permission.denied" => "Permiso denegado",
+        "permission.denied" => "denegado",
         "cost.turn" => "Este turno costó {usd}",
         "cost.session" => "Total de la sesión: {usd}",
         "error.generic" => "Algo salió mal: {message}",
         "goal.active" => "objetivo activo: {condition}",
         "goal.done" => "hecho: {reason}",
         "session.resumed" => "sesión {short}\u{2026} reanudada \u{2014} el modelo recordará la conversación anterior",
-        "session.saved" => "Sesión guardada",
+        "session.saved" => "guardado en {path}",
         "interrupt" => "interrupción enviada (Ctrl+D para salir)",
         "bye" => "Adiós",
         "cmd.model.set" => "modelo establecido: {name}",
@@ -281,18 +296,18 @@ fn es(key: &str) -> Option<&'static str> {
 fn fr(key: &str) -> Option<&'static str> {
     Some(match key {
         "welcome" => "Bienvenue sur origin",
-        "thinking" => "Réflexion...",
-        "tool.running" => "Exécution de {tool}",
-        "tool.done" => "{tool} terminé",
+        "thinking" => "Réflexion",
+        "tool.running" => "[{tool}]",
+        "tool.done" => "{tool} a échoué",
         "permission.ask" => "Autoriser {tool} {args} ?",
-        "permission.denied" => "Permission refusée",
+        "permission.denied" => "refusé",
         "cost.turn" => "Ce tour a coûté {usd}",
         "cost.session" => "Total de la session : {usd}",
         "error.generic" => "Une erreur est survenue : {message}",
         "goal.active" => "objectif actif : {condition}",
         "goal.done" => "terminé : {reason}",
         "session.resumed" => "session {short}\u{2026} reprise \u{2014} le modèle se souviendra de la conversation précédente",
-        "session.saved" => "Session enregistrée",
+        "session.saved" => "écrit dans {path}",
         "interrupt" => "interruption envoyée (Ctrl+D pour quitter)",
         "bye" => "Au revoir",
         "cmd.model.set" => "modèle défini : {name}",
@@ -314,18 +329,18 @@ fn fr(key: &str) -> Option<&'static str> {
 fn de(key: &str) -> Option<&'static str> {
     Some(match key {
         "welcome" => "Willkommen bei origin",
-        "thinking" => "Denke nach...",
-        "tool.running" => "Führe {tool} aus",
-        "tool.done" => "{tool} abgeschlossen",
+        "thinking" => "Denke nach",
+        "tool.running" => "[{tool}]",
+        "tool.done" => "{tool} fehlgeschlagen",
         "permission.ask" => "{tool} {args} erlauben?",
-        "permission.denied" => "Zugriff verweigert",
+        "permission.denied" => "verweigert",
         "cost.turn" => "Diese Runde kostete {usd}",
         "cost.session" => "Sitzungssumme: {usd}",
         "error.generic" => "Etwas ist schiefgelaufen: {message}",
         "goal.active" => "aktives Ziel: {condition}",
         "goal.done" => "fertig: {reason}",
         "session.resumed" => "Sitzung {short}\u{2026} fortgesetzt \u{2014} das Modell erinnert sich an das vorherige Gespräch",
-        "session.saved" => "Sitzung gespeichert",
+        "session.saved" => "in {path} geschrieben",
         "interrupt" => "Unterbrechung gesendet (Ctrl+D zum Beenden)",
         "bye" => "Auf Wiedersehen",
         "cmd.model.set" => "Modell gesetzt: {name}",
@@ -347,18 +362,18 @@ fn de(key: &str) -> Option<&'static str> {
 fn ja(key: &str) -> Option<&'static str> {
     Some(match key {
         "welcome" => "origin へようこそ",
-        "thinking" => "思考中...",
-        "tool.running" => "{tool} を実行中",
-        "tool.done" => "{tool} が完了しました",
+        "thinking" => "思考中",
+        "tool.running" => "[{tool}]",
+        "tool.done" => "{tool} が失敗しました",
         "permission.ask" => "{tool} {args} を許可しますか？",
-        "permission.denied" => "許可が拒否されました",
+        "permission.denied" => "拒否",
         "cost.turn" => "このターンの費用は {usd} です",
         "cost.session" => "セッション合計: {usd}",
         "error.generic" => "問題が発生しました: {message}",
         "goal.active" => "目標がアクティブ: {condition}",
         "goal.done" => "完了: {reason}",
         "session.resumed" => "セッション {short}\u{2026} を再開しました \u{2014} モデルは以前の会話を覚えています",
-        "session.saved" => "セッションを保存しました",
+        "session.saved" => "{path} に書き込みました",
         "interrupt" => "中断を送信しました (Ctrl+D で終了)",
         "bye" => "さようなら",
         "cmd.model.set" => "モデルを設定しました: {name}",
@@ -380,18 +395,18 @@ fn ja(key: &str) -> Option<&'static str> {
 fn zh_cn(key: &str) -> Option<&'static str> {
     Some(match key {
         "welcome" => "欢迎使用 origin",
-        "thinking" => "思考中...",
-        "tool.running" => "正在运行 {tool}",
-        "tool.done" => "{tool} 已完成",
+        "thinking" => "思考中",
+        "tool.running" => "[{tool}]",
+        "tool.done" => "{tool} 失败",
         "permission.ask" => "允许 {tool} {args}?",
-        "permission.denied" => "权限被拒绝",
+        "permission.denied" => "已拒绝",
         "cost.turn" => "本轮花费 {usd}",
         "cost.session" => "会话总计: {usd}",
         "error.generic" => "出现错误: {message}",
         "goal.active" => "目标已激活: {condition}",
         "goal.done" => "完成: {reason}",
         "session.resumed" => "已恢复会话 {short}\u{2026} \u{2014} 模型将记住先前的对话",
-        "session.saved" => "会话已保存",
+        "session.saved" => "已写入 {path}",
         "interrupt" => "已发送中断 (Ctrl+D 退出)",
         "bye" => "再见",
         "cmd.model.set" => "已设置模型: {name}",
@@ -488,16 +503,21 @@ mod tests {
     fn placeholder_substitution_replaces_named_args() {
         let s = tf(Lang::En, "cost.turn", &[("usd", "$0.0123")]);
         assert_eq!(s, "This turn cost $0.0123");
+        // `tool.running` is the bracket marker `[{tool}]` (reconciled to the live
+        // tool-activity header literal); it is the same in every locale.
         let r = tf(Lang::ZhCn, "tool.running", &[("tool", "Bash")]);
-        assert_eq!(r, "正在运行 Bash");
+        assert_eq!(r, "[Bash]");
     }
 
     #[test]
     fn placeholder_without_matching_arg_is_left_verbatim() {
         let s = tf(Lang::En, "tool.running", &[]);
-        assert_eq!(s, "Running {tool}");
+        assert_eq!(s, "[{tool}]");
+        // `error.generic` is the bare `{message}` passthrough in English (the live
+        // turn-error line prints the raw error verbatim); a missing arg leaves the
+        // placeholder literal.
         let s2 = tf(Lang::En, "error.generic", &[("unrelated", "x")]);
-        assert_eq!(s2, "Something went wrong: {message}");
+        assert_eq!(s2, "{message}");
     }
 
     #[test]
@@ -527,5 +547,46 @@ mod tests {
                 assert_ne!(s, "?", "{} / {key} hit sentinel", lang.code());
             }
         }
+    }
+
+    /// The seven previously-unrouted keys are now wired to live CLI call sites.
+    /// Their English literals are reconciled to the EXACT text those sites emit,
+    /// so the default-English (no `--lang`, no `$LANG`) output stays byte-identical
+    /// after routing. This locks the reconciled En literals against drift.
+    #[test]
+    fn newly_routed_keys_have_byte_identical_english_literals() {
+        assert_eq!(en("thinking").unwrap(), "Thinking");
+        assert_eq!(en("tool.running").unwrap(), "[{tool}]");
+        assert_eq!(en("tool.done").unwrap(), "{tool} failed");
+        assert_eq!(en("permission.denied").unwrap(), "denied");
+        assert_eq!(en("cost.turn").unwrap(), "This turn cost {usd}");
+        assert_eq!(en("error.generic").unwrap(), "{message}");
+        assert_eq!(en("session.saved").unwrap(), "wrote {path}");
+        // And the substituted forms render exactly as the call site builds them.
+        assert_eq!(tf(Lang::En, "tool.running", &[("tool", "Bash")]), "[Bash]");
+        assert_eq!(tf(Lang::En, "tool.done", &[("tool", "Edit")]), "Edit failed");
+        assert_eq!(
+            tf(Lang::En, "cost.turn", &[("usd", "$0.01")]),
+            "This turn cost $0.01"
+        );
+        assert_eq!(tf(Lang::En, "error.generic", &[("message", "boom")]), "boom");
+        assert_eq!(
+            tf(Lang::En, "session.saved", &[("path", "/tmp/s.md")]),
+            "wrote /tmp/s.md"
+        );
+    }
+
+    /// Every newly-routed key still localizes away from English in at least one
+    /// locale that carries a genuinely different translation (the bracket-marker
+    /// `tool.running` is intentionally locale-neutral, so it is excluded here).
+    #[test]
+    fn newly_routed_keys_localize_in_non_english() {
+        assert_ne!(t(Lang::Es, "thinking"), t(Lang::En, "thinking"));
+        assert_ne!(t(Lang::Fr, "tool.done"), t(Lang::En, "tool.done"));
+        assert_ne!(t(Lang::De, "permission.denied"), t(Lang::En, "permission.denied"));
+        assert_ne!(t(Lang::Ja, "cost.turn"), t(Lang::En, "cost.turn"));
+        assert_ne!(t(Lang::ZhCn, "session.saved"), t(Lang::En, "session.saved"));
+        // error.generic wraps the bare {message} passthrough with a localized prefix.
+        assert_ne!(t(Lang::Es, "error.generic"), t(Lang::En, "error.generic"));
     }
 }

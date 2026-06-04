@@ -65,6 +65,40 @@ pub fn load(dir: &Path) -> Vec<SubagentDef> {
     out
 }
 
+/// The tools the built-in `browser` subagent is scoped to: the network-capable
+/// browse tools plus read-only inspection. Never `Edit`/`Write`/`Bash`/`Task`.
+const BROWSER_SUBAGENT_TOOLS: &[&str] = &["Browser", "WebFetch", "WebSearch", "Read", "Grep", "Glob"];
+
+/// Build the first-class, built-in `browser` named subagent (browser-security
+/// C), scoped to the browse/read tools and carrying the active conseca
+/// domain-allowlist in its description.
+///
+/// Returns `None` when `allow_domains` is empty so that — exactly as for
+/// `.md`-defined subagents — the assembled system prompt (and its cache
+/// breakpoints) stays byte-identical to before whenever the browser-security
+/// allowlist is unconfigured. When non-empty, the returned [`SubagentDef`] reuses
+/// the same `WorkerSpec`/`allowed_tools` enforcement the swarm worker applies, so
+/// the model can dispatch a `browser` subagent that is genuinely confined to the
+/// allow-listed domains and the browse/read tool set.
+#[must_use]
+pub fn builtin_browser_subagent(allow_domains: &[String]) -> Option<SubagentDef> {
+    if allow_domains.is_empty() {
+        return None;
+    }
+    Some(SubagentDef {
+        name: "browser".to_string(),
+        description: format!(
+            "Isolated web-browsing agent confined to the allow-listed domains \
+             [{}] and the browse/read tools; it cannot edit files or run shell.",
+            allow_domains.join(", ")
+        ),
+        allowed_tools: BROWSER_SUBAGENT_TOOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+    })
+}
+
 /// Render the `<origin-subagents>` system block. An empty list yields an empty
 /// string (byte-identical system prompt).
 #[must_use]
@@ -99,6 +133,37 @@ pub fn global_block() -> &'static str {
     static CELL: OnceLock<String> = OnceLock::new();
     CELL.get_or_init(|| subagents_dir().map_or_else(String::new, |d| catalog_block(&load(&d))))
         .as_str()
+}
+
+/// The process-wide `.md`-loaded subagent defs, cached once on first use.
+fn global_defs() -> &'static [SubagentDef] {
+    static CELL: OnceLock<Vec<SubagentDef>> = OnceLock::new();
+    CELL.get_or_init(|| subagents_dir().map_or_else(Vec::new, |d| load(&d)))
+        .as_slice()
+}
+
+/// Render the `<origin-subagents>` block from the `.md`-loaded subagents PLUS
+/// the built-in `browser` subagent when `allow_domains` is non-empty
+/// (browser-security C).
+///
+/// **Default-off / byte-identical:** when `allow_domains` is empty AND there are
+/// no `.md` subagents, this returns `""` — identical to [`global_block`]. With an
+/// empty allowlist it is byte-identical to [`global_block`] regardless of `.md`
+/// files (the built-in is simply not injected), so the only behavioral change is
+/// the additive injection of one extra catalog line when a browser allowlist is
+/// configured.
+#[must_use]
+pub fn block_with_builtins(allow_domains: &[String]) -> String {
+    let md_defs = global_defs();
+    builtin_browser_subagent(allow_domains).map_or_else(
+        || catalog_block(md_defs),
+        |browser| {
+            let mut defs: Vec<SubagentDef> = md_defs.to_vec();
+            defs.push(browser);
+            defs.sort_by(|a, b| a.name.cmp(&b.name));
+            catalog_block(&defs)
+        },
+    )
 }
 
 #[cfg(test)]
@@ -138,6 +203,31 @@ mod tests {
     fn missing_dir_loads_nothing() {
         let defs = load(std::path::Path::new("/no/such/subagents-dir-xyz"));
         assert!(defs.is_empty());
+    }
+
+    #[test]
+    fn builtin_browser_subagent_scoped_and_carries_allowlist() {
+        use super::builtin_browser_subagent;
+        // With no allowlist configured ⇒ no built-in browser subagent (the
+        // default system prompt stays byte-identical).
+        assert!(builtin_browser_subagent(&[]).is_none());
+
+        // With an allowlist ⇒ a named `browser` subagent scoped to the
+        // browse/read tools, carrying the allowlist in its description.
+        let def = builtin_browser_subagent(&["example.com".to_string(), "docs.rs".to_string()])
+            .expect("allowlist ⇒ built-in browser subagent");
+        assert_eq!(def.name, "browser");
+        // Scoped to exactly the browse + read tools, never Edit/Write/Bash/Task.
+        assert!(def.allowed_tools.contains(&"Browser".to_string()));
+        assert!(def.allowed_tools.contains(&"WebFetch".to_string()));
+        assert!(def.allowed_tools.contains(&"WebSearch".to_string()));
+        assert!(def.allowed_tools.contains(&"Read".to_string()));
+        assert!(!def.allowed_tools.contains(&"Edit".to_string()));
+        assert!(!def.allowed_tools.contains(&"Bash".to_string()));
+        assert!(!def.allowed_tools.contains(&"Task".to_string()));
+        // The allowlist domains are surfaced in the description.
+        assert!(def.description.contains("example.com"));
+        assert!(def.description.contains("docs.rs"));
     }
 
     #[test]
