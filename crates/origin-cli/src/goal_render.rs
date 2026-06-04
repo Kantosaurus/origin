@@ -66,7 +66,10 @@ pub fn verifying_line(iter: u32, max_iter: u32) -> String {
 #[must_use]
 pub fn cleared_line(reason: &ClearReasonWire) -> (String, u32) {
     match reason {
-        ClearReasonWire::Met { reason } => (format!("done: {reason}"), theme::GREEN),
+        ClearReasonWire::Met { reason } => (
+            crate::locale::linef("goal.done", &[("reason", reason)]),
+            theme::GREEN,
+        ),
         ClearReasonWire::UserSlash => ("goal cancelled".to_string(), theme::YELLOW),
         ClearReasonWire::UserClearAll => ("session cleared".to_string(), theme::YELLOW),
         ClearReasonWire::MaxIter => ("max iterations reached".to_string(), theme::YELLOW),
@@ -95,7 +98,14 @@ pub fn render_goal_event<R: GoalRender>(app: &mut R, ev: &StreamEvent) -> bool {
             max_iter,
             token_budget,
         } => {
-            app.push_colored(format!("  \u{25CE} goal active: {condition}"), theme::ACCENT, 0);
+            app.push_colored(
+                format!(
+                    "  \u{25CE} {}",
+                    crate::locale::linef("goal.active", &[("condition", condition)])
+                ),
+                theme::ACCENT,
+                0,
+            );
             app.set_goal_status(Some(status_line(0, *max_iter, 0, *token_budget)));
             true
         }

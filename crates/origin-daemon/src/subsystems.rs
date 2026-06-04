@@ -57,10 +57,38 @@ pub fn review_filter(
     origin_review::filter(findings, strictness)
 }
 
-/// Source-file extensions the repo-map scanner considers.
-const REPO_MAP_EXTS: &[&str] = &[
-    "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "h", "cpp", "hpp",
-];
+/// Group rebuild paths by their detected [`origin_codegraph::Language`].
+///
+/// Each path's language is detected per-file via
+/// [`origin_codegraph::Language::from_path`]; paths whose extension is not a
+/// codegraph-supported grammar are dropped (skipped gracefully) rather than
+/// forced through a wrong grammar. The returned groups are ordered by the
+/// language discriminant for deterministic output, and within a group the
+/// paths keep their input order.
+///
+/// This is the pure decision core behind the `graph_rebuild` tool dispatch:
+/// the daemon calls `rebuild_paths` once per language group instead of
+/// hardcoding a single grammar for the whole batch.
+#[must_use]
+pub fn group_paths_by_language(
+    paths: &[std::path::PathBuf],
+) -> Vec<(origin_codegraph::Language, Vec<std::path::PathBuf>)> {
+    // Preserve first-seen language order while bucketing, then sort by the
+    // stable discriminant so the result does not depend on input ordering.
+    let mut groups: Vec<(origin_codegraph::Language, Vec<std::path::PathBuf>)> = Vec::new();
+    for path in paths {
+        let Some(lang) = origin_codegraph::Language::from_path(path) else {
+            continue;
+        };
+        if let Some(slot) = groups.iter_mut().find(|(l, _)| *l == lang) {
+            slot.1.push(path.clone());
+        } else {
+            groups.push((lang, vec![path.clone()]));
+        }
+    }
+    groups.sort_by_key(|(l, _)| l.as_discriminant());
+    groups
+}
 
 /// Maximum number of files the repo-map scanner walks, bounding the cost of the
 /// (default-off) scan so an enormous tree can't stall prompt assembly.
@@ -70,24 +98,43 @@ const REPO_MAP_MAX_FILES: usize = 2_000;
 /// prepended map never dominates the system prompt.
 const REPO_MAP_BUDGET_TOKENS: u32 = 1_024;
 
-/// Build a compact `<repo-map>` system-prompt block for `root` (item E).
+/// Build a compact `<repo-map>` system-prompt block spanning `roots` (item E).
 ///
-/// Scans `root` for source files, extracts lightweight per-file symbol
-/// defs/refs, ranks them with [`repo_map_for`] (personalized `PageRank`) inside
-/// [`REPO_MAP_BUDGET_TOKENS`], and renders the top files + their defined
-/// symbols. Returns `None` when the tree has no rankable source files or the
-/// ranker yields nothing, so an enabled-but-empty repo stays byte-neutral.
+/// Scans each root in `roots` for source files (via the 18-language
+/// [`origin_repomap`] scanner), extracts lightweight per-file symbol defs/refs,
+/// and ranks them with personalized `PageRank` inside
+/// [`REPO_MAP_BUDGET_TOKENS`]. With a single root this is the original
+/// single-corpus [`origin_repomap::build_map`] path; with more than one root the
+/// per-root corpora are merged and re-ranked together via
+/// [`origin_repomap::build_map_multi_root`] so cross-root references (root A
+/// referencing a symbol root B defines) influence the shared ranking. Renders
+/// the top files + their defined symbols. Returns `None` when no root has any
+/// rankable source file or the ranker yields nothing, so an enabled-but-empty
+/// workspace stays byte-neutral.
 ///
 /// This is pure given the filesystem: it performs read-only directory walks and
 /// never mutates anything. The caller (the agent loop) only invokes it behind
 /// the `ORIGIN_REPOMAP=1` env gate, so the default prompt is unchanged.
 #[must_use]
-pub fn repo_map_block(root: &std::path::Path) -> Option<String> {
-    let files = scan_file_symbols(root);
-    if files.is_empty() {
-        return None;
-    }
-    let ranked = repo_map_for(&files, &[], REPO_MAP_BUDGET_TOKENS).ok()?;
+pub fn repo_map_block(roots: &[std::path::PathBuf]) -> Option<String> {
+    let ranked = if roots.len() <= 1 {
+        // Single root (or none): original single-corpus path.
+        let root = roots.first()?;
+        let files = scan_file_symbols(root);
+        if files.is_empty() {
+            return None;
+        }
+        repo_map_for(&files, &[], REPO_MAP_BUDGET_TOKENS).ok()?
+    } else {
+        // Multi-root: scan each root into its own corpus, then merge + re-rank
+        // under one shared budget so cross-root edges are honoured.
+        let per_root: Vec<Vec<origin_repomap::FileSymbols>> =
+            roots.iter().map(|r| scan_file_symbols(r)).collect();
+        if per_root.iter().all(Vec::is_empty) {
+            return None;
+        }
+        origin_repomap::build_map_multi_root(per_root, &[], REPO_MAP_BUDGET_TOKENS).ok()?
+    };
     if ranked.is_empty() {
         return None;
     }
@@ -136,10 +183,12 @@ fn scan_file_symbols(root: &std::path::Path) -> Vec<origin_repomap::FileSymbols>
                 stack.push(path);
                 continue;
             }
+            // Source-file detection now spans all of origin_repomap's 18
+            // languages (Ruby, PHP, Swift, Kotlin, …), not the old ~8-extension
+            // list — so files the previous heuristic ignored still contribute.
             let is_source = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| REPO_MAP_EXTS.contains(&e));
+                .to_str()
+                .is_some_and(|p| origin_repomap::Language::from_path(p).is_some());
             if !is_source {
                 continue;
             }
@@ -158,7 +207,15 @@ fn scan_file_symbols(root: &std::path::Path) -> Vec<origin_repomap::FileSymbols>
 }
 
 /// Extract [`origin_repomap::FileSymbols`] from a single file. Returns `None`
-/// when the file can't be read as UTF-8 or yields no symbols.
+/// when the file can't be read as UTF-8, its language is unsupported, or it
+/// yields no symbols.
+///
+/// Definitions come from [`origin_repomap::scan_path`] — the tested
+/// 18-language, per-grammar definition scanner — giving full language breadth
+/// and far better defs than the old inline `starts_with` heuristic. References
+/// remain the cheap identifier-token set (used only to seed the def→ref ranking
+/// graph), minus the file's own definitions so a file does not "reference"
+/// itself.
 fn file_symbols(
     root: &std::path::Path,
     path: &std::path::Path,
@@ -169,28 +226,23 @@ fn file_symbols(
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/");
-    let mut defs = Vec::new();
+    // Real per-language definition extraction (18 grammars). `scan_path` keys
+    // off the path's extension; `None` means an unsupported language.
+    let (_lang, defs) = origin_repomap::scan_path(&rel, &text)?;
+    // Build the reference set from identifier tokens for the ranking graph,
+    // excluding the file's own definitions.
+    let def_set: std::collections::HashSet<&str> = defs.iter().map(String::as_str).collect();
     let mut refs = Vec::new();
     let mut approx_tokens: u32 = 0;
     for line in text.lines() {
-        let trimmed = line.trim_start();
-        let is_def = trimmed.starts_with("fn ")
-            || trimmed.starts_with("pub fn ")
-            || trimmed.starts_with("def ")
-            || trimmed.starts_with("class ")
-            || trimmed.starts_with("struct ")
-            || trimmed.starts_with("pub struct ")
-            || trimmed.starts_with("type ")
-            || trimmed.starts_with("function ");
         for tok in identifiers(line) {
             approx_tokens = approx_tokens.saturating_add(1);
-            if is_def {
-                defs.push(tok);
-            } else {
+            if !def_set.contains(tok.as_str()) {
                 refs.push(tok);
             }
         }
     }
+    let mut defs = defs;
     if defs.is_empty() && refs.is_empty() {
         return None;
     }
@@ -234,6 +286,44 @@ fn push_identifier(out: &mut Vec<String>, cur: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_paths_by_language_detects_per_file_and_skips_unknown() {
+        use std::path::PathBuf;
+        let paths = vec![
+            PathBuf::from("src/a.rs"),
+            PathBuf::from("svc/b.py"),
+            PathBuf::from("README.md"), // unsupported -> skipped
+            PathBuf::from("src/c.rs"),
+            PathBuf::from("data.bin"), // unsupported -> skipped
+            PathBuf::from("svc/d.go"),
+        ];
+        let groups = group_paths_by_language(&paths);
+        // Three supported languages: Rust, Python, Go. Markdown/bin dropped.
+        assert_eq!(groups.len(), 3, "only supported languages form groups");
+        let rust = groups
+            .iter()
+            .find(|(l, _)| *l == origin_codegraph::Language::Rust)
+            .expect("rust group");
+        assert_eq!(rust.1.len(), 2, "both .rs files land in the Rust group");
+        let py = groups
+            .iter()
+            .find(|(l, _)| *l == origin_codegraph::Language::Python)
+            .expect("python group");
+        assert_eq!(py.1, vec![PathBuf::from("svc/b.py")]);
+        let go = groups
+            .iter()
+            .find(|(l, _)| *l == origin_codegraph::Language::Go)
+            .expect("go group");
+        assert_eq!(go.1, vec![PathBuf::from("svc/d.go")]);
+    }
+
+    #[test]
+    fn group_paths_by_language_empty_when_all_unsupported() {
+        use std::path::PathBuf;
+        let paths = vec![PathBuf::from("a.txt"), PathBuf::from("b.md"), PathBuf::from("noext")];
+        assert!(group_paths_by_language(&paths).is_empty());
+    }
 
     #[test]
     fn repo_map_ranks_files_within_budget() {
@@ -282,7 +372,7 @@ mod tests {
         std::fs::write(dir.join("a.rs"), "fn alpha() { beta(); }\n").expect("write a");
         std::fs::write(dir.join("b.py"), "def gamma():\n    return delta()\n").expect("write b");
         std::fs::write(dir.join("ignore.txt"), "not source\n").expect("write txt");
-        let block = repo_map_block(&dir).expect("repo map block");
+        let block = repo_map_block(std::slice::from_ref(&dir)).expect("repo map block");
         assert!(block.starts_with("<repo-map>"));
         assert!(block.ends_with("</repo-map>"));
         assert!(block.contains("a.rs") || block.contains("b.py"));
@@ -290,9 +380,86 @@ mod tests {
         let empty = std::env::temp_dir().join(format!("origin_repomap_empty_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&empty);
         std::fs::write(empty.join("notes.txt"), "hi\n").expect("write txt");
-        assert!(repo_map_block(&empty).is_none());
+        assert!(repo_map_block(std::slice::from_ref(&empty)).is_none());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn scan_file_symbols_covers_ruby_and_php_beyond_old_heuristic() {
+        // The previous inline heuristic only knew ~8 C-family/Rust/Python/TS
+        // extensions and ignored .rb / .php entirely. With origin_repomap's
+        // 18-language scanner these files must now contribute defs.
+        let dir = std::env::temp_dir().join(format!("origin_repomap_rbphp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("widget.rb"),
+            "def build_widget\n  assemble\nend\nclass Gadget\nend\n",
+        )
+        .expect("write rb");
+        std::fs::write(
+            dir.join("service.php"),
+            "<?php\nfunction handle_request() {\n  return dispatch();\n}\n",
+        )
+        .expect("write php");
+        let syms = scan_file_symbols(&dir);
+        let rb = syms
+            .iter()
+            .find(|s| s.file == "widget.rb")
+            .expect("ruby file scanned");
+        assert!(
+            rb.defines.contains(&"build_widget".to_string()),
+            "ruby def must be extracted, got {:?}",
+            rb.defines
+        );
+        assert!(
+            rb.defines.contains(&"Gadget".to_string()),
+            "ruby class must be extracted, got {:?}",
+            rb.defines
+        );
+        let php = syms
+            .iter()
+            .find(|s| s.file == "service.php")
+            .expect("php file scanned");
+        assert!(
+            php.defines.contains(&"handle_request".to_string()),
+            "php function must be extracted, got {:?}",
+            php.defines
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repo_map_block_multi_root_merges_both_roots() {
+        let base = std::env::temp_dir().join(format!("origin_repomap_multi_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root_a = base.join("a");
+        let root_b = base.join("b");
+        std::fs::create_dir_all(&root_a).expect("mkdir a");
+        std::fs::create_dir_all(&root_b).expect("mkdir b");
+        // Root A defines `core_engine`; Root B references it (cross-root edge).
+        std::fs::write(root_a.join("core.rb"), "def core_engine\n  spin\nend\n").expect("write a");
+        std::fs::write(
+            root_b.join("client.php"),
+            "<?php\nfunction client_main() {\n  core_engine();\n}\n",
+        )
+        .expect("write b");
+        let roots = vec![root_a.clone(), root_b];
+        let block = repo_map_block(&roots).expect("multi-root map block");
+        assert!(block.starts_with("<repo-map>"));
+        assert!(
+            block.contains("core.rb"),
+            "root A file must appear in merged map: {block}"
+        );
+        assert!(
+            block.contains("client.php"),
+            "root B file must appear in merged map: {block}"
+        );
+        // A single-root call still works (default path) and is a subset.
+        let single = repo_map_block(std::slice::from_ref(&root_a)).expect("single-root block");
+        assert!(single.contains("core.rb"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

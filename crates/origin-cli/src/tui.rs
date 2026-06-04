@@ -1102,8 +1102,8 @@ impl App {
             let status_row = layout.at_bottom.saturating_sub(1);
             if status_row < layout.rows {
                 let msg = format!(
-                    "\u{26A0} Allow {} {}?  y = allow \u{00B7} n = deny",
-                    ask.tool, ask.args
+                    "\u{26A0} {}  y = allow \u{00B7} n = deny",
+                    crate::locale::linef("permission.ask", &[("tool", &ask.tool), ("args", &ask.args)])
                 );
                 write_str_styled(
                     main,

@@ -1116,6 +1116,11 @@ fn spawn_handler_task(
                     let body = serde_json::to_vec(&ev).unwrap_or_default();
                     let _ = conn_clone.lock().await.write_frame(FrameKind::Event, &body).await;
                 }
+                ClientMessage::RunWorkflow { name } => {
+                    if !handle_run_workflow(&conn, &coordinator, skill_catalog.as_ref(), name).await {
+                        break;
+                    }
+                }
                 ClientMessage::SubscribePlan => {
                     spawn_plan_relay(plan_bus.subscribe(), Arc::clone(&conn));
                 }
@@ -1291,6 +1296,19 @@ fn spawn_handler_task(
                 if let Err(e) = session_store.save_resume_token(&token) {
                     warn!(error = %e, session = %sid, "supervisor: could not persist detach token");
                 }
+                // Stage C5 Task 4: a detach token means the supervisor moved
+                // this still-live session `Attached -> Detached` — the client
+                // walked away while work was resumable rather than ending on a
+                // terminal signal. That is exactly the `Abandoned` pain bucket.
+                // Gated on `on_detach` returning `Some` so a session that was
+                // never tracked / already detached (and the clean-completion
+                // path, which emitted `Completed` inside `run_loop`) does not
+                // double-emit. Default-off ⇒ no event.
+                origin_daemon::agent::record_session_stop_pain(
+                    origin_daemon::agent::SessionStopPain::reason_only(
+                        origin_telemetry::SessionStopReason::Abandoned,
+                    ),
+                );
             }
         }
     });
@@ -2141,13 +2159,24 @@ async fn handle_iterate_pending(
     if let Some(ev) = cleared_ev {
         let _ = event_tx.send(ev).await;
     }
-    // Push back only when the user's intent was something OTHER than a plain
-    // interrupt (a follow-up Prompt, an admin call, etc). Interrupt itself is
-    // consumed here — its job was to fire the GoalCleared we just emitted.
-    if !is_interrupt {
-        if let Some(msg) = parsed {
-            *pending_message.lock().await = Some(msg);
-        }
+    // Decide based on the user's intent. A plain `Interrupt` is the client
+    // explicitly cancelling the in-flight autonomous run; anything else is a
+    // follow-up we push back to the outer loop for normal dispatch.
+    if is_interrupt {
+        // Stage C5 Task 4: a plain `Interrupt` landing mid-goal-iteration is
+        // the client explicitly cancelling the in-flight autonomous run — the
+        // `UserInterrupt` pain bucket. Emitted only on the interrupt branch (a
+        // pushed-back follow-up is a continuation, not a cancellation), so the
+        // reason is precise. Default-off ⇒ no event.
+        origin_daemon::agent::record_session_stop_pain(
+            origin_daemon::agent::SessionStopPain::reason_only(
+                origin_telemetry::SessionStopReason::UserInterrupt,
+            ),
+        );
+    } else if let Some(msg) = parsed {
+        // A follow-up Prompt, an admin call, etc. — consumed here would lose
+        // the user's intent, so push it back for the outer loop to dispatch.
+        *pending_message.lock().await = Some(msg);
     }
     true
 }
@@ -2641,7 +2670,8 @@ async fn handle_admin(
         | ClientMessage::SelfDevReset
         | ClientMessage::TeamCreate { .. }
         | ClientMessage::TeamAssign { .. }
-        | ClientMessage::TeamStatus { .. } => return true,
+        | ClientMessage::TeamStatus { .. }
+        | ClientMessage::RunWorkflow { .. } => return true,
     };
     write_event(conn, &ev).await.is_ok()
 }
@@ -3104,21 +3134,23 @@ async fn drive_selfdev_cycle(
             .with_goal(description.clone());
         let store = FileReloadStore::new(origin_daemon::selfdev::reload_store_path());
         let authority = origin_daemon::selfdev::ApprovalAuthority::new(state);
-        let mut driver = state.driver();
-        match driver.request_restart(&authority, &store, &ctx) {
-            Ok(()) => {
-                info!(
-                    job = %job_id,
-                    generation = driver.generation(),
-                    "self-dev: restart AUTHORIZED + ReloadContext persisted — \
-                     TODO: relaunch via origin-supervisor resume-restart path (ready to relaunch)"
-                );
+        // `request_restart` persists `ctx` (generation already stamped) and flips
+        // the driver to `Resuming`; we hold the driver lock only for that quick
+        // fold and release it before any relaunch I/O / process exit.
+        let granted = {
+            let mut driver = state.driver();
+            match driver.request_restart(&authority, &store, &ctx) {
+                Ok(()) => Some(driver.generation()),
+                Err(e) => {
+                    // Deny ⇒ parked in AwaitingRestart awaiting SelfDevApprove.
+                    // This is the normal operator-in-the-loop path, not an error.
+                    info!(error = %e, job = %job_id, "self-dev: restart not yet granted (awaiting operator approval)");
+                    None
+                }
             }
-            Err(e) => {
-                // Deny ⇒ parked in AwaitingRestart awaiting SelfDevApprove. This
-                // is the normal operator-in-the-loop path, not an error.
-                info!(error = %e, job = %job_id, "self-dev: restart not yet granted (awaiting operator approval)");
-            }
+        };
+        if let Some(generation) = granted {
+            selfdev_relaunch_handoff(&job_id, &ctx, generation, &workspace);
         }
     } else {
         // Step 5: build or test failed ⇒ roll back to the pre-edit checkpoint on
@@ -3143,6 +3175,123 @@ async fn drive_selfdev_cycle(
                 "self-dev: storm guard tripped — refusing further jobs until SelfDevReset"
             );
         }
+    }
+}
+
+/// Perform the relaunch handoff after a restart was AUTHORIZED + the
+/// `ReloadContext` was persisted.
+///
+/// WITHOUT the `ORIGIN_SELFDEV_RELAUNCH=1` gate this is byte-identical to the
+/// historical behaviour: it logs "ready to relaunch" and returns (the daemon
+/// keeps running, the operator/supervisor drives any restart out of band).
+///
+/// WITH the gate set, it:
+/// 1. resolves the previous binary (`current_exe`) and the freshly-built
+///    artifact (`<CARGO_TARGET_DIR|workspace/target>/debug/<exe-file-name>`,
+///    matching the self-dev `CargoRunner`'s debug build);
+/// 2. writes `relaunch.json` via [`origin_selfdev::RelaunchRequest::record`]
+///    under the same state dir as the reload store;
+/// 3. flushes logs and `std::process::exit`s with the supervisor relaunch
+///    sentinel so origin-supervisor swaps the binary and restarts it.
+///
+/// If the artifact cannot be resolved (no `current_exe` file name) or the
+/// manifest cannot be written, it logs and DOES NOT exit — the daemon stays on
+/// the known-good binary and the persisted `ReloadContext` is left in place.
+///
+/// The persisted `ctx.generation` (mirrored in `reload.json`) is recorded into
+/// the manifest so the supervisor can detect cross-`exec` restart storms; the
+/// driver's post-grant `generation` is logged for cross-referencing.
+fn selfdev_relaunch_handoff(
+    job_id: &str,
+    ctx: &origin_selfdev::ReloadContext,
+    generation: u64,
+    workspace: &std::path::Path,
+) {
+    use origin_daemon::selfdev::{decide_relaunch_action, relaunch_enabled, RelaunchAction};
+
+    match decide_relaunch_action(relaunch_enabled(), true) {
+        RelaunchAction::LogOnly => {
+            info!(
+                job = %job_id,
+                generation,
+                relaunch_gate = relaunch_enabled(),
+                "self-dev: restart AUTHORIZED + ReloadContext persisted — ready to relaunch \
+                 (set ORIGIN_SELFDEV_RELAUNCH=1 to swap the binary via origin-supervisor)"
+            );
+        }
+        RelaunchAction::ExitForRelaunch => {
+            selfdev_write_manifest_and_exit(job_id, ctx, generation, workspace);
+        }
+    }
+}
+
+/// The gated exit path of [`selfdev_relaunch_handoff`]: resolve the previous and
+/// freshly-built binaries, write `relaunch.json`, then exit with the supervisor
+/// relaunch sentinel.
+///
+/// Returns (without exiting) only on a resolution/persist failure — the daemon
+/// then stays on the known-good binary with the `ReloadContext` left in place.
+//
+// A single linear sequence of guarded steps (resolve previous binary → resolve
+// fresh artifact → record manifest → log + exit), each with its own error
+// branch; the apparent complexity is the structured-logging macros, not control
+// flow. Splitting further would scatter the relaunch invariant. Allow the
+// nursery threshold, mirroring `selfdev_successor_boot`.
+#[allow(clippy::cognitive_complexity)]
+fn selfdev_write_manifest_and_exit(
+    job_id: &str,
+    ctx: &origin_selfdev::ReloadContext,
+    generation: u64,
+    workspace: &std::path::Path,
+) {
+    use origin_daemon::selfdev::{
+        resolve_new_artifact_path, resolve_target_dir, selfdev_state_dir, SELFDEV_RELAUNCH_EXIT_CODE,
+    };
+    use origin_selfdev::{FileRelaunchStore, RelaunchRequest};
+    // Imported at fn scope (before any statement) so the pre-exit flush below
+    // does not trip `clippy::items_after_statements`.
+    use std::io::Write as _;
+
+    let Ok(previous_binary) = std::env::current_exe() else {
+        warn!(job = %job_id, "self-dev: cannot resolve current_exe; staying on the running binary (no relaunch)");
+        return;
+    };
+    let target_dir = resolve_target_dir(workspace, std::env::var_os("CARGO_TARGET_DIR"));
+    // The self-dev CargoRunner builds `cargo build --quiet` (no --release), so
+    // the artifact lives under the `debug` profile dir.
+    let Some(new_binary) = resolve_new_artifact_path(&target_dir, "debug", &previous_binary) else {
+        warn!(
+            job = %job_id,
+            previous = %previous_binary.display(),
+            "self-dev: cannot resolve fresh artifact path from current_exe; staying on the running binary (no relaunch)"
+        );
+        return;
+    };
+    let store = FileRelaunchStore::under_state_dir(selfdev_state_dir());
+    match RelaunchRequest::new(&new_binary, &previous_binary).record(&store, ctx.generation) {
+        Ok(_manifest) => {
+            info!(
+                job = %job_id,
+                generation,
+                previous = %previous_binary.display(),
+                new = %new_binary.display(),
+                manifest = %store.path().display(),
+                exit_code = SELFDEV_RELAUNCH_EXIT_CODE,
+                "self-dev: relaunch manifest written — exiting for supervisor binary swap"
+            );
+            // Best-effort flush of the std streams before exit (exit does not
+            // unwind, so Drop-based flushes will not run). The supervisor
+            // (Job-object/parent) reaps any in-flight tasks.
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            std::process::exit(SELFDEV_RELAUNCH_EXIT_CODE);
+        }
+        Err(e) => warn!(
+            error = %e,
+            job = %job_id,
+            manifest = %store.path().display(),
+            "self-dev: failed to write relaunch manifest; staying on the running binary (no relaunch)"
+        ),
     }
 }
 
@@ -3343,6 +3492,69 @@ fn drive_to_resuming(driver: &mut origin_selfdev::SelfDevDriver) -> bool {
 /// its lifecycle, and bridge each [`TeamEvent`](origin_swarm::TeamEvent) onto
 /// the wire AND the lifecycle-hook runtime. Returns `false` only on an IPC write
 /// failure.
+/// Handle a [`ClientMessage::RunWorkflow`]: load the named workflow fresh from
+/// `~/.origin/workflows.toml` (so user edits land without a restart), run it as
+/// a phase-layered parallel DAG via [`origin_daemon::workflow_runner::run_workflow`]
+/// against the daemon-wide swarm `coordinator`, and reply with a single
+/// [`StreamEvent::WorkflowRunComplete`] summarising the run. An unknown name or a
+/// run failure replies with [`StreamEvent::SkillError`]. Returns `false` only on
+/// a connection write error (so the caller breaks the message loop).
+async fn handle_run_workflow(
+    conn: &SharedConnection,
+    coordinator: &Coordinator,
+    skill_catalog: &SkillCatalog,
+    name: String,
+) -> bool {
+    let home = std::env::var_os("ORIGIN_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let wf_path = home.join(".origin").join("workflows.toml");
+    let file = match origin_daemon::workflows::load_from(&wf_path) {
+        Ok(f) => f,
+        Err(e) => {
+            return write_event(
+                conn,
+                &StreamEvent::SkillError {
+                    message: format!("workflows.toml load: {e}"),
+                },
+            )
+            .await
+            .is_ok();
+        }
+    };
+    let Some(wf) = file.workflows.iter().find(|w| w.name == name) else {
+        return write_event(
+            conn,
+            &StreamEvent::SkillError {
+                message: format!("no such workflow: {name}"),
+            },
+        )
+        .await
+        .is_ok();
+    };
+    let ev = match origin_daemon::workflow_runner::run_workflow(wf, coordinator, skill_catalog).await {
+        Ok(report) => StreamEvent::WorkflowRunComplete {
+            name: report.name,
+            layers: u32::try_from(report.layers).unwrap_or(u32::MAX),
+            steps: report
+                .steps
+                .into_iter()
+                .map(|s| origin_daemon::protocol::WorkflowRunStep {
+                    index: u32::try_from(s.index).unwrap_or(u32::MAX),
+                    skill: s.skill,
+                    layer: u32::try_from(s.layer).unwrap_or(u32::MAX),
+                    status: s.status,
+                })
+                .collect(),
+        },
+        Err(e) => StreamEvent::SkillError {
+            message: format!("workflow run failed: {e}"),
+        },
+    };
+    write_event(conn, &ev).await.is_ok()
+}
+
 async fn handle_team_assign(
     conn: &SharedConnection,
     coordinator: &Coordinator,

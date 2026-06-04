@@ -283,6 +283,15 @@ fn apply_decision(state: &SupervisorState, decision: &Decision) {
         Decision::Keep { .. } => {}
         Decision::Retire { session_id, reason } => {
             tracing::info!(session = %session_id, ?reason, "supervisor: session retired (idle grace)");
+            // Stage C5 Task 4: the supervisor is retiring this session after an
+            // inactivity grace lapsed (idle while attached, or detached past its
+            // grace) — that is the `Idle` pain bucket. Emitted at the single
+            // idle-retire decision site so it fires exactly once per retirement,
+            // for both `IdleGrace` and `DetachedGrace` (both are
+            // inactivity-timeout closures). Default-off ⇒ no event.
+            crate::agent::record_session_stop_pain(crate::agent::SessionStopPain::reason_only(
+                origin_telemetry::SessionStopReason::Idle,
+            ));
             // Drop our bookkeeping; the real session persists on disk. The
             // foreground interactive session is only retired after the long
             // idle grace, and we never force-close its connection.

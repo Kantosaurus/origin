@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `Language` enum + tree-sitter parser bindings.
 
+use std::path::Path;
+
 use thiserror::Error;
 use tree_sitter::{Parser as TsParser, Tree};
 
@@ -28,6 +30,33 @@ pub enum LangError {
 }
 
 impl Language {
+    /// Detect a [`Language`] from a file extension (without the leading dot).
+    ///
+    /// The match is case-insensitive. Returns `None` for any extension that
+    /// does not correspond to one of the five supported grammars.
+    #[must_use]
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        match ext.to_ascii_lowercase().as_str() {
+            "rs" => Some(Self::Rust),
+            "ts" | "tsx" | "mts" | "cts" => Some(Self::TypeScript),
+            "py" | "pyi" => Some(Self::Python),
+            "go" => Some(Self::Go),
+            "java" => Some(Self::Java),
+            _ => None,
+        }
+    }
+
+    /// Detect a [`Language`] from a file path by inspecting its extension.
+    ///
+    /// Delegates to [`Language::from_extension`]; returns `None` when the path
+    /// has no extension or the extension is not recognised.
+    #[must_use]
+    pub fn from_path(path: &Path) -> Option<Self> {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(Self::from_extension)
+    }
+
     /// Map this `Language` to its tree-sitter grammar.
     #[must_use]
     pub fn ts_language(self) -> tree_sitter::Language {

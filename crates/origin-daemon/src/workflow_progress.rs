@@ -141,9 +141,12 @@ mod tests {
             description: None,
             steps: steps
                 .iter()
-                .map(|s| WorkflowStep {
+                .enumerate()
+                .map(|(i, s)| WorkflowStep {
+                    id: i,
                     skill: (*s).into(),
                     args: None,
+                    depends_on: Vec::new(),
                 })
                 .collect(),
         }

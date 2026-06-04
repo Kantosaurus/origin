@@ -34,6 +34,7 @@ pub mod creds;
 pub mod error;
 pub mod http;
 pub mod model;
+pub mod provision;
 pub mod request;
 
 use origin_keyvault::{KeyVault, Secret};

@@ -19,6 +19,7 @@ pub mod monitor;
 pub mod multi_edit;
 pub mod read;
 pub mod recall;
+pub mod run_workflow;
 pub mod task;
 pub mod tool_search;
 pub mod web_fetch;

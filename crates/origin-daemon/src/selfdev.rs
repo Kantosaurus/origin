@@ -48,6 +48,23 @@ use origin_vcs::{GitRunner, RestoreMode, ShadowGit, VcsError};
 /// Env gate: the whole self-dev control plane is inert unless this is `1`.
 const SELFDEV_ENV: &str = "ORIGIN_SELFDEV";
 
+/// Additional opt-in env gate for the ACTUAL binary relaunch. Required *in
+/// addition to* [`SELFDEV_ENV`]: with `ORIGIN_SELFDEV=1` alone the daemon only
+/// authorizes + persists the restart and logs "ready to relaunch" (today's
+/// behaviour, byte-identical). Only with `ORIGIN_SELFDEV_RELAUNCH=1` as well
+/// does an authorized restart write `relaunch.json` and exit with the
+/// supervisor relaunch sentinel.
+const SELFDEV_RELAUNCH_ENV: &str = "ORIGIN_SELFDEV_RELAUNCH";
+
+/// Exit code the daemon uses to ask the supervisor to swap it for the freshly
+/// self-built binary (rather than treating the exit as a crash).
+///
+/// This MUST stay in sync with `origin_supervisor::relaunch::SELFDEV_RELAUNCH_EXIT_CODE`.
+/// It is duplicated as a local constant (instead of importing the supervisor)
+/// so the daemon's relaunch path does not depend on the supervisor binary's
+/// internals; the value is asserted against the contract in tests there.
+pub const SELFDEV_RELAUNCH_EXIT_CODE: i32 = 86;
+
 /// Default storm-guard ceiling (consecutive failed generations before self-dev
 /// refuses new jobs until [`SelfDevDriver::reset_storm_guard`]).
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
@@ -93,6 +110,41 @@ impl SelfDevState {
 #[must_use]
 pub fn enabled() -> bool {
     std::env::var(SELFDEV_ENV).as_deref() == Ok("1")
+}
+
+/// `true` iff the ACTUAL binary relaunch is opted into (`ORIGIN_SELFDEV_RELAUNCH=1`).
+///
+/// This is read in addition to [`enabled`]: without it an authorized restart
+/// stays a log-only "ready to relaunch" (today's default-off behaviour); with
+/// it, an authorized restart writes the relaunch manifest and exits with
+/// [`SELFDEV_RELAUNCH_EXIT_CODE`] so the supervisor swaps the binary.
+#[must_use]
+pub fn relaunch_enabled() -> bool {
+    std::env::var(SELFDEV_RELAUNCH_ENV).as_deref() == Ok("1")
+}
+
+/// What the restart-authorized site should do, decided purely from the relaunch
+/// env gate and whether the restart was authorized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelaunchAction {
+    /// Write the relaunch manifest, persist the reload context (already done),
+    /// shut down gracefully, and `std::process::exit(SELFDEV_RELAUNCH_EXIT_CODE)`.
+    ExitForRelaunch,
+    /// Keep today's behaviour: log "ready to relaunch" and stay running.
+    LogOnly,
+}
+
+/// Decide whether the restart-authorized site should exit-for-relaunch or only log.
+///
+/// The exit path is taken IFF the relaunch gate is set AND the restart was
+/// authorized; every other combination keeps the daemon running (log-only).
+#[must_use]
+pub const fn decide_relaunch_action(relaunch_gate: bool, restart_authorized: bool) -> RelaunchAction {
+    if relaunch_gate && restart_authorized {
+        RelaunchAction::ExitForRelaunch
+    } else {
+        RelaunchAction::LogOnly
+    }
 }
 
 /// The process-global self-dev state, or `None` when disabled.
@@ -251,6 +303,61 @@ pub fn shadow_git_dir() -> std::path::PathBuf {
         .join("shadow.git")
 }
 
+/// The daemon state directory base (`data_local_dir()`).
+///
+/// Uses the same fallback as [`reload_store_path`]. This is the `state_dir` to
+/// hand to [`origin_selfdev::FileRelaunchStore::under_state_dir`], which appends
+/// `origin/selfdev/relaunch.json`.
+#[allow(clippy::module_name_repetitions)] // `selfdev_state_dir` reads clearly at the call site (`origin_daemon::selfdev::selfdev_state_dir`).
+#[must_use]
+pub fn selfdev_state_dir() -> std::path::PathBuf {
+    dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// The relaunch-manifest path the supervisor reads.
+///
+/// The conventional `<data_local_dir>/origin/selfdev/relaunch.json`. Mirrors
+/// [`reload_store_path`] but is a *separate* slot (the manifest is the
+/// binary-swap contract; the reload context is the orchestration-resume state).
+#[must_use]
+pub fn relaunch_store_path() -> std::path::PathBuf {
+    selfdev_state_dir()
+        .join("origin")
+        .join("selfdev")
+        .join("relaunch.json")
+}
+
+/// Resolve the cargo target directory the self-dev [`origin_selfdev::CargoRunner`]
+/// builds into: the `CARGO_TARGET_DIR` override when set, else `<workspace>/target`.
+///
+/// Pure: the env value is passed in (the caller reads `CARGO_TARGET_DIR`) so the
+/// join is unit-testable without touching the process environment.
+#[must_use]
+pub fn resolve_target_dir(
+    workspace: &std::path::Path,
+    cargo_target_dir: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    cargo_target_dir.map_or_else(|| workspace.join("target"), std::path::PathBuf::from)
+}
+
+/// Resolve the freshly-built artifact path corresponding to the running daemon
+/// binary: `<target_dir>/<profile>/<current_exe file name>`.
+///
+/// The self-dev `CargoRunner` runs `cargo build --quiet` with NO `--release`, so
+/// `profile` is `"debug"`; the artifact keeps the running binary's file name
+/// (e.g. `origin-daemon` / `origin-daemon.exe`). Returns `None` when
+/// `current_exe` has no file-name component (so the caller can log and NOT exit
+/// rather than swapping in an unresolved path).
+#[must_use]
+pub fn resolve_new_artifact_path(
+    target_dir: &std::path::Path,
+    profile: &str,
+    current_exe: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let file_name = current_exe.file_name()?;
+    Some(target_dir.join(profile).join(file_name))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -344,5 +451,89 @@ mod tests {
     fn reload_store_path_is_under_selfdev() {
         let p = reload_store_path();
         assert!(p.ends_with(std::path::Path::new("selfdev").join("reload.json")));
+    }
+
+    #[test]
+    fn relaunch_disabled_when_env_unset() {
+        // A clean test shell never sets ORIGIN_SELFDEV_RELAUNCH, so the relaunch
+        // gate is off (relaunch is opt-in IN ADDITION to ORIGIN_SELFDEV).
+        if std::env::var(SELFDEV_RELAUNCH_ENV).is_err() {
+            assert!(!relaunch_enabled(), "relaunch must default to off");
+        }
+    }
+
+    #[test]
+    fn resolve_new_artifact_path_joins_target_profile_and_exe_name() {
+        use std::path::Path;
+        // The CargoRunner builds `cargo build --quiet` (no --release) into
+        // <target>/debug/<current-exe-file-name>.
+        let target = Path::new("/work/target");
+        let exe = Path::new("/usr/local/bin/origin-daemon");
+        let got = resolve_new_artifact_path(target, "debug", exe).expect("file name present");
+        assert_eq!(got, Path::new("/work/target/debug/origin-daemon"));
+    }
+
+    #[test]
+    fn resolve_new_artifact_path_preserves_windows_exe_extension() {
+        use std::path::Path;
+        // On Windows the running binary keeps its `.exe` suffix; the freshly
+        // built artifact has the identical file name in the profile dir.
+        let target = Path::new("C:/work/target");
+        let exe = Path::new("C:/bin/origin-daemon.exe");
+        let got = resolve_new_artifact_path(target, "debug", exe).expect("file name present");
+        assert_eq!(got.file_name().and_then(|n| n.to_str()), Some("origin-daemon.exe"));
+        assert!(got.ends_with(Path::new("target/debug/origin-daemon.exe")));
+    }
+
+    #[test]
+    fn resolve_new_artifact_path_none_without_file_name() {
+        use std::path::Path;
+        // A path that has no file-name component (e.g. a bare root) cannot be
+        // resolved to an artifact; the caller logs and does NOT exit.
+        assert!(resolve_new_artifact_path(Path::new("/work/target"), "debug", Path::new("/")).is_none());
+    }
+
+    #[test]
+    fn selfdev_target_dir_honours_cargo_target_dir_override() {
+        use std::path::Path;
+        // When CARGO_TARGET_DIR is set the CargoRunner inherits it, so the
+        // artifact lives there, not under <workspace>/target.
+        let got = resolve_target_dir(Path::new("/work"), Some("/custom/out".into()));
+        assert_eq!(got, Path::new("/custom/out"));
+    }
+
+    #[test]
+    fn selfdev_target_dir_defaults_to_workspace_target() {
+        use std::path::Path;
+        let got = resolve_target_dir(Path::new("/work"), None);
+        assert_eq!(got, Path::new("/work/target"));
+    }
+
+    #[test]
+    fn decide_relaunch_action_exits_only_when_gated_and_authorized() {
+        // The exit (process::exit(86)) happens iff BOTH the relaunch gate is set
+        // AND the restart was authorized; every other combination logs only.
+        assert_eq!(
+            decide_relaunch_action(true, true),
+            RelaunchAction::ExitForRelaunch
+        );
+        assert_eq!(
+            decide_relaunch_action(false, true),
+            RelaunchAction::LogOnly
+        );
+        assert_eq!(
+            decide_relaunch_action(true, false),
+            RelaunchAction::LogOnly
+        );
+        assert_eq!(
+            decide_relaunch_action(false, false),
+            RelaunchAction::LogOnly
+        );
+    }
+
+    #[test]
+    fn relaunch_store_path_is_under_selfdev() {
+        let p = relaunch_store_path();
+        assert!(p.ends_with(std::path::Path::new("selfdev").join("relaunch.json")));
     }
 }
