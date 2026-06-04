@@ -74,18 +74,30 @@ impl SteeringQueue {
     }
 }
 
-/// Prepends a steering block ahead of the base user text when present.
+/// Appends a steering block after the base user text when present.
 ///
 /// When `steering_block` is `Some`, the block is wrapped in the
-/// [`STEER_OPEN`] and [`STEER_CLOSE`] markers and placed before
-/// `base_user_text`, separated by a blank line. When `None`, the base
-/// text is returned unchanged.
+/// [`STEER_OPEN`] and [`STEER_CLOSE`] markers and placed after
+/// `base_user_text`, separated by a blank line. Keeping steering as a
+/// trailing suffix leaves the stable prefix (system + prior turns + base
+/// user text) byte-identical so Anthropic prefix caching stays warm. When
+/// `None`, the base text is returned unchanged.
 #[must_use]
 pub fn merge_into_prompt(base_user_text: &str, steering_block: Option<&str>) -> String {
     steering_block.map_or_else(
         || base_user_text.to_string(),
-        |block| format!("{STEER_OPEN}\n{block}\n{STEER_CLOSE}\n\n{base_user_text}"),
+        |block| format!("{base_user_text}\n\n{STEER_OPEN}\n{block}\n{STEER_CLOSE}"),
     )
+}
+
+/// Wraps a steering block in the steering markers without any base text.
+///
+/// Returns the `steering_block` enclosed by [`STEER_OPEN`] and
+/// [`STEER_CLOSE`] on their own lines. The daemon appends this as a
+/// separate user message block so the cached prefix stays byte-identical.
+#[must_use]
+pub fn wrap_block(steering_block: &str) -> String {
+    format!("{STEER_OPEN}\n{steering_block}\n{STEER_CLOSE}")
 }
 
 #[cfg(test)]
@@ -126,14 +138,24 @@ mod tests {
     }
 
     #[test]
-    fn merge_with_some_wraps_in_markers_before_base() {
+    fn merge_with_some_wraps_in_markers_after_base() {
         let merged = merge_into_prompt("base text", Some("hint"));
         assert!(merged.contains(STEER_OPEN));
         assert!(merged.contains(STEER_CLOSE));
         assert!(merged.contains("hint"));
         let open_pos = merged.find(STEER_OPEN).unwrap();
         let base_pos = merged.find("base text").unwrap();
-        assert!(open_pos < base_pos, "steering must precede base text");
+        assert!(base_pos < open_pos, "base text must precede steering");
+        assert!(
+            !merged.starts_with(STEER_OPEN),
+            "steering must be a trailing suffix, not a prepended prefix"
+        );
+    }
+
+    #[test]
+    fn wrap_block_returns_exact_wrapped_form() {
+        let wrapped = wrap_block("hint");
+        assert_eq!(wrapped, format!("{STEER_OPEN}\nhint\n{STEER_CLOSE}"));
     }
 
     #[test]
@@ -168,6 +190,7 @@ mod tests {
         assert!(merged.contains("steer one"));
         assert!(merged.contains("steer two"));
         assert!(merged.contains("original prompt"));
-        assert!(merged.starts_with(STEER_OPEN));
+        assert!(merged.ends_with(STEER_CLOSE));
+        assert!(merged.starts_with("original prompt"));
     }
 }

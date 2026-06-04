@@ -77,3 +77,80 @@ pub trait DiagnosticsHandle: Send + Sync + std::fmt::Debug {
     /// first query. Not as efficient but avoids the envelope plumbing.
     async fn notify_file_changed(&self, path: &Path, contents: &str);
 }
+
+/// A source location returned by an LSP navigation query.
+///
+/// Produced by go-to-definition / find-references. Line and column are 1-based
+/// for user-facing presentation, matching the `Diagnostics` tool's rendering
+/// convention; the daemon-side handle converts to/from the 0-based LSP wire
+/// form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NavLocation {
+    pub file: std::path::PathBuf,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// A call-hierarchy item: an incoming caller or an outgoing callee.
+///
+/// Returned by `callHierarchy/incomingCalls` / `outgoingCalls`. Line/col are
+/// 1-based.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NavCallItem {
+    pub name: String,
+    pub file: std::path::PathBuf,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// Object-safe trait the `LspNavigate` tool calls through, mirroring
+/// [`DiagnosticsHandle`]. Implemented in the daemon by `DaemonRa` (wrapping
+/// `origin_lsp_client::LspClient`); tests use a `FakeNav`.
+///
+/// Positions are 1-based here; the daemon implementation handles the 0-based
+/// LSP wire conversion.
+#[async_trait]
+pub trait NavigationHandle: Send + Sync + std::fmt::Debug {
+    /// Resolve the definition(s) of the symbol at `path:line:col`.
+    ///
+    /// # Errors
+    /// Returns `subsystem.ra_unavailable` if the language server is down.
+    async fn definition(&self, path: &Path, line: u32, col: u32)
+        -> Result<Vec<NavLocation>, ToolError>;
+
+    /// Find references to the symbol at `path:line:col`.
+    ///
+    /// # Errors
+    /// Returns `subsystem.ra_unavailable` if the language server is down.
+    async fn references(
+        &self,
+        path: &Path,
+        line: u32,
+        col: u32,
+        include_declaration: bool,
+    ) -> Result<Vec<NavLocation>, ToolError>;
+
+    /// Resolve incoming callers of the symbol at `path:line:col`.
+    ///
+    /// # Errors
+    /// Returns `subsystem.ra_unavailable` if the language server is down or
+    /// lacks call-hierarchy support (in which case an empty list is fine).
+    async fn incoming_calls(
+        &self,
+        path: &Path,
+        line: u32,
+        col: u32,
+    ) -> Result<Vec<NavCallItem>, ToolError>;
+
+    /// Resolve outgoing callees of the symbol at `path:line:col`.
+    ///
+    /// # Errors
+    /// Returns `subsystem.ra_unavailable` if the language server is down or
+    /// lacks call-hierarchy support (in which case an empty list is fine).
+    async fn outgoing_calls(
+        &self,
+        path: &Path,
+        line: u32,
+        col: u32,
+    ) -> Result<Vec<NavCallItem>, ToolError>;
+}

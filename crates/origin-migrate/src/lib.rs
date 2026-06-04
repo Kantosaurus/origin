@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod claude_code;
+pub mod codex;
 pub mod jcode;
 pub mod opencode;
 pub mod reconstruct;

@@ -19,7 +19,6 @@
 //! prevents the parent↔child circular-wait the `Critical`-on-`Critical` design
 //! would cause.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -44,13 +43,44 @@ const DEFAULT_WORKER_TURNS: u32 = 32;
 /// read-only builtins); permission-gated tools (Edit/Write/Bash/…) are denied
 /// unless named in the worker's `allowed_tools`.
 struct AllowList {
-    allowed: HashSet<String>,
+    set: globset::GlobSet,
+}
+
+impl AllowList {
+    /// Build from the worker's allow-list patterns, EXCLUDING `Task` (a child may
+    /// not spawn its own children). Each entry is treated as a glob: a plain name
+    /// like `Read` matches only itself, while `mcp__github__*`, `graph_*`, or `*`
+    /// match a whole family. A pattern that fails to compile as a glob falls back
+    /// to a literal exact-match, so a malformed entry can never *widen* access.
+    fn from_patterns(patterns: &[String]) -> Self {
+        let mut builder = globset::GlobSetBuilder::new();
+        for p in patterns {
+            if p == "Task" {
+                continue;
+            }
+            match globset::GlobBuilder::new(p).literal_separator(false).build() {
+                Ok(g) => {
+                    builder.add(g);
+                }
+                Err(_) => {
+                    if let Ok(g) = globset::Glob::new(&globset::escape(p)) {
+                        builder.add(g);
+                    }
+                }
+            }
+        }
+        Self {
+            set: builder.build().unwrap_or_else(|_| globset::GlobSet::empty()),
+        }
+    }
 }
 
 #[async_trait]
 impl Prompter for AllowList {
     async fn ask(&self, meta: &ToolMeta, _args_preview: &str) -> bool {
-        self.allowed.contains(meta.name)
+        // `Task` is never delegable to a child (no recursion), regardless of
+        // patterns; otherwise glob-match the tool name against the allow-list.
+        meta.name != "Task" && self.set.is_match(meta.name)
     }
 }
 
@@ -82,12 +112,10 @@ async fn run_worker(
     });
     let mut session = Session::new(provider.name(), &model);
 
-    // Narrow the child's tools to its allow-list, and never `Task` (a child that
-    // could spawn its own children would re-enter the Swarm pool and risk the
-    // same circular wait this design avoids).
-    let mut allowed: HashSet<String> = ctx.spec.allowed_tools.iter().cloned().collect();
-    allowed.remove("Task");
-    let prompter = AllowList { allowed };
+    // Narrow the child's tools to its allow-list (glob patterns supported), and
+    // never `Task` (a child that could spawn its own children would re-enter the
+    // Swarm pool and risk the same circular wait this design avoids).
+    let prompter = AllowList::from_patterns(&ctx.spec.allowed_tools);
 
     let max_turns = if ctx.budget.max_tool_calls == 0 {
         DEFAULT_WORKER_TURNS
@@ -155,4 +183,54 @@ async fn run_worker(
         }
     };
     Ok(report)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::AllowList;
+    use origin_permission::prompt::Prompter;
+    use origin_tools::{registry_iter, ToolMeta};
+
+    fn meta(name: &str) -> &'static ToolMeta {
+        registry_iter().find(|m| m.name == name).expect("tool must be registered")
+    }
+
+    #[tokio::test]
+    async fn exact_name_matches_only_itself() {
+        let al = AllowList::from_patterns(&["Read".to_string()]);
+        assert!(al.ask(meta("Read"), "").await);
+        assert!(!al.ask(meta("Write"), "").await);
+    }
+
+    #[tokio::test]
+    async fn star_matches_everything_except_task() {
+        let al = AllowList::from_patterns(&["*".to_string()]);
+        assert!(al.ask(meta("Read"), "").await);
+        assert!(al.ask(meta("Write"), "").await);
+        assert!(al.ask(meta("Bash"), "").await);
+        // `Task` is always denied (no recursion), even under `*`.
+        assert!(!al.ask(meta("Task"), "").await);
+    }
+
+    #[tokio::test]
+    async fn prefix_glob_matches_namespace_family() {
+        let al = AllowList::from_patterns(&["graph_*".to_string()]);
+        assert!(al.ask(meta("graph_query"), "").await);
+        assert!(al.ask(meta("graph_explain"), "").await);
+        assert!(!al.ask(meta("Read"), "").await);
+    }
+
+    #[tokio::test]
+    async fn empty_allow_list_denies_all() {
+        let al = AllowList::from_patterns(&[]);
+        assert!(!al.ask(meta("Read"), "").await);
+    }
+
+    #[tokio::test]
+    async fn explicit_task_pattern_is_still_denied() {
+        let al = AllowList::from_patterns(&["Task".to_string(), "Read".to_string()]);
+        assert!(!al.ask(meta("Task"), "").await);
+        assert!(al.ask(meta("Read"), "").await);
+    }
 }

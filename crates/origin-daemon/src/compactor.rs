@@ -144,18 +144,36 @@ pub async fn maybe_compact_transcript(
     summaries: &[Option<String>],
     soft_cap_bytes: usize,
 ) -> Option<Vec<Message>> {
+    maybe_compact_transcript_indexed(transcript, summaries, soft_cap_bytes)
+        .await
+        .map(|o| o.transcript)
+}
+
+/// Same as [`maybe_compact_transcript`] but returns the full [`CompactionOutput`]
+/// so the caller also learns WHICH turn indices were collapsed.
+///
+/// The agent loop uses this to snapshot each compacted turn's pre-compaction
+/// body (via `SessionStore::snapshot_original`) before replacing the transcript,
+/// making compaction reversible by a later rewind. Returns `None` (no hook fire,
+/// no allocation) when under the cap, exactly like [`maybe_compact_transcript`].
+pub async fn maybe_compact_transcript_indexed(
+    transcript: &[Message],
+    summaries: &[Option<String>],
+    soft_cap_bytes: usize,
+) -> Option<CompactionOutput> {
     let current_bytes = estimate_transcript_bytes(transcript);
     if current_bytes <= soft_cap_bytes {
         return None;
     }
-    let out = compact_with_hooks(&CompactionInput {
-        transcript,
-        summaries,
-        current_bytes,
-        soft_cap_bytes,
-    })
-    .await;
-    Some(out.transcript)
+    Some(
+        compact_with_hooks(&CompactionInput {
+            transcript,
+            summaries,
+            current_bytes,
+            soft_cap_bytes,
+        })
+        .await,
+    )
 }
 
 #[cfg(test)]

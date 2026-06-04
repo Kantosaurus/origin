@@ -256,8 +256,9 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
         } => origin_cli::admin::export_session(session_id, json, out).await,
         Cmd::Checkpoint { label } => origin_cli::vcs::checkpoint(label),
         Cmd::Checkpoints => origin_cli::vcs::checkpoints(),
-        Cmd::Rewind { id, files_only } => origin_cli::vcs::rewind(&id, files_only),
+        Cmd::Rewind { id, files_only, path } => origin_cli::vcs::rewind(&id, files_only, path),
         Cmd::CheckpointDiff { id } => origin_cli::vcs::checkpoint_diff(&id),
+        Cmd::Memory { sub } => origin_cli::memory_inbox::run_memory(sub),
         Cmd::Scout { repo_url, cache } => origin_cli::scout::run(&repo_url, cache),
         Cmd::Watch { root, ext } => origin_cli::watch::run(root, ext),
         Cmd::CopyContext { instruction, files } => {

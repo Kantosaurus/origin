@@ -22,6 +22,7 @@ use std::path::Path;
 use origin_core::types::{Block, Message, Role};
 
 use crate::claude_code::ClaudeCodeSource;
+use crate::codex::CodexSource;
 use crate::jcode::JcodeSource;
 use crate::opencode::OpencodeSource;
 use crate::source::{ImportedMessage, ImportedSession, Source, SourceError};
@@ -61,6 +62,8 @@ pub enum SourceKind {
     Jcode,
     /// opencode (`storage/*.json`).
     Opencode,
+    /// Codex CLI (`sessions/**/rollout-*.jsonl`).
+    Codex,
 }
 
 impl SourceKind {
@@ -72,17 +75,19 @@ impl SourceKind {
             Self::ClaudeCode => "claude-code",
             Self::Jcode => "jcode",
             Self::Opencode => "opencode",
+            Self::Codex => "codex",
         }
     }
 
     /// Parse a harness tag back into a [`SourceKind`]. Accepts the canonical
-    /// [`Self::as_str`] tags plus common aliases (`claude`, `cc`, `oc`).
+    /// [`Self::as_str`] tags plus common aliases (`claude`, `cc`, `oc`, `cx`).
     #[must_use]
     pub fn from_tag(tag: &str) -> Option<Self> {
         match tag.trim().to_ascii_lowercase().as_str() {
             "claude-code" | "claude" | "cc" => Some(Self::ClaudeCode),
             "jcode" => Some(Self::Jcode),
             "opencode" | "oc" => Some(Self::Opencode),
+            "codex" | "cx" => Some(Self::Codex),
             _ => None,
         }
     }
@@ -204,6 +209,12 @@ pub fn from_opencode(session: &ImportedSession, external_model_id: Option<&str>)
     reconstruct_session(session, SourceKind::Opencode, external_model_id)
 }
 
+/// Reconstruct a Codex session for live resume.
+#[must_use]
+pub fn from_codex(session: &ImportedSession, external_model_id: Option<&str>) -> ResumedSession {
+    reconstruct_session(session, SourceKind::Codex, external_model_id)
+}
+
 /// Unified entry point: reconstruct a session given its declared [`SourceKind`].
 ///
 /// Dispatches on `kind`; the per-source functions currently share one core, but
@@ -227,6 +238,7 @@ impl SourceKind {
             Self::ClaudeCode => ClaudeCodeSource.scan(root),
             Self::Jcode => JcodeSource.scan(root),
             Self::Opencode => OpencodeSource.scan(root),
+            Self::Codex => CodexSource.scan(root),
         }
     }
 }
@@ -456,12 +468,46 @@ mod tests {
 
     #[test]
     fn source_kind_tag_roundtrip() {
-        for k in [SourceKind::ClaudeCode, SourceKind::Jcode, SourceKind::Opencode] {
+        for k in [
+            SourceKind::ClaudeCode,
+            SourceKind::Jcode,
+            SourceKind::Opencode,
+            SourceKind::Codex,
+        ] {
             assert_eq!(SourceKind::from_tag(k.as_str()), Some(k));
         }
         assert_eq!(SourceKind::from_tag("CLAUDE"), Some(SourceKind::ClaudeCode));
         assert_eq!(SourceKind::from_tag("oc"), Some(SourceKind::Opencode));
+        assert_eq!(SourceKind::from_tag("CODEX"), Some(SourceKind::Codex));
+        assert_eq!(SourceKind::from_tag("cx"), Some(SourceKind::Codex));
         assert_eq!(SourceKind::from_tag("nope"), None);
+    }
+
+    /// Codex transcripts flatten role/body pairs just like the other adapters
+    /// (see [`crate::codex`]); verify ordering, tool-role mapping, and that the
+    /// `gpt-5-codex` model id remaps to the codex catalog entry.
+    #[test]
+    fn codex_roundtrip_orders_roles_and_suggests_codex_model() {
+        let session = ImportedSession {
+            source_id: "sessions/2026/rollout-test.jsonl".to_string(),
+            title: None,
+            created_at_unix_ms: 1_700_000_000_000,
+            messages: vec![
+                msg("user", "refactor the parser"),
+                msg("assistant", "splitting the lexer out"),
+                msg("tool", "src/lexer.rs\nsrc/parser.rs"),
+            ],
+        };
+
+        let resumed = from_codex(&session, Some("gpt-5-codex"));
+
+        assert_eq!(resumed.source_kind, SourceKind::Codex);
+        assert_eq!(resumed.original_id, "sessions/2026/rollout-test.jsonl");
+        let roles: Vec<Role> = resumed.messages.iter().map(|m| m.role).collect();
+        assert_eq!(roles, vec![Role::User, Role::Assistant, Role::Tool]);
+        assert_eq!(text_of(&resumed.messages[1]), "splitting the lexer out");
+        assert_eq!(resumed.suggested_model, "gpt-5-codex");
+        assert!(!resumed.suggested_model.is_empty());
     }
 
     /// A non-existent path must fail before any read, with `NotFound`.

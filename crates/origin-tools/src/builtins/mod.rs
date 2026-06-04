@@ -14,6 +14,7 @@ pub mod graph_query;
 pub mod graph_rebuild;
 pub mod graph_summarize;
 pub mod grep_tool;
+pub mod lsp_nav;
 pub mod mem;
 pub mod monitor;
 pub mod multi_edit;

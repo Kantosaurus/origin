@@ -189,10 +189,21 @@ async fn maybe_compact_session(session: &mut Session, opts: &LoopOptions) {
             }
         }
     }
-    if let Some(compacted) =
-        crate::compactor::maybe_compact_transcript(&session.messages, &summaries, cap).await
+    if let Some(output) =
+        crate::compactor::maybe_compact_transcript_indexed(&session.messages, &summaries, cap).await
     {
-        session.messages = compacted;
+        // Before collapsing the oldest turns into their summaries, snapshot each
+        // one's pre-compaction body so a later `rewind` can reconstruct it
+        // (gap 2: rewind across compaction points). Best-effort: a snapshot write
+        // failure must not block compaction. No-op when no store is wired.
+        if let Some(store) = opts.session_store.as_ref() {
+            for &i in &output.compacted_indices {
+                if let Some(original) = session.messages.get(i) {
+                    let _ = store.snapshot_original(&session.id, u32::try_from(i).unwrap_or(u32::MAX), original);
+                }
+            }
+        }
+        session.messages = output.transcript;
     }
 }
 
@@ -3814,6 +3825,48 @@ async fn dispatch_tool(
             origin_tools::builtins::diagnostics::diagnostics(dargs, &ra)
                 .await
                 .map(|v| serde_json::to_string(&v).expect("BUG: DiagnosticsResult always serializes"))
+                .map_err(|e| LoopError::ToolFailure(e.message))
+        }
+        "LspNavigate" => {
+            // Per-call `DaemonRa` (same Phase-6 posture as `Diagnostics`); it
+            // also implements `NavigationHandle`.
+            let op = args
+                .get("op")
+                .and_then(Value::as_str)
+                .ok_or_else(|| LoopError::BadArgs("LspNavigate: missing `op`".into()))?
+                .to_string();
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| LoopError::BadArgs("LspNavigate: missing `path`".into()))?
+                .to_string();
+            let line = args
+                .get("line")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| LoopError::BadArgs("LspNavigate: missing/invalid `line`".into()))?;
+            let col = args
+                .get("col")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| LoopError::BadArgs("LspNavigate: missing/invalid `col`".into()))?;
+            let include_declaration = args
+                .get("include_declaration")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let nav_args = origin_tools::builtins::lsp_nav::LspNavArgs {
+                op,
+                path,
+                line,
+                col,
+                include_declaration,
+            };
+            let ra = crate::ra_impl::DaemonRa::new(
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            );
+            origin_tools::builtins::lsp_nav::lsp_navigate(nav_args, &ra)
+                .await
+                .map(|v| serde_json::to_string(&v).expect("BUG: LspNavigate result always serializes"))
                 .map_err(|e| LoopError::ToolFailure(e.message))
         }
         "ToolSearch" => {

@@ -120,26 +120,37 @@ pub fn checkpoints() -> Result<()> {
 
 /// Restore the working tree from checkpoint `id`.
 ///
-/// With `files_only` only the tracked files are restored (gemini `/rewind` of
-/// files only); otherwise HEAD and the working tree are hard-reset.
+/// When `paths` is non-empty, only those paths are restored from the checkpoint
+/// (a per-file selective revert, `RestoreMode::Files`) without moving HEAD.
+/// Otherwise, with `files_only` only the tracked files are restored (gemini
+/// `/rewind` of files only); without it HEAD and the working tree are hard-reset.
 ///
 /// # Errors
 /// Returns on filesystem failure, an unknown checkpoint, or a git failure.
-pub fn rewind(id: &str, files_only: bool) -> Result<()> {
+pub fn rewind(id: &str, files_only: bool, paths: Vec<String>) -> Result<()> {
     let runner = CmdGit;
     let shadow = shadow_dir()?;
     if !shadow.exists() {
         anyhow::bail!("no checkpoints yet");
     }
     let sg = ShadowGit::new(&runner, shadow.to_string_lossy().into_owned());
-    let mode = if files_only {
+    let path_count = paths.len();
+    let mode = if path_count > 0 {
+        RestoreMode::Files(paths)
+    } else if files_only {
         RestoreMode::WorkingTree
     } else {
         RestoreMode::Full
     };
     match sg.restore(id, &mode) {
         Ok(()) => {
-            let scope = if files_only { "working tree" } else { "HEAD + working tree" };
+            let scope = if path_count > 0 {
+                format!("{path_count} path(s)")
+            } else if files_only {
+                "working tree".to_string()
+            } else {
+                "HEAD + working tree".to_string()
+            };
             println!("restored {scope} from checkpoint {id}");
             Ok(())
         }

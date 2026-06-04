@@ -54,6 +54,7 @@ origin-doctor   = { path = "../origin-doctor" }
 origin-mermaid  = { path = "../origin-mermaid" }
 origin-knowledge = { path = "../origin-knowledge" }
 origin-mem      = { path = "../origin-mem" }
+origin-cas      = { path = "../origin-cas" }
 origin-schedule = { path = "../origin-schedule" }
 origin-export   = { path = "../origin-export" }
 origin-i18n     = { path = "../origin-i18n" }

@@ -2611,7 +2611,11 @@ async fn handle_admin(
         ClientMessage::RewindSession {
             session_id,
             keep_turns,
-        } => match session_store.truncate_after(&session_id, keep_turns) {
+        } => match session_store.rewind_restoring(&session_id, keep_turns) {
+            // gap 2: rewind now reconstructs any compacted-but-kept turns from
+            // their pre-compaction snapshots. No-op restore when nothing was
+            // compacted, so this stays byte-identical to the old truncate path
+            // for short sessions.
             Ok(_removed) => StreamEvent::AdminOk,
             Err(e) => StreamEvent::AdminError {
                 message: e.to_string(),

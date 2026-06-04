@@ -1,0 +1,4 @@
+{"type":"session_meta","ts":1700000000000,"id":"rollout-test","cwd":"/home/dev/proj"}
+{"type":"message","role":"user","content":[{"type":"text","text":"refactor the parser"}]}
+{"type":"message","role":"assistant","content":[{"type":"text","text":"splitting "},{"type":"text","text":"the lexer out"}]}
+{"type":"function_call_output","role":"tool","content":"src/lexer.rs\nsrc/parser.rs"}

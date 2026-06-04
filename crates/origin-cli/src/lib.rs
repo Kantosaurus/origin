@@ -19,6 +19,7 @@ pub mod daemon_launch;
 pub mod display_hook;
 pub mod doctor;
 pub mod knowledge;
+pub mod memory_inbox;
 pub mod markdown_tasks;
 pub mod mermaid;
 pub mod oidc;

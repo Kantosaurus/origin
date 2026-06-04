@@ -29,7 +29,7 @@
 //! for the labelled branch (a deeper, riskier change that must never switch the
 //! user's working tree).*
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use origin_ambient::{AmbientTask, MorningReport, OvernightDriver, OvernightPlan};
@@ -113,7 +113,18 @@ async fn run(sock_path: String) {
         wall_ms,
     );
     let start = now_ms();
+    let day = start / 86_400_000;
     let mut driver = OvernightDriver::new(plan, start);
+
+    // gap 6: opt-in per-task git-worktree isolation. Default-off keeps the loop
+    // byte-identical (no worktree, no prompt change). When `ORIGIN_OVERNIGHT_WORKTREE=1`
+    // each task runs against a dedicated worktree+branch rooted at the workspace.
+    let worktree_enabled = std::env::var("ORIGIN_OVERNIGHT_WORKTREE").as_deref() == Ok("1");
+    let workspace_root = std::env::var_os("ORIGIN_WORKSPACE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut worktrees: Vec<String> = Vec::new();
 
     loop {
         let now = now_ms();
@@ -125,13 +136,25 @@ async fn run(sock_path: String) {
         };
         let session_id = format!("overnight-{}", task.slug());
         tracing::info!(?task, "overnight: dispatching task");
-        match crate::scheduler::dispatch_prompt_with_usage(
-            &sock_path,
-            &model,
-            session_id,
-            task_prompt(task),
-        )
-        .await
+
+        // Create the isolation worktree (best-effort) and, on success, point the
+        // task prompt at it so the agent edits there rather than the live tree.
+        let isolation: Option<PathBuf> = if worktree_enabled {
+            overnight_dir().map(|d| d.join("worktrees").join(format!("{day}-{}", task.slug())))
+        } else {
+            None
+        };
+        let mut prompt = task_prompt(task).to_string();
+        if let Some(ref wt) = isolation {
+            let branch = origin_ambient::branch_name(task, day);
+            if create_worktree(&workspace_root, wt, &branch) {
+                worktrees.push(wt.to_string_lossy().into_owned());
+                prompt = isolation_prompt(&prompt, wt, &branch);
+            }
+        }
+
+        match crate::scheduler::dispatch_prompt_with_usage(&sock_path, &model, session_id, &prompt)
+            .await
         {
             // Real per-turn usage drained from the dispatch reply. A non-zero
             // total is recorded verbatim; a zero total means the daemon emitted
@@ -147,12 +170,59 @@ async fn run(sock_path: String) {
         tokio::time::sleep(POLL).await;
     }
 
-    // `start` is epoch-ms; `/ 86_400_000` is the day index used for branch names.
-    let report = driver.into_report(start / 86_400_000);
+    // Tear down the run's worktrees (the branches + their commits persist) and
+    // prune any stale registrations.
+    if worktree_enabled && !worktrees.is_empty() {
+        cleanup_worktrees(&workspace_root, &worktrees);
+    }
+
+    // `start` is epoch-ms; `day` is the day index used for branch names.
+    let report = driver.into_report(day).with_worktrees(worktrees);
     match persist_report(&report) {
         Ok(()) => tracing::info!("overnight: morning report persisted to ~/.origin/overnight/"),
         Err(e) => tracing::warn!(error = %e, "overnight: failed to persist morning report"),
     }
+}
+
+/// Append the isolation instruction onto a task's base prompt so the overnight
+/// agent edits inside the dedicated worktree rather than the live working tree.
+fn isolation_prompt(base: &str, worktree: &Path, branch: &str) -> String {
+    format!(
+        "{base}\n\nWork ONLY inside the isolated git worktree at {} (branch `{branch}`), \
+         so the main working tree stays untouched.",
+        worktree.display()
+    )
+}
+
+/// Create an isolation worktree at `path` on `branch`, rooted at `workspace`.
+/// Best-effort: returns `true` on success; on any failure it logs and returns
+/// `false` so the task still runs (without isolation).
+fn create_worktree(workspace: &Path, path: &Path, branch: &str) -> bool {
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(error = %e, "overnight: worktree parent dir create failed");
+            return false;
+        }
+    }
+    let runner = crate::selfdev::ProcessGitRunner::new(workspace);
+    match origin_vcs::Worktree::new(&runner).add(path, branch) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, branch, "overnight: git worktree add failed; running without isolation");
+            false
+        }
+    }
+}
+
+/// Remove the run's worktrees and prune stale registrations. Branches (and the
+/// commits made in them) are preserved; only the checkouts are removed.
+fn cleanup_worktrees(workspace: &Path, paths: &[String]) {
+    let runner = crate::selfdev::ProcessGitRunner::new(workspace);
+    let wt = origin_vcs::Worktree::new(&runner);
+    for p in paths {
+        let _ = wt.remove(Path::new(p), true);
+    }
+    let _ = wt.prune();
 }
 
 /// Standing prompt for each overnight task kind (mirrors the ambient loop's set).
@@ -208,8 +278,23 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{observe_task_tokens, real_or_estimate, task_prompt, AmbientTask, TASK_COST_TOKENS};
+    use super::{
+        isolation_prompt, observe_task_tokens, real_or_estimate, task_prompt, AmbientTask,
+        TASK_COST_TOKENS,
+    };
     use origin_ambient::{OvernightDriver, OvernightPlan};
+
+    #[test]
+    fn isolation_prompt_appends_worktree_and_branch_after_base() {
+        let base = task_prompt(AmbientTask::Tests);
+        let out = isolation_prompt(base, std::path::Path::new("/wt/0-tests"), "origin/ambient/tests-0");
+        // The base task instruction is preserved as a prefix; the isolation
+        // instruction (path + branch) is appended.
+        assert!(out.starts_with(base));
+        assert!(out.contains("/wt/0-tests"));
+        assert!(out.contains("origin/ambient/tests-0"));
+        assert!(out.contains("isolated git worktree"));
+    }
 
     #[test]
     fn real_or_estimate_maps_zero_to_none_and_nonzero_to_some() {

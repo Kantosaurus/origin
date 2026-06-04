@@ -230,17 +230,40 @@ pub struct MorningReport {
     pub tokens_spent: u64,
     /// URLs or identifiers of pull requests opened.
     pub prs_opened: Vec<String>,
+    /// Filesystem paths of worktrees created during the run.
+    ///
+    /// `#[serde(default)]` keeps already-persisted `latest.json` reports (written
+    /// before this field existed) backward-compatible: a missing key deserializes
+    /// to an empty vec, and a default/empty value renders no Markdown section.
+    #[serde(default)]
+    pub worktrees: Vec<String>,
 }
 
 impl MorningReport {
     /// Construct a morning report.
+    ///
+    /// The `worktrees` list starts empty; attach paths with
+    /// [`with_worktrees`](Self::with_worktrees). Keeping this constructor `const`
+    /// and free of the extra parameter preserves every existing caller.
     #[must_use]
     pub const fn new(ran: Vec<String>, tokens_spent: u64, prs_opened: Vec<String>) -> Self {
         Self {
             ran,
             tokens_spent,
             prs_opened,
+            worktrees: Vec::new(),
         }
+    }
+
+    /// Attach the worktree paths created during the run, returning `self`.
+    ///
+    /// A builder-style setter (rather than a `new` parameter) so the `const`
+    /// constructor and its existing callers stay unchanged. An empty `paths`
+    /// leaves the report's Markdown byte-identical to one with no worktrees.
+    #[must_use]
+    pub fn with_worktrees(mut self, paths: Vec<String>) -> Self {
+        self.worktrees = paths;
+        self
     }
 
     /// Render the report as Markdown for display or commit into the repo.
@@ -271,6 +294,17 @@ impl MorningReport {
             for pr in &self.prs_opened {
                 out.push_str("- ");
                 out.push_str(pr);
+                out.push('\n');
+            }
+        }
+
+        // Only render the Worktrees section when there is something to list, so
+        // default output stays byte-identical to pre-worktrees reports.
+        if !self.worktrees.is_empty() {
+            out.push_str("\n## Worktrees\n\n");
+            for wt in &self.worktrees {
+                out.push_str("- ");
+                out.push_str(wt);
                 out.push('\n');
             }
         }
@@ -569,6 +603,70 @@ mod tests {
     fn equal_window_bounds_mean_always_on() {
         assert!(should_schedule(0, 0, 0));
         assert!(should_schedule(720, 600, 600));
+    }
+
+    #[test]
+    fn with_worktrees_renders_worktrees_section() {
+        let r = MorningReport::new(vec!["ran tests".to_string()], 100, vec![])
+            .with_worktrees(vec![
+                "/tmp/origin-wt/tests-1".to_string(),
+                "/tmp/origin-wt/docs-1".to_string(),
+            ]);
+        assert_eq!(r.worktrees.len(), 2);
+        let md = r.to_markdown();
+        assert!(md.contains("## Worktrees"), "section must appear: {md}");
+        assert!(
+            md.contains("/tmp/origin-wt/tests-1"),
+            "first path must appear: {md}"
+        );
+        assert!(
+            md.contains("/tmp/origin-wt/docs-1"),
+            "second path must appear: {md}"
+        );
+        // The Worktrees section must follow the PRs section.
+        let prs_at = md.find("## PRs opened").expect("PRs section present");
+        let wt_at = md.find("## Worktrees").expect("Worktrees section present");
+        assert!(prs_at < wt_at, "Worktrees must follow PRs: {md}");
+    }
+
+    #[test]
+    fn empty_worktrees_render_byte_identical() {
+        // A report with no worktrees must render exactly as before this feature:
+        // no "## Worktrees" section and byte-identical to the same report built
+        // without ever calling `with_worktrees`.
+        let base = MorningReport::new(
+            vec!["ran tests on origin-cost".to_string()],
+            12_345,
+            vec!["pull/42".to_string()],
+        );
+        let md = base.to_markdown();
+        assert!(!md.contains("## Worktrees"), "no section when empty: {md}");
+
+        let with_empty = base.with_worktrees(vec![]);
+        assert_eq!(
+            with_empty.to_markdown(),
+            md,
+            "empty worktrees must be byte-identical"
+        );
+        // Default report (no worktrees) likewise omits the section.
+        assert!(!MorningReport::default().to_markdown().contains("## Worktrees"));
+    }
+
+    #[test]
+    fn morning_report_round_trips_with_and_without_worktrees() {
+        let r = MorningReport::new(vec!["ran tests".to_string()], 7, vec!["pr-1".to_string()])
+            .with_worktrees(vec!["/tmp/wt/a".to_string(), "/tmp/wt/b".to_string()]);
+        let json = serde_json::to_string(&r).unwrap();
+        let back: MorningReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(r, back);
+        assert_eq!(back.worktrees, vec!["/tmp/wt/a", "/tmp/wt/b"]);
+
+        // JSON persisted before this field existed (no `worktrees` key) must
+        // still deserialize via serde(default) to an empty vec.
+        let legacy = r#"{"ran":["x"],"tokens_spent":3,"prs_opened":[]}"#;
+        let parsed: MorningReport = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.worktrees.is_empty(), "missing field defaults empty");
+        assert_eq!(parsed.tokens_spent, 3);
     }
 
     #[test]

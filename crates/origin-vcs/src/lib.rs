@@ -22,6 +22,7 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// Field separator emitted by `%x1f` in the checkpoint log format.
 const FIELD_SEP: char = '\u{1f}';
@@ -269,6 +270,107 @@ impl<'a> ShadowGit<'a> {
     pub fn diff(&self, id: &str) -> Result<String, VcsError> {
         self.ensure_exists(id)?;
         self.git(&["show", "--stat", "-p", id])
+    }
+}
+
+/// An isolated git *worktree* helper, for running an agent's task in a checkout
+/// that is physically separate from the user's main working tree.
+///
+/// A worktree (jcode/openclaude-style isolated lanes) lets the overnight runner
+/// branch off, do destructive work, then tear the checkout down without ever
+/// disturbing the user's files. The *source* repository is implicit: it is
+/// whatever repo the injected [`GitRunner`] is rooted at (mirroring how a
+/// process-backed runner roots at the workspace), so this type only carries a
+/// runner reference and emits `git worktree …` subcommands through it.
+///
+/// Every effect is routed through [`GitRunner::run`], so the helper is unit
+/// tested offline with a recording mock — no subprocess, no repo, no network.
+pub struct Worktree<'a> {
+    runner: &'a dyn GitRunner,
+}
+
+impl<'a> Worktree<'a> {
+    /// Create a worktree helper that drives `runner` (rooted at the source repo).
+    #[must_use]
+    pub const fn new(runner: &'a dyn GitRunner) -> Self {
+        Self { runner }
+    }
+
+    /// Add a new worktree at `path`, creating and checking out a *new* branch.
+    ///
+    /// Emits `worktree add --quiet <path> -b <branch>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VcsError::Git`] if the underlying git command fails.
+    pub fn add(&self, path: &Path, branch: &str) -> Result<(), VcsError> {
+        let path = path.to_string_lossy();
+        self.runner
+            .run(&["worktree", "add", "--quiet", path.as_ref(), "-b", branch])
+            .map(|_| ())
+    }
+
+    /// Add a worktree at `path`, checking out an *existing* `branch`.
+    ///
+    /// Emits `worktree add --quiet <path> <branch>` (no `-b`, so git resolves an
+    /// existing ref rather than creating one).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VcsError::Git`] if the underlying git command fails.
+    pub fn add_existing(&self, path: &Path, branch: &str) -> Result<(), VcsError> {
+        let path = path.to_string_lossy();
+        self.runner
+            .run(&["worktree", "add", "--quiet", path.as_ref(), branch])
+            .map(|_| ())
+    }
+
+    /// Remove the worktree at `path`, optionally `--force`-ing past a dirty tree.
+    ///
+    /// Emits `worktree remove [--force] <path>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VcsError::Git`] if the underlying git command fails.
+    pub fn remove(&self, path: &Path, force: bool) -> Result<(), VcsError> {
+        let path = path.to_string_lossy();
+        let mut args: Vec<&str> = Vec::with_capacity(4);
+        args.push("worktree");
+        args.push("remove");
+        if force {
+            args.push("--force");
+        }
+        args.push(path.as_ref());
+        self.runner.run(&args).map(|_| ())
+    }
+
+    /// Prune administrative records for worktrees whose directories are gone.
+    ///
+    /// Emits `worktree prune`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VcsError::Git`] if the underlying git command fails.
+    pub fn prune(&self) -> Result<(), VcsError> {
+        self.runner.run(&["worktree", "prune"]).map(|_| ())
+    }
+
+    /// List the registered worktrees, returning each worktree's path.
+    ///
+    /// Emits `worktree list --porcelain` and extracts the `worktree <path>`
+    /// entries from the porcelain stream (one per registered worktree, the main
+    /// one first).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VcsError::Git`] if the underlying git command fails.
+    pub fn list(&self) -> Result<Vec<String>, VcsError> {
+        let out = self.runner.run(&["worktree", "list", "--porcelain"])?;
+        Ok(out
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .map(str::to_owned)
+            .collect())
     }
 }
 
@@ -523,6 +625,117 @@ mod tests {
         let json = serde_json::to_string(&lane).unwrap();
         let back: Lane = serde_json::from_str(&json).unwrap();
         assert_eq!(lane, back);
+    }
+
+    #[test]
+    fn worktree_add_emits_quiet_add_with_new_branch() {
+        let mock = MockGit::scripted(vec![Ok(String::new())]);
+        let wt = Worktree::new(&mock);
+        let path = Path::new("/tmp/wt-feat");
+        wt.add(path, "feat/x").unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            vec![
+                "worktree",
+                "add",
+                "--quiet",
+                path.to_string_lossy().as_ref(),
+                "-b",
+                "feat/x"
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_add_existing_emits_quiet_add_with_existing_branch() {
+        let mock = MockGit::scripted(vec![Ok(String::new())]);
+        let wt = Worktree::new(&mock);
+        let path = Path::new("/tmp/wt-existing");
+        wt.add_existing(path, "feat/y").unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            vec![
+                "worktree",
+                "add",
+                "--quiet",
+                path.to_string_lossy().as_ref(),
+                "feat/y"
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_remove_without_force_emits_plain_remove() {
+        let mock = MockGit::scripted(vec![Ok(String::new())]);
+        let wt = Worktree::new(&mock);
+        let path = Path::new("/tmp/wt-gone");
+        wt.remove(path, false).unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            vec!["worktree", "remove", path.to_string_lossy().as_ref()]
+        );
+    }
+
+    #[test]
+    fn worktree_remove_with_force_inserts_force_flag() {
+        let mock = MockGit::scripted(vec![Ok(String::new())]);
+        let wt = Worktree::new(&mock);
+        let path = Path::new("/tmp/wt-gone");
+        wt.remove(path, true).unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            vec![
+                "worktree",
+                "remove",
+                "--force",
+                path.to_string_lossy().as_ref()
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_prune_emits_prune() {
+        let mock = MockGit::scripted(vec![Ok(String::new())]);
+        let wt = Worktree::new(&mock);
+        wt.prune().unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], vec!["worktree", "prune"]);
+    }
+
+    #[test]
+    fn worktree_list_emits_porcelain_and_parses_paths() {
+        let porcelain = "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\nworktree /tmp/wt-feat\nHEAD def\nbranch refs/heads/feat/x\n";
+        let mock = MockGit::scripted(vec![Ok(porcelain.to_string())]);
+        let wt = Worktree::new(&mock);
+        let paths = wt.list().unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], vec!["worktree", "list", "--porcelain"]);
+        assert_eq!(paths, vec!["/repo".to_string(), "/tmp/wt-feat".to_string()]);
+    }
+
+    #[test]
+    fn worktree_add_maps_failure_to_git_error() {
+        let mock = MockGit::scripted(vec![Err(VcsError::Git("boom".into()))]);
+        let wt = Worktree::new(&mock);
+        let path = Path::new("/tmp/wt-feat");
+        let err = wt.add(path, "feat/x").unwrap_err();
+        assert!(matches!(err, VcsError::Git(_)));
     }
 
     #[test]

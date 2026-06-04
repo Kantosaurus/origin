@@ -227,11 +227,21 @@ pub enum Cmd {
         /// Restore only the tracked files (do not move HEAD).
         #[arg(long)]
         files_only: bool,
+        /// Restore only these paths from the checkpoint (repeatable, e.g.
+        /// `--path src/a.rs --path src/b.rs`). Scopes the restore to the given
+        /// files without moving HEAD; mutually exclusive with `--files-only`.
+        #[arg(long = "path", conflicts_with = "files_only")]
+        path: Vec<String>,
     },
     /// Print the patch for a checkpoint id.
     CheckpointDiff {
         /// Checkpoint id to diff.
         id: String,
+    },
+    /// Manage auto-memory (the mem-garden draft inbox).
+    Memory {
+        #[command(subcommand)]
+        sub: MemorySub,
     },
     /// Shallow-clone a dependency repo and print a compact overview.
     Scout {
@@ -380,6 +390,34 @@ pub enum Cmd {
     Team {
         #[command(subcommand)]
         sub: TeamSub,
+    },
+}
+
+/// `origin memory …` subcommands.
+#[derive(Subcommand)]
+pub enum MemorySub {
+    /// Operate on the auto-memory inbox (drafts staged by the daemon's
+    /// mem-garden; distinct from the in-session `/mem` proposal queue).
+    Inbox {
+        #[command(subcommand)]
+        sub: MemoryInboxSub,
+    },
+}
+
+/// `origin memory inbox …` subcommands.
+#[derive(Subcommand)]
+pub enum MemoryInboxSub {
+    /// List the staged auto-memory drafts.
+    List,
+    /// Promote a draft into the live memory store, then remove it from the inbox.
+    Accept {
+        /// Draft id (full content-hash or a unique prefix).
+        id: String,
+    },
+    /// Discard a draft without saving it.
+    Reject {
+        /// Draft id (full content-hash or a unique prefix).
+        id: String,
     },
 }
 
@@ -641,4 +679,31 @@ pub enum PairSub {
 #[must_use]
 pub fn main_cli() -> clap::Command {
     <Cli as clap::CommandFactory>::command()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod gap4_rewind_path_tests {
+    use super::{Cli, Cmd};
+    use clap::Parser;
+
+    #[test]
+    fn rewind_accepts_repeatable_path() {
+        let cli = Cli::try_parse_from([
+            "origin", "rewind", "cafe", "--path", "src/a.rs", "--path", "src/b.rs",
+        ])
+        .expect("parse");
+        let Some(Cmd::Rewind { id, files_only, path }) = cli.cmd else {
+            panic!("expected Cmd::Rewind");
+        };
+        assert_eq!(id, "cafe");
+        assert!(!files_only);
+        assert_eq!(path, vec!["src/a.rs".to_string(), "src/b.rs".to_string()]);
+    }
+
+    #[test]
+    fn rewind_path_conflicts_with_files_only() {
+        let res = Cli::try_parse_from(["origin", "rewind", "cafe", "--files-only", "--path", "a.rs"]);
+        assert!(res.is_err(), "--path and --files-only must be mutually exclusive");
+    }
 }

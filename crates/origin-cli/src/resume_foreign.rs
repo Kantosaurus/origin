@@ -26,6 +26,8 @@ const KNOWN_SOURCES: &[&str] = &[
     "jcode",
     "opencode",
     "oc",
+    "codex",
+    "cx",
 ];
 
 /// Run `origin resume-foreign <source> <path>`.

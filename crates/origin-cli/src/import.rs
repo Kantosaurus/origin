@@ -10,6 +10,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 use origin_migrate::claude_code::ClaudeCodeSource;
+use origin_migrate::codex::CodexSource;
 use origin_migrate::jcode::JcodeSource;
 use origin_migrate::opencode::OpencodeSource;
 use origin_migrate::sink::{apply_with_store, summarize, ApplyReport};
@@ -23,6 +24,7 @@ pub enum ImportSource {
     ClaudeCode,
     Jcode,
     Opencode,
+    Codex,
 }
 
 #[derive(Debug, clap::Args)]
@@ -67,6 +69,7 @@ pub fn run_import(args: &ImportArgs) -> Result<ApplyReport, ImportCliError> {
         ImportSource::ClaudeCode => ClaudeCodeSource.scan(&args.from)?,
         ImportSource::Jcode => JcodeSource.scan(&args.from)?,
         ImportSource::Opencode => OpencodeSource.scan(&args.from)?,
+        ImportSource::Codex => CodexSource.scan(&args.from)?,
     };
 
     if !args.apply {
