@@ -59,16 +59,27 @@ pub async fn run(source: String, path: String) -> Result<()> {
             messages_loaded,
             suggested_model,
         } => {
+            let count = messages_loaded.to_string();
             println!(
-                "resumed foreign session into {session_id}: {messages_loaded} messages \
-                 (model {suggested_model})"
+                "{}",
+                crate::locale::linef(
+                    "resume.foreign.ok",
+                    &[
+                        ("id", session_id.as_str()),
+                        ("count", count.as_str()),
+                        ("model", suggested_model.as_str()),
+                    ],
+                )
             );
             // The hydrated session is now a first-class, resumable origin
             // session: it is listed by `origin sessions ls` and its persisted
             // transcript can be inspected / continued via `origin sessions
             // resume`. We surface the working command rather than an invented
             // flag so the printed guidance is actually runnable.
-            println!("resume it with: origin sessions resume {session_id}");
+            println!(
+                "{}",
+                crate::locale::linef("resume.foreign.hint", &[("id", session_id.as_str())])
+            );
             Ok(())
         }
         StreamEvent::AdminError { message } => Err(anyhow::anyhow!("{message}")),

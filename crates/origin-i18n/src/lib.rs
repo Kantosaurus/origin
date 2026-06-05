@@ -197,6 +197,9 @@ static KEYS: &[&str] = &[
     "cmd.copy.empty",
     "cmd.account.active",
     "cmd.turn.busy",
+    // Cross-harness live-resume CLI chrome (routed from `origin resume-foreign`).
+    "resume.foreign.ok",
+    "resume.foreign.hint",
 ];
 
 /// Core lookup: the localized string for `(lang, key)`, or `None` if this
@@ -256,6 +259,10 @@ fn en(key: &str) -> Option<&'static str> {
         "cmd.copy.empty" => "nothing to copy yet",
         "cmd.account.active" => "provider active: {provider}/{account}",
         "cmd.turn.busy" => "a turn is already running (Ctrl+C to interrupt it)",
+        // En reconciled to the exact pre-routing literals ⇒ default output is
+        // byte-identical.
+        "resume.foreign.ok" => "resumed foreign session into {id}: {count} messages (model {model})",
+        "resume.foreign.hint" => "resume it with: origin sessions resume {id}",
         _ => return None,
     })
 }
@@ -289,6 +296,8 @@ fn es(key: &str) -> Option<&'static str> {
         "cmd.copy.empty" => "nada que copiar todavía",
         "cmd.account.active" => "proveedor activo: {provider}/{account}",
         "cmd.turn.busy" => "ya hay un turno en ejecución (Ctrl+C para interrumpirlo)",
+        "resume.foreign.ok" => "sesión externa reanudada en {id}: {count} mensajes (modelo {model})",
+        "resume.foreign.hint" => "reanúdala con: origin sessions resume {id}",
         _ => return None,
     })
 }
@@ -322,6 +331,8 @@ fn fr(key: &str) -> Option<&'static str> {
         "cmd.copy.empty" => "rien à copier pour l'instant",
         "cmd.account.active" => "fournisseur actif : {provider}/{account}",
         "cmd.turn.busy" => "un tour est déjà en cours (Ctrl+C pour l'interrompre)",
+        "resume.foreign.ok" => "session externe reprise dans {id} : {count} messages (modèle {model})",
+        "resume.foreign.hint" => "reprenez-la avec : origin sessions resume {id}",
         _ => return None,
     })
 }
@@ -355,6 +366,8 @@ fn de(key: &str) -> Option<&'static str> {
         "cmd.copy.empty" => "nichts zu kopieren",
         "cmd.account.active" => "aktiver Anbieter: {provider}/{account}",
         "cmd.turn.busy" => "ein Zug läuft bereits (Ctrl+C zum Unterbrechen)",
+        "resume.foreign.ok" => "fremde Sitzung übernommen nach {id}: {count} Nachrichten (Modell {model})",
+        "resume.foreign.hint" => "fortsetzen mit: origin sessions resume {id}",
         _ => return None,
     })
 }
@@ -388,6 +401,8 @@ fn ja(key: &str) -> Option<&'static str> {
         "cmd.copy.empty" => "コピーするものがありません",
         "cmd.account.active" => "アクティブなプロバイダー: {provider}/{account}",
         "cmd.turn.busy" => "すでにターンが実行中です (Ctrl+C で中断)",
+        "resume.foreign.ok" => "外部セッションを {id} に再開しました: {count} 件のメッセージ (モデル {model})",
+        "resume.foreign.hint" => "再開するには: origin sessions resume {id}",
         _ => return None,
     })
 }
@@ -421,6 +436,8 @@ fn zh_cn(key: &str) -> Option<&'static str> {
         "cmd.copy.empty" => "暂无可复制的内容",
         "cmd.account.active" => "活动提供方: {provider}/{account}",
         "cmd.turn.busy" => "已有一个回合正在运行 (Ctrl+C 中断)",
+        "resume.foreign.ok" => "已将外部会话恢复到 {id}：{count} 条消息（模型 {model}）",
+        "resume.foreign.hint" => "恢复方式：origin sessions resume {id}",
         _ => return None,
     })
 }
