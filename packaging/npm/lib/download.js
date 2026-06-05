@@ -3,7 +3,14 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { currentTarget, assetName, RELEASES_REPO } = require('./platform');
+const {
+  currentTarget,
+  assetName,
+  RELEASES_REPO,
+  AUX_BINS,
+  auxAssetName,
+  auxBinName,
+} = require('./platform');
 
 const USER_AGENT = 'originx-installer';
 
@@ -103,6 +110,40 @@ async function downloadBinary(version, destPath, target = currentTarget()) {
   return { url, bytes: buf.length, verified: Boolean(expected) };
 }
 
+// Download the auxiliary binaries (origin-daemon, origin-supervisor) into the
+// SAME directory as `mainDestPath`, so the CLI's sibling lookup finds them on
+// the cold (fallback) path just as it would in a per-platform package. Each is
+// best-effort: a missing/failed aux asset is reported but does not throw, since
+// only daemon spawn / self-dev need them and the main binary still runs. When a
+// SHA256SUMS manifest is present each download must match it. Returns the names
+// successfully fetched.
+async function downloadAuxBinaries(version, mainDestPath, target = currentTarget()) {
+  if (!target) return [];
+  const dir = path.dirname(mainDestPath);
+  const sums = await fetchChecksums(version);
+  const fetched = [];
+  for (const name of AUX_BINS) {
+    const asset = auxAssetName(name, target);
+    const dest = path.join(dir, auxBinName(name, target));
+    const url = `https://github.com/${RELEASES_REPO}/releases/download/v${version}/${asset}`;
+    try {
+      const buf = await downloadTo(url, dest);
+      const expected = expectedHashFor(sums, asset);
+      if (expected && sha256(buf) !== expected) {
+        fs.rmSync(dest, { force: true });
+        throw new Error(`checksum mismatch for ${asset}`);
+      }
+      if (process.platform !== 'win32') {
+        fs.chmodSync(dest, 0o755);
+      }
+      fetched.push(name);
+    } catch (err) {
+      process.stderr.write(`origin: optional ${name} not fetched: ${err && err.message}\n`);
+    }
+  }
+  return fetched;
+}
+
 module.exports = {
   releaseAssetUrl,
   checksumsUrl,
@@ -111,4 +152,5 @@ module.exports = {
   expectedHashFor,
   sha256,
   downloadBinary,
+  downloadAuxBinaries,
 };

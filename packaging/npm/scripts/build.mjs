@@ -16,9 +16,13 @@
 //   node scripts/build.mjs --version 0.1.0 --binaries ./binaries --publish --provenance --dry-run
 //
 // `--binaries <dir>` must contain the release assets named
-// `origin-<triple>[.exe]` (exactly as produced by release.yml). Targets whose
-// binary is missing from that dir are skipped (with a warning) and dropped
-// from the main package's optionalDependencies, so partial builds still work.
+// `origin-<triple>[.exe]` (exactly as produced by release.yml). It SHOULD also
+// contain the co-shipped `origin-daemon-<triple>` and `origin-supervisor-<triple>`
+// assets, which are bundled next to `origin` in each platform package so the
+// CLI's sibling lookup can spawn the daemon / self-dev supervisor; a missing aux
+// asset is a warning, not a failure. Targets whose MAIN binary is missing are
+// skipped (with a warning) and dropped from the main package's
+// optionalDependencies, so partial builds still work.
 //
 // Publishing is IDEMPOTENT: in --publish mode each package whose exact
 // `name@version` is already on the registry is skipped (npm forbids
@@ -35,7 +39,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const require = createRequire(import.meta.url);
-const { TARGETS, assetName, binName, PKG_PREFIX } = require('../lib/platform.js');
+const { TARGETS, assetName, binName, PKG_PREFIX, AUX_BINS, auxAssetName, auxBinName } =
+  require('../lib/platform.js');
 
 const NPM_DIR = path.resolve(fileURLToPath(import.meta.url), '..', '..'); // packaging/npm
 const ROOT = path.resolve(NPM_DIR, '..', '..'); // repo root (holds LICENSE + NOTICE)
@@ -136,6 +141,26 @@ function buildPlatformPackage(out, version, binariesDir, key, target) {
   // and download-artifact strips the exec bit, so unix-target binaries arrive
   // as 0644 and must be restored to 0755. (.exe targets need no exec bit.)
   if (!target.ext) fs.chmodSync(dstBin, 0o755);
+
+  // Co-ship the daemon (required: the CLI spawns it as a separate process) and
+  // the supervisor (self-dev hot-reload + crash-restart) next to `origin`, so
+  // the CLI's sibling lookup resolves them. A missing aux asset is a loud
+  // warning, not a failure: the CLI still launches; only daemon spawn / self-dev
+  // need them, and a partial build should still yield an installable package.
+  for (const aux of AUX_BINS) {
+    const auxSrc = path.join(binariesDir, auxAssetName(aux, target));
+    if (!fs.existsSync(auxSrc)) {
+      console.warn(
+        `[build] ${target.pkg}: missing ${auxAssetName(aux, target)} in ${binariesDir} ` +
+          `(CLI sibling lookup will not find ${aux})`
+      );
+      continue;
+    }
+    const auxDst = path.join(dir, 'bin', auxBinName(aux, target));
+    copyFile(auxSrc, auxDst);
+    if (!target.ext) fs.chmodSync(auxDst, 0o755);
+    console.log(`[build] ${target.pkg}: + ${auxBinName(aux, target)}`);
+  }
 
   const { platform, cpu } = platformPkgMeta(key);
   writeJson(path.join(dir, 'package.json'), {

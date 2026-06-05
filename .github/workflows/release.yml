@@ -57,20 +57,32 @@ jobs:
           CARGO_PROFILE_RELEASE_OPT_LEVEL: z
           CARGO_PROFILE_RELEASE_STRIP: symbols
         run: |
+          # Ship the whole runtime trio: `origin` (CLI) plus the SEPARATE
+          # `origin-daemon` binary the CLI spawns (required — without it a
+          # packaged install cannot stand up the daemon at all) and
+          # `origin-supervisor` (owns/restarts the daemon + consumes the self-dev
+          # hot-reload exit-86 sentinel). They must land co-located so the CLI's
+          # sibling lookup (current_exe().parent()) resolves them.
+          PKGS="-p origin-cli -p origin-daemon -p origin-supervisor"
           # aarch64 Linux is cross-compiled with `cross`; x86_64 Linux builds
           # natively on the ubuntu runner; macOS/Windows build natively too.
           if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
-            cross build -p origin-cli --release --target ${{ matrix.target }}
+            cross build $PKGS --release --target ${{ matrix.target }}
           else
-            cargo build -p origin-cli --release --target ${{ matrix.target }}
+            cargo build $PKGS --release --target ${{ matrix.target }}
           fi
-      - name: Stage binary
+      - name: Stage binaries
         shell: bash
         run: |
           mkdir -p dist
           ext=""
           if [[ "${{ matrix.target }}" == *windows* ]]; then ext=".exe"; fi
-          cp "target/${{ matrix.target }}/release/origin$ext" "dist/origin-${{ matrix.target }}$ext"
+          # All three binaries are named `<bin>-<triple>[.exe]` so the SHA256SUMS
+          # (`origin-*`), cosign (`dist/*`), upload (`origin-*`), and npm collect
+          # (`origin-*`) steps below pick every one up unchanged.
+          for b in origin origin-daemon origin-supervisor; do
+            cp "target/${{ matrix.target }}/release/$b$ext" "dist/$b-${{ matrix.target }}$ext"
+          done
       - name: Cosign keyless sign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Sign

@@ -66,6 +66,26 @@ function binName(target) {
   return `origin${target.ext}`;
 }
 
+// Auxiliary binaries shipped ALONGSIDE `origin` in every platform package (and
+// in the cold-path fallback dir). The CLI spawns `origin-daemon` (required to do
+// anything — it is a separate process, not embedded) and, for self-dev
+// hot-reload + crash-restart, `origin-supervisor`. They must be co-located with
+// `origin` so the CLI's sibling lookup (`current_exe().parent()`) resolves them.
+// Keep in lockstep with .github/workflows/release.yml's build/stage steps.
+const AUX_BINS = ['origin-daemon', 'origin-supervisor'];
+
+// Release asset file name for an aux binary, e.g.
+// `origin-daemon-x86_64-apple-darwin` or `origin-supervisor-...-msvc.exe`.
+function auxAssetName(name, target) {
+  return `${name}-${target.triple}${target.ext}`;
+}
+
+// On-disk name for an aux binary inside a package's bin/ directory, e.g.
+// `origin-daemon` / `origin-daemon.exe`.
+function auxBinName(name, target) {
+  return `${name}${target.ext}`;
+}
+
 module.exports = {
   PKG_PREFIX,
   RELEASES_REPO,
@@ -74,4 +94,7 @@ module.exports = {
   currentTarget,
   assetName,
   binName,
+  AUX_BINS,
+  auxAssetName,
+  auxBinName,
 };
