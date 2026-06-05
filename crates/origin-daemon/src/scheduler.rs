@@ -25,6 +25,15 @@ struct TriggerEntry {
     id: String,
     spec: String,
     prompt: String,
+    /// Name of a reusable `[profiles.<name>]` variable set to apply when this
+    /// trigger fires (its `{{key}}` entries become template variables). Absent
+    /// ⇒ no profile vars, byte-identical to the pre-profile schema.
+    #[serde(default)]
+    profile: Option<String>,
+    /// Inline per-trigger variables, layered OVER the named `profile` (so a
+    /// trigger can reuse a shared profile yet override one value). Empty ⇒ none.
+    #[serde(default)]
+    env: std::collections::BTreeMap<String, String>,
 }
 
 /// On-disk schedule file.
@@ -32,14 +41,25 @@ struct TriggerEntry {
 struct ScheduleFile {
     #[serde(default)]
     triggers: Vec<TriggerEntry>,
+    /// Reusable, named variable sets referenced by `trigger.profile`. Each is a
+    /// `{{key}} -> value` map merged into a fired trigger's template variables,
+    /// so common context (repo URL, base branch, on-call handle, …) is declared
+    /// once and shared across many webhook/cron triggers. Built-in vars
+    /// (`{{date}}`, `{{trigger_id}}`, …) always win on a name clash.
+    #[serde(default)]
+    profiles: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
-/// A trigger that came due on the current tick, paired with the prompt to fire.
+/// A trigger that came due on the current tick, paired with the prompt to fire
+/// and its resolved profile/inline template variables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DueTrigger {
     id: String,
     spec: String,
     prompt: String,
+    /// Resolved `(name, value)` template vars from the trigger's `profile` +
+    /// inline `env` (inline overrides profile). Empty for triggers with neither.
+    vars: Vec<(String, String)>,
 }
 
 /// Interval between scheduler ticks.
@@ -79,8 +99,18 @@ async fn run_loop(sock_path: String) {
             let session_id = format!("sched-{}", now_ms());
             // Read the wall clock once at the call site so the expander stays
             // pure; `fire_vars` builds the fixed template variables from the
-            // trigger plus this timestamp, then `expand_template` substitutes.
-            let prompt = expand_template(&due.prompt, &fire_vars(&due, now_ms()));
+            // trigger plus this timestamp, then the trigger's resolved profile /
+            // inline vars are appended (built-ins listed FIRST ⇒ they win on a
+            // name clash, since `expand_template` takes the first match), then
+            // `expand_template` substitutes.
+            let mut vars: Vec<(&str, String)> = Vec::new();
+            for (k, v) in fire_vars(&due, now_ms()) {
+                vars.push((k, v));
+            }
+            for (k, v) in &due.vars {
+                vars.push((k.as_str(), v.clone()));
+            }
+            let prompt = expand_template(&due.prompt, &vars);
             if let Err(e) = dispatch_prompt(&sock_path, &model, session_id, &prompt).await {
                 tracing::warn!(id = %due.id, error = %e, "scheduler: dispatch failed");
             }
@@ -129,6 +159,7 @@ fn due_triggers(window_start: u64, now: u64) -> Vec<DueTrigger> {
                     id: t.id.clone(),
                     spec: t.spec.clone(),
                     prompt: t.prompt.clone(),
+                    vars: resolve_trigger_vars(&file.profiles, t.profile.as_deref(), &t.env),
                 });
             }
         }
@@ -338,6 +369,33 @@ fn fire_vars(due: &DueTrigger, now_unix_ms: u64) -> Vec<(&'static str, String)> 
     ]
 }
 
+/// Resolve a trigger's reusable-profile + inline variables into ordered
+/// `(name, value)` pairs.
+///
+/// The named `profile` (if it exists in `profiles`) is laid down first, then the
+/// trigger's inline `env` is layered OVER it, so a trigger can reuse a shared
+/// profile yet override individual values. A missing/`None` profile contributes
+/// nothing. Pure and dependency-free so it is unit-testable without a runtime.
+fn resolve_trigger_vars(
+    profiles: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    profile: Option<&str>,
+    inline: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut merged: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    if let Some(name) = profile {
+        if let Some(p) = profiles.get(name) {
+            for (k, v) in p {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    // Inline env overrides the profile.
+    for (k, v) in inline {
+        merged.insert(k.clone(), v.clone());
+    }
+    merged.into_iter().collect()
+}
+
 /// Decompose a unix-millisecond instant into UTC `("YYYY-MM-DD", "HH:MM:SS")`.
 ///
 /// Integer-only, std-only, no new dependency: the date part uses Howard
@@ -387,8 +445,8 @@ fn weekday_name(ms: u64) -> &'static str {
 #[allow(clippy::panic)]
 mod tests {
     use super::{
-        accumulate_usage, civil_strings, due_triggers, expand_template, fire_vars, weekday_name,
-        DueTrigger, ScheduleFile,
+        accumulate_usage, civil_strings, due_triggers, expand_template, fire_vars,
+        resolve_trigger_vars, weekday_name, DueTrigger, ScheduleFile,
     };
     use crate::protocol::StreamEvent;
 
@@ -530,11 +588,81 @@ mod tests {
     }
 
     #[test]
+    fn resolve_trigger_vars_merges_profile_then_inline_override() {
+        use std::collections::BTreeMap;
+        let mut profiles: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        let mut prod: BTreeMap<String, String> = BTreeMap::new();
+        prod.insert("repo".to_string(), "acme/app".to_string());
+        prod.insert("branch".to_string(), "main".to_string());
+        profiles.insert("prod".to_string(), prod);
+
+        // No profile / no inline ⇒ empty.
+        assert!(resolve_trigger_vars(&profiles, None, &BTreeMap::new()).is_empty());
+        // Unknown profile contributes nothing.
+        assert!(resolve_trigger_vars(&profiles, Some("nope"), &BTreeMap::new()).is_empty());
+
+        // Profile alone, then inline overriding one key + adding another.
+        let mut inline: BTreeMap<String, String> = BTreeMap::new();
+        inline.insert("branch".to_string(), "release".to_string());
+        inline.insert("urgent".to_string(), "true".to_string());
+        let vars = resolve_trigger_vars(&profiles, Some("prod"), &inline);
+        // BTreeMap ⇒ deterministic ascending key order.
+        assert_eq!(
+            vars,
+            vec![
+                ("branch".to_string(), "release".to_string()), // inline overrode profile
+                ("repo".to_string(), "acme/app".to_string()),
+                ("urgent".to_string(), "true".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn profile_vars_expand_but_never_shadow_builtins() {
+        use std::collections::BTreeMap;
+        // A profile var named `date` must NOT override the built-in {{date}}.
+        let mut profile_clash: BTreeMap<String, String> = BTreeMap::new();
+        profile_clash.insert("date".to_string(), "SHADOW".to_string());
+        let due = DueTrigger {
+            id: "t".to_string(),
+            spec: "@daily 00:00".to_string(),
+            prompt: String::new(),
+            vars: profile_clash.into_iter().collect::<Vec<_>>(),
+        };
+        // Built-ins first ⇒ they win on a name clash (expand_template = first match).
+        let mut vars: Vec<(&str, String)> = Vec::new();
+        for (k, v) in fire_vars(&due, 0) {
+            vars.push((k, v));
+        }
+        for (k, v) in &due.vars {
+            vars.push((k.as_str(), v.clone()));
+        }
+        assert_eq!(expand_template("{{date}}", &vars), "1970-01-01");
+
+        // A non-builtin profile var DOES expand.
+        let due2 = DueTrigger {
+            id: "t".to_string(),
+            spec: "@daily 00:00".to_string(),
+            prompt: String::new(),
+            vars: vec![("repo".to_string(), "acme/app".to_string())],
+        };
+        let mut vars2: Vec<(&str, String)> = Vec::new();
+        for (k, v) in fire_vars(&due2, 0) {
+            vars2.push((k, v));
+        }
+        for (k, v) in &due2.vars {
+            vars2.push((k.as_str(), v.clone()));
+        }
+        assert_eq!(expand_template("repo={{repo}}", &vars2), "repo=acme/app");
+    }
+
+    #[test]
     fn fire_vars_builds_all_six_and_expands_end_to_end() {
         let due = DueTrigger {
             id: "nightly".to_string(),
             spec: "@daily 03:00".to_string(),
             prompt: String::new(),
+            vars: Vec::new(),
         };
         // Epoch: 1970-01-01 00:00:00, a Thursday.
         let vars = fire_vars(&due, 0);
