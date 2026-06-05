@@ -1667,7 +1667,14 @@ async fn handle_request(
             relay_tx: Some(tx_sub.clone()),
             streaming_disabled: false,
             sidecar: None, // sidecar submit fires in handle_request after persist
-            session_store: None,
+            session_store: Some(Arc::clone(&session_store)),
+            // ^ enable live compaction + snapshot-on-compaction on the request
+            // loop: with the store wired the compactor loads per-turn summaries
+            // and snapshots each folded turn's pre-compaction body, so
+            // `origin sessions rewind` can reconstruct ACROSS compaction points
+            // (gap 2). This was `None`, which silently disabled both the fold and
+            // the snapshot, degrading rewind to a plain truncate. Under the soft
+            // cap the compactor is a no-op ⇒ short sessions stay byte-identical.
             proposer: memory.map(|m| Arc::clone(&m.proposer)),
             event_tx: Some(event_tx.clone()),
             injector: memory.and_then(|m| m.injector.clone()),
