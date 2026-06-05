@@ -43,7 +43,7 @@ tree-sitter-swift = "=0.5.0"
 tree-sitter-kotlin = "=0.3.8"
 tree-sitter-scala = "=0.22.1"
 tree-sitter-haskell = "=0.21.0"
-tree-sitter-elixir = "=0.2.0"
+tree-sitter-elixir = "=0.3.5"
 # Lua 0.1.0 is the last release that exposes the classic `language()` ABI
 # against the tree-sitter 0.21+/0.22 core; 0.2.0+ switched to the
 # `tree-sitter-language` LanguageFn ABI which our pinned 0.22.6 core cannot
