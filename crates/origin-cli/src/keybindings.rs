@@ -30,6 +30,8 @@ pub enum Action {
     HistoryNext,
     /// Clear the input buffer.
     Clear,
+    /// Enter reverse-incremental history search (Ctrl-R by default).
+    ReverseSearch,
     /// No binding matched; the caller uses its default handling.
     None,
 }
@@ -48,6 +50,7 @@ impl Action {
             "history_prev" => Some(Self::HistoryPrev),
             "history_next" => Some(Self::HistoryNext),
             "clear" => Some(Self::Clear),
+            "reverse_search" => Some(Self::ReverseSearch),
             _ => None,
         }
     }
