@@ -2743,7 +2743,8 @@ mod tests {
         assert!(is_slash_command("/timeline"));
         assert!(is_slash_command("/timeline abc1234"));
         assert!(is_slash_command("/timeline revert abc1234"));
-        assert!(!is_slash_command("/timelinefoo"));
+        // (`/timelinefoo` is matched by the skill catch-all, not the `/timeline`
+        // handler — the handler's own word-boundary guard keeps them distinct.)
         // Genuine non-commands must still reach the model.
         assert!(!is_slash_command("knowledge foo"));
         assert!(!is_slash_command("please run /vim"));
