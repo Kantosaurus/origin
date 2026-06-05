@@ -61,6 +61,7 @@ origin-export           = { path = "../origin-export" }
 origin-plan             = { path = "../origin-plan" }
 origin-planner          = { path = "../origin-planner" }
 origin-swarm            = { path = "../origin-swarm" }
+origin-mcp              = { path = "../origin-mcp" }
 origin-selfdev          = { path = "../origin-selfdev" }
 origin-browser          = { path = "../origin-browser" }
 origin-lsp-client       = { path = "../origin-lsp-client" }
@@ -98,6 +99,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
+serde_yaml.workspace = true
 async-trait = "0.1"
 thiserror   = "1"
 rkyv        = { version = "0.7", features = ["validation", "bytecheck"] }

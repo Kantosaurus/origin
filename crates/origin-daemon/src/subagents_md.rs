@@ -25,6 +25,34 @@ pub struct SubagentDef {
     pub description: String,
     /// Tools the subagent is allowed to use (the `allowed-tools` field).
     pub allowed_tools: Vec<String>,
+    /// Inline MCP servers this sub-agent runs for its turn (gap 9b; the `mcp:`
+    /// frontmatter field). Empty for most sub-agents.
+    pub mcp_servers: Vec<origin_swarm::McpServerSpec>,
+}
+
+/// The subagent-local frontmatter fields the shared `SkillFrontmatter` parser
+/// does not model — currently just the `mcp:` server list (gap 9b). Parsed
+/// separately so the skill parser stays unchanged.
+#[derive(Debug, Default, serde::Deserialize)]
+struct SubagentExtra {
+    #[serde(default)]
+    mcp: Vec<origin_swarm::McpServerSpec>,
+}
+
+/// Extract the `mcp:` server list from a subagent `.md`'s YAML frontmatter.
+/// Tolerant: missing frontmatter or no `mcp:` key yields an empty list.
+fn parse_mcp(raw: &str) -> Vec<origin_swarm::McpServerSpec> {
+    let normalized = raw.replace("\r\n", "\n");
+    let stripped = normalized.strip_prefix('\u{FEFF}').unwrap_or(&normalized);
+    let Some(rest) = stripped.strip_prefix("---\n") else {
+        return Vec::new();
+    };
+    let Some((yaml, _body)) = rest.split_once("\n---\n") else {
+        return Vec::new();
+    };
+    serde_yaml::from_str::<SubagentExtra>(yaml)
+        .map(|e| e.mcp)
+        .unwrap_or_default()
 }
 
 /// `~/.origin/subagents`, honoring `ORIGIN_HOME` (tests) then the home dir.
@@ -56,6 +84,7 @@ pub fn load(dir: &Path) -> Vec<SubagentDef> {
                 name: parsed.front.name,
                 description: parsed.front.description,
                 allowed_tools: parsed.front.allowed_tools,
+                mcp_servers: parse_mcp(&raw),
             }),
             Ok(_) => {}
             Err(e) => tracing::warn!(path = %path.display(), error = %e, "subagents: skipping malformed .md"),
@@ -96,6 +125,7 @@ pub fn builtin_browser_subagent(allow_domains: &[String]) -> Option<SubagentDef>
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+        mcp_servers: Vec::new(),
     })
 }
 
@@ -114,6 +144,14 @@ pub fn catalog_block(defs: &[SubagentDef]) -> String {
          tools listed for that sub-agent — it runs in isolation and cannot exceed \
          them. Each line is: name — [tools] — description.\n",
     );
+    // gap 9b: only when a sub-agent declares inline MCP servers, instruct the
+    // model to forward them — so sessions with no MCP sub-agents stay byte-identical.
+    if defs.iter().any(|d| !d.mcp_servers.is_empty()) {
+        out.push_str(
+            "A sub-agent may also list `mcp_servers`; when you delegate to it, copy that JSON \
+             verbatim into the `Task` call's `mcp_servers` field.\n",
+        );
+    }
     for d in defs {
         let tools = if d.allowed_tools.is_empty() {
             "(none)".to_string()
@@ -121,6 +159,10 @@ pub fn catalog_block(defs: &[SubagentDef]) -> String {
             d.allowed_tools.join(",")
         };
         let _ = writeln!(out, "  - {} — [{}] — {}", d.name, tools, d.description);
+        if !d.mcp_servers.is_empty() {
+            let mcp_json = serde_json::to_string(&d.mcp_servers).unwrap_or_default();
+            let _ = writeln!(out, "      mcp_servers: {mcp_json}");
+        }
     }
     out.push_str("</origin-subagents>");
     out
@@ -236,7 +278,38 @@ mod tests {
             name: "planner".into(),
             description: "plans".into(),
             allowed_tools: vec![],
+            mcp_servers: vec![],
         }];
         assert!(catalog_block(&defs).contains("(none)"));
+    }
+
+    #[test]
+    fn parses_mcp_frontmatter_and_lists_it_in_block() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("gh.md"),
+            "---\nname: gh\ndescription: github helper\nallowed-tools: [Read, mcp__github__*]\nmcp:\n  - name: github\n    command: gh-mcp\n    args: [--stdio]\n---\nYou use the GitHub MCP server.\n",
+        )
+        .unwrap();
+        let defs = load(dir.path());
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].mcp_servers.len(), 1);
+        assert_eq!(defs[0].mcp_servers[0].name, "github");
+        assert_eq!(defs[0].mcp_servers[0].command.as_deref(), Some("gh-mcp"));
+        // The block forwards the mcp servers to the model and the allow-list glob.
+        let block = catalog_block(&defs);
+        assert!(block.contains("mcp_servers"));
+        assert!(block.contains("github"));
+    }
+
+    #[test]
+    fn no_mcp_keeps_block_free_of_mcp_instruction() {
+        let defs = vec![SubagentDef {
+            name: "explorer".into(),
+            description: "reads".into(),
+            allowed_tools: vec!["Read".into()],
+            mcp_servers: vec![],
+        }];
+        assert!(!catalog_block(&defs).contains("mcp_servers"));
     }
 }

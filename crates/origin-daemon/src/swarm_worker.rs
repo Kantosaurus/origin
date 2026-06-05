@@ -19,17 +19,82 @@
 //! prevents the parent↔child circular-wait the `Critical`-on-`Critical` design
 //! would cause.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use origin_permission::prompt::Prompter;
 use origin_provider::Provider;
-use origin_swarm::{CompletionReport, ReportStatus, Usage, WorkerContext, WorkerFn};
-use origin_tools::ToolMeta;
+use origin_swarm::{CompletionReport, McpServerSpec, ReportStatus, Usage, WorkerContext, WorkerFn};
+use origin_tools::{
+    DynTool, SandboxProfile, SideEffects, Tier, ToolMeta, Urgency, DEFAULT_TOKEN_BUDGET,
+};
 use tokio::sync::RwLock;
 
-use crate::agent::{run_loop, scope_swarm_collab, LoopOptions, SwarmCollab};
+use crate::agent::{run_loop, scope_runtime_tools, scope_swarm_collab, LoopOptions, SwarmCollab};
 use crate::session::Session;
+
+/// Spin up each declared inline-MCP server and wrap its tools as [`DynTool`]s
+/// namespaced `mcp__<server>__<tool>` (gap 9b: inline-MCP-per-subagent). Returns
+/// the worker-scoped runtime registry plus the namespaced tool names to add to
+/// the worker's allow-list. Best-effort: a server that fails to spawn or list its
+/// tools is logged and skipped (the worker still runs without it).
+async fn build_runtime_tools(
+    specs: &[McpServerSpec],
+) -> (HashMap<String, Arc<dyn DynTool>>, Vec<String>) {
+    let mut map: HashMap<String, Arc<dyn DynTool>> = HashMap::new();
+    let mut names: Vec<String> = Vec::new();
+    for spec in specs {
+        let transport: Arc<dyn origin_mcp::transport::Transport> = if let Some(cmd) = &spec.command {
+            match origin_mcp::transport_stdio::StdioTransport::spawn(cmd, &spec.args) {
+                Ok(t) => Arc::new(t),
+                Err(e) => {
+                    tracing::warn!(server = %spec.name, error = %e, "inline-MCP: stdio spawn failed; skipping");
+                    continue;
+                }
+            }
+        } else if let Some(url) = &spec.url {
+            Arc::new(origin_mcp::transport_http::HttpTransport::new(url.clone(), None))
+        } else {
+            tracing::warn!(server = %spec.name, "inline-MCP: server declares neither command nor url; skipping");
+            continue;
+        };
+        let client = Arc::new(origin_mcp::client::McpClient::new(transport));
+        let listed = match client.list_tools().await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(server = %spec.name, error = %e, "inline-MCP: tools/list failed; skipping");
+                continue;
+            }
+        };
+        for tool in listed.tools {
+            let full = format!("mcp__{}__{}", spec.name, tool.name);
+            // ToolMeta requires `&'static` strings; leak the per-tool metadata
+            // (small, process-lifetime, mirroring the static inventory registry).
+            let name: &'static str = Box::leak(full.clone().into_boxed_str());
+            let description: &'static str = Box::leak(tool.description.into_boxed_str());
+            let schema = serde_json::to_string(&tool.input_schema)
+                .unwrap_or_else(|_| r#"{"type":"object"}"#.to_string());
+            let input_schema: &'static str = Box::leak(schema.into_boxed_str());
+            let meta = ToolMeta {
+                name,
+                description,
+                tier: Tier::RequiresPermission,
+                urgency: Urgency::Medium,
+                side_effects: SideEffects::Mutating,
+                input_schema,
+                sandbox_profile: SandboxProfile::Inherit,
+                token_budget: DEFAULT_TOKEN_BUDGET,
+                hot: false,
+            };
+            let proxy =
+                origin_mcp::proxy::McpToolProxy::new(Arc::clone(&client), meta, tool.name.clone());
+            map.insert(full.clone(), Arc::new(proxy) as Arc<dyn DynTool>);
+            names.push(full);
+        }
+    }
+    (map, names)
+}
 
 /// The daemon's live provider handle (swappable via `/account`). The worker
 /// snapshots it at spawn time so a mid-flight switch is respected.
@@ -93,7 +158,8 @@ impl Prompter for AllowList {
 pub fn real_worker(active: ActiveProvider) -> WorkerFn {
     Arc::new(move |ctx: WorkerContext| {
         let active = Arc::clone(&active);
-        Box::pin(async move { run_worker(active, ctx).await })
+        // Heap-box the (large) worker future to keep the closure's stack small.
+        Box::pin(async move { Box::pin(run_worker(active, ctx)).await })
     })
 }
 
@@ -112,10 +178,18 @@ async fn run_worker(
     });
     let mut session = Session::new(provider.name(), &model);
 
-    // Narrow the child's tools to its allow-list (glob patterns supported), and
-    // never `Task` (a child that could spawn its own children would re-enter the
-    // Swarm pool and risk the same circular wait this design avoids).
-    let prompter = AllowList::from_patterns(&ctx.spec.allowed_tools);
+    // gap 9b: spin up this sub-agent's declared inline-MCP servers and expose
+    // their tools to the worker for the run. Empty specs ⇒ empty map ⇒ no MCP
+    // (byte-identical default).
+    let (mcp_tools, mcp_tool_names) = build_runtime_tools(&ctx.spec.mcp_servers).await;
+
+    // Narrow the child's tools to its allow-list (glob patterns supported) plus
+    // its inline-MCP tool names, and never `Task` (a child that could spawn its
+    // own children would re-enter the Swarm pool and risk the same circular wait
+    // this design avoids).
+    let mut allow_patterns = ctx.spec.allowed_tools.clone();
+    allow_patterns.extend(mcp_tool_names);
+    let prompter = AllowList::from_patterns(&allow_patterns);
 
     let max_turns = if ctx.budget.max_tool_calls == 0 {
         DEFAULT_WORKER_TURNS
@@ -142,6 +216,10 @@ async fn run_worker(
     let run = async {
         run_loop(&mut session, &goal, provider.as_ref(), &prompter, &opts).await
     };
+    // gap 9b: install the worker's inline-MCP runtime registry for the duration
+    // of its loop so the dispatch path can resolve + invoke those tools (empty
+    // map ⇒ no effect). Heap-box the (large) composed future.
+    let run = Box::pin(scope_runtime_tools(Arc::new(mcp_tools), run));
     let loop_result = match ctx.collab.clone() {
         Some(wc) => {
             let collab = SwarmCollab {

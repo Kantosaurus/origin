@@ -74,6 +74,11 @@ pub struct TaskInput {
     /// ⇒ the worker uses the daemon default model.
     #[serde(default)]
     pub model: Option<String>,
+    /// Inline MCP servers for this sub-agent (gap 9b). The model copies these
+    /// from the `<origin-subagents>` block when delegating to a declarative
+    /// sub-agent that declares `mcp:` servers. Empty ⇒ no MCP (default).
+    #[serde(default)]
+    pub mcp_servers: Vec<origin_swarm::McpServerSpec>,
 }
 
 /// Actionable inlined view of the worker's [`CompletionReport`].
@@ -126,6 +131,7 @@ pub async fn task_spawn(coord: &Coordinator, input: TaskInput) -> Result<WorkerH
         workspace: None,
         parent_actor: origin_plan::ActorId::new(0),
         model: input.model,
+        mcp_servers: input.mcp_servers,
     };
     Ok(coord.spawn(spec).await?)
 }
@@ -172,7 +178,7 @@ crate::origin_tool! {
     tier: crate::Tier::RequiresPermission,
     urgency: crate::Urgency::Medium,
     side_effects: crate::SideEffects::Mutating,
-    input_schema: r#"{"type":"object","required":["goal","allowed_tools"],"properties":{"goal":{"type":"string"},"allowed_tools":{"type":"array","items":{"type":"string"}},"budget":{"type":"object"},"model":{"type":"string"}}}"#,
+    input_schema: r#"{"type":"object","required":["goal","allowed_tools"],"properties":{"goal":{"type":"string"},"allowed_tools":{"type":"array","items":{"type":"string"}},"budget":{"type":"object"},"model":{"type":"string"},"mcp_servers":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"url":{"type":"string"}},"required":["name"]}}}}"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
     token_budget: crate::DEFAULT_TOKEN_BUDGET,
     hot: false,

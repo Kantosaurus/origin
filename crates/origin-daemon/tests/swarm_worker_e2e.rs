@@ -86,6 +86,7 @@ async fn real_worker_runs_a_subagent_to_completion() {
         workspace: None,
         parent_actor: origin_plan::ActorId::new(0),
         model: None,
+        mcp_servers: Vec::new(),
     };
 
     let handle = coord.spawn(spec).await.expect("spawn worker");

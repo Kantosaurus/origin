@@ -61,6 +61,7 @@ async fn task_tool_dispatches_worker_and_inlines_report() {
             allowed_tools: vec!["read".into()],
             budget: TaskBudget::default(),
             model: None,
+            mcp_servers: vec![],
         },
     )
     .await
@@ -109,6 +110,7 @@ async fn task_tool_filters_disallowed_tools_into_decision_record() {
             allowed_tools: vec!["read".into(), "grep".into()],
             budget: TaskBudget::default(),
             model: None,
+            mcp_servers: vec![],
         },
     )
     .await

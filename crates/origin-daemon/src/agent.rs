@@ -1118,6 +1118,112 @@ where
     SWARM_COLLAB.scope(collab, fut).await
 }
 
+/// A worker-scoped runtime tool registry (gap 9b: inline-MCP-per-subagent).
+/// Maps a (namespaced) tool name to a [`DynTool`] the worker may invoke.
+pub type RuntimeTools = std::sync::Arc<std::collections::HashMap<String, std::sync::Arc<dyn origin_tools::DynTool>>>;
+
+tokio::task_local! {
+    /// Per-worker inline-MCP tools (gap 9b). A swarm worker that declared `mcp:`
+    /// servers installs this via [`scope_runtime_tools`] for the duration of its
+    /// [`run_loop`]; the dispatch loop consults it for tool names absent from the
+    /// compile-time registry. Unset on every other task ⇒ byte-identical.
+    static RUNTIME_TOOLS: RuntimeTools;
+}
+
+/// Run `fut` with `tools` installed in the [`RUNTIME_TOOLS`] task-local.
+///
+/// The dispatch loop can then resolve + invoke this worker's inline-MCP tools.
+/// Tasks that never call this see an unset task-local and behave as before.
+pub async fn scope_runtime_tools<F, T>(tools: RuntimeTools, fut: F) -> T
+where
+    F: std::future::Future<Output = T> + Send,
+{
+    RUNTIME_TOOLS.scope(tools, fut).await
+}
+
+/// Look up a runtime (inline-MCP) tool by name in the worker's task-local
+/// registry. Returns `None` when unset (the default) or when absent.
+fn runtime_tool(name: &str) -> Option<std::sync::Arc<dyn origin_tools::DynTool>> {
+    RUNTIME_TOOLS.try_with(|m| m.get(name).cloned()).ok().flatten()
+}
+
+/// Schemas for the worker's runtime (inline-MCP) tools, to advertise alongside
+/// the static registry. Empty when the task-local is unset (the default).
+fn runtime_tool_schemas() -> Vec<origin_provider::ToolSchema> {
+    RUNTIME_TOOLS
+        .try_with(|m| {
+            m.values()
+                .map(|t| {
+                    let meta = t.meta();
+                    origin_provider::ToolSchema {
+                        name: meta.name.to_string(),
+                        description: meta.description.to_string(),
+                        input_schema_json: meta.input_schema.to_string(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod runtime_tools_tests {
+    use super::{runtime_tool, runtime_tool_schemas, scope_runtime_tools};
+    use async_trait::async_trait;
+    use origin_tools::{DynTool, SandboxProfile, SideEffects, Tier, ToolMeta, Urgency};
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct FakeMcpTool(ToolMeta);
+
+    #[async_trait]
+    impl DynTool for FakeMcpTool {
+        fn meta(&self) -> &ToolMeta {
+            &self.0
+        }
+        async fn invoke(&self, _args: Value) -> Result<Value, String> {
+            Ok(json!({"ok": true}))
+        }
+    }
+
+    fn fake() -> Arc<dyn DynTool> {
+        Arc::new(FakeMcpTool(ToolMeta {
+            name: "mcp__demo__ping",
+            description: "demo mcp tool",
+            tier: Tier::RequiresPermission,
+            urgency: Urgency::Low,
+            side_effects: SideEffects::Mutating,
+            input_schema: r#"{"type":"object"}"#,
+            sandbox_profile: SandboxProfile::Inherit,
+            token_budget: 1024,
+            hot: false,
+        }))
+    }
+
+    #[tokio::test]
+    async fn runtime_registry_resolves_and_advertises_within_scope_only() {
+        // Unset by default ⇒ no runtime tools (byte-identical default path).
+        assert!(runtime_tool("mcp__demo__ping").is_none());
+        assert!(runtime_tool_schemas().is_empty());
+
+        let mut map: HashMap<String, Arc<dyn DynTool>> = HashMap::new();
+        map.insert("mcp__demo__ping".to_string(), fake());
+        scope_runtime_tools(Arc::new(map), async {
+            assert!(runtime_tool("mcp__demo__ping").is_some());
+            assert!(runtime_tool("nope").is_none());
+            let schemas = runtime_tool_schemas();
+            assert_eq!(schemas.len(), 1);
+            assert_eq!(schemas[0].name, "mcp__demo__ping");
+        })
+        .await;
+
+        // Outside the scope the task-local is unset again.
+        assert!(runtime_tool("mcp__demo__ping").is_none());
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -2105,7 +2211,7 @@ async fn run_loop_inner(
             .await;
     }
 
-    let tools_schema = registry_iter()
+    let mut tools_schema = registry_iter()
         .map(|m| {
             if m.hot {
                 // Full schema embed.
@@ -2127,6 +2233,9 @@ async fn run_loop_inner(
             }
         })
         .collect::<Vec<_>>();
+    // gap 9b: advertise the worker's inline-MCP tools alongside the static
+    // registry. Empty (no extension) on every non-worker task ⇒ byte-identical.
+    tools_schema.extend(runtime_tool_schemas());
 
     // Per-session memoization cache (N5.4). Lives for the lifetime of this
     // run_loop call so identical (tool_name, input_bytes) pairs within the
@@ -3004,6 +3113,30 @@ async fn run_loop_inner(
         let mut pending_tasks: Vec<(usize, String, String, origin_swarm::WorkerHandle)> = Vec::new();
         for (id, name, input_bytes) in tool_uses {
             let Some(meta) = registry_iter().find(|m| m.name == name) else {
+                // gap 9b: a name absent from the compile-time registry may be a
+                // worker's inline-MCP tool in the task-local runtime registry.
+                // Permission-checked against the worker's allow-list (so a glob
+                // like `mcp__github__*` must permit it) then invoked via DynTool.
+                if let Some(tool) = runtime_tool(&name) {
+                    let args: Value = serde_json::from_slice(&input_bytes).unwrap_or(Value::Null);
+                    let allowed = prompter.ask(tool.meta(), &args.to_string()).await;
+                    let inline = if allowed {
+                        match tool.invoke(args).await {
+                            Ok(v) => serde_json::to_vec(&v).unwrap_or_else(|_| b"null".to_vec()),
+                            Err(e) => format!("Error: {e}").into_bytes(),
+                        }
+                    } else {
+                        format!("Error: tool `{name}` is not in this sub-agent's allow-list")
+                            .into_bytes()
+                    };
+                    tool_results.push(Block::ToolResult {
+                        tool_use_id: id,
+                        handle: None,
+                        inline: Some(inline),
+                        cache_marker: None,
+                    });
+                    continue;
+                }
                 tracing::warn!(tool = %name, "unknown tool; returning error to model");
                 tool_results.push(Block::ToolResult {
                     tool_use_id: id,

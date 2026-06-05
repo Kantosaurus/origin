@@ -39,6 +39,7 @@ fn spec(goal: &str) -> WorkerSpec {
         workspace: None,
         parent_actor: ActorId::new(0),
         model: None,
+        mcp_servers: Vec::new(),
     }
 }
 
