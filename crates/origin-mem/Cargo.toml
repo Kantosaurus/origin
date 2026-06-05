@@ -20,7 +20,7 @@ workspace = true
 # moved to 1.96 (see rust-toolchain.toml). Default features keep ndarray +
 # download-binaries + copy-dylibs + std + tls-native + api-24.
 ort         = { version = "2.0.0-rc.12", features = ["ndarray"] }
-ndarray     = "0.15"
+ndarray     = "0.17"
 tokenizers  = { version = "0.20", default-features = false, features = ["onig"] }
 hnsw_rs     = "0.3"
 rand        = "0.8"
