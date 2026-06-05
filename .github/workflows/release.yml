@@ -57,13 +57,22 @@ jobs:
           CARGO_PROFILE_RELEASE_OPT_LEVEL: z
           CARGO_PROFILE_RELEASE_STRIP: symbols
         run: |
-          # Ship the whole runtime trio: `origin` (CLI) plus the SEPARATE
-          # `origin-daemon` binary the CLI spawns (required — without it a
-          # packaged install cannot stand up the daemon at all) and
-          # `origin-supervisor` (owns/restarts the daemon + consumes the self-dev
-          # hot-reload exit-86 sentinel). They must land co-located so the CLI's
+          # Ship the runtime trio where it links: `origin` (CLI) plus the
+          # SEPARATE `origin-daemon` binary the CLI spawns (required to stand up
+          # the daemon) and `origin-supervisor` (restarts the daemon + consumes
+          # the self-dev hot-reload exit-86 sentinel), co-located so the CLI's
           # sibling lookup (current_exe().parent()) resolves them.
+          #
+          # EXCEPTION: the daemon links ONNX Runtime (`ort`, via origin-mem),
+          # whose native lib is only present for the HOST arch. The two aarch64
+          # CROSS targets (the `cross` container for Linux; x64->arm64 for
+          # Windows) can't link it, so there we ship the thin `origin-cli` ALONE
+          # (the daemon dead-strips in the client, which is why CLI-only aarch64
+          # builds worked before). The 4 native-arch targets ship the full trio.
           PKGS="-p origin-cli -p origin-daemon -p origin-supervisor"
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu|aarch64-pc-windows-msvc) PKGS="-p origin-cli" ;;
+          esac
           # aarch64 Linux is cross-compiled with `cross`; x86_64 Linux builds
           # natively on the ubuntu runner; macOS/Windows build natively too.
           if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
@@ -77,11 +86,16 @@ jobs:
           mkdir -p dist
           ext=""
           if [[ "${{ matrix.target }}" == *windows* ]]; then ext=".exe"; fi
-          # All three binaries are named `<bin>-<triple>[.exe]` so the SHA256SUMS
-          # (`origin-*`), cosign (`dist/*`), upload (`origin-*`), and npm collect
-          # (`origin-*`) steps below pick every one up unchanged.
+          # Stage whatever was built for this target (the trio on native-arch
+          # targets, `origin` alone on the two aarch64 cross targets). All are
+          # named `<bin>-<triple>[.exe]` so the SHA256SUMS (`origin-*`), cosign
+          # (`dist/*`), upload (`origin-*`), and npm collect (`origin-*`) steps
+          # pick up every one. A binary not built for this target is skipped
+          # (the npm assembler + cold-path downloader both tolerate a missing
+          # daemon/supervisor for that platform).
           for b in origin origin-daemon origin-supervisor; do
-            cp "target/${{ matrix.target }}/release/$b$ext" "dist/$b-${{ matrix.target }}$ext"
+            src="target/${{ matrix.target }}/release/$b$ext"
+            if [[ -f "$src" ]]; then cp "$src" "dist/$b-${{ matrix.target }}$ext"; fi
           done
       - name: Cosign keyless sign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
