@@ -332,15 +332,23 @@ pub enum Cmd {
         leaderboard: bool,
     },
     /// Confidence-scored, multi-dimension review of the working-tree diff vs
-    /// `HEAD`. Runs fully local static heuristics through `origin-review`'s
-    /// confidence dedup + strictness filter and prints a deduped report
-    /// (claude-code multi-agent confidence-scored review, local half).
+    /// `HEAD`. By default runs fully local static heuristics through
+    /// `origin-review`'s confidence dedup + strictness filter. With `--llm` it
+    /// instead runs a model review pass through the daemon (the same LLM
+    /// bug/security/perf dimensions the CI bot uses), then dedups + thresholds
+    /// the result through the same pure layer (claude-code multi-agent
+    /// confidence-scored review — now available locally, not just in CI).
     Review {
         /// How aggressively to surface findings: `strict` (high-confidence
         /// only), `balanced` (default), or `lenient` (surface almost
         /// everything).
         #[arg(long, default_value = "balanced")]
         strictness: String,
+        /// Run an LLM review pass via the daemon instead of the static
+        /// heuristics. Needs a running daemon (auto-spawned by a prior `origin`
+        /// session) and resolves the model from `--model`/`ORIGIN_MODEL`.
+        #[arg(long)]
+        llm: bool,
     },
     /// First-class Gmail tool over Google OAuth. Loads credentials from the
     /// keyvault (`google`/`gmail`), runs one operation, and prints the JSON

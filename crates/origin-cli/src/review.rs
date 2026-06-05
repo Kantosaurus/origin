@@ -43,12 +43,19 @@ pub fn parse_strictness(raw: &str) -> Result<Strictness> {
 
 /// Run `origin review`: diff the working tree, analyze it, and print findings.
 ///
+/// With `llm = false` (default) the analysis is the local static heuristic set
+/// ([`analyze_diff`]). With `llm = true` it runs a model review pass through the
+/// daemon ([`llm_review_diff`]) — the LLM bug/security/perf dimensions, now
+/// available locally and not just in the CI bot — then both paths flow through
+/// the same pure dedup + strictness layer ([`render`]).
+///
 /// On a non-git directory or an empty diff a friendly message is printed and the
 /// command succeeds (no panic).
 ///
 /// # Errors
-/// Returns when `--strictness` is invalid or when `git` cannot be spawned.
-pub fn run(strictness: &str) -> Result<()> {
+/// Returns when `--strictness` is invalid, when `git` cannot be spawned, or
+/// (in `--llm` mode) when the daemon turn fails.
+pub async fn run(strictness: &str, llm: bool) -> Result<()> {
     let level = parse_strictness(strictness)?;
     match working_tree_diff()? {
         DiffOutcome::NotARepo => {
@@ -60,11 +67,130 @@ pub fn run(strictness: &str) -> Result<()> {
             Ok(())
         }
         DiffOutcome::Patch(patch) => {
-            let findings = analyze_diff(&patch);
+            let findings = if llm {
+                llm_review_diff(&patch).await?
+            } else {
+                analyze_diff(&patch)
+            };
             print!("{}", render(&findings, level));
             Ok(())
         }
     }
+}
+
+/// Run an LLM review pass over `patch` through the daemon and parse its findings.
+///
+/// Builds a structured review prompt, runs one read-only daemon turn via
+/// [`crate::headless::one_shot_text`], and parses the model's JSON findings into
+/// [`Finding`]s. Parsing is lenient: malformed output yields no findings rather
+/// than an error, so a stray model response degrades to an empty (clean) review.
+///
+/// # Errors
+/// Returns when the daemon turn itself fails (unreachable daemon, etc.).
+async fn llm_review_diff(patch: &str) -> Result<Vec<Finding>> {
+    let model = std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-8".to_string());
+    let reply = crate::headless::one_shot_text(&model, build_review_prompt(patch)).await?;
+    Ok(parse_llm_findings(&reply))
+}
+
+/// The review instruction + structured-output contract sent to the model.
+fn build_review_prompt(patch: &str) -> String {
+    format!(
+        "You are a meticulous senior code reviewer. Review the following unified diff \
+         (working tree vs HEAD). Focus on real defects, not nits.\n\n\
+         Output ONLY a JSON array (no prose, no markdown fences). Each element:\n\
+         {{\"dimension\":\"bug|security|performance|test|style\",\"file\":\"<path>\",\
+         \"line\":<new-file line number>,\"title\":\"<short>\",\"detail\":\"<why + how to fix>\",\
+         \"confidence\":<0.0-1.0>}}\n\
+         Use a high confidence only when you are sure. Return [] if nothing is worth flagging.\n\n\
+         DIFF:\n{patch}"
+    )
+}
+
+/// One finding as emitted by the model (lenient: missing fields default).
+#[derive(serde::Deserialize)]
+struct RawFinding {
+    #[serde(default)]
+    dimension: String,
+    #[serde(default)]
+    file: String,
+    #[serde(default)]
+    line: u32,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    detail: String,
+    #[serde(default)]
+    confidence: f32,
+}
+
+/// Map a model dimension string onto a [`Dimension`]; unknown labels are dropped.
+fn parse_dimension(raw: &str) -> Option<Dimension> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "bug" | "correctness" => Some(Dimension::Bug),
+        "security" | "sec" => Some(Dimension::Security),
+        "performance" | "perf" => Some(Dimension::Performance),
+        "test" | "tests" | "testing" => Some(Dimension::Test),
+        "style" | "nit" | "docs" => Some(Dimension::Style),
+        _ => None,
+    }
+}
+
+/// Parse the model's reply into [`Finding`]s.
+///
+/// Tolerates surrounding prose / code fences by extracting the first top-level
+/// `[ ... ]` JSON array; a reply with no parseable array (or only unknown
+/// dimensions) yields an empty list.
+fn parse_llm_findings(reply: &str) -> Vec<Finding> {
+    let Some(json) = extract_json_array(reply) else {
+        return Vec::new();
+    };
+    let Ok(raws) = serde_json::from_str::<Vec<RawFinding>>(json) else {
+        return Vec::new();
+    };
+    raws.into_iter()
+        .filter(|r| !r.file.is_empty() && !r.title.is_empty())
+        .filter_map(|r| {
+            parse_dimension(&r.dimension)
+                .map(|d| Finding::new(d, &r.file, r.line, &r.title, &r.detail, r.confidence))
+        })
+        .collect()
+}
+
+/// Slice out the first balanced top-level JSON array from `s`.
+///
+/// Scans from the first `[` tracking bracket depth (ignoring brackets inside
+/// JSON strings), so the parser tolerates a model that wraps the array in prose
+/// or a fenced code block. Returns `None` when there is no balanced array.
+fn extract_json_array(s: &str) -> Option<&str> {
+    let start = s.find('[')?;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, ch) in s[start..].char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..=start + i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The result of trying to read the working-tree patch.
@@ -419,6 +545,48 @@ mod tests {
         assert_eq!(parse_strictness("strict").unwrap(), Strictness::Strict);
         assert_eq!(parse_strictness("BALANCED").unwrap(), Strictness::Balanced);
         assert_eq!(parse_strictness("  lenient ").unwrap(), Strictness::Lenient);
+    }
+
+    #[test]
+    fn extract_json_array_ignores_surrounding_prose_and_fences() {
+        let s = "Here are the findings:\n```json\n[{\"a\":1}, {\"b\":[2,3]}]\n```\nDone.";
+        assert_eq!(extract_json_array(s), Some("[{\"a\":1}, {\"b\":[2,3]}]"));
+        // A bracket inside a string must not end the array early.
+        let s2 = "[{\"title\":\"has ] bracket\"}]";
+        assert_eq!(extract_json_array(s2), Some(s2));
+        assert_eq!(extract_json_array("no array here"), None);
+    }
+
+    #[test]
+    fn parse_dimension_maps_labels_and_drops_unknown() {
+        assert_eq!(parse_dimension("Bug"), Some(Dimension::Bug));
+        assert_eq!(parse_dimension("perf"), Some(Dimension::Performance));
+        assert_eq!(parse_dimension("security"), Some(Dimension::Security));
+        assert_eq!(parse_dimension("tests"), Some(Dimension::Test));
+        assert_eq!(parse_dimension("wat"), None);
+    }
+
+    #[test]
+    fn parse_llm_findings_parses_array_and_skips_invalid() {
+        let reply = "```json\n[\
+            {\"dimension\":\"bug\",\"file\":\"a.rs\",\"line\":12,\"title\":\"off-by-one\",\"detail\":\"d\",\"confidence\":0.9},\
+            {\"dimension\":\"unknown\",\"file\":\"b.rs\",\"line\":1,\"title\":\"x\",\"detail\":\"\",\"confidence\":0.5},\
+            {\"dimension\":\"security\",\"file\":\"\",\"line\":1,\"title\":\"no file\",\"detail\":\"\",\"confidence\":0.5}\
+        ]\n```";
+        let findings = parse_llm_findings(reply);
+        // Only the well-formed, known-dimension, file+title-bearing finding survives.
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].dimension, Dimension::Bug);
+        assert_eq!(findings[0].file, "a.rs");
+        assert_eq!(findings[0].line, 12);
+        assert!((findings[0].confidence - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_llm_findings_empty_on_garbage() {
+        assert!(parse_llm_findings("the model refused").is_empty());
+        assert!(parse_llm_findings("[not valid json").is_empty());
+        assert!(parse_llm_findings("[]").is_empty());
     }
 
     #[test]

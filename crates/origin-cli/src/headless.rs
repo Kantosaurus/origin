@@ -311,6 +311,41 @@ fn extract_json(reply: &str) -> &str {
 
 /// Send one `PromptRequest` and drain the stream to its terminal frame,
 /// returning the accumulated assistant text. `emit` controls live output.
+/// One-shot prompt → assistant text via the LOCAL daemon.
+///
+/// For in-process callers that need a single model turn without the full `run`
+/// surface (e.g. `origin review --llm`). Connects to the local daemon
+/// (`ORIGIN_SOCK` or the default path), drives one silent, read-only turn, and
+/// returns the assistant text. Errors with actionable guidance when the daemon
+/// is unreachable.
+///
+/// # Errors
+/// Returns when the daemon cannot be reached or the turn fails.
+pub async fn one_shot_text(model: &str, user_text: String) -> Result<String> {
+    let path = std::env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
+    let mut conn = Conn::Local(Connector::connect(&path).await.map_err(|e| {
+        anyhow::anyhow!(
+            "could not reach the origin daemon ({e}); start a session with `origin` first, \
+             or use plain `origin review` (static, no daemon)"
+        )
+    })?);
+    let prompt = PromptRequest {
+        system: String::new(),
+        model: model.to_string(),
+        user_text,
+        session_id: None,
+        effort: None,
+        thinking_tokens: None,
+        attachments: Vec::new(),
+        // A review never edits, so deny mutating tools for this turn.
+        read_only: true,
+        roots: Vec::new(),
+        permission_ask: false,
+        account: None,
+    };
+    drive_turn(&mut conn, prompt, Emit::Silent).await
+}
+
 async fn drive_turn(conn: &mut Conn, prompt: PromptRequest, emit: Emit) -> Result<String> {
     let body = serde_json::to_vec(&ClientMessage::prompt(prompt))?;
     conn.write_raw(&encode(1, FrameKind::Request, &body)).await?;

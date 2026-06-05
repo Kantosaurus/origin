@@ -313,7 +313,7 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
                 origin_cli::bench::run(samples, json, from.into_iter().next())
             }
         }
-        Cmd::Review { strictness } => origin_cli::review::run(&strictness),
+        Cmd::Review { strictness, llm } => origin_cli::review::run(&strictness, llm).await,
         Cmd::Gmail {
             op,
             query,
