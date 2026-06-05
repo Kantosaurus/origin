@@ -28,6 +28,7 @@ const KNOWN_SOURCES: &[&str] = &[
     "oc",
     "codex",
     "cx",
+    "pi",
 ];
 
 /// Run `origin resume-foreign <source> <path>`.
@@ -43,8 +44,8 @@ pub async fn run(source: String, path: String) -> Result<()> {
     let tag = source.trim().to_ascii_lowercase();
     if !KNOWN_SOURCES.contains(&tag.as_str()) {
         anyhow::bail!(
-            "unknown source {source:?}: expected one of claude-code | jcode | opencode \
-             (aliases claude/cc/oc)"
+            "unknown source {source:?}: expected one of claude-code | jcode | opencode | codex | pi \
+             (aliases claude/cc/oc/cx/π)"
         );
     }
     if path.trim().is_empty() {

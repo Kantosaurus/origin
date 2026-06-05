@@ -154,13 +154,13 @@ pub enum Cmd {
     /// Import a session/skill set from another harness (P14.B.7).
     Import(crate::import::ImportArgs),
     /// Cross-harness *live resume*: reconstruct a foreign harness's transcript
-    /// (Claude Code / jcode / opencode) into a brand-new resumable origin
-    /// session, then continue it with `origin sessions resume <id>`. Unlike
-    /// `origin import` (which only stores history), this hydrates a session you
-    /// can keep talking to. *Closes: jcode L227.*
+    /// (Claude Code / jcode / opencode / codex / pi) into a brand-new resumable
+    /// origin session, then continue it with `origin sessions resume <id>`.
+    /// Unlike `origin import` (which only stores history), this hydrates a
+    /// session you can keep talking to. *Closes: jcode L227.*
     ResumeForeign {
-        /// Originating harness: `claude-code` | `jcode` | `opencode` (aliases
-        /// `claude`/`cc`/`oc` are also accepted).
+        /// Originating harness: `claude-code` | `jcode` | `opencode` | `codex` |
+        /// `pi` (aliases `claude`/`cc`/`oc`/`cx`/`π` are also accepted).
         source: String,
         /// Path to the external session file or harness root directory.
         path: String,
