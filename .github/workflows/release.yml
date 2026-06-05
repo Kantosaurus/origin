@@ -34,8 +34,12 @@ jobs:
           # builds on every target.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
+          # x86_64 macOS builds on a NATIVE Intel runner: ort rc.12 links ONNX
+          # Runtime for Apple via an xcframework, which only resolves for the
+          # host arch — cross-building x64 on the arm64 `macos-latest` runner
+          # fails ("can't do xcframework linking for x86_64-apple-darwin").
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-13
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-pc-windows-msvc
@@ -89,9 +93,15 @@ jobs:
             src="target/${{ matrix.target }}/release/$b$ext"
             if [[ -f "$src" ]]; then cp "$src" "dist/$b-${{ matrix.target }}$ext"; fi
           done
+      # Cosign has no arm64-Windows binary (the installer errors "unsupported
+      # architecture ARM64"), so skip cosign signing on that one target. Its
+      # binaries still ship and are covered by SHA256SUMS (which is what the npm
+      # download fallback verifies against).
       - name: Cosign keyless sign
+        if: matrix.target != 'aarch64-pc-windows-msvc'
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Sign
+        if: matrix.target != 'aarch64-pc-windows-msvc'
         shell: bash
         env:
           COSIGN_YES: "true"
@@ -99,7 +109,10 @@ jobs:
           for f in dist/*; do
             cosign sign-blob --bundle "$f.sig" "$f"
           done
+      # Also skip SLSA attestation on arm64-Windows (same toolchain-support gap
+      # as cosign); the binary ships + is covered by SHA256SUMS.
       - name: SLSA provenance attestation
+        if: matrix.target != 'aarch64-pc-windows-msvc'
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: "dist/*"
