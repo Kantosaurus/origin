@@ -2,9 +2,8 @@
 //! ONNX `MiniLM` wrapper. Loads a sentence-transformer ONNX graph and exposes
 //! `embed(text) -> [f32; 384]`. CPU execution provider only.
 
-use ndarray::Array2;
-use ort::{Session, SessionInputValue, Value};
-use std::borrow::Cow;
+use ort::session::Session;
+use ort::value::TensorRef;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -46,14 +45,23 @@ pub enum EmbedderError {
     /// The requested model path does not exist on disk.
     #[error("model file not found at {0:?}")]
     NotFound(PathBuf),
+
+    /// The session mutex was poisoned by a prior panic mid-inference.
+    #[error("embedder session lock poisoned")]
+    SessionPoisoned,
 }
 
 /// Sentence-embedding pipeline over an ONNX MiniLM-class model.
 ///
 /// One [`Embedder`] owns a single ONNX [`Session`] and tokenizer. It is cheap
 /// to call [`Self::embed`] repeatedly; expensive to construct.
+///
+/// The session is behind a `Mutex` because ort rc.12's `Session::run` takes
+/// `&mut self`, while `embed` must stay `&self` (callers hold `&Embedder`, e.g.
+/// a shared `Option<&Embedder>`). Inference therefore serializes per embedder —
+/// fine, since a single CPU session is not meant to run concurrently anyway.
 pub struct Embedder {
-    session: Session,
+    session: std::sync::Mutex<Session>,
     tokenizer: Tokenizer,
 }
 
@@ -72,7 +80,7 @@ impl Embedder {
         if !path.exists() {
             return Err(EmbedderError::NotFound(path.to_owned()));
         }
-        let session = Session::builder()?.commit_from_file(path)?;
+        let session = std::sync::Mutex::new(Session::builder()?.commit_from_file(path)?);
         let tok_path = path.with_extension("tokenizer.json");
         let tokenizer = if tok_path.exists() {
             Tokenizer::from_file(&tok_path).map_err(|e| EmbedderError::Tokenizer(e.to_string()))?
@@ -100,26 +108,24 @@ impl Embedder {
         let seq_len = if ids.is_empty() { 1 } else { ids.len() };
         let ids_buf = if ids.is_empty() { vec![0_i64] } else { ids };
         let mask_buf = if mask.is_empty() { vec![1_i64] } else { mask };
-        let ids_arr: Array2<i64> = Array2::from_shape_vec((1, seq_len), ids_buf)
-            .map_err(|e| EmbedderError::Tokenizer(e.to_string()))?;
-        let mask_arr: Array2<i64> = Array2::from_shape_vec((1, seq_len), mask_buf)
-            .map_err(|e| EmbedderError::Tokenizer(e.to_string()))?;
 
-        let ids_val = Value::from_array(ids_arr)?;
-        let mask_val = Value::from_array(mask_arr)?;
-        let inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> = vec![
-            (Cow::Borrowed("input_ids"), ids_val.into()),
-            (Cow::Borrowed("attention_mask"), mask_val.into()),
-        ];
-        let outputs = self.session.run(inputs)?;
+        // ort rc.12: build `[1, seq_len]` i64 tensors that BORROW the flat
+        // buffers (shape tuple + slice) — no `ndarray::Array2` intermediary.
+        let ids_t = TensorRef::from_array_view(([1_usize, seq_len], ids_buf.as_slice()))?;
+        let mask_t = TensorRef::from_array_view(([1_usize, seq_len], mask_buf.as_slice()))?;
+        // rc.12 `Session::run` takes `&mut self`; lock the session for the call
+        // and hold the guard through extraction (the output view borrows it).
+        let mut session = self.session.lock().map_err(|_| EmbedderError::SessionPoisoned)?;
+        let outputs = session.run(ort::inputs!["input_ids" => ids_t, "attention_mask" => mask_t])?;
 
-        let tensor = outputs[0].try_extract_tensor::<f32>()?;
-        let view = tensor.view();
-        let shape = view.shape();
+        // `try_extract_array` yields a dynamic-dim ndarray view; read it by shape
+        // so we stay agnostic to ort's internal ndarray version.
+        let arr = outputs[0].try_extract_array::<f32>()?;
+        let shape = arr.shape();
         if shape.len() != 2 || shape[0] != 1 || shape[1] != EMBED_DIM {
             return Err(EmbedderError::BadShape { got: shape.to_vec() });
         }
-        Ok(view.iter().copied().collect())
+        Ok(arr.iter().copied().collect())
     }
 
     /// Minimal whitespace word-level tokenizer used when no sibling
