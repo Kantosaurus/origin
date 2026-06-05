@@ -161,6 +161,87 @@ pub fn rewind(id: &str, files_only: bool, paths: Vec<String>) -> Result<()> {
     }
 }
 
+/// Value-returning checkpoint list for in-TUI consumers (gap 3 timeline).
+///
+/// Unlike [`checkpoints`] (which prints), this returns the checkpoints (newest
+/// first) so the TUI can render them under the alternate screen. Returns an empty
+/// list when no shadow repo exists yet.
+///
+/// # Errors
+/// Returns when the underlying `git log` fails.
+pub fn list_checkpoints() -> Result<Vec<origin_vcs::Checkpoint>> {
+    let runner = CmdGit;
+    let shadow = shadow_dir()?;
+    if !shadow.exists() {
+        return Ok(Vec::new());
+    }
+    let sg = ShadowGit::new(&runner, shadow.to_string_lossy().into_owned());
+    sg.list().map_err(|e| anyhow::anyhow!("listing checkpoints: {e}"))
+}
+
+/// Value-returning patch for checkpoint `id` for the in-TUI diff viewer (gap 3).
+///
+/// # Errors
+/// Returns when no shadow repo exists, the checkpoint is unknown, or git fails.
+pub fn checkpoint_patch(id: &str) -> Result<String> {
+    let runner = CmdGit;
+    let shadow = shadow_dir()?;
+    if !shadow.exists() {
+        anyhow::bail!("no checkpoints yet");
+    }
+    let sg = ShadowGit::new(&runner, shadow.to_string_lossy().into_owned());
+    match sg.diff(id) {
+        Ok(patch) => Ok(patch),
+        Err(VcsError::NotFound(_)) => anyhow::bail!("no such checkpoint: {id}"),
+        Err(e) => Err(anyhow::anyhow!("diffing checkpoint: {e}")),
+    }
+}
+
+/// Quiet restore for in-TUI revert (gap 3).
+///
+/// Restores from checkpoint `id` without printing (the caller renders the
+/// outcome into the scrollback). `files_only` restores just the working tree
+/// (HEAD unmoved); otherwise a full reset.
+///
+/// # Errors
+/// Returns when no shadow repo exists, the checkpoint is unknown, or git fails.
+pub fn rewind_to(id: &str, files_only: bool) -> Result<()> {
+    let runner = CmdGit;
+    let shadow = shadow_dir()?;
+    if !shadow.exists() {
+        anyhow::bail!("no checkpoints yet");
+    }
+    let sg = ShadowGit::new(&runner, shadow.to_string_lossy().into_owned());
+    let mode = if files_only {
+        RestoreMode::WorkingTree
+    } else {
+        RestoreMode::Full
+    };
+    match sg.restore(id, &mode) {
+        Ok(()) => Ok(()),
+        Err(VcsError::NotFound(_)) => anyhow::bail!("no such checkpoint: {id}"),
+        Err(e) => Err(anyhow::anyhow!("restoring checkpoint: {e}")),
+    }
+}
+
+/// Render checkpoints into display lines for the in-TUI `/timeline` (newest
+/// first). Pure: the caller pushes these into the scrollable scrollback.
+#[must_use]
+pub fn format_checkpoint_lines(checkpoints: &[origin_vcs::Checkpoint]) -> Vec<String> {
+    if checkpoints.is_empty() {
+        return vec!["no checkpoints yet".to_string()];
+    }
+    let mut out = Vec::with_capacity(checkpoints.len() + 1);
+    out.push(format!(
+        "{} checkpoint(s), newest first — `/timeline <id>` views a diff, `/timeline revert <id>` restores:",
+        checkpoints.len()
+    ));
+    for cp in checkpoints {
+        out.push(format!("  {}  ({} files)  {}", cp.id, cp.files_changed, cp.label));
+    }
+    out
+}
+
 /// Print the patch for checkpoint `id`.
 ///
 /// # Errors
@@ -181,5 +262,35 @@ pub fn checkpoint_diff(id: &str) -> Result<()> {
             anyhow::bail!("no such checkpoint: {id}")
         }
         Err(e) => Err(anyhow::anyhow!("diffing checkpoint: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_checkpoint_lines;
+    use origin_vcs::Checkpoint;
+
+    fn cp(id: &str, files: u32, label: &str) -> Checkpoint {
+        Checkpoint {
+            id: id.to_string(),
+            label: label.to_string(),
+            created_at_unix_ms: 0,
+            files_changed: files,
+        }
+    }
+
+    #[test]
+    fn empty_list_renders_placeholder() {
+        assert_eq!(format_checkpoint_lines(&[]), vec!["no checkpoints yet".to_string()]);
+    }
+
+    #[test]
+    fn non_empty_list_has_header_and_one_line_per_checkpoint() {
+        let cps = vec![cp("abc1234", 3, "turn"), cp("def5678", 1, "tool:Edit")];
+        let lines = format_checkpoint_lines(&cps);
+        assert_eq!(lines.len(), 3, "header + 2 checkpoints");
+        assert!(lines[0].contains("2 checkpoint(s)"));
+        assert!(lines[1].contains("abc1234") && lines[1].contains("3 files") && lines[1].contains("turn"));
+        assert!(lines[2].contains("def5678") && lines[2].contains("tool:Edit"));
     }
 }

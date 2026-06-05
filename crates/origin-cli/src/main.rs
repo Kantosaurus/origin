@@ -1180,6 +1180,7 @@ fn is_slash_command(text: &str) -> bool {
         // gate stays authoritative if `RESERVED_SLASH_VERBS` changes. Each
         // predicate mirrors its handler's word-boundary in `handle_submit`.
         || is_help_command(text)
+        || slash_verb_boundary(text, "/timeline")
         || slash_verb_boundary(text, "/knowledge")
         || slash_verb_boundary(text, "/permissions")
         || text
@@ -1324,6 +1325,50 @@ async fn handle_submit(
                 "system> ",
                 &origin_cli::locale::linef("cmd.steer.queued", &[("pending", pending.as_str())]),
             );
+        }
+        handle.mark_dirty();
+        return;
+    }
+    // `/timeline [<id>|revert <id>]` — in-TUI checkpoint timeline + diff viewer
+    // (gap 3). No arg lists checkpoints; `<id>` renders that checkpoint's patch
+    // into the scrollable scrollback; `revert <id>` restores the working tree
+    // from it (files-only, HEAD unmoved). Checkpoints are client-local shadow git.
+    if let Some(arg) = text
+        .trim()
+        .strip_prefix("/timeline")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        .map(str::trim)
+    {
+        app.lock().add_line("you> ", text);
+        if let Some(cp_id) = arg
+            .strip_prefix("revert")
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+            .map(str::trim)
+        {
+            match origin_cli::vcs::rewind_to(cp_id, true) {
+                Ok(()) => app
+                    .lock()
+                    .add_line("system> ", &format!("reverted working tree from checkpoint {cp_id}")),
+                Err(e) => app.lock().add_line("error> ", &format!("{e}")),
+            }
+        } else if arg.is_empty() {
+            match origin_cli::vcs::list_checkpoints() {
+                Ok(cps) => {
+                    for line in origin_cli::vcs::format_checkpoint_lines(&cps) {
+                        app.lock().add_line("system> ", &line);
+                    }
+                }
+                Err(e) => app.lock().add_line("error> ", &format!("{e}")),
+            }
+        } else {
+            match origin_cli::vcs::checkpoint_patch(arg) {
+                Ok(diff) => {
+                    for line in diff.lines() {
+                        app.lock().add_line("", line);
+                    }
+                }
+                Err(e) => app.lock().add_line("error> ", &format!("{e}")),
+            }
         }
         handle.mark_dirty();
         return;
@@ -2694,6 +2739,11 @@ mod tests {
         assert!(is_slash_command("/vim"));
         assert!(is_slash_command("/permissions"));
         assert!(is_slash_command("/permissions on"));
+        // gap 3: the in-TUI checkpoint timeline is gated inline, not sent to the model.
+        assert!(is_slash_command("/timeline"));
+        assert!(is_slash_command("/timeline abc1234"));
+        assert!(is_slash_command("/timeline revert abc1234"));
+        assert!(!is_slash_command("/timelinefoo"));
         // Genuine non-commands must still reach the model.
         assert!(!is_slash_command("knowledge foo"));
         assert!(!is_slash_command("please run /vim"));
