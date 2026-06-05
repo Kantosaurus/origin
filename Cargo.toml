@@ -32,7 +32,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 arrow = { version = "53", default-features = false, features = ["prettyprint"] }
 parquet = { version = "53", default-features = false, features = ["arrow", "snap"] }
 jsonschema = { version = "0.18", default-features = false }
-prometheus = { version = "0.13", default-features = false }
+prometheus = { version = "0.14", default-features = false }
 opentelemetry = { version = "0.24", default-features = false, features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.17", default-features = false, features = ["grpc-tonic", "metrics"] }
 opentelemetry_sdk = { version = "0.24", default-features = false, features = ["metrics", "rt-tokio"] }
