@@ -8,6 +8,7 @@ pub mod claude_code;
 pub mod codex;
 pub mod jcode;
 pub mod opencode;
+pub mod pi;
 pub mod reconstruct;
 pub mod sink;
 pub mod source;

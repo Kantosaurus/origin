@@ -34,10 +34,16 @@
 //!
 //! | `ORIGIN_ROUTER` | Strategy | Companion env (`provider/model`) |
 //! |---|---|---|
+//! | `auto` | [`PhaseAware`](origin_router::Strategy::PhaseAware) | none required — catalog defaults; `ORIGIN_ROUTER_PLAN`/`ORIGIN_ROUTER_FAST` override either leg |
 //! | `phase` | [`PhaseAware`](origin_router::Strategy::PhaseAware) | `ORIGIN_ROUTER_PLAN`, `ORIGIN_ROUTER_FAST` |
 //! | `architect` | [`ArchitectEditor`](origin_router::Strategy::ArchitectEditor) | `ORIGIN_ROUTER_PLAN`, `ORIGIN_ROUTER_FAST` |
 //! | `scored` | [`Scored`](origin_router::Strategy::Scored) | `ORIGIN_ROUTER_CANDIDATES` (comma-separated) |
 //! | `quota` | [`QuotaFallback`](origin_router::Strategy::QuotaFallback) | `ORIGIN_ROUTER_CHAIN` (comma-separated) |
+//!
+//! `auto` is the zero-config sentinel: unlike `phase` (which is inert without
+//! its companion vars) it always builds, defaulting plan/fast to the latest
+//! Anthropic pair (the catalog's default provider). Set `ORIGIN_ROUTER_PLAN` /
+//! `ORIGIN_ROUTER_FAST` (`provider/model`) to retarget either leg.
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -134,6 +140,24 @@ impl LiveRouter {
     /// `ORIGIN_ROUTER` value, `get` resolves a companion variable by name.
     fn from_env_with(kind: &str, get: impl Fn(&str) -> Option<String>) -> Option<Self> {
         match kind.trim() {
+            "auto" => {
+                // Zero-config phase-aware routing: a capable model to plan, a
+                // cheap one to edit. Defaults to the latest Anthropic pair (the
+                // catalog's default provider); ORIGIN_ROUTER_PLAN/FAST override
+                // either leg, so `auto` retargets to any provider without the
+                // user learning the strategy names. ALWAYS builds (unlike
+                // "phase", which is None without companions) — the sentinel
+                // "just works".
+                let plan = get("ORIGIN_ROUTER_PLAN")
+                    .as_deref()
+                    .and_then(parse_model_ref)
+                    .unwrap_or_else(default_plan_model);
+                let fast = get("ORIGIN_ROUTER_FAST")
+                    .as_deref()
+                    .and_then(parse_model_ref)
+                    .unwrap_or_else(default_fast_model);
+                Some(Self::new(Strategy::PhaseAware { plan, fast }, Vec::new()))
+            }
             "phase" | "architect" => {
                 let plan = parse_model_ref(&get("ORIGIN_ROUTER_PLAN")?)?;
                 let fast = parse_model_ref(&get("ORIGIN_ROUTER_FAST")?)?;
@@ -164,6 +188,18 @@ impl LiveRouter {
             _ => None,
         }
     }
+}
+
+/// Default `ORIGIN_ROUTER=auto` "plan/architect" model (overridable via
+/// `ORIGIN_ROUTER_PLAN`): the latest capable Anthropic model.
+fn default_plan_model() -> ModelRef {
+    ModelRef::new("anthropic", "claude-opus-4-8")
+}
+
+/// Default `ORIGIN_ROUTER=auto` "fast/editor" model (overridable via
+/// `ORIGIN_ROUTER_FAST`): a cheap, quick Anthropic model.
+fn default_fast_model() -> ModelRef {
+    ModelRef::new("anthropic", "claude-haiku-4-5")
 }
 
 /// Parse a single `provider/model` reference. Splits on the first `/`; both
@@ -276,6 +312,27 @@ mod tests {
         lr.record("anthropic", "slow", 2_000, true);
         lr.record("anthropic", "fast", 100, true);
         assert_eq!(lr.choose_model(1, "anthropic").as_deref(), Some("fast"));
+    }
+
+    #[test]
+    fn auto_router_uses_catalog_defaults_with_no_companions() {
+        // The zero-config sentinel must build even with no companion env vars,
+        // defaulting to phase-aware routing on the latest Anthropic pair.
+        let lr = LiveRouter::from_env_with("auto", |_| None).expect("auto always builds");
+        assert_eq!(lr.choose_model(1, "anthropic").as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(lr.choose_model(2, "anthropic").as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn auto_router_honors_companion_overrides() {
+        let env = |k: &str| match k {
+            "ORIGIN_ROUTER_PLAN" => Some("openai/gpt-x".to_string()),
+            "ORIGIN_ROUTER_FAST" => Some("openai/gpt-mini".to_string()),
+            _ => None,
+        };
+        let lr = LiveRouter::from_env_with("auto", env).expect("auto builds with overrides");
+        assert_eq!(lr.choose_model(1, "openai").as_deref(), Some("gpt-x"));
+        assert_eq!(lr.choose_model(2, "openai").as_deref(), Some("gpt-mini"));
     }
 
     #[test]

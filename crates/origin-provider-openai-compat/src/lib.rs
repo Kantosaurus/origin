@@ -61,6 +61,10 @@ impl Provider for OpenAiCompat {
         self.cfg.name
     }
 
+    fn base_url(&self) -> Option<&str> {
+        Some(&self.cfg.base_url)
+    }
+
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError> {
         let messages = origin_provider::inflate_tool_result_handles(&req.messages, self.cas.as_ref())?;
         let req = ChatRequest { messages, ..req };

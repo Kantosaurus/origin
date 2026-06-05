@@ -54,6 +54,17 @@ pub struct PromptRequest {
     /// tool execution are byte-identical. Headless/swarm never set this.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub permission_ask: bool,
+    /// Per-request account override for credential resolution. The interactive
+    /// CLI stamps the session's active account (set via `/account`) onto EVERY
+    /// prompt, because it opens a fresh daemon connection per prompt — so a
+    /// `/account` switch on a throwaway connection cannot reach the prompt
+    /// connection's per-connection slot. The daemon prefers this over its
+    /// connection slot when building `LoopOptions.session_account` (the account
+    /// a cross-provider mid-loop rebuild resolves credentials for). `None` (the
+    /// default) ⇒ fall back to the connection slot / global account, wire
+    /// byte-identical to the pre-per-request behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 /// Request to rebuild the code graph over a set of paths.
@@ -766,5 +777,28 @@ mod permission_wire_tests {
         assert!(!req.permission_ask);
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(!json.contains("permission_ask"), "default request omits the flag: {json}");
+    }
+
+    #[test]
+    fn account_defaults_none_omitted_and_round_trips_when_set() {
+        // Byte-identical default: no `account` key when unset.
+        let req = PromptRequest {
+            user_text: "hi".to_string(),
+            ..Default::default()
+        };
+        assert!(req.account.is_none());
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(!json.contains("account"), "default request omits account: {json}");
+
+        // When set it serializes + round-trips.
+        let req = PromptRequest {
+            user_text: "hi".to_string(),
+            account: Some("work".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains("\"account\":\"work\""), "json was: {json}");
+        let back: PromptRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.account.as_deref(), Some("work"));
     }
 }

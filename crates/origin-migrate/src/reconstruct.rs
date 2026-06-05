@@ -64,6 +64,8 @@ pub enum SourceKind {
     Opencode,
     /// Codex CLI (`sessions/**/rollout-*.jsonl`).
     Codex,
+    /// `pi` CLI (`sessions/**/*.jsonl`).
+    Pi,
 }
 
 impl SourceKind {
@@ -76,6 +78,7 @@ impl SourceKind {
             Self::Jcode => "jcode",
             Self::Opencode => "opencode",
             Self::Codex => "codex",
+            Self::Pi => "pi",
         }
     }
 
@@ -88,6 +91,7 @@ impl SourceKind {
             "jcode" => Some(Self::Jcode),
             "opencode" | "oc" => Some(Self::Opencode),
             "codex" | "cx" => Some(Self::Codex),
+            "pi" | "π" => Some(Self::Pi),
             _ => None,
         }
     }
@@ -215,6 +219,12 @@ pub fn from_codex(session: &ImportedSession, external_model_id: Option<&str>) ->
     reconstruct_session(session, SourceKind::Codex, external_model_id)
 }
 
+/// Reconstruct a `pi` session for live resume.
+#[must_use]
+pub fn from_pi(session: &ImportedSession, external_model_id: Option<&str>) -> ResumedSession {
+    reconstruct_session(session, SourceKind::Pi, external_model_id)
+}
+
 /// Unified entry point: reconstruct a session given its declared [`SourceKind`].
 ///
 /// Dispatches on `kind`; the per-source functions currently share one core, but
@@ -239,6 +249,7 @@ impl SourceKind {
             Self::Jcode => JcodeSource.scan(root),
             Self::Opencode => OpencodeSource.scan(root),
             Self::Codex => CodexSource.scan(root),
+            Self::Pi => crate::pi::PiSource.scan(root),
         }
     }
 }
@@ -338,6 +349,27 @@ mod tests {
             Some(Block::Text { text, .. }) => text.as_str(),
             _ => "",
         }
+    }
+
+    #[test]
+    fn pi_tag_parses_and_reconstructs() {
+        // The `pi` harness tag (and the `π` alias) resolve to SourceKind::Pi,
+        // and a reconstructed pi session carries provenance + roles.
+        assert_eq!(SourceKind::from_tag("pi"), Some(SourceKind::Pi));
+        assert_eq!(SourceKind::from_tag("π"), Some(SourceKind::Pi));
+        assert_eq!(SourceKind::Pi.as_str(), "pi");
+
+        let session = ImportedSession {
+            source_id: "sessions/demo.jsonl".to_string(),
+            title: None,
+            created_at_unix_ms: 0,
+            messages: vec![msg("user", "hi"), msg("assistant", "hello")],
+        };
+        let resumed = from_pi(&session, None);
+        assert_eq!(resumed.source_kind, SourceKind::Pi);
+        assert_eq!(resumed.messages.len(), 2);
+        assert_eq!(resumed.messages[1].role, Role::Assistant);
+        assert_eq!(text_of(&resumed.messages[1]), "hello");
     }
 
     /// Claude Code transcripts use `type: "human"|"assistant"` (see

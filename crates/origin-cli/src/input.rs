@@ -82,7 +82,63 @@ pub fn reduce(buffer: &mut String, ev: KeyEvent, op_in_flight: bool) -> InputAct
 /// `width` is the input card's text width, for visual Home/End and Up/Down
 /// across wrapped lines. Returns the same [`InputAction`]s as [`reduce`];
 /// cursor-only moves return `Noop` (the caller still redraws to move the caret).
+/// Reduce one key while a Ctrl-R reverse-incremental history search is active
+/// (bash-style). Typed chars build the QUERY (not the buffer); Ctrl-R cycles to
+/// older matches; Backspace shrinks the query; Esc / Ctrl-G / Ctrl-C cancels
+/// (restoring the pre-search draft); Enter accepts the match and submits it. Any
+/// other key accepts the match into the buffer and is then re-dispatched as a
+/// normal edit (search is now off, so the recursion is at most one level deep).
+fn reduce_reverse_search(
+    editor: &mut Editor,
+    ev: KeyEvent,
+    op_in_flight: bool,
+    width: usize,
+) -> InputAction {
+    match (ev.code, ev.modifiers) {
+        (KeyCode::Char('r'), m) if m.contains(KeyModifiers::CONTROL) => {
+            editor.reverse_search_again();
+            InputAction::Noop
+        }
+        (KeyCode::Char('g' | 'c'), m) if m.contains(KeyModifiers::CONTROL) => {
+            editor.cancel_reverse_search();
+            InputAction::Noop
+        }
+        (KeyCode::Esc, _) => {
+            editor.cancel_reverse_search();
+            InputAction::Noop
+        }
+        (KeyCode::Backspace, _) => {
+            editor.reverse_search_backspace();
+            InputAction::Backspace
+        }
+        (KeyCode::Enter, _) => {
+            let text = editor.accept_reverse_search();
+            if text.is_empty() {
+                InputAction::Noop
+            } else {
+                editor.push_history(&text);
+                editor.set_buffer(String::new());
+                InputAction::Submit(text)
+            }
+        }
+        (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            editor.reverse_search_push(c);
+            InputAction::Noop
+        }
+        _ => {
+            editor.accept_reverse_search();
+            reduce_editor(editor, ev, op_in_flight, width)
+        }
+    }
+}
+
 pub fn reduce_editor(editor: &mut Editor, ev: KeyEvent, op_in_flight: bool, width: usize) -> InputAction {
+    // While a Ctrl-R reverse search is active, the search sub-reducer owns every
+    // key (see [`reduce_reverse_search`]).
+    if editor.reverse_search_active() {
+        return reduce_reverse_search(editor, ev, op_in_flight, width);
+    }
+
     match (ev.code, ev.modifiers) {
         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
             if op_in_flight {
@@ -92,6 +148,11 @@ pub fn reduce_editor(editor: &mut Editor, ev: KeyEvent, op_in_flight: bool, widt
             }
         }
         (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => InputAction::Quit,
+        // Ctrl-R: enter reverse-incremental history search.
+        (KeyCode::Char('r'), m) if m.contains(KeyModifiers::CONTROL) => {
+            editor.start_reverse_search();
+            InputAction::Noop
+        }
         (KeyCode::Esc, _) => InputAction::Quit,
         (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => {
             editor.insert_newline();
@@ -603,6 +664,48 @@ mod tests {
         reduce_editor(&mut ed, k(KeyCode::Enter), false, 80); // submit → pushed to history
         reduce_editor(&mut ed, k(KeyCode::Up), false, 80); // recall
         assert_eq!(ed.buffer(), "first", "Up past the top recalls the previous prompt");
+    }
+
+    const fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn reduce_editor_ctrl_r_reverse_search_flow() {
+        let mut ed = Editor::new();
+        for s in ["cargo build", "git status", "cargo test"] {
+            ed.push_history(s);
+        }
+        ed.set_buffer("draft".to_string());
+        // Ctrl-R enters search; typed chars build the query (not the buffer).
+        assert_eq!(reduce_editor(&mut ed, ctrl('r'), false, 80), InputAction::Noop);
+        assert!(ed.reverse_search_active());
+        for c in "cargo".chars() {
+            reduce_editor(&mut ed, k(KeyCode::Char(c)), false, 80);
+        }
+        assert_eq!(ed.buffer(), "cargo test", "newest match shown live");
+        // Ctrl-R again cycles older; Enter accepts + submits it.
+        reduce_editor(&mut ed, ctrl('r'), false, 80);
+        assert_eq!(ed.buffer(), "cargo build");
+        assert_eq!(
+            reduce_editor(&mut ed, k(KeyCode::Enter), false, 80),
+            InputAction::Submit("cargo build".to_string())
+        );
+        assert!(!ed.reverse_search_active());
+    }
+
+    #[test]
+    fn reduce_editor_ctrl_r_esc_cancels_and_restores_draft() {
+        let mut ed = Editor::new();
+        ed.push_history("cargo build");
+        ed.set_buffer("draft".to_string());
+        reduce_editor(&mut ed, ctrl('r'), false, 80);
+        reduce_editor(&mut ed, k(KeyCode::Char('c')), false, 80);
+        assert_eq!(ed.buffer(), "cargo build");
+        // Esc cancels search (does NOT quit) and restores the draft.
+        assert_eq!(reduce_editor(&mut ed, k(KeyCode::Esc), false, 80), InputAction::Noop);
+        assert!(!ed.reverse_search_active());
+        assert_eq!(ed.buffer(), "draft");
     }
 
     #[test]

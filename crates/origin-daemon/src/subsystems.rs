@@ -126,12 +126,20 @@ pub fn repo_map_block(roots: &[std::path::PathBuf]) -> Option<String> {
         }
         repo_map_for(&files, &[], REPO_MAP_BUDGET_TOKENS).ok()?
     } else {
-        // Multi-root: scan each root into its own corpus, then merge + re-rank
-        // under one shared budget so cross-root edges are honoured.
+        // Multi-root: scan each root into its own corpus.
         let per_root: Vec<Vec<origin_repomap::FileSymbols>> =
             roots.iter().map(|r| scan_file_symbols(r)).collect();
         if per_root.iter().all(Vec::is_empty) {
             return None;
+        }
+        // ORIGIN_REPOMAP_PER_ROOT=1: rank each root INDEPENDENTLY (per-root
+        // PageRank + per-root budget share), rendered as labelled sections, so a
+        // small root is never buried by a large one and each root's most central
+        // files always surface. Default (unset): merge + re-rank together under
+        // one shared budget so cross-root edges are honoured — byte-identical to
+        // before.
+        if std::env::var("ORIGIN_REPOMAP_PER_ROOT").as_deref() == Ok("1") {
+            return render_per_root_map(roots, &per_root);
         }
         origin_repomap::build_map_multi_root(per_root, &[], REPO_MAP_BUDGET_TOKENS).ok()?
     };
@@ -147,6 +155,44 @@ pub fn repo_map_block(roots: &[std::path::PathBuf]) -> Option<String> {
             out.push_str(&entry.symbols.join(", "));
         }
         out.push('\n');
+    }
+    out.push_str("</repo-map>");
+    Some(out)
+}
+
+/// Render a `<repo-map>` block with one labelled section per workspace root.
+///
+/// Each root is ranked INDEPENDENTLY via [`origin_repomap::build_map_per_root`]
+/// (gated by `ORIGIN_REPOMAP_PER_ROOT=1`): its own `PageRank` over only its own
+/// graph plus an equal share of the token budget, so per-root locality is
+/// preserved. Returns `None` when no root ranks anything.
+fn render_per_root_map(
+    roots: &[std::path::PathBuf],
+    per_root: &[Vec<origin_repomap::FileSymbols>],
+) -> Option<String> {
+    let maps = origin_repomap::build_map_per_root(per_root, &[], REPO_MAP_BUDGET_TOKENS).ok()?;
+    if maps.iter().all(|m| m.entries.is_empty()) {
+        return None;
+    }
+    let mut out = String::from("<repo-map>\n");
+    for m in &maps {
+        out.push_str("# ");
+        if let Some(p) = roots.get(m.root_index) {
+            out.push_str(&p.display().to_string());
+        } else {
+            out.push_str("root ");
+            out.push_str(&m.root_index.to_string());
+        }
+        out.push('\n');
+        for entry in &m.entries {
+            out.push_str("- ");
+            out.push_str(&entry.file);
+            if !entry.symbols.is_empty() {
+                out.push_str(": ");
+                out.push_str(&entry.symbols.join(", "));
+            }
+            out.push('\n');
+        }
     }
     out.push_str("</repo-map>");
     Some(out)
@@ -335,6 +381,33 @@ mod tests {
         assert!(!map.is_empty(), "ranked map should contain entries");
         // The widely-referenced definer ranks first.
         assert_eq!(map[0].file, "core.rs");
+    }
+
+    #[test]
+    fn render_per_root_map_labels_each_root_section() {
+        use std::path::PathBuf;
+        let per_root = vec![
+            vec![origin_repomap::FileSymbols::new(
+                "a/core.rs",
+                vec!["A".to_string()],
+                vec![],
+                10,
+            )],
+            vec![origin_repomap::FileSymbols::new(
+                "b/core.rs",
+                vec!["B".to_string()],
+                vec![],
+                10,
+            )],
+        ];
+        let roots = vec![PathBuf::from("/ws/a"), PathBuf::from("/ws/b")];
+        let block = render_per_root_map(&roots, &per_root).expect("non-empty per-root map");
+        assert!(block.starts_with("<repo-map>\n"));
+        assert!(block.trim_end().ends_with("</repo-map>"));
+        // Both roots get a labelled section listing only their own file.
+        assert!(block.contains("# "), "per-root sections are labelled");
+        assert!(block.contains("a/core.rs: A"), "root A's file in its section");
+        assert!(block.contains("b/core.rs: B"), "root B's file in its section");
     }
 
     #[test]

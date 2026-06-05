@@ -236,6 +236,73 @@ pub fn build_map_multi_root(
     merge_and_rerank_maps(per_root, focus, token_budget)
 }
 
+/// One workspace root's independently-ranked map (see [`build_map_per_root`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RootMap {
+    /// Index of this root in the input `per_root` slice.
+    pub root_index: usize,
+    /// The root's files, ranked by personalized `PageRank` over ONLY that root's
+    /// own def→ref graph, admitted under the root's share of the token budget.
+    pub entries: Vec<RankedEntry>,
+}
+
+/// Rank each workspace root INDEPENDENTLY instead of merging them.
+///
+/// Runs personalized `PageRank` over each root's own symbol graph under its own
+/// share of the token budget (vs [`build_map_multi_root`], which merges every
+/// root into one corpus and ranks globally).
+///
+/// Per-root ranking preserves within-root locality: a small root is never buried
+/// by a large one, each root's most central files always appear in its own
+/// section of the map, and cross-root edges cannot dilute a root's internal
+/// importance ordering. The shared `token_budget` is split evenly across the
+/// NON-EMPTY roots, with the remainder handed to the earliest roots so the whole
+/// budget is allocated. `focus` only biases the root that actually contains a
+/// focus file (the ranker ignores focus entries naming files absent from a given
+/// root, per [`personalized_pagerank`]).
+///
+/// Returns one [`RootMap`] per non-empty input root, in input order.
+///
+/// # Errors
+///
+/// Returns [`RepoMapError::Empty`] when every root is empty.
+pub fn build_map_per_root(
+    per_root: &[Vec<FileSymbols>],
+    focus: &[String],
+    token_budget: u32,
+) -> Result<Vec<RootMap>, RepoMapError> {
+    let non_empty: Vec<usize> = per_root
+        .iter()
+        .enumerate()
+        .filter(|(_, files)| !files.is_empty())
+        .map(|(i, _)| i)
+        .collect();
+    if non_empty.is_empty() {
+        return Err(RepoMapError::Empty);
+    }
+    let n = u32::try_from(non_empty.len()).unwrap_or(u32::MAX).max(1);
+    let base = token_budget / n;
+    let mut remainder = token_budget % n;
+
+    let mut out = Vec::with_capacity(non_empty.len());
+    for &i in &non_empty {
+        // Earliest roots absorb the +1 remainder so the entire budget is spent.
+        let mut budget = base;
+        if remainder > 0 {
+            budget = budget.saturating_add(1);
+            remainder -= 1;
+        }
+        // `per_root[i]` is non-empty by construction, so `build_map` never
+        // returns `Empty` here.
+        let entries = build_map(&per_root[i], focus, budget)?;
+        out.push(RootMap {
+            root_index: i,
+            entries,
+        });
+    }
+    Ok(out)
+}
+
 /// Concatenate per-root rows into one corpus, dropping later duplicates by path.
 ///
 /// First occurrence of each [`FileSymbols::file`] wins; subsequent rows naming a
@@ -1390,5 +1457,47 @@ mod tests {
         let via_helper = merge_and_rerank_maps(roots.clone(), &[], 1_000).unwrap();
         let via_entry = build_map_multi_root(roots, &[], 1_000).unwrap();
         assert_eq!(via_entry, via_helper);
+    }
+
+    #[test]
+    fn per_root_ranks_each_root_independently() {
+        let roots = vec![
+            vec![def("a/core.rs", &["A"], 10), refs("a/use.rs", &["A"], 10)],
+            vec![def("b/core.rs", &["B"], 10)],
+        ];
+        let maps = build_map_per_root(&roots, &[], 1_000).unwrap();
+        assert_eq!(maps.len(), 2);
+        assert_eq!(maps[0].root_index, 0);
+        assert_eq!(maps[1].root_index, 1);
+        // Root 1's map contains ONLY root 1's file — each root is its own graph.
+        let r1: Vec<&str> = maps[1].entries.iter().map(|e| e.file.as_str()).collect();
+        assert_eq!(r1, vec!["b/core.rs"]);
+        let mut r0: Vec<&str> = maps[0].entries.iter().map(|e| e.file.as_str()).collect();
+        r0.sort_unstable();
+        assert_eq!(r0, vec!["a/core.rs", "a/use.rs"]);
+    }
+
+    #[test]
+    fn per_root_skips_empty_roots_and_errors_when_all_empty() {
+        let roots = vec![vec![], vec![def("x.rs", &["X"], 5)], vec![]];
+        let maps = build_map_per_root(&roots, &[], 1_000).unwrap();
+        assert_eq!(maps.len(), 1);
+        assert_eq!(maps[0].root_index, 1, "preserves the original root index");
+        assert_eq!(
+            build_map_per_root(&[vec![], vec![]], &[], 1_000),
+            Err(RepoMapError::Empty)
+        );
+    }
+
+    #[test]
+    fn per_root_splits_budget_across_roots() {
+        // Two roots, each a single 10-token file; a 20-token total splits to 10
+        // per root so each admits its file — a per-root fair share regardless of
+        // the other root's size.
+        let roots = vec![vec![def("a.rs", &["A"], 10)], vec![def("b.rs", &["B"], 10)]];
+        let maps = build_map_per_root(&roots, &[], 20).unwrap();
+        assert_eq!(maps.len(), 2);
+        assert_eq!(maps[0].entries.len(), 1);
+        assert_eq!(maps[1].entries.len(), 1);
     }
 }

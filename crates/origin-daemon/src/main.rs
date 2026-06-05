@@ -1654,11 +1654,16 @@ async fn handle_request(
     // this line — otherwise the channels have TWO senders each and
     // `rx.recv()` never returns None, so the relay tasks hang forever.
     let loop_result = {
-        // Snapshot THIS connection's active account (set by `/account` on this
-        // connection) for the cross-provider rebuild. `None` (no switch on this
-        // connection yet) ⇒ the loop falls back to the global account slot,
-        // byte-identical to the pre-per-connection wire.
-        let session_account: Option<Arc<str>> = active_account.lock().await.clone();
+        // Per-turn account for the cross-provider rebuild: prefer an explicit
+        // per-request account (the CLI stamps the session's `/account` choice on
+        // EVERY prompt, since it opens a fresh connection per prompt so a switch
+        // on a throwaway connection never reaches this one) over THIS
+        // connection's `/account` slot, which itself falls back (`None`) to the
+        // process-wide global account — byte-identical to the pre-per-request wire.
+        let session_account: Option<Arc<str>> = {
+            let slot = active_account.lock().await.clone();
+            origin_daemon::agent::resolve_session_account(req.account.as_deref(), &slot)
+        };
         let opts = LoopOptions {
             max_turns: 200,
             cas: Some(cas),
@@ -1667,7 +1672,14 @@ async fn handle_request(
             relay_tx: Some(tx_sub.clone()),
             streaming_disabled: false,
             sidecar: None, // sidecar submit fires in handle_request after persist
-            session_store: None,
+            session_store: Some(Arc::clone(&session_store)),
+            // ^ enable live compaction + snapshot-on-compaction on the request
+            // loop: with the store wired the compactor loads per-turn summaries
+            // and snapshots each folded turn's pre-compaction body, so
+            // `origin sessions rewind` can reconstruct ACROSS compaction points
+            // (gap 2). This was `None`, which silently disabled both the fold and
+            // the snapshot, degrading rewind to a plain truncate. Under the soft
+            // cap the compactor is a no-op ⇒ short sessions stay byte-identical.
             proposer: memory.map(|m| Arc::clone(&m.proposer)),
             event_tx: Some(event_tx.clone()),
             injector: memory.and_then(|m| m.injector.clone()),

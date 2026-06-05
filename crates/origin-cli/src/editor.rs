@@ -40,8 +40,22 @@ pub struct Editor {
     /// the user is composing fresh text in `buffer` (the `draft`).
     history_pos: Option<usize>,
     /// Stash for the in-flight buffer when the user starts browsing
-    /// history. Restored on `history_down` past the newest entry.
+    /// history. Restored on `history_down` past the newest entry, and on
+    /// cancelling a reverse search.
     draft: String,
+    /// Active Ctrl-R reverse-incremental history search, if any.
+    search: Option<RevSearch>,
+}
+
+/// Live Ctrl-R reverse-incremental history search state.
+///
+/// `query` is the text typed so far; `match_idx` is the index into
+/// [`Editor::history`] of the current match (searched newest-first), or `None`
+/// when nothing matches the query yet.
+#[derive(Debug, Default, Clone)]
+struct RevSearch {
+    query: String,
+    match_idx: Option<usize>,
 }
 
 impl Editor {
@@ -272,6 +286,131 @@ impl Editor {
             }
         }
     }
+
+    // -- Ctrl-R reverse-incremental history search -------------------------
+
+    /// Whether a Ctrl-R reverse history search is currently active.
+    #[must_use]
+    pub const fn reverse_search_active(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// The current reverse-search query (for rendering a `(reverse-i-search)`
+    /// prompt), or `None` when not searching.
+    #[must_use]
+    pub fn reverse_search_query(&self) -> Option<&str> {
+        self.search.as_ref().map(|s| s.query.as_str())
+    }
+
+    /// Enter reverse-search mode, stashing the in-flight buffer as the draft so
+    /// a later cancel can restore it. No-op (false) if already searching.
+    pub fn start_reverse_search(&mut self) -> bool {
+        if self.search.is_some() {
+            return false;
+        }
+        self.history_pos = None;
+        self.draft = std::mem::take(&mut self.buffer);
+        self.cursor = 0;
+        self.search = Some(RevSearch::default());
+        true
+    }
+
+    /// Newest history index `<= start` whose entry contains `query`; `None` for
+    /// an empty query / empty history / no match.
+    fn find_match_at_or_below(&self, start: usize, query: &str) -> Option<usize> {
+        if query.is_empty() || self.history.is_empty() {
+            return None;
+        }
+        let top = start.min(self.history.len() - 1);
+        (0..=top).rev().find(|&i| self.history[i].contains(query))
+    }
+
+    /// Mirror the current match (if any) into the buffer; clear it otherwise.
+    fn apply_search_match(&mut self) {
+        let idx = self.search.as_ref().and_then(|s| s.match_idx);
+        if let Some(i) = idx {
+            self.buffer = self.history[i].clone();
+        } else {
+            self.buffer.clear();
+        }
+        self.cursor = self.buffer.len();
+    }
+
+    /// Append `c` to the query and re-search from the newest entry. Returns
+    /// `false` when not in search mode.
+    pub fn reverse_search_push(&mut self, c: char) -> bool {
+        let Some(query) = self.search.as_mut().map(|s| {
+            s.query.push(c);
+            s.query.clone()
+        }) else {
+            return false;
+        };
+        let top = self.history.len().saturating_sub(1);
+        let m = self.find_match_at_or_below(top, &query);
+        if let Some(s) = self.search.as_mut() {
+            s.match_idx = m;
+        }
+        self.apply_search_match();
+        true
+    }
+
+    /// Delete the last query char and re-search. Returns `false` when inactive.
+    pub fn reverse_search_backspace(&mut self) -> bool {
+        let Some(query) = self.search.as_mut().map(|s| {
+            s.query.pop();
+            s.query.clone()
+        }) else {
+            return false;
+        };
+        let top = self.history.len().saturating_sub(1);
+        let m = self.find_match_at_or_below(top, &query);
+        if let Some(s) = self.search.as_mut() {
+            s.match_idx = m;
+        }
+        self.apply_search_match();
+        true
+    }
+
+    /// Cycle to the next OLDER match for the current query (a second Ctrl-R).
+    /// Returns `false` when inactive.
+    pub fn reverse_search_again(&mut self) -> bool {
+        let Some((cur, query)) = self.search.as_ref().map(|s| (s.match_idx, s.query.clone())) else {
+            return false;
+        };
+        if let Some(c) = cur {
+            if c > 0 {
+                if let Some(next) = self.find_match_at_or_below(c - 1, &query) {
+                    if let Some(s) = self.search.as_mut() {
+                        s.match_idx = Some(next);
+                    }
+                }
+            }
+        }
+        self.apply_search_match();
+        true
+    }
+
+    /// Accept the current match: keep it in the buffer and exit search mode.
+    /// With no match the pre-search draft is restored. Returns the resulting
+    /// buffer text.
+    pub fn accept_reverse_search(&mut self) -> String {
+        if let Some(s) = self.search.take() {
+            if s.match_idx.is_none() {
+                self.buffer = std::mem::take(&mut self.draft);
+                self.cursor = self.buffer.len();
+            }
+            self.draft.clear();
+        }
+        self.buffer.clone()
+    }
+
+    /// Cancel search: restore the pre-search draft and exit search mode.
+    pub fn cancel_reverse_search(&mut self) {
+        if self.search.take().is_some() {
+            self.buffer = std::mem::take(&mut self.draft);
+            self.cursor = self.buffer.len();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +576,65 @@ mod tests {
         e.insert_char('l');
         assert_eq!(e.buffer(), "hello");
         assert_eq!(e.cursor(), 4);
+    }
+
+    fn seeded() -> Editor {
+        let mut e = Editor::new();
+        for s in ["cargo build", "cargo test --workspace", "git status", "cargo clippy"] {
+            e.push_history(s);
+        }
+        e
+    }
+
+    #[test]
+    fn reverse_search_matches_cycles_and_accepts() {
+        let mut e = seeded();
+        e.set_buffer("draft text".into());
+        assert!(e.start_reverse_search());
+        assert!(e.reverse_search_active());
+        // Typing "cargo" matches the NEWEST cargo entry first.
+        e.reverse_search_push('c');
+        e.reverse_search_push('a');
+        e.reverse_search_push('r');
+        e.reverse_search_push('g');
+        e.reverse_search_push('o');
+        assert_eq!(e.buffer(), "cargo clippy");
+        // Ctrl-R again steps to the next older cargo match.
+        e.reverse_search_again();
+        assert_eq!(e.buffer(), "cargo test --workspace");
+        e.reverse_search_again();
+        assert_eq!(e.buffer(), "cargo build");
+        // Accept keeps the match and exits search.
+        let accepted = e.accept_reverse_search();
+        assert_eq!(accepted, "cargo build");
+        assert!(!e.reverse_search_active());
+    }
+
+    #[test]
+    fn reverse_search_backspace_widens_and_cancel_restores_draft() {
+        let mut e = seeded();
+        e.set_buffer("my draft".into());
+        e.start_reverse_search();
+        e.reverse_search_push('g'); // matches "cargo clippy" (newest with 'g')
+        e.reverse_search_push('i'); // "git status" is newest containing "gi"
+        assert_eq!(e.buffer(), "git status");
+        e.reverse_search_backspace(); // back to "g"
+        assert_eq!(e.reverse_search_query(), Some("g"));
+        // Cancel restores the pre-search draft.
+        e.cancel_reverse_search();
+        assert!(!e.reverse_search_active());
+        assert_eq!(e.buffer(), "my draft");
+    }
+
+    #[test]
+    fn reverse_search_no_match_restores_draft_on_accept() {
+        let mut e = seeded();
+        e.set_buffer("keep me".into());
+        e.start_reverse_search();
+        e.reverse_search_push('z'); // nothing matches
+        assert_eq!(e.buffer(), "");
+        let out = e.accept_reverse_search();
+        assert_eq!(out, "keep me", "no match restores the draft");
     }
 
     #[test]

@@ -205,6 +205,15 @@ pub fn inflate_tool_result_handles(
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
 
+    /// The provider's upstream base URL, when statically known (e.g. an
+    /// OpenAI-compatible endpoint). Used to populate the OpenTelemetry
+    /// `server.address` / `server.port` `gen_ai` attributes (otel feature only).
+    /// The default is `None` — providers whose endpoint is fixed/opaque simply
+    /// omit those attributes, leaving the span byte-identical.
+    fn base_url(&self) -> Option<&str> {
+        None
+    }
+
     /// Send a single non-streaming chat request.
     ///
     /// # Errors

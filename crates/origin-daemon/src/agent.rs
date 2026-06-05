@@ -730,6 +730,27 @@ fn turn_response_id(session_id: &str, turn: u32) -> String {
     format!("{session_id}#t{turn}")
 }
 
+/// Split a provider base URL (e.g. `https://api.host:8443/v1`) into
+/// `(server.address, server.port)` for the OpenTelemetry `gen_ai` span.
+///
+/// Best-effort + dependency-free: strips the scheme + any userinfo + the path,
+/// then separates a trailing numeric `:port`. An IPv6/host-only authority yields
+/// the whole authority as the address with no port. Only consumed by the
+/// otel-gated span wiring, so it is dead code in a default, non-test build.
+#[cfg_attr(not(any(test, feature = "otel")), allow(dead_code))]
+fn split_host_port(base_url: &str) -> (String, Option<i64>) {
+    let after_scheme = base_url.split("://").nth(1).unwrap_or(base_url);
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        // Only a numeric right-hand side is a real port (guards IPv6 `[::1]`).
+        if let Ok(p) = port.parse::<i64>() {
+            return (host.to_string(), Some(p));
+        }
+    }
+    (authority.to_string(), None)
+}
+
 /// Compute the autonomy streak for a single `run_loop` invocation (Stage C5
 /// Task 3).
 ///
@@ -1730,6 +1751,64 @@ impl LoopOptions {
     }
 }
 
+/// Resolve the per-turn account for the cross-provider mid-loop rebuild.
+///
+/// An explicit per-request account (the client stamps the session's active
+/// account on EVERY prompt) takes precedence over this connection's `/account`
+/// slot. This is the load-bearing fix for the connection-per-prompt CLI: a
+/// `/account` switch is sent on a throwaway one-shot connection, so it can never
+/// survive to the separate connection that serves the next prompt — the
+/// per-connection slot is therefore always `None` on the prompt path. Carrying
+/// the account on the request itself makes per-session isolation actually reach
+/// [`crate::provider_factory::build_provider_for_account`]. An empty per-request
+/// account is treated as absent. `None` from both sources ⇒ the loop falls back
+/// to the process-wide global account, byte-identical to the pre-per-request wire.
+#[must_use]
+pub fn resolve_session_account(
+    req_account: Option<&str>,
+    conn_slot: &Option<Arc<str>>,
+) -> Option<Arc<str>> {
+    match req_account {
+        Some(a) if !a.is_empty() => Some(Arc::from(a)),
+        _ => conn_slot.clone(),
+    }
+}
+
+#[cfg(test)]
+mod session_account_tests {
+    use super::resolve_session_account;
+    use std::sync::Arc;
+
+    #[test]
+    fn request_account_takes_precedence_over_connection_slot() {
+        let slot: Option<Arc<str>> = Some(Arc::from("conn-acct"));
+        assert_eq!(
+            resolve_session_account(Some("req-acct"), &slot).as_deref(),
+            Some("req-acct"),
+            "an explicit per-request account must win over the connection slot"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_connection_slot_when_request_absent_or_empty() {
+        let slot: Option<Arc<str>> = Some(Arc::from("conn-acct"));
+        assert_eq!(
+            resolve_session_account(None, &slot).as_deref(),
+            Some("conn-acct")
+        );
+        assert_eq!(
+            resolve_session_account(Some(""), &slot).as_deref(),
+            Some("conn-acct"),
+            "an empty per-request account is treated as absent"
+        );
+    }
+
+    #[test]
+    fn none_everywhere_yields_global_fallback() {
+        assert_eq!(resolve_session_account(None, &None).as_deref(), None);
+    }
+}
+
 /// Deliverer that writes a summary to the `SQLite` `messages.summary` column via
 /// a blocking `spawn_blocking` task.
 pub struct SessionStoreSummaryDeliverer(pub Arc<SessionStore>);
@@ -1893,6 +1972,34 @@ fn is_self_dispatch_session(session_id: &str) -> bool {
     SELF_DISPATCH_SESSION_PREFIXES
         .iter()
         .any(|p| session_id.starts_with(p))
+}
+
+#[cfg(test)]
+mod split_host_port_tests {
+    use super::split_host_port;
+
+    #[test]
+    fn parses_scheme_host_port_userinfo_and_path() {
+        assert_eq!(
+            split_host_port("https://api.host:8443/v1"),
+            ("api.host".to_string(), Some(8443))
+        );
+        assert_eq!(
+            split_host_port("http://localhost:4000"),
+            ("localhost".to_string(), Some(4000))
+        );
+        // No port ⇒ host only.
+        assert_eq!(
+            split_host_port("https://api.anthropic.com/v1"),
+            ("api.anthropic.com".to_string(), None)
+        );
+        // Bare host (no scheme) and userinfo stripping.
+        assert_eq!(split_host_port("example.com"), ("example.com".to_string(), None));
+        assert_eq!(
+            split_host_port("https://user@host:9000/x"),
+            ("host".to_string(), Some(9000))
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2695,14 +2802,18 @@ async fn run_loop_inner(
         // without `--features otel`), so the default path is byte-identical.
         //   * request sampling params — the real max_tokens floor from the turn's
         //     extended-thinking budget (`request_params_from_req`).
-        //   * provider/server — the provider name reachable through the trait
-        //     (`server.address`/`server.port` are private to each provider impl
-        //     and not exposed, so they are omitted rather than faked).
+        //   * provider/server — the provider name plus `server.address`/
+        //     `server.port` parsed from the provider's `base_url()` when it
+        //     exposes one (e.g. OpenAI-compatible endpoints); providers with an
+        //     opaque endpoint return `None` and those attributes are omitted.
         //   * agent/conversation — the session id as `gen_ai.conversation.id`.
         #[cfg(feature = "otel")]
         {
             gen_ai_span.set_request_params(request_params_from_req(&req));
-            gen_ai_span.set_server_attributes(turn_provider.name(), "", None);
+            let (srv_addr, srv_port) = turn_provider
+                .base_url()
+                .map_or_else(|| (String::new(), None), split_host_port);
+            gen_ai_span.set_server_attributes(turn_provider.name(), &srv_addr, srv_port);
             gen_ai_span.set_agent_attributes("", "", "", &session.id, "");
         }
         let (resp, mut speculative, stream_first_token_ms) = {
