@@ -27,7 +27,7 @@ undocumented_unsafe_blocks = "deny"
 thiserror = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.28", features = ["ioctl"] }
+nix = { version = "0.31", features = ["ioctl"] }
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
