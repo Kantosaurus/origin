@@ -33,7 +33,7 @@ tree-sitter-java = "=0.21.0"
 tree-sitter-c = "=0.21.4"
 tree-sitter-cpp = "=0.22.3"
 tree-sitter-c-sharp = "=0.21.3"
-tree-sitter-ruby = "=0.21.0"
+tree-sitter-ruby = "=0.23.1"
 tree-sitter-bash = "=0.21.0"
 # Extended grammars (codegraph parity with the repomap heuristic scanner).
 # All pinned to the generation that links the tree-sitter 0.22.x core directly
