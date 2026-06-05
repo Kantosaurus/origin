@@ -39,7 +39,7 @@ opentelemetry_sdk = { version = "0.24", default-features = false, features = ["m
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 caps = "0.5"
-seccompiler = "0.4"
+seccompiler = "0.5"
 landlock = "0.4"
 # P12 additions
 tikv-jemallocator = { version = "0.6", default-features = false, features = ["background_threads"] }
