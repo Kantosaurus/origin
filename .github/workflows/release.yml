@@ -23,8 +23,17 @@ jobs:
           # glibc and runs on all mainstream Linux distros (not Alpine/static).
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+          # aarch64 Linux/Windows build on NATIVE ARM64 runners (GA for public
+          # repos) rather than cross-compiling: ONNX Runtime (ort, via
+          # origin-mem) has no aarch64 prebuilt for this ort version, so it
+          # statically compiles ORT from source — which fails to link in the
+          # `cross` container (old sysroot: undefined __libc_single_threaded /
+          # newer libstdc++ symbols) and produced no lib at all when x64->arm64
+          # cross-compiling Windows (unresolved OrtGetApiBase). Native arm64
+          # runners compile + link ORT with a modern toolchain, so the full trio
+          # builds on every target.
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: aarch64-apple-darwin
@@ -32,7 +41,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
           - target: aarch64-pc-windows-msvc
-            os: windows-latest
+            os: windows-11-arm
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
@@ -40,9 +49,6 @@ jobs:
           toolchain: 1.83.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Install cross (aarch64 Linux only)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo install cross --locked
       - name: Build
         shell: bash
         env:
@@ -57,29 +63,15 @@ jobs:
           CARGO_PROFILE_RELEASE_OPT_LEVEL: z
           CARGO_PROFILE_RELEASE_STRIP: symbols
         run: |
-          # Ship the runtime trio where it links: `origin` (CLI) plus the
+          # Ship the runtime trio on every target: `origin` (CLI) plus the
           # SEPARATE `origin-daemon` binary the CLI spawns (required to stand up
           # the daemon) and `origin-supervisor` (restarts the daemon + consumes
           # the self-dev hot-reload exit-86 sentinel), co-located so the CLI's
-          # sibling lookup (current_exe().parent()) resolves them.
-          #
-          # EXCEPTION: the daemon links ONNX Runtime (`ort`, via origin-mem),
-          # whose native lib is only present for the HOST arch. The two aarch64
-          # CROSS targets (the `cross` container for Linux; x64->arm64 for
-          # Windows) can't link it, so there we ship the thin `origin-cli` ALONE
-          # (the daemon dead-strips in the client, which is why CLI-only aarch64
-          # builds worked before). The 4 native-arch targets ship the full trio.
-          PKGS="-p origin-cli -p origin-daemon -p origin-supervisor"
-          case "${{ matrix.target }}" in
-            aarch64-unknown-linux-gnu|aarch64-pc-windows-msvc) PKGS="-p origin-cli" ;;
-          esac
-          # aarch64 Linux is cross-compiled with `cross`; x86_64 Linux builds
-          # natively on the ubuntu runner; macOS/Windows build natively too.
-          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
-            cross build $PKGS --release --target ${{ matrix.target }}
-          else
-            cargo build $PKGS --release --target ${{ matrix.target }}
-          fi
+          # sibling lookup (current_exe().parent()) resolves them. Every target
+          # now builds NATIVELY on its own architecture's runner, so ONNX Runtime
+          # (ort, via origin-mem) compiles + links cleanly everywhere.
+          cargo build -p origin-cli -p origin-daemon -p origin-supervisor \
+            --release --target ${{ matrix.target }}
       - name: Stage binaries
         shell: bash
         run: |
