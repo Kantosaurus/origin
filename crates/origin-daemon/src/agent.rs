@@ -1730,6 +1730,64 @@ impl LoopOptions {
     }
 }
 
+/// Resolve the per-turn account for the cross-provider mid-loop rebuild.
+///
+/// An explicit per-request account (the client stamps the session's active
+/// account on EVERY prompt) takes precedence over this connection's `/account`
+/// slot. This is the load-bearing fix for the connection-per-prompt CLI: a
+/// `/account` switch is sent on a throwaway one-shot connection, so it can never
+/// survive to the separate connection that serves the next prompt — the
+/// per-connection slot is therefore always `None` on the prompt path. Carrying
+/// the account on the request itself makes per-session isolation actually reach
+/// [`crate::provider_factory::build_provider_for_account`]. An empty per-request
+/// account is treated as absent. `None` from both sources ⇒ the loop falls back
+/// to the process-wide global account, byte-identical to the pre-per-request wire.
+#[must_use]
+pub fn resolve_session_account(
+    req_account: Option<&str>,
+    conn_slot: &Option<Arc<str>>,
+) -> Option<Arc<str>> {
+    match req_account {
+        Some(a) if !a.is_empty() => Some(Arc::from(a)),
+        _ => conn_slot.clone(),
+    }
+}
+
+#[cfg(test)]
+mod session_account_tests {
+    use super::resolve_session_account;
+    use std::sync::Arc;
+
+    #[test]
+    fn request_account_takes_precedence_over_connection_slot() {
+        let slot: Option<Arc<str>> = Some(Arc::from("conn-acct"));
+        assert_eq!(
+            resolve_session_account(Some("req-acct"), &slot).as_deref(),
+            Some("req-acct"),
+            "an explicit per-request account must win over the connection slot"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_connection_slot_when_request_absent_or_empty() {
+        let slot: Option<Arc<str>> = Some(Arc::from("conn-acct"));
+        assert_eq!(
+            resolve_session_account(None, &slot).as_deref(),
+            Some("conn-acct")
+        );
+        assert_eq!(
+            resolve_session_account(Some(""), &slot).as_deref(),
+            Some("conn-acct"),
+            "an empty per-request account is treated as absent"
+        );
+    }
+
+    #[test]
+    fn none_everywhere_yields_global_fallback() {
+        assert_eq!(resolve_session_account(None, &None).as_deref(), None);
+    }
+}
+
 /// Deliverer that writes a summary to the `SQLite` `messages.summary` column via
 /// a blocking `spawn_blocking` task.
 pub struct SessionStoreSummaryDeliverer(pub Arc<SessionStore>);

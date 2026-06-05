@@ -72,6 +72,31 @@ fn thinking_tokens_seed() -> Option<u32> {
     THINKING_TOKENS_SEED.get().copied().flatten()
 }
 
+/// Process-wide active account for the interactive session, set by the
+/// `/account` composer command and stamped onto every [`PromptRequest`].
+///
+/// Unlike the thinking-budget seed this is MUTATED mid-session, so it is a
+/// `Mutex` rather than a `OnceLock`. It lives here (not on `App` or threaded
+/// through `call_daemon`) because the CLI opens a fresh daemon connection per
+/// prompt: the account cannot live on a connection, and the daemon's
+/// per-connection slot is therefore never set on the prompt path. Stamping the
+/// account on each request is what makes `/account` isolation actually reach the
+/// daemon's cross-provider rebuild. `None` (the default) ⇒ no override, wire
+/// byte-identical.
+static SESSION_ACCOUNT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Record the session's active account (called by the `/account` handler).
+fn set_session_account(account: Option<String>) {
+    if let Ok(mut g) = SESSION_ACCOUNT.lock() {
+        *g = account;
+    }
+}
+
+/// Read the session's active account for stamping onto a `PromptRequest`.
+fn session_account() -> Option<String> {
+    SESSION_ACCOUNT.lock().ok().and_then(|g| g.clone())
+}
+
 /// Stack size for the thread that drives the async entrypoint.
 ///
 /// The TUI's top-level future is a single large state machine — many
@@ -1602,6 +1627,12 @@ async fn handle_submit(
         match parse_account_command(rest) {
             Ok((provider, account_id)) => match switch_account(path, &provider, &account_id).await {
                 Ok((p, a)) => {
+                    // Record the session's active account so it rides on every
+                    // subsequent PromptRequest (the daemon prefers it over its
+                    // per-connection slot for the cross-provider rebuild). Without
+                    // this the switch only lives on the throwaway switch
+                    // connection and never reaches the prompt path.
+                    set_session_account(Some(a.clone()));
                     let line = origin_cli::locale::linef(
                         "cmd.account.active",
                         &[("provider", p.as_str()), ("account", a.as_str())],
@@ -2042,6 +2073,7 @@ async fn call_daemon(
         read_only,
         roots,
         permission_ask,
+        account: session_account(),
     });
     let body = serde_json::to_vec(&msg)?;
     let frame = encode(1, FrameKind::Request, &body);

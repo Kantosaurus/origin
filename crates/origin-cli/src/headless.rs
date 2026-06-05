@@ -196,6 +196,9 @@ pub async fn run(args: RunArgs) -> Result<()> {
         read_only: false,
         roots,
         permission_ask: false,
+        // Headless is one-shot and never switches accounts mid-session, so the
+        // daemon resolves the startup/global account ⇒ wire byte-identical.
+        account: None,
     };
     let reply = drive_turn(&mut conn, prompt, emit).await?;
     if matches!(fmt, OutputFormat::Json) {
@@ -248,6 +251,7 @@ async fn run_structured(
             read_only: false,
             roots: roots.clone(),
             permission_ask: false,
+            account: None,
         };
         let reply = drive_turn(conn, prompt, Emit::Silent).await?;
         let candidate = extract_json(&reply);
