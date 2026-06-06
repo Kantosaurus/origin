@@ -71,7 +71,7 @@ impl Backend for WindowsBackend {
             // remain valid for the duration of this call. `CredWriteW`
             // copies the data into the credential store and does not
             // retain pointers past return.
-            unsafe { CredWriteW(&cred, 0) }.map_err(|e| Error::Backend(format!("CredWriteW: {e}")))
+            unsafe { CredWriteW(&raw const cred, 0) }.map_err(|e| Error::Backend(format!("CredWriteW: {e}")))
         })
         .await
         .map_err(join_err)?
@@ -89,7 +89,7 @@ impl Backend for WindowsBackend {
             // parameter; on success Windows sets it to a heap allocation
             // that must be freed with `CredFree`. The pointer is consumed
             // before the free call below.
-            let result = unsafe { CredReadW(PCWSTR(name.as_ptr()), CRED_TYPE_GENERIC, 0, &mut out_ptr) };
+            let result = unsafe { CredReadW(PCWSTR(name.as_ptr()), CRED_TYPE_GENERIC, 0, &raw mut out_ptr) };
             if let Err(e) = result {
                 if e.code().0 == ERROR_NOT_FOUND_HRESULT {
                     return Err(Error::NotFound {

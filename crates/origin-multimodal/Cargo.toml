@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "origin-multimodal"
+description = "Image and PDF context ingestion: classify, extract text, and build content blocks."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { workspace = true }
+pdf-extract = { workspace = true }
+
+[lints]
+workspace = true

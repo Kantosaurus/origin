@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use origin_cli::autocomplete::CompletionSources;
 use origin_cli::tui::App;
 use origin_stream::{TokenEvent, TokenKind};
 use origin_tui::composer::Composer;
@@ -11,7 +12,11 @@ fn bench_keystroke_to_pixel(c: &mut Criterion) {
     group.bench_function("type_then_render_one_frame", |b| {
         b.iter_batched(
             || {
-                let app = App::new("anthropic", "claude-opus-4-7".to_string(), Default::default());
+                let app = App::new(
+                    "anthropic",
+                    "claude-opus-4-7".to_string(),
+                    CompletionSources::default(),
+                );
                 let composer = Composer::new(200, 60);
                 let widget = StreamWidget::new(Rect {
                     row: 0,
@@ -22,7 +27,7 @@ fn bench_keystroke_to_pixel(c: &mut Criterion) {
                 (app, composer, widget)
             },
             |(mut app, mut composer, mut widget)| {
-                app.input.push('x');
+                app.input.insert_char('x');
                 app.draw(&mut composer, &mut widget);
                 black_box(composer.frame());
             },

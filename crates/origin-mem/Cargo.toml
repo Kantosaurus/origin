@@ -11,14 +11,15 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-# NOTE (deviation from P6.1 spec): the plan called for `load-dynamic` so the
-# ONNX Runtime shared library is resolved at runtime via `libloading`. That
-# requires shipping or pre-installing a system `onnxruntime.{dll,dylib,so}`.
-# For Phase 6.1 we use `download-binaries` instead so `cargo test` is
-# hermetic — ort-sys fetches a vendored ORT binary at build time, no PATH
-# dance, no manual install. Phase 12 (multi-runtime + arenas) can switch
-# back to `load-dynamic` when we own the loader policy ourselves.
-ort         = { version = "2.0.0-rc.4", default-features = false, features = ["ndarray", "download-binaries", "copy-dylibs"] }
+# `download-binaries` (default) so `cargo test` is hermetic — ort-sys fetches a
+# vendored, statically-linked ORT binary at build time (no PATH dance, no manual
+# install). rc.12 (ONNX Runtime 1.24.2) is the first ort with prebuilt static
+# binaries for BOTH aarch64-unknown-linux-gnu AND aarch64-pc-windows-msvc, so the
+# release builds the full trio on all 6 targets without source-compiling ORT.
+# rc.11+ requires Rust >= 1.88 / edition 2024, which is why the workspace MSRV
+# moved to 1.96 (see rust-toolchain.toml). Default features keep ndarray +
+# download-binaries + copy-dylibs + std + tls-native + api-24.
+ort         = { version = "2.0.0-rc.12", features = ["ndarray"] }
 ndarray     = "0.15"
 tokenizers  = { version = "0.20", default-features = false, features = ["onig"] }
 hnsw_rs     = "0.3"

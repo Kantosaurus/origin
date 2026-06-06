@@ -14,9 +14,23 @@ use origin_tui::widgets::plan_panel::PlanLine;
 use unicode_width::UnicodeWidthChar;
 
 use crate::autocomplete::CompletionSources;
+use crate::editor::Editor;
+use crate::input::VimMode;
+use crate::keybindings::KeyMap;
 use crate::status::UsageSnapshot;
 use crate::suggestions::SuggestionState;
-use crate::theme;
+use crate::theme::{self, Theme};
+
+/// An in-flight permission ask surfaced by the daemon (opt-in `/permissions`).
+///
+/// `Some` while the user is being asked to approve a tool; the next `y`/`n`
+/// answers it. Rendered as a prompt above the input card.
+#[derive(Debug, Clone)]
+pub struct PendingPermission {
+    pub id: u64,
+    pub tool: String,
+    pub args: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct ScrollLine {
@@ -24,12 +38,34 @@ pub struct ScrollLine {
     pub fg: u32,
     pub bg: u32,
     pub bold: bool,
+    /// When `true`, the line is drawn verbatim with no inline-markdown parsing.
+    /// Set for pre-formatted tool/diff/command output so source bytes that
+    /// contain `**` or backticks are never reinterpreted as bold/code styling
+    /// (a diff must show the literal bytes). Prose (assistant turns) stays
+    /// `false` so markdown still renders.
+    pub literal: bool,
 }
 
 impl ScrollLine {
-    fn styled(text: String, fg: u32, bg: u32, bold: bool) -> Self {
-        Self { text, fg, bg, bold }
+    const fn styled(text: String, fg: u32, bg: u32, bold: bool) -> Self {
+        Self { text, fg, bg, bold, literal: false }
     }
+
+    /// A pre-formatted line drawn verbatim (no markdown parsing). Used for
+    /// tool headers, diff rows, and streamed command output.
+    const fn verbatim(text: String, fg: u32, bg: u32) -> Self {
+        Self { text, fg, bg, bold: false, literal: true }
+    }
+}
+
+/// Foreground/background/bold triple for a single styled-text write. Bundled so
+/// [`write_str_styled`] takes one style parameter instead of three positional
+/// color/flag arguments.
+#[derive(Clone, Copy)]
+struct Style {
+    fg: u32,
+    bg: u32,
+    bold: bool,
 }
 
 const SPINNER_FRAMES: &[char] = &[
@@ -37,6 +73,36 @@ const SPINNER_FRAMES: &[char] = &[
     '\u{2807}', '\u{280F}',
 ];
 const SPINNER_INTERVAL_MS: u64 = 80;
+
+/// Reserve a single row of breathing room below the scrollback so the last line
+/// of output never sits flush against the input card. `finalize_assistant_turn`
+/// also appends a trailing blank line after each LLM message, giving 2 rows of
+/// separation for persistent content while only costing 1 visible row.
+const INPUT_GAP_ROWS: u16 = 1;
+
+/// Minimum number of text rows the input card reserves, even when the buffer
+/// holds a single (or zero) wrapped lines. A one-row card reads as cramped —
+/// the caret sits flush against the top and bottom borders. Reserving a few
+/// rows gives the composer visible breathing room without growing the card as
+/// the user types (it only matters below this floor).
+const MIN_INPUT_ROWS: u16 = 3;
+
+/// Hard cap on the input card's text rows. Beyond this the card stops growing
+/// and the buffer scrolls internally (only the last `MAX_INPUT_ROWS` wrapped
+/// lines render), so a long paste can't swallow the scrollback above.
+const MAX_INPUT_ROWS: u16 = 6;
+
+/// Hard cap on retained scrollback rows. A multi-hour session (esp. one with
+/// long streamed Bash output) would otherwise grow `scrollback` without bound —
+/// leaking RSS and making the per-frame wrap O(whole history), which degrades
+/// the CI-gated keystroke latency. Trimmed in batches (see [`SCROLLBACK_SLACK`])
+/// so the O(n) front-drain is rare.
+const MAX_SCROLLBACK: usize = 5000;
+
+/// Trim hysteresis: only trim once `scrollback` exceeds `MAX_SCROLLBACK +
+/// SCROLLBACK_SLACK`, dropping back to `MAX_SCROLLBACK`. Keeps the front-drain
+/// infrequent (once per `SCROLLBACK_SLACK` new rows) rather than per push.
+const SCROLLBACK_SLACK: usize = 1000;
 
 #[derive(Debug)]
 pub struct Spinner {
@@ -57,7 +123,7 @@ impl Spinner {
         self.start = Instant::now();
     }
 
-    pub fn stop(&mut self) {
+    pub const fn stop(&mut self) {
         self.active = false;
     }
 
@@ -65,34 +131,97 @@ impl Spinner {
         if !self.active {
             return ' ';
         }
-        let elapsed = self.start.elapsed().as_millis() as u64;
+        let elapsed = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
         let idx = (elapsed / SPINNER_INTERVAL_MS) as usize % SPINNER_FRAMES.len();
         SPINNER_FRAMES[idx]
     }
 }
 
-/// How long the daemon may go without emitting a single stream event during an
-/// in-flight turn before the status line surfaces a stall warning. Deliberately
-/// generous: extended-thinking turns and long non-streaming tools can be quiet
-/// for a while, so this only fires on genuine, sustained silence.
-pub const STALL_WARN_AFTER: Duration = Duration::from_secs(60);
+/// Quiet time before the soft "still working…" reassurance tier appears.
+///
+/// Short enough to answer the "is this still going?" doubt that creeps in after
+/// ~10s of a silent spinner, without the alarm of the hard tier.
+pub const STALL_SOFT_AFTER: Duration = Duration::from_secs(11);
 
-/// Pure stall decision. Given how long the turn has been quiet (no new daemon
-/// events) and the warning threshold, return `Some(seconds_quiet)` to warn, or
-/// `None`. Kept free of `Instant` so it is deterministically testable.
+/// Quiet time before the hard "no daemon activity" alarm (with the interrupt
+/// hint). Was 60s — a full silent minute is well past the doubt threshold, so
+/// the watchdog fired too late to be reassuring.
+pub const STALL_WARN_AFTER: Duration = Duration::from_secs(28);
+
+/// Which stall notice (if any) to show after `quiet` seconds of daemon silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StallTier {
+    /// Gentle reassurance — a long turn may just be thinking. No interrupt hint.
+    Soft(u64),
+    /// Sustained silence — likely wedged; surface the Ctrl+C interrupt hint.
+    Hard(u64),
+}
+
+/// Pure stall decision: classify `quiet` against the soft/hard thresholds.
+///
+/// `None` below `soft`, `Soft` between, `Hard` at/above `hard`. Kept free of
+/// `Instant` so it is deterministically testable.
 #[must_use]
-pub fn stall_seconds(quiet: Duration, threshold: Duration) -> Option<u64> {
-    if quiet >= threshold {
-        Some(quiet.as_secs())
+pub fn stall_tier(quiet: Duration, soft: Duration, hard: Duration) -> Option<StallTier> {
+    let secs = quiet.as_secs();
+    if quiet >= hard {
+        Some(StallTier::Hard(secs))
+    } else if quiet >= soft {
+        Some(StallTier::Soft(secs))
     } else {
         None
     }
 }
 
+/// Pure desktop-notification gate (aider L107 OS-notification parity).
+///
+/// Returns whether a turn-completion desktop notification should fire. Two
+/// inputs gate it: `enabled` (the resolved opt-in flag — `ORIGIN_NOTIFY_DESKTOP=1`
+/// or a config flag) and `succeeded` (whether the turn ended cleanly). A failed
+/// turn already surfaces an error line, so we only chime on success. Default
+/// (`enabled == false`) ⇒ `false` ⇒ no spawn ⇒ byte-identical.
+#[must_use]
+pub const fn should_notify(enabled: bool, succeeded: bool) -> bool {
+    enabled && succeeded
+}
+
+/// Whether the opt-in desktop-notification layer is active for this session.
+///
+/// True when `ORIGIN_NOTIFY_DESKTOP=1` or `config_flag` is set. Mirrors the
+/// daemon's `ORIGIN_NOTIFY` opt-in but uses a CLI-specific variable so the two
+/// surfaces can be toggled independently. Default-off ⇒ no notification.
+#[must_use]
+pub fn desktop_notify_enabled(config_flag: bool) -> bool {
+    config_flag || std::env::var("ORIGIN_NOTIFY_DESKTOP").as_deref() == Ok("1")
+}
+
+/// Fire a best-effort desktop notification for a completed turn.
+///
+/// Gated by [`should_notify`]; when it returns `false` this is a no-op (no
+/// process spawn, no observable effect). Otherwise it builds the OS-native
+/// notifier command via [`origin_notify::desktop_command`] and spawns it,
+/// swallowing every error — a missing notifier binary must never disturb the
+/// session. Returns `true` when a spawn was attempted, for tests/telemetry.
+#[must_use]
+pub fn notify_turn_complete(enabled: bool, succeeded: bool) -> bool {
+    if !should_notify(enabled, succeeded) {
+        return false;
+    }
+    let n = origin_notify::Notification::new("origin", "Turn complete", false);
+    let (program, cmd_args) = origin_notify::desktop_command(&n);
+    let _ = std::process::Command::new(program).args(cmd_args).spawn();
+    true
+}
+
+// App-state aggregate: each bool is an independent, unrelated session toggle
+// (plan mode, vim, desktop notify, permission prompting). Grouping them into a
+// sub-struct would obscure rather than clarify.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct App {
     pub scrollback: Vec<ScrollLine>,
-    pub input: String,
+    /// Cursor-aware input editor (mid-buffer edit, Home/End, prompt history).
+    pub input: Editor,
     pub cursor: usize,
     pub current_assistant: Option<String>,
     pub usage: UsageSnapshot,
@@ -109,12 +238,133 @@ pub struct App {
     /// while a goal is running; `None` when cleared. Rendered above the
     /// input card by `draw`.
     pub goal_status: Option<String>,
-    /// Stall watchdog: `Some(seconds_quiet)` when the render heartbeat has seen
-    /// no daemon activity for [`STALL_WARN_AFTER`] during an in-flight turn.
-    /// `None` whenever the daemon is producing output or no turn is running.
-    /// Rendered as a high-visibility notice so a wedged daemon stops looking
+    /// Stall watchdog: the [`StallTier`] when the render heartbeat has seen no
+    /// daemon activity for [`STALL_SOFT_AFTER`]/[`STALL_WARN_AFTER`] during an
+    /// in-flight turn. `None` whenever the daemon is producing output or no turn
+    /// is running. Rendered as a notice so a quiet/wedged daemon stops looking
     /// like an indefinitely-spinning spinner.
-    pub stall_secs: Option<u64>,
+    pub stall: Option<StallTier>,
+    /// Session reasoning-effort level (`fast`/`low`/`medium`/`high`/`max`) as a
+    /// canonical wire token, or `None` to leave the provider wire unchanged.
+    /// Seeded from the startup `--effort` flag and mutated mid-session by the
+    /// `/effort <level>` and `/fast` composer commands. Sent on every
+    /// `PromptRequest`. *Closes: claude-code `/effort`+`/fast` (interactive).*
+    pub effort: Option<String>,
+    /// Active output style (Explanatory / Learning / Concise), or `None` for the
+    /// default voice. Set by the `/output-style <name>` composer command; its
+    /// system suffix is sent on every `PromptRequest` (in the `system` field) so
+    /// the model adopts the style. *Closes: claude-code output styles.*
+    pub output_style: Option<origin_outputstyle::Style>,
+    /// Queued mid-turn steering hints (gemini model steering). The `/steer
+    /// <text>` composer command pushes a hint here; the next real prompt drains
+    /// the queue and merges the hints (in `<steering>` markers) ahead of the
+    /// user's text. Empty ⇒ the prompt is sent unchanged. *Closes: gemini model
+    /// steering (the queue+merge wire).*
+    pub steering: origin_steering::SteeringQueue,
+    /// Read-only "plan mode" (gemini Plan Mode). When `true`, every subsequent
+    /// `PromptRequest` carries `read_only`, so the daemon denies all mutating
+    /// tools for that turn. Toggled by the `/plan` composer command.
+    pub plan_mode: bool,
+    /// Multimodal attachments staged by `/attach <file>` for the next prompt
+    /// (interactive parity with headless `origin run --attach`). Drained into
+    /// the next `PromptRequest.attachments`; empty ⇒ text-only. *Closes: the
+    /// interactive half of aider/gemini/claude image+PDF input.*
+    pub pending_attachments: Vec<origin_multimodal::ContentBlock>,
+    /// Extra workspace roots for this session (cline multi-root), seeded from
+    /// the startup `--root` flags and sent on every `PromptRequest`. Empty ⇒
+    /// single-root behaviour.
+    pub workspace_roots: Vec<String>,
+    /// Live "prompt cache went cold" state (jcode parity). Tracks the wall-clock
+    /// end of the previous turn and whether any prior turn had a warm cache, so a
+    /// new turn whose gap exceeds [`origin_cost::PROMPT_CACHE_TTL_MS`] — or whose
+    /// usage reports zero cache reads after a warm turn — flips
+    /// `cache_cold` on for that turn. Cleared on the next warm turn. Purely
+    /// additive to the status line; byte-identical when warm or unused.
+    cache_cold: CacheColdState,
+    /// Opt-in vim input mode (aider L107). [`VimMode::Insert`] is the default
+    /// and reproduces today's direct-insert composer; the caller only consults
+    /// the vim reducer when [`Self::vim_active`] is set, so a default session is
+    /// byte-identical. Toggled by the `/vim` composer command or `ORIGIN_VIM=1`.
+    pub vim_mode: VimMode,
+    /// Whether the vim layer is active this session. `false` ⇒ the vim reducer
+    /// is never consulted and input is byte-identical.
+    pub vim_active: bool,
+    /// Active color preset (aider L107). [`Theme::Default`] reproduces the
+    /// legacy "Burnished Copper" constants verbatim, so the default render path
+    /// is byte-identical; changed only by the `/theme <name>` composer command.
+    pub theme: Theme,
+    /// Opt-in desktop-notification flag (aider L107). When set, a best-effort OS
+    /// notification fires on successful turn completion via `origin-notify`.
+    /// Default `false` ⇒ no spawn ⇒ byte-identical.
+    pub notify_desktop: bool,
+    /// Opt-in interactive tool-permission prompting. When `true`, each
+    /// `PromptRequest` carries `permission_ask`, so the daemon asks before
+    /// running `RequiresPermission` tools. Default `false` ⇒ the daemon stays on
+    /// auto-allow ⇒ byte-identical. Toggled by the `/permissions` command.
+    pub permission_ask: bool,
+    /// The pending permission ask, if the daemon is currently waiting on the
+    /// user. `Some` ⇒ the next `y`/`n` (or `Esc`) answers it; rendered above the
+    /// input card. `None` in the common case.
+    pub pending_permission: Option<PendingPermission>,
+    /// Scrollback row of the tool-activity line currently showing a `▸`
+    /// "running" marker, so [`finish_tool_line`](Self::finish_tool_line) can
+    /// flip it to `✔`/`✘` when the tool completes. `None` when no tool is in
+    /// flight.
+    running_tool_row: Option<usize>,
+    /// Whether terminal mouse capture is on. Default `true` (wheel scrolls, but
+    /// the terminal's native drag-select/copy is intercepted) — byte-identical
+    /// with the historic behaviour. `/mouse off` releases capture so the user
+    /// can select & copy; scrollback stays reachable via PageUp/Shift+arrows.
+    pub mouse_capture: bool,
+    /// The most recent finalized assistant reply, for `/copy` (OSC 52). `None`
+    /// until the first reply completes.
+    pub last_assistant: Option<String>,
+    /// Total input tokens (uncached + cache-read + cache-write) of the most
+    /// recent turn — a proxy for how full the context window is. `0` before any
+    /// turn. Surfaced as `ctx N%` in the status line.
+    pub last_ctx_tokens: u32,
+    /// Cumulative input-token total snapshotted at turn start, so the turn's own
+    /// context size can be isolated as a delta at turn end.
+    ctx_at_start: u32,
+    /// Customizable composer keybindings (claude-code L147). Seeded once at
+    /// startup from [`KeyMap::load`] (builtin defaults overlaid with
+    /// `~/.origin/keybindings.toml`). The default builtin map reports the same
+    /// chords the legacy reducer already owns, so an absent override file leaves
+    /// the key path byte-identical. The live key handler consults it via
+    /// [`Self::keymap`] before the default reducer.
+    keymap: KeyMap,
+}
+
+/// State backing the live cache-cold status-line nudge. All times are
+/// wall-clock milliseconds (`SystemTime` since the Unix epoch); this lives in
+/// the CLI, not a workflow, so real time is fine.
+#[derive(Debug, Default)]
+struct CacheColdState {
+    /// Wall-clock ms at which the previous turn ended, or `None` before any turn.
+    last_turn_end_ms: Option<u64>,
+    /// Wall-clock ms at which the in-flight turn started. Used to measure the
+    /// idle gap against `last_turn_end_ms`. `None` between turns.
+    turn_start_ms: Option<u64>,
+    /// Cumulative `cache_read` tokens observed at the moment the in-flight turn
+    /// started, so the turn's own cache reads can be isolated as a delta.
+    cache_read_at_start: u32,
+    /// `true` once any turn has been served from a warm cache (`cache_read > 0`).
+    /// Gates the "zero cache reads ⇒ cold" arm so a session's very first
+    /// cache-write turn is not misreported as cold.
+    had_prior_warm: bool,
+    /// Whether the *current/most-recent* turn started against a cold cache. This
+    /// is the bit the status line renders.
+    cold: bool,
+}
+
+/// Current wall-clock time in milliseconds since the Unix epoch. Saturates to
+/// `0` on the impossible pre-epoch case rather than panicking; this only feeds a
+/// best-effort idle-gap heuristic, so a degraded clock at worst suppresses the
+/// nudge.
+fn now_wallclock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 const BANNER: &[&str] = &[
@@ -131,7 +381,7 @@ impl App {
     pub fn new(provider: &'static str, model: impl Into<String>, sources: CompletionSources) -> Self {
         Self {
             scrollback: Vec::new(),
-            input: String::new(),
+            input: Editor::new(),
             cursor: 0,
             current_assistant: None,
             usage: UsageSnapshot::new(provider, model),
@@ -142,13 +392,124 @@ impl App {
             spinner: Spinner::new(),
             turn_started: None,
             goal_status: None,
-            stall_secs: None,
+            stall: None,
+            effort: None,
+            output_style: None,
+            steering: origin_steering::SteeringQueue::new(),
+            plan_mode: false,
+            pending_attachments: Vec::new(),
+            workspace_roots: Vec::new(),
+            cache_cold: CacheColdState::default(),
+            vim_mode: VimMode::Insert,
+            vim_active: false,
+            theme: Theme::Default,
+            notify_desktop: false,
+            permission_ask: false,
+            pending_permission: None,
+            running_tool_row: None,
+            mouse_capture: true,
+            last_assistant: None,
+            last_ctx_tokens: 0,
+            ctx_at_start: 0,
+            keymap: KeyMap::default(),
         }
+    }
+
+    /// The session's composer [`KeyMap`]. Defaults to the builtin map (==
+    /// current behaviour); replaced once at startup via [`Self::set_keymap`]
+    /// with the user's `~/.origin/keybindings.toml` overlay.
+    #[must_use]
+    pub const fn keymap(&self) -> &KeyMap {
+        &self.keymap
+    }
+
+    /// Install the session keymap (called once at startup with [`KeyMap::load`]).
+    pub fn set_keymap(&mut self, keymap: KeyMap) {
+        self.keymap = keymap;
+    }
+
+    /// Seed the opt-in vim layer's active state at startup.
+    ///
+    /// Passed [`crate::input::vim_active_default`] so `ORIGIN_VIM=1` starts the
+    /// session in vim Normal mode; `false` (the default) leaves the composer in
+    /// direct-insert mode so the key path is byte-identical. Enabling starts in
+    /// [`VimMode::Normal`] (vim convention), matching [`Self::toggle_vim`].
+    pub const fn set_vim_active(&mut self, active: bool) {
+        self.vim_active = active;
+        self.vim_mode = if active {
+            VimMode::Normal
+        } else {
+            VimMode::Insert
+        };
+    }
+
+    /// Whether the opt-in vim layer is active this session. `false` ⇒ the vim
+    /// reducer is never consulted (byte-identical input handling).
+    #[must_use]
+    pub const fn vim_active(&self) -> bool {
+        self.vim_active
+    }
+
+    /// The current vim input mode (only meaningful when [`Self::vim_active`]).
+    #[must_use]
+    pub const fn vim_mode(&self) -> VimMode {
+        self.vim_mode
+    }
+
+    /// Total input tokens currently counted (uncached + cache-read + cache-write).
+    const fn ctx_total(&self) -> u32 {
+        self.usage
+            .input_tokens
+            .saturating_add(self.usage.cache_read_input_tokens)
+            .saturating_add(self.usage.cache_creation_input_tokens)
+    }
+
+    /// The context-window fill of the most recent turn as a percentage (0–100),
+    /// or `None` before any turn ran. Uses a per-model window estimate.
+    #[must_use]
+    pub fn ctx_pct(&self) -> Option<u8> {
+        if self.last_ctx_tokens == 0 {
+            return None;
+        }
+        let window = context_window_for(&self.usage.model);
+        let pct = u64::from(self.last_ctx_tokens) * 100 / u64::from(window.max(1));
+        Some(u8::try_from(pct.min(100)).unwrap_or(100))
+    }
+
+    /// Apply a `/permissions [on|off]` toggle, returning the new state. No
+    /// argument flips the current state; `on`/`off` set it explicitly.
+    pub fn set_permission_ask(&mut self, arg: &str) -> bool {
+        self.permission_ask = match arg.trim() {
+            "on" => true,
+            "off" => false,
+            _ => !self.permission_ask,
+        };
+        self.permission_ask
+    }
+
+    /// Apply a `/mouse [on|off]` toggle, returning the new capture state. No
+    /// argument flips; `on`/`off` set it explicitly. The caller is responsible
+    /// for issuing the matching `EnableMouseCapture`/`DisableMouseCapture`.
+    pub fn set_mouse_capture(&mut self, arg: &str) -> bool {
+        self.mouse_capture = match arg.trim() {
+            "on" => true,
+            "off" => false,
+            _ => !self.mouse_capture,
+        };
+        self.mouse_capture
     }
 
     /// Start the live turn timer. Called when a user submission begins.
     pub fn start_turn_timer(&mut self) {
         self.turn_started = Some(Instant::now());
+        // Snapshot the wall-clock start and the cumulative cache-read counter so
+        // `stop_turn_timer` can measure this turn's idle gap and isolate its own
+        // cache reads for the cold-cache nudge.
+        self.cache_cold.turn_start_ms = Some(now_wallclock_ms());
+        self.cache_cold.cache_read_at_start = self.usage.cache_read_input_tokens;
+        // Snapshot the cumulative input total so this turn's context size (its
+        // delta) can be isolated for the `ctx N%` meter.
+        self.ctx_at_start = self.ctx_total();
     }
 
     /// Stop the live timer and fold the elapsed delta into `usage.elapsed`
@@ -159,7 +520,54 @@ impl App {
             self.usage.elapsed += start.elapsed();
         }
         // No turn in flight => no stall possible; clear any lingering notice.
-        self.stall_secs = None;
+        self.stall = None;
+        // A streaming tool (e.g. Bash) may not signal completion explicitly;
+        // resolve its running marker to ✔ now that the turn has ended.
+        self.finish_tool_line(true);
+        // This turn's context size = the input-token delta since turn start.
+        self.last_ctx_tokens = self.ctx_total().saturating_sub(self.ctx_at_start);
+        self.evaluate_cache_cold();
+    }
+
+    /// Decide whether the just-finished turn started against a cold prompt cache
+    /// and update the live nudge state, using the real wall clock for the turn
+    /// end. Thin wrapper over [`Self::evaluate_cache_cold_at`] so the decision is
+    /// deterministically testable.
+    fn evaluate_cache_cold(&mut self) {
+        self.evaluate_cache_cold_at(now_wallclock_ms());
+    }
+
+    /// Core of the cache-cold decision with an explicit `now_ms` for the turn
+    /// end. Reuses `origin_cost::is_cache_cold` so the TUI surface and the cost
+    /// meter share one decision. Purely additive: when warm (or no turn ran) the
+    /// rendered status line is unchanged.
+    fn evaluate_cache_cold_at(&mut self, now_ms: u64) {
+        let Some(start_ms) = self.cache_cold.turn_start_ms.take() else {
+            return;
+        };
+        let turn_cache_read = self
+            .usage
+            .cache_read_input_tokens
+            .saturating_sub(self.cache_cold.cache_read_at_start);
+        let cold = origin_cost::is_cache_cold(
+            self.cache_cold.last_turn_end_ms,
+            start_ms,
+            u64::from(turn_cache_read),
+            self.cache_cold.had_prior_warm,
+        );
+        if turn_cache_read > 0 {
+            self.cache_cold.had_prior_warm = true;
+        }
+        self.cache_cold.cold = cold;
+        self.cache_cold.last_turn_end_ms = Some(now_ms);
+    }
+
+    /// Whether the most-recent turn started against a cold prompt cache — the bit
+    /// the status line renders as a brief nudge. Exposed for tests and the
+    /// renderer.
+    #[must_use]
+    pub const fn cache_cold(&self) -> bool {
+        self.cache_cold.cold
     }
 
     /// A cheap fingerprint of everything a daemon stream event can change
@@ -175,7 +583,9 @@ impl App {
         s = s
             .wrapping_mul(P)
             .wrapping_add(self.current_assistant.as_ref().map_or(0, String::len) as u64);
-        s = s.wrapping_mul(P).wrapping_add(u64::from(self.usage.output_tokens));
+        s = s
+            .wrapping_mul(P)
+            .wrapping_add(u64::from(self.usage.output_tokens));
         s = s.wrapping_mul(P).wrapping_add(u64::from(self.usage.input_tokens));
         s
     }
@@ -183,7 +593,7 @@ impl App {
     /// Apply a streaming usage delta. Mirrors `record_usage` but takes no
     /// elapsed value — used while a turn is in flight so the token counts
     /// and cost in the status line update as events stream in.
-    pub fn record_usage_tokens(
+    pub const fn record_usage_tokens(
         &mut self,
         input_tokens: u32,
         output_tokens: u32,
@@ -198,7 +608,7 @@ impl App {
     }
 
     pub fn recompute_suggestions(&mut self) {
-        self.suggestions = crate::suggestions::suggest(&self.input, &self.sources);
+        self.suggestions = crate::suggestions::suggest(self.input.buffer(), &self.sources);
     }
 
     pub fn push_banner(&mut self, cols: u16, rows: u16) {
@@ -217,7 +627,7 @@ impl App {
             let pad = (cols as usize).saturating_sub(w) / 2;
             let padded = format!("{:>width$}{line}", "", width = pad);
             self.scrollback
-                .push(ScrollLine::styled(padded, theme::ACCENT_DIM, 0, false));
+                .push(ScrollLine::styled(padded, self.palette().accent_dim, 0, false));
         }
         for _ in 0..3 {
             self.scrollback
@@ -228,22 +638,39 @@ impl App {
         let tpad = (cols as usize).saturating_sub(tw) / 2;
         let padded_tip = format!("{:>width$}{tip}", "", width = tpad);
         self.scrollback
-            .push(ScrollLine::styled(padded_tip, theme::MUTED, 0, false));
+            .push(ScrollLine::styled(padded_tip, self.palette().muted, 0, false));
+    }
+
+    /// Wipe the in-session TUI view and restore the just-launched look, so
+    /// `/clear` leaves the terminal as if origin had only just started.
+    ///
+    /// Drops all scrollback rows, any half-rendered assistant turn, the goal
+    /// indicator, and resets the scroll position before re-painting the
+    /// startup banner. Persistent/session config carried on `App` (effort,
+    /// output style, theme, workspace roots, …) is deliberately left intact —
+    /// `/clear` resets the *conversation view*, not the session's settings.
+    pub fn reset_to_login(&mut self, cols: u16, rows: u16) {
+        self.scrollback.clear();
+        self.current_assistant = None;
+        self.goal_status = None;
+        self.stall = None;
+        self.scroll_offset = 0;
+        self.push_banner(cols, rows);
     }
 
     pub fn set_model(&mut self, model: impl Into<String>) {
         self.usage.model = model.into();
     }
 
-    pub fn scroll_up(&mut self, n: usize) {
+    pub const fn scroll_up(&mut self, n: usize) {
         self.scroll_offset = self.scroll_offset.saturating_add(n);
     }
 
-    pub fn scroll_down(&mut self, n: usize) {
+    pub const fn scroll_down(&mut self, n: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
     }
 
-    pub fn scroll_to_bottom(&mut self) {
+    pub const fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
     }
 
@@ -254,7 +681,7 @@ impl App {
                     .push(ScrollLine::styled(String::new(), 0, 0, false));
                 self.scrollback.push(ScrollLine::styled(
                     format!("\u{276F} {body}"),
-                    theme::USER,
+                    self.palette().user,
                     0,
                     true,
                 ));
@@ -264,19 +691,19 @@ impl App {
             "error> " => {
                 self.scrollback.push(ScrollLine::styled(
                     format!("  \u{2718} {body}"),
-                    theme::RED,
+                    self.palette().red,
                     0,
                     false,
                 ));
             }
             "system> " => {
                 self.scrollback
-                    .push(ScrollLine::styled(format!("  {body}"), theme::MUTED, 0, false));
+                    .push(ScrollLine::styled(format!("  {body}"), self.palette().muted, 0, false));
             }
             "ok> " => {
                 self.scrollback.push(ScrollLine::styled(
                     format!("  \u{2714} {body}"),
-                    theme::GREEN,
+                    self.palette().green,
                     0,
                     false,
                 ));
@@ -284,25 +711,44 @@ impl App {
             "mem> " => {
                 self.scrollback.push(ScrollLine::styled(
                     format!("  {body}"),
-                    theme::ACCENT_DIM,
+                    self.palette().accent_dim,
                     0,
                     false,
                 ));
             }
             "tab> " => {
                 self.scrollback
-                    .push(ScrollLine::styled(format!("    {body}"), theme::MUTED, 0, false));
+                    .push(ScrollLine::styled(format!("    {body}"), self.palette().muted, 0, false));
             }
             _ => {
                 self.scrollback
-                    .push(ScrollLine::styled(format!("  {body}"), theme::BODY, 0, false));
+                    .push(ScrollLine::styled(format!("  {body}"), self.palette().body, 0, false));
             }
         }
         self.scroll_offset = 0;
     }
 
     pub fn add_colored_line(&mut self, text: String, fg: u32, bg: u32) {
-        self.scrollback.push(ScrollLine::styled(text, fg, bg, false));
+        // Pre-formatted (tool output, diff rows, streamed command lines): drawn
+        // verbatim so embedded `**`/backticks aren't reinterpreted as markdown.
+        self.scrollback.push(ScrollLine::verbatim(text, fg, bg));
+        // This is the high-volume append path (streamed Bash, diffs); cap here.
+        self.trim_scrollback();
+    }
+
+    /// Drop the oldest rows when scrollback exceeds [`MAX_SCROLLBACK`] (plus
+    /// slack), keeping the newest. Front-drains in a batch so the O(n) shift is
+    /// rare. Indices into scrollback are fixed up: the running-tool marker row
+    /// shifts down (or is forgotten if its line was trimmed). `scroll_offset` is
+    /// measured from the bottom, so trimming the front never invalidates it.
+    fn trim_scrollback(&mut self) {
+        if self.scrollback.len() <= MAX_SCROLLBACK + SCROLLBACK_SLACK {
+            return;
+        }
+        let drop_n = self.scrollback.len() - MAX_SCROLLBACK;
+        self.scrollback.drain(0..drop_n);
+        // `checked_sub` ⇒ `None` when the tracked tool line was itself trimmed.
+        self.running_tool_row = self.running_tool_row.and_then(|r| r.checked_sub(drop_n));
     }
 
     /// Bug #4: update the one-line goal status indicator. `None` clears it
@@ -311,10 +757,119 @@ impl App {
         self.goal_status = status;
     }
 
+    /// Handle a `/theme <name>` composer command (aider L107 theme preset).
+    ///
+    /// On a recognised name, switches the active [`Theme`] and returns `true`;
+    /// an unknown name leaves the theme unchanged and returns `false` so the
+    /// caller can surface a usage hint. The default theme is unchanged unless
+    /// this is called, so the default render path stays byte-identical.
+    pub fn set_theme_by_name(&mut self, name: &str) -> bool {
+        Theme::parse(name).is_some_and(|t| {
+            self.theme = t;
+            true
+        })
+    }
+
+    /// The palette for the active theme — the named colors the renderer reads
+    /// when a non-default theme is in effect.
+    #[must_use]
+    pub const fn palette(&self) -> theme::Palette {
+        theme::palette(self.theme)
+    }
+
+    /// Toggle the opt-in vim input layer (aider L107), returning the new active
+    /// state. Enabling always starts in [`VimMode::Normal`] (vim convention);
+    /// disabling resets to [`VimMode::Insert`] so the composer is immediately
+    /// back to byte-identical direct insert.
+    pub const fn toggle_vim(&mut self) -> bool {
+        self.vim_active = !self.vim_active;
+        self.vim_mode = if self.vim_active {
+            VimMode::Normal
+        } else {
+            VimMode::Insert
+        };
+        self.vim_active
+    }
+
+    /// Apply a [`crate::input::VimAction`] to the input buffer/cursor.
+    ///
+    /// This is the (impure) mutation the pure `vim_key` reducer feeds: mode
+    /// switches update [`Self::vim_mode`]; motions move [`Self::cursor`] within
+    /// the current buffer. Returns whether the event was consumed by the vim
+    /// layer (`false` ⇒ [`crate::input::VimAction::Pass`], so the caller runs
+    /// its normal handling). Cursor moves are clamped to the buffer; word
+    /// motions step over runs of non-whitespace.
+    pub fn apply_vim_action(&mut self, action: crate::input::VimAction) -> bool {
+        use crate::input::VimAction as A;
+        if action == A::Pass {
+            return false;
+        }
+        // Seed the working cursor (char-indexed) from the editor's live caret so
+        // motions chain across consecutive vim keys and the visible caret moves.
+        // `self.cursor` is the char-indexed scratch the motion arithmetic uses;
+        // it is mirrored back onto the byte-indexed editor cursor below.
+        self.cursor = self.input.cursor_chars();
+        let len = self.input.buffer().chars().count();
+        // Resolve the action into an optional cursor target and an optional
+        // mode switch, so each effect is expressed once and clippy sees no two
+        // arms with identical bodies. `None` cursor ⇒ leave the cursor put.
+        let (cursor, mode): (Option<usize>, Option<VimMode>) = match action {
+            A::Pass => (None, None),
+            A::SwitchMode(m) => (None, Some(m)),
+            A::InsertHere | A::BeginCommand => (None, Some(VimMode::Insert)),
+            A::AppendAfter => (Some((self.cursor + 1).min(len)), Some(VimMode::Insert)),
+            A::InsertLineStart => (Some(0), Some(VimMode::Insert)),
+            A::AppendLineEnd => (Some(len), Some(VimMode::Insert)),
+            A::MoveLeft | A::MoveUp => (Some(self.cursor.saturating_sub(1)), None),
+            A::MoveRight | A::MoveDown => (Some((self.cursor + 1).min(len)), None),
+            A::LineStart | A::WordBack => (Some(0), None),
+            A::LineEnd | A::WordForward => (Some(len), None),
+        };
+        if let Some(c) = cursor {
+            self.cursor = c;
+            // Mirror the char-indexed motion onto the byte-indexed editor caret
+            // so the rendered caret (which reads `input.cursor()`) tracks it.
+            self.input.set_cursor_chars(c);
+        }
+        if let Some(m) = mode {
+            self.vim_mode = m;
+        }
+        true
+    }
 
     pub fn add_tool_line(&mut self, text: String) {
+        self.scrollback.push(ScrollLine::verbatim(text, self.palette().tool, 0));
+    }
+
+    /// Push a tool-activity line with a leading `▸` "running" marker, recording
+    /// its row so [`finish_tool_line`](Self::finish_tool_line) can flip it to
+    /// `✔`/`✘`. If a previous tool is still marked running (e.g. a streaming
+    /// Bash whose completion isn't signalled explicitly), assume it finished OK
+    /// before starting the new one — so at most one `▸` is ever visible.
+    pub fn start_tool_line(&mut self, text: &str) {
+        self.finish_tool_line(true);
+        self.running_tool_row = Some(self.scrollback.len());
         self.scrollback
-            .push(ScrollLine::styled(text, theme::TOOL, 0, false));
+            .push(ScrollLine::verbatim(format!("  \u{25B8} {text}"), self.palette().tool, 0));
+        self.scroll_offset = 0;
+    }
+
+    /// Flip the tracked running tool line's `▸` to `✔` (ok) or `✘` (failure, in
+    /// red) and stop tracking it. No-op when no tool line is being tracked, so
+    /// it is safe to call on every result and at turn end.
+    pub fn finish_tool_line(&mut self, ok: bool) {
+        let Some(row) = self.running_tool_row.take() else {
+            return;
+        };
+        // Resolve the color before the mutable scrollback borrow below.
+        let red = self.palette().red;
+        if let Some(line) = self.scrollback.get_mut(row) {
+            let glyph = if ok { '\u{2714}' } else { '\u{2718}' };
+            line.text = line.text.replacen('\u{25B8}', &glyph.to_string(), 1);
+            if !ok {
+                line.fg = red;
+            }
+        }
     }
 
     pub fn start_assistant_turn(&mut self) {
@@ -328,8 +883,42 @@ impl App {
         self.scroll_offset = 0;
     }
 
-    pub fn finalize_assistant_turn(&mut self, _turns: u32) {
-        if let Some(text) = self.current_assistant.take() {
+    /// The text buffered for the in-flight assistant turn, if any.
+    ///
+    /// Lets the caller fire the (async) `MessageDisplay` shell hook on the
+    /// rendered text *before* it acquires the `App` lock and calls
+    /// [`finalize_assistant_turn`](Self::finalize_assistant_turn), passing the
+    /// resulting action in. `None` ⇒ no turn buffered ⇒ nothing to render.
+    #[must_use]
+    pub fn current_assistant_text(&self) -> Option<&str> {
+        self.current_assistant.as_deref()
+    }
+
+    /// Flush the buffered assistant turn into scrollback.
+    ///
+    /// No `MessageDisplay` hook action: equivalent to
+    /// [`finalize_assistant_turn_with_action`](Self::finalize_assistant_turn_with_action)
+    /// with `None`, so the active output style alone decides the render.
+    pub fn finalize_assistant_turn(&mut self, turns: u32) {
+        self.finalize_assistant_turn_with_action(turns, None);
+    }
+
+    pub fn finalize_assistant_turn_with_action(
+        &mut self,
+        _turns: u32,
+        hook_action: Option<&origin_outputstyle::DisplayAction>,
+    ) {
+        if let Some(raw) = self.current_assistant.take() {
+            // claude-code MessageDisplay: a `MessageDisplay` shell hook (when one
+            // fired and returned an action) decides the rendered text outright;
+            // otherwise the active output style may rewrite or hide it. No hook
+            // *and* no style (or the default) ⇒ identity ⇒ `Some(raw)` unchanged,
+            // so rendering is byte-identical. `None` suppresses the message.
+            let Some(text) =
+                origin_outputstyle::resolve_display(&raw, self.output_style, hook_action)
+            else {
+                return;
+            };
             if !text.is_empty() {
                 let mut in_code_block = false;
                 for line in text.split('\n') {
@@ -338,8 +927,8 @@ impl App {
                         in_code_block = !in_code_block;
                         self.scrollback.push(ScrollLine::styled(
                             format!("  {line}"),
-                            theme::MUTED,
-                            if in_code_block { theme::CODE_BG } else { 0 },
+                            self.palette().muted,
+                            if in_code_block { self.palette().code_bg } else { 0 },
                             false,
                         ));
                         continue;
@@ -347,14 +936,26 @@ impl App {
                     if in_code_block {
                         self.scrollback.push(ScrollLine::styled(
                             format!("  {line}"),
-                            theme::CODE_FG,
-                            theme::CODE_BG,
+                            self.palette().code_fg,
+                            self.palette().code_bg,
                             false,
                         ));
-                    } else {
-                        let (fg, bold) = md_line_style(line);
+                    } else if let Some(task) = crate::markdown_tasks::render_gfm_task_line(line) {
+                        // claude-code L147 (GFM task-list rendering): `- [ ]` /
+                        // `- [x]` lines render with a checkbox glyph. Pure
+                        // fall-through: non-task lines yield `None` and keep the
+                        // byte-identical default styling below.
                         self.scrollback
-                            .push(ScrollLine::styled(format!("  {line}"), fg, 0, bold));
+                            .push(ScrollLine::styled(format!("  {task}"), self.palette().body, 0, false));
+                    } else {
+                        let (fg, bold) = md_line_style(line, self.palette());
+                        // Strip ATX heading markers (`## `) — the color/weight
+                        // from `md_line_style` already conveys the hierarchy, so
+                        // the literal hashes are clutter. Non-headings unchanged.
+                        let rendered =
+                            strip_heading_markers(line).unwrap_or_else(|| line.to_string());
+                        self.scrollback
+                            .push(ScrollLine::styled(format!("  {rendered}"), fg, 0, bold));
                     }
                 }
                 // Trailing blank line so the next user turn (or the input
@@ -362,6 +963,14 @@ impl App {
                 self.scrollback
                     .push(ScrollLine::styled(String::new(), 0, 0, false));
             }
+            // Remember the rendered reply for `/copy` (OSC 52).
+            self.last_assistant = Some(text);
+            // aider L107 OS-notification: best-effort desktop chime on turn
+            // completion. Gated by the opt-in flag (default-off ⇒ no spawn ⇒
+            // byte-identical) and best-effort — a missing notifier never
+            // disturbs the session. `succeeded == true`: reaching this arm means
+            // the turn produced a (possibly empty-rendered) assistant reply.
+            let _ = notify_turn_complete(self.notify_desktop, true);
         }
     }
 
@@ -393,23 +1002,31 @@ impl App {
                 }
             }
 
+            // Snapshot the active palette once per frame; every chrome helper
+            // reads it (via CardLayout or a `pal` arg), so a `/theme` switch
+            // re-themes the chrome immediately. Default ⇒ the legacy constants.
+            let pal = self.palette();
+
             let card_w = 75u16.min(cols.saturating_sub(4));
             let cl = cols.saturating_sub(card_w) / 2;
             let cr = cl + card_w;
             let cs = cl + 2;
             let text_w = cr.saturating_sub(cs) as usize;
 
-            let wrapped = wrap_input_lines(&self.input, text_w);
-            let line_count = (wrapped.len() as u16).min(6);
+            // Lay out the input with the cursor mapped into the wrapped grid, so
+            // the painted caret matches the rendered lines exactly.
+            let buf = self.input.buffer();
+            let input_layout = crate::editor::wrap_with_cursor(buf, text_w, self.input.cursor());
+            let wrapped: Vec<&str> = input_layout
+                .lines
+                .iter()
+                .map(|vl| &buf[vl.byte_start..vl.byte_end])
+                .collect();
+            let line_count = clamp_u16(wrapped.len())
+                .clamp(MIN_INPUT_ROWS, MAX_INPUT_ROWS);
             let card_h = line_count + 1;
             let card_total = card_h + 2;
             let at_bottom = rows.saturating_sub(card_total);
-            // Reserve a single row of breathing room below the scrollback so
-            // the last line of output never sits flush against the input
-            // card. `finalize_assistant_turn` also appends a trailing blank
-            // line after each LLM message, giving 2 rows of separation for
-            // persistent content while only costing 1 visible row.
-            const INPUT_GAP_ROWS: u16 = 1;
             let scrollback_limit = at_bottom.saturating_sub(INPUT_GAP_ROWS) as usize;
 
             let cols_usize = cols as usize;
@@ -421,6 +1038,7 @@ impl App {
                     entry.fg,
                     entry.bg,
                     entry.bold,
+                    entry.literal,
                     cols_usize,
                     &mut visual_lines,
                 );
@@ -428,7 +1046,8 @@ impl App {
             let live_buf;
             if let Some(buf) = self.current_assistant.as_ref() {
                 live_buf = format!("  {buf}");
-                wrap_into(&live_buf, theme::BODY, 0, false, cols_usize, &mut visual_lines);
+                // Live assistant text is prose → markdown-parsed (literal=false).
+                wrap_into(&live_buf, pal.body, 0, false, false, cols_usize, &mut visual_lines);
             }
 
             let total = visual_lines.len();
@@ -442,255 +1061,473 @@ impl App {
                 if row >= at_bottom {
                     break;
                 }
-                render_md_line(main, row, vl.text, cols, vl.fg, vl.bg, vl.bold);
+                render_scroll_line(main, row, vl, cols, pal);
                 row = row.saturating_add(1);
-            }
-
-            if offset > 0 {
-                let indicator = format!(" \u{2191} {offset} more ");
-                // Position by DISPLAY width, not byte length: the `\u{2191}` (↑)
-                // arrow is 3 UTF-8 bytes but one terminal column, so `.len()`
-                // would push the indicator two columns too far left.
-                let indicator_w: usize = indicator
-                    .chars()
-                    .map(|c| UnicodeWidthChar::width(c).unwrap_or(1))
-                    .sum();
-                let start_col = cols.saturating_sub(indicator_w as u16 + 1);
-                write_str_styled(
-                    main,
-                    0,
-                    start_col,
-                    &indicator,
-                    cols,
-                    theme::ACCENT,
-                    theme::SURFACE_RAISED,
-                    false,
-                );
-            }
-
-            // Bug #4: render the one-line goal-status indicator (when set)
-            // on the breathing-room row just above the input card. Centered
-            // inside the card width so it visually associates with the
-            // current operation rather than the scrollback above.
-            if let Some(ref status) = self.goal_status {
-                let status_row = at_bottom.saturating_sub(1);
-                if status_row < rows {
-                    let pad = cl.saturating_add(2);
-                    write_str_styled(
-                        main,
-                        status_row,
-                        pad,
-                        status,
-                        cr,
-                        theme::ACCENT,
-                        0,
-                        false,
-                    );
-                }
-            }
-
-            // Stall watchdog notice. When the render heartbeat has seen no
-            // daemon activity for `STALL_WARN_AFTER`, surface a high-visibility
-            // warning so a wedged daemon reads as "possibly stuck" instead of an
-            // indefinitely-spinning spinner. Takes the row the goal status would
-            // use — a stall is the more urgent signal.
-            if let Some(secs) = self.stall_secs {
-                let status_row = at_bottom.saturating_sub(1);
-                if status_row < rows {
-                    let msg =
-                        format!("\u{26A0} no daemon activity for {secs}s \u{2014} Ctrl+C to interrupt");
-                    write_str_styled(
-                        main,
-                        status_row,
-                        cl.saturating_add(2),
-                        &msg,
-                        cr,
-                        theme::RED,
-                        0,
-                        false,
-                    );
-                }
             }
 
             let r_top = row.saturating_add(2).min(at_bottom);
             let r_status = r_top + line_count;
             let r_cap = r_status + 1;
+            let layout = CardLayout {
+                cols,
+                rows,
+                cl,
+                cr,
+                cs,
+                at_bottom,
+                r_top,
+                r_status,
+                r_cap,
+                palette: pal,
+            };
 
-            for r in r_top..=r_status.min(rows.saturating_sub(1)) {
-                for c in cl..cr.min(cols) {
-                    main.put(r, c, Cell::new(' ', 0, theme::SURFACE_RAISED, Attr::PLAIN));
-                }
-                if cl < cols {
-                    main.put(
-                        r,
-                        cl,
-                        Cell::new('\u{2503}', theme::ACCENT, theme::SURFACE_RAISED, Attr::PLAIN),
-                    );
-                }
+            draw_scroll_indicator(main, &layout, offset);
+            self.draw_notices(main, &layout);
+            draw_input_card_bg(main, &layout);
+            self.draw_input_text(main, &layout, &wrapped, input_layout.cursor_row, input_layout.cursor_col);
+            self.draw_status_line(main, &layout);
+            draw_keybind_hint(main, &layout, self.spinner.active || self.goal_status.is_some());
+            self.draw_suggestions_popup(main, &layout);
+        }
+        clear_prompt_grid(composer.prompt_grid(), self.palette());
+    }
+
+    /// Render the goal-status indicator and stall-watchdog notice on the
+    /// breathing-room row just above the input card. The stall notice (when
+    /// active) overpaints the goal status — a stall is the more urgent signal.
+    fn draw_notices(&self, main: &mut Grid, layout: &CardLayout) {
+        // Highest-priority notice: a pending permission ask blocks the turn, so
+        // it overpaints the goal/stall row. The user answers with y / n.
+        if let Some(ref ask) = self.pending_permission {
+            let status_row = layout.at_bottom.saturating_sub(1);
+            if status_row < layout.rows {
+                let msg = format!(
+                    "\u{26A0} {}  y = allow \u{00B7} n = deny",
+                    crate::locale::linef("permission.ask", &[("tool", &ask.tool), ("args", &ask.args)])
+                );
+                write_str_styled(
+                    main,
+                    status_row,
+                    layout.cl.saturating_add(2),
+                    &msg,
+                    layout.cr,
+                    Style {
+                        fg: layout.palette.yellow,
+                        bg: 0,
+                        bold: true,
+                    },
+                );
             }
-
-            if self.input.is_empty() && self.current_assistant.is_none() {
-                if r_top < rows {
-                    write_str_styled(
-                        main,
-                        r_top,
-                        cs,
-                        "Ask anything...",
-                        cr,
-                        theme::MUTED,
-                        theme::SURFACE_RAISED,
-                        false,
-                    );
-                }
-            } else if !self.input.is_empty() {
-                let vis_start = if wrapped.len() > 6 { wrapped.len() - 6 } else { 0 };
-                for (i, line) in wrapped[vis_start..].iter().enumerate() {
-                    let r = r_top + i as u16;
-                    if r >= r_status || r >= rows {
-                        break;
-                    }
-                    write_str_styled(main, r, cs, line, cr, theme::BRIGHT, theme::SURFACE_RAISED, false);
-                    if vis_start + i == wrapped.len() - 1 && !self.suggestions.ghost.is_empty() {
-                        let gc = cs + char_display_width(line);
-                        write_str_styled(
-                            main,
-                            r,
-                            gc,
-                            &self.suggestions.ghost,
-                            cr,
-                            theme::DIM,
-                            theme::SURFACE_RAISED,
-                            false,
-                        );
-                    }
-                }
+            return;
+        }
+        // Bug #4: render the one-line goal-status indicator (when set)
+        // on the breathing-room row just above the input card. Centered
+        // inside the card width so it visually associates with the
+        // current operation rather than the scrollback above.
+        if let Some(ref status) = self.goal_status {
+            let status_row = layout.at_bottom.saturating_sub(1);
+            if status_row < layout.rows {
+                let pad = layout.cl.saturating_add(2);
+                write_str_styled(
+                    main,
+                    status_row,
+                    pad,
+                    status,
+                    layout.cr,
+                    Style {
+                        fg: layout.palette.accent,
+                        bg: 0,
+                        bold: false,
+                    },
+                );
             }
+        }
 
-            if r_status < rows {
-                let cost = crate::status::cost_usd(&self.usage);
-                let live_elapsed = self
-                    .turn_started
-                    .map_or(self.usage.elapsed, |t| self.usage.elapsed + t.elapsed());
-                let secs = live_elapsed.as_secs_f64();
-                let tok_in = format_tokens(self.usage.input_tokens);
-                let tok_out = format_tokens(self.usage.output_tokens);
-
-                let (prefix, status) = if self.spinner.active {
-                    let sc = self.spinner.frame_char();
-                    (
-                        Some(sc),
-                        format!(
-                            "{sc} {} \u{00B7} {} \u{00B7} {tok_in}\u{2191} {tok_out}\u{2193} \u{00B7} ${cost:.3} \u{00B7} {secs:.1}s",
-                            self.workflow, self.usage.model,
-                        ),
-                    )
-                } else {
-                    (
-                        None,
-                        format!(
-                            "{} \u{00B7} {} \u{00B7} {tok_in}\u{2191} {tok_out}\u{2193} \u{00B7} ${cost:.3} \u{00B7} {secs:.1}s",
-                            self.workflow, self.usage.model,
-                        ),
-                    )
+        // Stall watchdog notice. A soft tier reassures ("still working…") after
+        // a short quiet; the hard tier alarms (red + interrupt hint) on
+        // sustained silence so a wedged daemon reads as "possibly stuck" instead
+        // of an indefinitely-spinning spinner. Takes the row the goal status
+        // would use — a stall is the more urgent signal.
+        if let Some(tier) = self.stall {
+            let status_row = layout.at_bottom.saturating_sub(1);
+            if status_row < layout.rows {
+                let (msg, fg) = match tier {
+                    StallTier::Soft(secs) => {
+                        (format!("\u{2026} still working\u{2026} {secs}s"), layout.palette.muted)
+                    }
+                    StallTier::Hard(secs) => (
+                        format!("\u{26A0} no daemon activity for {secs}s \u{2014} Ctrl+C to interrupt"),
+                        layout.palette.red,
+                    ),
                 };
                 write_str_styled(
                     main,
-                    r_status,
-                    cs,
-                    &status,
-                    cr,
-                    theme::DIM,
-                    theme::SURFACE_RAISED,
-                    false,
+                    status_row,
+                    layout.cl.saturating_add(2),
+                    &msg,
+                    layout.cr,
+                    Style { fg, bg: 0, bold: false },
                 );
-                if let Some(sc) = prefix {
-                    if let Some(pos) = status.find(sc) {
-                        let c = cs + pos as u16;
-                        if c < cr {
-                            main.put(
-                                r_status,
-                                c,
-                                Cell::new(sc, theme::ACCENT, theme::SURFACE_RAISED, Attr::PLAIN),
-                            );
-                        }
-                    }
-                }
-                let wf_offset = if prefix.is_some() { 2u16 } else { 0u16 };
-                for (i, ch) in self.workflow.chars().enumerate() {
-                    let c = cs + wf_offset + i as u16;
-                    if c < cr {
-                        main.put(
-                            r_status,
-                            c,
-                            Cell::new(ch, theme::ACCENT, theme::SURFACE_RAISED, Attr::BOLD),
-                        );
-                    }
-                }
             }
+        }
+    }
 
-            if r_cap < rows {
-                if cl < cols {
-                    main.put(r_cap, cl, Cell::new('\u{2579}', theme::ACCENT, 0, Attr::PLAIN));
-                }
-                let hint_parts: &[(&str, u32)] = &[
-                    ("shift+enter", theme::BODY),
-                    (" newline  ", theme::MUTED),
-                    ("tab", theme::BODY),
-                    (" skills  ", theme::MUTED),
-                    ("ctrl+c", theme::BODY),
-                    (" quit", theme::MUTED),
-                ];
-                let total_hw: u16 = hint_parts.iter().map(|(s, _)| char_display_width(s)).sum();
-                let mut hc = cr.saturating_sub(total_hw);
-                for (text, fg) in hint_parts {
-                    let tw = char_display_width(text);
-                    write_str_styled(main, r_cap, hc, text, hc + tw, *fg, 0, false);
-                    hc += tw;
-                }
+    /// Render the input card's text: the muted placeholder when empty, or the
+    /// (last six) wrapped input lines plus the ghost-suggestion completion.
+    fn draw_input_text(
+        &self,
+        main: &mut Grid,
+        layout: &CardLayout,
+        wrapped: &[&str],
+        cursor_row: usize,
+        cursor_col: usize,
+    ) {
+        // Show at most the last `MAX_INPUT_ROWS` wrapped rows (the card's
+        // text area caps there and scrolls internally beyond it).
+        let vis_start = wrapped.len().saturating_sub(MAX_INPUT_ROWS as usize);
+        if self.input.is_empty() && self.current_assistant.is_none() {
+            if layout.r_top < layout.rows {
+                write_str_styled(
+                    main,
+                    layout.r_top,
+                    layout.cs,
+                    "Ask anything...",
+                    layout.cr,
+                    Style {
+                        fg: layout.palette.muted,
+                        bg: layout.palette.surface_raised,
+                        bold: false,
+                    },
+                );
             }
-
-            if !self.suggestions.candidates.is_empty() {
-                let count = self.suggestions.candidates.len().min(6) as u16;
-                let popup_bottom = r_top.saturating_sub(1);
-                let popup_top = popup_bottom.saturating_sub(count);
-                let selected = self.suggestions.selected;
-                for (i, candidate) in self.suggestions.candidates.iter().take(6).enumerate() {
-                    let r = popup_top + i as u16;
-                    if r >= popup_bottom || r >= rows {
-                        break;
-                    }
-                    for c in cl..cr.min(cols) {
-                        main.put(r, c, Cell::new(' ', 0, theme::SURFACE_RAISED, Attr::PLAIN));
-                    }
-                    let (ind_fg, txt_fg) = if i == selected {
-                        (theme::ACCENT, theme::BODY)
-                    } else {
-                        (theme::MUTED, theme::MUTED)
-                    };
-                    let ind = if i == selected { " \u{25B8} " } else { "   " };
-                    let ps = cl + 1;
-                    write_str_styled(main, r, ps, ind, cr, ind_fg, theme::SURFACE_RAISED, false);
-                    let ind_w = char_display_width(ind);
+        } else if !self.input.is_empty() {
+            for (i, line) in wrapped[vis_start..].iter().enumerate() {
+                let r = layout.r_top + clamp_u16(i);
+                if r >= layout.r_status || r >= layout.rows {
+                    break;
+                }
+                write_str_styled(
+                    main,
+                    r,
+                    layout.cs,
+                    line,
+                    layout.cr,
+                    Style {
+                        fg: layout.palette.bright,
+                        bg: layout.palette.surface_raised,
+                        bold: false,
+                    },
+                );
+                if vis_start + i == wrapped.len() - 1 && !self.suggestions.ghost.is_empty() {
+                    let gc = layout.cs + char_display_width(line);
                     write_str_styled(
                         main,
                         r,
-                        ps + ind_w,
-                        candidate,
-                        cr,
-                        txt_fg,
-                        theme::SURFACE_RAISED,
-                        false,
+                        gc,
+                        &self.suggestions.ghost,
+                        layout.cr,
+                        Style {
+                            fg: layout.palette.dim,
+                            bg: layout.palette.surface_raised,
+                            bold: false,
+                        },
                     );
                 }
             }
         }
-        {
-            let prompt = composer.prompt_grid();
-            for r in 0..prompt.rows() {
-                for c in 0..prompt.cols() {
-                    prompt.put(r, c, Cell::new(' ', 0, theme::SURFACE, Attr::PLAIN));
-                }
+        // Paint the caret (a reversed cell) at the insertion point, over the
+        // text/placeholder, so the user always sees where they are typing.
+        if cursor_row >= vis_start {
+            let r = layout.r_top + clamp_u16(cursor_row - vis_start);
+            let c = layout.cs + clamp_u16(cursor_col);
+            if r < layout.r_status && r < layout.rows && c < layout.cr {
+                let glyph = char::from_u32(main.get(r, c).glyph)
+                    .filter(|&g| g != ' ' && g != '\0')
+                    .unwrap_or(' ');
+                main.put(
+                    r,
+                    c,
+                    Cell::new(glyph, layout.palette.bright, layout.palette.surface_raised, Attr::REVERSE),
+                );
             }
+        }
+    }
+
+    /// Render the status line as ordered styled spans: the spinner glyph and
+    /// workflow lead in accent, a Thinking/Responding phase follows while a turn
+    /// is in flight, the live cost and elapsed are body-bright (the numbers a
+    /// user watches), token counts are muted, and the static model name is dim —
+    /// so the line has a focal point instead of a flat, near-invisible DIM wall.
+    fn draw_status_line(&self, main: &mut Grid, layout: &CardLayout) {
+        if layout.r_status >= layout.rows {
+            return;
+        }
+        let cost = crate::status::cost_usd(&self.usage);
+        let live_elapsed = self
+            .turn_started
+            .map_or(self.usage.elapsed, |t| self.usage.elapsed + t.elapsed());
+        let secs = live_elapsed.as_secs_f64();
+        let tok_in = format_tokens(self.usage.input_tokens);
+        let tok_out = format_tokens(self.usage.output_tokens);
+        let phase = turn_phase(self.spinner.active, self.current_assistant.as_deref());
+        // Localize the phase label: the "Thinking" pre-token state routes through
+        // the `thinking` catalog key (En "Thinking" — byte-identical). "Responding"
+        // has no catalog key and stays in code. `None` (idle) renders nothing.
+        let phase_owned = localize_phase(phase);
+        let tokens = format!("{tok_in}\u{2191} {tok_out}\u{2193}");
+        let pal = layout.palette;
+        let spans = status_spans(
+            pal,
+            &self.workflow,
+            phase_owned.as_deref(),
+            &self.usage.model,
+            &tokens,
+            cost,
+            secs,
+            self.ctx_pct(),
+            self.cache_cold.cold,
+        );
+
+        let mut c = layout.cs;
+        // The animated spinner glyph leads in accent while a turn is in flight.
+        if self.spinner.active {
+            if c < layout.cr {
+                main.put(
+                    layout.r_status,
+                    c,
+                    Cell::new(self.spinner.frame_char(), pal.accent, pal.surface_raised, Attr::PLAIN),
+                );
+            }
+            c = c.saturating_add(2);
+        }
+        for (i, span) in spans.iter().enumerate() {
+            if i > 0 {
+                let sep = Style {
+                    fg: pal.dim,
+                    bg: pal.surface_raised,
+                    bold: false,
+                };
+                c = write_span(main, layout.r_status, c, " \u{00B7} ", layout.cr, sep);
+            }
+            let span_style = Style {
+                fg: span.fg,
+                bg: pal.surface_raised,
+                bold: span.bold,
+            };
+            c = write_span(main, layout.r_status, c, &span.text, layout.cr, span_style);
+            if c >= layout.cr {
+                break;
+            }
+        }
+        // Fill the remainder with the raised surface so the status line spans the
+        // full card width like the input rows above it.
+        while c < layout.cr {
+            main.put(layout.r_status, c, Cell::new(' ', 0, pal.surface_raised, Attr::PLAIN));
+            c = c.saturating_add(1);
+        }
+    }
+
+    /// Render the autocomplete suggestions popup directly above the input card.
+    /// Shows a scrolling window of up to [`suggestions::MAX_VISIBLE`] candidates
+    /// over the full match list, with the selected row highlighted, so every
+    /// skill is reachable by arrowing through the list.
+    fn draw_suggestions_popup(&self, main: &mut Grid, layout: &CardLayout) {
+        let total = self.suggestions.candidates.len();
+        if total == 0 {
+            return;
+        }
+        let win = crate::suggestions::MAX_VISIBLE;
+        let offset = crate::suggestions::scroll_offset(total, self.suggestions.selected);
+        let visible = total.saturating_sub(offset).min(win);
+        let count = clamp_u16(visible);
+        let popup_bottom = layout.r_top.saturating_sub(1);
+        let popup_top = popup_bottom.saturating_sub(count);
+        let selected = self.suggestions.selected;
+        let more_above = offset > 0;
+        let more_below = offset + visible < total;
+        for (row, candidate) in self
+            .suggestions
+            .candidates
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(visible)
+        {
+            let i = row - offset;
+            let r = popup_top + clamp_u16(i);
+            if r >= popup_bottom || r >= layout.rows {
+                break;
+            }
+            for c in layout.cl..layout.cr.min(layout.cols) {
+                main.put(r, c, Cell::new(' ', 0, layout.palette.surface_raised, Attr::PLAIN));
+            }
+            let (ind_fg, txt_fg) = if row == selected {
+                (layout.palette.accent, layout.palette.body)
+            } else {
+                (layout.palette.muted, layout.palette.muted)
+            };
+            // Indicator column: selection arrow takes priority; otherwise
+            // show scroll hints on the top/bottom rows when the list overflows.
+            let ind = if row == selected {
+                " \u{25B8} "
+            } else if i == 0 && more_above {
+                " \u{2191} "
+            } else if i + 1 == visible && more_below {
+                " \u{2193} "
+            } else {
+                "   "
+            };
+            let ps = layout.cl + 1;
+            write_str_styled(
+                main,
+                r,
+                ps,
+                ind,
+                layout.cr,
+                Style {
+                    fg: ind_fg,
+                    bg: layout.palette.surface_raised,
+                    bold: false,
+                },
+            );
+            let ind_w = char_display_width(ind);
+            write_str_styled(
+                main,
+                r,
+                ps + ind_w,
+                candidate,
+                layout.cr,
+                Style {
+                    fg: txt_fg,
+                    bg: layout.palette.surface_raised,
+                    bold: false,
+                },
+            );
+        }
+    }
+}
+
+/// Shared input-card geometry computed once in [`App::draw`] and threaded into
+/// each card-rendering helper, so they take a single `&CardLayout` instead of a
+/// long list of positional `u16` coordinates.
+struct CardLayout {
+    cols: u16,
+    rows: u16,
+    cl: u16,
+    cr: u16,
+    cs: u16,
+    at_bottom: u16,
+    r_top: u16,
+    r_status: u16,
+    r_cap: u16,
+    /// Active theme palette, snapshotted once per frame so every chrome helper
+    /// taking `&CardLayout` re-themes without a separate parameter.
+    palette: theme::Palette,
+}
+
+/// Render the "N more" scrollback indicator in the top-right corner when the
+/// viewport is scrolled up.
+fn draw_scroll_indicator(main: &mut Grid, layout: &CardLayout, offset: usize) {
+    if offset > 0 {
+        let indicator = format!(" \u{2191} {offset} more ");
+        // Position by DISPLAY width, not byte length: the `\u{2191}` (↑)
+        // arrow is 3 UTF-8 bytes but one terminal column, so `.len()`
+        // would push the indicator two columns too far left.
+        let indicator_w: usize = indicator
+            .chars()
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(1))
+            .sum();
+        let start_col = layout
+            .cols
+            .saturating_sub(clamp_u16(indicator_w).saturating_add(1));
+        write_str_styled(
+            main,
+            0,
+            start_col,
+            &indicator,
+            layout.cols,
+            Style {
+                fg: layout.palette.accent,
+                bg: layout.palette.surface_raised,
+                bold: false,
+            },
+        );
+    }
+}
+
+/// Paint the raised-surface background of the input card and its left accent
+/// rule, spanning the card rows.
+fn draw_input_card_bg(main: &mut Grid, layout: &CardLayout) {
+    for r in layout.r_top..=layout.r_status.min(layout.rows.saturating_sub(1)) {
+        for c in layout.cl..layout.cr.min(layout.cols) {
+            main.put(r, c, Cell::new(' ', 0, layout.palette.surface_raised, Attr::PLAIN));
+        }
+        if layout.cl < layout.cols {
+            main.put(
+                r,
+                layout.cl,
+                Cell::new('\u{2503}', layout.palette.accent, layout.palette.surface_raised, Attr::PLAIN),
+            );
+        }
+    }
+}
+
+/// The right-aligned keybind hint segments. While a turn is in flight the
+/// trailing `ctrl+c quit` becomes `ctrl+c interrupt`, matching the reducer
+/// (which remaps Ctrl+C to Interrupt during a turn) — so the hint never claims
+/// it will quit at the exact moment it will actually interrupt.
+const fn keybind_hint_parts(in_flight: bool, pal: theme::Palette) -> [(&'static str, u32); 6] {
+    let last_label = if in_flight { " interrupt" } else { " quit" };
+    [
+        ("shift+enter", pal.body),
+        (" newline  ", pal.muted),
+        ("tab", pal.body),
+        (" skills  ", pal.muted),
+        ("ctrl+c", pal.body),
+        (last_label, pal.muted),
+    ]
+}
+
+/// Render the keybind hint line beneath the input card (and the card's bottom
+/// accent corner), right-aligned within the card width.
+fn draw_keybind_hint(main: &mut Grid, layout: &CardLayout, in_flight: bool) {
+    if layout.r_cap < layout.rows {
+        if layout.cl < layout.cols {
+            main.put(
+                layout.r_cap,
+                layout.cl,
+                Cell::new('\u{2579}', layout.palette.accent, 0, Attr::PLAIN),
+            );
+        }
+        let hint_parts = keybind_hint_parts(in_flight, layout.palette);
+        let total_hw: u16 = hint_parts.iter().map(|(s, _)| char_display_width(s)).sum();
+        let mut hc = layout.cr.saturating_sub(total_hw);
+        for (text, fg) in &hint_parts {
+            let tw = char_display_width(text);
+            write_str_styled(
+                main,
+                layout.r_cap,
+                hc,
+                text,
+                hc + tw,
+                Style {
+                    fg: *fg,
+                    bg: 0,
+                    bold: false,
+                },
+            );
+            hc += tw;
+        }
+    }
+}
+
+/// Clear the (unused) prompt grid to the base surface color. The composer keeps
+/// a second grid for a separate prompt region; the TUI renders everything into
+/// the main grid, so this just blanks it each frame.
+fn clear_prompt_grid(prompt: &mut Grid, pal: theme::Palette) {
+    for r in 0..prompt.rows() {
+        for c in 0..prompt.cols() {
+            prompt.put(r, c, Cell::new(' ', 0, pal.surface, Attr::PLAIN));
         }
     }
 }
@@ -700,8 +1537,10 @@ impl App {
 // instead of a duplicated match on every Goal* variant.
 impl crate::goal_render::GoalRender for App {
     fn push_colored(&mut self, text: String, fg: u32, _bg: u32) {
-        self.scrollback.push(ScrollLine::styled(text, fg, 0, false));
+        // Goal/agent progress lines are pre-formatted status text → verbatim.
+        self.scrollback.push(ScrollLine::verbatim(text, fg, 0));
         self.scroll_offset = 0;
+        self.trim_scrollback();
     }
     fn set_goal_status(&mut self, status: Option<String>) {
         self.goal_status = status;
@@ -709,13 +1548,13 @@ impl crate::goal_render::GoalRender for App {
 }
 
 /// Render plan steps and a vertical divider into the side panel grid.
-pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
+pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine], pal: theme::Palette) {
     let cols = side.cols();
     let rows = side.rows();
 
     for r in 0..rows {
         for c in 0..cols {
-            side.put(r, c, Cell::new(' ', 0, theme::PANEL_BG, Attr::PLAIN));
+            side.put(r, c, Cell::new(' ', 0, pal.panel_bg, Attr::PLAIN));
         }
     }
 
@@ -723,7 +1562,7 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
         side.put(
             r,
             0,
-            Cell::new('\u{2502}', theme::BORDER, theme::PANEL_BG, Attr::PLAIN),
+            Cell::new('\u{2502}', pal.border, pal.panel_bg, Attr::PLAIN),
         );
     }
 
@@ -735,9 +1574,11 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
             1,
             label,
             cols.saturating_sub(1),
-            theme::MUTED,
-            theme::PANEL_BG,
-            false,
+            Style {
+                fg: pal.muted,
+                bg: pal.panel_bg,
+                bold: false,
+            },
         );
         return;
     }
@@ -749,122 +1590,403 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine]) {
         1,
         header,
         cols.saturating_sub(1),
-        theme::PANEL_HEADER,
-        theme::PANEL_BG,
-        true,
+        Style {
+            fg: pal.panel_header,
+            bg: pal.panel_bg,
+            bold: true,
+        },
     );
 
     for c in 1..cols {
         side.put(
             1,
             c,
-            Cell::new('\u{2500}', theme::BORDER, theme::PANEL_BG, Attr::PLAIN),
+            Cell::new('\u{2500}', pal.border, pal.panel_bg, Attr::PLAIN),
         );
     }
     side.put(
         1,
         0,
-        Cell::new('\u{251C}', theme::BORDER, theme::PANEL_BG, Attr::PLAIN),
+        Cell::new('\u{251C}', pal.border, pal.panel_bg, Attr::PLAIN),
     );
 
+    // cline L171: render the plan as a live focus-chain checkbox todo list.
+    // The checkbox marker (`[ ]`/`[~]`/`[x]`) carries the GFM-style state; the
+    // existing status glyph stays as a colored leading dot so progress reads at
+    // a glance.
+    let checklist = render_focus_chain(plan_lines);
     let mut row: u16 = 2;
-    for pl in plan_lines {
+    // `row` is a screen-row render cursor starting at 2 (not a 0-based index),
+    // and the loop early-breaks at `rows`, so enumerate doesn't fit cleanly.
+    #[allow(clippy::explicit_counter_loop)]
+    for (pl, checkbox) in plan_lines.iter().zip(&checklist) {
         if row >= rows {
             break;
         }
         let glyph_fg = match pl.status_glyph {
-            '\u{25CB}' => theme::MUTED,
-            '\u{25D0}' => theme::ACCENT,
-            '\u{25CF}' => theme::GREEN,
-            '\u{2715}' => theme::RED,
-            _ => theme::BODY,
+            '\u{25CB}' => pal.muted,
+            '\u{25D0}' => pal.accent,
+            '\u{25CF}' => pal.green,
+            '\u{2715}' => pal.red,
+            _ => pal.body,
         };
         side.put(
             row,
             2,
-            Cell::new(pl.status_glyph, glyph_fg, theme::PANEL_BG, Attr::PLAIN),
+            Cell::new(pl.status_glyph, glyph_fg, pal.panel_bg, Attr::PLAIN),
         );
         write_str_styled(
             side,
             row,
             4,
-            &pl.content,
+            checkbox,
             cols.saturating_sub(4),
-            theme::BODY,
-            theme::PANEL_BG,
-            false,
+            Style {
+                fg: pal.body,
+                bg: pal.panel_bg,
+                bold: false,
+            },
         );
         row += 1;
     }
 }
 
-fn char_display_width(s: &str) -> u16 {
-    s.chars()
-        .map(|c| UnicodeWidthChar::width(c).unwrap_or(1) as u16)
-        .sum()
+/// Checkbox state for one focus-chain row, derived from a plan step's status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskState {
+    /// Not started.
+    Pending,
+    /// Currently being worked.
+    InProgress,
+    /// Complete (or cancelled — both render as a filled box).
+    Done,
 }
 
-fn wrap_input_lines(text: &str, width: usize) -> Vec<&str> {
-    if text.is_empty() {
-        return vec![""];
+impl TaskState {
+    /// GFM-style three-state checkbox marker for this row.
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::Pending => "[ ]",
+            Self::InProgress => "[~]",
+            Self::Done => "[x]",
+        }
     }
-    let mut lines = Vec::new();
-    for segment in text.split('\n') {
-        if segment.is_empty() || width == 0 {
-            lines.push(segment);
+}
+
+/// Map a plan-panel status glyph (`○`/`◐`/`●`/`✕`) to a checkbox state.
+///
+/// Mirrors `origin_tui::widgets::plan_panel::status_glyph`: pending is open,
+/// in-progress is half, done and cancelled are filled. Unknown glyphs are
+/// treated as pending so a future status never panics the renderer.
+const fn task_state_for_glyph(glyph: char) -> TaskState {
+    match glyph {
+        '\u{25D0}' => TaskState::InProgress,
+        '\u{25CF}' | '\u{2715}' => TaskState::Done,
+        _ => TaskState::Pending,
+    }
+}
+
+/// Render the active plan as a live focus-chain checklist (cline L171).
+///
+/// Each plan step becomes a GFM-style checkbox line — `[ ]` pending, `[~]`
+/// in-progress, `[x]` done — in plan (Logoot) order, with the step body
+/// appended. When no step carries an explicit non-pending status (the plan
+/// hasn't reported progress yet), a reasonable focus is derived: the first
+/// step is treated as in-progress and the rest stay pending, so the panel
+/// always highlights one active item. Returns an empty `Vec` for an empty
+/// plan, so the caller renders nothing when there is no plan.
+#[must_use]
+pub fn render_focus_chain(plan_lines: &[PlanLine]) -> Vec<String> {
+    if plan_lines.is_empty() {
+        return Vec::new();
+    }
+    let mut states: Vec<TaskState> = plan_lines
+        .iter()
+        .map(|pl| task_state_for_glyph(pl.status_glyph))
+        .collect();
+
+    // Derive a focus when the plan reports no explicit progress: with every
+    // step pending, promote the first to in-progress so one item reads as
+    // active. A plan that already marks any step keeps its reported states.
+    if states.iter().all(|s| *s == TaskState::Pending) {
+        if let Some(first) = states.first_mut() {
+            *first = TaskState::InProgress;
+        }
+    }
+
+    states
+        .iter()
+        .zip(plan_lines)
+        .map(|(state, pl)| format!("{} {}", state.marker(), pl.content))
+        .collect()
+}
+
+/// Display width of a single char in terminal cells (`0`-width control chars
+/// count as 1). Bounded to `u16`; no real glyph width approaches the clamp.
+fn char_cell_width(c: char) -> u16 {
+    u16::try_from(UnicodeWidthChar::width(c).unwrap_or(1)).unwrap_or(1)
+}
+
+/// Saturating `usize -> u16` for terminal geometry (rows/cols/indices). The
+/// clamp is unreachable for real terminals but keeps the conversion both
+/// panic-free and free of `cast_possible_truncation`.
+fn clamp_u16(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
+fn char_display_width(s: &str) -> u16 {
+    s.chars().map(char_cell_width).sum()
+}
+
+/// Word-boundary-wrap one logical line (no embedded `\n`) to `width` columns,
+/// returning the wrapped pieces as slices into `s`.
+///
+/// Breaks at the last space that fits rather than mid-word; a single word longer
+/// than `width` is hard-broken (unavoidable). Leading spaces on a continuation
+/// line are dropped. `width == 0` or an empty `s` yields `s` unwrapped.
+fn wrap_segment(s: &str, width: usize) -> Vec<&str> {
+    if width == 0 || s.is_empty() {
+        return vec![s];
+    }
+    // (byte offset, char, display width) per char.
+    let chars: Vec<(usize, char, usize)> = s
+        .char_indices()
+        .map(|(byte, ch)| (byte, ch, UnicodeWidthChar::width(ch).unwrap_or(1)))
+        .collect();
+    let len = chars.len();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut start = 0usize; // char index of the current line's first char
+    let mut col = 0usize; // accumulated display width of the current line
+    let mut last_space: Option<usize> = None; // char index of the last space seen
+    let mut i = 0usize;
+    while i < len {
+        let (byte, ch, cw) = chars[i];
+        // Record the FIRST space of a run as the break point, so breaking there
+        // drops the whole run and the wrapped line has no trailing space.
+        if ch.is_whitespace() && (i == 0 || !chars[i - 1].1.is_whitespace()) {
+            last_space = Some(i);
+        }
+        if col + cw > width && i > start {
+            if let Some(sp) = last_space.filter(|&sp| sp > start) {
+                // Break at the space: drop it; continuation skips further spaces.
+                lines.push(&s[chars[start].0..chars[sp].0]);
+                let mut ns = sp + 1;
+                while ns < len && chars[ns].1.is_whitespace() {
+                    ns += 1;
+                }
+                start = ns;
+                i = ns;
+            } else {
+                // No usable space (a word longer than the column): hard-break.
+                lines.push(&s[chars[start].0..byte]);
+                start = i;
+            }
+            col = 0;
+            last_space = None;
             continue;
         }
-        let chars: Vec<char> = segment.chars().collect();
-        let mut start = 0;
-        let mut col_w = 0usize;
-        for (idx, &ch) in chars.iter().enumerate() {
-            let w = UnicodeWidthChar::width(ch).unwrap_or(1);
-            if col_w + w > width && start < idx {
-                let bs: usize = chars[..start].iter().map(|c| c.len_utf8()).sum();
-                let be: usize = chars[..idx].iter().map(|c| c.len_utf8()).sum();
-                lines.push(&segment[bs..be]);
-                start = idx;
-                col_w = 0;
-            }
-            col_w += w;
-        }
-        let bs: usize = chars[..start].iter().map(|c| c.len_utf8()).sum();
-        lines.push(&segment[bs..]);
+        col += cw;
+        i += 1;
+    }
+    if start < len {
+        lines.push(&s[chars[start].0..]);
+    } else if lines.is_empty() {
+        lines.push("");
     }
     lines
 }
 
-fn md_line_style(line: &str) -> (u32, bool) {
+/// If `line` is an ATX markdown heading (`# `/`## `/`### ` after optional
+/// leading whitespace), return the text with the `#` markers and the one
+/// following space removed. Hierarchy is conveyed by [`md_line_style`]'s color
+/// and weight, so the literal hashes are visual clutter. Non-headings (and
+/// `#hashtag` with no space, or 4+ hashes) return `None` and render verbatim.
+fn strip_heading_markers(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
-    if trimmed.starts_with("### ") {
-        (theme::H3, true)
-    } else if trimmed.starts_with("## ") {
-        (theme::H2, true)
-    } else if trimmed.starts_with("# ") {
-        (theme::H1, true)
-    } else if trimmed.starts_with("---") && trimmed.chars().all(|c| c == '-' || c == ' ') {
-        (theme::RULE, false)
-    } else if trimmed.starts_with("```") {
-        (theme::MUTED, false)
-    } else if trimmed.starts_with("> ") {
-        (theme::ACCENT_DIM, false)
-    } else if trimmed.starts_with("| ") || trimmed.starts_with("|---") || trimmed.starts_with("|:") {
-        (theme::BODY, false)
+    let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+    // `#` is ASCII so byte-indexing at `hashes` is a valid char boundary.
+    if (1..=3).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
+        Some(trimmed[hashes + 1..].to_string())
     } else {
-        (theme::BODY, false)
+        None
     }
 }
 
-fn render_md_line(
-    grid: &mut Grid,
-    row: u16,
-    text: &str,
-    max_cols: u16,
-    base_fg: u32,
-    bg: u32,
-    base_bold: bool,
-) {
-    let attr_plain = if base_bold { Attr::BOLD } else { Attr::PLAIN };
+fn md_line_style(line: &str, pal: theme::Palette) -> (u32, bool) {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("### ") {
+        (pal.h3, true)
+    } else if trimmed.starts_with("## ") {
+        (pal.h2, true)
+    } else if trimmed.starts_with("# ") {
+        (pal.h1, true)
+    } else if trimmed.starts_with("---") && trimmed.chars().all(|c| c == '-' || c == ' ') {
+        (pal.rule, false)
+    } else if trimmed.starts_with("```") {
+        (pal.muted, false)
+    } else if trimmed.starts_with("> ") {
+        (pal.accent_dim, false)
+    } else {
+        (pal.body, false)
+    }
+}
+
+/// One styled segment of the status line.
+struct StatusSpan {
+    text: String,
+    fg: u32,
+    bold: bool,
+}
+
+/// The status phase label while a turn is active: `"Thinking"` before any
+/// assistant text has streamed, `"Responding"` once it has. `None` when idle —
+/// so a long pre-token think no longer looks identical to streaming or a stall.
+fn turn_phase(spinner_active: bool, assistant: Option<&str>) -> Option<&'static str> {
+    if !spinner_active {
+        return None;
+    }
+    if assistant.is_none_or(str::is_empty) {
+        Some("Thinking")
+    } else {
+        Some("Responding")
+    }
+}
+
+/// Localize a [`turn_phase`] label for display.
+///
+/// The pre-token `"Thinking"` state routes through the `thinking` catalog key,
+/// whose English literal is exactly `"Thinking"` — so the default-locale output
+/// is byte-identical, while `--lang`/`$LANG` renders e.g. "Pensando". The
+/// `"Responding"` state has no catalog key and passes through unchanged. `None`
+/// (idle) yields `None`.
+fn localize_phase(phase: Option<&str>) -> Option<String> {
+    match phase {
+        Some("Thinking") => Some(crate::locale::line("thinking").to_string()),
+        Some(other) => Some(other.to_string()),
+        None => None,
+    }
+}
+
+/// Build the ordered status-line segments (excluding the animated spinner glyph,
+/// which the caller prepends). Pure, for testability. Hierarchy: workflow leads
+/// in accent+bold, an optional phase follows in dimmed accent, the model name is
+/// dim, token counts muted, and the live cost/elapsed are body-bright. A cold
+/// nudge, when present, trails in yellow.
+#[allow(clippy::too_many_arguments)] // each is a distinct status segment; bundling would obscure
+fn status_spans(
+    pal: theme::Palette,
+    workflow: &str,
+    phase: Option<&str>,
+    model: &str,
+    tokens: &str,
+    cost: f64,
+    secs: f64,
+    ctx_pct: Option<u8>,
+    cache_cold: bool,
+) -> Vec<StatusSpan> {
+    let mut spans = vec![StatusSpan {
+        text: workflow.to_string(),
+        fg: pal.accent,
+        bold: true,
+    }];
+    if let Some(p) = phase {
+        spans.push(StatusSpan {
+            text: p.to_string(),
+            fg: pal.accent_dim,
+            bold: false,
+        });
+    }
+    spans.push(StatusSpan {
+        text: model.to_string(),
+        fg: pal.dim,
+        bold: false,
+    });
+    spans.push(StatusSpan {
+        text: tokens.to_string(),
+        fg: pal.muted,
+        bold: false,
+    });
+    spans.push(StatusSpan {
+        text: format!("${cost:.3}"),
+        fg: pal.body,
+        bold: false,
+    });
+    spans.push(StatusSpan {
+        text: format!("{secs:.1}s"),
+        fg: pal.body,
+        bold: false,
+    });
+    if let Some(pct) = ctx_pct {
+        // Context-window fill, warming to yellow then red as it approaches the
+        // limit (and an eventual compaction).
+        let fg = if pct >= 90 {
+            pal.red
+        } else if pct >= 75 {
+            pal.yellow
+        } else {
+            pal.muted
+        };
+        spans.push(StatusSpan {
+            text: format!("ctx {pct}%"),
+            fg,
+            bold: false,
+        });
+    }
+    if cache_cold {
+        spans.push(StatusSpan {
+            text: "\u{29D7} cache cold".to_string(),
+            fg: pal.yellow,
+            bold: false,
+        });
+    }
+    spans
+}
+
+/// Write `s` at (`row`, `col`) on the raised-surface background and return the
+/// next free column. Unlike [`write_str_styled`] it does not bg-fill to the row
+/// end, so spans can be chained left-to-right.
+fn write_span(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16, style: Style) -> u16 {
+    let attr = if style.bold { Attr::BOLD } else { Attr::PLAIN };
+    let mut c = col;
+    for ch in s.chars() {
+        let w = char_cell_width(ch);
+        if w == 0 {
+            continue;
+        }
+        if c + w > max_cols {
+            break;
+        }
+        grid.put(row, c, Cell::new(ch, style.fg, style.bg, attr));
+        if w == 2 {
+            grid.put(row, c + 1, Cell::continuation(style.bg));
+        }
+        c += w;
+    }
+    c
+}
+
+/// Render one wrapped visual line into the grid.
+///
+/// Literal lines (pre-formatted tool/diff/command output) are written verbatim
+/// so `**`/backticks survive; prose lines go through the inline-markdown
+/// renderer so `**bold**` and `` `code` `` style correctly.
+fn render_scroll_line(grid: &mut Grid, row: u16, vl: &VisualLine<'_>, cols: u16, pal: theme::Palette) {
+    let style = Style {
+        fg: vl.fg,
+        bg: vl.bg,
+        bold: vl.bold,
+    };
+    if vl.literal {
+        write_str_styled(grid, row, 0, vl.text, cols, style);
+    } else {
+        render_md_line(grid, row, vl.text, cols, style, pal);
+    }
+}
+
+fn render_md_line(grid: &mut Grid, row: u16, text: &str, max_cols: u16, style: Style, pal: theme::Palette) {
+    let base_fg = style.fg;
+    let bg = style.bg;
+    let attr_plain = if style.bold { Attr::BOLD } else { Attr::PLAIN };
     let mut col: u16 = 0;
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
@@ -876,11 +1998,14 @@ fn render_md_line(
             if let Some(end) = close {
                 i += 2;
                 while i < end && col < max_cols {
-                    let w = UnicodeWidthChar::width(chars[i]).unwrap_or(1) as u16;
+                    let w = char_cell_width(chars[i]);
                     if col + w > max_cols {
                         break;
                     }
-                    grid.put(row, col, Cell::new(chars[i], theme::BRIGHT, bg, Attr::BOLD));
+                    grid.put(row, col, Cell::new(chars[i], pal.bright, bg, Attr::BOLD));
+                    if w == 2 {
+                        grid.put(row, col + 1, Cell::continuation(bg));
+                    }
                     col += w;
                     i += 1;
                 }
@@ -892,15 +2017,18 @@ fn render_md_line(
             if let Some(end) = chars[i + 1..].iter().position(|&c| c == '`').map(|p| i + 1 + p) {
                 i += 1;
                 while i < end && col < max_cols {
-                    let w = UnicodeWidthChar::width(chars[i]).unwrap_or(1) as u16;
+                    let w = char_cell_width(chars[i]);
                     if col + w > max_cols {
                         break;
                     }
                     grid.put(
                         row,
                         col,
-                        Cell::new(chars[i], theme::CODE_FG, theme::CODE_BG, Attr::PLAIN),
+                        Cell::new(chars[i], pal.code_fg, pal.code_bg, Attr::PLAIN),
                     );
+                    if w == 2 {
+                        grid.put(row, col + 1, Cell::continuation(pal.code_bg));
+                    }
                     col += w;
                     i += 1;
                 }
@@ -909,11 +2037,14 @@ fn render_md_line(
             }
         }
 
-        let w = UnicodeWidthChar::width(chars[i]).unwrap_or(1) as u16;
+        let w = char_cell_width(chars[i]);
         if col + w > max_cols {
             break;
         }
         grid.put(row, col, Cell::new(chars[i], base_fg, bg, attr_plain));
+        if w == 2 {
+            grid.put(row, col + 1, Cell::continuation(bg));
+        }
         col += w;
         i += 1;
     }
@@ -926,7 +2057,7 @@ fn render_md_line(
     }
 }
 
-fn find_closing(chars: &[char], start: usize, c1: char, c2: char) -> Option<usize> {
+const fn find_closing(chars: &[char], start: usize, c1: char, c2: char) -> Option<usize> {
     let mut j = start;
     while j + 1 < chars.len() {
         if chars[j] == c1 && chars[j + 1] == c2 {
@@ -939,12 +2070,40 @@ fn find_closing(chars: &[char], start: usize, c1: char, c2: char) -> Option<usiz
 
 fn format_tokens(n: u32) -> String {
     if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
+        format!("{:.1}M", f64::from(n) / 1_000_000.0)
     } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
+        format!("{:.1}k", f64::from(n) / 1_000.0)
     } else {
         n.to_string()
     }
+}
+
+/// A rough context-window size (tokens) for `model`, for the `ctx N%` meter.
+/// Heuristic by family — exact-enough to show how full the window is.
+fn context_window_for(model: &str) -> u32 {
+    let m = model.to_ascii_lowercase();
+    if m.contains("gemini") {
+        1_000_000
+    } else if m.contains("claude") || m.contains("opus") || m.contains("sonnet") || m.contains("haiku") {
+        200_000
+    } else {
+        128_000
+    }
+}
+
+/// Summary line for a diff truncated to `shown` of `total` rows, or `None` when
+/// nothing was elided (`total <= shown`).
+///
+/// Lets the tool view render the first `shown` changed rows then one muted line
+/// instead of dumping a 2000-line `Write` and burying the conversation. The
+/// 2-space indent nests it under the tool header.
+#[must_use]
+pub fn diff_elision_summary(total: usize, shown: usize) -> Option<String> {
+    if total <= shown {
+        return None;
+    }
+    let hidden = total - shown;
+    Some(format!("  \u{2026} +{hidden} more diff lines ({total} total)"))
 }
 
 struct VisualLine<'a> {
@@ -952,90 +2111,83 @@ struct VisualLine<'a> {
     fg: u32,
     bg: u32,
     bold: bool,
+    /// Carries [`ScrollLine::literal`] through wrapping so the draw loop knows
+    /// whether to markdown-parse this row or write it verbatim.
+    literal: bool,
 }
 
-fn wrap_into<'a>(text: &'a str, fg: u32, bg: u32, bold: bool, cols: usize, out: &mut Vec<VisualLine<'a>>) {
+fn wrap_into<'a>(
+    text: &'a str,
+    fg: u32,
+    bg: u32,
+    bold: bool,
+    literal: bool,
+    cols: usize,
+    out: &mut Vec<VisualLine<'a>>,
+) {
     for sub in text.split('\n') {
         if cols == 0 {
             continue;
         }
-        let chars: Vec<char> = sub.chars().collect();
-        if chars.is_empty() {
+        if sub.is_empty() {
             out.push(VisualLine {
                 text: "",
                 fg,
                 bg,
                 bold,
+                literal,
             });
             continue;
         }
-        let mut start_idx = 0;
-        let mut col_width = 0usize;
-        let mut end_idx = 0;
-        while end_idx < chars.len() {
-            let w = UnicodeWidthChar::width(chars[end_idx]).unwrap_or(1);
-            if col_width + w > cols {
-                let byte_start: usize = chars[..start_idx].iter().map(|c| c.len_utf8()).sum();
-                let byte_end: usize = chars[..end_idx].iter().map(|c| c.len_utf8()).sum();
-                out.push(VisualLine {
-                    text: &sub[byte_start..byte_end],
-                    fg,
-                    bg,
-                    bold,
-                });
-                start_idx = end_idx;
-                col_width = 0;
-            }
-            col_width += w;
-            end_idx += 1;
-        }
-        if start_idx < chars.len() {
-            let byte_start: usize = chars[..start_idx].iter().map(|c| c.len_utf8()).sum();
+        // Word-boundary wrap so prose breaks between words, not mid-word.
+        for piece in wrap_segment(sub, cols) {
             out.push(VisualLine {
-                text: &sub[byte_start..],
+                text: piece,
                 fg,
                 bg,
                 bold,
+                literal,
             });
         }
     }
 }
 
-fn write_str_styled(
-    grid: &mut Grid,
-    row: u16,
-    col: u16,
-    s: &str,
-    max_cols: u16,
-    fg: u32,
-    bg: u32,
-    bold: bool,
-) {
-    let attr = if bold { Attr::BOLD } else { Attr::PLAIN };
+fn write_str_styled(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16, style: Style) {
+    let attr = if style.bold { Attr::BOLD } else { Attr::PLAIN };
     let mut c = col;
     for ch in s.chars() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(1) as u16;
+        let w = char_cell_width(ch);
+        // Zero-width combining marks (e.g. a base char + U+0301) get no cell of
+        // their own — emitting one would overwrite the base glyph or drift the
+        // rest of the row. Skip them so the base stays intact.
+        if w == 0 {
+            continue;
+        }
         if c + w > max_cols {
             break;
         }
-        grid.put(row, c, Cell::new(ch, fg, bg, attr));
+        grid.put(row, c, Cell::new(ch, style.fg, style.bg, attr));
+        if w == 2 {
+            grid.put(row, c + 1, Cell::continuation(style.bg));
+        }
         c += w;
     }
-    if bg != 0 {
+    if style.bg != 0 {
         while c < max_cols {
-            grid.put(row, c, Cell::new(' ', 0, bg, Attr::PLAIN));
+            grid.put(row, c, Cell::new(' ', 0, style.bg, Attr::PLAIN));
             c += 1;
         }
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)] // panic!/unwrap are idiomatic test assertions
 mod tests {
     use super::*;
 
     #[test]
     fn set_model_updates_usage_snapshot() {
-        let mut app = App::new("anthropic", "claude-opus-4-7", Default::default());
+        let mut app = App::new("anthropic", "claude-opus-4-7", CompletionSources::default());
         assert_eq!(app.usage.model, "claude-opus-4-7");
         app.set_model("claude-sonnet-4-6");
         assert_eq!(app.usage.model, "claude-sonnet-4-6");
@@ -1043,7 +2195,7 @@ mod tests {
 
     #[test]
     fn set_model_does_not_reset_token_counters() {
-        let mut app = App::new("anthropic", "claude-opus-4-7", Default::default());
+        let mut app = App::new("anthropic", "claude-opus-4-7", CompletionSources::default());
         app.record_usage(100, 50, 0, 0, std::time::Duration::from_millis(200));
         app.set_model("claude-sonnet-4-6");
         assert_eq!(app.usage.input_tokens, 100);
@@ -1054,76 +2206,715 @@ mod tests {
     #[test]
     fn wrap_respects_unicode_width() {
         let mut lines = Vec::new();
-        wrap_into("ab\u{276F}cd", 0, 0, false, 4, &mut lines);
+        wrap_into("ab\u{276F}cd", 0, 0, false, false, 4, &mut lines);
         assert_eq!(lines.len(), 2, "wide char should cause wrap at col 4");
     }
 
     #[test]
-    fn wrap_input_lines_single_line() {
-        let lines = wrap_input_lines("hello world", 20);
-        assert_eq!(lines, vec!["hello world"]);
+    fn tool_and_diff_lines_are_literal() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.add_colored_line("**not bold**".to_string(), theme::BODY, 0);
+        assert!(
+            matches!(app.scrollback.last(), Some(l) if l.literal),
+            "tool/diff/command output must be drawn verbatim"
+        );
+        app.add_tool_line("[Bash] echo **x**".to_string());
+        assert!(matches!(app.scrollback.last(), Some(l) if l.literal));
     }
 
     #[test]
-    fn wrap_input_lines_wraps_at_width() {
-        let lines = wrap_input_lines("abcdefghij", 5);
-        assert_eq!(lines, vec!["abcde", "fghij"]);
-    }
-
-    #[test]
-    fn wrap_input_lines_preserves_newlines() {
-        let lines = wrap_input_lines("abc\ndef", 10);
-        assert_eq!(lines, vec!["abc", "def"]);
-    }
-
-    #[test]
-    fn wrap_input_lines_empty() {
-        let lines = wrap_input_lines("", 10);
-        assert_eq!(lines, vec![""]);
-    }
-
-    #[test]
-    fn stall_seconds_none_below_threshold() {
-        assert_eq!(
-            stall_seconds(Duration::from_secs(59), Duration::from_secs(60)),
-            None
+    fn tool_line_marks_running_then_done() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.start_tool_line("[Write] src/x.rs");
+        assert!(
+            app.scrollback.last().is_some_and(|l| l.text.contains('\u{25B8}')),
+            "running line shows the ▸ marker"
+        );
+        app.finish_tool_line(true);
+        assert!(
+            app.scrollback
+                .last()
+                .is_some_and(|l| l.text.contains('\u{2714}') && !l.text.contains('\u{25B8}')),
+            "completed-ok shows ✔ and no ▸"
         );
     }
 
     #[test]
-    fn stall_seconds_some_at_and_above_threshold() {
+    fn tool_line_failure_is_cross_and_red() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.start_tool_line("[Bash] false");
+        app.finish_tool_line(false);
+        assert!(
+            app.scrollback.last().is_some_and(|l| l.text.contains('\u{2718}') && l.fg == theme::RED),
+            "failure shows ✘ in red"
+        );
+    }
+
+    #[test]
+    fn starting_next_tool_resolves_previous_running_marker() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.start_tool_line("[Bash] first");
+        app.start_tool_line("[Bash] second");
+        let ticks = app.scrollback.iter().filter(|l| l.text.contains('\u{2714}')).count();
+        let arrows = app.scrollback.iter().filter(|l| l.text.contains('\u{25B8}')).count();
+        assert_eq!(ticks, 1, "previous tool resolved to ✔");
+        assert_eq!(arrows, 1, "only the current tool still shows ▸");
+    }
+
+    #[test]
+    fn diff_elision_summary_only_when_truncated() {
+        assert_eq!(diff_elision_summary(10, 40), None, "small diff: no summary");
+        assert_eq!(diff_elision_summary(40, 40), None, "exactly at cap: no summary");
+        let s = diff_elision_summary(2000, 40).expect("large diff summarized");
+        assert!(s.contains("1960"), "hidden count: {s}");
+        assert!(s.contains("2000 total"), "total count: {s}");
+    }
+
+    #[test]
+    fn scrollback_is_bounded_and_keeps_newest() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        let total = MAX_SCROLLBACK + SCROLLBACK_SLACK + 200;
+        for i in 0..total {
+            app.add_colored_line(format!("line {i}"), 0, 0);
+        }
+        assert!(
+            app.scrollback.len() <= MAX_SCROLLBACK + SCROLLBACK_SLACK,
+            "scrollback must be capped, got {}",
+            app.scrollback.len()
+        );
+        assert!(
+            app.scrollback.last().is_some_and(|l| l.text == format!("line {}", total - 1)),
+            "the newest line must be retained"
+        );
+    }
+
+    #[test]
+    fn trim_forgets_running_tool_marker_when_its_line_is_dropped() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.start_tool_line("[Bash] big"); // row 0
+        for i in 0..(MAX_SCROLLBACK + SCROLLBACK_SLACK + 200) {
+            app.add_colored_line(format!("out {i}"), 0, 0);
+        }
+        // Row 0 was trimmed; finishing must not panic or mis-index a stale row.
+        app.finish_tool_line(true);
+    }
+
+    #[test]
+    fn finish_tool_line_without_running_is_noop() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.finish_tool_line(true);
+        assert!(app.scrollback.is_empty(), "no tool line, nothing happens");
+    }
+
+    #[test]
+    fn assistant_prose_lines_are_not_literal() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.start_assistant_turn();
+        app.append_to_current_assistant("**bold** prose");
+        app.finalize_assistant_turn(0);
+        assert!(
+            app.scrollback
+                .iter()
+                .any(|l| !l.literal && l.text.contains("bold")),
+            "assistant prose must stay markdown-parsed (literal=false)"
+        );
+    }
+
+    #[test]
+    fn verbatim_line_keeps_markdown_glyphs_but_prose_parses_them() {
+        let mut g = Grid::new(12, 1);
+        let lit = VisualLine {
+            text: "**x**",
+            fg: theme::BODY,
+            bg: 0,
+            bold: false,
+            literal: true,
+        };
+        render_scroll_line(&mut g, 0, &lit, 12, theme::Palette::default());
+        assert_eq!(g.get(0, 0).glyph, u32::from('*'), "literal line keeps leading *");
+
+        let mut g2 = Grid::new(12, 1);
+        let prose = VisualLine {
+            text: "**x**",
+            fg: theme::BODY,
+            bg: 0,
+            bold: false,
+            literal: false,
+        };
+        render_scroll_line(&mut g2, 0, &prose, 12, theme::Palette::default());
         assert_eq!(
-            stall_seconds(Duration::from_secs(60), Duration::from_secs(60)),
-            Some(60)
+            g2.get(0, 0).glyph,
+            u32::from('x'),
+            "prose line parses **bold**, dropping the markers"
+        );
+    }
+
+    #[test]
+    fn strip_heading_markers_strips_leading_hashes() {
+        assert_eq!(strip_heading_markers("# Title").as_deref(), Some("Title"));
+        assert_eq!(strip_heading_markers("## Section").as_deref(), Some("Section"));
+        assert_eq!(strip_heading_markers("### Sub").as_deref(), Some("Sub"));
+        assert_eq!(strip_heading_markers("plain text"), None);
+        assert_eq!(strip_heading_markers("#hashtag"), None);
+        assert_eq!(strip_heading_markers("#### four"), None);
+    }
+
+    #[test]
+    fn finalize_strips_heading_hashes_from_scrollback() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.start_assistant_turn();
+        app.append_to_current_assistant("## Heading\nbody");
+        app.finalize_assistant_turn(0);
+        assert!(
+            app.scrollback.iter().any(|l| l.text == "  Heading"),
+            "heading hashes stripped, got {:?}",
+            app.scrollback.iter().map(|l| l.text.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            !app.scrollback.iter().any(|l| l.text.contains("##")),
+            "no literal ## remains"
+        );
+    }
+
+    #[test]
+    fn turn_phase_distinguishes_thinking_and_responding() {
+        assert_eq!(turn_phase(false, None), None);
+        assert_eq!(turn_phase(false, Some("hi")), None);
+        assert_eq!(turn_phase(true, None), Some("Thinking"));
+        assert_eq!(turn_phase(true, Some("")), Some("Thinking"));
+        assert_eq!(turn_phase(true, Some("partial")), Some("Responding"));
+    }
+
+    #[test]
+    fn localize_phase_routes_thinking_through_catalog_byte_identical() {
+        // The "Thinking" label routes through the `thinking` catalog key; in
+        // English it is byte-identical ("Thinking", no ellipsis), and it must
+        // equal what the catalog resolves so a `--lang` override localizes it.
+        let thinking = localize_phase(Some("Thinking")).expect("thinking yields a label");
+        assert_eq!(thinking, crate::locale::line("thinking"));
+        assert_eq!(origin_i18n::t(origin_i18n::Lang::En, "thinking"), "Thinking");
+        // "Responding" has no catalog key and passes through unchanged.
+        assert_eq!(localize_phase(Some("Responding")).as_deref(), Some("Responding"));
+        // Idle yields nothing.
+        assert_eq!(localize_phase(None), None);
+    }
+
+    #[test]
+    fn status_spans_have_legibility_hierarchy() {
+        let spans = status_spans(theme::Palette::default(), "Code", Some("Thinking"), "claude", "1.2k\u{2191} 300\u{2193}", 0.84, 3.4, None, false);
+        assert_eq!(spans[0].text, "Code");
+        assert_eq!(spans[0].fg, theme::ACCENT);
+        assert!(spans[0].bold, "workflow leads bold");
+        assert!(spans.iter().any(|s| s.text == "Thinking" && s.fg == theme::ACCENT_DIM));
+        assert!(spans.iter().any(|s| s.text == "claude" && s.fg == theme::DIM), "model is dim");
+        assert!(spans.iter().any(|s| s.text == "$0.840" && s.fg == theme::BODY), "cost is body-bright");
+        assert!(spans.iter().any(|s| s.text == "3.4s" && s.fg == theme::BODY), "elapsed is body-bright");
+        assert!(spans.iter().any(|s| s.text.contains('\u{2191}') && s.fg == theme::MUTED), "tokens muted");
+        assert!(!spans.iter().any(|s| s.text.contains("cache cold")));
+    }
+
+    #[test]
+    fn ctx_meter_tracks_turn_input_and_warns_when_full() {
+        let mut app = App::new("anthropic", "claude-sonnet-4-6", CompletionSources::default());
+        assert_eq!(app.ctx_pct(), None, "no turn yet");
+        app.start_turn_timer();
+        app.record_usage_tokens(150_000, 10, 0, 0); // ~150k of a ~200k window
+        app.stop_turn_timer();
+        let pct = app.ctx_pct().expect("a turn ran");
+        assert!((70..=80).contains(&pct), "≈75% of 200k, got {pct}");
+        let spans = status_spans(theme::Palette::default(), "Code", None, "m", "0", 0.0, 0.0, Some(pct), false);
+        assert!(
+            spans.iter().any(|s| s.text == format!("ctx {pct}%") && s.fg == theme::YELLOW),
+            "ctx span warns yellow at >=75%"
+        );
+    }
+
+    #[test]
+    fn status_spans_append_cold_nudge_in_yellow() {
+        let spans = status_spans(theme::Palette::default(), "Code", None, "m", "0\u{2191} 0\u{2193}", 0.0, 0.0, None, true);
+        assert!(
+            spans.last().is_some_and(|s| s.text.contains("cache cold") && s.fg == theme::YELLOW),
+            "cold nudge trails in yellow"
+        );
+    }
+
+    #[test]
+    fn keybind_hint_shows_interrupt_while_in_flight() {
+        let idle = keybind_hint_parts(false, theme::Palette::default());
+        assert!(idle.iter().any(|(t, _)| *t == " quit"));
+        assert!(!idle.iter().any(|(t, _)| t.contains("interrupt")));
+        let busy = keybind_hint_parts(true, theme::Palette::default());
+        assert!(busy.iter().any(|(t, _)| *t == " interrupt"));
+        assert!(!busy.iter().any(|(t, _)| *t == " quit"));
+    }
+
+    #[test]
+    fn wide_glyph_writes_continuation_cell_without_drift() {
+        // '世' (U+4E16) is double-width: the cell after it must be a continuation
+        // marker, and the following 'x' must land at column +2 (no drift).
+        let mut g = Grid::new(8, 1);
+        write_str_styled(
+            &mut g,
+            0,
+            0,
+            "\u{4e16}x",
+            8,
+            Style {
+                fg: theme::BODY,
+                bg: 0,
+                bold: false,
+            },
+        );
+        assert_eq!(g.get(0, 0).glyph, u32::from('\u{4e16}'), "wide glyph at col 0");
+        assert!(g.get(0, 1).is_continuation(), "col 1 is a continuation cell");
+        assert_eq!(g.get(0, 2).glyph, u32::from('x'), "next char at col 2, not drifted");
+    }
+
+    #[test]
+    fn zero_width_combining_mark_keeps_base_glyph() {
+        // "e" + U+0301 (combining acute): the mark must not overwrite the base
+        // 'e' nor shift the following 'x'.
+        let mut g = Grid::new(8, 1);
+        write_str_styled(
+            &mut g,
+            0,
+            0,
+            "e\u{0301}x",
+            8,
+            Style {
+                fg: theme::BODY,
+                bg: 0,
+                bold: false,
+            },
+        );
+        assert_eq!(g.get(0, 0).glyph, u32::from('e'), "base glyph preserved");
+        assert_eq!(g.get(0, 1).glyph, u32::from('x'), "next char not drifted");
+    }
+
+    #[test]
+    fn wrap_segment_breaks_at_word_boundary() {
+        assert_eq!(wrap_segment("hello world", 20), vec!["hello world"], "fits on one line");
+        assert_eq!(wrap_segment("hello world", 7), vec!["hello", "world"], "break between words");
+        assert_eq!(wrap_segment("a b c d e", 5), vec!["a b c", "d e"], "pack greedily");
+    }
+
+    #[test]
+    fn wrap_segment_hard_breaks_overlong_word() {
+        assert_eq!(wrap_segment("abcdefghij", 4), vec!["abcd", "efgh", "ij"], "no spaces → hard break");
+    }
+
+    #[test]
+    fn wrap_segment_drops_space_run_at_break() {
+        assert_eq!(
+            wrap_segment("foo    bar", 4),
+            vec!["foo", "bar"],
+            "the whole space run is dropped, no trailing space"
+        );
+    }
+
+    #[test]
+    fn stall_tier_classifies_quiet_into_soft_and_hard() {
+        let soft = Duration::from_secs(11);
+        let hard = Duration::from_secs(28);
+        assert_eq!(stall_tier(Duration::from_secs(5), soft, hard), None, "below soft: nothing");
+        assert_eq!(
+            stall_tier(Duration::from_secs(11), soft, hard),
+            Some(StallTier::Soft(11)),
+            "at soft threshold"
         );
         assert_eq!(
-            stall_seconds(Duration::from_secs(125), Duration::from_secs(60)),
-            Some(125)
+            stall_tier(Duration::from_secs(27), soft, hard),
+            Some(StallTier::Soft(27)),
+            "between thresholds stays soft"
         );
+        assert_eq!(
+            stall_tier(Duration::from_secs(28), soft, hard),
+            Some(StallTier::Hard(28)),
+            "at hard threshold escalates"
+        );
+        assert_eq!(stall_tier(Duration::from_secs(90), soft, hard), Some(StallTier::Hard(90)));
     }
 
     #[test]
     fn activity_signature_changes_on_new_output() {
-        let mut app = App::new("anthropic", "m", Default::default());
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
         let s0 = app.activity_signature();
         app.add_colored_line("hello".to_string(), 0, 0);
-        assert_ne!(s0, app.activity_signature(), "new output must change the fingerprint");
+        assert_ne!(
+            s0,
+            app.activity_signature(),
+            "new output must change the fingerprint"
+        );
     }
 
     #[test]
     fn activity_signature_changes_on_token_usage() {
-        let mut app = App::new("anthropic", "m", Default::default());
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
         let s0 = app.activity_signature();
         app.record_usage_tokens(10, 5, 0, 0);
-        assert_ne!(s0, app.activity_signature(), "token deltas must change the fingerprint");
+        assert_ne!(
+            s0,
+            app.activity_signature(),
+            "token deltas must change the fingerprint"
+        );
     }
 
     #[test]
     fn stop_turn_timer_clears_stall_notice() {
-        let mut app = App::new("anthropic", "m", Default::default());
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
         app.start_turn_timer();
-        app.stall_secs = Some(90);
+        app.stall = Some(StallTier::Hard(90));
         app.stop_turn_timer();
-        assert_eq!(app.stall_secs, None, "ending a turn must clear the stall notice");
+        assert_eq!(app.stall, None, "ending a turn must clear the stall notice");
+    }
+
+    #[test]
+    fn reset_to_login_wipes_conversation_and_restores_banner() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        // Simulate an in-flight session: scrollback, a half-rendered turn,
+        // a goal indicator, a stall notice, and a scrolled-up viewport.
+        app.add_line("you> ", "hello");
+        app.add_line("ok> ", "did a thing");
+        app.current_assistant = Some("partial reply".to_string());
+        app.goal_status = Some("goal active".to_string());
+        app.stall = Some(StallTier::Hard(42));
+        app.scroll_offset = 7;
+
+        app.reset_to_login(80, 24);
+
+        // The banner is re-pushed, so scrollback is non-empty but contains
+        // only freshly-painted launch rows — none of the conversation lines.
+        assert!(
+            !app.scrollback.is_empty(),
+            "reset must re-paint the startup banner"
+        );
+        assert!(
+            !app
+                .scrollback
+                .iter()
+                .any(|l| l.text.contains("hello") || l.text.contains("did a thing")),
+            "conversation rows must be gone after reset"
+        );
+        assert_eq!(app.current_assistant, None, "half-rendered turn cleared");
+        assert_eq!(app.goal_status, None, "goal indicator cleared");
+        assert_eq!(app.stall, None, "stall notice cleared");
+        assert_eq!(app.scroll_offset, 0, "viewport snapped back to bottom");
+
+        // A fresh launch produces the same view as the reset one.
+        let mut fresh = App::new("anthropic", "m", CompletionSources::default());
+        fresh.push_banner(80, 24);
+        let reset_text: Vec<&String> = app.scrollback.iter().map(|l| &l.text).collect();
+        let fresh_text: Vec<&String> = fresh.scrollback.iter().map(|l| &l.text).collect();
+        assert_eq!(
+            reset_text, fresh_text,
+            "reset_to_login must match a just-launched banner view"
+        );
+    }
+
+    // Drive one turn through the cache-cold state machine with explicit
+    // wall-clock times so the time-gap arm is deterministic. `cache_read` is the
+    // tokens the daemon reported served from cache during the turn.
+    fn run_turn(app: &mut App, start_ms: u64, end_ms: u64, cache_read: u32) {
+        app.cache_cold.turn_start_ms = Some(start_ms);
+        app.cache_cold.cache_read_at_start = app.usage.cache_read_input_tokens;
+        app.record_usage_tokens(0, 0, cache_read, 0);
+        app.evaluate_cache_cold_at(end_ms);
+    }
+
+    #[test]
+    fn cache_cold_first_turn_is_warm() {
+        let mut app = App::new("anthropic", "claude-sonnet-4-6", CompletionSources::default());
+        assert!(!app.cache_cold(), "no turn yet => warm");
+        run_turn(&mut app, 0, 1_000, 0);
+        assert!(!app.cache_cold(), "first turn has no prior cache to expire");
+    }
+
+    #[test]
+    fn cache_cold_gap_beyond_ttl_is_cold() {
+        let mut app = App::new("anthropic", "claude-sonnet-4-6", CompletionSources::default());
+        // Warm turn establishes a prior cache.
+        run_turn(&mut app, 0, 1_000, 5_000);
+        assert!(!app.cache_cold());
+        // Next turn starts well after the TTL => cold.
+        let start = 1_000 + origin_cost::PROMPT_CACHE_TTL_MS + 1;
+        run_turn(&mut app, start, start + 500, 5_000);
+        assert!(app.cache_cold(), "idle gap beyond TTL must flag cold");
+    }
+
+    #[test]
+    fn cache_cold_gap_within_ttl_with_reads_is_warm() {
+        let mut app = App::new("anthropic", "claude-sonnet-4-6", CompletionSources::default());
+        run_turn(&mut app, 0, 1_000, 5_000);
+        // Next turn starts within the TTL and reads from cache => warm.
+        let start = 1_000 + origin_cost::PROMPT_CACHE_TTL_MS - 1;
+        run_turn(&mut app, start, start + 500, 5_000);
+        assert!(!app.cache_cold(), "quick follow-up with cache reads stays warm");
+    }
+
+    // A `PlanLine` fixture with the given status glyph and body. `id`/`holder`
+    // do not affect focus-chain rendering, so they are filler.
+    fn plan_line(glyph: char, body: &str) -> PlanLine {
+        PlanLine {
+            id: origin_plan::StepId::from_u128(0),
+            indent: 0,
+            status_glyph: glyph,
+            content: body.to_string(),
+            holder: None,
+        }
+    }
+
+    #[test]
+    fn focus_chain_empty_plan_is_empty() {
+        assert!(render_focus_chain(&[]).is_empty());
+    }
+
+    #[test]
+    fn focus_chain_maps_explicit_statuses() {
+        // Pending ○, in-progress ◐, done ●, cancelled ✕.
+        let lines = [
+            plan_line('\u{25CF}', "first"),
+            plan_line('\u{25D0}', "second"),
+            plan_line('\u{25CB}', "third"),
+            plan_line('\u{2715}', "fourth"),
+        ];
+        let chain = render_focus_chain(&lines);
+        assert_eq!(
+            chain,
+            vec![
+                "[x] first".to_string(),
+                "[~] second".to_string(),
+                "[ ] third".to_string(),
+                "[x] fourth".to_string(),
+            ],
+            "explicit statuses map to checkbox markers in plan order"
+        );
+    }
+
+    #[test]
+    fn focus_chain_derives_focus_when_all_pending() {
+        // No reported progress => promote the first step to in-progress so one
+        // item reads as the active focus; the rest stay pending.
+        let lines = [
+            plan_line('\u{25CB}', "alpha"),
+            plan_line('\u{25CB}', "beta"),
+            plan_line('\u{25CB}', "gamma"),
+        ];
+        let chain = render_focus_chain(&lines);
+        assert_eq!(
+            chain,
+            vec![
+                "[~] alpha".to_string(),
+                "[ ] beta".to_string(),
+                "[ ] gamma".to_string(),
+            ],
+            "all-pending plan derives the first step as in-progress"
+        );
+    }
+
+    #[test]
+    fn focus_chain_preserves_order_and_does_not_derive_when_progress_exists() {
+        // A done step means progress is reported, so no derivation kicks in and
+        // the lone pending step stays pending.
+        let lines = [
+            plan_line('\u{25CF}', "done one"),
+            plan_line('\u{25CB}', "pending two"),
+        ];
+        let chain = render_focus_chain(&lines);
+        assert_eq!(
+            chain,
+            vec!["[x] done one".to_string(), "[ ] pending two".to_string()],
+            "reported progress suppresses the all-pending derivation"
+        );
+    }
+
+    #[test]
+    fn should_notify_off_by_default() {
+        // Default gate (disabled) never fires, regardless of outcome.
+        assert!(!should_notify(false, true));
+        assert!(!should_notify(false, false));
+    }
+
+    #[test]
+    fn should_notify_fires_only_on_enabled_success() {
+        assert!(should_notify(true, true));
+        // Enabled but the turn failed => no chime (error line already shown).
+        assert!(!should_notify(true, false));
+    }
+
+    #[test]
+    fn notify_turn_complete_no_spawn_when_disabled() {
+        // Disabled => returns false (no process spawn attempted).
+        assert!(!notify_turn_complete(false, true));
+    }
+
+    #[test]
+    fn default_app_is_byte_identical_opt_ins_off() {
+        // The opt-in TUI/config layers must all default OFF so a fresh App is
+        // unchanged from before this workstream.
+        let app = App::new("anthropic", "m", CompletionSources::default());
+        assert_eq!(app.theme, Theme::Default);
+        assert!(!app.vim_active);
+        assert_eq!(app.vim_mode, VimMode::Insert);
+        assert!(!app.notify_desktop);
+        assert!(!app.permission_ask, "permission prompting defaults off");
+        assert!(app.pending_permission.is_none());
+        assert_eq!(app.palette(), theme::palette(Theme::Default));
+    }
+
+    #[test]
+    fn set_permission_ask_toggles_and_sets() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        assert!(!app.permission_ask, "default off");
+        assert!(app.set_permission_ask(""), "no arg flips on");
+        assert!(app.permission_ask);
+        assert!(!app.set_permission_ask(""), "no arg flips back off");
+        assert!(app.set_permission_ask("on"), "explicit on");
+        assert!(!app.set_permission_ask("off"), "explicit off");
+    }
+
+    #[test]
+    fn set_mouse_capture_defaults_on_and_toggles() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        assert!(app.mouse_capture, "mouse capture on by default (byte-identical)");
+        assert!(!app.set_mouse_capture(""), "no arg flips off");
+        assert!(app.set_mouse_capture(""), "no arg flips back on");
+        assert!(!app.set_mouse_capture("off"), "explicit off");
+        assert!(app.set_mouse_capture("on"), "explicit on");
+    }
+
+    #[test]
+    fn chrome_is_byte_identical_for_default_then_re_themes() {
+        use origin_tui::composer::Composer;
+        use origin_tui::stream_widget::{Rect, StreamWidget};
+
+        // Draw `app` and return the first chrome cell painted in the active
+        // `surface_raised` (the input-card background), with its coordinate.
+        fn card_bg(app: &App) -> (u16, u16) {
+            let mut composer = Composer::new(60, 12);
+            let mut widget = StreamWidget::new(Rect { row: 0, col: 0, cols: 60, rows: 6 });
+            app.draw(&mut composer, &mut widget);
+            let want = app.palette().surface_raised;
+            let grid = composer.main_grid();
+            for r in 0..grid.rows() {
+                for c in 0..grid.cols() {
+                    if grid.get(r, c).bg == want {
+                        return (r, c);
+                    }
+                }
+            }
+            panic!("no surface_raised chrome cell found");
+        }
+
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        let (row, col) = card_bg(&app);
+        // Default: that cell equals the legacy constant — chrome is byte-identical.
+        {
+            let mut composer = Composer::new(60, 12);
+            let mut widget = StreamWidget::new(Rect { row: 0, col: 0, cols: 60, rows: 6 });
+            app.draw(&mut composer, &mut widget);
+            assert_eq!(
+                composer.main_grid().get(row, col).bg,
+                theme::SURFACE_RAISED,
+                "Default chrome must be byte-identical to the legacy constant"
+            );
+        }
+        // Switch to a distinctly different theme; the SAME cell must re-theme.
+        assert!(app.set_theme_by_name("high-contrast"));
+        let hc = theme::palette(Theme::HighContrast).surface_raised;
+        assert_ne!(hc, theme::SURFACE_RAISED, "HighContrast must differ from Default");
+        let mut composer = Composer::new(60, 12);
+        let mut widget = StreamWidget::new(Rect { row: 0, col: 0, cols: 60, rows: 6 });
+        app.draw(&mut composer, &mut widget);
+        assert_eq!(
+            composer.main_grid().get(row, col).bg,
+            hc,
+            "switching theme must re-theme the chrome"
+        );
+    }
+
+    #[test]
+    fn set_theme_by_name_switches_and_rejects_unknown() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        assert!(app.set_theme_by_name("dark"));
+        assert_eq!(app.theme, Theme::Dark);
+        assert_eq!(app.palette(), theme::palette(Theme::Dark));
+        // Unknown name leaves the theme untouched.
+        assert!(!app.set_theme_by_name("chartreuse"));
+        assert_eq!(app.theme, Theme::Dark);
+    }
+
+    #[test]
+    fn toggle_vim_flips_active_and_mode() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        assert!(app.toggle_vim());
+        assert!(app.vim_active);
+        assert_eq!(app.vim_mode, VimMode::Normal, "enabling vim starts in Normal");
+        assert!(!app.toggle_vim());
+        assert!(!app.vim_active);
+        assert_eq!(app.vim_mode, VimMode::Insert, "disabling resets to Insert");
+    }
+
+    #[test]
+    fn apply_vim_action_moves_cursor_and_switches_mode() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.input.set_buffer("hello".to_string()); // editor caret at end (char 5)
+        // Drive the editor caret to char 2 so the vim layer (which seeds from the
+        // editor caret) starts there.
+        app.input.move_left();
+        app.input.move_left();
+        app.input.move_left(); // 5 -> 2
+        app.vim_mode = VimMode::Normal;
+        // h moves left: both the App scratch cursor and the editor caret track it.
+        assert!(app.apply_vim_action(crate::input::VimAction::MoveLeft));
+        assert_eq!(app.cursor, 1);
+        assert_eq!(app.input.cursor_chars(), 1, "editor caret follows the motion");
+        // $ jumps to end (char count).
+        assert!(app.apply_vim_action(crate::input::VimAction::LineEnd));
+        assert_eq!(app.cursor, 5);
+        assert_eq!(app.input.cursor_chars(), 5);
+        // i switches to Insert and is consumed.
+        assert!(app.apply_vim_action(crate::input::VimAction::SwitchMode(VimMode::Insert)));
+        assert_eq!(app.vim_mode, VimMode::Insert);
+        // Pass is not consumed.
+        assert!(!app.apply_vim_action(crate::input::VimAction::Pass));
+    }
+
+    #[test]
+    fn set_vim_active_seeds_mode() {
+        // The startup seed point: active ⇒ Normal mode (vim convention),
+        // inactive ⇒ Insert (byte-identical direct insert).
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.set_vim_active(true);
+        assert!(app.vim_active());
+        assert_eq!(app.vim_mode(), VimMode::Normal);
+        app.set_vim_active(false);
+        assert!(!app.vim_active());
+        assert_eq!(app.vim_mode(), VimMode::Insert);
+    }
+
+    #[test]
+    fn set_keymap_installs_override() {
+        // The session keymap defaults to builtin and can be replaced once at
+        // startup with a user override.
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        assert!(!app.keymap().is_overridden(), "defaults to builtin");
+        let km = crate::keybindings::KeyMap::from_toml_str("history-prev = \"ctrl+p\"")
+            .expect("parse");
+        app.set_keymap(km);
+        assert!(app.keymap().is_overridden());
+    }
+
+    #[test]
+    fn cache_cold_zero_reads_after_warm_is_cold_then_clears() {
+        let mut app = App::new("anthropic", "claude-sonnet-4-6", CompletionSources::default());
+        // Warm turn first.
+        run_turn(&mut app, 0, 1_000, 5_000);
+        assert!(!app.cache_cold());
+        // Quick follow-up but the daemon reported zero cache reads => cold.
+        run_turn(&mut app, 1_100, 1_600, 0);
+        assert!(app.cache_cold(), "zero cache reads after a warm turn is cold");
+        // The next warm turn clears the nudge.
+        run_turn(&mut app, 1_700, 2_200, 5_000);
+        assert!(!app.cache_cold(), "a warm turn clears the cold marker");
     }
 }

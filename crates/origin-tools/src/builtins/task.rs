@@ -14,7 +14,7 @@
 // sibling builtin modules' types when re-exported.
 #![allow(clippy::module_name_repetitions)]
 
-use origin_swarm::{Budget, Coordinator, ReportStatus, SwarmError, WorkerSpec};
+use origin_swarm::{Budget, Coordinator, ReportStatus, SwarmError, WorkerHandle, WorkerSpec};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -70,6 +70,15 @@ pub struct TaskInput {
     /// Optional budget override; defaults applied per field if omitted.
     #[serde(default)]
     pub budget: TaskBudget,
+    /// Optional model override for this sub-agent (per-agent routing). `None`
+    /// ⇒ the worker uses the daemon default model.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Inline MCP servers for this sub-agent (gap 9b). The model copies these
+    /// from the `<origin-subagents>` block when delegating to a declarative
+    /// sub-agent that declares `mcp:` servers. Empty ⇒ no MCP (default).
+    #[serde(default)]
+    pub mcp_servers: Vec<origin_swarm::McpServerSpec>,
 }
 
 /// Actionable inlined view of the worker's [`CompletionReport`].
@@ -99,19 +108,19 @@ pub enum TaskError {
     Json(String),
 }
 
-/// Spawn a worker for `input.goal`, await completion, return the actionable view.
+/// Spawn a worker for `input.goal` WITHOUT awaiting it, returning its handle.
 ///
-/// Forwards `allowed_tools` and `budget` verbatim into the [`WorkerSpec`]. The
-/// `parent_actor` is set to `ActorId::new(0)` — the agent loop (Phase 11) will
-/// thread the real parent through once daemons have per-actor identities.
+/// The worker begins running immediately on the coordinator's independent pool.
+/// This is the spawn half of [`task_tool`]: the agent loop spawns every `Task`
+/// in a turn up front, then [`task_await`]s them — so multiple sub-agents run
+/// concurrently instead of one-at-a-time. Pair every `task_spawn` with exactly
+/// one `task_await`.
 ///
 /// # Errors
-/// Returns [`TaskError::Swarm`] if spawn or `await_completion` fails.
-#[allow(clippy::module_name_repetitions)] // `task_tool` in module `task` — matches recall_tool / ask_tool precedent
-pub async fn task_tool(coord: &Coordinator, input: TaskInput) -> Result<TaskOutput, TaskError> {
-    let goal = input.goal.clone();
+/// Returns [`TaskError::Swarm`] if the spawn fails.
+pub async fn task_spawn(coord: &Coordinator, input: TaskInput) -> Result<WorkerHandle, TaskError> {
     let spec = WorkerSpec {
-        goal: goal.clone(),
+        goal: input.goal,
         allowed_tools: input.allowed_tools,
         budget: Budget {
             max_wall_ms: input.budget.max_wall_ms,
@@ -121,10 +130,20 @@ pub async fn task_tool(coord: &Coordinator, input: TaskInput) -> Result<TaskOutp
         },
         workspace: None,
         parent_actor: origin_plan::ActorId::new(0),
+        model: input.model,
+        mcp_servers: input.mcp_servers,
     };
-    let handle = coord.spawn(spec).await?;
-    let report = coord.await_completion(&handle).await?;
+    Ok(coord.spawn(spec).await?)
+}
 
+/// Await a worker previously spawned by [`task_spawn`] and build its actionable
+/// view. `goal` is only used to label the summary.
+///
+/// # Errors
+/// Returns [`TaskError::Swarm`] if `await_completion` fails (e.g. the worker
+/// reported `Failed`).
+pub async fn task_await(coord: &Coordinator, handle: &WorkerHandle, goal: &str) -> Result<TaskOutput, TaskError> {
+    let report = coord.await_completion(handle).await?;
     let status = match report.status {
         ReportStatus::Completed => "completed",
         ReportStatus::GoalUnreachable => "goal_unreachable",
@@ -139,13 +158,27 @@ pub async fn task_tool(coord: &Coordinator, input: TaskInput) -> Result<TaskOutp
     })
 }
 
+/// Spawn a worker for `input.goal`, await completion, return the actionable view.
+///
+/// Convenience wrapper over [`task_spawn`] + [`task_await`] for the single-task
+/// and test paths; the agent loop splits the two halves to parallelise.
+///
+/// # Errors
+/// Returns [`TaskError::Swarm`] if spawn or `await_completion` fails.
+#[allow(clippy::module_name_repetitions)] // `task_tool` in module `task` — matches recall_tool / ask_tool precedent
+pub async fn task_tool(coord: &Coordinator, input: TaskInput) -> Result<TaskOutput, TaskError> {
+    let goal = input.goal.clone();
+    let handle = task_spawn(coord, input).await?;
+    task_await(coord, &handle, &goal).await
+}
+
 crate::origin_tool! {
     name: "Task",
     description: "Dispatch a sub-agent with a goal, allowed tools, and budget. Returns a structured CompletionReport summary.",
     tier: crate::Tier::RequiresPermission,
     urgency: crate::Urgency::Medium,
     side_effects: crate::SideEffects::Mutating,
-    input_schema: r#"{"type":"object","required":["goal","allowed_tools"],"properties":{"goal":{"type":"string"},"allowed_tools":{"type":"array","items":{"type":"string"}},"budget":{"type":"object"}}}"#,
+    input_schema: r#"{"type":"object","required":["goal","allowed_tools"],"properties":{"goal":{"type":"string"},"allowed_tools":{"type":"array","items":{"type":"string"}},"budget":{"type":"object"},"model":{"type":"string"},"mcp_servers":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"url":{"type":"string"}},"required":["name"]}}}}"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
     token_budget: crate::DEFAULT_TOKEN_BUDGET,
     hot: false,

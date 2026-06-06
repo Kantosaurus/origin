@@ -17,6 +17,8 @@ pub enum SessionsAction {
     Ls,
     Resume(String),
     Rm(String),
+    /// Rewind a session's transcript, keeping the first `keep` turns.
+    Rewind { session_id: String, keep: u32 },
 }
 
 /// Actions accepted by [`keyring`].
@@ -48,17 +50,54 @@ pub async fn usage() -> Result<()> {
     match ev {
         StreamEvent::UsageReport { rows } => {
             println!(
-                "{:<14} {:<24} {:>14} {:>14}",
-                "PROVIDER", "MODEL", "TOKENS_IN", "TOKENS_OUT"
+                "{:<14} {:<24} {:>14} {:>14} {:>10}",
+                "PROVIDER", "MODEL", "TOKENS_IN", "TOKENS_OUT", "COST"
             );
+            let mut total = 0.0_f64;
             for r in rows {
+                total += r.cost_usd;
                 println!(
-                    "{:<14} {:<24} {:>14} {:>14}",
-                    r.provider, r.model, r.tokens_in, r.tokens_out
+                    "{:<14} {:<24} {:>14} {:>14} {:>10}",
+                    r.provider,
+                    r.model,
+                    r.tokens_in,
+                    r.tokens_out,
+                    origin_cost::fmt_usd(r.cost_usd)
                 );
+            }
+            println!(
+                "{:<14} {:<24} {:>14} {:>14} {:>10}",
+                "", "TOTAL", "", "", origin_cost::fmt_usd(total)
+            );
+            Ok(())
+        }
+        other => Err(anyhow::anyhow!("unexpected: {other:?}")),
+    }
+}
+
+/// Export a persisted session transcript to Markdown (default) or JSON,
+/// writing to `out` when given, otherwise stdout.
+///
+/// # Errors
+/// Returns if the daemon refuses, the IPC transport closes, the session is
+/// unknown, or the output file cannot be written.
+pub async fn export_session(session_id: String, json: bool, out: Option<String>) -> Result<()> {
+    let format = if json { "json" } else { "md" }.to_string();
+    let ev = round_trip(ClientMessage::ExportSession { session_id, format }).await?;
+    match ev {
+        StreamEvent::SessionExport { content } => {
+            if let Some(path) = out {
+                std::fs::write(&path, content)?;
+                // The session-export confirmation routes through the `session.saved`
+                // catalog key (En "wrote {path}" — byte-identical); localized under
+                // `--lang`/`$LANG`.
+                println!("{}", crate::locale::linef("session.saved", &[("path", &path)]));
+            } else {
+                print!("{content}");
             }
             Ok(())
         }
+        StreamEvent::AdminError { message } => Err(anyhow::anyhow!(message)),
         other => Err(anyhow::anyhow!("unexpected: {other:?}")),
     }
 }
@@ -73,6 +112,10 @@ pub async fn sessions(action: SessionsAction) -> Result<()> {
         SessionsAction::Ls => ClientMessage::ListSessions,
         SessionsAction::Resume(id) => ClientMessage::ResumeSession { session_id: id },
         SessionsAction::Rm(id) => ClientMessage::RemoveSession { session_id: id },
+        SessionsAction::Rewind { session_id, keep } => ClientMessage::RewindSession {
+            session_id,
+            keep_turns: keep,
+        },
     };
     let ev = round_trip(msg).await?;
     match ev {
@@ -169,7 +212,11 @@ fn read_secret(arg: String) -> Result<String> {
     }
 }
 
-async fn round_trip(msg: ClientMessage) -> Result<StreamEvent> {
+/// Send one [`ClientMessage`] to the daemon and read one [`StreamEvent`] back.
+///
+/// # Errors
+/// Propagates IPC connect/transport failures and JSON (de)serialization errors.
+pub(crate) async fn round_trip(msg: ClientMessage) -> Result<StreamEvent> {
     let path = std::env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
     let mut c = Connector::connect(&path).await?;
     let body = serde_json::to_vec(&msg)?;
@@ -177,6 +224,13 @@ async fn round_trip(msg: ClientMessage) -> Result<StreamEvent> {
     let resp = c.read_frame_body().await?;
     let ev: StreamEvent = serde_json::from_slice(&resp)?;
     Ok(ev)
+}
+
+/// Resolve the local daemon socket / named-pipe path (`$ORIGIN_SOCK` or the
+/// platform default).
+#[must_use]
+pub(crate) fn socket_path() -> String {
+    std::env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path())
 }
 
 fn default_path() -> String {

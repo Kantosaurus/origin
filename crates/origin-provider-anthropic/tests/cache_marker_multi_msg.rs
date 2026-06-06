@@ -28,6 +28,9 @@ fn cache_marker_on_non_first_message_is_emitted() {
         messages: vec![m0, m1],
         model: "claude".into(),
         tools: vec![],
+        effort: None,
+        thinking_tokens: None,
+        attachments: Vec::new(),
     };
     let body = encode_request_for_test(&req);
     let s = serde_json::to_string(&body).expect("serialize");

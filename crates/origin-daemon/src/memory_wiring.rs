@@ -116,8 +116,7 @@ impl MemoryHandle for MemoryDispatchHandle {
             let q_lower = query.to_lowercase();
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-                .unwrap_or(0);
+                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
             let mut hits: Vec<SearchHit> = all
                 .into_iter()
                 .filter(|r| r.body_preview.to_lowercase().contains(&q_lower))
@@ -167,8 +166,7 @@ impl MemoryHandle for MemoryDispatchHandle {
                 .collect();
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-                .unwrap_or(0);
+                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
 
             let opts = origin_mem::SearchOpts {
                 top_n: k,

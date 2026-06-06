@@ -105,8 +105,7 @@ fn cache_path() -> Option<PathBuf> {
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// Strip a single leading `v` or `V` prefix, returning the version string
@@ -474,8 +473,7 @@ async fn run_background_check_inner() -> Result<(), UpdateError> {
     // Windows and can fail on Linux).
     let exe = current_exe()?;
     let parent = exe.parent().ok_or_else(|| {
-        UpdateError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        UpdateError::Io(std::io::Error::other(
             "exe has no parent",
         ))
     })?;

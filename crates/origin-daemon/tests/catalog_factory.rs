@@ -64,6 +64,9 @@ async fn deepseek_row_builds_and_chats() {
             }],
             model: "deepseek-chat".to_string(),
             tools: vec![],
+            effort: None,
+            thinking_tokens: None,
+            attachments: Vec::new(),
         })
         .await
         .unwrap();
@@ -146,6 +149,9 @@ async fn anthropic_oauth_row_uses_bearer_header() {
             }],
             model: "claude-sonnet-4-6".to_string(),
             tools: vec![],
+            effort: None,
+            thinking_tokens: None,
+            attachments: Vec::new(),
         })
         .await
         .unwrap();
@@ -227,6 +233,9 @@ async fn openai_codex_oauth_row_uses_bearer() {
             }],
             model: "gpt-5-codex".to_string(),
             tools: vec![],
+            effort: None,
+            thinking_tokens: None,
+            attachments: Vec::new(),
         })
         .await
         .unwrap();

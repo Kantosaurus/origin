@@ -33,7 +33,7 @@ impl StreamWidget {
         }
     }
 
-    pub fn reset_cursor(&mut self) {
+    pub const fn reset_cursor(&mut self) {
         self.cursor_row = self.viewport.row;
         self.cursor_col = self.viewport.col;
     }
@@ -63,7 +63,7 @@ impl StreamWidget {
         }
     }
 
-    fn newline(&mut self) {
+    const fn newline(&mut self) {
         self.cursor_col = self.viewport.col;
         let bottom = self.viewport.row + self.viewport.rows.saturating_sub(1);
         if self.cursor_row < bottom {

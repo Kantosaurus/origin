@@ -207,6 +207,9 @@ impl Quantizer {
             });
         }
         let scale = f32::from_le_bytes(bytes[8..12].try_into().expect("slice is 4 bytes"));
+        // Intentional: the centroid table (~384 KiB) is immediately heap-boxed;
+        // the lint fires on the transient stack temporary inside `Box::new`.
+        #[allow(clippy::large_stack_arrays)]
         let mut centroids = Box::new([[0_f32; EMBED_DIM]; NUM_CENTROIDS]);
         let mut offset = 12_usize;
         for c in centroids.iter_mut() {
@@ -252,6 +255,9 @@ fn kmeans_plus_plus_init(
         chosen.push(training[picked]);
     }
 
+    // Intentional: the centroid table (~384 KiB) is immediately heap-boxed;
+    // the lint fires on the transient stack temporary inside `Box::new`.
+    #[allow(clippy::large_stack_arrays)]
     let mut out = Box::new([[0_f32; EMBED_DIM]; NUM_CENTROIDS]);
     for (slot, c) in out.iter_mut().zip(chosen) {
         *slot = c;
@@ -280,6 +286,9 @@ fn lloyd(
         }
 
         let mut total_movement = 0.0_f32;
+        // Intentional: the centroid table (~384 KiB) is immediately heap-boxed;
+        // the lint fires on the transient stack temporary inside `Box::new`.
+        #[allow(clippy::large_stack_arrays)]
         let mut new_centroids = Box::new([[0_f32; EMBED_DIM]; NUM_CENTROIDS]);
         for k in 0..NUM_CENTROIDS {
             if counts[k] == 0 {

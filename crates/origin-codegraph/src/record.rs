@@ -88,6 +88,11 @@ impl NodeKind {
 impl Language {
     /// Stable integer discriminant for the `language` SQL column. The order is
     /// fixed by Phase 7 and MUST NOT change without a follow-up migration.
+    ///
+    /// Slots 5–9 are reserved for the C/C++/C#/Ruby/Bash grammars landed on a
+    /// parallel branch; the extended grammars added here therefore start at 10
+    /// so the two sets never collide when both are present in the same row
+    /// space. Existing rows keep their discriminant; this is purely additive.
     #[must_use]
     pub const fn as_discriminant(self) -> i64 {
         match self {
@@ -96,6 +101,21 @@ impl Language {
             Self::Python => 2,
             Self::Go => 3,
             Self::Java => 4,
+            // Appended for the curated grammar additions; never interleave the
+            // above (the discriminant is a persisted SQL contract).
+            Self::C => 5,
+            Self::Cpp => 6,
+            Self::CSharp => 7,
+            Self::Ruby => 8,
+            Self::Bash => 9,
+            // Extended grammars (codegraph ⇄ repomap parity); appended at 10+.
+            Self::Php => 10,
+            Self::Swift => 11,
+            Self::Kotlin => 12,
+            Self::Scala => 13,
+            Self::Haskell => 14,
+            Self::Elixir => 15,
+            Self::Lua => 16,
         }
     }
 }

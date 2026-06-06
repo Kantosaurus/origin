@@ -46,6 +46,26 @@ impl Budget {
     }
 }
 
+/// An inline MCP server a sub-agent spins up for the duration of its run.
+///
+/// Gap 9b (inline-MCP-per-subagent): stdio (`command` + `args`) or HTTP (`url`).
+/// The tools it exposes are namespaced `mcp__<name>__<tool>` and made available
+/// only to the worker that declared it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerSpec {
+    /// Logical server name (the `mcp__<name>__*` tool-name prefix).
+    pub name: String,
+    /// Stdio transport: the program to spawn. Mutually exclusive with `url`.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Arguments for the stdio `command`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// HTTP transport URL. Mutually exclusive with `command`.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
 /// Input to `Coordinator::spawn` — describes a single worker to launch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSpec {
@@ -59,6 +79,16 @@ pub struct WorkerSpec {
     pub workspace: Option<PathBuf>,
     /// Parent actor id — used to thread Lamport ordering through worker ops.
     pub parent_actor: ActorId,
+    /// Optional per-worker model override (openclaude per-agent routing). `None`
+    /// ⇒ the worker uses the daemon default; `Some` routes this sub-agent to a
+    /// specific model (e.g. a cheap "explorer" vs an expensive "planner").
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Inline MCP servers for this sub-agent (gap 9b). Empty ⇒ no MCP (the
+    /// default, byte-identical). Each server's tools are exposed to this worker
+    /// only, for the duration of its run.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerSpec>,
 }
 
 /// A follow-up task suggested by a worker on completion.

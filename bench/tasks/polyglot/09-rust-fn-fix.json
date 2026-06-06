@@ -1,0 +1,9 @@
+{
+  "id": "09-rust-fn-fix",
+  "prompt": "In a Rust file, the function `fn add(a: i32, b: i32) -> i32 { a - b }` is wrong. Fix the body so it returns the sum, and add a `#[test]` proving add(2, 3) == 5.",
+  "expected_tools_min": ["Edit"],
+  "expected_tool_calls_max": 5,
+  "max_turn_latency_ms": 6000,
+  "max_input_tokens": 4000,
+  "max_output_tokens": 1200
+}

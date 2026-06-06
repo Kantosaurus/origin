@@ -29,6 +29,8 @@
 //!   [`Coordinator::set_default_worker`] with the real agent-loop closure.
 //! - **P9.9:** subscribes the TUI plan panel to [`PlanHandle::subscribe`].
 
+pub mod admission;
+pub mod collab;
 pub mod coordinator;
 pub mod credit;
 pub mod error;
@@ -37,13 +39,24 @@ pub mod prefix_inherit;
 pub mod report;
 pub mod rpc;
 pub mod spec;
+pub mod team;
 pub mod worker;
 
+pub use admission::{
+    default_probe, AdmissionGate, AdmissionTicket, GateCfg, MemReading, MemoryProbe, NullProbe, ScriptedProbe,
+};
+pub use collab::{FileRegistry, FileShiftNotice, Mailbox, Message, MsgScope};
 pub use coordinator::{Coordinator, WorkerHandle, WorkerId};
 pub use error::SwarmError;
 pub use lifecycle::Lifecycle;
 pub use prefix_inherit::PrefixSnapshot;
 pub use report::CompletionReport;
 pub use rpc::PlanHandle;
-pub use spec::{Budget, DecisionRecord, ReportStatus, TaskRef, Usage, WorkerSpec};
-pub use worker::{default_noop_worker, WorkerContext, WorkerFn};
+pub use spec::{
+    Budget, DecisionRecord, McpServerSpec, ReportStatus, TaskRef, Usage, WorkerSpec,
+};
+pub use team::{
+    report_summary, MissionEntry, MissionEvent, MissionLog, Team, TeamError, TeamEvent, TeamRegistry,
+    Teammate, TeammateStatus,
+};
+pub use worker::{default_noop_worker, SharedMailboxes, WorkerCollab, WorkerContext, WorkerFn};

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod apply_patch;
 pub mod ask;
+pub mod author_workflow;
 pub mod bash;
 pub mod browser;
 pub mod diagnostics;
+pub mod gmail;
 pub mod edit;
 pub mod glob_tool;
 pub mod graph_explain;
@@ -12,11 +14,13 @@ pub mod graph_query;
 pub mod graph_rebuild;
 pub mod graph_summarize;
 pub mod grep_tool;
+pub mod lsp_nav;
 pub mod mem;
 pub mod monitor;
 pub mod multi_edit;
 pub mod read;
 pub mod recall;
+pub mod run_workflow;
 pub mod task;
 pub mod tool_search;
 pub mod web_fetch;

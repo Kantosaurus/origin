@@ -7,13 +7,64 @@ use origin_plan::OpEnvelope;
 use origin_resume_token::ResumeToken;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct PromptRequest {
     pub system: String,
     pub model: String,
     pub user_text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Optional reasoning-effort level for this turn, as a canonical wire token
+    /// (`fast`/`low`/`medium`/`high`/`max`). `None` (the default) leaves the
+    /// provider wire byte-identical to the pre-effort behavior. The daemon maps
+    /// this to [`origin_provider::ReasoningEffort`] when building the
+    /// `ChatRequest`. *Closes: claude-code `/effort`+`/fast`.*
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Optional extended-thinking budget (in tokens) for this turn. `None` (the
+    /// default) leaves the provider wire byte-identical. The daemon threads this
+    /// onto `LoopOptions.thinking_tokens`, which the Anthropic encoder maps to
+    /// `"thinking": {"type":"enabled","budget_tokens": n}` (bumping `max_tokens`
+    /// above `n`); other providers ignore it. *Closes: aider `--thinking-tokens`.*
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_tokens: Option<u32>,
+    /// Multimodal attachments (images / extracted PDF text) to append to the
+    /// FIRST user turn. Empty by default ⇒ text-only wire unchanged. The CLI
+    /// encodes each file via `origin_multimodal::to_content_block` so the
+    /// daemon never reads client-side paths itself. *Closes: aider images;
+    /// gemini PDF/sketch; claude multimodal input.*
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<origin_multimodal::ContentBlock>,
+    /// Read-only "plan mode": when `true`, the daemon downgrades every mutating
+    /// tool to Deny for this turn so the model can only read/plan, never edit or
+    /// run commands. `false` (the default) ⇒ unchanged. *Closes: gemini Plan
+    /// Mode (policy-enforced read-only design phase).*
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+    /// Additional workspace roots the agent may operate across (cline multi-root
+    /// workspaces). Empty (the default) ⇒ single-root behaviour, wire unchanged.
+    /// Surfaced to the model via a `<workspace-roots>` system-prompt block.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<String>,
+    /// Opt-in interactive permission prompting. When `true`, the daemon routes
+    /// `RequiresPermission` tools (Bash/Write/Edit/…) through an IPC prompter
+    /// that emits [`StreamEvent::PermissionAsk`] and waits for the client's
+    /// [`ClientMessage::PermissionDecision`] before running the tool. `false`
+    /// (the default) keeps the historical auto-allow behaviour, so the wire and
+    /// tool execution are byte-identical. Headless/swarm never set this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub permission_ask: bool,
+    /// Per-request account override for credential resolution. The interactive
+    /// CLI stamps the session's active account (set via `/account`) onto EVERY
+    /// prompt, because it opens a fresh daemon connection per prompt — so a
+    /// `/account` switch on a throwaway connection cannot reach the prompt
+    /// connection's per-connection slot. The daemon prefers this over its
+    /// connection slot when building `LoopOptions.session_account` (the account
+    /// a cross-provider mid-loop rebuild resolves credentials for). `None` (the
+    /// default) ⇒ fall back to the connection slot / global account, wire
+    /// byte-identical to the pre-per-request behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 /// Request to rebuild the code graph over a set of paths.
@@ -57,6 +108,11 @@ pub struct PromptReply {
 pub enum ClientMessage {
     /// A user prompt to run through the agent loop.
     Prompt(PromptRequest),
+    /// Client's answer to a [`StreamEvent::PermissionAsk`], correlated by `id`.
+    /// `allow == false` denies the tool. Sent mid-turn over the same connection
+    /// serving the prompt (like [`ClientMessage::Interrupt`]). Only produced
+    /// when the turn opted into [`PromptRequest::permission_ask`].
+    PermissionDecision { id: u64, allow: bool },
     /// Hot-swap the active provider/account credential without restarting
     /// the daemon.
     SwitchAccount { provider: String, account_id: String },
@@ -79,6 +135,13 @@ pub enum ClientMessage {
     /// daemon replies with [`StreamEvent::AdminOk`] on success or
     /// [`StreamEvent::AdminError`] on failure.
     RemoveSession { session_id: String },
+    /// Conversation rewind: keep the first `keep_turns` message rows of
+    /// `session_id` and delete the rest, rolling the transcript back to an
+    /// earlier point (the session row is preserved so it can still be resumed).
+    /// The daemon replies with [`StreamEvent::AdminOk`] on success or
+    /// [`StreamEvent::AdminError`] on failure. *Closes: gemini `/rewind` chat
+    /// revert (the transcript half; file revert is `origin rewind`).*
+    RewindSession { session_id: String, keep_turns: u32 },
     /// P13.4.2: resume a previously persisted session. The daemon
     /// counts the persisted message rows for `session_id`, reads any
     /// checkpointed [`ResumeToken`] from the `resume/` directory, and
@@ -86,6 +149,17 @@ pub enum ClientMessage {
     /// hydratable state. Returns [`StreamEvent::AdminError`] if the
     /// session does not exist.
     ResumeSession { session_id: String },
+    /// Cross-harness *live resume*: hydrate a brand-new resumable origin
+    /// session from a foreign harness's transcript. `source` is the originating
+    /// harness tag (`claude-code` | `jcode` | `opencode`, plus the aliases
+    /// [`origin_migrate::reconstruct::SourceKind::from_tag`] accepts); `path` is
+    /// the external session file or harness root directory. The daemon
+    /// reconstructs the transcript via [`origin_migrate::reconstruct`], creates a
+    /// new session seeded with those messages, and replies with
+    /// [`StreamEvent::ForeignResumed`] (or [`StreamEvent::AdminError`] on an
+    /// unknown source / parse / I/O failure). *Closes: jcode L227 cross-harness
+    /// session import AND resume.*
+    ResumeForeign { source: String, path: String },
     /// P13.4.2: ask the daemon for a per-provider/per-model token usage
     /// snapshot. The daemon replies with [`StreamEvent::UsageReport`].
     GetUsage,
@@ -116,10 +190,7 @@ pub enum ClientMessage {
     /// [`StreamEvent::SkillActive`] carrying the skill's `allowed-tools`
     /// (so the CLI can render the narrowing it just applied). On failure
     /// (skill not in catalog) it replies with [`StreamEvent::SkillError`].
-    ActivateSkill {
-        name: String,
-        args: Option<String>,
-    },
+    ActivateSkill { name: String, args: Option<String> },
     /// Pop the named skill off this connection's active stack (the
     /// rightmost match if the same skill was activated multiple times).
     /// Always replies with [`StreamEvent::AdminOk`] — deactivating an
@@ -138,6 +209,11 @@ pub enum ClientMessage {
     /// a [`StreamEvent::PlanOp`] event frame. The subscription terminates
     /// when the connection closes.
     SubscribePlan,
+    /// Export a persisted session transcript. `format` is `"md"` (Markdown)
+    /// or `"json"`. The daemon loads the message log, renders it via
+    /// `origin_export`, and replies with [`StreamEvent::SessionExport`], or
+    /// [`StreamEvent::AdminError`] if the session does not exist.
+    ExportSession { session_id: String, format: String },
     /// User-issued cancel. Clears any in-flight goal iteration. The outer
     /// message loop continues running afterward — the connection stays open.
     ///
@@ -147,6 +223,92 @@ pub enum ClientMessage {
     /// When sent with no goal active the outer loop emits no event — the
     /// signal is harmless.
     Interrupt,
+    /// `/clear`: mechanically reset the in-session context. This is a
+    /// first-class admin verb, NOT a skill activation — it never touches the
+    /// per-connection skill stack or the skill catalog.
+    ///
+    /// The daemon terminates any active goal (emitting
+    /// [`StreamEvent::GoalCleared`] with [`origin_goal::ClearReasonWire::UserClearAll`]
+    /// and writing the terminal-status checkpoint so a crash cannot resurrect
+    /// the discarded goal), then replies with [`StreamEvent::AdminOk`]. With no
+    /// active goal it is a single `AdminOk`.
+    ClearAll,
+    // ── Binary self-development control plane (gated `ORIGIN_SELFDEV=1`) ──────
+    //
+    // All four verbs are no-ops returning a clear "self-dev disabled" message
+    // unless the daemon was started with `ORIGIN_SELFDEV=1`; the variants are
+    // APPENDED here so the wire layout of every pre-existing variant is
+    // preserved. *Closes: binary self-development orchestration.*
+    /// Enqueue a self-modification [`BuildJob`](origin_selfdev::BuildJob) and
+    /// begin the supervised edit → checkpoint → build → test → restart cycle.
+    /// `description` is both the job description and the prompt driven onto the
+    /// live agent path for the self-edit step; `paths` scopes the edit and the
+    /// rollback. The daemon emits [`StreamEvent::SelfDevStatus`] as the cycle
+    /// advances. Disabled (returns [`StreamEvent::SelfDevDisabled`]) unless
+    /// `ORIGIN_SELFDEV=1`.
+    SelfDevStart {
+        /// Human description of what the self-modification should accomplish.
+        description: String,
+        /// Source paths the job intends to touch (empty ⇒ unscoped).
+        paths: Vec<String>,
+    },
+    /// Query the self-dev driver's current state. The daemon replies with a
+    /// [`StreamEvent::SelfDevStatus`] (or [`StreamEvent::SelfDevDisabled`]).
+    SelfDevStatus,
+    /// Operator approval for the in-flight self-dev restart. Flips the approval
+    /// flag so the next `request_restart` returns `Grant`. Replies with
+    /// [`StreamEvent::SelfDevStatus`] (or [`StreamEvent::SelfDevDisabled`]).
+    SelfDevApprove,
+    /// Reset the storm guard after an operator has acknowledged repeated
+    /// self-dev failures, re-enabling new jobs. Replies with
+    /// [`StreamEvent::SelfDevStatus`] (or [`StreamEvent::SelfDevDisabled`]).
+    SelfDevReset,
+    // ── Named agent teams control plane (origin-swarm::team) ─────────────────
+    //
+    // APPENDED to preserve wire layout. No team exists unless a client sends
+    // `TeamCreate`, so default behaviour is byte-identical.
+    /// Register a named team (idempotent-by-replace). Replies with a
+    /// [`StreamEvent::TeamStatus`] for the freshly created team.
+    TeamCreate {
+        /// Team name (unique within the daemon-wide registry).
+        name: String,
+    },
+    /// Assign `task` to a (possibly new) named teammate within `team`, spawning
+    /// a real swarm worker as that teammate. The daemon emits a
+    /// [`StreamEvent::TeamEventFired`] as the teammate transitions
+    /// Working → Done → Idle, each journaled to the team's `MissionLog`.
+    TeamAssign {
+        /// The team the teammate belongs to.
+        team: String,
+        /// Human-facing teammate name (created on first assign).
+        teammate: String,
+        /// The task description the teammate should pursue.
+        task: String,
+    },
+    /// Render a team's `MissionLog` + per-teammate statuses. The daemon replies
+    /// with [`StreamEvent::TeamStatus`] (or [`StreamEvent::AdminError`] when the
+    /// team is unknown).
+    TeamStatus {
+        /// The team to render.
+        team: String,
+    },
+    // ── Workflow fan-out (origin-daemon::workflow_runner) ────────────────────
+    //
+    // APPENDED to preserve wire layout. The default behaviour (linear
+    // `ActivateWorkflow` skill-mask walk) is unchanged: a client must explicitly
+    // send `RunWorkflow` to fan out.
+    /// Run `name`'s authored workflow as a phase-layered parallel DAG of real
+    /// swarm workers (the FAN-OUT complement to [`ClientMessage::ActivateWorkflow`],
+    /// which only walks skill masks linearly). The daemon loads the workflow,
+    /// dispatches one sub-agent per step per dependency layer (independent
+    /// same-layer steps concurrent), and replies with a single
+    /// [`StreamEvent::WorkflowRunComplete`] summarising the run, or
+    /// [`StreamEvent::SkillError`] when the workflow name isn't found / the run
+    /// fails.
+    RunWorkflow {
+        /// Name of an authored workflow in `~/.origin/workflows.toml`.
+        name: String,
+    },
 }
 
 impl ClientMessage {
@@ -222,6 +384,20 @@ pub enum StreamEvent {
         elided_bytes: u32,
     },
     TurnEnd,
+    /// Opt-in interactive permission ask (gated by
+    /// [`PromptRequest::permission_ask`]). Emitted before a `RequiresPermission`
+    /// tool runs; the daemon then blocks on the matching
+    /// [`ClientMessage::PermissionDecision`] (correlated by `id`). Never emitted
+    /// in the default (auto-allow) path, so default streams are byte-identical.
+    PermissionAsk {
+        /// Correlation id, unique within a turn. Echoed back in the decision.
+        id: u64,
+        /// Tool name (e.g. `Bash`, `Write`).
+        tool: String,
+        /// Truncated, human-readable preview of the tool arguments (the command
+        /// or path) so the user sees *what* they are approving.
+        args_preview: String,
+    },
     /// Emitted after a successful `ClientMessage::SwitchAccount` so the CLI
     /// can confirm the new provider/account is in effect for subsequent
     /// prompts.
@@ -284,6 +460,9 @@ pub enum StreamEvent {
         provider: String,
         accounts: Vec<String>,
     },
+    /// Response to [`ClientMessage::ExportSession`]: the rendered transcript
+    /// (Markdown or JSON depending on the requested format).
+    SessionExport { content: String },
     /// P13.4.2: positive acknowledgement for admin mutations that have no
     /// payload of their own (`RemoveSession`, `KeyringAdd`, …).
     AdminOk,
@@ -304,6 +483,19 @@ pub enum StreamEvent {
         messages_loaded: u32,
         restored_to_turn: u32,
         had_resume_token: bool,
+    },
+    /// Response to [`ClientMessage::ResumeForeign`]. `session_id` is the
+    /// freshly-created origin session seeded with the reconstructed foreign
+    /// transcript; `messages_loaded` is the number of message rows persisted;
+    /// `suggested_model` is the origin-catalog model the new session adopted
+    /// (mapped from the foreign session's model family via
+    /// [`origin_migrate::reconstruct::suggest_model`]). The new session is a
+    /// first-class resumable origin session (`origin sessions resume
+    /// <session_id>`).
+    ForeignResumed {
+        session_id: String,
+        messages_loaded: u32,
+        suggested_model: String,
     },
     /// Positive ack for a successful [`ClientMessage::ActivateSkill`].
     /// `allowed_tools` is the intersection mask currently in effect after
@@ -399,6 +591,89 @@ pub enum StreamEvent {
         iter: u32,
         tokens_spent: u64,
     },
+    // ── Binary self-development (gated `ORIGIN_SELFDEV=1`) ────────────────────
+    /// Snapshot of the self-dev driver after a `SelfDev*` verb. Carries the
+    /// state label, the number of queued jobs, the consecutive-failure streak,
+    /// the granted-restart generation counter, and whether the storm guard has
+    /// tripped. APPENDED to preserve the wire layout of every prior variant.
+    SelfDevStatus {
+        /// Debug label of the current [`SelfDevState`](origin_selfdev::SelfDevState).
+        state: String,
+        /// Id of the in-flight job, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_id: Option<String>,
+        /// Jobs waiting in the queue (excludes the in-flight job).
+        queued: u32,
+        /// Consecutive failed generations since the last success.
+        consecutive_failures: u32,
+        /// Number of generations that reached a granted restart.
+        generation: u64,
+        /// Whether the storm guard has tripped (self-dev disabled until reset).
+        storm_guard_tripped: bool,
+    },
+    /// Emitted for every `SelfDev*` verb when the daemon was NOT started with
+    /// `ORIGIN_SELFDEV=1`. The `message` is the operator-facing hint.
+    SelfDevDisabled {
+        /// Human-readable "self-dev disabled (set `ORIGIN_SELFDEV=1`)" message.
+        message: String,
+    },
+    // ── Named agent teams (origin-swarm::team) ───────────────────────────────
+    /// One [`TeamEvent`](origin_swarm::TeamEvent) bridged onto the wire so the
+    /// CLI can render teammate lifecycle transitions. `event_kind` is
+    /// `teammate_idle` | `task_completed`; `teammate` is the worker-id hex.
+    /// (The field is `event_kind`, not `kind`, because the enum is internally
+    /// tagged on `kind`.)
+    TeamEventFired {
+        /// The team the event belongs to.
+        team: String,
+        /// Event kind label (`teammate_idle` / `task_completed`).
+        event_kind: String,
+        /// The teammate's [`WorkerId`](origin_swarm::WorkerId) as 32-hex.
+        teammate: String,
+        /// For `task_completed`, the prose-free report summary; empty otherwise.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        summary: String,
+    },
+    /// Response to [`ClientMessage::TeamCreate`] / [`ClientMessage::TeamStatus`]:
+    /// the rendered `MissionLog` plus a one-line-per-teammate status block.
+    TeamStatus {
+        /// The team name.
+        team: String,
+        /// Plain-text [`MissionLog::render`](origin_swarm::MissionLog::render).
+        mission_log: String,
+        /// One `name: status` line per teammate, in registration order.
+        teammates: Vec<String>,
+    },
+    // ── Workflow fan-out (origin-daemon::workflow_runner) ────────────────────
+    /// Response to [`ClientMessage::RunWorkflow`]: the result of running a
+    /// workflow as a phase-layered parallel DAG. Carries the run summary so the
+    /// CLI can render the layering + per-step outcomes from one frame. APPENDED
+    /// to preserve the wire layout of every prior variant.
+    WorkflowRunComplete {
+        /// The workflow name that ran.
+        name: String,
+        /// Number of dependency layers executed.
+        layers: u32,
+        /// One `index|skill|layer|status` row per step, in execution order.
+        steps: Vec<WorkflowRunStep>,
+    },
+}
+
+/// One step's outcome inside a [`StreamEvent::WorkflowRunComplete`].
+///
+/// Wire-shape projection of `workflow_runner::StepReport`, kept distinct so the
+/// runner's in-process type can evolve without breaking IPC compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowRunStep {
+    /// Zero-based position of the step in the workflow.
+    pub index: u32,
+    /// The step's skill name.
+    pub skill: String,
+    /// The dependency layer the step ran in (0 == first).
+    pub layer: u32,
+    /// Terminal status, lower-snake-cased (`completed`, `goal_unreachable`,
+    /// `budget_exhausted`, `aborted`).
+    pub status: String,
 }
 
 /// A single line in a unified diff view.
@@ -435,6 +710,10 @@ pub struct UsageRow {
     pub model: String,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// Estimated USD cost for this (provider, model) row under the centralized
+    /// [`origin_cost`] pricing table. `0.0` when the model is unpriced.
+    #[serde(default)]
+    pub cost_usd: f64,
 }
 
 /// Outbound responses the daemon sends back to a client (or the supervisor).
@@ -452,4 +731,74 @@ pub enum ServerMessage {
         session_id: String,
         restored_to_turn: u32,
     },
+}
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+mod permission_wire_tests {
+    use super::*;
+
+    #[test]
+    fn permission_ask_event_round_trips() {
+        let ev = StreamEvent::PermissionAsk {
+            id: 7,
+            tool: "Bash".to_string(),
+            args_preview: "rm -rf build/".to_string(),
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(json.contains("\"kind\":\"permission_ask\""), "tagged on kind: {json}");
+        let back: StreamEvent = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            StreamEvent::PermissionAsk { id, tool, args_preview } => {
+                assert_eq!(id, 7);
+                assert_eq!(tool, "Bash");
+                assert_eq!(args_preview, "rm -rf build/");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn permission_decision_message_round_trips() {
+        let msg = ClientMessage::PermissionDecision { id: 7, allow: true };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let back: ClientMessage = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(back, ClientMessage::PermissionDecision { id: 7, allow: true }));
+    }
+
+    #[test]
+    fn permission_ask_defaults_off_and_is_omitted_when_false() {
+        // Byte-identical default: a request that never opts in must not emit the
+        // `permission_ask` key at all (skip_serializing_if).
+        let req = PromptRequest {
+            user_text: "hi".to_string(),
+            ..Default::default()
+        };
+        assert!(!req.permission_ask);
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(!json.contains("permission_ask"), "default request omits the flag: {json}");
+    }
+
+    #[test]
+    fn account_defaults_none_omitted_and_round_trips_when_set() {
+        // Byte-identical default: no `account` key when unset.
+        let req = PromptRequest {
+            user_text: "hi".to_string(),
+            ..Default::default()
+        };
+        assert!(req.account.is_none());
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(!json.contains("account"), "default request omits account: {json}");
+
+        // When set it serializes + round-trips.
+        let req = PromptRequest {
+            user_text: "hi".to_string(),
+            account: Some("work".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains("\"account\":\"work\""), "json was: {json}");
+        let back: PromptRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.account.as_deref(), Some("work"));
+    }
 }

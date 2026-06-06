@@ -11,9 +11,22 @@
 // All three must agree on the target triples and the `origin-<triple>[.exe]`
 // asset naming, or the download fallback / in-binary updater break.
 
-// The npm package family name. The *command* installed onto PATH is always
-// `origin` regardless of this (see the main package's `bin` field).
-const PKG_PREFIX = 'originx';
+// The npm package family name: the main package's name, and the prefix of the
+// six per-platform packages (`${PKG_PREFIX}-<plat>-<arch>`). The *command*
+// installed onto PATH is always `origin` regardless of this (see the main
+// package's `bin` field).
+//
+// The default is the SCOPED family `@kantosaurus/origin`: the unscoped
+// `originx*` names tripped npm's spam-detection filter mid-publish (see
+// PUBLISHING.md), and scoped names live under the account namespace where that
+// filter does not apply.
+//
+// Overridable at PUBLISH time via `ORIGIN_NPM_PREFIX` (e.g. back to a future
+// unscoped name) without hand-editing names across files. `scripts/build.mjs`
+// reads this value when assembling, then bakes the *resolved* literal into the
+// published copy of this file — so an end user's environment can never alter
+// which package the launcher resolves the binary from.
+const PKG_PREFIX = process.env.ORIGIN_NPM_PREFIX || '@kantosaurus/origin';
 
 // GitHub repository that hosts the release artifacts. Must match the Rust
 // updater's RELEASES_REPO and the git remote.
@@ -53,6 +66,26 @@ function binName(target) {
   return `origin${target.ext}`;
 }
 
+// Auxiliary binaries shipped ALONGSIDE `origin` in every platform package (and
+// in the cold-path fallback dir). The CLI spawns `origin-daemon` (required to do
+// anything — it is a separate process, not embedded) and, for self-dev
+// hot-reload + crash-restart, `origin-supervisor`. They must be co-located with
+// `origin` so the CLI's sibling lookup (`current_exe().parent()`) resolves them.
+// Keep in lockstep with .github/workflows/release.yml's build/stage steps.
+const AUX_BINS = ['origin-daemon', 'origin-supervisor'];
+
+// Release asset file name for an aux binary, e.g.
+// `origin-daemon-x86_64-apple-darwin` or `origin-supervisor-...-msvc.exe`.
+function auxAssetName(name, target) {
+  return `${name}-${target.triple}${target.ext}`;
+}
+
+// On-disk name for an aux binary inside a package's bin/ directory, e.g.
+// `origin-daemon` / `origin-daemon.exe`.
+function auxBinName(name, target) {
+  return `${name}${target.ext}`;
+}
+
 module.exports = {
   PKG_PREFIX,
   RELEASES_REPO,
@@ -61,4 +94,7 @@ module.exports = {
   currentTarget,
   assetName,
   binName,
+  AUX_BINS,
+  auxAssetName,
+  auxBinName,
 };

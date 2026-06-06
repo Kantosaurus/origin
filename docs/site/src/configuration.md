@@ -88,7 +88,7 @@ A small set of env vars overrides config for ops use:
 | `ORIGIN_LOG` | `tracing-subscriber` filter, e.g. `origin_daemon=debug,hyper=warn`. |
 | `ORIGIN_CONFIG` | Path to an alternate `config.toml` (whole-file override). |
 | `ORIGIN_HOME` | Override `~/.origin` root. CI and ephemeral envs use this. |
-| `ORIGIN_NO_SUPERVISOR` | Disable `origin-supervisor`; the daemon panics rather than restarting. |
+| `ORIGIN_NO_SUPERVISOR` | Spawn `origin-daemon` directly instead of via `origin-supervisor` (the default auto-spawn). Disables crash-restart and self-dev binary hot-reload. |
 | `ORIGIN_REPLAY_BUNDLE` | Load an `.origin-replay` bundle instead of hitting real providers. |
 
 ## Inspecting and editing from the CLI

@@ -50,7 +50,6 @@ fn copy_dir_inner(src: &Path, dst: &Path) -> io::Result<()> {
             // Symlinks / sockets / fifos: skip silently for Phase 9.
             // Phase 11 will need explicit handling per the workspace
             // semantics defined by the daemon.
-            continue;
         }
     }
     Ok(())

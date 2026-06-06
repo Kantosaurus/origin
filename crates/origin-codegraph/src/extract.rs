@@ -184,13 +184,115 @@ fn sig_and_body_ranges(node: Node, whole: Range) -> (Range, Option<Range>) {
 /// declaration in the given language. Returns `Ok(None)` when the node is
 /// uninteresting or has no recoverable name.
 fn classify(node: Node, lang: Language, src: &[u8]) -> Result<Option<(String, NodeKind)>, ExtractError> {
+    // Elixir definitions are macro `call` nodes (`defmodule`/`def`/`defp`),
+    // not field-bearing declarations, so they need a bespoke classifier.
+    if lang == Language::Elixir {
+        return classify_elixir(node, src);
+    }
     let Some(kind) = node_kind_for(lang, node.kind()) else {
         return Ok(None);
     };
-    let Some(name_node) = node.child_by_field_name("name") else {
+    let Some(name_node) = name_node_for(node, lang) else {
         return Ok(None);
     };
     let name = std::str::from_utf8(&src[name_node.start_byte()..name_node.end_byte()])?.to_owned();
+    Ok(Some((name, kind)))
+}
+
+/// Recover a C/C++ function name by walking the `declarator` field chain
+/// (`function_declarator` → `pointer_declarator` → … → `identifier`). Returns
+/// `None` for any other language, or when no name-bearing node is reached.
+fn c_cpp_declarator_name(node: Node, lang: Language) -> Option<Node> {
+    if !matches!(lang, Language::C | Language::Cpp) {
+        return None;
+    }
+    let mut cur = node.child_by_field_name("declarator")?;
+    loop {
+        if matches!(
+            cur.kind(),
+            "identifier"
+                | "field_identifier"
+                | "qualified_identifier"
+                | "destructor_name"
+                | "operator_name"
+        ) {
+            return Some(cur);
+        }
+        match cur.child_by_field_name("declarator") {
+            // Always descends to a child, so the walk terminates.
+            Some(next) => cur = next,
+            None => return cur.child_by_field_name("name"),
+        }
+    }
+}
+
+/// Resolve the identifier node that names a declaration.
+///
+/// Most grammars expose a `name` field; a few need a fallback: Kotlin attaches
+/// the identifier as a positional child, and C/C++ `function_definition` hides
+/// the name at the end of a `declarator` chain.
+fn name_node_for(node: Node<'_>, lang: Language) -> Option<Node<'_>> {
+    if let Some(n) = node.child_by_field_name("name") {
+        return Some(n);
+    }
+    // Positional fallback: Kotlin's `function_declaration` / `class_declaration`
+    // / `object_declaration` carry the name as the first `simple_identifier`
+    // (functions) or `type_identifier` (types) child rather than a `name` field.
+    if lang == Language::Kotlin {
+        let mut cursor = node.walk();
+        return node
+            .children(&mut cursor)
+            .find(|c| matches!(c.kind(), "simple_identifier" | "type_identifier"));
+    }
+    // C/C++ `function_definition` has no `name` field; walk the declarator chain
+    // (`c_cpp_declarator_name` returns `None` for every other language).
+    c_cpp_declarator_name(node, lang)
+}
+
+/// Classify an Elixir `call` node as a module/function definition.
+///
+/// Elixir has no dedicated declaration grammar nodes: `defmodule Foo`, `def f`,
+/// and `defp f` are all `call` nodes whose leading `identifier` child is the
+/// macro keyword and whose `arguments` child holds the name (an `alias` for
+/// modules, an `identifier`/nested `call` for functions).
+fn classify_elixir(node: Node, src: &[u8]) -> Result<Option<(String, NodeKind)>, ExtractError> {
+    if node.kind() != "call" {
+        return Ok(None);
+    }
+    let mut cursor = node.walk();
+    let children: Vec<Node> = node.children(&mut cursor).collect();
+    let Some(head) = children.first() else {
+        return Ok(None);
+    };
+    if head.kind() != "identifier" {
+        return Ok(None);
+    }
+    let keyword = std::str::from_utf8(&src[head.start_byte()..head.end_byte()])?;
+    let kind = match keyword {
+        "defmodule" | "defprotocol" => NodeKind::Module,
+        "def" | "defp" | "defmacro" | "defmacrop" => NodeKind::Function,
+        _ => return Ok(None),
+    };
+    let Some(args) = children.iter().find(|c| c.kind() == "arguments") else {
+        return Ok(None);
+    };
+    // The first argument names the definition. For functions it may be a
+    // `call` (`alpha()`) whose own leading identifier is the bare name; for
+    // modules it is an `alias`; otherwise it is a plain `identifier`.
+    let mut arg_cursor = args.walk();
+    let Some(first_arg) = args.named_children(&mut arg_cursor).next() else {
+        return Ok(None);
+    };
+    let mut arg_inner = first_arg.walk();
+    let name_node = if first_arg.kind() == "call" {
+        first_arg.children(&mut arg_inner).next().unwrap_or(first_arg)
+    } else {
+        first_arg
+    };
+    let name = std::str::from_utf8(&src[name_node.start_byte()..name_node.end_byte()])?.to_owned();
+    if name.is_empty() {
+        return Ok(None);
+    }
     Ok(Some((name, kind)))
 }
 
@@ -202,8 +304,15 @@ fn node_kind_for(lang: Language, ts_kind: &str) -> Option<NodeKind> {
     let is_function = matches!(
         (lang, ts_kind),
         (Language::Rust, "function_item")
-            | (Language::TypeScript | Language::Go, "function_declaration")
-            | (Language::Python, "function_definition"),
+            | (
+                Language::TypeScript | Language::Go | Language::Kotlin | Language::Swift | Language::Lua,
+                "function_declaration",
+            )
+            | (
+                Language::Python | Language::C | Language::Cpp | Language::Bash | Language::Php | Language::Scala,
+                "function_definition",
+            )
+            | (Language::Haskell, "signature"),
     );
     if is_function {
         return Some(NodeKind::Function);
@@ -211,40 +320,81 @@ fn node_kind_for(lang: Language, ts_kind: &str) -> Option<NodeKind> {
     // Methods across languages.
     let is_method = matches!(
         (lang, ts_kind),
-        (Language::TypeScript, "method_definition") | (Language::Go | Language::Java, "method_declaration"),
+        (Language::TypeScript, "method_definition")
+            | (
+                Language::Go | Language::Java | Language::CSharp | Language::Php,
+                "method_declaration"
+            )
+            | (Language::Ruby, "method" | "singleton_method"),
     );
     if is_method {
         return Some(NodeKind::Method);
     }
-    // Structs / record-shaped declarations.
+    // Structs / record-shaped declarations. Haskell `data` declarations are
+    // the closest analogue to a struct/record.
     let is_struct = matches!(
         (lang, ts_kind),
-        (Language::Rust, "struct_item") | (Language::Go, "type_declaration"),
+        (Language::Rust, "struct_item")
+            | (Language::Go, "type_declaration")
+            | (Language::C | Language::Cpp, "struct_specifier")
+            | (Language::C, "enum_specifier" | "type_definition")
+            | (Language::CSharp, "struct_declaration")
+            | (Language::Haskell, "data_type"),
     );
     if is_struct {
         return Some(NodeKind::Struct);
     }
-    // Classes (TS / Python / Java).
+    // Classes. Swift folds `struct`/`enum` into `class_declaration` (the kind
+    // is disambiguated by an inner `declaration_kind` token we don't split on).
     let is_class = matches!(
         (lang, ts_kind),
-        (Language::TypeScript | Language::Java, "class_declaration") | (Language::Python, "class_definition"),
+        (
+            Language::TypeScript
+                | Language::Java
+                | Language::CSharp
+                | Language::Kotlin
+                | Language::Swift
+                | Language::Php,
+            "class_declaration"
+        ) | (Language::Python | Language::Scala, "class_definition")
+            | (Language::Cpp, "class_specifier")
+            | (Language::CSharp, "record_declaration" | "enum_declaration")
+            | (Language::Ruby, "class"),
     );
     if is_class {
         return Some(NodeKind::Class);
     }
-    // Traits (Rust only).
-    if matches!((lang, ts_kind), (Language::Rust, "trait_item")) {
-        return Some(NodeKind::Trait);
-    }
-    // Interfaces (TS / Java).
+    // Traits (Rust) and their analogues (Scala `trait`, PHP `trait`).
     if matches!(
         (lang, ts_kind),
-        (Language::TypeScript | Language::Java, "interface_declaration"),
+        (Language::Rust, "trait_item")
+            | (Language::Scala, "trait_definition")
+            | (Language::Php, "trait_declaration"),
+    ) {
+        return Some(NodeKind::Trait);
+    }
+    // Interfaces (TS / Java / C# / PHP) and protocols (Swift).
+    if matches!(
+        (lang, ts_kind),
+        (
+            Language::TypeScript | Language::Java | Language::CSharp | Language::Php,
+            "interface_declaration"
+        ) | (Language::Swift, "protocol_declaration"),
     ) {
         return Some(NodeKind::Interface);
     }
-    // Modules (Rust only at P7.1).
-    if matches!((lang, ts_kind), (Language::Rust, "mod_item")) {
+    // Modules / namespaces: Rust `mod`, C++/PHP `namespace`, C# `namespace`,
+    // Ruby `module`, Scala/Kotlin `object` (singleton). Elixir modules are
+    // handled in `classify`.
+    if matches!(
+        (lang, ts_kind),
+        (Language::Rust, "mod_item")
+            | (Language::Cpp | Language::Php, "namespace_definition")
+            | (Language::CSharp, "namespace_declaration")
+            | (Language::Ruby, "module")
+            | (Language::Scala, "object_definition")
+            | (Language::Kotlin, "object_declaration"),
+    ) {
         return Some(NodeKind::Module);
     }
     None

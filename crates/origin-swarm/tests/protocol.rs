@@ -47,6 +47,8 @@ async fn three_workers_complete_and_report() {
             },
             workspace: None,
             parent_actor: origin_plan::ActorId::new(0),
+            model: None,
+            mcp_servers: Vec::new(),
         };
         handles.push(coord.spawn(spec).await.expect("spawn"));
     }

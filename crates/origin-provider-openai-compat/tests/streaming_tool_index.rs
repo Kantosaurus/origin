@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Verifies that the openai-compat SSE → ring adapter propagates each
-//! tool_call's `index` into the ring payload, matching the wire shape the
+//! `tool_call`'s `index` into the ring payload, matching the wire shape the
 //! Anthropic provider emits (see `origin-provider-anthropic/src/streaming.rs`)
 //! and which the daemon consumer expects (see `origin-daemon/src/agent.rs`
 //! around the `ToolUseStart` / `ToolUseDelta` decode sites).
@@ -21,7 +21,7 @@ use origin_stream::{Ring, TokenKind};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// SSE frame for two interleaved tool_calls (indices 0 and 1). The first
+/// SSE frame for two interleaved `tool_calls` (indices 0 and 1). The first
 /// fragment per index carries `id` + `function.name`; later fragments carry
 /// only `function.arguments`.
 fn build_sse_body() -> String {
@@ -102,6 +102,9 @@ async fn parallel_tool_calls_carry_index_prefix() {
                     messages: vec![Message::new(Role::User).with_block(Block::text("hi"))],
                     model: "gpt-test".into(),
                     tools: vec![],
+                    effort: None,
+                    thinking_tokens: None,
+                    attachments: Vec::new(),
                 },
                 &r,
             )
@@ -123,7 +126,6 @@ async fn parallel_tool_calls_carry_index_prefix() {
                     decode_tool_use_delta(ev.payload()).expect("ToolUseDelta must carry LE index prefix");
                 deltas.push((idx, args));
             }
-            TokenKind::TurnEnd => {}
             _ => {}
         }
     }

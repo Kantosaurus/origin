@@ -18,9 +18,82 @@
 pub struct CompletionSources {
     /// Skill names as they appear in the `name:` frontmatter field.
     pub skills: Vec<String>,
+    /// Short descriptions parallel to [`skills`](Self::skills) (frontmatter
+    /// `description:`). Same length as `skills` when populated by
+    /// [`load_sources`]; an empty vector means "no descriptions known" so a
+    /// missing entry is treated as the empty string. Additive — consumers
+    /// that don't render descriptions are unaffected.
+    pub skill_descriptions: Vec<String>,
+    /// Built-in slash-command verbs that the TUI dispatches inline (e.g.
+    /// `clear`, `effort`, `model`). Matched against the `/<partial>` shape
+    /// exactly like skills so the popup surfaces them too.
+    pub verbs: Vec<String>,
+    /// Short static descriptions parallel to [`verbs`](Self::verbs). Same
+    /// length as `verbs` when populated; an empty vector means "no
+    /// descriptions known". Additive.
+    pub verb_descriptions: Vec<String>,
     /// Workflow names from `~/.origin/workflows.toml`.
     pub workflows: Vec<String>,
 }
+
+impl CompletionSources {
+    /// The combined skill-shape candidate names: built-in [`verbs`](Self::verbs)
+    /// followed by [`skills`](Self::skills). Used for the `/<partial>` and
+    /// `/-<partial>` shapes so both kinds match identically.
+    #[must_use]
+    pub fn skill_candidates(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.verbs.len() + self.skills.len());
+        out.extend(self.verbs.iter().cloned());
+        out.extend(self.skills.iter().cloned());
+        out
+    }
+
+    /// The descriptions parallel to [`skill_candidates`](Self::skill_candidates),
+    /// in the same order (verbs first, then skills). A candidate with no known
+    /// description maps to the empty string so the two vectors stay aligned.
+    #[must_use]
+    pub fn skill_candidate_descriptions(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.verbs.len() + self.skills.len());
+        out.extend(aligned_descriptions(&self.verbs, &self.verb_descriptions));
+        out.extend(aligned_descriptions(&self.skills, &self.skill_descriptions));
+        out
+    }
+}
+
+/// Pad/truncate `descriptions` so it lines up one-to-one with `names`,
+/// filling missing entries with the empty string. Lets callers store an
+/// empty `descriptions` vector to mean "none known" without panicking on a
+/// length mismatch.
+fn aligned_descriptions(names: &[String], descriptions: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, _)| descriptions.get(i).cloned().unwrap_or_default())
+        .collect()
+}
+
+/// The built-in slash-command verbs the TUI dispatches inline, paired with a
+/// short static description. Kept here (rather than in `main.rs`) so the
+/// completion sources are self-contained. Only verbs that are actually wired
+/// up belong here; `theme`/`vim`/`help` are intentionally omitted until a
+/// later wave dispatches them.
+const BUILTIN_VERBS: &[(&str, &str)] = &[
+    ("model", "switch the active model"),
+    ("effort", "set reasoning effort (fast..max)"),
+    ("fast", "shortcut for minimal reasoning effort"),
+    ("output-style", "set the output style"),
+    ("steer", "queue a steering hint for the next turn"),
+    ("plan", "toggle read-only plan mode"),
+    ("attach", "stage an image/PDF for the next prompt"),
+    ("account", "switch the active provider account"),
+    ("mem", "manage proposed memories"),
+    ("permissions", "toggle approving tools before they run"),
+    ("mouse", "toggle mouse capture (off to select & copy)"),
+    ("theme", "switch palette (default/dark/light/high-contrast)"),
+    ("copy", "copy the last reply to the clipboard (OSC 52)"),
+    ("help", "show the command + keybinding cheatsheet"),
+    ("clear", "clear the conversation and goal"),
+];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CompletionResult {
@@ -49,10 +122,12 @@ pub fn complete(buffer: &mut String, sources: &CompletionSources) -> CompletionR
             format!("{{workflow:{full}}}")
         });
     }
-    // Skill shapes — `/-<name>` (deactivate) or `/<name>` (activate).
+    // Skill shapes — `/-<name>` (deactivate) or `/<name>` (activate). Both
+    // match against the combined verb+skill candidate list.
+    let candidates = sources.skill_candidates();
     if let Some(partial) = buffer.strip_prefix("/-") {
         let partial = partial.to_string();
-        return complete_with(buffer, &partial, &sources.skills, |full| format!("/-{full}"));
+        return complete_with(buffer, &partial, &candidates, |full| format!("/-{full}"));
     }
     if let Some(partial) = buffer.strip_prefix('/') {
         // Whitespace inside the partial means it's not a slash command.
@@ -60,7 +135,7 @@ pub fn complete(buffer: &mut String, sources: &CompletionSources) -> CompletionR
             return CompletionResult::NoMatch;
         }
         let partial = partial.to_string();
-        return complete_with(buffer, &partial, &sources.skills, |full| format!("/{full}"));
+        return complete_with(buffer, &partial, &candidates, |full| format!("/{full}"));
     }
     CompletionResult::NoMatch
 }
@@ -118,7 +193,9 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 
 /// Build a [`CompletionSources`] by reading the embedded `superpowers/`
 /// skill catalog merged with any user overrides in `~/.origin/skills/`
-/// (every `<dir>/SKILL.md`), plus `~/.origin/workflows.toml` for workflows.
+/// (every `<dir>/SKILL.md`).
+///
+/// Also reads `~/.origin/workflows.toml` for workflows.
 ///
 /// Failures degrade to empty lists so a missing directory or corrupt file
 /// doesn't break Tab.
@@ -136,15 +213,33 @@ pub fn load_sources() -> CompletionSources {
     // because `~/.origin/skills/` exists but is empty after onboarding — the
     // bundled `superpowers` skills (systematic-debugging, impeccable, etc.)
     // never become discoverable through `/`.
-    let skills: Vec<String> = origin_skills::load_all(&skills_dir)
-        .map(|v| v.into_iter().map(|s| s.front.name).collect())
-        .unwrap_or_default();
+    //
+    // Keep `skills` and `skill_descriptions` index-aligned: build them in one
+    // pass so a later wave can render the frontmatter description next to each
+    // candidate.
+    let (skills, skill_descriptions): (Vec<String>, Vec<String>) =
+        origin_skills::load_all(&skills_dir)
+            .map(|v| {
+                v.into_iter()
+                    .map(|s| (s.front.name, s.front.description))
+                    .unzip()
+            })
+            .unwrap_or_default();
     let workflows: Vec<String> = crate::workflows::load_from(&workflows_path)
         .ok()
         .flatten()
         .map(|f| f.workflows.into_iter().map(|w| w.name).collect())
         .unwrap_or_default();
-    CompletionSources { skills, workflows }
+    let verbs: Vec<String> = BUILTIN_VERBS.iter().map(|(v, _)| (*v).to_string()).collect();
+    let verb_descriptions: Vec<String> =
+        BUILTIN_VERBS.iter().map(|(_, d)| (*d).to_string()).collect();
+    CompletionSources {
+        skills,
+        skill_descriptions,
+        verbs,
+        verb_descriptions,
+        workflows,
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +256,7 @@ mod tests {
                 "polish".into(),
             ],
             workflows: vec!["frontend-design".into(), "polish-pass".into()],
+            ..Default::default()
         }
     }
 
@@ -280,5 +376,78 @@ mod tests {
             names.iter().any(|n| n == "systematic-debugging"),
             "expected `systematic-debugging` skill in completion sources, got: {names:?}"
         );
+    }
+
+    /// `load_sources` must inject the dispatched built-in verbs so typing
+    /// `/eff` Tab-completes to `/effort` even with no matching skill.
+    #[test]
+    fn builtin_verb_completes_effort() {
+        let sources = load_sources();
+        assert!(
+            sources.verbs.iter().any(|v| v == "effort"),
+            "expected `effort` built-in verb in completion sources, got: {:?}",
+            sources.verbs
+        );
+        let mut buf = "/eff".to_string();
+        let r = complete(&mut buf, &sources);
+        assert_eq!(r, CompletionResult::UniqueCompletion);
+        assert_eq!(buf, "/effort");
+    }
+
+    /// The still-non-dispatched verb `vim` must NOT be injected yet — a later
+    /// wave wires it up. (`theme`/`help` ARE dispatched now, so they belong.)
+    #[test]
+    fn undispatched_verbs_are_absent() {
+        let sources = load_sources();
+        assert!(
+            !sources.verbs.iter().any(|v| v == "vim"),
+            "did not expect `vim` among built-in verbs: {:?}",
+            sources.verbs
+        );
+        for present in ["theme", "help"] {
+            assert!(sources.verbs.iter().any(|v| v == present), "`{present}` should be a built-in verb");
+        }
+    }
+
+    /// Built-in verbs participate in the same `/<partial>` match as skills.
+    #[test]
+    fn verbs_and_skills_share_skill_shape() {
+        let sources = CompletionSources {
+            skills: vec!["effortless-skill".into()],
+            verbs: vec!["effort".into()],
+            ..Default::default()
+        };
+        let mut buf = "/effo".to_string();
+        let r = complete(&mut buf, &sources);
+        // Two candidates share the "/effo" prefix: the verb and the skill.
+        match r {
+            CompletionResult::MultipleCandidates { candidates } => {
+                assert_eq!(candidates.len(), 2);
+                assert!(candidates.iter().any(|c| c == "effort"));
+                assert!(candidates.iter().any(|c| c == "effortless-skill"));
+            }
+            other => panic!("expected MultipleCandidates, got {other:?}"),
+        }
+    }
+
+    /// `skill_candidate_descriptions` stays index-aligned with
+    /// `skill_candidates` (verbs first, then skills), padding missing
+    /// entries with the empty string.
+    #[test]
+    fn candidate_descriptions_stay_aligned() {
+        let sources = CompletionSources {
+            skills: vec!["alpha".into(), "beta".into()],
+            skill_descriptions: vec!["A skill".into()], // shorter on purpose
+            verbs: vec!["effort".into()],
+            verb_descriptions: vec!["set reasoning effort".into()],
+            ..Default::default()
+        };
+        let names = sources.skill_candidates();
+        let descs = sources.skill_candidate_descriptions();
+        assert_eq!(names.len(), descs.len());
+        assert_eq!(names, vec!["effort", "alpha", "beta"]);
+        assert_eq!(descs[0], "set reasoning effort");
+        assert_eq!(descs[1], "A skill");
+        assert_eq!(descs[2], ""); // missing description → empty string
     }
 }

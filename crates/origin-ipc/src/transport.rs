@@ -46,11 +46,46 @@ impl Listener {
     // so callers can uniformly `.await` it alongside other async transport operations.
     #[allow(clippy::unused_async)]
     pub async fn bind(path: &str) -> io::Result<Self> {
-        let name = path
-            .to_fs_name::<GenericFilePath>()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let inner = ListenerOptions::new().name(name).create_tokio()?;
-        Ok(Self { inner })
+        let to_name = || {
+            path.to_fs_name::<GenericFilePath>()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+        };
+        match ListenerOptions::new().name(to_name()?).create_tokio() {
+            Ok(inner) => Ok(Self { inner }),
+            // A Unix-socket path that already exists yields `AddrInUse`. A
+            // daemon that was killed or panicked never ran the Drop-time
+            // unlink, so the file lingers with no listener behind it. Reclaim
+            // it — but only after confirming nothing live is actually serving
+            // the path, so we never clobber a running daemon.
+            #[cfg(unix)]
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                if Self::stale_socket(path).await {
+                    std::fs::remove_file(path)?;
+                    let inner = ListenerOptions::new().name(to_name()?).create_tokio()?;
+                    Ok(Self { inner })
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Returns `true` when `path` is a socket file left behind by a dead
+    /// process — it exists on disk but no listener answers a connect. A live
+    /// listener (connect succeeds) or a non-socket file returns `false`, so
+    /// the caller leaves the path untouched.
+    #[cfg(unix)]
+    async fn stale_socket(path: &str) -> bool {
+        use std::os::unix::fs::FileTypeExt;
+        // Only ever remove an actual socket file, never a regular file that
+        // happens to sit at this path.
+        match std::fs::metadata(path) {
+            Ok(m) if m.file_type().is_socket() => {}
+            _ => return false,
+        }
+        // If we can connect, a live daemon owns it — not stale.
+        Connector::connect(path).await.is_err()
     }
 
     /// Accept the next incoming connection.
@@ -196,7 +231,10 @@ pub async fn read_frame_buffered<R: AsyncRead + Unpin>(
     reader: &mut R,
     rx_buf: &mut Vec<u8>,
 ) -> io::Result<(FrameKind, Vec<u8>)> {
-    let mut tmp = [0_u8; 65536];
+    // Heap scratch buffer: a 64KB stack array here would live in this future
+    // across the awaits below, bloating every frame-read future (a stack-overflow
+    // hazard). Vec keeps one-read-per-syscall throughput; the future holds a ptr.
+    let mut tmp = vec![0_u8; 65536];
 
     // 1) Ensure the fixed-size header is buffered.
     while rx_buf.len() < HEADER_LEN {
@@ -212,7 +250,8 @@ pub async fn read_frame_buffered<R: AsyncRead + Unpin>(
 
     // 2) Parse the header WITHOUT consuming it, so a cancellation before the
     //    body is fully read resumes cleanly. Mirrors `read_frame_from`.
-    let kind = match rx_buf[4] {
+    let kind_byte = rx_buf[4];
+    let kind = match kind_byte {
         1 => FrameKind::Request,
         2 => FrameKind::Response,
         3 => FrameKind::Event,
@@ -339,6 +378,9 @@ mod tests {
             .expect("resumed read returns the whole frame");
         assert!(matches!(kind, FrameKind::Request));
         assert_eq!(got, body, "body must round-trip across the cancelled peek");
-        assert!(rx_buf.is_empty(), "buffer fully drained after consuming the frame");
+        assert!(
+            rx_buf.is_empty(),
+            "buffer fully drained after consuming the frame"
+        );
     }
 }

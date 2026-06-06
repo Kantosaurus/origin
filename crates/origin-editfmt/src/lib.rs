@@ -1,0 +1,712 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Model-tuned edit-format matrix for applying LLM-produced edits.
+//!
+//! This crate parses several common edit formats into a normalized
+//! [`Hunk`] representation and applies them against original file
+//! contents. It also exposes a per-model best-format table so callers
+//! can pick the format a given model is most reliable with.
+
+#![forbid(unsafe_code)]
+
+use std::fmt;
+
+/// The edit format used to encode a model's proposed change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EditFormat {
+    /// `aider`-style SEARCH/REPLACE blocks with `<<<<<<<`/`=======`/`>>>>>>>` markers.
+    SearchReplace,
+    /// A fenced diff block (```diff ... ```) wrapping SEARCH/REPLACE content.
+    DiffFenced,
+    /// A full replacement of the file's contents.
+    WholeFile,
+    /// A minimal unified diff (`--- `/`+++ `/`@@` hunks).
+    Udiff,
+}
+
+impl fmt::Display for EditFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::SearchReplace => "search-replace",
+            Self::DiffFenced => "diff-fenced",
+            Self::WholeFile => "whole-file",
+            Self::Udiff => "udiff",
+        };
+        f.write_str(s)
+    }
+}
+
+impl EditFormat {
+    /// One-line human label for the format, e.g. `"search/replace"`.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SearchReplace => "search/replace",
+            Self::DiffFenced => "fenced diff",
+            Self::WholeFile => "whole file",
+            Self::Udiff => "unified diff",
+        }
+    }
+
+    /// Short guidance describing how a model should emit edits in this format.
+    #[must_use]
+    pub const fn guidance(self) -> &'static str {
+        match self {
+            Self::SearchReplace => {
+                "give one or more blocks, each `<<<<<<< SEARCH` then the exact \
+                 lines to find, then `=======`, then the replacement lines, then \
+                 `>>>>>>> REPLACE`, with the file path on the line above the block"
+            }
+            Self::DiffFenced => {
+                "wrap the change in a fenced ```diff block containing \
+                 `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` markers, with the \
+                 file path just before the fence"
+            }
+            Self::WholeFile => {
+                "emit the entire updated file contents inside a fenced code block, \
+                 preceded by the file path; do not abbreviate or elide any lines"
+            }
+            Self::Udiff => {
+                "use unified-diff hunks: `--- a/path` and `+++ b/path` headers, then \
+                 `@@` hunk headers, with context lines unprefixed, removed lines \
+                 prefixed `-`, and added lines prefixed `+`"
+            }
+        }
+    }
+}
+
+/// A normalized edit: replace `before` with `after` inside `file`.
+///
+/// For [`EditFormat::WholeFile`], `before` is empty and `after` holds
+/// the complete new file contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hunk {
+    /// Target file path as named by the model.
+    pub file: String,
+    /// The text to locate in the original (empty for whole-file edits).
+    pub before: String,
+    /// The replacement text.
+    pub after: String,
+}
+
+/// Errors produced while parsing or applying an edit.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EditFmtError {
+    /// The input did not match the expected structure for the format.
+    #[error("parse error: {0}")]
+    Parse(String),
+    /// The `before` text was not found in the original contents.
+    #[error("no match: {0}")]
+    NoMatch(String),
+    /// The `before` text matched more than once, so the edit is ambiguous.
+    #[error("ambiguous match: {0}")]
+    Ambiguous(String),
+}
+
+/// Parses `text` in the given `format` into a list of normalized hunks.
+///
+/// # Errors
+///
+/// Returns [`EditFmtError::Parse`] when the input does not contain a
+/// well-formed block for the requested format.
+pub fn parse(format: EditFormat, text: &str) -> Result<Vec<Hunk>, EditFmtError> {
+    match format {
+        EditFormat::SearchReplace => parse_search_replace(text, false),
+        EditFormat::DiffFenced => parse_search_replace(text, true),
+        EditFormat::WholeFile => parse_whole_file(text),
+        EditFormat::Udiff => parse_udiff(text),
+    }
+}
+
+/// Applies a single hunk to `original`, returning the new contents.
+///
+/// For [`Hunk`]s whose `before` is empty (whole-file edits) the original
+/// is replaced wholesale by `after`. Otherwise the unique occurrence of
+/// `before` is replaced by `after`.
+///
+/// # Errors
+///
+/// Returns [`EditFmtError::NoMatch`] when `before` is absent and
+/// [`EditFmtError::Ambiguous`] when `before` occurs more than once.
+pub fn apply(hunk: &Hunk, original: &str) -> Result<String, EditFmtError> {
+    if hunk.before.is_empty() {
+        return Ok(hunk.after.clone());
+    }
+    let first = original.find(&hunk.before);
+    let Some(idx) = first else {
+        return Err(EditFmtError::NoMatch(hunk.file.clone()));
+    };
+    let next = original[idx + hunk.before.len()..].find(&hunk.before);
+    if next.is_some() {
+        return Err(EditFmtError::Ambiguous(hunk.file.clone()));
+    }
+    let mut out = String::with_capacity(original.len() - hunk.before.len() + hunk.after.len());
+    out.push_str(&original[..idx]);
+    out.push_str(&hunk.after);
+    out.push_str(&original[idx + hunk.before.len()..]);
+    Ok(out)
+}
+
+/// Returns the edit format that the named `model` is most reliable with.
+///
+/// The match is case-insensitive and prefix-based. Unknown models fall
+/// back to [`EditFormat::SearchReplace`].
+#[must_use]
+pub fn best_format_for(model: &str) -> EditFormat {
+    let m = model.to_ascii_lowercase();
+    if m.starts_with("claude") || m.contains("anthropic") || m.starts_with("sonnet")
+        || m.starts_with("opus") || m.starts_with("haiku")
+    {
+        return EditFormat::SearchReplace;
+    }
+    if m.starts_with("gpt-4") || m.starts_with("gpt4") || m.starts_with("o1") || m.starts_with("o3")
+    {
+        return EditFormat::Udiff;
+    }
+    if m.starts_with("deepseek") {
+        return EditFormat::DiffFenced;
+    }
+    if m.starts_with("gpt-3.5") || m.contains("turbo-instruct") {
+        return EditFormat::WholeFile;
+    }
+    EditFormat::SearchReplace
+}
+
+/// Builds an `<origin-edit-format>` system-prompt block tuned to `model`.
+///
+/// The chosen format is resolved via [`best_format_for`]. The returned
+/// string is safe to embed directly into a larger prompt: it has no
+/// trailing newline.
+#[must_use]
+pub fn system_block(model: &str) -> String {
+    let fmt = best_format_for(model);
+    format!(
+        "<origin-edit-format>\n\
+         When you must show a code edit in prose (outside the structured \
+         Edit/MultiEdit/ApplyPatch tools), prefer the {} format: {}\n\
+         </origin-edit-format>",
+        fmt.label(),
+        fmt.guidance(),
+    )
+}
+
+/// Detects which [`EditFormat`] a block of model-emitted prose is written in.
+///
+/// The scan keys on the exact textual markers the `parse_*` functions
+/// consume, and returns the most specific matching format:
+///
+/// * [`EditFormat::DiffFenced`] — a code fence (` ``` `) together with a
+///   `<<<<<<<` SEARCH marker, matching [`parse`]'s fenced search/replace path.
+/// * [`EditFormat::SearchReplace`] — a `<<<<<<<` SEARCH marker without a fence.
+/// * [`EditFormat::Udiff`] — an `@@` hunk header, the hard requirement of the
+///   unified-diff parser (typically alongside `--- ` / `+++ ` headers).
+/// * [`EditFormat::WholeFile`] — a code fence with none of the above markers.
+///
+/// Returns `None` when `text` carries no edit-format markers at all (so a
+/// caller can fall back to a model-tuned default).
+#[must_use]
+pub fn format_from_text(text: &str) -> Option<EditFormat> {
+    let mut has_fence = false;
+    let mut has_search_marker = false;
+    let mut has_udiff_hunk = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            has_fence = true;
+        }
+        if trimmed.starts_with("<<<<<<<") {
+            has_search_marker = true;
+        }
+        // `parse_udiff` keys strictly on a line beginning with `@@`.
+        if line.starts_with("@@") {
+            has_udiff_hunk = true;
+        }
+    }
+    if has_search_marker {
+        // A fenced SEARCH/REPLACE block is the diff-fenced format; a bare one is
+        // plain search/replace. Mirrors `parse_search_replace`'s `require_fence`.
+        if has_fence {
+            return Some(EditFormat::DiffFenced);
+        }
+        return Some(EditFormat::SearchReplace);
+    }
+    if has_udiff_hunk {
+        return Some(EditFormat::Udiff);
+    }
+    if has_fence {
+        return Some(EditFormat::WholeFile);
+    }
+    None
+}
+
+/// Extracts every hunk from model-emitted `text`, auto-detecting the format.
+///
+/// When [`format_from_text`] recognizes a format, `text` is parsed with it;
+/// otherwise the parser falls back to [`best_format_for`] for `model`. The
+/// result is whatever [`parse`] returns for the chosen format.
+///
+/// # Errors
+///
+/// Returns [`EditFmtError::Parse`] when the detected (or fallback) format's
+/// parser finds no well-formed block in `text`.
+pub fn extract_all_hunks(text: &str, model: &str) -> Result<Vec<Hunk>, EditFmtError> {
+    let fmt = format_from_text(text).unwrap_or_else(|| best_format_for(model));
+    parse(fmt, text)
+}
+
+/// Optional filename hint preceding a search/replace block.
+fn extract_filename(lines: &[&str], block_start: usize) -> String {
+    // Walk backwards over blank lines / fence lines to find a path-ish line.
+    let mut i = block_start;
+    while i > 0 {
+        i -= 1;
+        let trimmed = lines[i].trim();
+        if trimmed.is_empty() || trimmed.starts_with("```") {
+            continue;
+        }
+        return trimmed.trim_end_matches(':').to_string();
+    }
+    String::new()
+}
+
+/// Shared parser for SEARCH/REPLACE blocks (optionally inside a diff fence).
+fn parse_search_replace(text: &str, require_fence: bool) -> Result<Vec<Hunk>, EditFmtError> {
+    if require_fence && !text.contains("```") {
+        return Err(EditFmtError::Parse("missing diff fence".to_string()));
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut hunks = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim_start().starts_with("<<<<<<<") {
+            let file = extract_filename(&lines, i);
+            let mut before = String::new();
+            let mut after = String::new();
+            let mut j = i + 1;
+            let mut seen_divider = false;
+            let mut closed = false;
+            while j < lines.len() {
+                let line = lines[j];
+                if line.trim_start().starts_with("=======") {
+                    seen_divider = true;
+                    j += 1;
+                    continue;
+                }
+                if line.trim_start().starts_with(">>>>>>>") {
+                    closed = true;
+                    break;
+                }
+                if seen_divider {
+                    after.push_str(line);
+                    after.push('\n');
+                } else {
+                    before.push_str(line);
+                    before.push('\n');
+                }
+                j += 1;
+            }
+            if !seen_divider || !closed {
+                return Err(EditFmtError::Parse(
+                    "unterminated search/replace block".to_string(),
+                ));
+            }
+            hunks.push(Hunk {
+                file,
+                before: trim_trailing_newline(before),
+                after: trim_trailing_newline(after),
+            });
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    if hunks.is_empty() {
+        return Err(EditFmtError::Parse(
+            "no search/replace block found".to_string(),
+        ));
+    }
+    Ok(hunks)
+}
+
+/// Removes exactly one trailing `\n` accumulated during line collection.
+fn trim_trailing_newline(mut s: String) -> String {
+    if s.ends_with('\n') {
+        s.pop();
+    }
+    s
+}
+
+/// Parses a whole-file block: an optional `file:` header then fenced contents,
+/// or the raw text if no fence is present.
+fn parse_whole_file(text: &str) -> Result<Vec<Hunk>, EditFmtError> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut file = String::new();
+    let mut content_lines: Vec<&str> = Vec::new();
+    let mut in_fence = false;
+    let mut saw_fence = false;
+    for line in &lines {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            if in_fence {
+                in_fence = false;
+            } else {
+                in_fence = true;
+                saw_fence = true;
+            }
+            continue;
+        }
+        if in_fence {
+            content_lines.push(line);
+        } else if file.is_empty() && !trimmed.is_empty() && !saw_fence {
+            file = trimmed.trim_end_matches(':').to_string();
+        }
+    }
+    let content = if saw_fence {
+        content_lines.join("\n")
+    } else {
+        // No fence: everything after an optional first header line is the body.
+        text.to_string()
+    };
+    if content.is_empty() && file.is_empty() {
+        return Err(EditFmtError::Parse("empty whole-file block".to_string()));
+    }
+    Ok(vec![Hunk {
+        file,
+        before: String::new(),
+        after: content,
+    }])
+}
+
+/// Parses a minimal unified diff into normalized hunks (one per `@@` section).
+fn parse_udiff(text: &str) -> Result<Vec<Hunk>, EditFmtError> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut file = String::new();
+    let mut hunks: Vec<Hunk> = Vec::new();
+    let mut before = String::new();
+    let mut after = String::new();
+    let mut in_hunk = false;
+    let mut any_hunk = false;
+
+    let flush = |before: &mut String, after: &mut String, file: &str, hunks: &mut Vec<Hunk>| {
+        hunks.push(Hunk {
+            file: file.to_string(),
+            before: trim_trailing_newline(std::mem::take(before)),
+            after: trim_trailing_newline(std::mem::take(after)),
+        });
+    };
+
+    for line in &lines {
+        if let Some(rest) = line.strip_prefix("--- ") {
+            file = clean_diff_path(rest);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            // Prefer the new-file path when present and meaningful.
+            let p = clean_diff_path(rest);
+            if !p.is_empty() {
+                file = p;
+            }
+            continue;
+        }
+        if line.starts_with("@@") {
+            if in_hunk {
+                flush(&mut before, &mut after, &file, &mut hunks);
+            }
+            in_hunk = true;
+            any_hunk = true;
+            continue;
+        }
+        if !in_hunk {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('+') {
+            after.push_str(rest);
+            after.push('\n');
+        } else if let Some(rest) = line.strip_prefix('-') {
+            before.push_str(rest);
+            before.push('\n');
+        } else {
+            let ctx = line.strip_prefix(' ').unwrap_or(line);
+            before.push_str(ctx);
+            before.push('\n');
+            after.push_str(ctx);
+            after.push('\n');
+        }
+    }
+    if !any_hunk {
+        return Err(EditFmtError::Parse("no @@ hunk header found".to_string()));
+    }
+    if in_hunk {
+        flush(&mut before, &mut after, &file, &mut hunks);
+    }
+    Ok(hunks)
+}
+
+/// Strips a `a/`/`b/` prefix and trailing timestamp from a diff path.
+fn clean_diff_path(raw: &str) -> String {
+    let path = raw.split('\t').next().unwrap_or(raw).trim();
+    if path == "/dev/null" {
+        return String::new();
+    }
+    let stripped = path
+        .strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path);
+    stripped.to_string()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::float_cmp)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_search_replace_block() {
+        let text = "src/main.rs\n\
+                    <<<<<<< SEARCH\n\
+                    let x = 1;\n\
+                    =======\n\
+                    let x = 2;\n\
+                    >>>>>>> REPLACE\n";
+        let hunks = parse(EditFormat::SearchReplace, text).unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].file, "src/main.rs");
+        assert_eq!(hunks[0].before, "let x = 1;");
+        assert_eq!(hunks[0].after, "let x = 2;");
+    }
+
+    #[test]
+    fn apply_replaces_exactly_once() {
+        let hunk = Hunk {
+            file: "f".to_string(),
+            before: "foo".to_string(),
+            after: "bar".to_string(),
+        };
+        let out = apply(&hunk, "a foo b").unwrap();
+        assert_eq!(out, "a bar b");
+    }
+
+    #[test]
+    fn apply_no_match_errors() {
+        let hunk = Hunk {
+            file: "f".to_string(),
+            before: "zzz".to_string(),
+            after: "bar".to_string(),
+        };
+        let err = apply(&hunk, "a foo b").unwrap_err();
+        assert!(matches!(err, EditFmtError::NoMatch(_)));
+    }
+
+    #[test]
+    fn apply_ambiguous_errors() {
+        let hunk = Hunk {
+            file: "f".to_string(),
+            before: "foo".to_string(),
+            after: "bar".to_string(),
+        };
+        let err = apply(&hunk, "foo and foo").unwrap_err();
+        assert!(matches!(err, EditFmtError::Ambiguous(_)));
+    }
+
+    #[test]
+    fn apply_whole_file_replaces() {
+        let hunk = Hunk {
+            file: "f".to_string(),
+            before: String::new(),
+            after: "brand new".to_string(),
+        };
+        let out = apply(&hunk, "anything at all").unwrap();
+        assert_eq!(out, "brand new");
+    }
+
+    #[test]
+    fn parses_whole_file_fenced() {
+        let text = "config.toml\n```\nkey = \"value\"\nother = 1\n```\n";
+        let hunks = parse(EditFormat::WholeFile, text).unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].file, "config.toml");
+        assert!(hunks[0].before.is_empty());
+        assert_eq!(hunks[0].after, "key = \"value\"\nother = 1");
+    }
+
+    #[test]
+    fn parses_small_udiff() {
+        let text = "--- a/src/lib.rs\n\
+                    +++ b/src/lib.rs\n\
+                    @@ -1,3 +1,3 @@\n\
+                    ctx line\n\
+                    -old line\n\
+                    +new line\n\
+                    more ctx\n";
+        let hunks = parse(EditFormat::Udiff, text).unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].file, "src/lib.rs");
+        assert_eq!(hunks[0].before, "ctx line\nold line\nmore ctx");
+        assert_eq!(hunks[0].after, "ctx line\nnew line\nmore ctx");
+    }
+
+    #[test]
+    fn udiff_round_trips_through_apply() {
+        let original = "ctx line\nold line\nmore ctx";
+        let text = "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n ctx line\n-old line\n+new line\n more ctx\n";
+        let hunks = parse(EditFormat::Udiff, text).unwrap();
+        let out = apply(&hunks[0], original).unwrap();
+        assert_eq!(out, "ctx line\nnew line\nmore ctx");
+    }
+
+    #[test]
+    fn diff_fenced_requires_fence() {
+        let no_fence = "<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n";
+        assert!(matches!(
+            parse(EditFormat::DiffFenced, no_fence),
+            Err(EditFmtError::Parse(_))
+        ));
+        let fenced = "file.py\n```diff\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n```\n";
+        let hunks = parse(EditFormat::DiffFenced, fenced).unwrap();
+        assert_eq!(hunks[0].before, "a");
+        assert_eq!(hunks[0].after, "b");
+    }
+
+    #[test]
+    fn best_format_for_known_models() {
+        assert_eq!(best_format_for("claude-3-5-sonnet"), EditFormat::SearchReplace);
+        assert_eq!(best_format_for("Opus-4"), EditFormat::SearchReplace);
+        assert_eq!(best_format_for("gpt-4o"), EditFormat::Udiff);
+        assert_eq!(best_format_for("o3-mini"), EditFormat::Udiff);
+        assert_eq!(best_format_for("deepseek-coder"), EditFormat::DiffFenced);
+        assert_eq!(best_format_for("gpt-3.5-turbo"), EditFormat::WholeFile);
+    }
+
+    #[test]
+    fn best_format_for_unknown_defaults() {
+        assert_eq!(best_format_for("some-random-model"), EditFormat::SearchReplace);
+        assert_eq!(best_format_for(""), EditFormat::SearchReplace);
+    }
+
+    #[test]
+    fn parse_missing_block_errors() {
+        let err = parse(EditFormat::SearchReplace, "just some prose").unwrap_err();
+        assert!(matches!(err, EditFmtError::Parse(_)));
+    }
+
+    #[test]
+    fn display_renders_format_names() {
+        assert_eq!(EditFormat::SearchReplace.to_string(), "search-replace");
+        assert_eq!(EditFormat::Udiff.to_string(), "udiff");
+    }
+
+    #[test]
+    fn label_and_guidance_non_empty_for_all_variants() {
+        for fmt in [
+            EditFormat::SearchReplace,
+            EditFormat::DiffFenced,
+            EditFormat::WholeFile,
+            EditFormat::Udiff,
+        ] {
+            assert!(!fmt.label().is_empty(), "label empty for {fmt:?}");
+            assert!(!fmt.guidance().is_empty(), "guidance empty for {fmt:?}");
+        }
+    }
+
+    #[test]
+    fn system_block_for_claude_uses_search_replace() {
+        assert_eq!(best_format_for("claude-opus-4"), EditFormat::SearchReplace);
+        let block = system_block("claude-opus-4");
+        assert!(block.contains("search/replace"), "block: {block}");
+        assert!(block.starts_with("<origin-edit-format>"));
+        assert!(block.ends_with("</origin-edit-format>"));
+        assert!(!block.ends_with('\n'));
+    }
+
+    #[test]
+    fn system_block_for_gpt4_mentions_unified_diff() {
+        assert_eq!(best_format_for("gpt-4o"), EditFormat::Udiff);
+        let block = system_block("gpt-4o");
+        assert!(block.contains("unified diff"), "block: {block}");
+    }
+
+    #[test]
+    fn format_from_text_detects_search_replace() {
+        let text = "src/main.rs\n\
+                    <<<<<<< SEARCH\n\
+                    let x = 1;\n\
+                    =======\n\
+                    let x = 2;\n\
+                    >>>>>>> REPLACE\n";
+        assert_eq!(format_from_text(text), Some(EditFormat::SearchReplace));
+    }
+
+    #[test]
+    fn format_from_text_detects_diff_fenced() {
+        let text = "file.py\n```diff\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n```\n";
+        assert_eq!(format_from_text(text), Some(EditFormat::DiffFenced));
+    }
+
+    #[test]
+    fn format_from_text_detects_udiff() {
+        let text = "--- a/src/lib.rs\n\
+                    +++ b/src/lib.rs\n\
+                    @@ -1,3 +1,3 @@\n\
+                    ctx line\n\
+                    -old line\n\
+                    +new line\n\
+                    more ctx\n";
+        assert_eq!(format_from_text(text), Some(EditFormat::Udiff));
+    }
+
+    #[test]
+    fn format_from_text_detects_whole_file_fence_only() {
+        let text = "config.toml\n```\nkey = \"value\"\nother = 1\n```\n";
+        assert_eq!(format_from_text(text), Some(EditFormat::WholeFile));
+    }
+
+    #[test]
+    fn format_from_text_none_for_plain_prose() {
+        assert_eq!(format_from_text("just some prose, no markers here"), None);
+        assert_eq!(format_from_text(""), None);
+    }
+
+    #[test]
+    fn extract_all_hunks_round_trips_search_replace() {
+        let text = "src/main.rs\n\
+                    <<<<<<< SEARCH\n\
+                    let x = 1;\n\
+                    =======\n\
+                    let x = 2;\n\
+                    >>>>>>> REPLACE\n";
+        // Detected as SearchReplace, so `model` is irrelevant here.
+        let hunks = extract_all_hunks(text, "claude-opus-4").unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].file, "src/main.rs");
+        assert_eq!(hunks[0].before, "let x = 1;");
+        assert_eq!(hunks[0].after, "let x = 2;");
+        let out = apply(&hunks[0], "let x = 1;").unwrap();
+        assert_eq!(out, "let x = 2;");
+    }
+
+    #[test]
+    fn extract_all_hunks_falls_back_to_model_default() {
+        // No markers: detection is `None`, so we fall back to `best_format_for`.
+        // gpt-4o maps to Udiff, whose parser errors with no `@@` header.
+        let err = extract_all_hunks("plain prose with no edits", "gpt-4o").unwrap_err();
+        assert!(matches!(err, EditFmtError::Parse(_)));
+    }
+
+    #[test]
+    fn extract_all_hunks_plain_prose_matches_parse_contract() {
+        // For a Claude default (SearchReplace), no-block input is a Parse error,
+        // exactly as `parse` reports for missing blocks.
+        let text = "just some prose";
+        let via_extract = extract_all_hunks(text, "claude-opus-4");
+        let via_parse = parse(best_format_for("claude-opus-4"), text);
+        assert_eq!(via_extract, via_parse);
+        assert!(matches!(via_extract, Err(EditFmtError::Parse(_))));
+    }
+
+    #[test]
+    fn extract_all_hunks_udiff_round_trips() {
+        let text = "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n ctx line\n-old line\n+new line\n more ctx\n";
+        let hunks = extract_all_hunks(text, "claude-opus-4").unwrap();
+        let out = apply(&hunks[0], "ctx line\nold line\nmore ctx").unwrap();
+        assert_eq!(out, "ctx line\nnew line\nmore ctx");
+    }
+}

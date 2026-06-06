@@ -71,6 +71,20 @@ fn collect_boundaries(node: Node, out: &mut BTreeSet<usize>) {
             | "function_definition"
             | "class_definition"
             | "type_declaration"
+            // Curated grammar additions (C / C++ / C# / Ruby / Bash).
+            | "struct_specifier"
+            | "enum_specifier"
+            | "type_definition"
+            | "class_specifier"
+            | "namespace_definition"
+            | "namespace_declaration"
+            | "struct_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "method"
+            | "singleton_method"
+            | "class"
+            | "module"
     ) {
         out.insert(node.start_byte());
         out.insert(node.end_byte());

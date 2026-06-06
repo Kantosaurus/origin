@@ -1,0 +1,78 @@
+# origin-schedule — recurring (cron) maintenance automation.
+#
+# Demonstrates origin's recurring/scheduled automation, the CI analogue of
+# claude `/schedule`, kilocode Triggers, and opencode cron. origin ships an
+# `origin-schedule` crate for cron/recurring jobs; this workflow is the GitHub
+# Actions surface for it.
+#
+# By DEFAULT this only runs on manual `workflow_dispatch`, so it never fires
+# unexpectedly. The daily `cron:` line is left COMMENTED as an example — a
+# maintainer can uncomment it to enable unattended daily maintenance.
+name: origin-schedule
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Maintenance task for origin to perform"
+        required: false
+        default: "Tidy docs, fix obvious typos, and refresh any stale examples. Make minimal, safe changes only."
+        type: string
+  # --- EXAMPLE: uncomment to enable a daily 06:00 UTC maintenance run. ---
+  # schedule:
+  #   - cron: "0 6 * * *"
+
+# Need write access to push a branch and open a PR.
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: origin-schedule
+  cancel-in-progress: false
+
+jobs:
+  maintain:
+    name: origin scheduled maintenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install origin
+        run: npm install -g @kantosaurus/origin
+
+      - name: Run origin maintenance task
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # On cron there is no input; fall back to a safe default task. The
+          # value is passed via env and quoted on use — never inlined.
+          ORIGIN_TASK: ${{ github.event.inputs.task || 'Tidy docs, fix obvious typos, and refresh any stale examples. Make minimal, safe changes only.' }}
+        run: |
+          set -o pipefail
+          origin run "$ORIGIN_TASK" | tee maintenance-log.txt
+
+      - name: Open a pull request with any changes
+        # peter-evans/create-pull-request no-ops cleanly when the tree is clean,
+        # so a quiet maintenance run simply produces no PR.
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: origin/scheduled-maintenance
+          delete-branch: true
+          commit-message: "chore: scheduled maintenance by origin"
+          title: "chore: scheduled maintenance by origin"
+          body: |
+            Automated maintenance opened by the `origin-schedule` workflow.
+
+            <details><summary>origin run log</summary>
+
+            ```
+            $(cat maintenance-log.txt 2>/dev/null || true)
+            ```
+
+            </details>
+
+            Review carefully before merging — these changes are unattended.
+          labels: automation, origin-schedule

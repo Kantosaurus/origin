@@ -55,6 +55,9 @@ async fn cache_marker_emitted_on_planned_boundary() {
             messages: vec![msg],
             model: "claude-3-5-haiku-20241022".into(),
             tools: vec![],
+            effort: None,
+            thinking_tokens: None,
+            attachments: Vec::new(),
         })
         .await
         .expect("ok");

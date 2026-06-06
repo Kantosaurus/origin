@@ -21,8 +21,7 @@ fn activation_checkpoint_persists_goal_immediately() {
     let db_path = tmp.path().join("sessions.db");
 
     // Step 1: parse + build, as the activation path does.
-    let parsed = parse_goal_args("--max-iter=7 --budget=99k fix the leak")
-        .expect("parse goal args");
+    let parsed = parse_goal_args("--max-iter=7 --budget=99k fix the leak").expect("parse goal args");
     let state = GoalState::new(parsed.condition.clone(), parsed.max_iter, parsed.token_budget);
 
     // Step 2 + 3: checkpoint immediately. This is the call the bug fix

@@ -22,6 +22,8 @@ fn token_round_trips_with_active_goal() {
             status: GoalStatusWire::Active,
             last_status_tag: None,
         }),
+        detached_at_unix: None,
+        memory_estimate_bytes: None,
     };
     let bytes = serde_json::to_vec(&token).unwrap();
     let back: ResumeToken = serde_json::from_slice(&bytes).unwrap();
@@ -59,14 +61,20 @@ fn token_round_trips_with_terminal_status() {
             tokens_spent: 1_000,
             token_budget: 200_000,
             started_at_unix: 1_716_000_000,
-            status: GoalStatusWire::Cleared { by: ClearReasonWire::MaxIter },
+            status: GoalStatusWire::Cleared {
+                by: ClearReasonWire::MaxIter,
+            },
             last_status_tag: None,
         }),
+        detached_at_unix: None,
+        memory_estimate_bytes: None,
     };
     let bytes = serde_json::to_vec(&token).unwrap();
     let back: ResumeToken = serde_json::from_slice(&bytes).unwrap();
     assert!(matches!(
         back.goal.unwrap().status,
-        GoalStatusWire::Cleared { by: ClearReasonWire::MaxIter }
+        GoalStatusWire::Cleared {
+            by: ClearReasonWire::MaxIter
+        }
     ));
 }

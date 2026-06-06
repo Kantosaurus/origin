@@ -136,8 +136,9 @@ origin trace query --span supervisor.restart --since 24h
 # Tail the daemon's structured spans
 origin daemon logs --follow
 
-# Run without the supervisor to see the panic on stderr
-ORIGIN_NO_SUPERVISOR=1 origin daemon start
+# Launch without the supervisor so a daemon panic is terminal (logged to
+# ~/.origin/daemon.log) instead of being auto-restarted
+ORIGIN_NO_SUPERVISOR=1 origin
 ```
 
 If SQLite corruption is suspected, `origin admin vacuum-db --check` runs a

@@ -1,12 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `ApplyPatch` — apply a unified diff atomically across files.
+//! `ApplyPatch` — apply a patch atomically across files.
 //!
-//! v2 supports the common subset of unified diff:
-//! - one or more `--- a/<path>` / `+++ b/<path>` file headers
-//! - `@@ -L1,C1 +L2,C2 @@` hunks with `-`/`+`/` ` lines
+//! Two input formats are accepted; the format is auto-detected from the body:
 //!
-//! All hunks are validated against the on-disk files before any write; if
-//! any hunk fails to apply, no file is modified.
+//! 1. **Unified diff** (the original v2 path), the common subset:
+//!    - one or more `--- a/<path>` / `+++ b/<path>` file headers
+//!    - `@@ -L1,C1 +L2,C2 @@` hunks with `-`/`+`/` ` lines
+//!
+//! 2. **Marker envelope** (the codex/opencode `*** Begin Patch` format), a
+//!    multi-file operation script supporting four directives:
+//!    - `*** Add File: <path>` — following `+`-prefixed lines (with the `+`
+//!      stripped) become the new file's content. Errors if the file exists.
+//!    - `*** Delete File: <path>` — removes the file. Errors if it is absent.
+//!    - `*** Update File: <path>` — followed by `@@` hunks (same syntax as
+//!      the unified-diff path) applied to the existing file.
+//!    - `*** Move to: <newpath>` — may follow an `*** Update File:` block;
+//!      after the hunks apply, the file is renamed to `<newpath>`.
+//!
+//! The optional `*** Begin Patch` / `*** End Patch` wrappers are tolerated
+//! whether present or absent.
+//!
+//! In BOTH formats every operation is validated against the on-disk files
+//! before any write/delete/rename: Add targets must not exist, Delete/Update
+//! targets must exist, and Move targets must resolve. If any operation fails
+//! validation, no file is modified.
 
 use crate::error::{ErrClass, ToolError};
 use crate::text_fmt;
@@ -28,10 +45,60 @@ struct Hunk {
     lines: Vec<String>, // each line begins with ' ', '-' or '+'
 }
 
+/// A single file operation parsed from a `*** Begin Patch` marker envelope.
+#[derive(Debug)]
+enum Op {
+    /// Create a new file from the verbatim content. Target must not exist.
+    Add { path: String, content: String },
+    /// Remove an existing file. Target must exist.
+    Delete { path: String },
+    /// Apply `@@` hunks to an existing file, optionally renaming it afterwards.
+    Update {
+        path: String,
+        hunks: Vec<Hunk>,
+        move_to: Option<String>,
+    },
+}
+
+/// Apply a patch to the working tree.
+///
+/// The input is dispatched by [`is_marker_patch`]: a marker envelope (codex /
+/// opencode `*** ... File:` directives) goes through [`apply_marker_patch`];
+/// anything else is treated as a unified diff by [`apply_unified_diff`].
+///
+/// # Errors
+/// `edit.no_match` if a hunk's context does not match disk;
+/// `validation.bad_patch` for malformed markers/hunks;
+/// `io.exists` / `io.not_found` if an Add/Delete/Update target is in the wrong
+/// state on disk.
+pub fn apply_patch(args: &ApplyPatchArgs) -> Result<Value, ToolError> {
+    if is_marker_patch(&args.patch) {
+        apply_marker_patch(&args.patch)
+    } else {
+        apply_unified_diff(&args.patch)
+    }
+}
+
+/// Detect the codex/opencode marker envelope. Returns `true` when any of the
+/// recognised `*** ... File:` directives (or the `*** Begin Patch` wrapper)
+/// appears on a line, after trimming leading whitespace. The unified-diff path
+/// never emits these markers, so detection is unambiguous.
+fn is_marker_patch(patch: &str) -> bool {
+    patch.lines().any(|line| {
+        let t = line.trim_start();
+        t.starts_with("*** Begin Patch")
+            || t.starts_with("*** Add File:")
+            || t.starts_with("*** Delete File:")
+            || t.starts_with("*** Update File:")
+    })
+}
+
+/// The original unified-diff path, byte-identical to the pre-marker behavior.
+///
 /// # Errors
 /// `edit.no_match` if a hunk's context does not match disk.
-pub fn apply_patch(args: &ApplyPatchArgs) -> Result<Value, ToolError> {
-    let hunks = parse_patch(&args.patch)?;
+fn apply_unified_diff(patch: &str) -> Result<Value, ToolError> {
+    let hunks = parse_patch(patch)?;
 
     // Plan all writes first; only commit if every hunk applies cleanly.
     // Key: forward-slash path from diff header; value: (orig_bytes, det, working_text)
@@ -68,6 +135,345 @@ pub fn apply_patch(args: &ApplyPatchArgs) -> Result<Value, ToolError> {
         atomic_write(&native_path, &new_bytes)?;
     }
     Ok(json!({"ok": true, "files_updated": files_updated}))
+}
+
+/// A validated filesystem action queued by [`stage_op`] for the commit phase.
+/// Each variant carries the exact bytes/paths so the commit pass performs no
+/// further validation or computation.
+enum Staged {
+    Write { native: String, bytes: Vec<u8> },
+    Delete { native: String },
+    Rename { from: String, to: String, bytes: Vec<u8> },
+}
+
+/// Running tally of operations, mirrored into the JSON result.
+#[derive(Default)]
+struct OpCounts {
+    added: usize,
+    updated: usize,
+    deleted: usize,
+    moved: usize,
+}
+
+/// Apply a codex/opencode marker-envelope patch.
+///
+/// Validates every operation against disk first (Add target absent,
+/// Delete/Update target present, Move target dir resolvable) via [`stage_op`],
+/// then commits the staged actions in a single pass via [`commit_plan`]. If any
+/// operation fails validation, no file is touched.
+///
+/// # Errors
+/// `validation.bad_patch` for malformed markers; `io.exists` if an Add target
+/// already exists; `io.not_found` if a Delete/Update target is missing;
+/// `edit.no_match` if an Update hunk's context does not match disk.
+fn apply_marker_patch(patch: &str) -> Result<Value, ToolError> {
+    let ops = parse_marker_patch(patch)?;
+
+    // Build the full plan (validating every op) before any filesystem write.
+    let mut plan: Vec<Staged> = Vec::new();
+    let mut counts = OpCounts::default();
+    for op in &ops {
+        stage_op(op, &mut plan, &mut counts)?;
+    }
+
+    commit_plan(plan)?;
+
+    Ok(json!({
+        "ok": true,
+        "files_added": counts.added,
+        "files_updated": counts.updated,
+        "files_deleted": counts.deleted,
+        "files_moved": counts.moved,
+    }))
+}
+
+/// Validate a single [`Op`] against disk and push its [`Staged`] action(s) onto
+/// `plan`, updating `counts`. Performs no writes — only reads and checks.
+fn stage_op(op: &Op, plan: &mut Vec<Staged>, counts: &mut OpCounts) -> Result<(), ToolError> {
+    match op {
+        Op::Add { path, content } => {
+            let native = to_native_path(path);
+            if std::path::Path::new(&native).exists() {
+                return Err(ToolError::new(
+                    ErrClass::Io,
+                    "exists",
+                    format!("Add File target already exists: {path}"),
+                ));
+            }
+            counts.added += 1;
+            plan.push(Staged::Write {
+                native,
+                bytes: content.clone().into_bytes(),
+            });
+        }
+        Op::Delete { path } => {
+            let native = to_native_path(path);
+            if !std::path::Path::new(&native).exists() {
+                return Err(ToolError::new(
+                    ErrClass::Io,
+                    "not_found",
+                    format!("Delete File target does not exist: {path}"),
+                ));
+            }
+            counts.deleted += 1;
+            plan.push(Staged::Delete { native });
+        }
+        Op::Update {
+            path,
+            hunks,
+            move_to,
+        } => {
+            let native = to_native_path(path);
+            let bytes = std::fs::read(&native)
+                .map_err(|e| ToolError::new(ErrClass::Io, "not_found", format!("{path}: {e}")))?;
+            let det = text_fmt::detect(&bytes);
+            let mut text = text_fmt::normalise_to_lf(&bytes, &det)?;
+            // Hunks are in original-file coordinates; shift later hunks by the
+            // net line delta of earlier ones on this same file.
+            let mut offset = 0_isize;
+            for h in hunks {
+                let (updated, delta) = apply_one_hunk(&text, h, offset)?;
+                text = updated;
+                offset += delta;
+            }
+            let new_bytes = text_fmt::denormalise(&text, &det);
+            counts.updated += 1;
+            if let Some(dest) = move_to {
+                let dest_native = to_native_path(dest);
+                // Move target must be resolvable and must not already exist as a
+                // different file (its parent dir is created in the commit step).
+                if dest_native != native && std::path::Path::new(&dest_native).exists() {
+                    return Err(ToolError::new(
+                        ErrClass::Io,
+                        "exists",
+                        format!("Move to target already exists: {dest}"),
+                    ));
+                }
+                counts.moved += 1;
+                plan.push(Staged::Rename {
+                    from: native,
+                    to: dest_native,
+                    bytes: new_bytes,
+                });
+            } else {
+                plan.push(Staged::Write {
+                    native,
+                    bytes: new_bytes,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Perform the side effects of a fully-validated plan. Every entry was checked
+/// by [`stage_op`], so this pass only writes/deletes/renames.
+fn commit_plan(plan: Vec<Staged>) -> Result<(), ToolError> {
+    for staged in plan {
+        match staged {
+            Staged::Write { native, bytes } => {
+                create_parent_dirs(&native)?;
+                atomic_write(&native, &bytes)?;
+            }
+            Staged::Delete { native } => {
+                std::fs::remove_file(&native).map_err(|e| {
+                    ToolError::new(ErrClass::Io, "permission", format!("{native}: {e}"))
+                })?;
+            }
+            Staged::Rename { from, to, bytes } => {
+                create_parent_dirs(&to)?;
+                // Write the updated content to the new path, then remove the old
+                // one. (A bare rename would lose the in-place hunk edits.)
+                atomic_write(&to, &bytes)?;
+                if to != from {
+                    std::fs::remove_file(&from).map_err(|e| {
+                        ToolError::new(ErrClass::Io, "permission", format!("{from}: {e}"))
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Create the parent directory chain for a native path, if any. No-op when the
+/// path has no parent or the parent already exists.
+fn create_parent_dirs(native: &str) -> Result<(), ToolError> {
+    if let Some(parent) = std::path::Path::new(native).parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ToolError::new(
+                    ErrClass::Io,
+                    "permission",
+                    format!("{}: {e}", parent.display()),
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Parse a marker-envelope patch into an ordered list of [`Op`]s.
+///
+/// Tolerates the optional `*** Begin Patch` / `*** End Patch` wrappers. Hunk
+/// lines inside an `*** Update File:` block reuse the same `@@`/` `/`-`/`+`
+/// grammar as the unified-diff path.
+fn parse_marker_patch(patch: &str) -> Result<Vec<Op>, ToolError> {
+    let mut p = MarkerParser::default();
+    for raw in patch.lines() {
+        p.feed(raw)?;
+    }
+    let ops = p.finish();
+    if ops.is_empty() {
+        return Err(ToolError::new(
+            ErrClass::Validation,
+            "bad_patch",
+            "marker patch contained no operations",
+        ));
+    }
+    Ok(ops)
+}
+
+/// Whichever directive block the [`MarkerParser`] is currently accumulating.
+#[derive(Default)]
+enum Block {
+    #[default]
+    None,
+    /// `*** Add File:` — `path` plus the `+`-stripped content lines so far.
+    Add { path: String, lines: Vec<String> },
+    /// `*** Update File:` — `path`, finished hunks, the in-progress hunk, and
+    /// an optional pending `*** Move to:` destination.
+    Update {
+        path: String,
+        hunks: Vec<Hunk>,
+        cur: Option<Hunk>,
+        move_to: Option<String>,
+    },
+}
+
+/// Line-oriented state machine for the marker envelope. Each [`feed`] call
+/// either opens a new directive (flushing the previous block) or appends the
+/// line to the open block.
+#[derive(Default)]
+struct MarkerParser {
+    ops: Vec<Op>,
+    block: Block,
+}
+
+impl MarkerParser {
+    /// Close the current block (if any), pushing its completed [`Op`].
+    fn flush(&mut self) {
+        match std::mem::take(&mut self.block) {
+            Block::None => {}
+            Block::Add { path, lines } => {
+                // Join with '\n'; codex Add blocks are newline-terminated, so
+                // append a trailing newline when any content line was present.
+                let mut content = lines.join("\n");
+                if !lines.is_empty() {
+                    content.push('\n');
+                }
+                self.ops.push(Op::Add { path, content });
+            }
+            Block::Update {
+                path,
+                mut hunks,
+                cur,
+                move_to,
+            } => {
+                if let Some(h) = cur {
+                    hunks.push(h);
+                }
+                self.ops.push(Op::Update {
+                    path,
+                    hunks,
+                    move_to,
+                });
+            }
+        }
+    }
+
+    /// Process one raw input line.
+    fn feed(&mut self, raw: &str) -> Result<(), ToolError> {
+        let line = raw.trim_start();
+        if line.starts_with("*** Begin Patch") || line.starts_with("*** End Patch") {
+            self.flush();
+        } else if let Some(path) = line.strip_prefix("*** Add File:") {
+            self.flush();
+            self.block = Block::Add {
+                path: path.trim().to_string(),
+                lines: Vec::new(),
+            };
+        } else if let Some(path) = line.strip_prefix("*** Delete File:") {
+            self.flush();
+            self.ops.push(Op::Delete {
+                path: path.trim().to_string(),
+            });
+        } else if let Some(path) = line.strip_prefix("*** Update File:") {
+            self.flush();
+            self.block = Block::Update {
+                path: path.trim().to_string(),
+                hunks: Vec::new(),
+                cur: None,
+                move_to: None,
+            };
+        } else if let Some(dest) = line.strip_prefix("*** Move to:") {
+            let Block::Update { move_to, .. } = &mut self.block else {
+                return Err(ToolError::new(
+                    ErrClass::Validation,
+                    "bad_patch",
+                    "`*** Move to:` without a preceding `*** Update File:`",
+                ));
+            };
+            *move_to = Some(dest.trim().to_string());
+        } else {
+            self.feed_body(raw, line)?;
+        }
+        Ok(())
+    }
+
+    /// Append a non-directive line to whichever block is open.
+    fn feed_body(&mut self, raw: &str, line: &str) -> Result<(), ToolError> {
+        match &mut self.block {
+            Block::Add { lines, .. } => {
+                // Add File bodies are `+`-prefixed; tolerate a bare line too.
+                lines.push(raw.strip_prefix('+').unwrap_or(raw).to_string());
+            }
+            Block::Update {
+                path, hunks, cur, ..
+            } => {
+                if let Some(rest) = line.strip_prefix("@@ -") {
+                    if let Some(h) = cur.take() {
+                        hunks.push(h);
+                    }
+                    let old_part = rest.split(' ').next().ok_or_else(|| {
+                        ToolError::new(ErrClass::Validation, "bad_patch", "missing old range")
+                    })?;
+                    let l_str = old_part.split(',').next().unwrap_or("1");
+                    let old_start: usize = l_str.parse().map_err(|_| {
+                        ToolError::new(ErrClass::Validation, "bad_patch", "bad old line number")
+                    })?;
+                    *cur = Some(Hunk {
+                        file: path.clone(),
+                        old_start,
+                        lines: Vec::new(),
+                    });
+                } else if let Some(h) = cur.as_mut() {
+                    if raw.starts_with(' ') || raw.starts_with('-') || raw.starts_with('+') {
+                        h.lines.push(raw.to_string());
+                    }
+                }
+            }
+            // Outside any block (e.g. blank lines around the envelope): ignore.
+            Block::None => {}
+        }
+        Ok(())
+    }
+
+    /// Flush the trailing block and return the parsed operations.
+    fn finish(mut self) -> Vec<Op> {
+        self.flush();
+        self.ops
+    }
 }
 
 /// Convert a diff-style forward-slash path to a native OS path.
@@ -154,7 +560,9 @@ fn apply_one_hunk(text: &str, h: &Hunk, offset: isize) -> Result<(String, isize)
     }
     // start index in CURRENT (working) coordinates; isize so a negative result
     // from an out-of-range hunk start is rejected rather than wrapping.
-    let base = h.old_start.saturating_sub(1) as isize + offset;
+    let base = isize::try_from(h.old_start.saturating_sub(1))
+        .unwrap_or(isize::MAX)
+        .saturating_add(offset);
     let start_idx = usize::try_from(base).map_err(|_| {
         ToolError::new(
             ErrClass::Edit,
@@ -200,7 +608,8 @@ fn apply_one_hunk(text: &str, h: &Hunk, offset: isize) -> Result<(String, isize)
     if text.ends_with('\n') {
         joined.push('\n');
     }
-    let delta = new_block.len() as isize - old_block.len() as isize;
+    let delta = isize::try_from(new_block.len()).unwrap_or(isize::MAX)
+        - isize::try_from(old_block.len()).unwrap_or(isize::MAX);
     Ok((joined, delta))
 }
 
@@ -222,7 +631,7 @@ fn atomic_write(path: &str, bytes: &[u8]) -> Result<(), ToolError> {
 
 crate::origin_tool! {
     name: "ApplyPatch",
-    description: "Apply a unified diff atomically across one or more files. Validates context lines before any write.",
+    description: "Apply a patch atomically across one or more files. Accepts either a unified diff (--- a/ / +++ b/ headers with @@ hunks) OR a codex/opencode marker envelope: optional `*** Begin Patch`/`*** End Patch` wrappers around `*** Add File: <path>` (+-prefixed content; file must not exist), `*** Delete File: <path>` (file must exist), and `*** Update File: <path>` (followed by @@ hunks, optionally then `*** Move to: <newpath>` to rename after editing). All operations are validated before any write; if any fails, nothing changes.",
     tier: Tier::RequiresPermission,
     urgency: Urgency::Medium,
     side_effects: SideEffects::Mutating,

@@ -268,7 +268,7 @@ pub fn parse_chunk_for_test(line: &[u8]) -> Option<TestFrame> {
     let payload = text
         .trim_start()
         .strip_prefix("data:")
-        .map_or(text.trim(), str::trim_start)
+        .map_or_else(|| text.trim(), str::trim_start)
         .trim();
     if payload.is_empty() || payload == "[DONE]" {
         return None;

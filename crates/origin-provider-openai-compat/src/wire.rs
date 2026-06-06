@@ -24,6 +24,10 @@ pub struct WireRequest<'a> {
     /// `usage` SSE frame with token counts (otherwise omitted).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<WireStreamOptions>,
+    /// Reasoning-effort hint (`reasoning_effort` on the wire). `None` is omitted,
+    /// keeping the request byte-identical to the pre-effort behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<&'static str>,
 }
 
 /// `stream_options` block on the streaming request body.
@@ -86,8 +90,9 @@ pub struct WireResponse {
 #[derive(Deserialize)]
 pub struct WireChoice {
     pub message: WireRespMessage,
+    /// Consumed by the response decode path to recognise a length-limit
+    /// truncation on non-`OpenAI` backends (see `decode_response`).
     #[serde(default)]
-    #[allow(dead_code)]
     pub finish_reason: Option<String>,
 }
 
@@ -108,6 +113,14 @@ pub struct WireUsage {
 }
 
 /// Encode a `ChatRequest` into the `OpenAI` wire-shape request.
+///
+/// `ChatRequest.thinking_tokens` is intentionally **not** mapped here: the
+/// explicit extended-thinking `budget_tokens` control is an Anthropic Messages
+/// API concept with no `OpenAI` Chat Completions equivalent (`OpenAI`-style
+/// reasoning models expose only the coarse `reasoning_effort` knob, which is
+/// already wired from `ChatRequest.effort`). The field is therefore a no-op for
+/// `OpenAI`-compatible backends, leaving the body byte-identical whether or not
+/// a thinking budget was requested.
 #[must_use]
 pub fn encode_request(req: &ChatRequest, stream: bool) -> WireRequest<'_> {
     let mut messages = Vec::with_capacity(req.messages.len() + 1);
@@ -146,6 +159,7 @@ pub fn encode_request(req: &ChatRequest, stream: bool) -> WireRequest<'_> {
         } else {
             None
         },
+        reasoning_effort: req.effort.map(origin_provider::ReasoningEffort::as_wire_str),
     }
 }
 

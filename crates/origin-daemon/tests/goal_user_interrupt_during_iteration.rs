@@ -122,8 +122,7 @@ async fn push_back_buffer_dispatches_pending_before_wire_read() {
     // would have stashed after a mid-iteration peek, then verifies the
     // drain pattern returns that exact message and leaves the slot
     // empty for the next iteration.
-    let pending: Arc<tokio::sync::Mutex<Option<ClientMessage>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
+    let pending: Arc<tokio::sync::Mutex<Option<ClientMessage>>> = Arc::new(tokio::sync::Mutex::new(None));
 
     // Drain on empty slot → None (outer loop would then read a new
     // frame from the wire).
@@ -136,6 +135,7 @@ async fn push_back_buffer_dispatches_pending_before_wire_read() {
         model: "m".into(),
         user_text: "after the interrupt".into(),
         session_id: None,
+        ..Default::default()
     });
     *pending.lock().await = Some(followup);
 
@@ -160,8 +160,7 @@ async fn push_back_buffer_holds_interrupt_too_when_caller_chooses() {
     // This test pins that down so a future refactor that changes the
     // driver's push-back policy can still rely on the buffer working
     // for any variant.
-    let pending: Arc<tokio::sync::Mutex<Option<ClientMessage>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
+    let pending: Arc<tokio::sync::Mutex<Option<ClientMessage>>> = Arc::new(tokio::sync::Mutex::new(None));
     *pending.lock().await = Some(ClientMessage::Interrupt);
     let drained = pending.lock().await.take();
     assert!(matches!(drained, Some(ClientMessage::Interrupt)));

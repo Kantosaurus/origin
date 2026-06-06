@@ -44,6 +44,9 @@ async fn calls_openrouter_chat_completions_endpoint() {
         messages: vec![Message::new(Role::User).with_block(Block::text("ping"))],
         model: "openrouter/auto".into(),
         tools: vec![],
+        effort: None,
+        thinking_tokens: None,
+        attachments: Vec::new(),
     };
     let resp = provider.chat(req).await.expect("openrouter chat should succeed");
 
@@ -74,6 +77,9 @@ async fn auth_error_maps_to_provider_auth() {
             messages: vec![],
             model: "openrouter/auto".into(),
             tools: vec![],
+            effort: None,
+            thinking_tokens: None,
+            attachments: Vec::new(),
         })
         .await
         .expect_err("should fail with auth");

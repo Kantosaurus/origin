@@ -29,7 +29,7 @@ pub async fn attach_bearer(
 ) -> Result<(), OAuthBridgeError> {
     let key = format!("{account}/oauth");
     let secret = vault.get(provider, &key).await?;
-    let token = secret.expose().to_string();
+    let token = secret.expose().clone();
     transport.set_bearer(Some(token));
     Ok(())
 }

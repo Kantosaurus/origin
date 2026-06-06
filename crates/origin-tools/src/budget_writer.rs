@@ -50,7 +50,7 @@ impl ResultWriter {
 
     /// Mark that the next `push_str` corresponds to the record at `line_idx`.
     /// Used to compute the `offset` field of the continuation handle on overflow.
-    pub fn note_line(&mut self, line_idx: u32) {
+    pub const fn note_line(&mut self, line_idx: u32) {
         if !self.overflowed {
             self.last_line_noted = Some(line_idx);
         }

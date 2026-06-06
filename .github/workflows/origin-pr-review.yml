@@ -1,0 +1,107 @@
+# origin-pr-review — automated PR review on open / update.
+#
+# Mirrors kilocode/opencode PR-review bots: on every push to a PR, compute the
+# diff against the base branch, ask `origin run` for a focused review, and post a
+# single summary comment.
+#
+# origin ships an `origin-review` crate that provides confidence-scored
+# dedup/triage primitives (so the bot can suppress repeat findings and rank by
+# confidence). This workflow is the thin CI shell around that capability; a
+# future iteration can call into `origin-review` directly for inline,
+# deduplicated comments instead of one summary blob.
+#
+# SECURITY: PR title and diff are untrusted. They are passed via `env:` and read
+# by the shell as plain strings — never inlined into a command with `${{ }}`.
+name: origin-pr-review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  # Allow a maintainer to trigger a review manually and pick a review mode.
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Review strictness"
+        required: false
+        default: balanced
+        type: choice
+        options: [balanced, strict]
+
+# Least privilege: read code, write a review comment.
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: origin-pr-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: origin reviews the diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Skip when the PR title carries an opt-out token, e.g. "WIP foo [skip origin]".
+    if: ${{ !contains(github.event.pull_request.title, '[skip origin]') }}
+    steps:
+      - name: Checkout (full history for diffing)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - name: Install origin
+        run: npm install -g @kantosaurus/origin
+
+      - name: Compute diff
+        id: diff
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          # base_ref is only set on pull_request events; fall back to the default
+          # branch for manual dispatch.
+          base="${BASE_REF:-dev}"
+          git fetch --no-tags --depth=1 origin "$base"
+          git diff "origin/${base}...HEAD" > pr.diff || true
+          lines="$(wc -l < pr.diff | tr -d ' ')"
+          echo "lines=$lines" >> "$GITHUB_OUTPUT"
+
+      - name: Run origin review
+        id: run
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Default to balanced for the auto-trigger; honor the dispatch input.
+          MODE: ${{ github.event.inputs.mode || 'balanced' }}
+        run: |
+          set -o pipefail
+          # Build the prompt in a file so the (untrusted) diff is never inlined
+          # into the command line.
+          {
+            echo "You are origin's PR reviewer. Review mode: ${MODE}."
+            echo "In ${MODE} mode, ${MODE/balanced/flag only correctness, security, and clear regressions; skip nits}."
+            echo "Produce a concise Markdown summary: a one-line verdict, then"
+            echo "grouped findings (Blocking / Should-fix / Nit) with file:line refs."
+            echo "Only comment on what the diff actually changes."
+            echo
+            echo "----- BEGIN DIFF -----"
+            cat pr.diff
+            echo "----- END DIFF -----"
+          } > prompt.txt
+          origin run "$(cat prompt.txt)" | tee review.md
+
+      - name: Post review summary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          MODE: ${{ github.event.inputs.mode || 'balanced' }}
+        run: |
+          {
+            echo "🔎 **origin PR review** (mode: \`${MODE}\`)"
+            echo
+            cat review.md
+            echo
+            echo "<sub>Powered by \`origin run\`. Confidence-scored dedup/triage"
+            echo "is provided by the \`origin-review\` crate. Add \`[skip origin]\`"
+            echo "to the PR title to opt out.</sub>"
+          } > review-comment.md
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file review-comment.md

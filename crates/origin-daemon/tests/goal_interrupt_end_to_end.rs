@@ -109,7 +109,10 @@ async fn interrupt_between_iterations_clears_with_user_slash() {
     );
     // iter is the goal's iter counter at the moment of clear. After one
     // run_loop call, record_iteration has been called once, so iter=1.
-    assert_eq!(iter, 1, "iter counter at clear time should reflect one completed iteration");
+    assert_eq!(
+        iter, 1,
+        "iter counter at clear time should reflect one completed iteration"
+    );
 }
 
 #[tokio::test]
@@ -143,6 +146,7 @@ async fn non_interrupt_pushback_also_clears_and_preserves_message() {
                 model: "m".into(),
                 user_text: "after the goal".into(),
                 session_id: None,
+                ..Default::default()
             }));
         })
     });

@@ -25,7 +25,7 @@ fn touch_file_triggers_rebuild_report() {
 
     let mut idx = open_idx(dir.path());
 
-    let report1 = rebuild_paths(&mut idx, &[src.clone()], Language::Rust).expect("r1");
+    let report1 = rebuild_paths(&mut idx, std::slice::from_ref(&src), Language::Rust).expect("r1");
     assert_eq!(report1.nodes_added + report1.nodes_updated, 1);
 
     fs::write(&src, "fn before() {}\nfn after() {}\n").expect("rewrite");

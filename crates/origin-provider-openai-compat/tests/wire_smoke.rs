@@ -43,6 +43,9 @@ async fn happy_path_chat() {
         }],
         model: "test-model".to_string(),
         tools: vec![],
+        effort: None,
+        thinking_tokens: None,
+        attachments: Vec::new(),
     };
 
     let resp = provider.chat(req).await.unwrap();

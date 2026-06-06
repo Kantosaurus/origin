@@ -23,26 +23,31 @@ jobs:
           # glibc and runs on all mainstream Linux distros (not Alpine/static).
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+          # aarch64 Linux/Windows build on NATIVE ARM64 runners (GA for public
+          # repos). ort 2.0.0-rc.12 ships aarch64 ONNX Runtime prebuilts that
+          # download-binaries links cleanly on a native arm64 host; cross-building
+          # them on x64 runners hit sysroot/link gaps (undefined
+          # __libc_single_threaded for Linux; unresolved OrtGetApiBase for the
+          # x64->arm64 Windows cross), so we build them natively.
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
+            os: ubuntu-24.04-arm
+          # NOTE: x86_64 (Intel) macOS is intentionally NOT built — ort rc.12
+          # (ONNX Runtime 1.24.2) dropped the x86_64-apple-darwin prebuilt, and no
+          # ort version ships BOTH x64-macOS and arm64-Windows prebuilts. Apple
+          # Silicon (below) is covered; Intel Macs run the arm64 build via Rosetta 2.
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-pc-windows-msvc
             os: windows-latest
           - target: aarch64-pc-windows-msvc
-            os: windows-latest
+            os: windows-11-arm
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: 1.83.0
+          toolchain: 1.96.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Install cross (aarch64 Linux only)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo install cross --locked
       - name: Build
         shell: bash
         env:
@@ -57,23 +62,41 @@ jobs:
           CARGO_PROFILE_RELEASE_OPT_LEVEL: z
           CARGO_PROFILE_RELEASE_STRIP: symbols
         run: |
-          # aarch64 Linux is cross-compiled with `cross`; x86_64 Linux builds
-          # natively on the ubuntu runner; macOS/Windows build natively too.
-          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
-            cross build -p origin-cli --release --target ${{ matrix.target }}
-          else
-            cargo build -p origin-cli --release --target ${{ matrix.target }}
-          fi
-      - name: Stage binary
+          # Ship the runtime trio on every target: `origin` (CLI) plus the
+          # SEPARATE `origin-daemon` binary the CLI spawns (required to stand up
+          # the daemon) and `origin-supervisor` (restarts the daemon + consumes
+          # the self-dev hot-reload exit-86 sentinel), co-located so the CLI's
+          # sibling lookup (current_exe().parent()) resolves them. Every target
+          # now builds NATIVELY on its own architecture's runner, so ONNX Runtime
+          # (ort, via origin-mem) compiles + links cleanly everywhere.
+          cargo build -p origin-cli -p origin-daemon -p origin-supervisor \
+            --release --target ${{ matrix.target }}
+      - name: Stage binaries
         shell: bash
         run: |
           mkdir -p dist
           ext=""
           if [[ "${{ matrix.target }}" == *windows* ]]; then ext=".exe"; fi
-          cp "target/${{ matrix.target }}/release/origin$ext" "dist/origin-${{ matrix.target }}$ext"
+          # Stage whatever was built for this target (the trio on native-arch
+          # targets, `origin` alone on the two aarch64 cross targets). All are
+          # named `<bin>-<triple>[.exe]` so the SHA256SUMS (`origin-*`), cosign
+          # (`dist/*`), upload (`origin-*`), and npm collect (`origin-*`) steps
+          # pick up every one. A binary not built for this target is skipped
+          # (the npm assembler + cold-path downloader both tolerate a missing
+          # daemon/supervisor for that platform).
+          for b in origin origin-daemon origin-supervisor; do
+            src="target/${{ matrix.target }}/release/$b$ext"
+            if [[ -f "$src" ]]; then cp "$src" "dist/$b-${{ matrix.target }}$ext"; fi
+          done
+      # Cosign has no arm64-Windows binary (the installer errors "unsupported
+      # architecture ARM64"), so skip cosign signing on that one target. Its
+      # binaries still ship and are covered by SHA256SUMS (which is what the npm
+      # download fallback verifies against).
       - name: Cosign keyless sign
+        if: matrix.target != 'aarch64-pc-windows-msvc'
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Sign
+        if: matrix.target != 'aarch64-pc-windows-msvc'
         shell: bash
         env:
           COSIGN_YES: "true"
@@ -81,8 +104,11 @@ jobs:
           for f in dist/*; do
             cosign sign-blob --bundle "$f.sig" "$f"
           done
+      # Also skip SLSA attestation on arm64-Windows (same toolchain-support gap
+      # as cosign); the binary ships + is covered by SHA256SUMS.
       - name: SLSA provenance attestation
-        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
+        if: matrix.target != 'aarch64-pc-windows-msvc'
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: "dist/*"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -95,12 +121,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: 1.83.0
+          toolchain: 1.96.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
       - name: Flatten
@@ -154,7 +180,7 @@ jobs:
             -exec cp {} out/sbom/ \;
           ls -la out/sbom || true
       - name: GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           files: |
             out/origin-*
@@ -175,12 +201,12 @@ jobs:
       contents: read
       id-token: write # required for `npm publish --provenance`
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
       - name: Collect binaries
@@ -196,6 +222,9 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: "true"
+          # Package family defaults to the scoped `@kantosaurus/origin`
+          # (lib/platform.js); the unscoped `originx*` names tripped npm spam
+          # detection. Set ORIGIN_NPM_PREFIX here only to override that default.
         run: |
           node packaging/npm/scripts/build.mjs \
             --version "${{ steps.ver.outputs.version }}" \

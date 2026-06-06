@@ -12,7 +12,7 @@ use origin_codegraph::index::CodeGraphIndex;
 use origin_core::types::Role;
 use origin_daemon::agent::{LoopOptions, SessionStoreSummaryDeliverer};
 use origin_daemon::auth::BearerStore;
-use origin_daemon::config::bearer_ttl_secs;
+use origin_daemon::config::{bearer_ttl_secs, governance_path, load_governance, Governance};
 use origin_daemon::memory_wiring::MemoryWiring;
 use origin_daemon::pairing::{Pairing, RedeemResult};
 use origin_daemon::plan_bus::PlanBus;
@@ -30,7 +30,8 @@ use origin_ipc::transport::{Listener, SharedConnection};
 use origin_keyvault::{KeyVault, Secret};
 use origin_mem::{Embedder, MemIndex};
 use origin_metrics::Metrics;
-use origin_permission::prompt::AlwaysAllow;
+use origin_daemon::ipc_prompter::{IpcPrompter, PermissionRegistry};
+use origin_permission::prompt::{AlwaysAllow, Prompter};
 use origin_provider::catalog::Catalog;
 use origin_provider::Provider;
 use origin_provider_anthropic::Anthropic;
@@ -291,6 +292,10 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     // Daemon-wide pending-proposal registry — lets `MemoryDecision::Accept`
     // resolve a proposal recorded by an earlier prompt-turn handler.
     let proposal_registry = Arc::new(ProposalRegistry::new());
+    // Daemon-wide pending permission-ask registry (opt-in interactive prompts).
+    // Shared across connections so a `PermissionDecision` arriving on a fresh
+    // connection resolves an ask emitted on the turn's (busy) connection.
+    let permission_registry = Arc::new(PermissionRegistry::new());
     // Daemon-wide plan-op broadcast bus. IPC clients subscribe via
     // `ClientMessage::SubscribePlan`; swarm coordinators publish via
     // `bus.publish(envelope)` when their PlanHandle::apply succeeds.
@@ -331,22 +336,29 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
         .with_plan(wire_plan.clone());
 
     let initial_account = env::var("ORIGIN_ACCOUNT").unwrap_or_else(|_| "default".into());
-    let initial_provider_str = match env::var("ORIGIN_PROVIDER") {
-        Ok(v) => v,
-        Err(_) => {
-            // Auto-detect: prefer anthropic-oauth when OAuth tokens exist in
-            // the vault but no raw API key is stored.
-            let has_api_key = vault.get("anthropic", &initial_account).await.is_ok();
-            let has_oauth = vault
-                .get("anthropic-oauth", &format!("{initial_account}/oauth"))
-                .await
-                .is_ok();
-            if !has_api_key && has_oauth {
-                info!("no anthropic API key found; using anthropic-oauth");
-                "anthropic-oauth".into()
-            } else {
-                "anthropic".into()
-            }
+    // Register the factory process-wide so the agent loop can rebuild a provider
+    // mid-loop for a CROSS-PROVIDER router pick (foundation L84 / kilo L265). This
+    // is inert unless `ORIGIN_ROUTER` is set and a pick lands on a different
+    // provider; credentials still resolve only through this factory's vault.
+    origin_daemon::provider_factory::set_global(
+        Arc::new(factory.clone()),
+        initial_account.clone(),
+    );
+    let initial_provider_str = if let Ok(v) = env::var("ORIGIN_PROVIDER") {
+        v
+    } else {
+        // Auto-detect: prefer anthropic-oauth when OAuth tokens exist in
+        // the vault but no raw API key is stored.
+        let has_api_key = vault.get("anthropic", &initial_account).await.is_ok();
+        let has_oauth = vault
+            .get("anthropic-oauth", &format!("{initial_account}/oauth"))
+            .await
+            .is_ok();
+        if !has_api_key && has_oauth {
+            info!("no anthropic API key found; using anthropic-oauth");
+            "anthropic-oauth".into()
+        } else {
+            "anthropic".into()
         }
     };
     let initial_provider_id = ProviderId::parse(&initial_provider_str, factory.catalog())
@@ -480,14 +492,20 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
                         Ok(env) => bus.publish(env),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             warn!(lagged = n, "plan bridge: fell behind PlanHandle broadcast");
-                            continue;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
             });
         }
-        Arc::new(Coordinator::new(plan_handle, "origin-daemon"))
+        // Install the REAL agent-loop worker (replacing the noop). Each `Task`
+        // dispatch now runs a bounded sub-agent against a snapshot of the active
+        // provider, with its tools narrowed to the worker's allow-list (minus
+        // `Task`). Worker bodies run in `TaskClass::Sidecar` (see Coordinator),
+        // so a parent awaiting a child never deadlocks the Critical pool.
+        let mut coord = Coordinator::new(plan_handle, "origin-daemon");
+        coord.set_default_worker(origin_daemon::swarm_worker::real_worker(Arc::clone(&active)));
+        Arc::new(coord)
     };
     info!("swarm coordinator ready");
 
@@ -526,6 +544,26 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
         "workflows catalog loaded at startup"
     );
 
+    // Optional governance config (5-tier policy engine + per-prompt ConSeca
+    // security policy). Loaded once at startup from `governance.toml`. When the
+    // file is absent both handles are `None` ⇒ the deny-only overlay is inert
+    // and daemon behavior is byte-identical to before this wiring landed.
+    let governance: Governance = {
+        let path = governance_path();
+        match load_governance(&path) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "governance config load failed; running with no governance overlay");
+                Governance::default()
+            }
+        }
+    };
+    info!(
+        policy = governance.policy.is_some(),
+        conseca = governance.conseca.is_some(),
+        "governance config loaded at startup"
+    );
+
     spawn_idle_consolidator(memory.as_ref());
 
     // P11.12: optional bounded-cardinality Prometheus `/metrics` endpoint.
@@ -539,10 +577,57 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     if let Some(bind) = parse_metrics_bind() {
         spawn_metrics_endpoint((*metrics).clone(), bind);
     }
+    // cline/gemini OpenTelemetry export: when built `--features otel` and
+    // ORIGIN_OTLP_ENDPOINT is set, install a real OTLP/gRPC metrics pipeline.
+    // The global meter provider keeps the returned handle alive (we drop the
+    // local clone). Off by default (feature + env both required).
+    #[cfg(feature = "otel")]
+    {
+        if let Ok(endpoint) = env::var("ORIGIN_OTLP_ENDPOINT") {
+            match origin_metrics::exporter::otel::install(&endpoint) {
+                Ok(_provider) => info!(%endpoint, "otel: OTLP metrics exporter installed"),
+                Err(e) => tracing::warn!(error = %e, "otel: failed to install OTLP exporter"),
+            }
+        }
+    }
 
     let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
     let listener = Listener::bind(&path).await?;
     info!(path = %path, "origin-daemon listening");
+
+    // Default-off autonomous background loops (items J + K). Each is gated on
+    // its own env var (`ORIGIN_SCHEDULER=1` / `ORIGIN_AMBIENT=1`); when unset
+    // these spawn nothing. When set, a fired trigger / selected ambient task
+    // connects back to the socket we just bound and submits a real `Prompt`,
+    // so it runs through the exact same agent path as an interactive turn.
+    origin_daemon::scheduler::maybe_spawn(path.clone());
+    origin_daemon::ambient::maybe_spawn(path.clone());
+    // jcode Overnight mode (ORIGIN_OVERNIGHT=1); off by default. Runs an
+    // OvernightPlan to completion within a wall-clock window and persists a
+    // morning report to ~/.origin/overnight/ for `origin ambient report`.
+    origin_daemon::overnight::maybe_spawn(path.clone());
+    // Authenticated HTTP webhook trigger source (ORIGIN_WEBHOOK + _TOKEN); off
+    // by default. A POST fires its body as a prompt onto the live agent path.
+    origin_daemon::webhook::maybe_spawn(path.clone());
+    // gemini-cli Auto Memory (ORIGIN_MEM_GARDEN=1); off by default. Mines recent
+    // session transcripts on an idle cadence into a secret-redacted review inbox
+    // at ~/.origin/memory-inbox/ for the user to accept/reject.
+    origin_daemon::mem_garden::maybe_spawn(Arc::clone(&session_store));
+    // Supervisor lifecycle policy (origin-supervisor): construct from env with
+    // conservative defaults (5-min idle / 30-min detached grace / 1 GiB budget
+    // / shed @ 90%) and start the periodic tick. Always-on but never acts on a
+    // normal short session; the destructive shed/retire teardown is itself
+    // opt-in via `ORIGIN_SUPERVISOR_ENFORCE=1`. Idempotent and safe to call
+    // unconditionally — see `supervisor::init`.
+    origin_daemon::supervisor::init();
+
+    // Self-dev SUCCESSOR BOOT (gated `ORIGIN_SELFDEV=1`). If a previous process
+    // authorized a supervised restart it persisted a `ReloadContext`; the
+    // successor loads it, drives the driver's `Resumed` event (settling the
+    // machine to Idle + clearing the failure streak), then clears the store so a
+    // crash cannot re-resume. A no-op when self-dev is disabled or no context is
+    // present, so default boot is byte-identical.
+    selfdev_successor_boot();
 
     // Populate the shared `DaemonState` so the cooperative shutdown driver
     // can bind real per-phase callbacks. We do this AFTER each subsystem is
@@ -577,13 +662,16 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
             vault.clone(),
             Arc::clone(&metrics),
             Arc::clone(&proposal_registry),
+            Arc::clone(&permission_registry),
             plan_bus.clone(),
             Arc::clone(&skill_catalog),
             Arc::clone(&workflows_catalog),
+            governance.clone(),
             Arc::clone(&code_graph),
             Arc::clone(&mem_router),
             Arc::clone(&coordinator),
             wire_plan.clone(),
+            path.clone(),
         );
     }
 }
@@ -676,13 +764,16 @@ fn spawn_handler_task(
     vault: KeyVault,
     metrics: Arc<Metrics>,
     proposal_registry: Arc<ProposalRegistry>,
+    permission_registry: Arc<PermissionRegistry>,
     plan_bus: PlanBus,
     skill_catalog: Arc<SkillCatalog>,
     workflows_catalog: Arc<origin_daemon::workflows::WorkflowsFile>,
+    governance: Governance,
     code_graph: Arc<tokio::sync::Mutex<CodeGraphIndex>>,
     mem_router: Arc<dyn origin_codegraph::ask::MemRouter>,
     coordinator: Arc<Coordinator>,
     wire_plan: origin_planner::Plan,
+    sock_path: String,
 ) {
     // Build a type-erased memory handle once per connection so `handle_request`
     // doesn't need to know about `MemoryWiring` internals.
@@ -723,6 +814,18 @@ fn spawn_handler_task(
         // iteration to complete (which is the window a crash could lose
         // the goal in).
         let last_known_session_id: Arc<tokio::sync::Mutex<Option<String>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        // Per-connection active account for CROSS-PROVIDER mid-loop rebuilds
+        // (multi-account credential isolation). `None` (the default, until this
+        // connection issues a `/account` switch) ⇒ a cross-provider rebuild
+        // falls back to the process-wide global account slot, byte-identical to
+        // the pre-per-connection wire. A `SwitchAccount` on THIS connection sets
+        // it (see `handle_switch`), so the rebuild resolves credentials for the
+        // account this connection chose — a `/account` switch on a different
+        // connection cannot leak in. Wrapped in `Arc<Mutex<…>>` so the switch
+        // handler and the per-request `LoopOptions` build can share it without
+        // rebuilding the per-connection state.
+        let active_account: Arc<tokio::sync::Mutex<Option<Arc<str>>>> =
             Arc::new(tokio::sync::Mutex::new(None));
 
         loop {
@@ -777,12 +880,11 @@ fn spawn_handler_task(
                     // only invoked when a goal is active AND the main model
                     // claimed `met`, so per-prompt construction is cheap
                     // (allocation only; no network calls here).
-                    let verifier: Arc<dyn origin_goal::verifier::Verifier> = Arc::new(
-                        origin_daemon::anthropic_verifier::AnthropicHaikuVerifier {
+                    let verifier: Arc<dyn origin_goal::verifier::Verifier> =
+                        Arc::new(origin_daemon::anthropic_verifier::AnthropicHaikuVerifier {
                             provider: Arc::clone(&provider_snapshot),
                             model: "claude-haiku-4-5".to_string(),
-                        },
-                    );
+                        });
                     let outcome = handle_request(
                         &conn,
                         provider_snapshot.as_ref(),
@@ -792,8 +894,10 @@ fn spawn_handler_task(
                         memory.as_ref(),
                         memory_handle.clone(),
                         Arc::clone(&proposal_registry),
+                        Arc::clone(&permission_registry),
                         Arc::clone(&skill_catalog),
                         Arc::clone(&workflows_catalog),
+                        governance.clone(),
                         Arc::clone(&active_skills),
                         Arc::clone(&code_graph),
                         Arc::clone(&mem_router),
@@ -802,6 +906,7 @@ fn spawn_handler_task(
                         Arc::clone(&active_goal),
                         Arc::clone(&pending_message),
                         Arc::clone(&last_known_session_id),
+                        Arc::clone(&active_account),
                         verifier,
                         req,
                     )
@@ -826,7 +931,16 @@ fn spawn_handler_task(
                     }
                 }
                 ClientMessage::SwitchAccount { provider, account_id } => {
-                    if !handle_switch(&conn, &active, &factory, &provider, &account_id).await {
+                    if !handle_switch(
+                        &conn,
+                        &active,
+                        &factory,
+                        &active_account,
+                        &provider,
+                        &account_id,
+                    )
+                    .await
+                    {
                         break;
                     }
                 }
@@ -880,13 +994,8 @@ fn spawn_handler_task(
                     }
                 }
                 ClientMessage::ResumeRequest { token } => {
-                    handle_resume_request(
-                        &conn,
-                        Arc::clone(&session_store),
-                        Arc::clone(&active_goal),
-                        token,
-                    )
-                    .await;
+                    handle_resume_request(&conn, Arc::clone(&session_store), Arc::clone(&active_goal), token)
+                        .await;
                 }
                 ClientMessage::ActivateSkill { name, args } => {
                     let conn_clone = Arc::clone(&conn);
@@ -903,62 +1012,6 @@ fn spawn_handler_task(
                         )
                         .await;
                         continue;
-                    }
-                    // Bug #10: `/clear` documents itself as wiping the
-                    // in-session context. Before activating the (purely
-                    // informational) `clear` skill, terminate any active goal
-                    // with `UserClearAll` and write the same terminal-status
-                    // checkpoint the Interrupt arm does. Without this the
-                    // user's `/clear` leaves `active_goal` populated and the
-                    // next `Prompt` silently resumes the driver loop.
-                    if name == "clear" {
-                        let prior_opt = {
-                            let mut slot = active_goal.lock().await;
-                            slot.take()
-                        };
-                        if let Some(prior) = prior_opt {
-                            if let Some(ev) = origin_daemon::goal_clear_all::clear_all_event_for(Some(&prior)) {
-                                // Terminal-status checkpoint so a crash between
-                                // /clear and the next Prompt cannot resurrect
-                                // the goal the user just discarded. Mirrors the
-                                // Interrupt arm's bug-#17 fix.
-                                let sid_opt = last_known_session_id.lock().await.clone();
-                                if let Some(sid) = sid_opt {
-                                    let snap = origin_goal::GoalSnapshot {
-                                        condition: prior.condition.clone(),
-                                        iter: prior.iter,
-                                        max_iter: prior.max_iter,
-                                        tokens_spent: prior.tokens_spent,
-                                        token_budget: prior.token_budget,
-                                        started_at_unix: prior
-                                            .started_at
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .map(|d| d.as_secs())
-                                            .unwrap_or(0),
-                                        status: origin_goal::GoalStatusWire::Cleared {
-                                            by: origin_goal::ClearReasonWire::UserClearAll,
-                                        },
-                                        last_status_tag: prior.last_status_tag.clone().map(Into::into),
-                                    };
-                                    let token = origin_resume_token::ResumeToken {
-                                        session_id: sid,
-                                        last_turn: 0,
-                                        cas_handle_root: [0u8; 32],
-                                        pending_tool_calls: Vec::new(),
-                                        plan_seq: 0,
-                                        goal: Some(snap),
-                                    };
-                                    if let Err(e) = session_store.save_resume_token(&token) {
-                                        warn!(error = %e, "clear: terminal goal checkpoint save failed");
-                                    }
-                                }
-                                let body = serde_json::to_vec(&ev).unwrap_or_default();
-                                let _ = conn_clone.lock().await.write_frame(FrameKind::Event, &body).await;
-                            }
-                        }
-                        // Fall through to the catalog lookup so the `clear`
-                        // skill itself still pushes onto the skill stack
-                        // (matches every other documentation skill's UX).
                     }
                     // Look up the skill in the daemon-wide catalog loaded at
                     // startup. The catalog is the single source of truth shared
@@ -1008,8 +1061,7 @@ fn spawn_handler_task(
                             let body = serde_json::to_vec(&ev).unwrap_or_default();
                             let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
                         } else {
-                            let body =
-                                serde_json::to_vec(&StreamEvent::AdminOk).unwrap_or_default();
+                            let body = serde_json::to_vec(&StreamEvent::AdminOk).unwrap_or_default();
                             let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
                         }
                         continue;
@@ -1085,8 +1137,20 @@ fn spawn_handler_task(
                     let body = serde_json::to_vec(&ev).unwrap_or_default();
                     let _ = conn_clone.lock().await.write_frame(FrameKind::Event, &body).await;
                 }
+                ClientMessage::RunWorkflow { name } => {
+                    if !handle_run_workflow(&conn, &coordinator, skill_catalog.as_ref(), name).await {
+                        break;
+                    }
+                }
                 ClientMessage::SubscribePlan => {
                     spawn_plan_relay(plan_bus.subscribe(), Arc::clone(&conn));
+                }
+                ClientMessage::PermissionDecision { id, allow } => {
+                    // Cross-connection resolution: the client sends its decision
+                    // on a FRESH connection (the turn's connection is busy
+                    // streaming), so it lands here. Resolve the waiting ask in
+                    // the daemon-wide registry. Unknown ids are ignored.
+                    permission_registry.resolve(id, allow);
                 }
                 ClientMessage::Interrupt => {
                     // When `Interrupt` lands in the OUTER loop it means
@@ -1124,8 +1188,7 @@ fn spawn_handler_task(
                                 started_at_unix: prior
                                     .started_at
                                     .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0),
+                                    .map_or(0, |d| d.as_secs()),
                                 status: origin_goal::GoalStatusWire::Cleared {
                                     by: origin_goal::ClearReasonWire::UserSlash,
                                 },
@@ -1138,6 +1201,8 @@ fn spawn_handler_task(
                                 pending_tool_calls: Vec::new(),
                                 plan_seq: 0,
                                 goal: Some(snap),
+                                detached_at_unix: None,
+                                memory_estimate_bytes: None,
                             };
                             if let Err(e) = session_store.save_resume_token(&token) {
                                 warn!(error = %e, "goal interrupt: terminal save failed");
@@ -1146,9 +1211,70 @@ fn spawn_handler_task(
                         let _ = write_event(&conn, &ev).await;
                     }
                 }
+                ClientMessage::ClearAll => {
+                    // `/clear` is mechanical: it resets the in-session context
+                    // without ever touching the skill stack or catalog. Its
+                    // only stateful effect is terminating any active goal
+                    // (bug #10), after which it acks with AdminOk.
+                    handle_clear_all(
+                        &conn,
+                        Arc::clone(&active_goal),
+                        Arc::clone(&session_store),
+                        Arc::clone(&last_known_session_id),
+                    )
+                    .await;
+                }
+                ClientMessage::SelfDevStart { description, paths } => {
+                    if !handle_selfdev_start(&conn, sock_path.clone(), description, paths).await {
+                        break;
+                    }
+                }
+                ClientMessage::SelfDevStatus => {
+                    if !handle_selfdev_simple(&conn, SelfDevVerb::Status).await {
+                        break;
+                    }
+                }
+                ClientMessage::SelfDevApprove => {
+                    if !handle_selfdev_simple(&conn, SelfDevVerb::Approve).await {
+                        break;
+                    }
+                }
+                ClientMessage::SelfDevReset => {
+                    if !handle_selfdev_simple(&conn, SelfDevVerb::Reset).await {
+                        break;
+                    }
+                }
+                ClientMessage::TeamCreate { name } => {
+                    let ev = origin_daemon::teams::create_team(&name);
+                    if write_event(&conn, &ev).await.is_err() {
+                        break;
+                    }
+                }
+                ClientMessage::TeamAssign {
+                    team,
+                    teammate,
+                    task,
+                } => {
+                    if !handle_team_assign(&conn, &coordinator, team, teammate, task).await {
+                        break;
+                    }
+                }
+                ClientMessage::TeamStatus { team } => {
+                    let ev = origin_daemon::teams::status_event(&team).unwrap_or_else(|| {
+                        StreamEvent::AdminError {
+                            message: format!("no such team: {team}"),
+                        }
+                    });
+                    if write_event(&conn, &ev).await.is_err() {
+                        break;
+                    }
+                }
                 admin @ (ClientMessage::ListSessions
                 | ClientMessage::RemoveSession { .. }
+                | ClientMessage::RewindSession { .. }
                 | ClientMessage::ResumeSession { .. }
+                | ClientMessage::ResumeForeign { .. }
+                | ClientMessage::ExportSession { .. }
                 | ClientMessage::GetUsage
                 | ClientMessage::KeyringAdd { .. }
                 | ClientMessage::KeyringList { .. }
@@ -1157,6 +1283,52 @@ fn spawn_handler_task(
                         break;
                     }
                 }
+            }
+        }
+
+        // Lifecycle `SessionEnd` hook (gemini `SessionEnd`): the per-connection
+        // message loop has exited — the client disconnected or the connection
+        // was torn down — so any session this connection drove is closing. We
+        // fire it once here (the loop's single exit point), and only when this
+        // connection actually bound a session id via at least one `Prompt`, so
+        // a connection that only issued admin verbs (or none) does not emit a
+        // spurious end. Routed through the same process-wide hooks runtime as
+        // `SessionStart`; a no-op without `~/.origin/hooks.json` (the default).
+        let ended_session_id = last_known_session_id.lock().await.clone();
+        if let Some(sid) = ended_session_id {
+            origin_daemon::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::SessionEnd)
+                .await;
+
+            // Supervisor lifecycle (origin-supervisor): the client disconnected
+            // but the daemon process stays alive, so move this session to
+            // `Detached` and persist the annotated resume token. The session is
+            // kept warm (re-attachable) until its detached grace lapses; the
+            // periodic tick retires it only then. A no-op when the supervisor
+            // never tracked this id or it was already detached. We build the
+            // base token from the (possibly active) goal checkpoint so a
+            // detached goal can still be resumed.
+            let base_token = {
+                use origin_daemon::goal_checkpoint::make_goal_checkpoint_token;
+                let guard = active_goal.lock().await;
+                make_goal_checkpoint_token(&sid, 0, &guard)
+            };
+            if let Some(token) = origin_daemon::supervisor::on_detach(&sid, base_token) {
+                if let Err(e) = session_store.save_resume_token(&token) {
+                    warn!(error = %e, session = %sid, "supervisor: could not persist detach token");
+                }
+                // Stage C5 Task 4: a detach token means the supervisor moved
+                // this still-live session `Attached -> Detached` — the client
+                // walked away while work was resumable rather than ending on a
+                // terminal signal. That is exactly the `Abandoned` pain bucket.
+                // Gated on `on_detach` returning `Some` so a session that was
+                // never tracked / already detached (and the clean-completion
+                // path, which emitted `Completed` inside `run_loop`) does not
+                // double-emit. Default-off ⇒ no event.
+                origin_daemon::agent::record_session_stop_pain(
+                    origin_daemon::agent::SessionStopPain::reason_only(
+                        origin_telemetry::SessionStopReason::Abandoned,
+                    ),
+                );
             }
         }
     });
@@ -1182,6 +1354,12 @@ async fn handle_resume_request(
     if let Err(e) = session_store.save_resume_token(&token) {
         warn!(error = %e, session = %session_id, "resume: could not persist token");
     }
+    // Supervisor lifecycle (origin-supervisor): a client is re-attaching to a
+    // still-live detached session. Reset its idle timers so any pending
+    // detached-grace retirement is cancelled. A no-op when the supervisor never
+    // tracked this id or it was not currently detached (e.g. a cold resume
+    // after the daemon restarted, which the existing replay path below handles).
+    let _ = origin_daemon::supervisor::on_reattach(&session_id);
     // Hydrate a previously-active goal back into the per-connection slot.
     // Only `Active` or `Verifying` snapshots are restored — terminal
     // statuses (`Met`/`Cleared`) carry their own outcomes that the CLI
@@ -1201,17 +1379,14 @@ async fn handle_resume_request(
             last_status_tag,
         } = snapshot.clone();
         if matches!(status, GoalStatusWire::Active | GoalStatusWire::Verifying) {
-            let started_at = std::time::UNIX_EPOCH
-                + std::time::Duration::from_secs(started_at_unix);
+            let started_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(started_at_unix);
             // Bug #9: preserve `last_status_tag` across resume so a
             // `Verifying` resume gets a fresh verifier call on the next
             // tick (the driver dispatches on `Met` and re-invokes the
             // verifier rather than blindly clearing).
             let restored_tag: Option<TagOutcome> = last_status_tag.map(|w| match w {
                 TagOutcomeWire::Met => TagOutcome::Met,
-                TagOutcomeWire::InProgress { what_remains } => {
-                    TagOutcome::InProgress { what_remains }
-                }
+                TagOutcomeWire::InProgress { what_remains } => TagOutcome::InProgress { what_remains },
                 TagOutcomeWire::Blocked { why } => TagOutcome::Blocked { why },
                 TagOutcomeWire::Missing => TagOutcome::Missing,
             });
@@ -1375,8 +1550,10 @@ async fn handle_request(
     memory: Option<&MemoryWiring>,
     memory_handle: Option<Arc<dyn MemoryHandleTrait>>,
     proposal_registry: Arc<ProposalRegistry>,
+    permission_registry: Arc<PermissionRegistry>,
     skill_catalog: Arc<SkillCatalog>,
     workflows_catalog: Arc<origin_daemon::workflows::WorkflowsFile>,
+    governance: Governance,
     active_skills: Arc<tokio::sync::Mutex<SkillRegistry>>,
     code_graph: Arc<tokio::sync::Mutex<CodeGraphIndex>>,
     mem_router: Arc<dyn origin_codegraph::ask::MemRouter>,
@@ -1385,6 +1562,7 @@ async fn handle_request(
     active_goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
     pending_message: Arc<tokio::sync::Mutex<Option<ClientMessage>>>,
     last_known_session_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    active_account: Arc<tokio::sync::Mutex<Option<Arc<str>>>>,
     verifier: Arc<dyn origin_goal::verifier::Verifier>,
     req: PromptRequest,
 ) -> PromptOutcome {
@@ -1400,17 +1578,39 @@ async fn handle_request(
             }
             _ => {
                 let mut s = Session::new(provider.name(), &req.model);
-                s.id = sid.clone();
+                // `clone_from` reuses the existing `id` allocation instead of
+                // dropping it and allocating a fresh `String` (clippy
+                // `assigning_clones`).
+                s.id.clone_from(sid);
                 s
             }
         }
     } else {
         Session::new(provider.name(), &req.model)
     };
+    // cline multi-root: surface any extra workspace roots to the agent loop,
+    // which renders them as a `<workspace-roots>` block. Empty ⇒ no change.
+    if !req.roots.is_empty() {
+        session.roots = req.roots.iter().map(std::path::PathBuf::from).collect();
+    }
     // Bug #8: stash the session id so a later `/goal` activation on this
     // connection can checkpoint without waiting for the first iteration
     // to complete.
     *last_known_session_id.lock().await = Some(session.id.clone());
+
+    // Lifecycle `SessionStart` hook (gemini `SessionStart`): fire once when a
+    // session is first prompted — i.e. it has no prior persisted history. A
+    // resumed session (the branch above that replays stored messages) is NOT a
+    // fresh start, so we gate on the empty transcript to avoid re-firing on
+    // every continuation prompt. Informational; routed through the same
+    // process-wide hooks runtime as `PrePrompt`/`PreTool`. With no
+    // `~/.origin/hooks.json` (the default) this is a no-op ⇒ byte-identical.
+    let is_new_session = session.messages.is_empty();
+    if is_new_session {
+        origin_daemon::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::SessionStart)
+            .await;
+    }
+
     let (tx_sub, mut rx_sub) = mpsc::channel::<Subscriber>(1);
     let conn_for_relay = Arc::clone(conn);
     let relay_handle: tokio::task::JoinHandle<()> = spawn_in(TaskClass::Realtime, async move {
@@ -1452,6 +1652,16 @@ async fn handle_request(
     // this line — otherwise the channels have TWO senders each and
     // `rx.recv()` never returns None, so the relay tasks hang forever.
     let loop_result = {
+        // Per-turn account for the cross-provider rebuild: prefer an explicit
+        // per-request account (the CLI stamps the session's `/account` choice on
+        // EVERY prompt, since it opens a fresh connection per prompt so a switch
+        // on a throwaway connection never reaches this one) over THIS
+        // connection's `/account` slot, which itself falls back (`None`) to the
+        // process-wide global account — byte-identical to the pre-per-request wire.
+        let session_account: Option<Arc<str>> = {
+            let slot = active_account.lock().await.clone();
+            origin_daemon::agent::resolve_session_account(req.account.as_deref(), &slot)
+        };
         let opts = LoopOptions {
             max_turns: 200,
             cas: Some(cas),
@@ -1460,7 +1670,14 @@ async fn handle_request(
             relay_tx: Some(tx_sub.clone()),
             streaming_disabled: false,
             sidecar: None, // sidecar submit fires in handle_request after persist
-            session_store: None,
+            session_store: Some(Arc::clone(&session_store)),
+            // ^ enable live compaction + snapshot-on-compaction on the request
+            // loop: with the store wired the compactor loads per-turn summaries
+            // and snapshots each folded turn's pre-compaction body, so
+            // `origin sessions rewind` can reconstruct ACROSS compaction points
+            // (gap 2). This was `None`, which silently disabled both the fold and
+            // the snapshot, degrading rewind to a plain truncate. Under the soft
+            // cap the compactor is a no-op ⇒ short sessions stay byte-identical.
             proposer: memory.map(|m| Arc::clone(&m.proposer)),
             event_tx: Some(event_tx.clone()),
             injector: memory.and_then(|m| m.injector.clone()),
@@ -1498,6 +1715,56 @@ async fn handle_request(
             // ^ per-connection goal slot. When `Some(Active|Verifying)` the
             // `run_loop` body renders an `<origin-goal>` block on each turn;
             // the post-loop driver below decides verify-vs-iterate-vs-clear.
+            policy: governance.policy.clone(),
+            conseca: governance.conseca.clone(),
+            // ^ DENY-ONLY governance overlay (Task 3). Populated from
+            // `governance.toml` at startup (see `config::load_governance`). When
+            // that file is absent both are `None` ⇒ default daemon behavior is
+            // byte-identical; when present they narrow (never widen) tool access
+            // via the deny-only `apply_governance_overlay` in `agent.rs`.
+            effort: req
+                .effort
+                .as_deref()
+                .and_then(origin_provider::ReasoningEffort::from_wire_str),
+            // ^ claude-code `/effort`+`/fast`: the CLI sends a canonical token;
+            // an unknown token maps to `None` ⇒ wire byte-identical.
+            thinking_tokens: req.thinking_tokens,
+            // ^ aider `--thinking-tokens`: only the Anthropic encoder honours it
+            // (extended thinking with `budget_tokens`); `None` ⇒ wire unchanged.
+            attachments: req.attachments.clone(),
+            // ^ aider/gemini/claude image+PDF input: applied to turn 1 only.
+            system_suffix: (!req.system.is_empty()).then(|| req.system.clone()),
+            // ^ claude-code output styles: the CLI puts the active style's
+            // system suffix in `req.system`; empty ⇒ no addendum (wire unchanged).
+            read_only: req.read_only,
+            // ^ gemini Plan Mode: deny-only read-only overlay for this turn.
+            router: origin_daemon::routing::global(),
+            // ^ aider/gemini/kilo/openclaude live model routing: process-wide
+            // router built once from `ORIGIN_ROUTER` (unset ⇒ None ⇒ each turn
+            // uses session.model, byte-identical). Per-turn phase selection +
+            // health/quota feedback live inside `run_loop`.
+            browser_rate_limit: governance.browser_max_actions,
+            // ^ browser-security (B): ENFORCED per-session browser-action cap
+            // from `[browser] max_actions_per_session` in `governance.toml`.
+            // Absent (the default) ⇒ `None` ⇒ no cap, byte-identical.
+            session_account,
+            // ^ per-connection multi-account isolation: when this connection has
+            // switched accounts (`/account`), a cross-provider mid-loop rebuild
+            // resolves credentials for THIS account; `None` ⇒ global-slot
+            // fallback, byte-identical to the pre-per-connection wire.
+        };
+        // Opt-in interactive prompting: when the turn requested it, route
+        // RequiresPermission tools through the IPC prompter (asks the client and
+        // blocks on the daemon-wide registry). Default (off) keeps `AlwaysAllow`,
+        // so tool execution is byte-identical. Both owners are locals so the
+        // `&dyn Prompter` borrow outlives the `drive_goal_loop` await.
+        let always_allow = AlwaysAllow;
+        let ipc_prompter;
+        let prompter: &dyn Prompter = if req.permission_ask {
+            ipc_prompter = IpcPrompter::new(event_tx.clone(), Arc::clone(&permission_registry));
+            &ipc_prompter
+        } else {
+            &always_allow
         };
         drive_goal_loop(
             conn,
@@ -1510,6 +1777,7 @@ async fn handle_request(
             Arc::clone(&session_store),
             verifier.as_ref(),
             event_tx.clone(),
+            prompter,
         )
         .await
     };
@@ -1574,15 +1842,25 @@ async fn handle_goal_activation(
         // Bare `/goal` — status query. With no goal we emit the benign
         // `GoalInactive` event so the CLI renders it as an info line, not
         // an error (bug #20).
-        let ev = if let Some(g) = active_goal.lock().await.as_ref() {
-            StreamEvent::GoalActive {
-                condition: g.condition.clone(),
-                max_iter: g.max_iter,
-                token_budget: g.token_budget,
-            }
-        } else {
-            StreamEvent::GoalInactive
-        };
+        //
+        // Narrow the lock: copy out exactly the fields the event needs while
+        // the guard is held, then release it at the end of this statement —
+        // before the event is built — so no lock guard sits in the `match`
+        // scrutinee (clippy `significant_drop_in_scrutinee` /
+        // `option_if_let_else`). The guard temporary lives only for this `let`.
+        let active_fields: Option<(String, u32, u64)> = active_goal
+            .lock()
+            .await
+            .as_ref()
+            .map(|g| (g.condition.clone(), g.max_iter, g.token_budget));
+        let ev = active_fields.map_or(
+            StreamEvent::GoalInactive,
+            |(condition, max_iter, token_budget)| StreamEvent::GoalActive {
+                condition,
+                max_iter,
+                token_budget,
+            },
+        );
         let body = serde_json::to_vec(&ev).unwrap_or_default();
         let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
         return;
@@ -1601,11 +1879,8 @@ async fn handle_goal_activation(
                 let body = serde_json::to_vec(&ev).unwrap_or_default();
                 let _ = conn.lock().await.write_frame(FrameKind::Event, &body).await;
             }
-            let new_goal = origin_goal::GoalState::new(
-                parsed.condition.clone(),
-                parsed.max_iter,
-                parsed.token_budget,
-            );
+            let new_goal =
+                origin_goal::GoalState::new(parsed.condition.clone(), parsed.max_iter, parsed.token_budget);
             let active = StreamEvent::GoalActive {
                 condition: new_goal.condition.clone(),
                 max_iter: new_goal.max_iter,
@@ -1649,6 +1924,47 @@ async fn handle_goal_activation(
     }
 }
 
+/// Handle the mechanical `/clear` admin verb ([`ClientMessage::ClearAll`]).
+///
+/// `/clear` is a first-class context reset, not a skill: it never touches the
+/// per-connection skill stack or the skill catalog. Its only stateful effect is
+/// terminating any active goal so the next `Prompt` cannot silently resume the
+/// driver loop (bug #10). The sequence is:
+///
+/// 1. Take the active-goal slot. If a goal was running, write the terminal
+///    `Cleared { UserClearAll }` checkpoint (so a crash between `/clear` and
+///    the next `Prompt` cannot resurrect it) and emit
+///    [`StreamEvent::GoalCleared`].
+/// 2. Always finish with [`StreamEvent::AdminOk`] so the CLI sees a terminal
+///    ack for the request — whether or not a goal was cleared.
+async fn handle_clear_all(
+    conn: &SharedConnection,
+    active_goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
+    session_store: Arc<SessionStore>,
+    last_known_session_id: Arc<tokio::sync::Mutex<Option<String>>>,
+) {
+    let prior_opt = {
+        let mut slot = active_goal.lock().await;
+        slot.take()
+    };
+    if let Some(prior) = prior_opt {
+        if let Some(ev) = origin_daemon::goal_clear_all::clear_all_event_for(Some(&prior)) {
+            // Terminal-status checkpoint so a crash between /clear and the next
+            // Prompt cannot resurrect the goal the user just discarded. Mirrors
+            // the Interrupt arm's bug-#17 fix.
+            let sid_opt = last_known_session_id.lock().await.clone();
+            if let Some(sid) = sid_opt {
+                let token = cleared_resume_token(&sid, 0, &prior, origin_goal::ClearReasonWire::UserClearAll);
+                if let Err(e) = session_store.save_resume_token(&token) {
+                    warn!(error = %e, "clear: terminal goal checkpoint save failed");
+                }
+            }
+            let _ = write_event(conn, &ev).await;
+        }
+    }
+    let _ = write_event(conn, &StreamEvent::AdminOk).await;
+}
+
 /// Pull the last assistant text out of `session` for tag parsing + verifier
 /// input. Concatenates every `Block::Text` body of the most recent
 /// `Role::Assistant` message; returns empty when none exists (shouldn't
@@ -1665,11 +1981,343 @@ fn last_assistant_text(session: &Session) -> String {
                     Block::Text { text, .. } => Some(text.clone()),
                     _ => None,
                 })
-                .collect::<Vec<_>>()
-                .join("");
+                .collect::<String>();
         }
     }
     String::new()
+}
+
+/// The empty `LoopSummary` returned when a goal iteration clears before any
+/// `run_loop` summary is available. Extracted so the return sites that need it
+/// stay identical (`LoopSummary` does not derive `Default`). `const` to satisfy
+/// clippy `missing_const_for_fn` (every field initializer is const).
+const fn empty_loop_summary() -> origin_daemon::agent::LoopSummary {
+    origin_daemon::agent::LoopSummary {
+        assistant_text: String::new(),
+        turns: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+    }
+}
+
+/// Build a terminal (`Cleared`) `ResumeToken` from a live `GoalState`.
+///
+/// Every goal-clear path in `drive_goal_loop` persists the same wire shape —
+/// a `ResumeToken` whose embedded `GoalSnapshot` is tagged `Cleared { by }`.
+/// Centralizing it keeps the `started_at_unix` conversion and field mapping in
+/// one place. Pure and synchronous: it holds no lock and performs no I/O, so
+/// callers may invoke it while the goal-slot guard is held without changing
+/// locking behavior.
+fn cleared_resume_token(
+    session_id: &str,
+    last_turn: u32,
+    state: &origin_goal::GoalState,
+    by: origin_goal::ClearReasonWire,
+) -> origin_resume_token::ResumeToken {
+    origin_resume_token::ResumeToken {
+        session_id: session_id.to_string(),
+        last_turn,
+        cas_handle_root: [0u8; 32],
+        pending_tool_calls: Vec::new(),
+        plan_seq: 0,
+        goal: Some(origin_goal::GoalSnapshot {
+            condition: state.condition.clone(),
+            iter: state.iter,
+            max_iter: state.max_iter,
+            tokens_spent: state.tokens_spent,
+            token_budget: state.token_budget,
+            started_at_unix: state
+                .started_at
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            status: origin_goal::GoalStatusWire::Cleared { by },
+            last_status_tag: state.last_status_tag.clone().map(Into::into),
+        }),
+        detached_at_unix: None,
+        memory_estimate_bytes: None,
+    }
+}
+
+/// Outcome of the top-of-iteration cap check in [`drive_goal_loop`].
+enum GoalCapOutcome {
+    /// No cap fired (or no goal active); proceed with the normal turn.
+    Continue,
+    /// The cap fired on the FIRST iteration. The goal is now cleared; the
+    /// caller must still run the user's prompt once (with no goal block) and
+    /// return that summary (Bug #7).
+    ClearedFirstIter,
+    /// The cap fired mid-loop. The caller returns its accumulated summary.
+    ClearedMidLoop,
+}
+
+/// Top-of-iteration cap check: if a goal exists and is already over budget /
+/// max-iter, skip the provider call entirely, clear the slot, persist a
+/// terminal checkpoint, and emit `GoalCleared`.
+///
+/// Reads `session` only (id + message count) and never mutates it. The goal
+/// slot lock is taken, the snapshot/token is built while it is held, the slot
+/// is set to `None`, and the lock is released before the best-effort store
+/// write and event send — matching the original inline scope.
+async fn goal_cap_clear(
+    active_goal: &tokio::sync::Mutex<Option<origin_goal::GoalState>>,
+    session: &Session,
+    session_store: &SessionStore,
+    event_tx: &tokio::sync::mpsc::Sender<StreamEvent>,
+    is_first_iter: bool,
+) -> GoalCapOutcome {
+    // Build the terminal token + GoalCleared payload under the slot lock, then
+    // release the guard before the store write / event send. The token is
+    // constructed from `g` before `*slot = None` (so `g`'s borrow ends first),
+    // mirroring the original flat ordering; `cleared_resume_token` is pure and
+    // performs no await, so building it under the lock is observationally
+    // identical to building it after the guard drops. The two `let ... else`
+    // arms return early (releasing the guard) when no goal is active or the cap
+    // has not fired — the common "keep going" path.
+    let (token, cleared_ev) = {
+        let mut slot = active_goal.lock().await;
+        let Some(g) = slot.as_mut() else {
+            return GoalCapOutcome::Continue;
+        };
+        let Some(reason) = g.cap_check() else {
+            return GoalCapOutcome::Continue;
+        };
+        let iter = g.iter;
+        let tokens_spent = g.tokens_spent;
+        let wire: origin_goal::ClearReasonWire = reason.into();
+        let last_turn = u32::try_from(session.messages.len().saturating_sub(1)).unwrap_or(u32::MAX);
+        let token = cleared_resume_token(&session.id, last_turn, g, wire.clone());
+        *slot = None;
+        // Intentional early drop: release the slot right after clearing it, so
+        // the lock is not held while the return tuple is built or during the
+        // best-effort store write / event send below (clippy
+        // `significant_drop_tightening`). Mirrors the original `*slot = None;
+        // drop(slot);` ordering.
+        drop(slot);
+        (
+            token,
+            StreamEvent::GoalCleared {
+                reason: wire,
+                iter,
+                tokens_spent,
+            },
+        )
+    };
+    if let Err(e) = session_store.save_resume_token(&token) {
+        warn!(error = %e, "goal checkpoint: cap-clear save failed");
+    }
+    let _ = event_tx.send(cleared_ev).await;
+    // Bug #7: if this is the FIRST iteration (the user just sent a Prompt and
+    // we haven't called run_loop yet), the caller runs their prompt once with
+    // the goal now `None` so the system prompt won't include the goal block.
+    // Otherwise we'd silently drop the user's input.
+    if is_first_iter {
+        GoalCapOutcome::ClearedFirstIter
+    } else {
+        GoalCapOutcome::ClearedMidLoop
+    }
+}
+
+/// Between-iteration peek for a pending client message (the `Iterate` arm of
+/// [`drive_goal_loop`]). Returns `true` when a frame was waiting — in which
+/// case the goal has been cleared, a terminal checkpoint persisted, the
+/// `GoalCleared` event emitted, and (for non-`Interrupt` messages) the parsed
+/// `ClientMessage` pushed into `pending_message` — and the caller should
+/// return. Returns `false` when nothing was waiting and the loop should
+/// continue. Reads `session` only (id + message count).
+async fn handle_iterate_pending(
+    conn: &SharedConnection,
+    session: &Session,
+    active_goal: &tokio::sync::Mutex<Option<origin_goal::GoalState>>,
+    session_store: &SessionStore,
+    pending_message: &tokio::sync::Mutex<Option<ClientMessage>>,
+    event_tx: &tokio::sync::mpsc::Sender<StreamEvent>,
+) -> bool {
+    // Peek for a pending user message between iterations. If one is waiting,
+    // parse it and decide:
+    //   * `Interrupt`         → clear the goal, drop the frame (Interrupt is
+    //                           itself a no-op after the clear).
+    //   * any other variant   → clear the goal AND push the parsed
+    //                           `ClientMessage` into `pending_message` so the
+    //                           outer message loop dispatches it on its next
+    //                           tick (replaces the previous "drop the frame"
+    //                           behaviour that silently lost the user's
+    //                           follow-up).
+    //   * decode failure      → clear the goal, drop the body (a malformed
+    //                           frame is the same as an Interrupt for our
+    //                           purposes; the outer loop would reject it on
+    //                           the next read).
+    let peek = {
+        let mut g = conn.lock().await;
+        tokio::time::timeout(std::time::Duration::ZERO, g.read_frame_body()).await
+    };
+    let Ok(Ok(pending_body)) = peek else {
+        return false;
+    };
+    // Mirror the outer loop's decode path: ClientMessage envelope first,
+    // legacy raw PromptRequest fallback.
+    let parsed: Option<ClientMessage> = serde_json::from_slice::<ClientMessage>(&pending_body)
+        .ok()
+        .or_else(|| {
+            #[allow(deprecated)]
+            from_legacy_prompt_request(&pending_body).ok()
+        });
+    let is_interrupt = matches!(parsed, Some(ClientMessage::Interrupt));
+    // Bug #12: if the peeked frame couldn't be decoded as any known message,
+    // write an ErrorFrame to the client so the user sees that their malformed
+    // prompt was dropped (mirrors the outer-loop decode path at
+    // main.rs:744-750). Without this the daemon would silently swallow the
+    // body and emit only GoalCleared.
+    if parsed.is_none() {
+        let _ = conn
+            .lock()
+            .await
+            .write_frame(
+                FrameKind::ErrorFrame,
+                b"bad request: malformed mid-goal frame; dropped",
+            )
+            .await;
+    }
+    // Clear the active goal before yielding control. The outer loop sees a
+    // stable `None` slot when it picks up the pushed-back message. Build a
+    // terminal checkpoint from the prior goal first so a crash between here
+    // and the next message write does not resurrect a now-stale Active
+    // snapshot.
+    let mut slot = active_goal.lock().await;
+    let prior = slot.take();
+    drop(slot);
+    let cleared_ev = prior.as_ref().map(|p| StreamEvent::GoalCleared {
+        reason: origin_goal::ClearReasonWire::UserSlash,
+        iter: p.iter,
+        tokens_spent: p.tokens_spent,
+    });
+    if let Some(p) = prior {
+        let last_turn = u32::try_from(session.messages.len().saturating_sub(1)).unwrap_or(u32::MAX);
+        let token = cleared_resume_token(
+            &session.id,
+            last_turn,
+            &p,
+            origin_goal::ClearReasonWire::UserSlash,
+        );
+        if let Err(e) = session_store.save_resume_token(&token) {
+            warn!(error = %e, "goal checkpoint: user-slash save failed");
+        }
+    }
+    if let Some(ev) = cleared_ev {
+        let _ = event_tx.send(ev).await;
+    }
+    // Decide based on the user's intent. A plain `Interrupt` is the client
+    // explicitly cancelling the in-flight autonomous run; anything else is a
+    // follow-up we push back to the outer loop for normal dispatch.
+    if is_interrupt {
+        // Stage C5 Task 4: a plain `Interrupt` landing mid-goal-iteration is
+        // the client explicitly cancelling the in-flight autonomous run — the
+        // `UserInterrupt` pain bucket. Emitted only on the interrupt branch (a
+        // pushed-back follow-up is a continuation, not a cancellation), so the
+        // reason is precise. Default-off ⇒ no event.
+        origin_daemon::agent::record_session_stop_pain(
+            origin_daemon::agent::SessionStopPain::reason_only(
+                origin_telemetry::SessionStopReason::UserInterrupt,
+            ),
+        );
+    } else if let Some(msg) = parsed {
+        // A follow-up Prompt, an admin call, etc. — consumed here would lose
+        // the user's intent, so push it back for the outer loop to dispatch.
+        *pending_message.lock().await = Some(msg);
+    }
+    true
+}
+
+/// Apply a `DriverDecision::Cleared`: persist a terminal-status checkpoint and
+/// emit the `GoalCleared` event. The caller returns its accumulated summary
+/// afterwards. Reads `session` only (id + message count).
+async fn handle_goal_cleared(
+    active_goal: &tokio::sync::Mutex<Option<origin_goal::GoalState>>,
+    session: &Session,
+    session_store: &SessionStore,
+    event_tx: &tokio::sync::mpsc::Sender<StreamEvent>,
+    reason: origin_goal::ClearReasonWire,
+    iter: u32,
+    tokens_spent: u64,
+) {
+    // Build a terminal-status snapshot ourselves so the checkpoint reflects
+    // the final wire-shape, then clear the slot. Doing this BEFORE the
+    // `take()` would require a reverse `From<ClearReasonWire>` for
+    // `ClearReason` (we currently only have the forward); building the
+    // snapshot directly is simpler and keeps the inverse mapping in one place.
+    let terminal_token = {
+        let mut slot = active_goal.lock().await;
+        slot.take().map(|g| {
+            let last_turn = u32::try_from(session.messages.len().saturating_sub(1)).unwrap_or(u32::MAX);
+            cleared_resume_token(&session.id, last_turn, &g, reason.clone())
+        })
+    };
+    if let Some(token) = terminal_token {
+        if let Err(e) = session_store.save_resume_token(&token) {
+            warn!(error = %e, "goal checkpoint: terminal save failed");
+        }
+    }
+    // `handle_resume_request` only re-installs Active / Verifying snapshots — a
+    // terminal Cleared snapshot is correctly ignored on the next resume.
+    let _ = event_tx
+        .send(StreamEvent::GoalCleared {
+            reason,
+            iter,
+            tokens_spent,
+        })
+        .await;
+}
+
+/// Record the just-completed iteration against the goal, run the verifier, and
+/// apply the resulting mutations — returning the [`DriverDecision`] to act on.
+///
+/// Returns `None` when the goal slot was cleared by another path (e.g.
+/// `/-goal`) while this turn ran; the caller treats that as "done, return the
+/// current summary". `input_tokens` / `output_tokens` come from the turn's
+/// `LoopSummary`.
+///
+/// Bug #6: the goal slot lock is held only across the snapshot and across the
+/// mutation apply — never across the verifier's network round-trip in
+/// `drive_decision`. Each guard is dropped explicitly at its last use so the
+/// lock is not held over the intervening await (clippy
+/// `significant_drop_tightening`).
+async fn run_verifier_dispatch(
+    session: &Session,
+    active_goal: &tokio::sync::Mutex<Option<origin_goal::GoalState>>,
+    verifier: &dyn origin_goal::verifier::Verifier,
+    event_tx: &tokio::sync::mpsc::Sender<StreamEvent>,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> Option<origin_daemon::goal_driver::DriverDecision> {
+    let last_text = last_assistant_text(session);
+    let tag = origin_goal::parse_tag(&last_text);
+    let inputs = {
+        let mut slot = active_goal.lock().await;
+        // `None` here means the goal was cleared by another path while we ran;
+        // `?` short-circuits the whole fn so the caller returns its summary.
+        let g = slot.as_mut()?;
+        g.record_iteration(input_tokens, output_tokens, tag);
+        // Emit `GoalVerifying` BEFORE calling the verifier so the CLI's status
+        // line flips before the Haiku call latency lands.
+        if matches!(g.last_status_tag, Some(origin_goal::TagOutcome::Met)) {
+            let _ = event_tx.send(StreamEvent::GoalVerifying).await;
+        }
+        let snapshot = origin_daemon::goal_driver::DriverInputs::snapshot(g);
+        // Intentional early drop: release the slot immediately after the last
+        // read of `g` so the lock is not held while `drive_decision` awaits the
+        // verifier. Releases at the same point the block's closing brace would.
+        drop(slot);
+        snapshot
+    };
+    // Lock is DROPPED here — the verifier's network round-trip in
+    // `drive_decision` runs without serializing the slot.
+    let outcome = origin_daemon::goal_driver::drive_decision(inputs, &last_text, verifier).await;
+    let mut slot = active_goal.lock().await;
+    let g = slot.as_mut()?;
+    let decision = origin_daemon::goal_driver::apply_outcome(g, outcome);
+    // Intentional early drop: release the slot right after `apply_outcome`
+    // mutates `g` (clippy `significant_drop_tightening`).
+    drop(slot);
+    Some(decision)
 }
 
 /// Goal-driver loop wrapping `run_loop`. When no goal is active this is a
@@ -1692,6 +2340,7 @@ async fn drive_goal_loop(
     session_store: Arc<SessionStore>,
     verifier: &dyn origin_goal::verifier::Verifier,
     event_tx: tokio::sync::mpsc::Sender<StreamEvent>,
+    prompter: &dyn Prompter,
 ) -> Result<origin_daemon::agent::LoopSummary, origin_daemon::agent::LoopError> {
     use origin_daemon::goal_checkpoint::make_goal_checkpoint_token;
     use origin_daemon::goal_driver::DriverDecision;
@@ -1702,8 +2351,7 @@ async fn drive_goal_loop(
     // last completed turn, saturating at 0 so an empty session reports
     // `last_turn: 0` rather than panicking on underflow.
     let checkpoint = |sess: &Session| {
-        let last_turn = u32::try_from(sess.messages.len().saturating_sub(1))
-            .unwrap_or(u32::MAX);
+        let last_turn = u32::try_from(sess.messages.len().saturating_sub(1)).unwrap_or(u32::MAX);
         let store = Arc::clone(&session_store);
         let goal_slot = Arc::clone(&active_goal);
         let session_id = sess.id.clone();
@@ -1727,99 +2375,26 @@ async fn drive_goal_loop(
     // with a synthetic empty summary.
     let mut is_first_iter = true;
     loop {
-        // Top-of-iteration cap check: if a goal exists and is already over
-        // budget / max-iter, skip the provider call entirely and clear.
-        let mut cap_cleared_on_first_iter = false;
-        {
-            let mut slot = active_goal.lock().await;
-            if let Some(g) = slot.as_mut() {
-                if let Some(reason) = g.cap_check() {
-                    let iter = g.iter;
-                    let tokens_spent = g.tokens_spent;
-                    let wire: origin_goal::ClearReasonWire = reason.into();
-                    // Terminal-status checkpoint (mirrors the post-iter
-                    // Cleared path). Built inline because we have a
-                    // ClearReasonWire in hand and no reverse mapping
-                    // back to ClearReason.
-                    let snap = origin_goal::GoalSnapshot {
-                        condition: g.condition.clone(),
-                        iter: g.iter,
-                        max_iter: g.max_iter,
-                        tokens_spent: g.tokens_spent,
-                        token_budget: g.token_budget,
-                        started_at_unix: g
-                            .started_at
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0),
-                        status: origin_goal::GoalStatusWire::Cleared { by: wire.clone() },
-                        last_status_tag: g.last_status_tag.clone().map(Into::into),
-                    };
-                    *slot = None;
-                    drop(slot);
-                    let last_turn = u32::try_from(session.messages.len().saturating_sub(1))
-                        .unwrap_or(u32::MAX);
-                    let token = origin_resume_token::ResumeToken {
-                        session_id: session.id.clone(),
-                        last_turn,
-                        cas_handle_root: [0u8; 32],
-                        pending_tool_calls: Vec::new(),
-                        plan_seq: 0,
-                        goal: Some(snap),
-                    };
-                    if let Err(e) = session_store.save_resume_token(&token) {
-                        warn!(error = %e, "goal checkpoint: cap-clear save failed");
-                    }
-                    let _ = event_tx
-                        .send(StreamEvent::GoalCleared {
-                            reason: wire,
-                            iter,
-                            tokens_spent,
-                        })
-                        .await;
-                    // Bug #7: if this is the FIRST iteration (the user just
-                    // sent a Prompt and we haven't called run_loop yet),
-                    // fall through to give their prompt one normal turn —
-                    // the goal slot is now None so the system prompt won't
-                    // include the goal block. Otherwise we'd silently drop
-                    // the user's input.
-                    if is_first_iter {
-                        cap_cleared_on_first_iter = true;
-                    } else {
-                        // Mid-loop cap: return whatever summary we have.
-                        return Ok(last_summary.unwrap_or(origin_daemon::agent::LoopSummary {
-                            assistant_text: String::new(),
-                            turns: 0,
-                            input_tokens: 0,
-                            output_tokens: 0,
-                        }));
-                    }
-                }
+        // Top-of-iteration cap check: if a goal is already over budget /
+        // max-iter, clear it before the provider call (see `goal_cap_clear`).
+        match goal_cap_clear(&active_goal, session, &session_store, &event_tx, is_first_iter).await {
+            GoalCapOutcome::Continue => {}
+            // Mid-loop cap: return whatever summary we have.
+            GoalCapOutcome::ClearedMidLoop => {
+                return Ok(last_summary.unwrap_or_else(empty_loop_summary));
+            }
+            // Bug #7: cap fired on the first iteration — run the user's prompt
+            // once with no active goal, then return. This guarantees the
+            // user's prompt is never silently dropped.
+            GoalCapOutcome::ClearedFirstIter => {
+                let summary =
+                    origin_daemon::agent::run_loop(session, &next_text, provider, prompter, opts).await?;
+                return Ok(summary);
             }
         }
-        // Bug #7: if the cap fired on the first iteration, run the user's
-        // prompt once with no active goal, then return. This guarantees the
-        // user's prompt is never silently dropped.
-        if cap_cleared_on_first_iter {
-            let summary = origin_daemon::agent::run_loop(
-                session,
-                &next_text,
-                provider,
-                &AlwaysAllow,
-                opts,
-            )
-            .await?;
-            return Ok(summary);
-        }
 
-        let summary = origin_daemon::agent::run_loop(
-            session,
-            &next_text,
-            provider,
-            &AlwaysAllow,
-            opts,
-        )
-        .await?;
+        let summary =
+            origin_daemon::agent::run_loop(session, &next_text, provider, &AlwaysAllow, opts).await?;
         is_first_iter = false;
 
         // If no goal is active, we're done after one turn.
@@ -1828,48 +2403,20 @@ async fn drive_goal_loop(
             return Ok(summary);
         }
 
-        // Parse the final assistant turn's tag, record this iteration's
-        // spend + tag, then dispatch via `drive_decision`.
-        //
-        // Bug #6: we previously held `active_goal.lock().await` across the
-        // verifier's network round-trip. That serialized every other
-        // mutation of the goal slot — including the system-prompt block
-        // render in `agent.rs:553` and the outer `Interrupt` handler.
-        //
-        // Fix: snapshot inputs and emit `GoalVerifying` under a SHORT
-        // lock, drop the lock before calling `drive_decision` (which
-        // awaits the verifier), then re-acquire only to apply mutations.
-        let last_text = last_assistant_text(session);
-        let tag = origin_goal::parse_tag(&last_text);
-        let inputs = {
-            let mut slot = active_goal.lock().await;
-            let Some(g) = slot.as_mut() else {
-                // Goal cleared by another path (e.g. /-goal) while we were
-                // running. Just return what we have.
-                return Ok(summary);
-            };
-            g.record_iteration(summary.input_tokens, summary.output_tokens, tag);
-            // Emit `GoalVerifying` BEFORE calling the verifier so the CLI's
-            // status line flips before the Haiku call latency lands.
-            if matches!(g.last_status_tag, Some(origin_goal::TagOutcome::Met)) {
-                let _ = event_tx.send(StreamEvent::GoalVerifying).await;
-            }
-            origin_daemon::goal_driver::DriverInputs::snapshot(g)
-        };
-        // Lock is DROPPED here — the verifier's network round-trip in
-        // `drive_decision` runs without serializing the slot.
-        let outcome = origin_daemon::goal_driver::drive_decision(
-            inputs,
-            &last_text,
+        // Record this iteration, run the verifier off-lock, and apply the
+        // resulting mutations (Bug #6). `None` means the goal was cleared by
+        // another path mid-turn — return what we have.
+        let Some(decision) = run_verifier_dispatch(
+            session,
+            &active_goal,
             verifier,
+            &event_tx,
+            summary.input_tokens,
+            summary.output_tokens,
         )
-        .await;
-        let decision = {
-            let mut slot = active_goal.lock().await;
-            let Some(g) = slot.as_mut() else {
-                return Ok(summary);
-            };
-            origin_daemon::goal_driver::apply_outcome(g, outcome)
+        .await
+        else {
+            return Ok(summary);
         };
         last_summary = Some(summary);
 
@@ -1885,118 +2432,20 @@ async fn drive_goal_loop(
             } => {
                 let _ = event_tx.send(iter_event).await;
                 next_text = synthesized_prompt;
-                // Peek for a pending user message between iterations. If
-                // one is waiting, parse it and decide:
-                //   * `Interrupt`         → clear the goal, drop the frame
-                //                           (Interrupt is itself a no-op
-                //                           after the clear).
-                //   * any other variant   → clear the goal AND push the
-                //                           parsed `ClientMessage` into
-                //                           `pending_message` so the outer
-                //                           message loop dispatches it on
-                //                           its next tick (replaces the
-                //                           previous "drop the frame"
-                //                           behaviour that silently lost
-                //                           the user's follow-up).
-                //   * decode failure      → clear the goal, drop the body
-                //                           (a malformed frame is the same
-                //                           as an Interrupt for our
-                //                           purposes; the outer loop would
-                //                           reject it on the next read).
-                let peek = {
-                    let mut g = conn.lock().await;
-                    tokio::time::timeout(std::time::Duration::ZERO, g.read_frame_body()).await
-                };
-                if let Ok(Ok(pending_body)) = peek {
-                    // Mirror the outer loop's decode path: ClientMessage
-                    // envelope first, legacy raw PromptRequest fallback.
-                    let parsed: Option<ClientMessage> =
-                        serde_json::from_slice::<ClientMessage>(&pending_body)
-                            .ok()
-                            .or_else(|| {
-                                #[allow(deprecated)]
-                                from_legacy_prompt_request(&pending_body).ok()
-                            });
-                    let is_interrupt = matches!(parsed, Some(ClientMessage::Interrupt));
-                    // Bug #12: if the peeked frame couldn't be decoded as
-                    // any known message, write an ErrorFrame to the client
-                    // so the user sees that their malformed prompt was
-                    // dropped (mirrors the outer-loop decode path at
-                    // main.rs:744-750). Without this the daemon would
-                    // silently swallow the body and emit only GoalCleared.
-                    if parsed.is_none() {
-                        let _ = conn
-                            .lock()
-                            .await
-                            .write_frame(
-                                FrameKind::ErrorFrame,
-                                b"bad request: malformed mid-goal frame; dropped",
-                            )
-                            .await;
-                    }
-                    // Clear the active goal before yielding control. The
-                    // outer loop sees a stable `None` slot when it picks
-                    // up the pushed-back message. Build a terminal
-                    // checkpoint from the prior goal first so a crash
-                    // between here and the next message write does not
-                    // resurrect a now-stale Active snapshot.
-                    let mut slot = active_goal.lock().await;
-                    let prior = slot.take();
-                    drop(slot);
-                    let cleared_ev = prior.as_ref().map(|p| StreamEvent::GoalCleared {
-                        reason: origin_goal::ClearReasonWire::UserSlash,
-                        iter: p.iter,
-                        tokens_spent: p.tokens_spent,
-                    });
-                    if let Some(p) = prior {
-                        let last_turn = u32::try_from(session.messages.len().saturating_sub(1))
-                            .unwrap_or(u32::MAX);
-                        let token = origin_resume_token::ResumeToken {
-                            session_id: session.id.clone(),
-                            last_turn,
-                            cas_handle_root: [0u8; 32],
-                            pending_tool_calls: Vec::new(),
-                            plan_seq: 0,
-                            goal: Some(origin_goal::GoalSnapshot {
-                                condition: p.condition.clone(),
-                                iter: p.iter,
-                                max_iter: p.max_iter,
-                                tokens_spent: p.tokens_spent,
-                                token_budget: p.token_budget,
-                                started_at_unix: p
-                                    .started_at
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0),
-                                status: origin_goal::GoalStatusWire::Cleared {
-                                    by: origin_goal::ClearReasonWire::UserSlash,
-                                },
-                                last_status_tag: p.last_status_tag.clone().map(Into::into),
-                            }),
-                        };
-                        if let Err(e) = session_store.save_resume_token(&token) {
-                            warn!(error = %e, "goal checkpoint: user-slash save failed");
-                        }
-                    }
-                    if let Some(ev) = cleared_ev {
-                        let _ = event_tx.send(ev).await;
-                    }
-                    // Push back only when the user's intent was something
-                    // OTHER than a plain interrupt (a follow-up Prompt,
-                    // an admin call, etc). Interrupt itself is consumed
-                    // here — its job was to fire the GoalCleared we just
-                    // emitted.
-                    if !is_interrupt {
-                        if let Some(msg) = parsed {
-                            *pending_message.lock().await = Some(msg);
-                        }
-                    }
-                    return Ok(last_summary.unwrap_or(origin_daemon::agent::LoopSummary {
-                        assistant_text: String::new(),
-                        turns: 0,
-                        input_tokens: 0,
-                        output_tokens: 0,
-                    }));
+                // Peek for a pending user message between iterations; if one is
+                // waiting, the goal is cleared and we return (see
+                // `handle_iterate_pending`). Otherwise fall through and loop.
+                if handle_iterate_pending(
+                    conn,
+                    session,
+                    &active_goal,
+                    &session_store,
+                    &pending_message,
+                    &event_tx,
+                )
+                .await
+                {
+                    return Ok(last_summary.unwrap_or_else(empty_loop_summary));
                 }
             }
             DriverDecision::Cleared {
@@ -2004,62 +2453,17 @@ async fn drive_goal_loop(
                 iter,
                 tokens_spent,
             } => {
-                // Build a terminal-status snapshot ourselves so the
-                // checkpoint reflects the final wire-shape, then clear
-                // the slot. Doing this BEFORE the `take()` would require
-                // a reverse `From<ClearReasonWire>` for `ClearReason`
-                // (we currently only have the forward); building the
-                // snapshot directly is simpler and keeps the inverse
-                // mapping in one place.
-                let terminal_token = {
-                    let mut slot = active_goal.lock().await;
-                    slot.take().map(|g| {
-                        let last_turn = u32::try_from(session.messages.len().saturating_sub(1))
-                            .unwrap_or(u32::MAX);
-                        origin_resume_token::ResumeToken {
-                            session_id: session.id.clone(),
-                            last_turn,
-                            cas_handle_root: [0u8; 32],
-                            pending_tool_calls: Vec::new(),
-                            plan_seq: 0,
-                            goal: Some(origin_goal::GoalSnapshot {
-                                condition: g.condition.clone(),
-                                iter: g.iter,
-                                max_iter: g.max_iter,
-                                tokens_spent: g.tokens_spent,
-                                token_budget: g.token_budget,
-                                started_at_unix: g
-                                    .started_at
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0),
-                                status: origin_goal::GoalStatusWire::Cleared { by: reason.clone() },
-                                last_status_tag: g.last_status_tag.clone().map(Into::into),
-                            }),
-                        }
-                    })
-                };
-                if let Some(token) = terminal_token {
-                    if let Err(e) = session_store.save_resume_token(&token) {
-                        warn!(error = %e, "goal checkpoint: terminal save failed");
-                    }
-                }
-                // `handle_resume_request` only re-installs Active /
-                // Verifying snapshots — a terminal Cleared snapshot is
-                // correctly ignored on the next resume.
-                let _ = event_tx
-                    .send(StreamEvent::GoalCleared {
-                        reason,
-                        iter,
-                        tokens_spent,
-                    })
-                    .await;
-                return Ok(last_summary.unwrap_or(origin_daemon::agent::LoopSummary {
-                    assistant_text: String::new(),
-                    turns: 0,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                }));
+                handle_goal_cleared(
+                    &active_goal,
+                    session,
+                    &session_store,
+                    &event_tx,
+                    reason,
+                    iter,
+                    tokens_spent,
+                )
+                .await;
+                return Ok(last_summary.unwrap_or_else(empty_loop_summary));
             }
         }
     }
@@ -2170,6 +2574,7 @@ async fn handle_switch(
     conn: &SharedConnection,
     active: &ActiveProvider,
     factory: &ProviderFactory,
+    active_account: &Arc<Mutex<Option<Arc<str>>>>,
     provider_str: &str,
     account: &str,
 ) -> bool {
@@ -2186,6 +2591,20 @@ async fn handle_switch(
         let mut g = active.write().await;
         *g = new_provider;
     }
+
+    // Set THIS connection's active account so a subsequent CROSS-provider router
+    // rebuild on this connection resolves credentials for the freshly-switched
+    // account — and a `/account` switch on a *different* connection cannot leak
+    // in (per-connection multi-account isolation). The per-request
+    // `LoopOptions.session_account` is read from this slot in `handle_request`.
+    *active_account.lock().await = Some(Arc::from(account));
+
+    // Also keep the process-wide factory's account in sync as the DEFAULT/fallback
+    // for any connection that has not switched (its `session_account` is `None`),
+    // and for back-compat with the single-account wire. No-op unless `set_global`
+    // was called at startup (i.e. cross-provider routing is active), so the
+    // default path is unchanged.
+    origin_daemon::provider_factory::update_global_account(account);
 
     let ev = StreamEvent::ProviderActive {
         provider: id.as_str().to_string(),
@@ -2243,7 +2662,26 @@ async fn handle_admin(
                 message: e.to_string(),
             },
         },
+        ClientMessage::RewindSession {
+            session_id,
+            keep_turns,
+        } => match session_store.rewind_restoring(&session_id, keep_turns) {
+            // gap 2: rewind now reconstructs any compacted-but-kept turns from
+            // their pre-compaction snapshots. No-op restore when nothing was
+            // compacted, so this stays byte-identical to the old truncate path
+            // for short sessions.
+            Ok(_removed) => StreamEvent::AdminOk,
+            Err(e) => StreamEvent::AdminError {
+                message: e.to_string(),
+            },
+        },
         ClientMessage::ResumeSession { session_id } => resume_session_event(session_store, &session_id),
+        ClientMessage::ResumeForeign { source, path } => {
+            resume_foreign_event(session_store, &source, &path)
+        }
+        ClientMessage::ExportSession { session_id, format } => {
+            export_session_event(session_store, &session_id, &format)
+        }
         ClientMessage::GetUsage => StreamEvent::UsageReport {
             rows: build_usage_rows(&metrics.snapshot()),
         },
@@ -2279,9 +2717,19 @@ async fn handle_admin(
         | ClientMessage::ResumeRequest { .. }
         | ClientMessage::SubscribePlan
         | ClientMessage::Interrupt
+        | ClientMessage::ClearAll
         | ClientMessage::ActivateSkill { .. }
         | ClientMessage::DeactivateSkill { .. }
-        | ClientMessage::ActivateWorkflow { .. } => return true,
+        | ClientMessage::PermissionDecision { .. }
+        | ClientMessage::ActivateWorkflow { .. }
+        | ClientMessage::SelfDevStart { .. }
+        | ClientMessage::SelfDevStatus
+        | ClientMessage::SelfDevApprove
+        | ClientMessage::SelfDevReset
+        | ClientMessage::TeamCreate { .. }
+        | ClientMessage::TeamAssign { .. }
+        | ClientMessage::TeamStatus { .. }
+        | ClientMessage::RunWorkflow { .. } => return true,
     };
     write_event(conn, &ev).await.is_ok()
 }
@@ -2320,11 +2768,20 @@ fn build_usage_rows(snap: &origin_metrics::Snapshot) -> Vec<origin_daemon::proto
     }
     acc.into_iter()
         .map(
-            |((provider, model), (tokens_in, tokens_out))| origin_daemon::protocol::UsageRow {
-                provider,
-                model,
-                tokens_in,
-                tokens_out,
+            |((provider, model), (tokens_in, tokens_out))| {
+                // Cost from output + fresh-input tokens (the metrics registry
+                // does not split cache tiers per model, so this is a floor).
+                let cost_usd = origin_cost::price_for(&model).map_or(0.0, |p| {
+                    let u = origin_cost::TokenUsage::new(tokens_in, tokens_out, 0, 0);
+                    origin_cost::cost_of(&p, &u).total()
+                });
+                origin_daemon::protocol::UsageRow {
+                    provider,
+                    model,
+                    tokens_in,
+                    tokens_out,
+                    cost_usd,
+                }
             },
         )
         .collect()
@@ -2351,7 +2808,6 @@ fn spawn_plan_relay(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     warn!(lagged = n, "plan relay: subscriber fell behind");
-                    continue;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
@@ -2367,6 +2823,86 @@ fn spawn_plan_relay(
 /// in-memory `Session` re-spawn (re-running pending tool calls, attaching the
 /// active provider, …) still belongs in the `Prompt` handler — `ResumeSession`
 /// describes the persisted state without touching the live agent loop.
+/// Build an [`origin_export::ExportSession`] from the persisted log and render
+/// it as Markdown (`format == "json"` selects JSON instead). Replies with
+/// [`StreamEvent::SessionExport`] or [`StreamEvent::AdminError`].
+fn export_session_event(session_store: &SessionStore, session_id: &str, format: &str) -> StreamEvent {
+    use origin_core::types::Block;
+    let messages = match session_store.load_messages(session_id) {
+        Ok(m) => m,
+        Err(e) => {
+            return StreamEvent::AdminError {
+                message: e.to_string(),
+            }
+        }
+    };
+    let summary = session_store
+        .list_summaries()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|s| s.id == session_id);
+    if messages.is_empty() && summary.is_none() {
+        return StreamEvent::AdminError {
+            message: format!("session not found: {session_id}"),
+        };
+    }
+    let (title, model, created_at) = summary.map_or((None, String::new(), 0), |s| {
+        let ms = u64::try_from(s.created_at).unwrap_or(0);
+        (s.title, s.model, ms)
+    });
+
+    let turns = messages
+        .iter()
+        .map(|m| {
+            let role = match m.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::Tool => "tool",
+                Role::System => "system",
+            }
+            .to_string();
+            let mut text = String::new();
+            let mut tools = Vec::new();
+            for b in &m.blocks {
+                match b {
+                    Block::Text { text: t, .. } => {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(t);
+                    }
+                    Block::ToolUse { name, .. } => tools.push(name.clone()),
+                    Block::Thinking { .. } | Block::ToolResult { .. } => {}
+                }
+            }
+            origin_export::ExportTurn { role, text, tools }
+        })
+        .collect();
+
+    let session = origin_export::ExportSession {
+        id: session_id.to_string(),
+        title,
+        provider: String::new(),
+        model,
+        created_at_unix_ms: created_at,
+        turns,
+    };
+
+    let content = if format == "json" {
+        match origin_export::to_json(&session) {
+            Ok(s) => s,
+            Err(e) => {
+                return StreamEvent::AdminError {
+                    message: e.to_string(),
+                }
+            }
+        }
+    } else {
+        origin_export::to_markdown(&session)
+    };
+    StreamEvent::SessionExport { content }
+}
+
 fn resume_session_event(session_store: &SessionStore, session_id: &str) -> StreamEvent {
     let messages = match session_store.load_messages(session_id) {
         Ok(m) => m,
@@ -2397,6 +2933,729 @@ fn resume_session_event(session_store: &SessionStore, session_id: &str) -> Strea
     }
 }
 
+/// Build the [`StreamEvent`] reply for a [`ClientMessage::ResumeForeign`].
+///
+/// Cross-harness live resume: map the `source` tag to a
+/// [`SourceKind`](origin_migrate::reconstruct::SourceKind), reconstruct the
+/// foreign transcript at `path` into origin's native message model, then CREATE
+/// a fresh origin session seeded with those messages via the same
+/// `persist_session` + `persist_message` path the live agent loop uses (the
+/// [`persist`] helper). The new session adopts the reconstructed
+/// `suggested_model`. Replies with [`StreamEvent::ForeignResumed`] carrying the
+/// new id + persisted count + model, or [`StreamEvent::AdminError`] on an
+/// unknown source tag, a missing path, or a parse/I-O failure — never panics.
+fn resume_foreign_event(session_store: &SessionStore, source: &str, path: &str) -> StreamEvent {
+    use origin_migrate::reconstruct::{reconstruct_from_path, SourceKind};
+
+    let Some(kind) = SourceKind::from_tag(source) else {
+        return StreamEvent::AdminError {
+            message: format!("unknown foreign source: {source:?} (expected claude-code | jcode | opencode)"),
+        };
+    };
+    // Reject empty paths before touching the filesystem; `reconstruct_from_path`
+    // itself validates existence and surfaces parse/IO failures as SourceError.
+    if path.trim().is_empty() {
+        return StreamEvent::AdminError {
+            message: "empty path for foreign resume".to_string(),
+        };
+    }
+    let resumed = match reconstruct_from_path(kind, std::path::Path::new(path), None) {
+        Ok(r) => r,
+        Err(e) => {
+            return StreamEvent::AdminError {
+                message: format!("reconstruct {source} session at {path}: {e}"),
+            };
+        }
+    };
+
+    // Seed a brand-new origin session with the reconstructed transcript and
+    // persist it through the SAME create+append path the agent loop uses.
+    let mut session = Session::new(String::new(), resumed.suggested_model.clone());
+    session.messages = resumed.messages;
+    persist(session_store, &session);
+
+    // Saturate at u32::MAX — a transcript with >4 G messages is not feasible.
+    #[allow(clippy::cast_possible_truncation)]
+    let messages_loaded = u32::try_from(session.messages.len()).unwrap_or(u32::MAX);
+    info!(
+        source,
+        path,
+        session = %session.id,
+        messages_loaded,
+        suggested_model = %resumed.suggested_model,
+        "resume-foreign: hydrated new session"
+    );
+    StreamEvent::ForeignResumed {
+        session_id: session.id,
+        messages_loaded,
+        suggested_model: resumed.suggested_model,
+    }
+}
+
+// ── Self-dev control plane handlers (gated `ORIGIN_SELFDEV=1`) ───────────────
+
+/// The non-`Start` self-dev verbs, so one handler covers all three.
+#[derive(Debug, Clone, Copy)]
+enum SelfDevVerb {
+    /// Emit the current driver status.
+    Status,
+    /// Flip the operator-approval flag for the in-flight restart.
+    Approve,
+    /// Reset the storm guard.
+    Reset,
+}
+
+/// Resolve the workspace root the self-dev cargo/git runners operate in.
+///
+/// Honors `ORIGIN_WORKSPACE` when set (so a daemon launched outside the repo can
+/// still self-build), otherwise the process cwd — matching the
+/// `std::env::current_dir()` convention the rest of the daemon uses.
+fn selfdev_workspace_root() -> PathBuf {
+    std::env::var_os("ORIGIN_WORKSPACE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Build the [`StreamEvent::SelfDevStatus`] snapshot for the driver, or the
+/// disabled event when self-dev is off.
+fn selfdev_status_event() -> StreamEvent {
+    origin_daemon::selfdev::global().map_or_else(
+        || StreamEvent::SelfDevDisabled {
+            message: origin_daemon::selfdev::disabled_message().to_string(),
+        },
+        |state| {
+            let driver = state.driver();
+            StreamEvent::SelfDevStatus {
+                state: format!("{:?}", driver.state()),
+                job_id: driver.current().map(|j| j.id.clone()),
+                queued: u32::try_from(driver.queued()).unwrap_or(u32::MAX),
+                consecutive_failures: driver.consecutive_failures(),
+                generation: driver.generation(),
+                storm_guard_tripped: driver.storm_guard_tripped(),
+            }
+        },
+    )
+}
+
+/// Handle `SelfDevStatus` / `SelfDevApprove` / `SelfDevReset`. Returns `false`
+/// only on an IPC write failure (the per-connection handler then exits).
+async fn handle_selfdev_simple(conn: &SharedConnection, verb: SelfDevVerb) -> bool {
+    if let Some(state) = origin_daemon::selfdev::global() {
+        match verb {
+            SelfDevVerb::Status => {}
+            SelfDevVerb::Approve => {
+                state.approve();
+                info!("self-dev: operator approval recorded for in-flight restart");
+            }
+            SelfDevVerb::Reset => {
+                state.driver().reset_storm_guard();
+                info!("self-dev: storm guard reset by operator");
+            }
+        }
+    }
+    // Always reply with the current status (or the disabled event).
+    write_event(conn, &selfdev_status_event()).await.is_ok()
+}
+
+/// Handle `SelfDevStart`: enqueue a [`BuildJob`](origin_selfdev::BuildJob) and
+/// run the supervised cycle to its safe stopping point. Returns `false` only on
+/// an IPC write failure.
+///
+/// SAFETY: a shadow checkpoint is taken BEFORE any edit; build AND test must
+/// both pass before `AwaitingRestart`; a failure rolls back to the same binary;
+/// the restart is only ever *authorized + persisted* here — the real
+/// process relaunch stays a TODO-logged hook (see [`drive_selfdev_cycle`]).
+async fn handle_selfdev_start(
+    conn: &SharedConnection,
+    sock_path: String,
+    description: String,
+    paths: Vec<String>,
+) -> bool {
+    let Some(state) = origin_daemon::selfdev::global() else {
+        return write_event(
+            conn,
+            &StreamEvent::SelfDevDisabled {
+                message: origin_daemon::selfdev::disabled_message().to_string(),
+            },
+        )
+        .await
+        .is_ok();
+    };
+
+    // Run the (blocking-heavy) cycle off the connection's critical path so a long
+    // build does not pin this connection task; we still reply with the resulting
+    // status on this connection.
+    drive_selfdev_cycle(state, &sock_path, description, paths).await;
+    write_event(conn, &selfdev_status_event()).await.is_ok()
+}
+
+/// Drive one self-dev job from enqueue to its safe stopping point.
+///
+/// Steps (each gated by the pure state machine's transition table):
+/// 1. enqueue + `StartJob` (refused if the storm guard tripped).
+/// 2. shadow-git checkpoint BEFORE editing (the rollback target).
+/// 3. self-edit: dispatch `description` as a prompt onto the live agent path
+///    under a `selfdev-` session id.
+/// 4. `EditDone` → `run_build` → `run_test` on `spawn_blocking`.
+/// 5. on `Failed` → `run_rollback` (shadow restore to the pre-edit checkpoint).
+/// 6. on `AwaitingRestart` → build `ReloadContext` + `request_restart`
+///    (authorize + persist). The actual relaunch is a `TODO`-logged hook; we
+///    never auto-exec.
+async fn drive_selfdev_cycle(
+    state: &'static origin_daemon::selfdev::SelfDevState,
+    sock_path: &str,
+    description: String,
+    paths: Vec<String>,
+) {
+    use origin_selfdev::{BuildJob, CargoRunner, FileReloadStore, ReloadContext, SelfDevEvent};
+
+    let job_id = format!("selfdev-{}", ulid::Ulid::new());
+    let job = BuildJob::new(job_id.clone(), description.clone()).with_paths(paths);
+
+    // Step 1: enqueue + start. A tripped storm guard refuses here (escalation).
+    {
+        let mut driver = state.driver();
+        driver.enqueue(job.clone());
+        if let Err(e) = driver.handle(&SelfDevEvent::StartJob) {
+            warn!(error = %e, job = %job_id, "self-dev: refused to start (storm guard or busy)");
+            return;
+        }
+    }
+
+    let workspace = selfdev_workspace_root();
+
+    // Step 2: shadow-git checkpoint BEFORE any edit, so rollback has a target.
+    // Done in a synchronous scope so the non-`Sync` `ShadowGit`/`GitRunner` are
+    // never held across an `.await` (which would make this task non-`Send`).
+    let Some(checkpoint_id) = selfdev_checkpoint(&workspace, &job_id) else {
+        // No checkpoint ⇒ no safe rollback target. Abort the cycle and roll the
+        // driver back to Idle via a synthetic failure path: mark the build
+        // failed so the machine settles without ever editing.
+        warn!(job = %job_id, "self-dev: pre-edit checkpoint FAILED; aborting before any edit");
+        abort_to_idle(state);
+        return;
+    };
+    info!(job = %job_id, checkpoint = %checkpoint_id, "self-dev: pre-edit checkpoint taken");
+
+    // Step 3: drive the self-edit by submitting `description` as a prompt onto
+    // the live agent path under a `selfdev-` session id (is_self_dispatch_session
+    // recognises this prefix, so it never resets the user's idle clock).
+    let model = std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".to_string());
+    let edit_session = format!("selfdev-{job_id}");
+    if let Err(e) =
+        origin_daemon::scheduler::dispatch_prompt(sock_path, &model, edit_session, &description)
+            .await
+    {
+        // The self-edit prompt failed; treat as a build-stage failure so the
+        // machine rolls back to the pre-edit checkpoint on the same binary.
+        warn!(error = %e, job = %job_id, "self-dev: self-edit dispatch failed; rolling back");
+    }
+
+    // Step 4: EditDone → build → test, both on spawn_blocking (cargo is sync).
+    let edit_done = state.driver().handle(&SelfDevEvent::EditDone);
+    if let Err(e) = edit_done {
+        warn!(error = %e, job = %job_id, "self-dev: EditDone rejected");
+        return;
+    }
+
+    let build_workspace = workspace.clone();
+    let Some(build_ok) = run_blocking_step(state, move |driver| {
+        let runner = CargoRunner::new(build_workspace);
+        driver.run_build(&runner)
+    })
+    .await
+    else {
+        // Step rejected by the machine; nothing further to do.
+        return;
+    };
+
+    let mut both_green = false;
+    if build_ok {
+        let test_workspace = workspace.clone();
+        if let Some(test_ok) = run_blocking_step(state, move |driver| {
+            let runner = CargoRunner::new(test_workspace);
+            driver.run_test(&runner)
+        })
+        .await
+        {
+            both_green = test_ok;
+        }
+    }
+
+    if both_green {
+        // Step 6: build AND test green ⇒ AwaitingRestart. Authorize + persist.
+        let session_ids = vec![format!("selfdev-{job_id}")];
+        let ctx = ReloadContext::new(job_id.clone())
+            .with_sessions(session_ids)
+            .with_goal(description.clone());
+        let store = FileReloadStore::new(origin_daemon::selfdev::reload_store_path());
+        let authority = origin_daemon::selfdev::ApprovalAuthority::new(state);
+        // `request_restart` persists `ctx` (generation already stamped) and flips
+        // the driver to `Resuming`; we hold the driver lock only for that quick
+        // fold and release it before any relaunch I/O / process exit.
+        let granted = {
+            let mut driver = state.driver();
+            match driver.request_restart(&authority, &store, &ctx) {
+                Ok(()) => Some(driver.generation()),
+                Err(e) => {
+                    // Deny ⇒ parked in AwaitingRestart awaiting SelfDevApprove.
+                    // This is the normal operator-in-the-loop path, not an error.
+                    info!(error = %e, job = %job_id, "self-dev: restart not yet granted (awaiting operator approval)");
+                    None
+                }
+            }
+        };
+        if let Some(generation) = granted {
+            selfdev_relaunch_handoff(&job_id, &ctx, generation, &workspace);
+        }
+    } else {
+        // Step 5: build or test failed ⇒ roll back to the pre-edit checkpoint on
+        // the SAME binary. A rollback failure is operator-escalation: log + stop.
+        // The non-`Sync` git handle stays inside the synchronous closure passed
+        // to the driver, so nothing crosses an `.await`.
+        let mut driver = state.driver();
+        let job = driver.current().cloned();
+        let result = selfdev_rollback(&mut driver, &workspace, &checkpoint_id);
+        match result {
+            Ok(outcome) => {
+                info!(job = ?job.as_ref().map(|j| &j.id), ?outcome, "self-dev: rolled back to pre-edit checkpoint");
+            }
+            Err(e) => {
+                error!(error = %e,
+                    "self-dev: ROLLBACK FAILED — operator escalation required; tree may be dirty, halting");
+            }
+        }
+        if driver.storm_guard_tripped() {
+            error!(
+                failures = driver.consecutive_failures(),
+                "self-dev: storm guard tripped — refusing further jobs until SelfDevReset"
+            );
+        }
+    }
+}
+
+/// Perform the relaunch handoff after a restart was AUTHORIZED + the
+/// `ReloadContext` was persisted.
+///
+/// WITHOUT the `ORIGIN_SELFDEV_RELAUNCH=1` gate this is byte-identical to the
+/// historical behaviour: it logs "ready to relaunch" and returns (the daemon
+/// keeps running, the operator/supervisor drives any restart out of band).
+///
+/// WITH the gate set, it:
+/// 1. resolves the previous binary (`current_exe`) and the freshly-built
+///    artifact (`<CARGO_TARGET_DIR|workspace/target>/debug/<exe-file-name>`,
+///    matching the self-dev `CargoRunner`'s debug build);
+/// 2. writes `relaunch.json` via [`origin_selfdev::RelaunchRequest::record`]
+///    under the same state dir as the reload store;
+/// 3. flushes logs and `std::process::exit`s with the supervisor relaunch
+///    sentinel so origin-supervisor swaps the binary and restarts it.
+///
+/// If the artifact cannot be resolved (no `current_exe` file name) or the
+/// manifest cannot be written, it logs and DOES NOT exit — the daemon stays on
+/// the known-good binary and the persisted `ReloadContext` is left in place.
+///
+/// The persisted `ctx.generation` (mirrored in `reload.json`) is recorded into
+/// the manifest so the supervisor can detect cross-`exec` restart storms; the
+/// driver's post-grant `generation` is logged for cross-referencing.
+fn selfdev_relaunch_handoff(
+    job_id: &str,
+    ctx: &origin_selfdev::ReloadContext,
+    generation: u64,
+    workspace: &std::path::Path,
+) {
+    use origin_daemon::selfdev::{decide_relaunch_action, relaunch_enabled, RelaunchAction};
+
+    match decide_relaunch_action(relaunch_enabled(), true) {
+        RelaunchAction::LogOnly => {
+            info!(
+                job = %job_id,
+                generation,
+                relaunch_gate = relaunch_enabled(),
+                "self-dev: restart AUTHORIZED + ReloadContext persisted — ready to relaunch \
+                 (set ORIGIN_SELFDEV_RELAUNCH=1 to swap the binary via origin-supervisor)"
+            );
+        }
+        RelaunchAction::ExitForRelaunch => {
+            selfdev_write_manifest_and_exit(job_id, ctx, generation, workspace);
+        }
+    }
+}
+
+/// The gated exit path of [`selfdev_relaunch_handoff`]: resolve the previous and
+/// freshly-built binaries, write `relaunch.json`, then exit with the supervisor
+/// relaunch sentinel.
+///
+/// Returns (without exiting) only on a resolution/persist failure — the daemon
+/// then stays on the known-good binary with the `ReloadContext` left in place.
+//
+// A single linear sequence of guarded steps (resolve previous binary → resolve
+// fresh artifact → record manifest → log + exit), each with its own error
+// branch; the apparent complexity is the structured-logging macros, not control
+// flow. Splitting further would scatter the relaunch invariant. Allow the
+// nursery threshold, mirroring `selfdev_successor_boot`.
+#[allow(clippy::cognitive_complexity)]
+fn selfdev_write_manifest_and_exit(
+    job_id: &str,
+    ctx: &origin_selfdev::ReloadContext,
+    generation: u64,
+    workspace: &std::path::Path,
+) {
+    use origin_daemon::selfdev::{
+        resolve_new_artifact_path, resolve_target_dir, selfdev_state_dir, SELFDEV_RELAUNCH_EXIT_CODE,
+    };
+    use origin_selfdev::{FileRelaunchStore, RelaunchRequest};
+    // Imported at fn scope (before any statement) so the pre-exit flush below
+    // does not trip `clippy::items_after_statements`.
+    use std::io::Write as _;
+
+    let Ok(previous_binary) = std::env::current_exe() else {
+        warn!(job = %job_id, "self-dev: cannot resolve current_exe; staying on the running binary (no relaunch)");
+        return;
+    };
+    let target_dir = resolve_target_dir(workspace, std::env::var_os("CARGO_TARGET_DIR"));
+    // The self-dev CargoRunner builds `cargo build --quiet` (no --release), so
+    // the artifact lives under the `debug` profile dir.
+    let Some(new_binary) = resolve_new_artifact_path(&target_dir, "debug", &previous_binary) else {
+        warn!(
+            job = %job_id,
+            previous = %previous_binary.display(),
+            "self-dev: cannot resolve fresh artifact path from current_exe; staying on the running binary (no relaunch)"
+        );
+        return;
+    };
+    let store = FileRelaunchStore::under_state_dir(selfdev_state_dir());
+    match RelaunchRequest::new(&new_binary, &previous_binary).record(&store, ctx.generation) {
+        Ok(_manifest) => {
+            info!(
+                job = %job_id,
+                generation,
+                previous = %previous_binary.display(),
+                new = %new_binary.display(),
+                manifest = %store.path().display(),
+                exit_code = SELFDEV_RELAUNCH_EXIT_CODE,
+                "self-dev: relaunch manifest written — exiting for supervisor binary swap"
+            );
+            // Best-effort flush of the std streams before exit (exit does not
+            // unwind, so Drop-based flushes will not run). The supervisor
+            // (Job-object/parent) reaps any in-flight tasks.
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            std::process::exit(SELFDEV_RELAUNCH_EXIT_CODE);
+        }
+        Err(e) => warn!(
+            error = %e,
+            job = %job_id,
+            manifest = %store.path().display(),
+            "self-dev: failed to write relaunch manifest; staying on the running binary (no relaunch)"
+        ),
+    }
+}
+
+/// Take a pre-edit shadow checkpoint synchronously, returning its id on success.
+///
+/// The non-`Sync` [`ShadowGit`](origin_vcs::ShadowGit) / `GitRunner` live only
+/// inside this synchronous function, so they never cross an `.await` boundary.
+fn selfdev_checkpoint(workspace: &std::path::Path, job_id: &str) -> Option<String> {
+    let git = origin_daemon::selfdev::ProcessGitRunner::new(workspace.to_path_buf());
+    let shadow_dir = origin_daemon::selfdev::shadow_git_dir();
+    let shadow = origin_vcs::ShadowGit::new(&git, shadow_dir.to_string_lossy().into_owned());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    match shadow.snapshot(&format!("selfdev pre-edit: {job_id}"), now_ms) {
+        Ok(cp) => Some(cp.id),
+        Err(e) => {
+            warn!(error = %e, job = %job_id, "self-dev: shadow snapshot failed");
+            None
+        }
+    }
+}
+
+/// Run the driver's rollback synchronously against `checkpoint_id`.
+///
+/// Constructs the non-`Sync` git handle inside this synchronous function so it
+/// never crosses an `.await`. Returns the driver's rollback result.
+fn selfdev_rollback(
+    driver: &mut origin_selfdev::SelfDevDriver,
+    workspace: &std::path::Path,
+    checkpoint_id: &str,
+) -> Result<origin_selfdev::RollbackOutcome, origin_selfdev::SelfDevError> {
+    let git = origin_daemon::selfdev::ProcessGitRunner::new(workspace.to_path_buf());
+    let shadow_dir = origin_daemon::selfdev::shadow_git_dir();
+    let shadow = origin_vcs::ShadowGit::new(&git, shadow_dir.to_string_lossy().into_owned());
+    let rollback = origin_daemon::selfdev::ShadowRollback::new(shadow, checkpoint_id.to_string());
+    driver.run_rollback(&rollback)
+}
+
+/// Run a fallible build/test step that needs the (sync) `SelfDevDriver` on a
+/// blocking thread without holding the driver lock across the `.await`.
+///
+/// Returns `Some(ok)` with the step's pass/fail, or `None` if the machine
+/// rejected the transition (already logged). The driver mutex is locked *inside*
+/// the blocking closure so the long cargo invocation does not block the async
+/// runtime, and is released before this returns.
+async fn run_blocking_step<F>(
+    state: &'static origin_daemon::selfdev::SelfDevState,
+    step: F,
+) -> Option<bool>
+where
+    F: FnOnce(&mut origin_selfdev::SelfDevDriver) -> Result<bool, origin_selfdev::SelfDevError>
+        + Send
+        + 'static,
+{
+    let join = tokio::task::spawn_blocking(move || {
+        let mut driver = state.driver();
+        step(&mut driver)
+    })
+    .await;
+    match join {
+        Ok(Ok(ok)) => Some(ok),
+        Ok(Err(e)) => {
+            warn!(error = %e, "self-dev: build/test step rejected by state machine");
+            None
+        }
+        Err(e) => {
+            error!(error = %e, "self-dev: build/test blocking task panicked");
+            None
+        }
+    }
+}
+
+/// Settle the driver back to `Idle` after a pre-edit abort (e.g. checkpoint
+/// failure) without performing an edit. Drives the synthetic
+/// `EditDone → BuildResult{false} → run_rollback`-free path by counting the
+/// failure: we mark build failed, then settle to Idle via a no-op rollback.
+fn abort_to_idle(state: &origin_daemon::selfdev::SelfDevState) {
+    use origin_selfdev::SelfDevEvent;
+    let mut driver = state.driver();
+    // Editing → Building → Failed, then a trivial rollback (NothingToRestore,
+    // since we never edited) returns the machine to Idle and counts the streak.
+    if driver.handle(&SelfDevEvent::EditDone).is_ok()
+        && driver.handle(&SelfDevEvent::BuildResult { ok: false }).is_ok()
+    {
+        let rollback = NoopRollback;
+        if let Err(e) = driver.run_rollback(&rollback) {
+            error!(error = %e, "self-dev: abort-to-idle rollback failed");
+        }
+    }
+}
+
+/// A trivial [`Rollback`](origin_selfdev::Rollback) used only by
+/// [`abort_to_idle`] when no edit ever landed (so there is nothing to restore).
+struct NoopRollback;
+impl origin_selfdev::Rollback for NoopRollback {
+    fn rollback(
+        &self,
+        _job: &origin_selfdev::BuildJob,
+    ) -> Result<origin_selfdev::RollbackOutcome, String> {
+        Ok(origin_selfdev::RollbackOutcome::NothingToRestore)
+    }
+}
+
+/// Self-dev successor boot: drive the driver's `Resumed` if a `ReloadContext`
+/// was persisted by a previous process's authorized restart.
+///
+/// SAFETY: only `RestartGranted` is ever driven by `request_restart` (never
+/// here); this path only feeds `Resumed`, which settles the resumed machine to
+/// Idle and clears the streak. The persisted `generation` is logged as the
+/// cross-exec storm ceiling. The store is cleared after a successful resume so a
+/// later crash cannot replay it. A no-op when self-dev is disabled or no context
+/// exists.
+//
+// The boot path is a single linear sequence of guarded steps (load → log →
+// replay → clear), each with its own error branch; splitting it would scatter
+// the resume invariant across helpers. Allow the nursery complexity threshold.
+#[allow(clippy::cognitive_complexity)]
+fn selfdev_successor_boot() {
+    use origin_selfdev::{ReloadStore, SelfDevEvent};
+
+    let Some(state) = origin_daemon::selfdev::global() else {
+        return;
+    };
+    let store = origin_selfdev::FileReloadStore::new(origin_daemon::selfdev::reload_store_path());
+    let ctx = match store.load() {
+        Ok(Some(ctx)) => ctx,
+        Ok(None) => return,
+        Err(e) => {
+            warn!(error = %e, "self-dev: reload-store load failed at boot; skipping resume");
+            return;
+        }
+    };
+    info!(
+        job = %ctx.in_flight_job_id,
+        generation = ctx.generation,
+        sessions = ctx.session_ids.len(),
+        "self-dev: successor boot — resuming from persisted ReloadContext \
+         (generation is the cross-exec storm ceiling)"
+    );
+
+    // The fresh driver is Idle; to legally feed `Resumed` we must walk it to
+    // `Resuming`. We replay the granted-restart path on a SYNTHETIC local driver
+    // mirror so the process-global driver settles to Idle with a cleared streak
+    // exactly as a successor should — but we NEVER re-run build/test/exec.
+    {
+        let mut driver = state.driver();
+        // Re-enqueue+start+green+grant a placeholder so the global driver reaches
+        // `Resuming`, then `Resumed`. This is bookkeeping-only: no effect runs.
+        driver.enqueue(origin_selfdev::BuildJob::new(
+            ctx.in_flight_job_id,
+            "successor-resume",
+        ));
+        let walked = drive_to_resuming(&mut driver);
+        if walked {
+            if let Err(e) = driver.handle(&SelfDevEvent::Resumed) {
+                warn!(error = %e, "self-dev: successor Resumed transition rejected");
+            }
+        }
+    }
+
+    if let Err(e) = store.clear() {
+        warn!(error = %e, "self-dev: could not clear reload store after resume");
+    }
+}
+
+/// Walk a freshly-`Idle` driver through `StartJob → EditDone → build green →
+/// test green → RestartGranted` so it reaches `Resuming`, ready for `Resumed`.
+///
+/// Used ONLY by [`selfdev_successor_boot`] to reconstruct the post-restart state
+/// in a fresh process. `RestartGranted` is fed directly here (the safety rule
+/// against direct grants applies to the *authorization* path, which already ran
+/// in the predecessor process via `request_restart`; the successor is replaying
+/// an already-authorized transition, not authorizing a new one). Returns `true`
+/// when the machine reached `Resuming`.
+fn drive_to_resuming(driver: &mut origin_selfdev::SelfDevDriver) -> bool {
+    use origin_selfdev::{SelfDevEvent, SelfDevState};
+    let steps = [
+        SelfDevEvent::StartJob,
+        SelfDevEvent::EditDone,
+        SelfDevEvent::BuildResult { ok: true },
+        SelfDevEvent::TestResult { ok: true },
+        SelfDevEvent::RestartGranted,
+    ];
+    for step in &steps {
+        if let Err(e) = driver.handle(step) {
+            warn!(error = %e, ?step, "self-dev: successor replay step rejected");
+            return false;
+        }
+    }
+    matches!(driver.state(), SelfDevState::Resuming)
+}
+
+// ── Named-teams control plane handlers ──────────────────────────────────────
+
+/// Handle `TeamAssign`: spawn a real swarm worker as the named teammate, drive
+/// its lifecycle, and bridge each [`TeamEvent`](origin_swarm::TeamEvent) onto
+/// the wire AND the lifecycle-hook runtime. Returns `false` only on an IPC write
+/// failure.
+/// Handle a [`ClientMessage::RunWorkflow`]: load the named workflow fresh from
+/// `~/.origin/workflows.toml` (so user edits land without a restart), run it as
+/// a phase-layered parallel DAG via [`origin_daemon::workflow_runner::run_workflow`]
+/// against the daemon-wide swarm `coordinator`, and reply with a single
+/// [`StreamEvent::WorkflowRunComplete`] summarising the run. An unknown name or a
+/// run failure replies with [`StreamEvent::SkillError`]. Returns `false` only on
+/// a connection write error (so the caller breaks the message loop).
+async fn handle_run_workflow(
+    conn: &SharedConnection,
+    coordinator: &Coordinator,
+    skill_catalog: &SkillCatalog,
+    name: String,
+) -> bool {
+    let home = std::env::var_os("ORIGIN_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let wf_path = home.join(".origin").join("workflows.toml");
+    let file = match origin_daemon::workflows::load_from(&wf_path) {
+        Ok(f) => f,
+        Err(e) => {
+            return write_event(
+                conn,
+                &StreamEvent::SkillError {
+                    message: format!("workflows.toml load: {e}"),
+                },
+            )
+            .await
+            .is_ok();
+        }
+    };
+    let Some(wf) = file.workflows.iter().find(|w| w.name == name) else {
+        return write_event(
+            conn,
+            &StreamEvent::SkillError {
+                message: format!("no such workflow: {name}"),
+            },
+        )
+        .await
+        .is_ok();
+    };
+    let ev = match origin_daemon::workflow_runner::run_workflow(wf, coordinator, skill_catalog).await {
+        Ok(report) => StreamEvent::WorkflowRunComplete {
+            name: report.name,
+            layers: u32::try_from(report.layers).unwrap_or(u32::MAX),
+            steps: report
+                .steps
+                .into_iter()
+                .map(|s| origin_daemon::protocol::WorkflowRunStep {
+                    index: u32::try_from(s.index).unwrap_or(u32::MAX),
+                    skill: s.skill,
+                    layer: u32::try_from(s.layer).unwrap_or(u32::MAX),
+                    status: s.status,
+                })
+                .collect(),
+        },
+        Err(e) => StreamEvent::SkillError {
+            message: format!("workflow run failed: {e}"),
+        },
+    };
+    write_event(conn, &ev).await.is_ok()
+}
+
+async fn handle_team_assign(
+    conn: &SharedConnection,
+    coordinator: &Coordinator,
+    team: String,
+    teammate: String,
+    task: String,
+) -> bool {
+    // Register + mark Working. Unknown team ⇒ AdminError (no spawn).
+    if let Err(e) = origin_daemon::teams::begin_assignment(&team, &teammate, &task) {
+        return write_event(
+            conn,
+            &StreamEvent::AdminError {
+                message: e.to_string(),
+            },
+        )
+        .await
+        .is_ok();
+    }
+
+    // Spawn the real worker and drive its lifecycle to completion (Working →
+    // Done → Idle), collecting the emitted TeamEvents.
+    let events = origin_daemon::teams::run_teammate(coordinator, &team, &teammate, &task).await;
+
+    // Bridge each event: onto the wire (for the CLI) AND the lifecycle hooks.
+    for ev in &events {
+        let note = origin_daemon::teams::event_to_notification(&team, ev);
+        origin_daemon::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::Notification {
+            message: note,
+        })
+        .await;
+        if write_event(conn, &origin_daemon::teams::event_to_stream(&team, ev))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+
+    // Finish with the team's current status so the CLI can render the timeline.
+    match origin_daemon::teams::status_event(&team) {
+        Some(ev) => write_event(conn, &ev).await.is_ok(),
+        None => true,
+    }
+}
+
 /// Serialize `ev` and write it as a single `Event` frame. Mirrors the
 /// pattern used by `handle_switch` for `StreamEvent::ProviderActive`,
 /// but kept as a small helper because P13.2 emits three different
@@ -2415,7 +3674,7 @@ fn persist(session_store: &SessionStore, session: &Session) {
         #[allow(clippy::expect_used)]
         // Turn count in a session cannot exceed u32::MAX in practice.
         let turn = u32::try_from(i).expect("turn fits u32");
-        if let Err(e) = session_store.persist_message(&session.id.to_string(), turn, m) {
+        if let Err(e) = session_store.persist_message(&session.id.clone(), turn, m) {
             error!(error = %e, "persist_message failed");
         }
     }
@@ -2432,7 +3691,7 @@ fn submit_summarize_jobs(sidecar: &Sidecar, session_store: &Arc<SessionStore>, s
         }
         #[allow(clippy::expect_used)]
         let turn_index = u32::try_from(i).expect("turn fits u32");
-        let session_id = session.id.to_string();
+        let session_id = session.id.clone();
         let deliverer = SessionStoreSummaryDeliverer(Arc::clone(session_store));
         let _ = sidecar.submit(SidecarJob::Summarize {
             session_id,
@@ -2619,4 +3878,76 @@ fn spawn_metrics_endpoint(metrics: Metrics, addr: String) {
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resume_foreign_event, SessionStore, StreamEvent};
+
+    /// End-to-end (sans IPC): reconstruct a Claude Code transcript at a path and
+    /// persist it into a fresh origin session. The reply's `messages_loaded`
+    /// must equal the number of rows actually written to the store, and the new
+    /// session must adopt the reconstructed model.
+    #[test]
+    #[allow(clippy::panic)] // test asserts the StreamEvent variant via a panicking else-arm
+    fn resume_foreign_persists_and_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Claude Code harness layout: <root>/projects/<proj>/<id>.jsonl
+        let root = dir.path().join("cc");
+        let proj = root.join("projects").join("demo");
+        std::fs::create_dir_all(&proj).expect("mkdir");
+        let jsonl = "{\"type\":\"human\",\"content\":\"fix the build\"}\n\
+                     {\"type\":\"assistant\",\"content\":\"patching Cargo.toml\"}\n\
+                     {\"type\":\"human\",\"content\":\"now run tests\"}\n";
+        std::fs::write(proj.join("abc.jsonl"), jsonl).expect("write transcript");
+
+        let store = SessionStore::open(dir.path().join("sessions.db")).expect("open store");
+        let ev = resume_foreign_event(&store, "claude-code", &root.display().to_string());
+
+        match ev {
+            StreamEvent::ForeignResumed {
+                session_id,
+                messages_loaded,
+                suggested_model,
+            } => {
+                assert_eq!(messages_loaded, 3, "three transcript turns");
+                assert_eq!(suggested_model, "claude-sonnet-4-6");
+
+                // The persisted row count must match what the reply reported.
+                let persisted = store.load_messages(&session_id).expect("load_messages");
+                assert_eq!(u32::try_from(persisted.len()).expect("fits u32"), messages_loaded);
+                // And the session is listed (resumable) with the reconstructed model.
+                let summary = store
+                    .list_summaries()
+                    .expect("list")
+                    .into_iter()
+                    .find(|s| s.id == session_id)
+                    .expect("new session present");
+                assert_eq!(summary.model, "claude-sonnet-4-6");
+                assert_eq!(summary.message_count, 3);
+            }
+            other => panic!("expected ForeignResumed, got {other:?}"),
+        }
+    }
+
+    /// An unknown source tag must fail with `AdminError` and never persist.
+    #[test]
+    fn resume_foreign_unknown_source_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(dir.path().join("sessions.db")).expect("open store");
+        let ev = resume_foreign_event(&store, "not-a-harness", "/whatever");
+        assert!(matches!(ev, StreamEvent::AdminError { .. }), "got {ev:?}");
+        assert!(store.list_summaries().expect("list").is_empty());
+    }
+
+    /// A missing path must fail with `AdminError` (validated before any read).
+    #[test]
+    fn resume_foreign_missing_path_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(dir.path().join("sessions.db")).expect("open store");
+        let missing = dir.path().join("does-not-exist");
+        let ev = resume_foreign_event(&store, "claude-code", &missing.display().to_string());
+        assert!(matches!(ev, StreamEvent::AdminError { .. }), "got {ev:?}");
+        assert!(store.list_summaries().expect("list").is_empty());
+    }
 }

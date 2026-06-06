@@ -43,10 +43,10 @@ use origin_resume_token::ResumeToken;
 /// Fields:
 /// * `session_id`     — the daemon's session id (one token file per session).
 /// * `last_turn`      — the highest persisted turn index. Used by the resume
-///                      handshake to cap the hydrated transcript.
+///   handshake to cap the hydrated transcript.
 /// * `active_goal`    — `&Option<GoalState>` snapshot at the call site.
-///                      `None` produces a token with `goal: None`, valid for
-///                      the broader resume contract but not goal-bearing.
+///   `None` produces a token with `goal: None`, valid for
+///   the broader resume contract but not goal-bearing.
 ///
 /// The snapshot mirrors what `handle_resume_request` reads on the way back
 /// in, so the round-trip is symmetric: write here, decode there, install in
@@ -100,6 +100,8 @@ pub fn make_goal_checkpoint_token(
             status: g.status.clone().into(),
             last_status_tag: g.last_status_tag.clone().map(Into::into),
         }),
+        detached_at_unix: None,
+        memory_estimate_bytes: None,
     }
 }
 

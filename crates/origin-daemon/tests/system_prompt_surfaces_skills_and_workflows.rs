@@ -116,25 +116,26 @@ async fn system_prompt_includes_default_workflow_directive() {
 async fn system_prompt_lists_workflows_by_name() {
     let workflows = Arc::new(WorkflowsFile {
         schema_version: 1,
-        workflows: vec![
-            Workflow {
-                name: "frontend-design".into(),
-                description: Some(
-                    "Two-step UI feature build: shape with frontend-design, then teach impeccable."
-                        .into(),
-                ),
-                steps: vec![
-                    WorkflowStep {
-                        skill: "frontend-design:frontend-design".into(),
-                        args: None,
-                    },
-                    WorkflowStep {
-                        skill: "impeccable".into(),
-                        args: Some("teach".into()),
-                    },
-                ],
-            },
-        ],
+        workflows: vec![Workflow {
+            name: "frontend-design".into(),
+            description: Some(
+                "Two-step UI feature build: shape with frontend-design, then teach impeccable.".into(),
+            ),
+            steps: vec![
+                WorkflowStep {
+                    id: 0,
+                    skill: "frontend-design:frontend-design".into(),
+                    args: None,
+                    depends_on: Vec::new(),
+                },
+                WorkflowStep {
+                    id: 1,
+                    skill: "impeccable".into(),
+                    args: Some("teach".into()),
+                    depends_on: vec![0],
+                },
+            ],
+        }],
     });
 
     let provider = CapturingProvider {
@@ -171,8 +172,10 @@ async fn system_prompt_combines_directive_skills_and_workflows() {
             name: "ship-it".into(),
             description: Some("plan then merge".into()),
             steps: vec![WorkflowStep {
+                id: 0,
                 skill: "writing-plans".into(),
                 args: None,
+                depends_on: Vec::new(),
             }],
         }],
     });

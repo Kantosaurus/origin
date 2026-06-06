@@ -43,6 +43,9 @@ async fn ollama_streams_text_then_turn_end() {
                 messages: vec![Message::new(Role::User).with_block(Block::text("hi"))],
                 model: "llama3".into(),
                 tools: vec![],
+                effort: None,
+                thinking_tokens: None,
+                attachments: Vec::new(),
             },
             &r,
         )
@@ -99,6 +102,9 @@ async fn ollama_chat_non_streaming_round_trip() {
             messages: vec![Message::new(Role::User).with_block(Block::text("ping"))],
             model: "llama3".into(),
             tools: vec![],
+            effort: None,
+            thinking_tokens: None,
+            attachments: Vec::new(),
         })
         .await
         .expect("ollama chat should succeed");
@@ -135,6 +141,9 @@ async fn ollama_auth_error_maps_to_provider_auth() {
             messages: vec![],
             model: "llama3".into(),
             tools: vec![],
+            effort: None,
+            thinking_tokens: None,
+            attachments: Vec::new(),
         })
         .await
         .expect_err("should fail with auth");

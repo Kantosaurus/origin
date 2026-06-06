@@ -15,6 +15,9 @@ fn anthropic_encoded_request_uses_16384_max_tokens() {
         messages: vec![Message::new(Role::User).with_block(Block::text("hi"))],
         model: "claude-test".into(),
         tools: vec![],
+        effort: None,
+        thinking_tokens: None,
+        attachments: Vec::new(),
     };
     let body = encode_request_for_test(&req);
     let max_tokens = body

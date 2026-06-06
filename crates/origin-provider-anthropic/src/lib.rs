@@ -10,13 +10,30 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use origin_core::types::{Block, Message, Role};
 use origin_planner::Plan;
-use origin_provider::{ChatRequest, ChatResponse, Provider, ProviderError, Usage};
+use origin_provider::{ChatRequest, ChatResponse, Provider, ProviderError, ReasoningEffort, Usage};
 use reqwest::StatusCode;
 use serde_json::json;
 
 const DEFAULT_BASE: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 16_384;
+
+/// Resolve the top-level `max_tokens` for a turn given an optional extended-
+/// thinking budget.
+///
+/// Anthropic requires `max_tokens` to be strictly greater than the thinking
+/// `budget_tokens`. When `thinking_tokens` is `None` we keep [`DEFAULT_MAX_TOKENS`]
+/// verbatim, so the unset path is byte-identical to the pre-thinking behavior.
+/// When set, we reserve [`DEFAULT_MAX_TOKENS`] of visible-output headroom on top
+/// of the budget (`budget + DEFAULT_MAX_TOKENS`), which both satisfies the
+/// `max_tokens > budget` constraint and leaves room for the model's actual
+/// answer after it finishes thinking. Saturating add keeps it total on overflow.
+const fn resolve_max_tokens(thinking_tokens: Option<u32>) -> u32 {
+    match thinking_tokens {
+        None => DEFAULT_MAX_TOKENS,
+        Some(budget) => budget.saturating_add(DEFAULT_MAX_TOKENS),
+    }
+}
 
 const OAUTH_BETA_HEADERS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24";
 const CLAUDE_CLI_USER_AGENT: &str = "claude-cli/2.1.123 (external, sdk-cli)";
@@ -148,15 +165,19 @@ impl Anthropic {
             format!("{}/v1/messages", self.base)
         }
     }
-}
 
-#[async_trait]
-impl Provider for Anthropic {
-    fn name(&self) -> &'static str {
-        "anthropic"
-    }
-
-    async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError> {
+    /// Build the JSON request body for `chat`: typed wire encode (messages,
+    /// tools, system, effort, oauth metadata) plus multimodal attachment
+    /// injection. Returns the body as a `serde_json::Value` ready to POST.
+    ///
+    /// With no attachments the result is byte-identical to serializing the typed
+    /// [`wire::WireRequest`]; with attachments, [`append_attachments`] adds the
+    /// encoded image/text blocks to the last user message's content array.
+    ///
+    /// # Errors
+    /// Propagates [`ProviderError`] from CAS handle expansion, or
+    /// [`ProviderError::Api`] if the typed body fails to serialize.
+    fn build_chat_body(&self, req: &ChatRequest) -> Result<serde_json::Value, ProviderError> {
         let expanded = expand_messages_for_wire(&req.messages, self.cas.as_ref(), self.plan.as_ref())?;
         let plan = self.plan.as_ref();
         let wire_messages = expanded
@@ -185,7 +206,10 @@ impl Provider for Anthropic {
 
         let body = wire::WireRequest {
             model: &req.model,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            // Bump `max_tokens` above the thinking budget when one is set
+            // (Anthropic requires `max_tokens` > `budget_tokens`); otherwise
+            // unchanged at `DEFAULT_MAX_TOKENS` ⇒ byte-identical default.
+            max_tokens: resolve_max_tokens(req.thinking_tokens),
             system: if system_text.is_empty() {
                 None
             } else {
@@ -196,20 +220,67 @@ impl Provider for Anthropic {
             metadata: self.oauth_metadata.as_ref().map(|m| wire::WireMetadata {
                 user_id: m.user_id.clone(),
             }),
+            effort: req.effort.map(ReasoningEffort::as_wire_str),
+            thinking: req.thinking_tokens.map(wire::WireThinking::enabled),
         };
 
+        let mut body_value =
+            serde_json::to_value(&body).map_err(|e| ProviderError::Api(format!("encode: {e}")))?;
+        append_attachments(&mut body_value, &req.attachments);
+        Ok(body_value)
+    }
+}
+
+#[async_trait]
+impl Provider for Anthropic {
+    fn name(&self) -> &'static str {
+        "anthropic"
+    }
+
+    async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError> {
+        // Build the JSON request body (typed wire encode + multimodal attachment
+        // injection). Extracted so `chat` stays under the line limit.
+        let body_value = self.build_chat_body(&req)?;
+
+        // Optional cassette tap (env `ORIGIN_CASSETTE=record:<path>|replay:<path>`).
+        // Default (unset) returns `None`, so the network path below is unchanged
+        // and byte-identical to the pre-cassette behavior.
+        let cassette_mode = cassette::Mode::from_env();
         let url = self.messages_url();
+        let req_body_text = serde_json::to_string(&body_value).unwrap_or_default();
+
+        // Replay mode: serve the recorded response from disk with no network I/O.
+        if let Some(cassette::Mode::Replay(path)) = &cassette_mode {
+            return cassette::replay(path, "POST", &url, &req_body_text).and_then(|text| {
+                serde_json::from_str::<wire::WireResponse>(&text)
+                    .map(decode_response)
+                    .map_err(|e| ProviderError::Api(format!("cassette decode: {e}")))
+            });
+        }
+
         let resp = self
             .apply_auth(self.client.post(&url))
             .header("anthropic-version", API_VERSION)
             .header("content-type", "application/json")
-            .json(&body)
+            .json(&body_value)
             .send()
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
         match resp.status() {
             StatusCode::OK => {
+                // When recording, capture the raw body text so it can be replayed
+                // later (after secret scrubbing); otherwise decode directly.
+                if let Some(cassette::Mode::Record(path)) = &cassette_mode {
+                    let text = resp
+                        .text()
+                        .await
+                        .map_err(|e| ProviderError::Api(format!("decode: {e}")))?;
+                    cassette::record(path, "POST", &url, &req_body_text, 200, &text)?;
+                    let wire: wire::WireResponse = serde_json::from_str(&text)
+                        .map_err(|e| ProviderError::Api(format!("decode: {e}")))?;
+                    return Ok(decode_response(wire));
+                }
                 let wire: wire::WireResponse = resp
                     .json()
                     .await
@@ -241,6 +312,7 @@ impl Provider for Anthropic {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // cohesive streaming method: body build + status handling + optional cassette record/replay tap
     async fn chat_stream(&self, req: ChatRequest, ring: &origin_stream::Ring) -> Result<(), ProviderError> {
         let expanded = expand_messages_for_wire(&req.messages, self.cas.as_ref(), self.plan.as_ref())?;
         let plan = self.plan.as_ref();
@@ -270,7 +342,10 @@ impl Provider for Anthropic {
 
         let mut body_json = serde_json::json!({
             "model": req.model,
-            "max_tokens": DEFAULT_MAX_TOKENS,
+            // Bump `max_tokens` above the thinking budget when one is set
+            // (Anthropic requires `max_tokens` > `budget_tokens`); otherwise
+            // unchanged at `DEFAULT_MAX_TOKENS` ⇒ byte-identical default.
+            "max_tokens": resolve_max_tokens(req.thinking_tokens),
             "system": if system_text.is_empty() {
                 serde_json::Value::Null
             } else {
@@ -283,8 +358,48 @@ impl Provider for Anthropic {
         if let Some(meta) = &self.oauth_metadata {
             body_json["metadata"] = serde_json::json!({ "user_id": meta.user_id });
         }
+        // Emit the effort hint only when set, so the unset path is byte-identical.
+        if let Some(level) = req.effort {
+            body_json["effort"] = serde_json::Value::String(level.as_wire_str().to_string());
+        }
+        // Emit the extended-thinking block only when a budget is set, so the
+        // unset path is byte-identical. `max_tokens` was already bumped above to
+        // exceed the budget, per Anthropic's requirement.
+        if let Some(budget) = req.thinking_tokens {
+            body_json["thinking"] = serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            });
+        }
+        // Inject multimodal attachments into the last user message, mirroring the
+        // non-streaming `chat` path (which injects via `build_chat_body`).
+        // Streaming is the DEFAULT path, so without this every streamed turn
+        // silently dropped attached images/PDFs. No-op when empty ⇒
+        // byte-identical to the pre-attachment wire.
+        append_attachments(&mut body_json, &req.attachments);
 
         let url = self.messages_url();
+
+        // Optional cassette tap on the STREAMING path (env
+        // `ORIGIN_CASSETTE=record:<path>|replay:<path>`). Default (unset) returns
+        // `None`, so the network path below is unchanged and byte-identical to
+        // the pre-cassette behavior. The recorded body is the raw SSE event-stream
+        // text, replayed through `parse_into_ring` exactly as a live response.
+        let cassette_mode = cassette::Mode::from_env();
+        let req_body_text = serde_json::to_string(&body_json).unwrap_or_default();
+
+        // Replay mode: serve the recorded SSE text from disk with no network I/O.
+        // `&[u8]` is an `AsyncRead`, so the buffered text flows through the same
+        // SSE → ring parser a live byte stream would.
+        if let Some(cassette::Mode::Replay(path)) = &cassette_mode {
+            let sse = cassette::replay(path, "POST", &url, &req_body_text)?;
+            crate::streaming::parse_into_ring(sse.as_bytes(), ring)
+                .await
+                .map_err(|e| ProviderError::Api(e.to_string()))?;
+            ring.close();
+            return Ok(());
+        }
+
         let resp = self
             .apply_auth(self.client.post(&url))
             .header("anthropic-version", API_VERSION)
@@ -321,9 +436,26 @@ impl Provider for Anthropic {
             }
         }
 
+        // Record mode: buffer the whole SSE body to text, persist it (after
+        // secret scrubbing + the save gate), THEN replay the buffered text into
+        // the ring so the live caller still streams. Buffering is acceptable here
+        // because recording is a test/dev affordance, not the hot path.
+        if let Some(cassette::Mode::Record(path)) = &cassette_mode {
+            let sse = resp
+                .text()
+                .await
+                .map_err(|e| ProviderError::Api(format!("stream decode: {e}")))?;
+            cassette::record(path, "POST", &url, &req_body_text, 200, &sse)?;
+            crate::streaming::parse_into_ring(sse.as_bytes(), ring)
+                .await
+                .map_err(|e| ProviderError::Api(e.to_string()))?;
+            ring.close();
+            return Ok(());
+        }
+
         let byte_stream = resp.bytes_stream();
         let async_read = tokio_util::io::StreamReader::new(
-            byte_stream.map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
+            byte_stream.map(|r| r.map_err(std::io::Error::other)),
         );
         crate::streaming::parse_into_ring(async_read, ring)
             .await
@@ -343,8 +475,7 @@ fn message_to_wire<'a>(m: &'a Message, plan: Option<&Plan>, msg_idx: usize) -> w
     let marker_indices: &[usize] = plan.map_or(&[], Plan::marker_indices);
     // Dynamic per-message markers (populated each turn by the agent loop).
     // Empty by default, so the read is cheap when no planner is wired.
-    let dyn_msg_marker_here = plan
-        .is_some_and(|p| p.dynamic_message_markers().contains(&msg_idx));
+    let dyn_msg_marker_here = plan.is_some_and(|p| p.dynamic_message_markers().contains(&msg_idx));
     // When path 3 fires we need to land the marker on the *last emitting*
     // block. `Block::Thinking` is filtered out by `block_to_wire`, so we skip
     // it when picking the boundary block — otherwise a trailing thinking
@@ -562,6 +693,158 @@ fn load_oauth_metadata(session_id: &str) -> wire::WireMetadata {
     wire::WireMetadata { user_id }
 }
 
+/// Append multimodal attachments to the last user message's content array
+/// (item G-live).
+///
+/// Each attachment is encoded to its Anthropic content-block JSON via
+/// [`origin_multimodal::encode_anthropic_block`] and pushed onto the `content`
+/// array of the last `{"role":"user"}` message. A no-op when `attachments` is
+/// empty, so the default text-only request is byte-identical. If there is no
+/// user message (an unusual but valid request), a new user message carrying the
+/// attachments is appended so the blocks are never silently dropped.
+fn append_attachments(body: &mut serde_json::Value, attachments: &[origin_multimodal::ContentBlock]) {
+    if attachments.is_empty() {
+        return;
+    }
+    let encoded: Vec<serde_json::Value> = attachments
+        .iter()
+        .map(origin_multimodal::encode_anthropic_block)
+        .collect();
+    let Some(messages) = body.get_mut("messages").and_then(serde_json::Value::as_array_mut) else {
+        return;
+    };
+    let last_user = messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("user"));
+    if let Some(msg) = last_user {
+        if let Some(content) = msg.get_mut("content").and_then(serde_json::Value::as_array_mut) {
+            content.extend(encoded);
+            return;
+        }
+    }
+    // No user message with an array content: append a fresh one.
+    messages.push(serde_json::json!({ "role": "user", "content": encoded }));
+}
+
+/// Cassette tap on the non-streaming `chat()` path (item I).
+///
+/// Records every provider request/response into an `origin-cassette` file when
+/// `ORIGIN_CASSETTE=record:<path>` is set, scrubbing secrets before persisting;
+/// serves the recorded response without any network I/O when
+/// `ORIGIN_CASSETTE=replay:<path>` is set. With the variable unset, nothing in
+/// this module runs and the chat path is byte-identical to before.
+mod cassette {
+    use origin_cassette::{Cassette, Interaction, ReqShape, RespShape};
+    use origin_provider::ProviderError;
+
+    /// Parsed `ORIGIN_CASSETTE` mode. The path is the cassette JSON file.
+    pub enum Mode {
+        /// `record:<path>` — append each interaction to the cassette on disk.
+        Record(String),
+        /// `replay:<path>` — serve recorded responses, no network call.
+        Replay(String),
+    }
+
+    impl Mode {
+        /// Parse the `ORIGIN_CASSETTE` env var. Returns `None` when unset or
+        /// malformed, so the default (no-cassette) path is unaffected.
+        #[must_use]
+        pub fn from_env() -> Option<Self> {
+            let raw = std::env::var("ORIGIN_CASSETTE").ok()?;
+            if let Some(p) = raw.strip_prefix("record:") {
+                return (!p.is_empty()).then(|| Self::Record(p.to_string()));
+            }
+            if let Some(p) = raw.strip_prefix("replay:") {
+                return (!p.is_empty()).then(|| Self::Replay(p.to_string()));
+            }
+            tracing::warn!(
+                value = %raw,
+                "ORIGIN_CASSETTE must be `record:<path>` or `replay:<path>`; ignoring"
+            );
+            None
+        }
+    }
+
+    /// Append a request/response interaction to the cassette at `path`,
+    /// scrubbing secrets before persisting and refusing to save if any leak
+    /// remains.
+    ///
+    /// # Errors
+    /// Returns [`ProviderError::Api`] if the existing cassette cannot be parsed,
+    /// if a secret survives scrubbing, or if the file cannot be written.
+    pub fn record(
+        path: &str,
+        method: &str,
+        url: &str,
+        req_body: &str,
+        status: u16,
+        resp_body: &str,
+    ) -> Result<(), ProviderError> {
+        let mut cassette = match std::fs::read_to_string(path) {
+            Ok(existing) => Cassette::from_json(&existing)
+                .map_err(|e| ProviderError::Api(format!("cassette parse: {e}")))?,
+            Err(_) => Cassette::new("anthropic"),
+        };
+        cassette.record(Interaction {
+            request: ReqShape {
+                method: method.to_string(),
+                url: url.to_string(),
+                headers: Vec::new(),
+                body: req_body.to_string(),
+            },
+            response: RespShape {
+                status,
+                headers: Vec::new(),
+                body: resp_body.to_string(),
+            },
+        });
+        // Scrub credentials, then hard-gate the save so a live token can never
+        // be persisted to a cassette file.
+        origin_cassette::scrub_secrets(&mut cassette);
+        origin_cassette::assert_redacted(&cassette)
+            .map_err(|e| ProviderError::Api(format!("cassette redaction gate: {e}")))?;
+        let json = cassette
+            .to_json()
+            .map_err(|e| ProviderError::Api(format!("cassette serialize: {e}")))?;
+        std::fs::write(path, json).map_err(|e| ProviderError::Api(format!("cassette write: {e}")))
+    }
+
+    /// Replay the recorded response body for a `(method, url)` request from the
+    /// cassette at `path`.
+    ///
+    /// # Errors
+    /// Returns [`ProviderError::Api`] if the cassette cannot be read/parsed, no
+    /// matching interaction exists, or the recorded status is non-OK.
+    pub fn replay(
+        path: &str,
+        method: &str,
+        url: &str,
+        req_body: &str,
+    ) -> Result<String, ProviderError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| ProviderError::Api(format!("cassette read: {e}")))?;
+        let cassette = Cassette::from_json(&text)
+            .map_err(|e| ProviderError::Api(format!("cassette parse: {e}")))?;
+        let probe = ReqShape {
+            method: method.to_string(),
+            url: url.to_string(),
+            headers: Vec::new(),
+            body: req_body.to_string(),
+        };
+        let interaction = cassette
+            .match_next(&probe)
+            .ok_or_else(|| ProviderError::Api(format!("cassette replay miss for {method} {url}")))?;
+        if interaction.response.status != 200 {
+            return Err(ProviderError::Api(format!(
+                "cassette replay status {}",
+                interaction.response.status
+            )));
+        }
+        Ok(interaction.response.body.clone())
+    }
+}
+
 fn short_hex(h: &[u8; 32]) -> String {
     origin_cas::Hash::from_bytes(*h)
         .to_string()
@@ -604,7 +887,7 @@ pub fn encode_request_for_test(req: &ChatRequest) -> serde_json::Value {
         .collect::<Vec<_>>();
     let body = wire::WireRequest {
         model: &req.model,
-        max_tokens: DEFAULT_MAX_TOKENS,
+        max_tokens: resolve_max_tokens(req.thinking_tokens),
         system: if req.system.is_empty() {
             None
         } else {
@@ -613,6 +896,8 @@ pub fn encode_request_for_test(req: &ChatRequest) -> serde_json::Value {
         messages: wire_messages,
         tools: wire_tools,
         metadata: None,
+        effort: req.effort.map(ReasoningEffort::as_wire_str),
+        thinking: req.thinking_tokens.map(wire::WireThinking::enabled),
     };
     serde_json::to_value(&body).expect("WireRequest serialises to JSON")
 }

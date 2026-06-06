@@ -53,12 +53,88 @@ pub struct ToolSchema {
     pub input_schema_json: String,
 }
 
-#[derive(Debug, Clone)]
+/// Reasoning-effort level for a turn.
+///
+/// Mirrors claude-code's `/effort` slider plus the dedicated `/fast` mode.
+/// Threaded onto [`ChatRequest`] as `Option<ReasoningEffort>`; the default of
+/// `None` means "unspecified" and leaves every provider's wire output
+/// byte-identical to before this field existed. A provider that does not
+/// understand effort simply ignores the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    /// Lowest latency; minimal deliberation (`/fast`).
+    Fast,
+    /// Low effort.
+    Low,
+    /// Balanced effort (the usual middle setting).
+    Medium,
+    /// High effort; more deliberation.
+    High,
+    /// Maximum effort; deepest deliberation.
+    Max,
+}
+
+impl ReasoningEffort {
+    /// The canonical lowercase wire token for this level.
+    ///
+    /// This is the string emitted on the provider wire when a level is set.
+    #[must_use]
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+
+    /// Parse a canonical wire token (`fast`/`low`/`medium`/`high`/`max`,
+    /// case-insensitive) back into a level. Returns `None` for anything else
+    /// so callers can leave the wire byte-identical when the token is unknown.
+    #[must_use]
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fast" => Some(Self::Fast),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct ChatRequest {
     pub system: String,
     pub messages: Vec<Message>,
     pub model: String,
     pub tools: Vec<ToolSchema>,
+    /// Optional reasoning-effort hint for this turn.
+    ///
+    /// `None` (the default) leaves the provider wire byte-identical to the
+    /// pre-effort behavior; a `Some(level)` causes effort-aware providers to
+    /// emit the level on the wire.
+    pub effort: Option<ReasoningEffort>,
+    /// Multimodal attachments (images/PDF pages) to append to the user turn
+    /// (item G-live).
+    ///
+    /// Empty by default, which leaves the provider wire byte-identical to the
+    /// text-only behavior. When non-empty, an attachment-aware provider encoder
+    /// translates each block via the `origin-multimodal` `encode_*_block`
+    /// helpers and appends it to the final user message's content.
+    pub attachments: Vec<origin_multimodal::ContentBlock>,
+    /// Optional extended-thinking budget (in tokens) for this turn.
+    ///
+    /// `None` (the default) leaves every provider's wire byte-identical to the
+    /// pre-thinking-tokens behavior. `Some(n)` asks an extended-thinking-aware
+    /// provider (today: Anthropic) to enable interleaved/extended thinking with
+    /// a `budget_tokens` of `n`; the encoder also guarantees the top-level
+    /// `max_tokens` exceeds `n`, per Anthropic's requirement. Providers that do
+    /// not support an explicit thinking budget (e.g. `OpenAI`-compatible) ignore
+    /// the value entirely. *Closes: aider `--thinking-tokens`.*
+    pub thinking_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +204,15 @@ pub fn inflate_tool_result_handles(
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
+
+    /// The provider's upstream base URL, when statically known (e.g. an
+    /// OpenAI-compatible endpoint). Used to populate the OpenTelemetry
+    /// `server.address` / `server.port` `gen_ai` attributes (otel feature only).
+    /// The default is `None` — providers whose endpoint is fixed/opaque simply
+    /// omit those attributes, leaving the span byte-identical.
+    fn base_url(&self) -> Option<&str> {
+        None
+    }
 
     /// Send a single non-streaming chat request.
     ///

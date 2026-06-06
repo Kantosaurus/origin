@@ -18,15 +18,29 @@ path = "src/lib.rs"
 name = "origin-supervisor"
 path = "src/main.rs"
 
+# Test-only stand-in for `origin-daemon`, driven by the self-dev relaunch
+# round-trip integration test (`tests/relaunch_e2e.rs`). `cargo` exposes its
+# path to the test via `CARGO_BIN_EXE_selfdev-fixture-daemon`.
+[[bin]]
+name = "selfdev-fixture-daemon"
+path = "tests/fixtures/selfdev_fixture_daemon.rs"
+test = false
+bench = false
+doc = false
+
 [dependencies]
 origin-resume-token = { path = "../origin-resume-token" }
 origin-ipc = { path = "../origin-ipc" }
+# Single source of truth for the self-dev relaunch sentinel exit code, which the
+# supervisor must recognize exactly as the daemon emits it. `origin-selfdev` is a
+# pure leaf crate (no daemon/supervisor edges), so this introduces no cycle.
+origin-selfdev = { path = "../origin-selfdev" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "time"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-which = "6"
+which = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

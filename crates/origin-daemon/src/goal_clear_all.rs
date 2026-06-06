@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Helper for the `/clear`-clears-active-goal coupling (bug #10).
 //!
-//! The bare `clear` skill is a documentation skill — activating it does
-//! nothing on the agent loop side beyond pushing it onto the per-connection
-//! skill stack. Bug #10 is that this leaves any active goal dangling: the
-//! user told the daemon "discard the in-session context", but `active_goal`
-//! still holds a `GoalState` that the next `Prompt` would pick up.
+//! `/clear` is a mechanical context reset ([`crate::protocol::ClientMessage::ClearAll`]),
+//! not a skill activation. Its only stateful effect on the agent loop is that
+//! it must terminate any active goal — otherwise the user told the daemon
+//! "discard the in-session context" but `active_goal` still holds a
+//! `GoalState` that the next `Prompt` would pick up.
 //!
 //! The wire enum already has [`origin_goal::ClearReasonWire::UserClearAll`]
-//! for exactly this case — no variant was previously emitting it. This
-//! module provides the small, pure decision helper the daemon's
-//! `ActivateSkill { name: "clear" }` arm calls before falling through to
-//! the normal skill catalog handler.
+//! for exactly this case — no other variant emits it. This module provides
+//! the small, pure decision helper the daemon's `ClearAll` arm (via
+//! `handle_clear_all`) calls to build the terminal `GoalCleared` event.
 
 use crate::protocol::StreamEvent;
 use origin_goal::{ClearReasonWire, GoalState};
@@ -26,7 +25,8 @@ use origin_goal::{ClearReasonWire, GoalState};
 /// (`MaxIter` / `BudgetExhausted`).
 #[must_use]
 pub fn clear_all_event_for(prior: Option<&GoalState>) -> Option<StreamEvent> {
-    prior.map(|g| StreamEvent::GoalCleared {
+    let g = prior?;
+    Some(StreamEvent::GoalCleared {
         reason: ClearReasonWire::UserClearAll,
         iter: g.iter,
         tokens_spent: g.tokens_spent,

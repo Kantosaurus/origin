@@ -208,11 +208,7 @@ pub struct ScriptedVerifier<'p> {
 
 #[async_trait]
 impl Verifier for ScriptedVerifier<'_> {
-    async fn verify(
-        &self,
-        condition: &str,
-        last_turn: &str,
-    ) -> Result<(Verdict, u64, u64), VerifierError> {
+    async fn verify(&self, condition: &str, last_turn: &str) -> Result<(Verdict, u64, u64), VerifierError> {
         // Build the same shape the real Haiku verifier would, so the
         // ScriptedProvider's `is_verifier` check matches.
         let user_text = format!("Goal: {condition}\nAssistant's claim of completion: {last_turn}");
@@ -221,6 +217,9 @@ impl Verifier for ScriptedVerifier<'_> {
             messages: vec![Message::new(Role::User).with_block(Block::text(user_text))],
             model: "claude-haiku-4-5".into(),
             tools: Vec::new(),
+            effort: None,
+            thinking_tokens: None,
+            attachments: Vec::new(),
         };
         let resp = self
             .provider
@@ -278,9 +277,11 @@ impl DriverRun {
 
     pub fn cleared(&self) -> Option<(&ClearReasonWire, u32, u64)> {
         match self.events.last()? {
-            StreamEvent::GoalCleared { reason, iter, tokens_spent } => {
-                Some((reason, *iter, *tokens_spent))
-            }
+            StreamEvent::GoalCleared {
+                reason,
+                iter,
+                tokens_spent,
+            } => Some((reason, *iter, *tokens_spent)),
             _ => None,
         }
     }
@@ -301,14 +302,7 @@ pub async fn run_driver_loop_with_state(
     provider: &ScriptedProvider,
     max_outer_iterations: u32,
 ) -> DriverRun {
-    run_driver_loop_full(
-        state,
-        initial_user_text,
-        provider,
-        max_outer_iterations,
-        None,
-    )
-    .await
+    run_driver_loop_full(state, initial_user_text, provider, max_outer_iterations, None).await
 }
 
 /// Run the driver loop against a scripted provider, exercising the REAL
@@ -430,18 +424,11 @@ pub async fn run_driver_loop_full(
         // Errors here are surfaced verbatim so a test sees the actual
         // ProviderError text (the ScriptedProvider's "exhausted" error
         // text is what the Wave-4 panic was wrapping).
-        let summary: LoopSummary = match run_loop(
-            &mut session,
-            &next_user_text,
-            provider,
-            &AlwaysAllow,
-            &opts,
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(e) => panic!("run_loop failed: {e}"),
-        };
+        let summary: LoopSummary =
+            match run_loop(&mut session, &next_user_text, provider, &AlwaysAllow, &opts).await {
+                Ok(s) => s,
+                Err(e) => panic!("run_loop failed: {e}"),
+            };
 
         run.iterations_run += 1;
 

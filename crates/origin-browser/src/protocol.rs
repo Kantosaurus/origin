@@ -53,4 +53,13 @@ pub struct SnapshotResp {
     pub title: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    /// Recent browser-console log lines captured during the action, newest
+    /// last. Populated only by backends that opt in to console capture; older
+    /// backends omit the field entirely.
+    ///
+    /// Serialized with `skip_serializing_if` so a `None` value emits **no**
+    /// `console` key at all — keeping the wire byte-identical to pre-visual
+    /// `SnapshotResp` responses for every backend that does not set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<Vec<String>>,
 }

@@ -166,6 +166,69 @@ impl ProviderFactory {
         &self.catalog
     }
 
+    /// Route a phase to a model via an [`origin_router::Router`] (Task 6).
+    ///
+    /// This is an *available* helper — it does NOT change the default
+    /// single-model selection performed by [`ProviderFactory::build`]; callers
+    /// opt in explicitly. It wraps `origin_router` so the daemon can pick a
+    /// `ModelRef` for a `phase` from `candidates` under any [`origin_router::Strategy`].
+    /// Returns `None` when the strategy yields no model (e.g. an empty
+    /// quota-fallback chain or every candidate exhausted).
+    #[must_use]
+    pub fn route(
+        &self,
+        strategy: origin_router::Strategy,
+        phase: origin_router::Phase,
+        candidates: &[origin_router::ModelRef],
+    ) -> Option<origin_router::ModelRef> {
+        origin_router::Router::new(strategy).choose(phase, candidates)
+    }
+
+    /// Build a provider for a cross-provider per-turn routing pick.
+    ///
+    /// Given a router-chosen `provider_id` (e.g. `"google"`, `"openai"`) this
+    /// resolves the credential for `account` and constructs an owned
+    /// [`Arc<dyn Provider>`] the agent loop can use in place of the borrowed
+    /// active provider for a single turn. The per-turn model id is applied by
+    /// the caller via [`ChatRequest::model`](origin_provider::ChatRequest), so
+    /// `model` here is informational only (it is *not* baked into the provider).
+    ///
+    /// Returns `None` — never an error — when the id is unknown to the catalog
+    /// or no credential is reachable for `(provider, account)`, so the caller
+    /// can fall back to the active provider for that turn without a panic. The
+    /// failure reason is logged at `debug`/`warn`.
+    ///
+    /// This is the cross-provider rebuild scaffold (foundation L84 / kilo L265).
+    /// It is reachable from the agent loop only when a factory has been
+    /// registered via [`set_global`]; see that function for the wiring contract.
+    pub async fn build_provider_for(
+        &self,
+        provider_id: &str,
+        model: &str,
+        account: &str,
+    ) -> Option<Arc<dyn Provider>> {
+        let Some(id) = ProviderId::parse(provider_id, &self.catalog) else {
+            tracing::debug!(provider_id, "router cross-provider pick: unknown provider id");
+            return None;
+        };
+        match self.build(&id, account).await {
+            Ok(p) => {
+                tracing::debug!(provider = id.as_str(), model, account, "router cross-provider rebuild ok");
+                Some(p)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    provider = id.as_str(),
+                    model,
+                    account,
+                    error = %e,
+                    "router cross-provider rebuild failed; caller will fall back to active provider"
+                );
+                None
+            }
+        }
+    }
+
     /// Build an [`Arc<dyn Provider>`] for the given catalog id + account.
     ///
     /// # Errors
@@ -223,7 +286,7 @@ impl ProviderFactory {
                         .await
                     {
                         Ok(origin_keyvault::RefreshOutcome::Rotated { access }) => {
-                            Ok(StaticBearer::new(access.expose().to_string()))
+                            Ok(StaticBearer::new(access.expose().clone()))
                         }
                         Ok(origin_keyvault::RefreshOutcome::NotDue { .. } | _) => {
                             let secret = self
@@ -402,6 +465,128 @@ impl ProviderFactory {
     }
 }
 
+/// Process-wide handle the agent loop uses to reach a [`ProviderFactory`] for
+/// cross-provider per-turn routing, paired with the default account to resolve
+/// credentials against.
+///
+/// `run_loop` only holds a `&dyn Provider` + `LoopOptions`; it cannot reach the
+/// `KeyVault` / `Catalog` a rebuild needs. Rather than thread a new field
+/// through `LoopOptions` (its construction site is exhaustive), the daemon can
+/// register the factory *once* here at startup. When it is **not** registered
+/// (the default), [`global`] returns `None`, the loop never rebuilds, and a
+/// cross-provider pick simply falls back to the active provider — byte-identical
+/// to the pre-existing same-provider-only behaviour.
+static GLOBAL_FACTORY: std::sync::OnceLock<GlobalFactory> = std::sync::OnceLock::new();
+
+/// A registered factory plus the account its rebuilds resolve credentials for.
+///
+/// `account` is behind a `std::sync::RwLock` so a `/account` switch can update
+/// which account a cross-provider rebuild resolves credentials for, after the
+/// factory was registered once at startup. The lock is held only long enough to
+/// clone the inner `Arc<str>` (never across an `await`), so it cannot deadlock
+/// the async loop.
+#[derive(Clone)]
+struct GlobalFactory {
+    factory: Arc<ProviderFactory>,
+    account: Arc<std::sync::RwLock<Arc<str>>>,
+}
+
+/// Read the current account out of a registered factory, cloning the inner
+/// `Arc<str>` and releasing the lock immediately. Falls back to the poisoned
+/// inner value rather than panicking, so a poisoned lock never aborts a turn.
+fn current_account_of(g: &GlobalFactory) -> Arc<str> {
+    g.account
+        .read()
+        .map_or_else(|p| Arc::clone(&p.into_inner()), |a| Arc::clone(&a))
+}
+
+/// Register the daemon-wide [`ProviderFactory`] + default `account` so the agent
+/// loop can rebuild a provider for a cross-provider routing pick.
+///
+/// Idempotent: only the first registration wins (later calls are a no-op),
+/// mirroring the daemon's single-startup lifecycle. Wiring this from `main.rs`
+/// after the factory is constructed turns cross-provider per-turn routing on;
+/// leaving it unwired keeps the loop byte-identical (the rebuild path stays
+/// dormant). Kept additive so it can be adopted without touching `LoopOptions`.
+pub fn set_global(factory: Arc<ProviderFactory>, account: impl Into<Arc<str>>) {
+    let _ = GLOBAL_FACTORY.set(GlobalFactory {
+        factory,
+        account: Arc::new(std::sync::RwLock::new(account.into())),
+    });
+}
+
+/// Update the account the process-wide factory resolves credentials for.
+///
+/// Called from the `/account` switch handler so a subsequent cross-provider
+/// rebuild uses the freshly-selected account's credentials rather than the
+/// startup default. No-op when [`set_global`] was never called (the default),
+/// keeping the agent loop byte-identical. The write lock is held only for the
+/// assignment.
+pub fn update_global_account(account: &str) {
+    if let Some(g) = GLOBAL_FACTORY.get() {
+        if let Ok(mut w) = g.account.write() {
+            *w = Arc::from(account);
+        }
+    }
+}
+
+/// The account the process-wide factory currently resolves credentials for, or
+/// `None` when no factory is registered. Read-only query, primarily for tests
+/// and diagnostics.
+#[must_use]
+pub fn get_current_account() -> Option<Arc<str>> {
+    GLOBAL_FACTORY.get().map(current_account_of)
+}
+
+/// The registered factory + account, or `None` when the daemon never called
+/// [`set_global`] (the default ⇒ no cross-provider rebuild, loop unchanged).
+#[must_use]
+fn global() -> Option<GlobalFactory> {
+    GLOBAL_FACTORY.get().cloned()
+}
+
+/// Build a provider for a cross-provider routing pick using the process-wide
+/// factory registered via [`set_global`], if any.
+///
+/// Returns `None` — never panics — when no factory is registered, the
+/// `provider_id` is unknown, or the credential is missing, so the agent loop
+/// can fall back to the active provider for that turn. This is the single entry
+/// point the loop calls; it owns the "is a factory reachable?" decision so the
+/// call site stays a one-liner.
+pub async fn build_provider_for(provider_id: &str, model: &str) -> Option<Arc<dyn Provider>> {
+    let g = global()?;
+    // Clone the current account out and drop the lock before the await.
+    let account = current_account_of(&g);
+    g.factory.build_provider_for(provider_id, model, &account).await
+}
+
+/// Build a provider for a cross-provider routing pick against an **explicit**
+/// account, using the process-wide factory registered via [`set_global`].
+///
+/// This is the per-connection (multi-account) seam: the agent loop passes the
+/// account that belongs to *its own* session/connection rather than reading the
+/// single process-wide account slot. As a result a `/account` switch on one
+/// connection no longer leaks into a concurrent connection's cross-provider
+/// rebuild — each connection resolves its own credentials.
+///
+/// The shared [`ProviderFactory`] (vault + catalog) still comes from the global
+/// registration; only the *account* is supplied by the caller. Returns `None` —
+/// never panics — when no factory is registered, the `provider_id` is unknown,
+/// or the credential is missing for `(provider, account)`, so the loop can fall
+/// back to the active provider for that turn.
+///
+/// [`build_provider_for`] is the thin default wrapper over this that reads the
+/// global account slot; callers with no per-session account keep using it and
+/// stay byte-identical.
+pub async fn build_provider_for_account(
+    provider_id: &str,
+    model: &str,
+    account: &str,
+) -> Option<Arc<dyn Provider>> {
+    let g = global()?;
+    g.factory.build_provider_for(provider_id, model, account).await
+}
+
 /// Intern a provider id into a process-static `&'static str`, leaking each
 /// distinct id at most once. Bounds the leak to the finite catalog regardless
 /// of how many provider rebuilds (account switches) occur.
@@ -481,5 +666,87 @@ mod tests {
             "google"
         );
         assert!(ProviderId::parse("totally-not-a-provider", &cat).is_none());
+    }
+
+    /// Task 6: the router helper is *available* and routes by phase without
+    /// touching the default `build()` selection path.
+    #[test]
+    fn route_helper_selects_by_phase() {
+        use origin_router::{ModelRef, Phase, Strategy};
+        let cat = Catalog::builtin();
+        let vault = KeyVault::in_memory();
+        let factory = ProviderFactory::new(vault, cat);
+
+        let architect = ModelRef::new("anthropic", "claude-opus-4");
+        let editor = ModelRef::new("anthropic", "claude-sonnet-4-6");
+        let strat = Strategy::ArchitectEditor {
+            architect: architect.clone(),
+            editor: editor.clone(),
+        };
+
+        assert_eq!(
+            factory.route(strat.clone(), Phase::Plan, &[]),
+            Some(architect)
+        );
+        assert_eq!(factory.route(strat, Phase::Edit, &[]), Some(editor));
+
+        // QuotaFallback with an empty chain yields no model.
+        assert_eq!(
+            factory.route(Strategy::QuotaFallback { chain: vec![] }, Phase::Edit, &[]),
+            None
+        );
+    }
+
+    /// Cross-provider rebuild scaffold: a known id with a reachable credential
+    /// builds a provider offline (the Anthropic `ApiKey` wire never touches the
+    /// network in `build`); an unknown id yields `None` instead of erroring so
+    /// the agent loop can fall back to the active provider.
+    #[tokio::test]
+    async fn build_provider_for_known_id_and_unknown_id() {
+        let cat = Catalog::builtin();
+        let vault = KeyVault::in_memory();
+        // Seed a credential so the Anthropic ApiKey wire build succeeds offline.
+        vault
+            .set("anthropic", "default", origin_keyvault::Secret::new("sk-test".to_string()))
+            .await
+            .expect("seed credential");
+        let factory = ProviderFactory::new(vault, cat);
+
+        // Known id + present credential ⇒ Some(provider) with the right name.
+        let built = factory
+            .build_provider_for("anthropic", "claude-sonnet-4-6", "default")
+            .await;
+        assert!(built.is_some(), "known id with credential must build");
+        assert_eq!(built.expect("some").name(), "anthropic");
+
+        // A model id is informational only; it is not baked into the provider,
+        // so an arbitrary model still builds the same provider.
+        assert!(factory
+            .build_provider_for("anthropic", "any-model-id", "default")
+            .await
+            .is_some());
+
+        // Unknown provider id ⇒ None (no panic, caller falls back).
+        assert!(factory
+            .build_provider_for("totally-not-a-provider", "m", "default")
+            .await
+            .is_none());
+
+        // Known id but NO credential for this account ⇒ None.
+        assert!(factory
+            .build_provider_for("anthropic", "m", "no-such-account")
+            .await
+            .is_none());
+    }
+
+    /// The process-wide registry is dormant until [`set_global`] is called: the
+    /// free `build_provider_for` returns `None` when nothing is registered, which
+    /// is exactly the byte-identical fall-back the agent loop relies on.
+    #[tokio::test]
+    async fn global_build_provider_for_is_none_when_unregistered() {
+        // NB: `set_global` is process-wide + idempotent, so this test only
+        // asserts the *unregistered* default (registering here would leak into
+        // other tests in the same process).
+        assert!(super::build_provider_for("anthropic", "m").await.is_none());
     }
 }

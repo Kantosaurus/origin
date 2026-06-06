@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "tasks": [
+    "09-rust-fn-fix.json",
+    "10-ts-types.json",
+    "11-py-refactor.json",
+    "12-go-iface.json",
+    "13-java-class.json"
+  ]
+}

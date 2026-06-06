@@ -62,12 +62,16 @@ pub enum ClearReason {
     MaxIter,
     BudgetExhausted,
     VerifierRejected(String),
-    Met { reason: String },
+    Met {
+        reason: String,
+    },
     VerifierUnavailable,
     /// The main model reported the goal blocked on something that requires the
     /// human. The driver clears the goal so the loop stops and the user can
     /// respond, instead of spinning on a block it cannot resolve autonomously.
-    Blocked { why: String },
+    Blocked {
+        why: String,
+    },
 }
 
 impl GoalState {
@@ -111,7 +115,7 @@ impl GoalState {
     }
 
     /// Bookkeeping for the verifier's own token spend.
-    pub fn record_verifier_tokens(&mut self, input_tokens: u64, output_tokens: u64) {
+    pub const fn record_verifier_tokens(&mut self, input_tokens: u64, output_tokens: u64) {
         self.tokens_spent = self
             .tokens_spent
             .saturating_add(input_tokens.saturating_add(output_tokens));

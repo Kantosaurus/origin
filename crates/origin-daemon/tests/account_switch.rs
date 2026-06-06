@@ -51,9 +51,8 @@ async fn factory_missing_credential_surfaces_error() {
     let factory = ProviderFactory::new(vault, Catalog::builtin());
     let id = ProviderId::parse("anthropic", factory.catalog()).expect("anthropic id");
     let result = factory.build(&id, "default").await;
-    let err = match result {
-        Ok(_) => panic!("expected MissingCredential, got Ok"),
-        Err(e) => e,
+    let Err(err) = result else {
+        panic!("expected MissingCredential, got Ok");
     };
     let msg = format!("{err}");
     assert!(
@@ -69,6 +68,7 @@ fn client_message_prompt_round_trips() {
         model: "claude-opus-4-7".into(),
         user_text: "hello".into(),
         session_id: None,
+        ..Default::default()
     });
     let json = serde_json::to_string(&msg).expect("serialize prompt");
     // Internally-tagged: `kind` discriminator sits next to the flattened fields.
@@ -88,6 +88,7 @@ fn client_message_prompt_round_trips() {
         | ClientMessage::PairRedeem { .. }
         | ClientMessage::ListSessions
         | ClientMessage::RemoveSession { .. }
+        | ClientMessage::RewindSession { .. }
         | ClientMessage::ResumeSession { .. }
         | ClientMessage::GetUsage
         | ClientMessage::KeyringAdd { .. }
@@ -98,7 +99,19 @@ fn client_message_prompt_round_trips() {
         | ClientMessage::ActivateSkill { .. }
         | ClientMessage::DeactivateSkill { .. }
         | ClientMessage::ActivateWorkflow { .. }
-        | ClientMessage::Interrupt => unreachable!("expected Prompt variant"),
+        | ClientMessage::ExportSession { .. }
+        | ClientMessage::ResumeForeign { .. }
+        | ClientMessage::Interrupt
+        | ClientMessage::PermissionDecision { .. }
+        | ClientMessage::ClearAll
+        | ClientMessage::SelfDevStart { .. }
+        | ClientMessage::SelfDevStatus
+        | ClientMessage::SelfDevApprove
+        | ClientMessage::SelfDevReset
+        | ClientMessage::TeamCreate { .. }
+        | ClientMessage::TeamAssign { .. }
+        | ClientMessage::TeamStatus { .. }
+        | ClientMessage::RunWorkflow { .. } => unreachable!("expected Prompt variant"),
     }
 }
 
@@ -124,6 +137,7 @@ fn client_message_switch_account_round_trips() {
         | ClientMessage::PairRedeem { .. }
         | ClientMessage::ListSessions
         | ClientMessage::RemoveSession { .. }
+        | ClientMessage::RewindSession { .. }
         | ClientMessage::ResumeSession { .. }
         | ClientMessage::GetUsage
         | ClientMessage::KeyringAdd { .. }
@@ -134,7 +148,19 @@ fn client_message_switch_account_round_trips() {
         | ClientMessage::ActivateSkill { .. }
         | ClientMessage::DeactivateSkill { .. }
         | ClientMessage::ActivateWorkflow { .. }
-        | ClientMessage::Interrupt => unreachable!("expected SwitchAccount variant"),
+        | ClientMessage::ExportSession { .. }
+        | ClientMessage::ResumeForeign { .. }
+        | ClientMessage::Interrupt
+        | ClientMessage::PermissionDecision { .. }
+        | ClientMessage::ClearAll
+        | ClientMessage::SelfDevStart { .. }
+        | ClientMessage::SelfDevStatus
+        | ClientMessage::SelfDevApprove
+        | ClientMessage::SelfDevReset
+        | ClientMessage::TeamCreate { .. }
+        | ClientMessage::TeamAssign { .. }
+        | ClientMessage::TeamStatus { .. }
+        | ClientMessage::RunWorkflow { .. } => unreachable!("expected SwitchAccount variant"),
     }
 }
 

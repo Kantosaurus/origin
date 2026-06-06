@@ -4,6 +4,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use origin_daemon::protocol::{ClientMessage, MemoryAction};
 
+use crate::cli_def::KnowledgeSub;
+use crate::editor::Editor;
+
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum InputAction {
@@ -72,6 +75,145 @@ pub fn reduce(buffer: &mut String, ev: KeyEvent, op_in_flight: bool) -> InputAct
     }
 }
 
+/// Reduce a key event against an [`Editor`] — cursor-aware editing.
+///
+/// Adds Home/End/Delete, arrow navigation, and prompt-history recall (Up/Down
+/// past the buffer edges). `op_in_flight` gates Ctrl+C (Interrupt vs Quit).
+/// `width` is the input card's text width, for visual Home/End and Up/Down
+/// across wrapped lines. Returns the same [`InputAction`]s as [`reduce`];
+/// cursor-only moves return `Noop` (the caller still redraws to move the caret).
+/// Reduce one key while a Ctrl-R reverse-incremental history search is active
+/// (bash-style). Typed chars build the QUERY (not the buffer); Ctrl-R cycles to
+/// older matches; Backspace shrinks the query; Esc / Ctrl-G / Ctrl-C cancels
+/// (restoring the pre-search draft); Enter accepts the match and submits it. Any
+/// other key accepts the match into the buffer and is then re-dispatched as a
+/// normal edit (search is now off, so the recursion is at most one level deep).
+fn reduce_reverse_search(
+    editor: &mut Editor,
+    ev: KeyEvent,
+    op_in_flight: bool,
+    width: usize,
+) -> InputAction {
+    match (ev.code, ev.modifiers) {
+        (KeyCode::Char('r'), m) if m.contains(KeyModifiers::CONTROL) => {
+            editor.reverse_search_again();
+            InputAction::Noop
+        }
+        (KeyCode::Char('g' | 'c'), m) if m.contains(KeyModifiers::CONTROL) => {
+            editor.cancel_reverse_search();
+            InputAction::Noop
+        }
+        (KeyCode::Esc, _) => {
+            editor.cancel_reverse_search();
+            InputAction::Noop
+        }
+        (KeyCode::Backspace, _) => {
+            editor.reverse_search_backspace();
+            InputAction::Backspace
+        }
+        (KeyCode::Enter, _) => {
+            let text = editor.accept_reverse_search();
+            if text.is_empty() {
+                InputAction::Noop
+            } else {
+                editor.push_history(&text);
+                editor.set_buffer(String::new());
+                InputAction::Submit(text)
+            }
+        }
+        (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            editor.reverse_search_push(c);
+            InputAction::Noop
+        }
+        _ => {
+            editor.accept_reverse_search();
+            reduce_editor(editor, ev, op_in_flight, width)
+        }
+    }
+}
+
+pub fn reduce_editor(editor: &mut Editor, ev: KeyEvent, op_in_flight: bool, width: usize) -> InputAction {
+    // While a Ctrl-R reverse search is active, the search sub-reducer owns every
+    // key (see [`reduce_reverse_search`]).
+    if editor.reverse_search_active() {
+        return reduce_reverse_search(editor, ev, op_in_flight, width);
+    }
+
+    match (ev.code, ev.modifiers) {
+        (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+            if op_in_flight {
+                InputAction::Interrupt
+            } else {
+                InputAction::Quit
+            }
+        }
+        (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => InputAction::Quit,
+        // Ctrl-R: enter reverse-incremental history search.
+        (KeyCode::Char('r'), m) if m.contains(KeyModifiers::CONTROL) => {
+            editor.start_reverse_search();
+            InputAction::Noop
+        }
+        (KeyCode::Esc, _) => InputAction::Quit,
+        (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => {
+            editor.insert_newline();
+            InputAction::Newline
+        }
+        (KeyCode::Enter, _) => {
+            if editor.is_empty() {
+                InputAction::Noop
+            } else {
+                let text = editor.buffer().to_string();
+                editor.push_history(&text);
+                editor.set_buffer(String::new());
+                InputAction::Submit(text)
+            }
+        }
+        (KeyCode::Backspace, _) => {
+            editor.backspace();
+            InputAction::Backspace
+        }
+        (KeyCode::Delete, _) => {
+            editor.delete();
+            InputAction::Backspace
+        }
+        (KeyCode::Left, _) => {
+            editor.move_left();
+            InputAction::Noop
+        }
+        (KeyCode::Right, _) => {
+            editor.move_right();
+            InputAction::Noop
+        }
+        (KeyCode::Home, _) => {
+            editor.move_home(width);
+            InputAction::Noop
+        }
+        (KeyCode::End, _) => {
+            editor.move_end(width);
+            InputAction::Noop
+        }
+        (KeyCode::Up, _) => {
+            // Move up a visual line; at the top, recall older history.
+            if !editor.move_up_visual(width) {
+                editor.history_up();
+            }
+            InputAction::Noop
+        }
+        (KeyCode::Down, _) => {
+            if !editor.move_down_visual(width) {
+                editor.history_down();
+            }
+            InputAction::Noop
+        }
+        // Plain typed character (no Ctrl/Alt) inserts at the cursor.
+        (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            editor.insert_char(c);
+            InputAction::Insert(c)
+        }
+        _ => InputAction::Noop,
+    }
+}
+
 /// Parse a `/mem ...` slash command into a [`ClientMessage::MemoryDecision`].
 ///
 /// Recognized forms (case-insensitive on the verb):
@@ -125,7 +267,7 @@ pub fn parse_mem_command(line: &str) -> Option<ClientMessage> {
 /// Slash verbs that already have dedicated handlers — they must not be
 /// re-routed through the skill parser even though they start with `/`.
 /// Update this list when a new slash verb is added.
-const RESERVED_SLASH_VERBS: &[&str] = &["mem", "account", "help", "model"];
+const RESERVED_SLASH_VERBS: &[&str] = &["mem", "account", "help", "model", "clear", "knowledge"];
 
 /// Parse `/<name>` (activate) and `/-<name>` (deactivate) into a
 /// [`ClientMessage::ActivateSkill`] or [`ClientMessage::DeactivateSkill`].
@@ -150,13 +292,10 @@ pub fn parse_skill_command(line: &str) -> Option<ClientMessage> {
     }
 
     // Split into `name_token` and `args` on the first whitespace.
-    let (name_token, args_str) = match rest.find(char::is_whitespace) {
-        Some(idx) => {
-            let (n, a) = rest.split_at(idx);
-            (n, a.trim_start())
-        }
-        None => (rest, ""),
-    };
+    let (name_token, args_str) = rest.find(char::is_whitespace).map_or((rest, ""), |idx| {
+        let (n, a) = rest.split_at(idx);
+        (n, a.trim_start())
+    });
     if name_token.is_empty() {
         return None;
     }
@@ -166,7 +305,7 @@ pub fn parse_skill_command(line: &str) -> Option<ClientMessage> {
         if name.is_empty() || !args_str.is_empty() {
             return None;
         }
-        if RESERVED_SLASH_VERBS.iter().any(|v| name == *v) {
+        if RESERVED_SLASH_VERBS.contains(&name) {
             return None;
         }
         return Some(ClientMessage::DeactivateSkill {
@@ -176,7 +315,7 @@ pub fn parse_skill_command(line: &str) -> Option<ClientMessage> {
 
     // Activate form. Reserved-verb guard applies to the first `:`-segment.
     let first_segment = name_token.split(':').next().unwrap_or(name_token);
-    if RESERVED_SLASH_VERBS.iter().any(|v| first_segment == *v) {
+    if RESERVED_SLASH_VERBS.contains(&first_segment) {
         return None;
     }
     let args = if args_str.is_empty() {
@@ -188,6 +327,21 @@ pub fn parse_skill_command(line: &str) -> Option<ClientMessage> {
         name: name_token.to_string(),
         args,
     })
+}
+
+/// Parse the mechanical `/clear` command into [`ClientMessage::ClearAll`].
+///
+/// `/clear` is NOT a skill — it resets the in-session context directly. The
+/// whole trimmed line must be exactly `/clear` (no args), so a prompt that
+/// merely mentions `/clear` mid-sentence is left as chat text. Returns `None`
+/// for anything else.
+#[must_use]
+pub fn parse_clear_command(line: &str) -> Option<ClientMessage> {
+    if line.trim() == "/clear" {
+        Some(ClientMessage::ClearAll)
+    } else {
+        None
+    }
 }
 
 /// Parse `{workflow:<name>}` (the whole trimmed line) into a
@@ -240,6 +394,228 @@ pub fn parse_model_command(line: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// Parse a `/knowledge <add|search|ls|rm> …` composer command into a
+/// [`KnowledgeSub`], giving the in-session TUI parity with the top-level
+/// `origin knowledge` subcommand (openclaude `/knowledge`).
+///
+/// Recognized forms (verb case-insensitive):
+/// - `/knowledge add <id> <text…>` — index `text` under `id` (both required).
+/// - `/knowledge search <query…>` — search; `k` defaults to 5 (the subcommand
+///   default), since the composer takes no `--k` flag.
+/// - `/knowledge ls` — list every indexed id (no args).
+/// - `/knowledge rm <id>` — remove `id` (a single token).
+///
+/// Returns `None` for any non-`/knowledge` line (so the caller falls through to
+/// its other handlers) and for malformed `/knowledge` invocations (so the
+/// caller, having already matched the `/knowledge` prefix, can surface a usage
+/// hint). A `/knowledgefoo` token without a word boundary is not matched.
+#[must_use]
+pub fn parse_knowledge_command(line: &str) -> Option<KnowledgeSub> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("/knowledge")?;
+    // Require a word boundary so `/knowledgefoo` is not treated as `/knowledge`.
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim();
+    let verb_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let verb = &rest[..verb_end];
+    let args = rest[verb_end..].trim();
+    match verb.to_ascii_lowercase().as_str() {
+        "add" => {
+            // Split the first token as the id; the remainder (with its internal
+            // spacing collapsed to single spaces is unnecessary) is the text.
+            let id_end = args.find(char::is_whitespace)?;
+            let id = &args[..id_end];
+            let text = args[id_end..].trim();
+            if id.is_empty() || text.is_empty() {
+                return None;
+            }
+            Some(KnowledgeSub::Add {
+                id: id.to_string(),
+                text: text.to_string(),
+            })
+        }
+        "search" => {
+            if args.is_empty() {
+                return None;
+            }
+            Some(KnowledgeSub::Search {
+                query: args.to_string(),
+                k: 5,
+            })
+        }
+        "ls" => {
+            if args.is_empty() {
+                Some(KnowledgeSub::Ls)
+            } else {
+                None
+            }
+        }
+        "rm" => {
+            if args.is_empty() || args.contains(char::is_whitespace) {
+                None
+            } else {
+                Some(KnowledgeSub::Rm { id: args.to_string() })
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Modal input mode for the opt-in vim layer (aider L107 parity).
+///
+/// Default sessions never construct anything but [`VimMode::Insert`] and the
+/// vim reducer is never consulted, so the composer's direct-insert behaviour is
+/// byte-identical unless the user opts in (`/vim`, `ORIGIN_VIM=1`, or a config
+/// flag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VimMode {
+    /// Direct text entry — every printable key inserts (today's behaviour).
+    #[default]
+    Insert,
+    /// Command mode — `hjkl`/`0`/`$`/`w`/`b` move; `i`/`a`/`A`/`I` enter insert.
+    Normal,
+}
+
+/// The effect a key has in vim mode, returned by the pure [`vim_key`] reducer.
+///
+/// The caller (`tui.rs`) owns the actual cursor/buffer mutation; this enum is
+/// the deterministically-testable decision. [`VimAction::Pass`] means "not a
+/// vim key — handle it the normal way" so unmapped keys fall through unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VimAction {
+    /// Switch to the given mode (no cursor change of its own).
+    SwitchMode(VimMode),
+    /// Move the cursor one cell left (`h`).
+    MoveLeft,
+    /// Move the cursor one cell right (`l`).
+    MoveRight,
+    /// Move to the previous line (`k`).
+    MoveUp,
+    /// Move to the next line (`j`).
+    MoveDown,
+    /// Jump to the start of the line (`0`).
+    LineStart,
+    /// Jump to the end of the line (`$`).
+    LineEnd,
+    /// Jump forward one word (`w`).
+    WordForward,
+    /// Jump back one word (`b`).
+    WordBack,
+    /// Enter insert mode at the cursor (`i`).
+    InsertHere,
+    /// Enter insert mode after the cursor (`a`).
+    AppendAfter,
+    /// Enter insert mode at the line start (`I`).
+    InsertLineStart,
+    /// Enter insert mode at the line end (`A`).
+    AppendLineEnd,
+    /// Begin a `:`-command (Normal mode only).
+    BeginCommand,
+    /// Not a vim binding in this mode — caller uses its normal handling.
+    Pass,
+}
+
+/// Pure modal-key reducer for the opt-in vim input layer.
+///
+/// Given the current [`VimMode`] and a key event, returns the [`VimAction`] to
+/// apply. The cursor/buffer mutation lives in the caller; this map is the
+/// unit-tested core.
+///
+/// Semantics:
+/// - In [`VimMode::Insert`], only `Esc` is special (→ Normal); every other key
+///   is [`VimAction::Pass`] so insertion stays byte-identical to the legacy
+///   reducer.
+/// - In [`VimMode::Normal`], `hjkl`/`0`/`$`/`w`/`b` move, `i`/`a`/`A`/`I` enter
+///   insert, `:` begins a command, and `Esc` re-asserts Normal. Unmapped keys
+///   are [`VimAction::Pass`] (they do not insert text in Normal mode — the
+///   caller drops them).
+///
+/// Map a keypress to a permission decision while an interactive permission ask
+/// is pending: `y`/`Y` allows, `n`/`N` or `Esc` denies, anything else is not an
+/// answer (`None`) and falls through to normal input handling.
+#[must_use]
+pub const fn permission_answer(code: KeyCode) -> Option<bool> {
+    match code {
+        KeyCode::Char('y' | 'Y') => Some(true),
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(false),
+        _ => None,
+    }
+}
+
+/// Modifier chords (anything with `CONTROL`/`ALT`) always [`VimAction::Pass`]
+/// so the global `Ctrl+C`/`Ctrl+D` exits keep working in either mode.
+#[must_use]
+pub fn vim_key(mode: VimMode, ev: KeyEvent) -> VimAction {
+    if ev.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+        return VimAction::Pass;
+    }
+    if ev.code == KeyCode::Esc {
+        return VimAction::SwitchMode(VimMode::Normal);
+    }
+    match mode {
+        VimMode::Insert => VimAction::Pass,
+        VimMode::Normal => vim_normal_key(ev.code),
+    }
+}
+
+/// Normal-mode key table, split out to keep [`vim_key`] flat (no nested match
+/// on the mode *and* the code in one function body).
+const fn vim_normal_key(code: KeyCode) -> VimAction {
+    match code {
+        KeyCode::Char('h') | KeyCode::Left => VimAction::MoveLeft,
+        KeyCode::Char('l') | KeyCode::Right => VimAction::MoveRight,
+        KeyCode::Char('k') | KeyCode::Up => VimAction::MoveUp,
+        KeyCode::Char('j') | KeyCode::Down => VimAction::MoveDown,
+        KeyCode::Char('0') => VimAction::LineStart,
+        KeyCode::Char('$') => VimAction::LineEnd,
+        KeyCode::Char('w') => VimAction::WordForward,
+        KeyCode::Char('b') => VimAction::WordBack,
+        KeyCode::Char('i') => VimAction::SwitchMode(VimMode::Insert),
+        KeyCode::Char('a') => VimAction::AppendAfter,
+        KeyCode::Char('A') => VimAction::AppendLineEnd,
+        KeyCode::Char('I') => VimAction::InsertLineStart,
+        KeyCode::Char(':') => VimAction::BeginCommand,
+        _ => VimAction::Pass,
+    }
+}
+
+/// Whether the opt-in vim input layer should be active for this session.
+///
+/// True when `ORIGIN_VIM=1` (env opt-in) or `config_flag` is set (e.g. a
+/// `config.toml` field threaded in by the caller). Default-off ⇒ the composer's
+/// direct-insert behaviour is byte-identical.
+#[must_use]
+pub fn vim_enabled(config_flag: bool) -> bool {
+    config_flag || std::env::var("ORIGIN_VIM").as_deref() == Ok("1")
+}
+
+/// The vim layer's startup-active state with no config flag.
+///
+/// `ORIGIN_VIM=1` alone — a convenience wrapper over [`vim_enabled`] for the TUI
+/// seed point, so a session begins in vim Normal mode when the env opt-in is
+/// set. Default-off (`ORIGIN_VIM` unset/!="1") ⇒ `false` ⇒ byte-identical direct
+/// insert.
+#[must_use]
+pub fn vim_active_default() -> bool {
+    vim_enabled(false)
+}
+
+/// Pure routing decision for the live key path: should this key event be routed
+/// through the vim reducer, or fall straight through to the legacy editor
+/// reducer?
+///
+/// Returns `true` only when the vim layer is active for the session. When
+/// `false` the caller MUST use its unchanged `reduce_editor` path, so a default
+/// session (no `ORIGIN_VIM`, no `/vim`) is byte-identical. This is split out as
+/// a pure predicate so the routing decision is deterministically unit-testable
+/// without standing up a full TUI.
+#[must_use]
+pub const fn route_through_vim(vim_active: bool) -> bool {
+    vim_active
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unreachable)] // panic! is the idiomatic mismatched-variant assertion in test code
 mod tests {
@@ -257,6 +633,90 @@ mod tests {
             InputAction::Submit("hello".into())
         );
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn reduce_editor_inserts_and_submits() {
+        let mut ed = Editor::new();
+        assert_eq!(reduce_editor(&mut ed, k(KeyCode::Char('h')), false, 80), InputAction::Insert('h'));
+        assert_eq!(reduce_editor(&mut ed, k(KeyCode::Char('i')), false, 80), InputAction::Insert('i'));
+        assert_eq!(ed.buffer(), "hi");
+        assert_eq!(
+            reduce_editor(&mut ed, k(KeyCode::Enter), false, 80),
+            InputAction::Submit("hi".to_string())
+        );
+        assert!(ed.is_empty(), "submit clears the buffer");
+    }
+
+    #[test]
+    fn reduce_editor_inserts_at_the_cursor_not_the_end() {
+        let mut ed = Editor::new();
+        ed.set_buffer("ac".to_string()); // cursor at end
+        reduce_editor(&mut ed, k(KeyCode::Left), false, 80); // now between a and c
+        reduce_editor(&mut ed, k(KeyCode::Char('b')), false, 80);
+        assert_eq!(ed.buffer(), "abc", "mid-buffer insert");
+    }
+
+    #[test]
+    fn reduce_editor_up_recalls_history() {
+        let mut ed = Editor::new();
+        ed.set_buffer("first".to_string());
+        reduce_editor(&mut ed, k(KeyCode::Enter), false, 80); // submit → pushed to history
+        reduce_editor(&mut ed, k(KeyCode::Up), false, 80); // recall
+        assert_eq!(ed.buffer(), "first", "Up past the top recalls the previous prompt");
+    }
+
+    const fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn reduce_editor_ctrl_r_reverse_search_flow() {
+        let mut ed = Editor::new();
+        for s in ["cargo build", "git status", "cargo test"] {
+            ed.push_history(s);
+        }
+        ed.set_buffer("draft".to_string());
+        // Ctrl-R enters search; typed chars build the query (not the buffer).
+        assert_eq!(reduce_editor(&mut ed, ctrl('r'), false, 80), InputAction::Noop);
+        assert!(ed.reverse_search_active());
+        for c in "cargo".chars() {
+            reduce_editor(&mut ed, k(KeyCode::Char(c)), false, 80);
+        }
+        assert_eq!(ed.buffer(), "cargo test", "newest match shown live");
+        // Ctrl-R again cycles older; Enter accepts + submits it.
+        reduce_editor(&mut ed, ctrl('r'), false, 80);
+        assert_eq!(ed.buffer(), "cargo build");
+        assert_eq!(
+            reduce_editor(&mut ed, k(KeyCode::Enter), false, 80),
+            InputAction::Submit("cargo build".to_string())
+        );
+        assert!(!ed.reverse_search_active());
+    }
+
+    #[test]
+    fn reduce_editor_ctrl_r_esc_cancels_and_restores_draft() {
+        let mut ed = Editor::new();
+        ed.push_history("cargo build");
+        ed.set_buffer("draft".to_string());
+        reduce_editor(&mut ed, ctrl('r'), false, 80);
+        reduce_editor(&mut ed, k(KeyCode::Char('c')), false, 80);
+        assert_eq!(ed.buffer(), "cargo build");
+        // Esc cancels search (does NOT quit) and restores the draft.
+        assert_eq!(reduce_editor(&mut ed, k(KeyCode::Esc), false, 80), InputAction::Noop);
+        assert!(!ed.reverse_search_active());
+        assert_eq!(ed.buffer(), "draft");
+    }
+
+    #[test]
+    fn permission_answer_maps_keys() {
+        assert_eq!(permission_answer(KeyCode::Char('y')), Some(true));
+        assert_eq!(permission_answer(KeyCode::Char('Y')), Some(true));
+        assert_eq!(permission_answer(KeyCode::Char('n')), Some(false));
+        assert_eq!(permission_answer(KeyCode::Char('N')), Some(false));
+        assert_eq!(permission_answer(KeyCode::Esc), Some(false), "Esc denies");
+        assert_eq!(permission_answer(KeyCode::Char('x')), None, "other keys not an answer");
+        assert_eq!(permission_answer(KeyCode::Enter), None);
     }
 
     #[test]
@@ -453,6 +913,9 @@ mod tests {
     }
 
     #[test]
+    // The test inputs contain literal `{workflow:x}`-style braces on purpose
+    // (they are parser fixtures, not format strings).
+    #[allow(clippy::literal_string_with_formatting_args)]
     fn parse_workflow_command_rejects_malformed() {
         assert!(parse_workflow_command("{workflow:}").is_none());
         assert!(parse_workflow_command("{workflow}").is_none());
@@ -501,6 +964,169 @@ mod tests {
         assert!(parse_skill_command("/model").is_none());
         assert!(parse_skill_command("/model:foo").is_none());
     }
+
+    // ---- vim input layer (aider L107) ----
+
+    #[test]
+    fn vim_default_mode_is_insert() {
+        assert_eq!(VimMode::default(), VimMode::Insert);
+    }
+
+    #[test]
+    fn vim_insert_passes_through_printable_keys() {
+        // In Insert mode every printable key is Pass, so the caller's normal
+        // direct-insert path runs unchanged (byte-identical default).
+        assert_eq!(vim_key(VimMode::Insert, k(KeyCode::Char('x'))), VimAction::Pass);
+        assert_eq!(vim_key(VimMode::Insert, k(KeyCode::Char('h'))), VimAction::Pass);
+        assert_eq!(vim_key(VimMode::Insert, k(KeyCode::Enter)), VimAction::Pass);
+    }
+
+    #[test]
+    fn vim_esc_enters_normal_from_insert() {
+        assert_eq!(
+            vim_key(VimMode::Insert, k(KeyCode::Esc)),
+            VimAction::SwitchMode(VimMode::Normal)
+        );
+    }
+
+    #[test]
+    fn vim_normal_hjkl_moves() {
+        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('h'))), VimAction::MoveLeft);
+        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('j'))), VimAction::MoveDown);
+        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('k'))), VimAction::MoveUp);
+        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('l'))), VimAction::MoveRight);
+    }
+
+    #[test]
+    fn vim_normal_line_and_word_motions() {
+        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('0'))), VimAction::LineStart);
+        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('$'))), VimAction::LineEnd);
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char('w'))),
+            VimAction::WordForward
+        );
+        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('b'))), VimAction::WordBack);
+    }
+
+    #[test]
+    fn vim_normal_insert_entries() {
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char('i'))),
+            VimAction::SwitchMode(VimMode::Insert)
+        );
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char('a'))),
+            VimAction::AppendAfter
+        );
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char('A'))),
+            VimAction::AppendLineEnd
+        );
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char('I'))),
+            VimAction::InsertLineStart
+        );
+    }
+
+    #[test]
+    fn vim_normal_colon_begins_command() {
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char(':'))),
+            VimAction::BeginCommand
+        );
+    }
+
+    #[test]
+    fn vim_normal_unmapped_key_passes() {
+        // An unmapped printable key in Normal mode does NOT insert — it passes
+        // so the caller drops it (vim Normal mode never types text).
+        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('z'))), VimAction::Pass);
+    }
+
+    #[test]
+    fn vim_ctrl_chords_always_pass() {
+        // Ctrl+C / Ctrl+D must keep reaching the global exit reducer in either
+        // mode, so modifier chords are never captured by the vim layer.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(vim_key(VimMode::Normal, ctrl_c), VimAction::Pass);
+        assert_eq!(vim_key(VimMode::Insert, ctrl_c), VimAction::Pass);
+    }
+
+    #[test]
+    fn vim_enabled_off_by_default() {
+        // With no config flag and ORIGIN_VIM unset/!="1", the layer is off.
+        // (We only assert the config-flag arm here to avoid mutating process
+        // env in a shared test binary; the env arm is exercised via the OR.)
+        assert!(!vim_enabled(false) || std::env::var("ORIGIN_VIM").as_deref() == Ok("1"));
+        assert!(vim_enabled(true));
+    }
+
+    #[test]
+    fn route_through_vim_only_when_active() {
+        // The live key path consults the vim reducer only when the session has
+        // the vim layer active. Inactive ⇒ the caller MUST use its unchanged
+        // direct path (byte-identical default).
+        assert!(route_through_vim(true), "active session routes through vim");
+        assert!(
+            !route_through_vim(false),
+            "inactive session must NOT route through vim (byte-identical default)"
+        );
+    }
+
+    #[test]
+    fn vim_active_default_matches_env_opt_in() {
+        // The startup seed is exactly the no-config-flag `vim_enabled`: it is on
+        // iff `ORIGIN_VIM=1`. We assert the equivalence rather than the absolute
+        // value to avoid depending on the shared test binary's env.
+        assert_eq!(vim_active_default(), vim_enabled(false));
+    }
+
+    // ---- /knowledge composer command (openclaude /knowledge parity in-session) ----
+
+    #[test]
+    fn parse_knowledge_add_takes_id_and_text() {
+        match parse_knowledge_command("/knowledge add rust-async tokio is a runtime") {
+            Some(KnowledgeSub::Add { id, text }) => {
+                assert_eq!(id, "rust-async");
+                assert_eq!(text, "tokio is a runtime");
+            }
+            _ => panic!("expected Add"),
+        }
+    }
+
+    #[test]
+    fn parse_knowledge_search_defaults_k_to_five() {
+        match parse_knowledge_command("/knowledge search rust async runtime") {
+            Some(KnowledgeSub::Search { query, k }) => {
+                assert_eq!(query, "rust async runtime");
+                assert_eq!(k, 5, "in-session search uses the subcommand's default k");
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn parse_knowledge_ls_and_rm() {
+        assert!(matches!(parse_knowledge_command("/knowledge ls"), Some(KnowledgeSub::Ls)));
+        match parse_knowledge_command("/knowledge rm foo") {
+            Some(KnowledgeSub::Rm { id }) => assert_eq!(id, "foo"),
+            _ => panic!("expected Rm"),
+        }
+    }
+
+    #[test]
+    fn parse_knowledge_rejects_malformed_and_non_knowledge() {
+        // Not a `/knowledge` line at all.
+        assert!(parse_knowledge_command("hello world").is_none());
+        assert!(parse_knowledge_command("/knowledgefoo").is_none(), "word boundary required");
+        // Malformed `/knowledge` invocations.
+        assert!(parse_knowledge_command("/knowledge").is_none(), "no verb");
+        assert!(parse_knowledge_command("/knowledge add foo").is_none(), "add needs text");
+        assert!(parse_knowledge_command("/knowledge search").is_none(), "search needs a query");
+        assert!(parse_knowledge_command("/knowledge rm").is_none(), "rm needs an id");
+        assert!(parse_knowledge_command("/knowledge rm foo bar").is_none(), "rm id is one token");
+        assert!(parse_knowledge_command("/knowledge bogus x").is_none(), "unknown verb");
+    }
 }
 
 #[cfg(test)]
@@ -520,12 +1146,35 @@ mod tests_args {
 
     #[test]
     fn slash_without_args_returns_none_args() {
-        let got = parse_skill_command("/clear");
+        let got = parse_skill_command("/brainstorming");
         assert!(matches!(
             got,
             Some(ClientMessage::ActivateSkill { ref name, args: None })
-                if name == "clear"
+                if name == "brainstorming"
         ));
+    }
+
+    #[test]
+    fn clear_is_not_a_skill() {
+        // `/clear` is a reserved verb; it must NOT parse as a skill activation.
+        assert!(
+            parse_skill_command("/clear").is_none(),
+            "/clear must route to the mechanical ClearAll path, not the skill parser"
+        );
+    }
+
+    #[test]
+    fn clear_parses_to_clear_all() {
+        assert!(matches!(parse_clear_command("/clear"), Some(ClientMessage::ClearAll)));
+        assert!(matches!(parse_clear_command("  /clear  "), Some(ClientMessage::ClearAll)));
+    }
+
+    #[test]
+    fn clear_command_rejects_args_and_chat() {
+        assert!(parse_clear_command("/clear now").is_none());
+        assert!(parse_clear_command("please /clear the screen").is_none());
+        assert!(parse_clear_command("/cleary").is_none());
+        assert!(parse_clear_command("clear").is_none());
     }
 
     #[test]

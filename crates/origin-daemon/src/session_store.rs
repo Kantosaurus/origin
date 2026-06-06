@@ -82,7 +82,7 @@ impl SessionStore {
     /// # Errors
     /// Returns a sqlite error on write failure.
     pub fn persist_session(&self, s: &Session) -> Result<(), SessionStoreError> {
-        let id = s.id.to_string();
+        let id = s.id.clone();
         let provider = s.provider_name.clone();
         let model = s.model.clone();
         let now = now_ms();
@@ -270,15 +270,184 @@ impl SessionStore {
         })?;
         Ok(())
     }
+
+    /// Conversation rewind: keep the first `keep_turns` message rows of a
+    /// session (those with `turn_index < keep_turns`) and delete the rest,
+    /// rolling the transcript back to an earlier point. The session row itself
+    /// is preserved so the trimmed history can still be `resume`d. Returns the
+    /// number of message rows removed. Idempotent when `keep_turns` already
+    /// covers the whole transcript (removes nothing).
+    ///
+    /// # Errors
+    /// Propagates sqlite errors on write failure.
+    pub fn truncate_after(&self, session_id: &str, keep_turns: u32) -> Result<u32, SessionStoreError> {
+        let removed: usize = self.inner.with_conn(|c| {
+            let n = c.execute(
+                "DELETE FROM messages WHERE session_id = ?1 AND turn_index >= ?2",
+                rusqlite::params![session_id, keep_turns],
+            )?;
+            Ok(n)
+        })?;
+        Ok(u32::try_from(removed).unwrap_or(u32::MAX))
+    }
+
+    /// Snapshot the pre-compaction `original` body for `turn_index` so a later
+    /// rewind can reconstruct it. Write-once per `(session, turn)`: re-snapshotting
+    /// an already-captured turn is a no-op (the first/original snapshot wins), so
+    /// repeated compaction never clobbers the true original.
+    ///
+    /// # Errors
+    /// Returns a sqlite error on write or an rkyv error on serialization failure.
+    pub fn snapshot_original(
+        &self,
+        session_id: &str,
+        turn_index: u32,
+        original: &Message,
+    ) -> Result<(), SessionStoreError> {
+        let bytes = rkyv::to_bytes::<_, 4096>(original)
+            .map_err(|e| SessionStoreError::Rkyv(e.to_string()))?
+            .to_vec();
+        let now = now_ms();
+        self.inner.with_conn(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO message_snapshots \
+                 (session_id, turn_index, original_body, compacted_at) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![session_id, turn_index, bytes, now],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Compaction-aware rewind. Like [`Self::truncate_after`] it deletes turns
+    /// `>= keep_turns`, but FIRST restores `body_inline` (and clears `summary`)
+    /// for every kept turn that has a pre-compaction snapshot — so the retained
+    /// transcript is byte-identical to its pre-compaction state rather than
+    /// leaving the collapsed `[compacted turn N]` placeholders in place. Consumed
+    /// snapshots for kept turns are dropped so a later re-compaction re-snapshots
+    /// fresh. Returns the number of message rows deleted. All three statements
+    /// run in one connection closure (a single implicit transaction).
+    ///
+    /// # Errors
+    /// Propagates sqlite errors on write failure.
+    pub fn rewind_restoring(&self, session_id: &str, keep_turns: u32) -> Result<u32, SessionStoreError> {
+        let removed: usize = self.inner.with_conn(|c| {
+            // 1. Restore kept turns that were compacted, from their snapshots.
+            //    The EXISTS guard ensures non-snapshotted turns are left untouched
+            //    (never set to a NULL body by the correlated subquery).
+            c.execute(
+                "UPDATE messages SET body_inline = ( \
+                     SELECT s.original_body FROM message_snapshots s \
+                     WHERE s.session_id = messages.session_id AND s.turn_index = messages.turn_index), \
+                     summary = NULL \
+                 WHERE session_id = ?1 AND turn_index < ?2 \
+                   AND EXISTS ( \
+                     SELECT 1 FROM message_snapshots s \
+                     WHERE s.session_id = ?1 AND s.turn_index = messages.turn_index)",
+                rusqlite::params![session_id, keep_turns],
+            )?;
+            // 2. Drop the now-consumed snapshots for kept turns.
+            c.execute(
+                "DELETE FROM message_snapshots WHERE session_id = ?1 AND turn_index < ?2",
+                rusqlite::params![session_id, keep_turns],
+            )?;
+            // 3. Delete the rewound-past turns.
+            let n = c.execute(
+                "DELETE FROM messages WHERE session_id = ?1 AND turn_index >= ?2",
+                rusqlite::params![session_id, keep_turns],
+            )?;
+            Ok(n)
+        })?;
+        Ok(u32::try_from(removed).unwrap_or(u32::MAX))
+    }
 }
 
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| {
+        .map_or(0, |d| {
             // Saturating cast — won't overflow in our lifetime.
             i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
         })
-        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Session, SessionStore};
+    use origin_core::types::{Block, Message, Role};
+
+    #[test]
+    fn truncate_after_keeps_first_n_turns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(dir.path().join("sessions.db")).expect("open");
+        let sid = "sess-rewind";
+        // Persist the parent session row first (messages FK → sessions.id).
+        store
+            .persist_session(&Session::new_with_id(sid.to_string(), "test-model".to_string()))
+            .expect("persist session");
+        for i in 0..5u32 {
+            let m = Message::new(Role::User).with_block(Block::text(format!("turn {i}")));
+            store.persist_message(sid, i, &m).expect("persist");
+        }
+        assert_eq!(store.load_messages(sid).expect("load").len(), 5);
+
+        // Keep the first 3 turns; the last 2 are removed.
+        let removed = store.truncate_after(sid, 3).expect("truncate");
+        assert_eq!(removed, 2);
+        assert_eq!(store.load_messages(sid).expect("load").len(), 3);
+
+        // Idempotent: keeping more turns than exist removes nothing.
+        assert_eq!(store.truncate_after(sid, 10).expect("truncate"), 0);
+        assert_eq!(store.load_messages(sid).expect("load").len(), 3);
+
+        // Keeping 0 turns clears the transcript.
+        assert_eq!(store.truncate_after(sid, 0).expect("truncate"), 3);
+        assert!(store.load_messages(sid).expect("load").is_empty());
+    }
+
+    fn first_text(m: &Message) -> String {
+        match m.blocks.first() {
+            Some(Block::Text { text, .. }) => text.clone(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn rewind_restoring_recovers_precompaction_bodies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(dir.path().join("sessions.db")).expect("open");
+        let sid = "sess-restore";
+        store
+            .persist_session(&Session::new_with_id(sid.to_string(), "test-model".to_string()))
+            .expect("persist session");
+        for i in 0..6u32 {
+            let m = Message::new(Role::User).with_block(Block::text(format!("original turn {i}")));
+            store.persist_message(sid, i, &m).expect("persist");
+        }
+        // Snapshot the oldest 3 originals (what compaction would collapse), then
+        // overwrite their bodies with placeholders to simulate compaction.
+        for i in 0..3u32 {
+            let original = Message::new(Role::User).with_block(Block::text(format!("original turn {i}")));
+            store.snapshot_original(sid, i, &original).expect("snapshot");
+            let compacted =
+                Message::new(Role::User).with_block(Block::text(format!("[compacted turn {i}] sum")));
+            store.persist_message(sid, i, &compacted).expect("persist compacted");
+        }
+        assert!(first_text(&store.load_messages(sid).expect("load")[0]).starts_with("[compacted turn 0]"));
+
+        // Rewind keeping all 6: restores the 3 compacted-but-kept bodies, deletes nothing.
+        assert_eq!(store.rewind_restoring(sid, 6).expect("rewind"), 0);
+        let msgs = store.load_messages(sid).expect("load");
+        assert_eq!(msgs.len(), 6);
+        for (i, msg) in msgs.iter().take(3).enumerate() {
+            assert_eq!(first_text(msg), format!("original turn {i}"), "turn {i} restored");
+        }
+        // Non-snapshotted kept turn is untouched.
+        assert_eq!(first_text(&msgs[4]), "original turn 4");
+
+        // Rewind keeping 2 also deletes turns >= 2.
+        assert_eq!(store.rewind_restoring(sid, 2).expect("rewind 2"), 4);
+        assert_eq!(store.load_messages(sid).expect("load").len(), 2);
+    }
 }

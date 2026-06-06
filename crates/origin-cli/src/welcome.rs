@@ -162,7 +162,7 @@ fn screen_toolbox<R: BufRead, W: Write>(r: &mut R, w: &mut W) -> Result<()> {
             w,
             "    {}  {}",
             ansi::accent(&format!("{:<16}", t.name)),
-            ansi::muted(&desc)
+            ansi::muted(desc)
         )?;
     }
     writeln!(w)?;
@@ -383,7 +383,7 @@ fn screen_workflows<R: BufRead, W: Write>(r: &mut R, w: &mut W, workflows_path: 
 /// on any read error so the welcome screen never aborts on permission
 /// glitches.
 fn count_skills(dir: &Path) -> usize {
-    load_skills_dir(dir).map(|v| v.len()).unwrap_or(0)
+    load_skills_dir(dir).map_or(0, |v| v.len())
 }
 
 fn press_enter<R: BufRead, W: Write>(r: &mut R, w: &mut W, prompt: &str) -> Result<()> {

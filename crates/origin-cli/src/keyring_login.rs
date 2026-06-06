@@ -3,11 +3,11 @@
 //! builtin provider catalog.
 //!
 //! Dispatches on `OAuthSpec::device_flow`:
-//!   - `true`  → GitHub-style device-code flow (POST device/code, poll token).
-//!   - `false` → PKCE auth-code flow; either spins a localhost TCP listener for
-//!               providers with a `http://localhost:…` redirect URI, or reads
-//!               the code from stdin for providers whose redirect URI is a
-//!               remote HTTPS URL (e.g. Anthropic's console callback).
+//! - `true`  → GitHub-style device-code flow (POST device/code, poll token).
+//! - `false` → PKCE auth-code flow; either spins a localhost TCP listener for
+//!   providers with a `http://localhost:…` redirect URI, or reads the code from
+//!   stdin for providers whose redirect URI is a remote HTTPS URL (e.g.
+//!   Anthropic's console callback).
 
 use anyhow::{anyhow, Result};
 use origin_keyvault::{AuthCodeRequest, KeyVault, OAuthClient, Pkce, Secret};

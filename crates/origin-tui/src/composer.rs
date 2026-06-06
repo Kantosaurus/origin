@@ -103,6 +103,12 @@ fn emit_translated(grid: &Grid, runs: &[Run], row_offset: u16, col_offset: u16) 
         for i in 0..orig.len {
             // Cell lookup uses pane-relative coords.
             let cell = grid.get(orig.row, orig.col + i);
+            // The continuation half of a wide glyph emits nothing: the wide glyph
+            // already advanced the terminal cursor by two columns, so writing
+            // here would shift the rest of the row right by one.
+            if cell.is_continuation() {
+                continue;
+            }
             let style = (cell.fg, cell.bg, cell.attr);
             if Some(style) != current_style {
                 push_sgr(&mut out, cell.fg, cell.bg, Attr(cell.attr));
@@ -116,6 +122,18 @@ fn emit_translated(grid: &Grid, runs: &[Run], row_offset: u16, col_offset: u16) 
 }
 
 fn push_sgr(out: &mut Vec<u8>, fg: u32, bg: u32, attr: Attr) {
+    // Honor `NO_COLOR` via the same cached decision the `ansi` emit path uses,
+    // so both render paths stay byte-consistent.
+    push_sgr_inner(out, fg, bg, attr, crate::ansi::want_color_cached());
+}
+
+/// Emit the SGR sequence for a style, with the color decision passed in so the
+/// behavior is unit-testable without touching the process environment.
+///
+/// Attribute sequences (bold/italic/underline/reverse/dim) are always emitted
+/// so structure survives even with color off; only the 24-bit foreground and
+/// background sequences are gated behind `want_color`.
+fn push_sgr_inner(out: &mut Vec<u8>, fg: u32, bg: u32, attr: Attr, want_color: bool) {
     out.extend_from_slice(b"\x1b[0m");
     if attr.bits() & Attr::BOLD.bits() != 0 {
         out.extend_from_slice(b"\x1b[1m");
@@ -132,11 +150,11 @@ fn push_sgr(out: &mut Vec<u8>, fg: u32, bg: u32, attr: Attr) {
     if attr.bits() & Attr::DIM.bits() != 0 {
         out.extend_from_slice(b"\x1b[2m");
     }
-    if fg != 0 {
+    if want_color && fg != 0 {
         let (r, g, b) = unpack(fg);
         let _ = write!(out, "\x1b[38;2;{r};{g};{b}m");
     }
-    if bg != 0 {
+    if want_color && bg != 0 {
         let (r, g, b) = unpack(bg);
         let _ = write!(out, "\x1b[48;2;{r};{g};{b}m");
     }
@@ -220,13 +238,24 @@ impl Composer {
         self.scratch_prompt = Grid::new_filled(cols, PROMPT_ROWS, SCRATCH_SENTINEL);
     }
 
+    /// Show or hide the side panel, reflowing the panes only on a state change.
+    ///
+    /// A no-op when already in the requested state, so callers can drive it from
+    /// the render loop every frame cheaply; the (re)allocation only happens on
+    /// the visible↔hidden transition. Reuses the current `cols`/`rows`.
+    pub fn set_side_visible(&mut self, visible: bool) {
+        if self.side_visible != visible {
+            self.resize(self.cols, self.rows, visible);
+        }
+    }
+
     /// Mutable reference to the main pane grid.
-    pub fn main_grid(&mut self) -> &mut Grid {
+    pub const fn main_grid(&mut self) -> &mut Grid {
         &mut self.main
     }
 
     /// Mutable reference to the side panel grid.
-    pub fn side_grid(&mut self) -> &mut Grid {
+    pub const fn side_grid(&mut self) -> &mut Grid {
         &mut self.side
     }
 
@@ -238,7 +267,7 @@ impl Composer {
     }
 
     /// Mutable reference to the prompt bar grid.
-    pub fn prompt_grid(&mut self) -> &mut Grid {
+    pub const fn prompt_grid(&mut self) -> &mut Grid {
         &mut self.prompt
     }
 
@@ -272,5 +301,67 @@ impl Composer {
         out.extend_from_slice(&bytes_side);
         out.extend_from_slice(&bytes_prompt);
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{push_sgr_inner, Composer};
+    use crate::grid::{Attr, Cell};
+
+    #[test]
+    fn emit_skips_wide_glyph_continuation_cell() {
+        // A wide glyph followed by its continuation must emit ONE glyph, so the
+        // terminal cursor isn't double-advanced (which would drift the row).
+        let mut c = Composer::new(10, 2);
+        {
+            let g = c.main_grid();
+            g.put(0, 0, Cell::new('\u{4e16}', 0, 0, Attr::PLAIN));
+            g.put(0, 1, Cell::continuation(0));
+            g.put(0, 2, Cell::new('x', 0, 0, Attr::PLAIN));
+        }
+        let bytes = c.frame();
+        let s = String::from_utf8(bytes).expect("utf-8");
+        assert!(
+            s.contains("\u{4e16}x"),
+            "wide glyph and next char must be adjacent (continuation emitted nothing): {s:?}"
+        );
+    }
+
+    #[test]
+    fn set_side_visible_toggles_only_on_change() {
+        let mut c = Composer::new(80, 24);
+        assert!(!c.side_visible(), "hidden by default");
+        c.set_side_visible(true);
+        assert!(c.side_visible());
+        let cols_with_side = c.side_grid().cols();
+        c.set_side_visible(true); // no-op
+        assert!(c.side_visible());
+        assert_eq!(c.side_grid().cols(), cols_with_side, "no reallocation on no-op");
+        c.set_side_visible(false);
+        assert!(!c.side_visible());
+    }
+
+    #[test]
+    fn disabled_color_keeps_attrs_drops_truecolor() {
+        // The translated emit path must honor `NO_COLOR` like `ansi::emit`:
+        // bold survives, 24-bit fg/bg are dropped.
+        let mut out: Vec<u8> = Vec::new();
+        push_sgr_inner(&mut out, 0x00FF_8040, 0x0010_2030, Attr::BOLD, false);
+        let s = String::from_utf8(out).expect("SGR bytes are valid UTF-8");
+        assert!(s.contains("\x1b[1m"), "bold attribute should still emit");
+        assert!(!s.contains("38;2"), "foreground truecolor must be skipped");
+        assert!(!s.contains("48;2"), "background truecolor must be skipped");
+    }
+
+    #[test]
+    fn enabled_color_emits_truecolor() {
+        // The default path stays byte-identical: color enabled → fg/bg present.
+        let mut out: Vec<u8> = Vec::new();
+        push_sgr_inner(&mut out, 0x00FF_8040, 0x0010_2030, Attr::BOLD, true);
+        let s = String::from_utf8(out).expect("SGR bytes are valid UTF-8");
+        assert!(s.contains("\x1b[1m"));
+        assert!(s.contains("\x1b[38;2;255;128;64m"));
+        assert!(s.contains("\x1b[48;2;16;32;48m"));
     }
 }

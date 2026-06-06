@@ -383,7 +383,7 @@ fn partition_to_rows(
             (key, members)
         })
         .collect();
-    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed.sort_by_key(|a| a.0);
     for (_, members) in keyed {
         let mut rows = Vec::with_capacity(members.len());
         for m in members {

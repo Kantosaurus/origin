@@ -411,6 +411,11 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
             default_model: "gpt-4o".into(),
             capabilities: FULL_CAPS,
         },
+        // LiteLLM proxy gateway: a self-hosted `OpenAI`-compatible router that
+        // fronts 100+ upstream providers behind one base URL. The default
+        // `base_url` points at a local proxy (`litellm --port 4000`); override
+        // it via `~/.origin/providers.toml` to reach a remote deployment. The
+        // proxy's master key is read as the bearer token from `LITELLM_API_KEY`.
         ProviderEntry {
             id: "litellm".into(),
             display_name: "LiteLLM Proxy".into(),
@@ -588,6 +593,16 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
             default_model: "qwen-max".into(),
             capabilities: FULL_CAPS,
         },
+        ProviderEntry {
+            id: "nebius".into(),
+            display_name: "Nebius AI Studio".into(),
+            wire: WireFormat::OpenAIChat,
+            auth: bearer(),
+            base_url: "https://api.studio.nebius.com".into(),
+            chat_path: "/v1/chat/completions".into(),
+            default_model: "meta-llama/Llama-3.3-70B-Instruct".into(),
+            capabilities: FULL_CAPS,
+        },
     ]
 }
 
@@ -614,6 +629,31 @@ mod tests {
                 assert!(!spec.client_id.is_empty(), "{}: empty client_id", e.id);
             }
         }
+    }
+
+    #[test]
+    fn first_class_providers_present() {
+        // Provider-breadth gap (kilo/cline/jcode/opencode) plus the LiteLLM
+        // gateway (openclaude L292): these ids must enumerate first-class.
+        let cat = builtin_catalog();
+        let ids: HashSet<&str> = cat.iter().map(|e| e.id.as_ref()).collect();
+        for id in [
+            "cerebras", "groq", "fireworks", "mistral", "deepseek", "together", "moonshot",
+            "kimi", "xai", "nebius", "litellm",
+        ] {
+            assert!(ids.contains(id), "missing first-class provider: {id}");
+        }
+    }
+
+    #[test]
+    fn litellm_gateway_defaults_to_local_proxy() {
+        let cat = builtin_catalog();
+        let litellm = cat
+            .iter()
+            .find(|e| e.id == "litellm")
+            .expect("litellm entry present");
+        assert_eq!(litellm.base_url.as_ref(), "http://localhost:4000");
+        assert_eq!(litellm.wire, WireFormat::OpenAIChat);
     }
 
     #[test]

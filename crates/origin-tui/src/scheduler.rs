@@ -50,8 +50,11 @@ impl Scheduler {
             }
             if let Some(prev) = last_frame {
                 let since = prev.elapsed();
-                if since < self.frame_budget {
-                    sleep(self.frame_budget - since).await;
+                // `checked_sub` is `Some` exactly while we are still inside the
+                // frame budget (and never panics on underflow); `None` ⇒ the
+                // budget already elapsed, so render immediately without sleeping.
+                if let Some(remaining) = self.frame_budget.checked_sub(since) {
+                    sleep(remaining).await;
                 }
             }
             render();

@@ -44,6 +44,9 @@ async fn reads_token_from_vault_and_calls_github_models() {
             messages: vec![Message::new(Role::User).with_block(Block::text("ping"))],
             model: "gpt-4o-mini".into(),
             tools: vec![],
+            effort: None,
+            thinking_tokens: None,
+            attachments: Vec::new(),
         })
         .await
         .expect("github models chat should succeed");
@@ -68,6 +71,9 @@ async fn missing_vault_entry_maps_to_auth() {
             messages: vec![],
             model: "gpt-4o-mini".into(),
             tools: vec![],
+            effort: None,
+            thinking_tokens: None,
+            attachments: Vec::new(),
         })
         .await
         .expect_err("missing vault entry must fail");
@@ -98,6 +104,9 @@ async fn auth_error_status_maps_to_provider_auth() {
             messages: vec![],
             model: "gpt-4o-mini".into(),
             tools: vec![],
+            effort: None,
+            thinking_tokens: None,
+            attachments: Vec::new(),
         })
         .await
         .expect_err("should fail with auth");
@@ -142,6 +151,9 @@ async fn token_is_reread_on_each_chat_call() {
             messages: vec![],
             model: "m".into(),
             tools: vec![],
+            effort: None,
+            thinking_tokens: None,
+            attachments: Vec::new(),
         })
         .await
         .expect("first call");
@@ -159,6 +171,9 @@ async fn token_is_reread_on_each_chat_call() {
             messages: vec![],
             model: "m".into(),
             tools: vec![],
+            effort: None,
+            thinking_tokens: None,
+            attachments: Vec::new(),
         })
         .await
         .expect("second call");

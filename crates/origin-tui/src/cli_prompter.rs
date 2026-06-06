@@ -96,6 +96,6 @@ impl Prompter for SidePanelPrompter {
             outcome_rx
         };
 
-        (outcome_rx.await).map_or(false, |outcome| matches!(outcome, PermissionOutcome::Allow))
+        (outcome_rx.await).is_ok_and(|outcome| matches!(outcome, PermissionOutcome::Allow))
     }
 }

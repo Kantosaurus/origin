@@ -37,12 +37,20 @@ fn cap_check_fires_on_budget_equality() {
 #[test]
 fn record_iteration_accumulates_tokens_and_increments_iter() {
     let mut g = GoalState::new("x".into(), None, None);
-    g.record_iteration(50, 25, TagOutcome::InProgress { what_remains: "a".into() });
+    g.record_iteration(
+        50,
+        25,
+        TagOutcome::InProgress {
+            what_remains: "a".into(),
+        },
+    );
     assert_eq!(g.tokens_spent, 75);
     assert_eq!(g.iter, 1);
     assert_eq!(
         g.last_status_tag,
-        Some(TagOutcome::InProgress { what_remains: "a".into() })
+        Some(TagOutcome::InProgress {
+            what_remains: "a".into()
+        })
     );
 }
 
@@ -57,8 +65,14 @@ fn record_verifier_tokens_charges_to_same_budget() {
 #[test]
 fn budget_overshoot_one_iteration_then_caps() {
     let mut g = GoalState::new("x".into(), None, Some(100));
-    assert_eq!(g.cap_check(), None);              // can run once
-    g.record_iteration(80, 60, TagOutcome::InProgress { what_remains: String::new() });
+    assert_eq!(g.cap_check(), None); // can run once
+    g.record_iteration(
+        80,
+        60,
+        TagOutcome::InProgress {
+            what_remains: String::new(),
+        },
+    );
     // tokens_spent = 140, over budget; next cap check fires
     assert_eq!(g.cap_check(), Some(ClearReason::BudgetExhausted));
 }

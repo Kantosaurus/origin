@@ -16,7 +16,7 @@ struct CcLine {
 }
 
 impl Source for ClaudeCodeSource {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "claude-code"
     }
 

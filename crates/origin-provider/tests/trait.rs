@@ -27,6 +27,9 @@ async fn fake_provider_round_trips() {
         messages: vec![Message::new(Role::User).with_block(Block::text("hello"))],
         model: "fake-1".to_string(),
         tools: Vec::<ToolSchema>::new(),
+        effort: None,
+        thinking_tokens: None,
+        attachments: Vec::new(),
     };
     let resp = p.chat(req).await.expect("fake provider should not fail");
     assert_eq!(resp.assistant.role, Role::Assistant);
@@ -68,6 +71,9 @@ async fn fake_provider_streams_one_token() {
             messages: vec![],
             model: "stream-1".into(),
             tools: vec![],
+            effort: None,
+            thinking_tokens: None,
+            attachments: Vec::new(),
         },
         &ring,
     )

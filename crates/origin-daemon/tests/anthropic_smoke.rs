@@ -18,6 +18,9 @@ async fn live_smoke() {
         messages: vec![Message::new(Role::User).with_block(Block::text("ping"))],
         model: "claude-opus-4-7".into(),
         tools: vec![],
+        effort: None,
+        thinking_tokens: None,
+        attachments: Vec::new(),
     };
     let resp = provider.chat(req).await.expect("anthropic should answer");
     let Block::Text { text: txt, .. } = &resp.assistant.blocks[0] else {
