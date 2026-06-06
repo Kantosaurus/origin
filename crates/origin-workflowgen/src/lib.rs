@@ -111,9 +111,7 @@ pub struct WorkflowStep {
 /// A transparent newtype over the step's zero-based position in the authored
 /// `steps` vector. Used both as a step's own [`id`](WorkflowStep::id) and inside
 /// other steps' [`depends_on`](WorkflowStep::depends_on) edges.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StepId(pub usize);
 
@@ -341,16 +339,7 @@ impl Phase {
                 "generate",
             ],
             Self::Verify => &[
-                "verify",
-                "test",
-                "check",
-                "validate",
-                "review",
-                "lint",
-                "ensure",
-                "confirm",
-                "audit",
-                "qa",
+                "verify", "test", "check", "validate", "review", "lint", "ensure", "confirm", "audit", "qa",
             ],
         }
     }
@@ -370,9 +359,8 @@ pub fn tokenize(text: &str) -> Vec<String> {
 
 /// Very small stop-word set so common filler words don't dominate scoring.
 const STOP_WORDS: &[&str] = &[
-    "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "then", "this", "that",
-    "it", "is", "are", "be", "by", "at", "as", "into", "from", "my", "our", "your", "all", "any",
-    "so", "we", "i",
+    "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "then", "this", "that", "it", "is",
+    "are", "be", "by", "at", "as", "into", "from", "my", "our", "your", "all", "any", "so", "we", "i",
 ];
 
 fn is_stop_word(tok: &str) -> bool {
@@ -410,7 +398,10 @@ pub fn score_skill(skill: &SkillInfo, query_tokens: &[String]) -> u32 {
             score = score.saturating_add(4);
         } else if desc_tokens.iter().any(|d| d == q) {
             score = score.saturating_add(2);
-        } else if name_tokens.iter().any(|n| n.contains(q.as_str()) || q.contains(n.as_str())) {
+        } else if name_tokens
+            .iter()
+            .any(|n| n.contains(q.as_str()) || q.contains(n.as_str()))
+        {
             // partial / substring hit on the name
             score = score.saturating_add(1);
         }
@@ -500,11 +491,7 @@ fn truncate_arg(goal: &str) -> String {
 ///   goal (e.g. a garbage goal sharing no vocabulary with any skill).
 pub fn author_workflow(goal: &str, catalog: &SkillCatalog) -> Result<WorkflowSpec> {
     let goal_tokens = tokenize(goal);
-    let meaningful: Vec<String> = goal_tokens
-        .iter()
-        .filter(|t| !is_stop_word(t))
-        .cloned()
-        .collect();
+    let meaningful: Vec<String> = goal_tokens.iter().filter(|t| !is_stop_word(t)).cloned().collect();
     if meaningful.is_empty() {
         return Err(WorkflowGenError::EmptyGoal);
     }
@@ -897,9 +884,15 @@ mod tests {
         assert_eq!(author_workflow("", &cat), Err(WorkflowGenError::EmptyGoal));
         assert_eq!(author_workflow("   \t\n", &cat), Err(WorkflowGenError::EmptyGoal));
         // pure punctuation tokenizes to nothing
-        assert_eq!(author_workflow("!!! ??? ...", &cat), Err(WorkflowGenError::EmptyGoal));
+        assert_eq!(
+            author_workflow("!!! ??? ...", &cat),
+            Err(WorkflowGenError::EmptyGoal)
+        );
         // stop-words-only is still empty of meaningful tokens
-        assert_eq!(author_workflow("the and or to of", &cat), Err(WorkflowGenError::EmptyGoal));
+        assert_eq!(
+            author_workflow("the and or to of", &cat),
+            Err(WorkflowGenError::EmptyGoal)
+        );
     }
 
     #[test]
@@ -965,8 +958,7 @@ mod tests {
         let cat = sample_catalog();
         let (spec, toml_text) = author_and_render("explore and implement and test the api", &cat).unwrap();
         // The emitted TOML must parse back into the daemon-shaped document.
-        let reparsed: WorkflowsFileShape =
-            toml::from_str(&toml_text).expect("daemon-shape parse");
+        let reparsed: WorkflowsFileShape = toml::from_str(&toml_text).expect("daemon-shape parse");
         assert_eq!(reparsed.schema_version, SCHEMA_VERSION);
         assert_eq!(reparsed.workflows.len(), 1);
         assert_eq!(reparsed.workflows[0], spec);
@@ -1015,7 +1007,11 @@ mod tests {
         let long = format!("implement {}", "word ".repeat(200));
         let spec = author_workflow(&long, &cat).unwrap();
         for s in &spec.steps {
-            assert!(s.args.chars().count() <= MAX_ARG_LEN, "arg too long: {}", s.args.len());
+            assert!(
+                s.args.chars().count() <= MAX_ARG_LEN,
+                "arg too long: {}",
+                s.args.len()
+            );
         }
     }
 
@@ -1098,7 +1094,10 @@ mod tests {
 
         let toml_text = spec.to_toml().unwrap();
         // The dependency metadata must be present in the serialised form.
-        assert!(toml_text.contains("depends_on"), "depends_on missing:\n{toml_text}");
+        assert!(
+            toml_text.contains("depends_on"),
+            "depends_on missing:\n{toml_text}"
+        );
 
         // Round-trip back into the same WorkflowSpec, ids/deps intact.
         let reparsed: WorkflowsFileShape = toml::from_str(&toml_text).expect("parse");

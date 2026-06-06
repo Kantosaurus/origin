@@ -203,8 +203,7 @@ impl WorkerHandle {
 /// Panics if either runtime fails to build, or the control OS thread
 /// cannot be spawned (both are fatal startup failures).
 pub fn start(signal: ShutdownSignal) {
-    let cores = std::thread::available_parallelism()
-        .map_or(4, std::num::NonZeroUsize::get);
+    let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
     let worker_threads = cores.saturating_sub(1).max(1);
 
     // Worker pool first — control core may dispatch to it on startup.

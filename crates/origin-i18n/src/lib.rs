@@ -53,11 +53,7 @@ impl Lang {
     #[must_use]
     pub fn from_code(code: &str) -> Option<Self> {
         // Take the primary subtag (before any '-' or '_') and lowercase it.
-        let primary = code
-            .split(['-', '_'])
-            .next()
-            .unwrap_or(code)
-            .to_ascii_lowercase();
+        let primary = code.split(['-', '_']).next().unwrap_or(code).to_ascii_lowercase();
         match primary.as_str() {
             "en" => Some(Self::En),
             "es" => Some(Self::Es),
@@ -86,14 +82,7 @@ impl Lang {
 /// Every locale this build can render, in canonical order.
 #[must_use]
 pub const fn available() -> &'static [Lang] {
-    &[
-        Lang::En,
-        Lang::Es,
-        Lang::Fr,
-        Lang::De,
-        Lang::Ja,
-        Lang::ZhCn,
-    ]
+    &[Lang::En, Lang::Es, Lang::Fr, Lang::De, Lang::Ja, Lang::ZhCn]
 }
 
 /// Look up the localized string for `key` in `lang`.
@@ -240,7 +229,9 @@ fn en(key: &str) -> Option<&'static str> {
         "error.generic" => "{message}",
         "goal.active" => "goal active: {condition}",
         "goal.done" => "done: {reason}",
-        "session.resumed" => "resumed session {short}\u{2026} \u{2014} the model will recall the earlier conversation",
+        "session.resumed" => {
+            "resumed session {short}\u{2026} \u{2014} the model will recall the earlier conversation"
+        }
         // Routed to the live `origin export-session --out <path>` confirmation,
         // which prints `wrote <path>`. En reconciled to the exact literal (with the
         // `{path}` slot) so the default output is byte-identical.
@@ -280,7 +271,9 @@ fn es(key: &str) -> Option<&'static str> {
         "error.generic" => "Algo salió mal: {message}",
         "goal.active" => "objetivo activo: {condition}",
         "goal.done" => "hecho: {reason}",
-        "session.resumed" => "sesión {short}\u{2026} reanudada \u{2014} el modelo recordará la conversación anterior",
+        "session.resumed" => {
+            "sesión {short}\u{2026} reanudada \u{2014} el modelo recordará la conversación anterior"
+        }
         "session.saved" => "guardado en {path}",
         "interrupt" => "interrupción enviada (Ctrl+D para salir)",
         "bye" => "Adiós",
@@ -315,7 +308,9 @@ fn fr(key: &str) -> Option<&'static str> {
         "error.generic" => "Une erreur est survenue : {message}",
         "goal.active" => "objectif actif : {condition}",
         "goal.done" => "terminé : {reason}",
-        "session.resumed" => "session {short}\u{2026} reprise \u{2014} le modèle se souviendra de la conversation précédente",
+        "session.resumed" => {
+            "session {short}\u{2026} reprise \u{2014} le modèle se souviendra de la conversation précédente"
+        }
         "session.saved" => "écrit dans {path}",
         "interrupt" => "interruption envoyée (Ctrl+D pour quitter)",
         "bye" => "Au revoir",
@@ -350,7 +345,9 @@ fn de(key: &str) -> Option<&'static str> {
         "error.generic" => "Etwas ist schiefgelaufen: {message}",
         "goal.active" => "aktives Ziel: {condition}",
         "goal.done" => "fertig: {reason}",
-        "session.resumed" => "Sitzung {short}\u{2026} fortgesetzt \u{2014} das Modell erinnert sich an das vorherige Gespräch",
+        "session.resumed" => {
+            "Sitzung {short}\u{2026} fortgesetzt \u{2014} das Modell erinnert sich an das vorherige Gespräch"
+        }
         "session.saved" => "in {path} geschrieben",
         "interrupt" => "Unterbrechung gesendet (Ctrl+D zum Beenden)",
         "bye" => "Auf Wiedersehen",
@@ -385,7 +382,9 @@ fn ja(key: &str) -> Option<&'static str> {
         "error.generic" => "問題が発生しました: {message}",
         "goal.active" => "目標がアクティブ: {condition}",
         "goal.done" => "完了: {reason}",
-        "session.resumed" => "セッション {short}\u{2026} を再開しました \u{2014} モデルは以前の会話を覚えています",
+        "session.resumed" => {
+            "セッション {short}\u{2026} を再開しました \u{2014} モデルは以前の会話を覚えています"
+        }
         "session.saved" => "{path} に書き込みました",
         "interrupt" => "中断を送信しました (Ctrl+D で終了)",
         "bye" => "さようなら",
@@ -401,7 +400,9 @@ fn ja(key: &str) -> Option<&'static str> {
         "cmd.copy.empty" => "コピーするものがありません",
         "cmd.account.active" => "アクティブなプロバイダー: {provider}/{account}",
         "cmd.turn.busy" => "すでにターンが実行中です (Ctrl+C で中断)",
-        "resume.foreign.ok" => "外部セッションを {id} に再開しました: {count} 件のメッセージ (モデル {model})",
+        "resume.foreign.ok" => {
+            "外部セッションを {id} に再開しました: {count} 件のメッセージ (モデル {model})"
+        }
         "resume.foreign.hint" => "再開するには: origin sessions resume {id}",
         _ => return None,
     })

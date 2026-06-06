@@ -52,7 +52,10 @@ fn summarizes_target_neighborhood() {
     let hex = hex::encode(target.as_bytes());
     let result = graph_summarize_tool(&idx, &hex).expect("summary");
 
-    assert!(!result.is_empty(), "summary must be a populated result, not Empty");
+    assert!(
+        !result.is_empty(),
+        "summary must be a populated result, not Empty"
+    );
     let QueryResult::Nodes(nodes) = result else {
         panic!("expected Nodes summary, got {result:?}");
     };

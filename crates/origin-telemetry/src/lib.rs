@@ -39,7 +39,11 @@ impl Event {
     /// Creates a new event with no properties.
     #[must_use]
     pub const fn new(name: String, ts_unix_ms: u64) -> Self {
-        Self { name, props: Vec::new(), ts_unix_ms }
+        Self {
+            name,
+            props: Vec::new(),
+            ts_unix_ms,
+        }
     }
 }
 
@@ -136,8 +140,16 @@ impl Config {
     #[must_use]
     pub fn from_env(do_not_track: bool, opt_in: bool, sample: f64) -> Self {
         let enabled = opt_in && !do_not_track;
-        let sample_rate = if sample.is_nan() { 0.0 } else { sample.clamp(0.0, 1.0) };
-        Self { enabled, sample_rate, endpoint: None }
+        let sample_rate = if sample.is_nan() {
+            0.0
+        } else {
+            sample.clamp(0.0, 1.0)
+        };
+        Self {
+            enabled,
+            sample_rate,
+            endpoint: None,
+        }
     }
 
     /// Returns a copy of this config with the given delivery endpoint set.
@@ -335,8 +347,7 @@ impl PainMetrics {
     ///
     /// Returns [`TelemetryError::Serde`] if the metrics fail to serialize.
     pub fn into_event(self, name: String, ts_unix_ms: u64) -> Result<Event, TelemetryError> {
-        let json =
-            serde_json::to_string(&self).map_err(|err| TelemetryError::Serde(err.to_string()))?;
+        let json = serde_json::to_string(&self).map_err(|err| TelemetryError::Serde(err.to_string()))?;
         let mut event = Event::new(name, ts_unix_ms);
         event.props.push(("pain_metrics".to_owned(), json));
         Ok(event)
@@ -354,7 +365,10 @@ impl Pipeline {
     /// Creates a new pipeline bound to the given configuration.
     #[must_use]
     pub const fn new(cfg: Config) -> Self {
-        Self { cfg, buffer: Vec::new() }
+        Self {
+            cfg,
+            buffer: Vec::new(),
+        }
     }
 
     /// Returns a reference to the pipeline's configuration.
@@ -409,7 +423,10 @@ mod tests {
     fn ev(name: &str, props: &[(&str, &str)], ts: u64) -> Event {
         Event {
             name: name.to_owned(),
-            props: props.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
+            props: props
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
             ts_unix_ms: ts,
         }
     }
@@ -459,7 +476,10 @@ mod tests {
         let mut props = vec![
             ("q".to_owned(), "url?api_key=secretvalue".to_owned()),
             ("hex".to_owned(), "deadbeefdeadbeefdeadbeefdeadbeef00".to_owned()),
-            ("b64".to_owned(), "QWxhZGRpbjpvcGVuIHNlc2FtZTEyMzQ1Njc4OTBhYmNk".to_owned()),
+            (
+                "b64".to_owned(),
+                "QWxhZGRpbjpvcGVuIHNlc2FtZTEyMzQ1Njc4OTBhYmNk".to_owned(),
+            ),
             ("short".to_owned(), "abc123".to_owned()),
         ];
         let n = redact(&mut props);
@@ -586,7 +606,9 @@ mod tests {
     #[test]
     fn total_agent_time_handles_partial_split() {
         assert_eq!(
-            PainMetrics::new().with_time_to_first_useful_action_ms(5).total_agent_time_ms(),
+            PainMetrics::new()
+                .with_time_to_first_useful_action_ms(5)
+                .total_agent_time_ms(),
             None
         );
         let mut only_model = PainMetrics::new();
@@ -605,7 +627,9 @@ mod tests {
             .with_turns(2, 1);
         let mut event = metrics.into_event("session_stop".to_owned(), 1234).unwrap();
         // Numeric/enum metrics survive; a caller-added secret prop is redacted.
-        event.props.push(("api_key".to_owned(), "sk-supersecretvalue123".to_owned()));
+        event
+            .props
+            .push(("api_key".to_owned(), "sk-supersecretvalue123".to_owned()));
 
         let line = to_jsonl(&event).unwrap();
         assert!(line.contains("\"name\":\"session_stop\""));
@@ -618,8 +642,7 @@ mod tests {
         assert_eq!(parsed["name"], "session_stop");
         assert_eq!(parsed["props"][0][0], "pain_metrics");
         // The embedded metrics JSON parses back into a PainMetrics.
-        let inner: PainMetrics =
-            serde_json::from_str(parsed["props"][0][1].as_str().unwrap()).unwrap();
+        let inner: PainMetrics = serde_json::from_str(parsed["props"][0][1].as_str().unwrap()).unwrap();
         assert_eq!(inner.stop_reason, Some(SessionStopReason::Completed));
         assert_eq!(inner.total_agent_time_ms(), Some(30));
     }

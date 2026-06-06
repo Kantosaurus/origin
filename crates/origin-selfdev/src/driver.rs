@@ -391,17 +391,12 @@ impl SelfDevDriver {
     /// Returns [`SelfDevError::InvalidTransition`] if not in `Failed`, or
     /// [`SelfDevError::RollbackFailed`] if the injected rollback errored — in
     /// which case the machine stays in `Failed` so the daemon can intervene.
-    pub fn run_rollback(
-        &mut self,
-        rollback: &dyn Rollback,
-    ) -> Result<RollbackOutcome, SelfDevError> {
+    pub fn run_rollback(&mut self, rollback: &dyn Rollback) -> Result<RollbackOutcome, SelfDevError> {
         let SelfDevState::Failed(_) = &self.state else {
             return Err(self.invalid(&SelfDevEvent::EditDone));
         };
         let job = self.current.clone().unwrap_or_else(|| BuildJob::new("", ""));
-        let outcome = rollback
-            .rollback(&job)
-            .map_err(SelfDevError::RollbackFailed)?;
+        let outcome = rollback.rollback(&job).map_err(SelfDevError::RollbackFailed)?;
         // Count this failed generation, then settle to Idle on the SAME binary.
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.current = None;
@@ -726,7 +721,10 @@ mod tests {
     #[test]
     fn start_job_on_empty_queue_errors() {
         let mut d = SelfDevDriver::new(SelfDevConfig::default());
-        assert_eq!(d.handle(&SelfDevEvent::StartJob).unwrap_err(), SelfDevError::QueueEmpty);
+        assert_eq!(
+            d.handle(&SelfDevEvent::StartJob).unwrap_err(),
+            SelfDevError::QueueEmpty
+        );
     }
 
     #[test]

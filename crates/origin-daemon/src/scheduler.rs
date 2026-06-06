@@ -421,7 +421,11 @@ fn civil_strings(ms: u64) -> (String, String) {
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_index = (5 * day_of_year + 2) / 153;
     let day_of_month = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 { month_index + 3 } else { month_index - 9 };
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
     let year = if month <= 2 { civil_year + 1 } else { civil_year };
 
     let date = format!("{year:04}-{month:02}-{day_of_month:02}");
@@ -432,7 +436,13 @@ fn civil_strings(ms: u64) -> (String, String) {
 /// UTC weekday name for a unix-millisecond instant (1970-01-01 was a Thursday).
 fn weekday_name(ms: u64) -> &'static str {
     const NAMES: [&str; 7] = [
-        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
     ];
     let days = i64::try_from(ms / (24 * 60 * 60 * 1_000)).unwrap_or(i64::MAX);
     // Sunday=0; epoch Thursday=4. Euclidean rem keeps the index in 0..7.
@@ -444,8 +454,8 @@ fn weekday_name(ms: u64) -> &'static str {
 #[allow(clippy::panic)]
 mod tests {
     use super::{
-        accumulate_usage, civil_strings, due_triggers, expand_template, fire_vars,
-        resolve_trigger_vars, weekday_name, DueTrigger, ScheduleFile,
+        accumulate_usage, civil_strings, due_triggers, expand_template, fire_vars, resolve_trigger_vars,
+        weekday_name, DueTrigger, ScheduleFile,
     };
     use crate::protocol::StreamEvent;
 
@@ -472,7 +482,9 @@ mod tests {
         // loop falls back to its estimate via observe_task_tokens(None).
         assert_eq!(accumulate_usage(&[]), 0);
         let non_usage = [
-            StreamEvent::TextDelta { text: "hi".to_string() },
+            StreamEvent::TextDelta {
+                text: "hi".to_string(),
+            },
             StreamEvent::TurnEnd,
         ];
         assert_eq!(accumulate_usage(&non_usage), 0);
@@ -482,7 +494,9 @@ mod tests {
     fn accumulate_usage_ignores_non_usage_events() {
         // Interleaved non-Usage events contribute nothing; only Usage counts.
         let events = [
-            StreamEvent::TextDelta { text: "x".to_string() },
+            StreamEvent::TextDelta {
+                text: "x".to_string(),
+            },
             usage(10, 5),
             StreamEvent::TurnEnd,
             usage(1, 1),
@@ -534,10 +548,7 @@ mod tests {
 
     #[test]
     fn expand_handles_repeated_and_adjacent_placeholders() {
-        let vars = vec![
-            ("a", "X".to_string()),
-            ("b", "Y".to_string()),
-        ];
+        let vars = vec![("a", "X".to_string()), ("b", "Y".to_string())];
         // Repeated and back-to-back placeholders with no separator.
         let out = expand_template("{{a}}{{b}}{{a}} {{a}}", &vars);
         assert_eq!(out, "XYX X");
@@ -569,7 +580,10 @@ mod tests {
     #[test]
     fn civil_strings_match_known_instants() {
         // 1970-01-01 00:00:00 UTC.
-        assert_eq!(civil_strings(0), ("1970-01-01".to_string(), "00:00:00".to_string()));
+        assert_eq!(
+            civil_strings(0),
+            ("1970-01-01".to_string(), "00:00:00".to_string())
+        );
         // 2024-02-29 (leap day) 12:19:30 UTC = 1_709_209_170_000 ms.
         assert_eq!(
             civil_strings(1_709_209_170_000),
@@ -668,7 +682,14 @@ mod tests {
         let keys: Vec<&str> = vars.iter().map(|(k, _)| *k).collect();
         assert_eq!(
             keys,
-            vec!["date", "time", "datetime", "weekday", "trigger_id", "trigger_spec"]
+            vec![
+                "date",
+                "time",
+                "datetime",
+                "weekday",
+                "trigger_id",
+                "trigger_spec"
+            ]
         );
         let prompt =
             "[{{datetime}}] ({{weekday}}) id={{trigger_id}} spec={{trigger_spec}} on {{date}} at {{time}}";

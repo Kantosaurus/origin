@@ -114,8 +114,7 @@ fn shallow_clone(url: &str, dest: &Path) -> Result<()> {
 /// Returns on filesystem failure, a failed `git clone`, or an invalid manifest.
 pub fn install(source: &str) -> Result<()> {
     let root = plugins_root()?;
-    std::fs::create_dir_all(&root)
-        .map_err(|e| anyhow::anyhow!("creating {}: {e}", root.display()))?;
+    std::fs::create_dir_all(&root).map_err(|e| anyhow::anyhow!("creating {}: {e}", root.display()))?;
 
     if looks_like_git_url(source) {
         install_from_git(source, &root)
@@ -126,8 +125,8 @@ pub fn install(source: &str) -> Result<()> {
                 "source `{source}` is not an existing directory and is not a recognised git URL"
             ));
         }
-        let (manifest, dest) = install_into(&src, &root)
-            .map_err(|e| anyhow::anyhow!("installing plugin: {e}"))?;
+        let (manifest, dest) =
+            install_into(&src, &root).map_err(|e| anyhow::anyhow!("installing plugin: {e}"))?;
         report(&manifest, &dest);
         Ok(())
     }
@@ -148,8 +147,7 @@ fn install_from_git(source: &str, root: &Path) -> Result<()> {
         return Err(e);
     }
 
-    let installed = install_into(&staging, root)
-        .map_err(|e| anyhow::anyhow!("installing plugin: {e}"));
+    let installed = install_into(&staging, root).map_err(|e| anyhow::anyhow!("installing plugin: {e}"));
     // Always remove the staging clone, success or failure.
     std::fs::remove_dir_all(&staging).ok();
     let (manifest, dest) = installed?;
@@ -170,7 +168,12 @@ fn staging_suffix(source: &str) -> String {
 /// and the context-cost estimate for a freshly installed `manifest`.
 fn report(manifest: &Manifest, dest: &Path) {
     let cost = context_cost_estimate(manifest);
-    println!("installed `{}` v{} -> {}", manifest.name, manifest.version, dest.display());
+    println!(
+        "installed `{}` v{} -> {}",
+        manifest.name,
+        manifest.version,
+        dest.display()
+    );
     println!(
         "surface: {} commands, {} agents, {} skills, {} hooks, {} mcp, {} lsp",
         manifest.commands.len(),

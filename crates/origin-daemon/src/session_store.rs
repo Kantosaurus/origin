@@ -364,12 +364,10 @@ impl SessionStore {
 
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| {
-            // Saturating cast — won't overflow in our lifetime.
-            i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
-        })
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+        // Saturating cast — won't overflow in our lifetime.
+        i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+    })
 }
 
 #[cfg(test)]
@@ -432,7 +430,9 @@ mod tests {
             store.snapshot_original(sid, i, &original).expect("snapshot");
             let compacted =
                 Message::new(Role::User).with_block(Block::text(format!("[compacted turn {i}] sum")));
-            store.persist_message(sid, i, &compacted).expect("persist compacted");
+            store
+                .persist_message(sid, i, &compacted)
+                .expect("persist compacted");
         }
         assert!(first_text(&store.load_messages(sid).expect("load")[0]).starts_with("[compacted turn 0]"));
 

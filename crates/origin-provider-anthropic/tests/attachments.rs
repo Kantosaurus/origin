@@ -41,9 +41,9 @@ fn body_has_image_block(req: &Request) -> bool {
             && m.get("content")
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|parts| {
-                    parts.iter().any(|p| {
-                        p.get("type").and_then(serde_json::Value::as_str) == Some("image")
-                    })
+                    parts
+                        .iter()
+                        .any(|p| p.get("type").and_then(serde_json::Value::as_str) == Some("image"))
                 })
     })
 }
@@ -107,7 +107,10 @@ async fn image_attachment_is_injected_on_streaming_path() {
         }
     }
     handle.await.expect("prov task");
-    assert_eq!(text, "Hello!", "streamed text decodes after the image-bearing body matched");
+    assert_eq!(
+        text, "Hello!",
+        "streamed text decodes after the image-bearing body matched"
+    );
 }
 
 #[test]

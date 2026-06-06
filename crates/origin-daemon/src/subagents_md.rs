@@ -121,10 +121,7 @@ pub fn builtin_browser_subagent(allow_domains: &[String]) -> Option<SubagentDef>
              [{}] and the browse/read tools; it cannot edit files or run shell.",
             allow_domains.join(", ")
         ),
-        allowed_tools: BROWSER_SUBAGENT_TOOLS
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect(),
+        allowed_tools: BROWSER_SUBAGENT_TOOLS.iter().map(|s| (*s).to_string()).collect(),
         mcp_servers: Vec::new(),
     })
 }

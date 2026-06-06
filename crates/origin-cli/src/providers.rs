@@ -111,7 +111,10 @@ pub fn refresh(provider: Option<&str>) {
     let custom = match origin_provider::custom::load(&toml_path) {
         Ok(c) => c,
         Err(e) => {
-            println!("no refresh source configured: failed to load {}: {e}", toml_path.display());
+            println!(
+                "no refresh source configured: failed to load {}: {e}",
+                toml_path.display()
+            );
             return;
         }
     };

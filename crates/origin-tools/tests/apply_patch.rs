@@ -51,10 +51,7 @@ fn marker_add_file_creates_new_file() {
     assert_eq!(out["files_added"], 1);
     assert_eq!(out["files_updated"], 0);
     // Parent dir was created and content written with trailing newline.
-    assert_eq!(
-        fs::read_to_string(&p).unwrap(),
-        "fn hello() {}\nfn world() {}\n"
-    );
+    assert_eq!(fs::read_to_string(&p).unwrap(), "fn hello() {}\nfn world() {}\n");
 }
 
 #[test]
@@ -74,7 +71,10 @@ fn marker_delete_file_removes_existing() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("gone.rs");
     fs::write(&p, "bye\n").unwrap();
-    let patch = format!("*** Begin Patch\n*** Delete File: {path}\n*** End Patch\n", path = fwd(&p));
+    let patch = format!(
+        "*** Begin Patch\n*** Delete File: {path}\n*** End Patch\n",
+        path = fwd(&p)
+    );
     let out = apply_patch(&ApplyPatchArgs { patch }).unwrap();
     assert_eq!(out["files_deleted"], 1);
     assert!(!p.exists());

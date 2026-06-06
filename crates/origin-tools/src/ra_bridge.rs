@@ -115,8 +115,7 @@ pub trait NavigationHandle: Send + Sync + std::fmt::Debug {
     ///
     /// # Errors
     /// Returns `subsystem.ra_unavailable` if the language server is down.
-    async fn definition(&self, path: &Path, line: u32, col: u32)
-        -> Result<Vec<NavLocation>, ToolError>;
+    async fn definition(&self, path: &Path, line: u32, col: u32) -> Result<Vec<NavLocation>, ToolError>;
 
     /// Find references to the symbol at `path:line:col`.
     ///
@@ -135,22 +134,12 @@ pub trait NavigationHandle: Send + Sync + std::fmt::Debug {
     /// # Errors
     /// Returns `subsystem.ra_unavailable` if the language server is down or
     /// lacks call-hierarchy support (in which case an empty list is fine).
-    async fn incoming_calls(
-        &self,
-        path: &Path,
-        line: u32,
-        col: u32,
-    ) -> Result<Vec<NavCallItem>, ToolError>;
+    async fn incoming_calls(&self, path: &Path, line: u32, col: u32) -> Result<Vec<NavCallItem>, ToolError>;
 
     /// Resolve outgoing callees of the symbol at `path:line:col`.
     ///
     /// # Errors
     /// Returns `subsystem.ra_unavailable` if the language server is down or
     /// lacks call-hierarchy support (in which case an empty list is fine).
-    async fn outgoing_calls(
-        &self,
-        path: &Path,
-        line: u32,
-        col: u32,
-    ) -> Result<Vec<NavCallItem>, ToolError>;
+    async fn outgoing_calls(&self, path: &Path, line: u32, col: u32) -> Result<Vec<NavCallItem>, ToolError>;
 }

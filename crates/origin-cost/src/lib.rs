@@ -528,23 +528,13 @@ mod tests {
     #[test]
     fn is_cache_cold_gap_beyond_ttl_is_cold() {
         // Gap strictly greater than the TTL => cold even with cache reads.
-        assert!(is_cache_cold(
-            Some(0),
-            PROMPT_CACHE_TTL_MS + 1,
-            5_000,
-            true
-        ));
+        assert!(is_cache_cold(Some(0), PROMPT_CACHE_TTL_MS + 1, 5_000, true));
     }
 
     #[test]
     fn is_cache_cold_gap_within_ttl_with_reads_is_warm() {
         // Gap below the TTL and the turn read from cache => warm.
-        assert!(!is_cache_cold(
-            Some(0),
-            PROMPT_CACHE_TTL_MS - 1,
-            5_000,
-            true
-        ));
+        assert!(!is_cache_cold(Some(0), PROMPT_CACHE_TTL_MS - 1, 5_000, true));
         // Exactly at the TTL boundary is still warm (cache not yet expired).
         assert!(!is_cache_cold(Some(0), PROMPT_CACHE_TTL_MS, 5_000, true));
     }

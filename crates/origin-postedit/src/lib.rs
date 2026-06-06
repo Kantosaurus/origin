@@ -135,10 +135,7 @@ pub fn formatter_for(path: &str) -> Option<&'static str> {
 /// Handles both `/` and `\` separators (Windows + POSIX) and ignores a leading
 /// dot on dotfiles (e.g. `.gitignore` has no extension here).
 fn extension_of(path: &str) -> Option<String> {
-    let file = path
-        .rsplit(['/', '\\'])
-        .next()
-        .filter(|s| !s.is_empty())?;
+    let file = path.rsplit(['/', '\\']).next().filter(|s| !s.is_empty())?;
     let (stem, ext) = file.rsplit_once('.')?;
     if stem.is_empty() || ext.is_empty() {
         return None;
@@ -309,7 +306,9 @@ mod tests {
 
     #[test]
     fn prettier_handles_web_assets() {
-        for path in ["a.ts", "b.tsx", "c.js", "d.jsx", "e.json", "f.css", "g.html", "h.md"] {
+        for path in [
+            "a.ts", "b.tsx", "c.js", "d.jsx", "e.json", "f.css", "g.html", "h.md",
+        ] {
             assert_eq!(formatter_for(path), Some("prettier"), "{path}");
         }
     }

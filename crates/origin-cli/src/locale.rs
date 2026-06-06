@@ -139,14 +139,20 @@ mod tests {
             t(Lang::En, "cmd.steer.usage"),
             "usage: /steer <hint to inject into the next turn>"
         );
-        assert_eq!(t(Lang::En, "cmd.copy.ok"), "copied the last reply to the clipboard");
+        assert_eq!(
+            t(Lang::En, "cmd.copy.ok"),
+            "copied the last reply to the clipboard"
+        );
         assert_eq!(t(Lang::En, "cmd.copy.empty"), "nothing to copy yet");
         assert_eq!(
             t(Lang::En, "cmd.turn.busy"),
             "a turn is already running (Ctrl+C to interrupt it)"
         );
         // `linef()`-routed command chrome rendered with the call site's args:
-        assert_eq!(tf(Lang::En, "cmd.model.set", &[("name", "opus")]), "model set: opus");
+        assert_eq!(
+            tf(Lang::En, "cmd.model.set", &[("name", "opus")]),
+            "model set: opus"
+        );
         assert_eq!(
             tf(Lang::En, "cmd.effort.set", &[("token", "high")]),
             "reasoning effort: high"
@@ -278,7 +284,11 @@ mod tests {
         );
         assert_eq!(
             fr_goal,
-            tf(Lang::Fr, "goal.active", &[("condition", "réparer la compilation")])
+            tf(
+                Lang::Fr,
+                "goal.active",
+                &[("condition", "réparer la compilation")]
+            )
         );
         // A newly-routed command-chrome key also renders in French under --lang.
         assert_eq!(line("cmd.turn.busy"), t(Lang::Fr, "cmd.turn.busy"));

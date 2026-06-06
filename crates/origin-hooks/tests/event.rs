@@ -50,9 +50,7 @@ fn every_event_kind_serializes() {
         },
         LifecycleEvent::SessionStart,
         LifecycleEvent::SessionEnd,
-        LifecycleEvent::MessageDisplay {
-            text: "hello".into(),
-        },
+        LifecycleEvent::MessageDisplay { text: "hello".into() },
         LifecycleEvent::BeforeModel {
             model: "claude".into(),
         },

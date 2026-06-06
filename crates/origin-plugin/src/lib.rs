@@ -304,10 +304,7 @@ pub fn resolve_order(manifests: &[Manifest]) -> Result<Vec<String>, PluginError>
                     m.name
                 )));
             }
-            deps_of
-                .entry(m.name.as_str())
-                .or_default()
-                .insert(dep.as_str());
+            deps_of.entry(m.name.as_str()).or_default().insert(dep.as_str());
         }
     }
 
@@ -327,11 +324,7 @@ pub fn resolve_order(manifests: &[Manifest]) -> Result<Vec<String>, PluginError>
             }
         }
         if !progressed {
-            let mut remaining: Vec<&str> = deps_of
-                .keys()
-                .filter(|n| !done.contains(*n))
-                .copied()
-                .collect();
+            let mut remaining: Vec<&str> = deps_of.keys().filter(|n| !done.contains(*n)).copied().collect();
             remaining.sort_unstable();
             return Err(PluginError::Cycle(remaining.join(" -> ")));
         }
@@ -466,8 +459,7 @@ fn read_manifest_source(path: &std::path::Path) -> Result<String, PluginError> {
         for name in MANIFEST_NAMES {
             let candidate = path.join(name);
             if candidate.is_file() {
-                return std::fs::read_to_string(&candidate)
-                    .map_err(|e| PluginError::Io(e.to_string()));
+                return std::fs::read_to_string(&candidate).map_err(|e| PluginError::Io(e.to_string()));
             }
         }
         return Err(PluginError::Io(format!(
@@ -645,11 +637,7 @@ mod tests {
     #[test]
     fn resolve_order_topo_sorts_chain() {
         // c depends on b, b depends on a => a, b, c.
-        let ms = [
-            manifest("c", &["b"]),
-            manifest("a", &[]),
-            manifest("b", &["a"]),
-        ];
+        let ms = [manifest("c", &["b"]), manifest("a", &[]), manifest("b", &["a"])];
         let order = resolve_order(&ms).unwrap();
         let pos = |n: &str| order.iter().position(|x| x == n).unwrap();
         assert!(pos("a") < pos("b"));
@@ -740,10 +728,7 @@ mod tests {
         let bad = root.join("bad");
         fs::create_dir_all(&bad).unwrap();
         fs::write(bad.join("plugin.toml"), "name = [\"oops\"]\n").unwrap();
-        assert!(matches!(
-            validate_manifest_at(&bad),
-            Err(PluginError::Toml(_))
-        ));
+        assert!(matches!(validate_manifest_at(&bad), Err(PluginError::Toml(_))));
 
         // Missing-name manifest is rejected even though it parses.
         let nameless = root.join("nameless");
@@ -833,7 +818,10 @@ mod tests {
         fs::create_dir_all(&plugins_root).unwrap();
 
         let err = install_into(&src, &plugins_root).unwrap_err();
-        assert!(matches!(err, PluginError::Toml(_)), "traversal name must be rejected");
+        assert!(
+            matches!(err, PluginError::Toml(_)),
+            "traversal name must be rejected"
+        );
         // The plugins root is untouched — nothing created or removed.
         assert!(
             plugins_root.read_dir().unwrap().next().is_none(),

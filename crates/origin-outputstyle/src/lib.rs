@@ -69,9 +69,7 @@ impl Style {
     #[must_use]
     pub fn display_transform(self, text: &str) -> Option<String> {
         match self {
-            Self::Default | Self::Explanatory | Self::Learning | Self::Concise => {
-                Some(text.to_owned())
-            }
+            Self::Default | Self::Explanatory | Self::Learning | Self::Concise => Some(text.to_owned()),
         }
     }
 
@@ -258,10 +256,7 @@ mod tests {
     #[test]
     fn apply_display_replace_returns_substitute() {
         let action = DisplayAction::Replace("[redacted]".to_string());
-        assert_eq!(
-            apply_display("secret", &action),
-            Some("[redacted]".to_string())
-        );
+        assert_eq!(apply_display("secret", &action), Some("[redacted]".to_string()));
     }
 
     #[test]
@@ -277,10 +272,7 @@ mod tests {
 
         // Replace without text defaults to empty.
         let replace_empty = parse_display_hook(r#"{"action":"replace"}"#).unwrap();
-        assert_eq!(
-            replace_empty.action,
-            DisplayAction::Replace(String::new())
-        );
+        assert_eq!(replace_empty.action, DisplayAction::Replace(String::new()));
     }
 
     #[test]
@@ -294,10 +286,7 @@ mod tests {
     #[test]
     fn parse_then_apply_round_trip() {
         let result = parse_display_hook(r#"{"action":"replace","text":"X"}"#).unwrap();
-        assert_eq!(
-            apply_display("original", &result.action),
-            Some("X".to_string())
-        );
+        assert_eq!(apply_display("original", &result.action), Some("X".to_string()));
     }
 
     #[test]

@@ -66,12 +66,7 @@ pub struct FileSymbols {
 impl FileSymbols {
     /// Construct a file row.
     #[must_use]
-    pub fn new(
-        file: impl Into<String>,
-        defines: Vec<String>,
-        references: Vec<String>,
-        tokens: u32,
-    ) -> Self {
+    pub fn new(file: impl Into<String>, defines: Vec<String>, references: Vec<String>, tokens: u32) -> Self {
         Self {
             file: file.into(),
             defines,
@@ -155,8 +150,7 @@ pub fn build_map(
     }
 
     let ranked = rank(files, focus, DEFAULT_DAMPING, DEFAULT_ITERS);
-    let defines: HashMap<&str, &Vec<String>> =
-        files.iter().map(|f| (f.file.as_str(), &f.defines)).collect();
+    let defines: HashMap<&str, &Vec<String>> = files.iter().map(|f| (f.file.as_str(), &f.defines)).collect();
     let costs: HashMap<&str, u32> = files.iter().map(|f| (f.file.as_str(), f.tokens)).collect();
 
     let mut out = Vec::new();
@@ -169,14 +163,8 @@ pub fn build_map(
             continue;
         }
         spent = spent.saturating_add(cost);
-        let symbols = defines
-            .get(file.as_str())
-            .map_or_else(Vec::new, |d| (*d).clone());
-        out.push(RankedEntry {
-            file,
-            score,
-            symbols,
-        });
+        let symbols = defines.get(file.as_str()).map_or_else(Vec::new, |d| (*d).clone());
+        out.push(RankedEntry { file, score, symbols });
     }
     Ok(out)
 }
@@ -414,13 +402,7 @@ fn teleport_vector(focus: &[String], index: &HashMap<&str, usize>, n: usize) -> 
 ///
 /// Dangling nodes (no out-links) redistribute their mass via the teleport
 /// vector, so probability is conserved and the result is a proper distribution.
-fn power_iterate(
-    out_links: &[Vec<usize>],
-    teleport: &[f64],
-    damping: f64,
-    iters: u32,
-    n: usize,
-) -> Vec<f64> {
+fn power_iterate(out_links: &[Vec<usize>], teleport: &[f64], damping: f64, iters: u32, n: usize) -> Vec<f64> {
     let d = damping.clamp(0.0, 1.0);
     let mut scores = teleport.to_vec();
 
@@ -645,7 +627,21 @@ fn split_before<'a>(line: &'a str, token: &str) -> &'a str {
 /// (e.g. Zig `const X = struct`) are handled specially.
 fn definitions_in_line(lang: Language, line: &str) -> Vec<String> {
     match lang {
-        Language::Rust => leader_defs(line, &["fn", "struct", "enum", "trait", "type", "mod", "const", "static", "union", "macro_rules!"]),
+        Language::Rust => leader_defs(
+            line,
+            &[
+                "fn",
+                "struct",
+                "enum",
+                "trait",
+                "type",
+                "mod",
+                "const",
+                "static",
+                "union",
+                "macro_rules!",
+            ],
+        ),
         Language::TypeScript => ts_defs(line),
         Language::Python => leader_defs(line, &["def", "class"]),
         Language::Go => go_defs(line),
@@ -653,13 +649,27 @@ fn definitions_in_line(lang: Language, line: &str) -> Vec<String> {
         Language::C | Language::Cpp => c_family_defs(line, lang),
         Language::Ruby => leader_defs(line, &["def", "class", "module"]),
         Language::Php => leader_defs(line, &["function", "class", "interface", "trait", "enum"]),
-        Language::Swift => leader_defs(line, &["func", "class", "struct", "enum", "protocol", "extension", "actor"]),
+        Language::Swift => leader_defs(
+            line,
+            &[
+                "func",
+                "class",
+                "struct",
+                "enum",
+                "protocol",
+                "extension",
+                "actor",
+            ],
+        ),
         Language::Kotlin => kotlin_defs(line),
         Language::Scala => leader_defs(line, &["def", "class", "object", "trait", "case class"]),
         Language::Zig => zig_defs(line),
         Language::Haskell => haskell_defs(line),
         Language::Lua => lua_defs(line),
-        Language::Elixir => leader_defs(line, &["def", "defp", "defmodule", "defmacro", "defstruct", "defprotocol"]),
+        Language::Elixir => leader_defs(
+            line,
+            &["def", "defp", "defmodule", "defmacro", "defstruct", "defprotocol"],
+        ),
         Language::Shell => shell_defs(line),
     }
 }
@@ -687,8 +697,22 @@ fn leader_defs(line: &str, leaders: &[&str]) -> Vec<String> {
 /// `data class Foo` / `enum class Bar` / `annotation class Baz` and Scala
 /// `case class Qux` where two keywords precede the real identifier.
 const CONSTRUCT_KEYWORDS: &[&str] = &[
-    "class", "struct", "enum", "interface", "object", "trait", "fn", "func",
-    "fun", "def", "type", "record", "union", "namespace", "protocol", "actor",
+    "class",
+    "struct",
+    "enum",
+    "interface",
+    "object",
+    "trait",
+    "fn",
+    "func",
+    "fun",
+    "def",
+    "type",
+    "record",
+    "union",
+    "namespace",
+    "protocol",
+    "actor",
 ];
 
 /// Extract the declared name after a leader, skipping a single immediately
@@ -714,10 +738,31 @@ fn definition_name(after: &str) -> Option<String> {
 /// Rust `const FOO` and Haskell `data Foo` must reach their leaders intact.
 fn strip_modifiers(line: &str) -> &str {
     const MODIFIERS: &[&str] = &[
-        "pub", "public", "private", "protected", "internal", "export", "default",
-        "final", "abstract", "sealed", "open", "override", "async",
-        "inline", "extern", "unsafe", "mut", "virtual", "partial",
-        "suspend", "lateinit", "readonly", "declare", "implicit", "lazy",
+        "pub",
+        "public",
+        "private",
+        "protected",
+        "internal",
+        "export",
+        "default",
+        "final",
+        "abstract",
+        "sealed",
+        "open",
+        "override",
+        "async",
+        "inline",
+        "extern",
+        "unsafe",
+        "mut",
+        "virtual",
+        "partial",
+        "suspend",
+        "lateinit",
+        "readonly",
+        "declare",
+        "implicit",
+        "lazy",
         "annotation",
     ];
     let mut cur = line;
@@ -802,7 +847,12 @@ const fn is_ident_char(c: char) -> bool {
 /// TypeScript / JavaScript: functions, classes, interfaces, enums, types, plus
 /// `const NAME = (…) =>` / `const NAME = function` arrow/assignment forms.
 fn ts_defs(line: &str) -> Vec<String> {
-    if let names @ [_, ..] = leader_defs(line, &["function", "class", "interface", "enum", "type", "namespace"]).as_slice() {
+    if let names @ [_, ..] = leader_defs(
+        line,
+        &["function", "class", "interface", "enum", "type", "namespace"],
+    )
+    .as_slice()
+    {
         return names.to_vec();
     }
     // `const foo = (...) => {}` / `let bar = function() {}` style definitions.
@@ -844,7 +894,15 @@ fn go_defs(line: &str) -> Vec<String> {
 /// is not a control-flow keyword, to keep false positives low.
 fn brace_lang_defs(line: &str, lang: Language) -> Vec<String> {
     let type_leaders: &[&str] = if lang == Language::CSharp {
-        &["class", "interface", "enum", "record", "struct", "namespace", "delegate"]
+        &[
+            "class",
+            "interface",
+            "enum",
+            "record",
+            "struct",
+            "namespace",
+            "delegate",
+        ]
     } else {
         &["class", "interface", "enum", "record"]
     };
@@ -908,8 +966,8 @@ fn c_family_defs(line: &str, lang: Language) -> Vec<String> {
 /// C-family control-flow / operator keywords that can appear as `keyword(` and
 /// must never be mistaken for a function definition.
 const C_CONTROL_KEYWORDS: &[&str] = &[
-    "if", "for", "while", "switch", "return", "catch", "sizeof", "do",
-    "else", "case", "throw", "new", "delete", "and", "or", "not",
+    "if", "for", "while", "switch", "return", "catch", "sizeof", "do", "else", "case", "throw", "new",
+    "delete", "and", "or", "not",
 ];
 
 /// Heuristic for C-family function/method definitions: a line shaped like
@@ -1208,10 +1266,7 @@ mod tests {
 
     #[test]
     fn unknown_focus_falls_back_to_uniform() {
-        let files = vec![
-            def("core.rs", &["Engine"], 10),
-            refs("a.rs", &["Engine"], 10),
-        ];
+        let files = vec![def("core.rs", &["Engine"], 10), refs("a.rs", &["Engine"], 10)];
         let plain = pagerank(&files, 0.85, 30);
         let bogus = personalized_pagerank(&files, &["nonexistent.rs".into()], 0.85, 30);
         assert_eq!(plain, bogus, "unknown focus must degrade to plain pagerank");
@@ -1360,8 +1415,16 @@ mod tests {
     fn comments_are_ignored() {
         // A `fn` mentioned only inside a comment must not yield a symbol.
         assert_defs(Language::Rust, "// fn ghost() {}\nfn real() {}", &["real"]);
-        assert_defs(Language::Python, "# def ghost():\ndef real():\n    pass", &["real"]);
-        assert_defs(Language::Lua, "-- function ghost()\nfunction real()\nend", &["real"]);
+        assert_defs(
+            Language::Python,
+            "# def ghost():\ndef real():\n    pass",
+            &["real"],
+        );
+        assert_defs(
+            Language::Lua,
+            "-- function ghost()\nfunction real()\nend",
+            &["real"],
+        );
     }
 
     #[test]
@@ -1426,7 +1489,10 @@ mod tests {
     #[test]
     fn merge_empty_input_is_empty_error() {
         // No roots at all, and roots that are all empty, both map to Empty.
-        assert_eq!(merge_and_rerank_maps(vec![], &[], 1_000), Err(RepoMapError::Empty));
+        assert_eq!(
+            merge_and_rerank_maps(vec![], &[], 1_000),
+            Err(RepoMapError::Empty)
+        );
         assert_eq!(
             merge_and_rerank_maps(vec![vec![], vec![]], &[], 1_000),
             Err(RepoMapError::Empty)

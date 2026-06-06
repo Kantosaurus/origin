@@ -123,11 +123,7 @@ impl DoctorReport {
     /// Most severe verdict across all checks, or [`Health::Ok`] when empty.
     #[must_use]
     pub fn worst(&self) -> Health {
-        self.checks
-            .iter()
-            .map(|c| c.health)
-            .max()
-            .unwrap_or(Health::Ok)
+        self.checks.iter().map(|c| c.health).max().unwrap_or(Health::Ok)
     }
 
     /// Render the report as aligned plain text suitable for a terminal.
@@ -220,10 +216,7 @@ fn check_toolchain(version: Option<&str>) -> Check {
             Some(parsed) if parsed >= MIN_RUST_VERSION => Check::new(
                 "toolchain",
                 Health::Ok,
-                format!(
-                    "Rust {v} (>= MSRV {}.{})",
-                    MIN_RUST_VERSION.0, MIN_RUST_VERSION.1
-                ),
+                format!("Rust {v} (>= MSRV {}.{})", MIN_RUST_VERSION.0, MIN_RUST_VERSION.1),
             ),
             Some(_) => Check::new(
                 "toolchain",
@@ -272,7 +265,11 @@ fn check_providers(providers: &[String]) -> Check {
         Check::new(
             "providers",
             Health::Ok,
-            format!("{} provider(s) configured: {}", providers.len(), providers.join(", ")),
+            format!(
+                "{} provider(s) configured: {}",
+                providers.len(),
+                providers.join(", ")
+            ),
         )
     }
 }
@@ -292,11 +289,7 @@ fn check_home(writable: bool) -> Check {
 fn check_network(network_ok: Option<bool>) -> Check {
     match network_ok {
         Some(true) => Check::new("network", Health::Ok, "outbound connectivity verified"),
-        Some(false) => Check::new(
-            "network",
-            Health::Fail,
-            "outbound connectivity probe failed",
-        ),
+        Some(false) => Check::new("network", Health::Fail, "outbound connectivity probe failed"),
         None => Check::new(
             "network",
             Health::Warn,

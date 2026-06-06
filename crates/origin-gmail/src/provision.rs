@@ -144,8 +144,7 @@ pub fn exchange_form(
 /// parses but carries no `refresh_token` (e.g. consent was not `offline`, so
 /// Google returned only an access token).
 pub fn parse_auth_code_response(body: &str) -> Result<Secret<String>> {
-    let raw: AuthCodeTokenResponse =
-        serde_json::from_str(body).map_err(|e| Error::Parse(e.to_string()))?;
+    let raw: AuthCodeTokenResponse = serde_json::from_str(body).map_err(|e| Error::Parse(e.to_string()))?;
     raw.refresh_token.map(Secret::new).ok_or_else(|| {
         Error::BadArgs(
             "token response carried no refresh_token (request access_type=offline + prompt=consent)"
@@ -205,11 +204,7 @@ fn request_line_query(request_line: &str) -> &str {
 
 /// Write a minimal HTTP/1.1 response with the given status line and HTML body,
 /// then flush. Best-effort: any write error is mapped to [`Error::Http`].
-fn write_http_response(
-    stream: &mut std::net::TcpStream,
-    status_line: &str,
-    body: &str,
-) -> Result<()> {
+fn write_http_response(stream: &mut std::net::TcpStream, status_line: &str, body: &str) -> Result<()> {
     let response = format!(
         "{status_line}\r\n\
          Content-Type: text/html; charset=utf-8\r\n\
@@ -313,11 +308,7 @@ pub async fn store_credentials(
     });
     let json = serde_json::to_string(&blob).map_err(|e| Error::Parse(e.to_string()))?;
     vault
-        .set(
-            crate::DEFAULT_PROVIDER,
-            crate::DEFAULT_ACCOUNT,
-            Secret::new(json),
-        )
+        .set(crate::DEFAULT_PROVIDER, crate::DEFAULT_ACCOUNT, Secret::new(json))
         .await
         .map_err(|e| Error::Credentials(e.to_string()))
 }
@@ -473,12 +464,7 @@ pub fn open_in_browser(url: &str) -> Result<()> {
 /// Any error from the underlying steps: [`Error::Http`] (listener bind, browser
 /// launch, transport), the [`parse_redirect_code`] / [`exchange_code`] error
 /// variants, or [`Error::Credentials`] on the final vault write.
-pub async fn run_login(
-    vault: &KeyVault,
-    client_id: &str,
-    client_secret: &str,
-    bind_port: u16,
-) -> Result<()> {
+pub async fn run_login(vault: &KeyVault, client_id: &str, client_secret: &str, bind_port: u16) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", bind_port))
         .map_err(|e| Error::Http(format!("binding loopback listener: {e}")))?;
     let port = listener
@@ -489,13 +475,7 @@ pub async fn run_login(
 
     let (verifier, challenge) = gen_pkce();
     let state = random_state();
-    let auth_url = build_auth_url(
-        client_id,
-        &redirect_uri,
-        &challenge,
-        GMAIL_READONLY_SCOPE,
-        &state,
-    );
+    let auth_url = build_auth_url(client_id, &redirect_uri, &challenge, GMAIL_READONLY_SCOPE, &state);
 
     // Best-effort browser launch; the URL is also returned to the caller's
     // console path so a headless user can paste it manually.
@@ -671,9 +651,8 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let _client = std::thread::spawn(move || {
             if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
-                let _ = stream.write_all(
-                    b"GET /callback?code=x&state=WRONG HTTP/1.1\r\nConnection: close\r\n\r\n",
-                );
+                let _ = stream
+                    .write_all(b"GET /callback?code=x&state=WRONG HTTP/1.1\r\nConnection: close\r\n\r\n");
             }
         });
         let err = capture_code(&listener, "EXPECTED").unwrap_err();

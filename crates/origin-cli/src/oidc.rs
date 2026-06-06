@@ -82,13 +82,12 @@ pub async fn run(args: OidcArgs) -> Result<()> {
 /// - anything else: used literally.
 fn resolve_subject_token(arg: &str) -> Result<String> {
     if let Some(path) = arg.strip_prefix('@') {
-        let s = std::fs::read_to_string(path)
-            .map_err(|e| anyhow!("reading subject token file `{path}`: {e}"))?;
+        let s =
+            std::fs::read_to_string(path).map_err(|e| anyhow!("reading subject token file `{path}`: {e}"))?;
         return Ok(s.trim().to_string());
     }
     if let Some(name) = arg.strip_prefix("env:") {
-        let s = std::env::var(name)
-            .map_err(|_| anyhow!("subject-token env var `{name}` is not set"))?;
+        let s = std::env::var(name).map_err(|_| anyhow!("subject-token env var `{name}` is not set"))?;
         return Ok(s.trim().to_string());
     }
     Ok(arg.to_string())
@@ -100,7 +99,10 @@ mod tests {
 
     #[test]
     fn literal_token_passes_through() {
-        assert_eq!(resolve_subject_token("eyJhbGci.x.y").expect("literal"), "eyJhbGci.x.y");
+        assert_eq!(
+            resolve_subject_token("eyJhbGci.x.y").expect("literal"),
+            "eyJhbGci.x.y"
+        );
     }
 
     #[test]

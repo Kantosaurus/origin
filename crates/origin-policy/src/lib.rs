@@ -45,8 +45,7 @@ use thiserror::Error;
 /// The derived [`Ord`] follows declaration order, so a *larger* value means
 /// *higher* precedence: `System > Admin > Managed > Project > User`. Use
 /// [`Tier::precedence`] for an explicit numeric rank if comparing across types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 pub enum Tier {
     /// Lowest precedence: the individual user's own settings.
     #[default]
@@ -102,7 +101,6 @@ pub struct PolicyLayer {
     /// RBAC role asserted at this tier.
     pub role: Option<String>,
 }
-
 
 /// Errors that can arise while loading a [`PolicyLayer`] from TOML.
 #[derive(Debug, Error)]
@@ -186,21 +184,13 @@ impl PolicyEngine {
     /// unless some tier denies it or some tier's allow-list omits it.
     #[must_use]
     pub fn is_tool_allowed(&self, tool: &str) -> bool {
-        self.is_allowed(
-            tool,
-            |l| l.allowed_tools.as_ref(),
-            |l| l.denied_tools.as_ref(),
-        )
+        self.is_allowed(tool, |l| l.allowed_tools.as_ref(), |l| l.denied_tools.as_ref())
     }
 
     /// `true` if `model` is permitted by the resolved policy.
     #[must_use]
     pub fn is_model_allowed(&self, model: &str) -> bool {
-        self.is_allowed(
-            model,
-            |l| l.allowed_models.as_ref(),
-            |l| l.denied_models.as_ref(),
-        )
+        self.is_allowed(model, |l| l.allowed_models.as_ref(), |l| l.denied_models.as_ref())
     }
 
     /// The effective spend cap: the minimum `max_spend_usd` across every layer
@@ -210,9 +200,7 @@ impl PolicyEngine {
         self.layers
             .iter()
             .filter_map(|l| l.max_spend_usd)
-            .fold(None, |acc, cap| {
-                Some(acc.map_or(cap, |best: f64| best.min(cap)))
-            })
+            .fold(None, |acc, cap| Some(acc.map_or(cap, |best: f64| best.min(cap))))
     }
 
     /// `true` if `spent_usd` is within the effective cap (inclusive). When no
@@ -237,9 +225,7 @@ impl PolicyEngine {
     /// sets one, or `None` if no layer asserts a role.
     #[must_use]
     pub fn effective_role(&self) -> Option<String> {
-        self.by_precedence_desc()
-            .into_iter()
-            .find_map(|l| l.role.clone())
+        self.by_precedence_desc().into_iter().find_map(|l| l.role.clone())
     }
 }
 
@@ -261,8 +247,7 @@ fn path_under(root: &str, path: &str) -> bool {
     if root.is_empty() {
         return false;
     }
-    path.strip_prefix(&root)
-        .is_some_and(|rest| rest.starts_with('/'))
+    path.strip_prefix(&root).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Lower-noise path: backslashes to slashes, trailing slash trimmed.
@@ -364,7 +349,10 @@ mod tests {
         let engine = PolicyEngine::new(vec![l]);
         assert!(engine.folder_trusted("/srv/app"), "exact root");
         assert!(engine.folder_trusted("/srv/app/sub/file"), "nested");
-        assert!(!engine.folder_trusted("/srv/apple"), "sibling prefix is not trusted");
+        assert!(
+            !engine.folder_trusted("/srv/apple"),
+            "sibling prefix is not trusted"
+        );
         assert!(!engine.folder_trusted("/srv"), "parent is not trusted");
         // Windows path normalised to forward slashes.
         assert!(engine.folder_trusted("C:/work/project"));
@@ -408,7 +396,10 @@ mod tests {
         "#;
         let layer = parse_layer(src, Tier::Admin).unwrap();
         assert_eq!(layer.tier, Tier::Admin);
-        assert_eq!(layer.allowed_tools.as_deref(), Some(&["read".to_string(), "edit".to_string()][..]));
+        assert_eq!(
+            layer.allowed_tools.as_deref(),
+            Some(&["read".to_string(), "edit".to_string()][..])
+        );
         assert_eq!(layer.denied_tools.as_deref(), Some(&["shell".to_string()][..]));
         assert_eq!(layer.max_spend_usd, Some(25.0));
         assert_eq!(layer.role.as_deref(), Some("operator"));
@@ -447,7 +438,10 @@ mod tests {
         .unwrap();
         let engine = PolicyEngine::new(vec![user, admin, system]);
         assert!(engine.is_tool_allowed("read"));
-        assert!(!engine.is_tool_allowed("shell"), "intersected out by user allow-list");
+        assert!(
+            !engine.is_tool_allowed("shell"),
+            "intersected out by user allow-list"
+        );
         assert!(!engine.is_model_allowed("banned-model"));
         assert!(engine.is_model_allowed("some-model"));
         assert_eq!(engine.spend_cap_usd(), Some(20.0));

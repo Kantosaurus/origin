@@ -285,9 +285,7 @@ impl Router {
             } else {
                 fast.clone()
             }),
-            Strategy::QuotaFallback { chain } => {
-                chain.iter().find(|m| !self.is_exhausted(m)).cloned()
-            }
+            Strategy::QuotaFallback { chain } => chain.iter().find(|m| !self.is_exhausted(m)).cloned(),
             Strategy::Scored => self.best_scored(candidates),
         }
     }
@@ -324,8 +322,11 @@ impl Router {
     /// so this works regardless of how the router was constructed.
     #[must_use]
     pub fn scored_order(&self, candidates: &[ModelRef]) -> Vec<ModelRef> {
-        let mut ranked: Vec<ModelRef> =
-            candidates.iter().filter(|m| !self.is_exhausted(m)).cloned().collect();
+        let mut ranked: Vec<ModelRef> = candidates
+            .iter()
+            .filter(|m| !self.is_exhausted(m))
+            .cloned()
+            .collect();
         ranked.sort_by(|a, b| self.score_cmp(b, a));
         ranked
     }
@@ -453,10 +454,7 @@ mod tests {
         r.record_result(&pricey, 500, true);
         r.set_cost_rank(&cheap, 1);
         r.set_cost_rank(&pricey, 5);
-        assert_eq!(
-            r.choose(Phase::Default, &[pricey, cheap.clone()]),
-            Some(cheap)
-        );
+        assert_eq!(r.choose(Phase::Default, &[pricey, cheap.clone()]), Some(cheap));
     }
 
     #[test]
@@ -517,12 +515,10 @@ mod tests {
         let err = Router::try_new(Strategy::QuotaFallback { chain: vec![] }).unwrap_err();
         assert_eq!(err, RouterError::EmptyChain);
         assert!(Router::try_new(Strategy::Scored).is_ok());
-        assert!(
-            Router::try_new(Strategy::QuotaFallback {
-                chain: vec![m("p", "a")]
-            })
-            .is_ok()
-        );
+        assert!(Router::try_new(Strategy::QuotaFallback {
+            chain: vec![m("p", "a")]
+        })
+        .is_ok());
     }
 
     #[test]

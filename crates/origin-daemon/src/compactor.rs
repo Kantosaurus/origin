@@ -26,15 +26,13 @@ pub fn estimate_transcript_bytes(transcript: &[Message]) -> usize {
             let block_bytes = match block {
                 Block::Text { text, .. } => text.len(),
                 Block::ToolUse {
-                    id,
-                    name,
-                    input_json,
-                    ..
-                } => id.len().saturating_add(name.len()).saturating_add(input_json.len()),
+                    id, name, input_json, ..
+                } => id
+                    .len()
+                    .saturating_add(name.len())
+                    .saturating_add(input_json.len()),
                 Block::ToolResult {
-                    tool_use_id,
-                    inline,
-                    ..
+                    tool_use_id, inline, ..
                 } => tool_use_id
                     .len()
                     .saturating_add(inline.as_ref().map_or(0, Vec::len)),
@@ -207,14 +205,20 @@ mod tests {
         let summaries: Vec<Option<String>> = transcript.iter().map(|_| Some("s".into())).collect();
         // Soft cap far above the tiny transcript ⇒ no compaction.
         let out = maybe_compact_transcript(&transcript, &summaries, 1_000_000).await;
-        assert!(out.is_none(), "short session must be byte-identical (no compaction)");
+        assert!(
+            out.is_none(),
+            "short session must be byte-identical (no compaction)"
+        );
     }
 
     #[tokio::test]
     async fn over_cap_compacts_oldest_summarized_turns() {
         let transcript: Vec<Message> = (0..10).map(|i| user(&format!("turn {i} body"))).collect();
-        let summaries: Vec<Option<String>> =
-            transcript.iter().enumerate().map(|(i, _)| Some(format!("sum{i}"))).collect();
+        let summaries: Vec<Option<String>> = transcript
+            .iter()
+            .enumerate()
+            .map(|(i, _)| Some(format!("sum{i}")))
+            .collect();
         // Force the over-cap branch with a tiny cap.
         let out = maybe_compact_transcript(&transcript, &summaries, 1)
             .await

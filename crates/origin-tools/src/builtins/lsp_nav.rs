@@ -60,12 +60,8 @@ pub async fn lsp_navigate(args: LspNavArgs, h: &dyn NavigationHandle) -> Result<
             &h.references(path, args.line, args.col, args.include_declaration)
                 .await?,
         )),
-        "incoming_calls" => Ok(calls_to_json(
-            &h.incoming_calls(path, args.line, args.col).await?,
-        )),
-        "outgoing_calls" => Ok(calls_to_json(
-            &h.outgoing_calls(path, args.line, args.col).await?,
-        )),
+        "incoming_calls" => Ok(calls_to_json(&h.incoming_calls(path, args.line, args.col).await?)),
+        "outgoing_calls" => Ok(calls_to_json(&h.outgoing_calls(path, args.line, args.col).await?)),
         other => Err(ToolError::new(
             ErrClass::Validation,
             "bad_op",

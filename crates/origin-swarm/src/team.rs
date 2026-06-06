@@ -312,7 +312,13 @@ impl MissionLog {
                 out.push('\n');
             }
             // `#<n> [<label>] <id>` then an optional ` <note>` tail.
-            let _ = write!(out, "#{} [{}] {:032x}", i + 1, e.event.label(), e.teammate.value());
+            let _ = write!(
+                out,
+                "#{} [{}] {:032x}",
+                i + 1,
+                e.event.label(),
+                e.teammate.value()
+            );
             if !e.note.is_empty() {
                 out.push(' ');
                 out.push_str(&e.note);
@@ -411,7 +417,10 @@ impl TeamRegistry {
         name: impl Into<String>,
     ) -> Result<WorkerId, TeamError> {
         let name = name.into();
-        let t = self.teams.get_mut(team).ok_or_else(|| TeamError::NoSuchTeam(team.to_owned()))?;
+        let t = self
+            .teams
+            .get_mut(team)
+            .ok_or_else(|| TeamError::NoSuchTeam(team.to_owned()))?;
         t.register_named(id, name.clone());
         self.mailboxes.entry(id).or_default();
         if let Some(log) = self.log.get_mut(team) {
@@ -511,12 +520,7 @@ impl TeamRegistry {
     ///
     /// # Errors
     /// [`TeamError::NoSuchTeam`] / [`TeamError::NoSuchTeammate`].
-    pub fn send_to_teammate(
-        &mut self,
-        team: &str,
-        teammate: &str,
-        msg: Message,
-    ) -> Result<bool, TeamError> {
+    pub fn send_to_teammate(&mut self, team: &str, teammate: &str, msg: Message) -> Result<bool, TeamError> {
         let id = self.teammate_mut(team, teammate)?.id;
         let delivered = msg.scope.delivers_to(id);
         if delivered {
@@ -539,7 +543,10 @@ impl TeamRegistry {
 
     /// Shared helper: resolve `(team, teammate)` to a mutable teammate ref.
     fn teammate_mut(&mut self, team: &str, teammate: &str) -> Result<&mut Teammate, TeamError> {
-        let t = self.teams.get_mut(team).ok_or_else(|| TeamError::NoSuchTeam(team.to_owned()))?;
+        let t = self
+            .teams
+            .get_mut(team)
+            .ok_or_else(|| TeamError::NoSuchTeam(team.to_owned()))?;
         t.teammate_mut(teammate).ok_or_else(|| TeamError::NoSuchTeammate {
             team: team.to_owned(),
             teammate: teammate.to_owned(),
@@ -692,17 +699,25 @@ mod tests {
         let w = WorkerId::generate();
         reg.register_teammate("alpha", w, "scout").expect("team");
 
-        let assigned_id = reg.assign_task("alpha", "scout", "survey the repo").expect("assign");
+        let assigned_id = reg
+            .assign_task("alpha", "scout", "survey the repo")
+            .expect("assign");
         assert_eq!(assigned_id, w);
         // Status flipped to Working { task }.
         assert_eq!(
-            reg.team("alpha").expect("team").teammate("scout").expect("mate").status,
+            reg.team("alpha")
+                .expect("team")
+                .teammate("scout")
+                .expect("mate")
+                .status,
             TeammateStatus::Working {
                 task: "survey the repo".into()
             }
         );
 
-        let event = reg.complete_task("alpha", "scout", "found 3 crates").expect("complete");
+        let event = reg
+            .complete_task("alpha", "scout", "found 3 crates")
+            .expect("complete");
         assert_eq!(
             event,
             TeamEvent::TaskCompleted {
@@ -722,7 +737,12 @@ mod tests {
         // Mission log: registered, assigned, completed.
         let log = reg.mission_log("alpha").expect("log");
         assert_eq!(log.len(), 3);
-        assert_eq!(log.entries()[1].event, MissionEvent::Assigned { task: "survey the repo".into() });
+        assert_eq!(
+            log.entries()[1].event,
+            MissionEvent::Assigned {
+                task: "survey the repo".into()
+            }
+        );
         assert_eq!(
             log.entries()[2].event,
             MissionEvent::Completed {
@@ -756,7 +776,9 @@ mod tests {
     #[test]
     fn assign_unknown_teammate_errors() {
         let (mut reg, _) = registry_with_team("alpha");
-        let err = reg.assign_task("alpha", "ghost", "t").expect_err("no such teammate");
+        let err = reg
+            .assign_task("alpha", "ghost", "t")
+            .expect_err("no such teammate");
         assert_eq!(
             err,
             TeamError::NoSuchTeammate {
@@ -811,7 +833,10 @@ mod tests {
         assert_eq!(drained, vec![msg]);
 
         // Draining again yields nothing.
-        assert!(reg.drain_teammate_inbox("alpha", "scout").expect("drain2").is_empty());
+        assert!(reg
+            .drain_teammate_inbox("alpha", "scout")
+            .expect("drain2")
+            .is_empty());
     }
 
     #[test]
@@ -825,7 +850,10 @@ mod tests {
         let msg = Message::new(coord, MsgScope::Direct(other), "not for you");
         let delivered = reg.send_to_teammate("alpha", "scout", msg).expect("send");
         assert!(!delivered);
-        assert!(reg.drain_teammate_inbox("alpha", "scout").expect("drain").is_empty());
+        assert!(reg
+            .drain_teammate_inbox("alpha", "scout")
+            .expect("drain")
+            .is_empty());
     }
 
     #[test]
@@ -836,7 +864,10 @@ mod tests {
 
         let msg = Message::new(coord, MsgScope::Broadcast, "all hands");
         assert!(reg.send_to_teammate("alpha", "scout", msg).expect("send"));
-        assert_eq!(reg.drain_teammate_inbox("alpha", "scout").expect("drain").len(), 1);
+        assert_eq!(
+            reg.drain_teammate_inbox("alpha", "scout").expect("drain").len(),
+            1
+        );
     }
 
     // ── report_summary helper ──────────────────────────────────────────────

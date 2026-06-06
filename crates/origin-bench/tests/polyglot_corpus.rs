@@ -7,9 +7,7 @@ use std::path::Path;
 
 fn repo_root() -> std::path::PathBuf {
     // crates/origin-bench/.. /.. == repo root
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
 #[test]
@@ -28,7 +26,11 @@ fn polyglot_manifest_loads_all_five_languages() {
     // positive budgets (no fixture/Docker/network dependency).
     for t in &tasks {
         assert!(!t.prompt.is_empty(), "task {} has an empty prompt", t.id);
-        assert!(t.expected_tool_calls_max > 0, "task {} caps tool calls at 0", t.id);
+        assert!(
+            t.expected_tool_calls_max > 0,
+            "task {} caps tool calls at 0",
+            t.id
+        );
         assert!(t.max_turn_latency_ms > 0, "task {} caps latency at 0", t.id);
     }
 }

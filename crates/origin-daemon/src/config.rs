@@ -176,20 +176,16 @@ pub fn load_governance(path: &Path) -> Result<Governance, GovernanceError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let cfg: GovernanceConfig =
-        toml::from_str(&raw).map_err(|source| GovernanceError::Parse {
-            path: path.to_path_buf(),
-            source: Box::new(source),
-        })?;
+    let cfg: GovernanceConfig = toml::from_str(&raw).map_err(|source| GovernanceError::Parse {
+        path: path.to_path_buf(),
+        source: Box::new(source),
+    })?;
     governance_from_config(cfg, path)
 }
 
 /// Convert a parsed [`GovernanceConfig`] into the threadable [`Governance`].
 /// Factored out so it can be unit-tested without touching the filesystem.
-fn governance_from_config(
-    cfg: GovernanceConfig,
-    path: &Path,
-) -> Result<Governance, GovernanceError> {
+fn governance_from_config(cfg: GovernanceConfig, path: &Path) -> Result<Governance, GovernanceError> {
     let policy = if cfg.policy_layers.is_empty() {
         None
     } else {
@@ -340,11 +336,7 @@ mod tests {
     fn browser_section_parses_max_actions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("governance.toml");
-        std::fs::write(
-            &path,
-            "[browser]\nmax_actions_per_session = 5\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "[browser]\nmax_actions_per_session = 5\n").unwrap();
         let gov = load_governance(&path).unwrap();
         assert_eq!(gov.browser_max_actions, Some(5));
         assert!(gov.policy.is_none());

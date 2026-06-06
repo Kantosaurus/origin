@@ -119,8 +119,8 @@ mod tests {
     fn spawn_failure_is_reported_not_panicked() {
         // A non-existent cargo binary must yield an Err (a clean failure
         // reason), never a panic — proving the runner degrades gracefully.
-        let r = CargoRunner::new(std::env::temp_dir())
-            .with_cargo_bin("definitely-not-a-real-cargo-binary-xyz");
+        let r =
+            CargoRunner::new(std::env::temp_dir()).with_cargo_bin("definitely-not-a-real-cargo-binary-xyz");
         let job = BuildJob::new("j", "x");
         let err = r.build(&job).unwrap_err();
         assert!(err.contains("failed to spawn"), "got: {err}");

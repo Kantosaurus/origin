@@ -139,7 +139,10 @@ mod tests {
             "must route through the cost.session catalog key"
         );
         assert!(line.contains(&usd), "must embed the formatted usd: {line}");
-        assert!(line.len() > usd.len(), "a catalog template wraps the figure: {line}");
+        assert!(
+            line.len() > usd.len(),
+            "a catalog template wraps the figure: {line}"
+        );
     }
 
     #[test]
@@ -160,6 +163,9 @@ mod tests {
             "must route through the cost.turn catalog key"
         );
         assert!(line.contains(&usd), "must embed the formatted usd: {line}");
-        assert!(line.len() > usd.len(), "a catalog template wraps the figure: {line}");
+        assert!(
+            line.len() > usd.len(),
+            "a catalog template wraps the figure: {line}"
+        );
     }
 }

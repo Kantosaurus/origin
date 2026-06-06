@@ -262,10 +262,7 @@ fn scan_file_symbols(root: &std::path::Path) -> Vec<origin_repomap::FileSymbols>
 /// remain the cheap identifier-token set (used only to seed the def→ref ranking
 /// graph), minus the file's own definitions so a file does not "reference"
 /// itself.
-fn file_symbols(
-    root: &std::path::Path,
-    path: &std::path::Path,
-) -> Option<origin_repomap::FileSymbols> {
+fn file_symbols(root: &std::path::Path, path: &std::path::Path) -> Option<origin_repomap::FileSymbols> {
     let text = std::fs::read_to_string(path).ok()?;
     let rel = path
         .strip_prefix(root)
@@ -367,7 +364,11 @@ mod tests {
     #[test]
     fn group_paths_by_language_empty_when_all_unsupported() {
         use std::path::PathBuf;
-        let paths = vec![PathBuf::from("a.txt"), PathBuf::from("b.md"), PathBuf::from("noext")];
+        let paths = vec![
+            PathBuf::from("a.txt"),
+            PathBuf::from("b.md"),
+            PathBuf::from("noext"),
+        ];
         assert!(group_paths_by_language(&paths).is_empty());
     }
 

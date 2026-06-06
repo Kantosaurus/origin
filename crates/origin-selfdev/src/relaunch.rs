@@ -72,10 +72,7 @@ pub struct RelaunchRequest {
 impl RelaunchRequest {
     /// Record a relaunch from `previous_binary_path` to `new_binary_path`.
     #[must_use]
-    pub fn new(
-        new_binary_path: impl Into<PathBuf>,
-        previous_binary_path: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn new(new_binary_path: impl Into<PathBuf>, previous_binary_path: impl Into<PathBuf>) -> Self {
         Self {
             new_binary_path: new_binary_path.into(),
             previous_binary_path: previous_binary_path.into(),
@@ -99,11 +96,7 @@ impl RelaunchRequest {
     ///
     /// # Errors
     /// Returns [`StoreError`] if the underlying store save fails.
-    pub fn record(
-        self,
-        store: &dyn RelaunchStore,
-        generation: u64,
-    ) -> Result<RelaunchManifest, StoreError> {
+    pub fn record(self, store: &dyn RelaunchStore, generation: u64) -> Result<RelaunchManifest, StoreError> {
         let manifest = self.into_manifest(generation);
         store.save(&manifest)?;
         Ok(manifest)
@@ -261,8 +254,7 @@ mod tests {
     #[test]
     fn file_store_save_load_clear_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
-        let store =
-            FileRelaunchStore::new(tmp.path().join("nested").join("relaunch.json"));
+        let store = FileRelaunchStore::new(tmp.path().join("nested").join("relaunch.json"));
         assert!(store.load().unwrap().is_none());
 
         let m = RelaunchManifest::new("/n", "/p", 9);
@@ -321,7 +313,10 @@ mod tests {
         let store = FileRelaunchStore::under_state_dir("/state");
         let p = store.path();
         // The contract layout the daemon mirrors: <state>/origin/selfdev/relaunch.json
-        assert!(p.ends_with(Path::new("origin/selfdev/relaunch.json")), "got: {p:?}");
+        assert!(
+            p.ends_with(Path::new("origin/selfdev/relaunch.json")),
+            "got: {p:?}"
+        );
         assert!(p.starts_with("/state"), "got: {p:?}");
     }
 }

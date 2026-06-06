@@ -96,6 +96,12 @@ async fn real_worker_runs_a_subagent_to_completion() {
     // (The noop worker would have returned Usage::default() == zeros.)
     assert_eq!(report.status, ReportStatus::Completed);
     assert_eq!(report.goal, "investigate the foo module");
-    assert_eq!(report.usage.input_tokens, 11, "scripted input tokens must flow through");
-    assert_eq!(report.usage.output_tokens, 7, "scripted output tokens must flow through");
+    assert_eq!(
+        report.usage.input_tokens, 11,
+        "scripted input tokens must flow through"
+    );
+    assert_eq!(
+        report.usage.output_tokens, 7,
+        "scripted output tokens must flow through"
+    );
 }

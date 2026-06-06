@@ -10,8 +10,8 @@ use std::time::Duration;
 use origin_cas::{Store as CasStore, StoreConfig};
 use origin_plan::{ActorId, Plan, PlanStore};
 use origin_swarm::{
-    AdmissionGate, Budget, CompletionReport, Coordinator, PlanHandle, ReportStatus, Usage, WorkerContext, WorkerFn,
-    WorkerSpec,
+    AdmissionGate, Budget, CompletionReport, Coordinator, PlanHandle, ReportStatus, Usage, WorkerContext,
+    WorkerFn, WorkerSpec,
 };
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -81,9 +81,18 @@ async fn spawned_workers_run_concurrently_not_serially() {
     });
 
     // Spawn three WITHOUT awaiting — each starts running immediately on the pool.
-    let h1 = coord.spawn_with(spec("a"), Arc::clone(&worker)).await.expect("spawn a");
-    let h2 = coord.spawn_with(spec("b"), Arc::clone(&worker)).await.expect("spawn b");
-    let h3 = coord.spawn_with(spec("c"), Arc::clone(&worker)).await.expect("spawn c");
+    let h1 = coord
+        .spawn_with(spec("a"), Arc::clone(&worker))
+        .await
+        .expect("spawn a");
+    let h2 = coord
+        .spawn_with(spec("b"), Arc::clone(&worker))
+        .await
+        .expect("spawn b");
+    let h3 = coord
+        .spawn_with(spec("c"), Arc::clone(&worker))
+        .await
+        .expect("spawn c");
     // Awaiting in sequence still resolves all three concurrently (they overlap).
     coord.await_completion(&h1).await.expect("a done");
     coord.await_completion(&h2).await.expect("b done");

@@ -120,9 +120,7 @@ pub mod otel {
     ///
     /// [`BatchSpanProcessor`]: opentelemetry_sdk::trace::BatchSpanProcessor
     /// [`runtime::Tokio`]: opentelemetry_sdk::runtime::Tokio
-    pub fn install_traces(
-        endpoint: &str,
-    ) -> Result<opentelemetry_sdk::trace::TracerProvider, String> {
+    pub fn install_traces(endpoint: &str) -> Result<opentelemetry_sdk::trace::TracerProvider, String> {
         let exporter = opentelemetry_otlp::new_exporter()
             .tonic()
             .with_endpoint(endpoint)
@@ -131,9 +129,7 @@ pub mod otel {
         let provider = opentelemetry_otlp::new_pipeline()
             .tracing()
             .with_exporter(exporter)
-            .with_trace_config(
-                opentelemetry_sdk::trace::Config::default().with_resource(resource()),
-            )
+            .with_trace_config(opentelemetry_sdk::trace::Config::default().with_resource(resource()))
             .install_batch(runtime::Tokio)
             .map_err(|e| format!("otlp trace pipeline build failed: {e}"))?;
 

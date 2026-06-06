@@ -254,7 +254,11 @@ mod tests {
         reg.record_read(reader, "src/lib.rs");
         let notify = reg.record_edit(editor, "src/lib.rs");
 
-        assert_eq!(notify, vec![reader], "the reader (not the editor) must be notified");
+        assert_eq!(
+            notify,
+            vec![reader],
+            "the reader (not the editor) must be notified"
+        );
     }
 
     #[test]
@@ -265,7 +269,10 @@ mod tests {
         reg.record_read(w, "src/lib.rs");
         let notify = reg.record_edit(w, "src/lib.rs");
 
-        assert!(notify.is_empty(), "a worker editing a file it read must not notify itself");
+        assert!(
+            notify.is_empty(),
+            "a worker editing a file it read must not notify itself"
+        );
     }
 
     #[test]
@@ -326,7 +333,11 @@ mod tests {
         reg.record_read(reader, "x.rs"); // duplicate
         let notify = reg.record_edit(editor, "x.rs");
 
-        assert_eq!(notify, vec![reader], "duplicate reads collapse to one notify entry");
+        assert_eq!(
+            notify,
+            vec![reader],
+            "duplicate reads collapse to one notify entry"
+        );
     }
 
     #[test]
@@ -336,7 +347,9 @@ mod tests {
         let editor = WorkerId::generate();
 
         reg.record_read(reader, "pkg/mod.rs");
-        let notice = reg.record_edit_notice(editor, "pkg/mod.rs").expect("readers exist");
+        let notice = reg
+            .record_edit_notice(editor, "pkg/mod.rs")
+            .expect("readers exist");
 
         assert_eq!(notice.editor, editor);
         assert_eq!(notice.readers, vec![reader]);
@@ -360,7 +373,11 @@ mod tests {
         assert_eq!(reg.tracked_paths(), 1);
 
         reg.forget_worker(gone);
-        assert_eq!(reg.tracked_paths(), 0, "path is pruned once its last reader leaves");
+        assert_eq!(
+            reg.tracked_paths(),
+            0,
+            "path is pruned once its last reader leaves"
+        );
 
         let notify = reg.record_edit(editor, "y.rs");
         assert!(notify.is_empty(), "a forgotten worker is never notified");

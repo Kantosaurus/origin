@@ -146,9 +146,8 @@ fn child_exiting_86_is_swapped_and_v2_relaunched() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let (marker, backup, installed, manifest_exists) = snapshot.expect(
-        "v2 marker was never written — the exit-86 swap+relaunch did not complete",
-    );
+    let (marker, backup, installed, manifest_exists) =
+        snapshot.expect("v2 marker was never written — the exit-86 swap+relaunch did not complete");
     // The marker is written only by the sentinel-bearing v2, and records its own
     // length: proof that perform_swap installed v2 and the supervisor relaunched it.
     assert!(
@@ -162,9 +161,15 @@ fn child_exiting_86_is_swapped_and_v2_relaunched() {
         "backup (.bak) should be the original v1 binary"
     );
     // daemon_path held the swapped-in v2 bytes at snapshot time.
-    assert_eq!(installed, v2_bytes, "daemon_path should hold the swapped-in v2 bytes");
+    assert_eq!(
+        installed, v2_bytes,
+        "daemon_path should hold the swapped-in v2 bytes"
+    );
     // The manifest is consumed (deleted) after a successful swap.
-    assert!(!manifest_exists, "relaunch manifest should be deleted after the swap");
+    assert!(
+        !manifest_exists,
+        "relaunch manifest should be deleted after the swap"
+    );
 }
 
 #[test]
@@ -210,5 +215,8 @@ fn fixture_v1_writes_manifest_and_v2_writes_marker() {
         .expect("run v2 fixture");
     assert_eq!(status.code(), Some(0));
     let marker = std::fs::read_to_string(&marker_path).unwrap();
-    assert!(marker.contains(&format!("len={}", bytes.len())), "marker={marker:?}");
+    assert!(
+        marker.contains(&format!("len={}", bytes.len())),
+        "marker={marker:?}"
+    );
 }

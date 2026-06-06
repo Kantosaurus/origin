@@ -67,7 +67,9 @@ pub async fn gmail(
     }
     let args = origin_gmail::GmailArgs::from_value(&serde_json::Value::Object(obj))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let json = origin_gmail::run_tool(args).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let json = origin_gmail::run_tool(args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("{json}");
     Ok(())
 }
@@ -85,19 +87,18 @@ pub async fn gmail(
 /// # Errors
 /// Returns a clear error when a credential is absent, when the keyvault cannot
 /// be detected, or forwards any [`origin_gmail::Error`] from the flow.
-async fn gmail_login(
-    client_id: Option<&str>,
-    client_secret: Option<&str>,
-    port: u16,
-) -> Result<()> {
+async fn gmail_login(client_id: Option<&str>, client_secret: Option<&str>, port: u16) -> Result<()> {
     let client_id = resolve_oauth_arg(client_id, "GMAIL_CLIENT_ID")?;
     let client_secret = resolve_oauth_arg(client_secret, "GMAIL_CLIENT_SECRET")?;
-    let vault = origin_keyvault::KeyVault::detect()
-        .map_err(|e| anyhow::anyhow!("keyvault detect: {e}"))?;
+    let vault = origin_keyvault::KeyVault::detect().map_err(|e| anyhow::anyhow!("keyvault detect: {e}"))?;
 
     println!(
         "Starting Gmail OAuth login (loopback redirect on 127.0.0.1:{}).",
-        if port == 0 { "<ephemeral>".to_string() } else { port.to_string() }
+        if port == 0 {
+            "<ephemeral>".to_string()
+        } else {
+            port.to_string()
+        }
     );
     println!("A browser window will open for Google consent; complete it there.");
 
@@ -273,7 +274,11 @@ fn spec_to_workflow(spec: &origin_workflowgen::WorkflowSpec) -> crate::workflows
                 // The planner stores args as a (possibly empty) string; the CLI
                 // shape uses `Option<String>` with empty mapped to `None` so the
                 // on-disk form stays clean.
-                args: if s.args.is_empty() { None } else { Some(s.args.clone()) },
+                args: if s.args.is_empty() {
+                    None
+                } else {
+                    Some(s.args.clone())
+                },
                 depends_on: s.depends_on.iter().map(|d| d.index()).collect(),
             })
             .collect(),
@@ -311,9 +316,7 @@ fn local_skill_catalog() -> origin_workflowgen::SkillCatalog {
 /// Forwards IPC connect/transport and (de)serialization failures.
 pub async fn selfdev(sub: SelfdevSub) -> Result<()> {
     if std::env::var("ORIGIN_SELFDEV").as_deref() != Ok("1") {
-        println!(
-            "note: self-dev is gated — start the daemon with ORIGIN_SELFDEV=1 to enable it."
-        );
+        println!("note: self-dev is gated — start the daemon with ORIGIN_SELFDEV=1 to enable it.");
     }
     let msg = match sub {
         SelfdevSub::Start { description, path } => ClientMessage::SelfDevStart {
@@ -506,8 +509,7 @@ mod tests {
     fn resolve_oauth_arg_errors_when_both_absent() {
         let env = "GMAIL_CLIENT_ID_TEST_BOTH_ABSENT";
         std::env::remove_var(env);
-        let err =
-            resolve_oauth_arg(None, env).expect_err("missing flag and env must be an error");
+        let err = resolve_oauth_arg(None, env).expect_err("missing flag and env must be an error");
         let msg = err.to_string();
         // The flag name is derived from the env name (lowercased, GMAIL_ stripped,
         // underscores -> hyphens) so the user sees the matching `--client-id`.

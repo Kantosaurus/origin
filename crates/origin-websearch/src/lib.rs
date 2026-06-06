@@ -52,7 +52,10 @@ pub enum Engine {
 #[must_use]
 pub fn parse_duckduckgo_html(html: &str) -> Vec<SearchHit> {
     // Split on the result-anchor class marker; the first chunk is preamble.
-    html.split("result__a").skip(1).filter_map(parse_ddg_chunk).collect()
+    html.split("result__a")
+        .skip(1)
+        .filter_map(parse_ddg_chunk)
+        .collect()
 }
 
 /// Parses a single post-`result__a` chunk into a hit, if it has a usable link.
@@ -130,16 +133,15 @@ fn hits_from_array(results: Option<&Vec<serde_json::Value>>, snippet_key: &str) 
 // `Engine` is a tiny `Copy` enum and the public API takes it by value by design.
 #[must_use]
 #[allow(clippy::needless_pass_by_value)]
-pub fn endpoint_for(
-    engine: Engine,
-    query: &str,
-    api_key: Option<&str>,
-) -> (String, Vec<(String, String)>) {
+pub fn endpoint_for(engine: Engine, query: &str, api_key: Option<&str>) -> (String, Vec<(String, String)>) {
     let encoded = urlencode(query);
     match engine {
         Engine::DuckDuckGo => {
             let url = format!("https://html.duckduckgo.com/html/?q={encoded}");
-            let headers = vec![("User-Agent".to_owned(), "Mozilla/5.0 (origin-websearch)".to_owned())];
+            let headers = vec![(
+                "User-Agent".to_owned(),
+                "Mozilla/5.0 (origin-websearch)".to_owned(),
+            )];
             (url, headers)
         }
         Engine::Brave => {
@@ -606,9 +608,21 @@ mod tests {
     #[test]
     fn rank_empty_query_preserves_order_and_dedups() {
         let hits = vec![
-            SearchHit { title: "a".to_owned(), url: "https://x/".to_owned(), snippet: String::new() },
-            SearchHit { title: "b".to_owned(), url: "https://x/".to_owned(), snippet: String::new() },
-            SearchHit { title: "c".to_owned(), url: "https://y/".to_owned(), snippet: String::new() },
+            SearchHit {
+                title: "a".to_owned(),
+                url: "https://x/".to_owned(),
+                snippet: String::new(),
+            },
+            SearchHit {
+                title: "b".to_owned(),
+                url: "https://x/".to_owned(),
+                snippet: String::new(),
+            },
+            SearchHit {
+                title: "c".to_owned(),
+                url: "https://y/".to_owned(),
+                snippet: String::new(),
+            },
         ];
         let ranked = rank(hits, "   ");
         assert_eq!(ranked.len(), 2);
@@ -708,9 +722,11 @@ mod tests {
 
     #[test]
     fn ground_falls_back_to_title_and_host_for_sparse_hits() {
-        let hits = vec![
-            SearchHit { title: String::new(), url: "https://only-host.example/path".to_owned(), snippet: String::new() },
-        ];
+        let hits = vec![SearchHit {
+            title: String::new(),
+            url: "https://only-host.example/path".to_owned(),
+            snippet: String::new(),
+        }];
         let grounded = ground("q", &hits);
         assert_eq!(grounded.sources.len(), 1);
         // Empty title falls back to the URL host for the source label.

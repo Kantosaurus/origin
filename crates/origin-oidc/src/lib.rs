@@ -68,10 +68,7 @@ pub struct ExchangeRequest {
 #[must_use]
 pub fn build_exchange_form(req: &ExchangeRequest) -> Vec<(String, String)> {
     let mut form = Vec::with_capacity(6);
-    form.push((
-        "grant_type".to_string(),
-        GRANT_TYPE_TOKEN_EXCHANGE.to_string(),
-    ));
+    form.push(("grant_type".to_string(), GRANT_TYPE_TOKEN_EXCHANGE.to_string()));
     form.push(("subject_token".to_string(), req.subject_token.clone()));
     form.push((
         "subject_token_type".to_string(),
@@ -115,8 +112,7 @@ struct RawTokenResponse {
 /// required `access_token` is missing, or when `expires_in` is present but is
 /// neither a non-negative number nor a numeric string.
 pub fn parse_token_response(json: &str) -> Result<ExchangedToken, OidcError> {
-    let raw: RawTokenResponse =
-        serde_json::from_str(json).map_err(|e| OidcError::Parse(e.to_string()))?;
+    let raw: RawTokenResponse = serde_json::from_str(json).map_err(|e| OidcError::Parse(e.to_string()))?;
 
     let access_token = raw
         .access_token
@@ -204,26 +200,16 @@ pub fn parse_oidc_claims(jwt: &str) -> Result<Claims, OidcError> {
     };
 
     let bytes = base64url_decode(payload)?;
-    let text = String::from_utf8(bytes)
-        .map_err(|e| OidcError::Jwt(format!("payload not UTF-8: {e}")))?;
+    let text = String::from_utf8(bytes).map_err(|e| OidcError::Jwt(format!("payload not UTF-8: {e}")))?;
     let raw: RawClaims =
         serde_json::from_str(&text).map_err(|e| OidcError::Jwt(format!("payload not JSON: {e}")))?;
 
     let iss = raw.iss.unwrap_or_default();
     let sub = raw.sub.unwrap_or_default();
     let aud = aud_to_string(raw.aud.as_ref());
-    let exp = raw
-        .exp
-        .as_ref()
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
+    let exp = raw.exp.as_ref().and_then(serde_json::Value::as_u64).unwrap_or(0);
 
-    Ok(Claims {
-        iss,
-        sub,
-        aud,
-        exp,
-    })
+    Ok(Claims { iss, sub, aud, exp })
 }
 
 /// Normalize an `aud` claim (string, or first element of an array) to a string.
@@ -316,8 +302,7 @@ mod tests {
     }
 
     fn b64url_no_pad(bytes: &[u8]) -> String {
-        const ALPHABET: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let mut out = String::new();
         for chunk in bytes.chunks(3) {
             let b0 = u32::from(chunk[0]);
@@ -349,9 +334,7 @@ mod tests {
     #[test]
     fn form_includes_workspace_and_rule_when_present() {
         let form = build_exchange_form(&sample_request());
-        assert!(form
-            .iter()
-            .any(|(k, v)| k == "workspace_id" && v == "ws_abc"));
+        assert!(form.iter().any(|(k, v)| k == "workspace_id" && v == "ws_abc"));
         assert!(form
             .iter()
             .any(|(k, v)| k == "federation_rule_id" && v == "rule_xyz"));

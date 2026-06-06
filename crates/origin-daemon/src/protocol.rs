@@ -462,7 +462,9 @@ pub enum StreamEvent {
     },
     /// Response to [`ClientMessage::ExportSession`]: the rendered transcript
     /// (Markdown or JSON depending on the requested format).
-    SessionExport { content: String },
+    SessionExport {
+        content: String,
+    },
     /// P13.4.2: positive acknowledgement for admin mutations that have no
     /// payload of their own (`RemoveSession`, `KeyringAdd`, …).
     AdminOk,
@@ -746,10 +748,17 @@ mod permission_wire_tests {
             args_preview: "rm -rf build/".to_string(),
         };
         let json = serde_json::to_string(&ev).expect("serialize");
-        assert!(json.contains("\"kind\":\"permission_ask\""), "tagged on kind: {json}");
+        assert!(
+            json.contains("\"kind\":\"permission_ask\""),
+            "tagged on kind: {json}"
+        );
         let back: StreamEvent = serde_json::from_str(&json).expect("deserialize");
         match back {
-            StreamEvent::PermissionAsk { id, tool, args_preview } => {
+            StreamEvent::PermissionAsk {
+                id,
+                tool,
+                args_preview,
+            } => {
                 assert_eq!(id, 7);
                 assert_eq!(tool, "Bash");
                 assert_eq!(args_preview, "rm -rf build/");
@@ -763,7 +772,10 @@ mod permission_wire_tests {
         let msg = ClientMessage::PermissionDecision { id: 7, allow: true };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: ClientMessage = serde_json::from_str(&json).expect("deserialize");
-        assert!(matches!(back, ClientMessage::PermissionDecision { id: 7, allow: true }));
+        assert!(matches!(
+            back,
+            ClientMessage::PermissionDecision { id: 7, allow: true }
+        ));
     }
 
     #[test]
@@ -776,7 +788,10 @@ mod permission_wire_tests {
         };
         assert!(!req.permission_ask);
         let json = serde_json::to_string(&req).expect("serialize");
-        assert!(!json.contains("permission_ask"), "default request omits the flag: {json}");
+        assert!(
+            !json.contains("permission_ask"),
+            "default request omits the flag: {json}"
+        );
     }
 
     #[test]

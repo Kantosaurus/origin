@@ -29,10 +29,7 @@ impl HttpClient {
     /// Wrap an existing `reqwest::Client` with a bearer access token.
     #[must_use]
     pub const fn new(inner: reqwest::Client, access_token: Secret<String>) -> Self {
-        Self {
-            inner,
-            access_token,
-        }
+        Self { inner, access_token }
     }
 
     /// Perform an authenticated `GET` and return the response body as a

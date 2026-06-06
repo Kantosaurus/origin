@@ -389,20 +389,14 @@ const RULES: &[Rule] = &[
         title: "left-in debug print",
         detail: "a debug print / log was added; confirm it is intentional",
         confidence: 0.55,
-        matches: |raw, _t| {
-            raw.contains("dbg!(")
-                || raw.contains("println!(")
-                || raw.contains("console.log(")
-        },
+        matches: |raw, _t| raw.contains("dbg!(") || raw.contains("println!(") || raw.contains("console.log("),
     },
     Rule {
         dimension: Dimension::Test,
         title: "TODO/FIXME left in code",
         detail: "an unresolved marker was introduced",
         confidence: 0.45,
-        matches: |raw, _t| {
-            raw.contains("TODO") || raw.contains("FIXME") || raw.contains("XXX")
-        },
+        matches: |raw, _t| raw.contains("TODO") || raw.contains("FIXME") || raw.contains("XXX"),
     },
     Rule {
         dimension: Dimension::Performance,
@@ -435,8 +429,15 @@ const RULES: &[Rule] = &[
 /// strings (`""`) are ignored to keep false positives down.
 fn looks_like_secret(raw: &str, _trimmed: &str) -> bool {
     const NAMES: &[&str] = &[
-        "password", "passwd", "secret", "api_key", "apikey", "api-key",
-        "access_key", "token", "private_key",
+        "password",
+        "passwd",
+        "secret",
+        "api_key",
+        "apikey",
+        "api-key",
+        "access_key",
+        "token",
+        "private_key",
     ];
     let lower = raw.to_ascii_lowercase();
     let names_hit = NAMES.iter().any(|n| lower.contains(n));
@@ -485,7 +486,10 @@ pub fn render(findings: &[Finding], level: Strictness) -> String {
     );
 
     if surfaced.is_empty() {
-        let _ = writeln!(out, "no findings at this strictness ({analyzed} candidate(s) analyzed).");
+        let _ = writeln!(
+            out,
+            "no findings at this strictness ({analyzed} candidate(s) analyzed)."
+        );
         return out;
     }
 
@@ -633,8 +637,8 @@ diff --git a/src/lib.rs b/src/lib.rs
         let positive = "+    let api_key = \"sk-livesecret123\";";
         let hits = analyze_diff(&format!("+++ b/cfg.rs\n@@ -0,0 +1,1 @@\n{positive}"));
         assert!(
-            hits.iter().any(|f| f.dimension == Dimension::Security
-                && f.title == "possible hardcoded secret"),
+            hits.iter()
+                .any(|f| f.dimension == Dimension::Security && f.title == "possible hardcoded secret"),
             "expected a security finding, got {hits:?}"
         );
 

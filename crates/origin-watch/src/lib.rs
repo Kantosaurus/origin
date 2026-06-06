@@ -219,14 +219,8 @@ mod tests {
 
     #[test]
     fn bare_marker_has_empty_text() {
-        assert_eq!(
-            parse_line("// AI"),
-            Some((AiKind::Ai, String::new()))
-        );
-        assert_eq!(
-            parse_line("# AI!"),
-            Some((AiKind::Bang, String::new()))
-        );
+        assert_eq!(parse_line("// AI"), Some((AiKind::Ai, String::new())));
+        assert_eq!(parse_line("# AI!"), Some((AiKind::Bang, String::new())));
     }
 
     #[test]

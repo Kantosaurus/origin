@@ -406,8 +406,7 @@ fn resolve_run_model(raw_model: &str, alias_specs: &[String]) -> Result<String> 
         .flatten()
         .map(|c| c.aliases)
         .unwrap_or_default();
-    let merged = crate::config::merge_alias_specs(&base, alias_specs)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let merged = crate::config::merge_alias_specs(&base, alias_specs).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(crate::config::resolve_alias(&merged, raw_model))
 }
 

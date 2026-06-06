@@ -167,10 +167,9 @@ impl LifecycleConfig {
     pub fn from_env() -> Self {
         let d = Self::DEFAULT;
         let idle_grace_ms = env_u64("ORIGIN_SUPERVISOR_IDLE_GRACE_MS", d.idle_grace_ms);
-        let detached_grace_ms =
-            env_u64("ORIGIN_SUPERVISOR_DETACHED_GRACE_MS", d.detached_grace_ms);
-        let mem_budget_bytes = env_u64("ORIGIN_SUPERVISOR_MEM_BUDGET_MB", d.mem_budget_bytes / MIB)
-            .saturating_mul(MIB);
+        let detached_grace_ms = env_u64("ORIGIN_SUPERVISOR_DETACHED_GRACE_MS", d.detached_grace_ms);
+        let mem_budget_bytes =
+            env_u64("ORIGIN_SUPERVISOR_MEM_BUDGET_MB", d.mem_budget_bytes / MIB).saturating_mul(MIB);
         let mem_shed_ratio = env_f64("ORIGIN_SUPERVISOR_MEM_SHED_RATIO", d.mem_shed_ratio);
         Self {
             idle_grace_ms,
@@ -480,9 +479,7 @@ impl LifecyclePolicy {
         }
         let idle = session.idle_ms(now_ms);
         let (grace, reason) = match session.attach {
-            AttachState::Detached { .. } => {
-                (self.config.detached_grace_ms, RetireReason::DetachedGrace)
-            }
+            AttachState::Detached { .. } => (self.config.detached_grace_ms, RetireReason::DetachedGrace),
             // Attached (Retired handled above).
             _ => (self.config.idle_grace_ms, RetireReason::IdleGrace),
         };
@@ -523,7 +520,11 @@ impl LifecyclePolicy {
             return Vec::new();
         }
         // Target byte usage that would put us back at the shed threshold.
-        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
         let target_bytes = (self.config.mem_shed_ratio * self.config.mem_budget_bytes as f64) as u64;
         let mut current = reading.rss_bytes;
 
@@ -855,8 +856,7 @@ mod tests {
         let mut s = sess("h", SessionClass::Detached, 0, 7 * MIB);
 
         // 1) Detach at t=2000 -> Handoff(Detached), token annotated.
-        let (decision, token) =
-            LifecyclePolicy::on_detach(&mut s, 2_000, 999, token_for("h")).unwrap();
+        let (decision, token) = LifecyclePolicy::on_detach(&mut s, 2_000, 999, token_for("h")).unwrap();
         assert!(matches!(
             decision,
             Decision::Handoff {
@@ -909,7 +909,10 @@ mod tests {
         // Now an idle tick at t=4500 must NOT retire (only 500ms since reattach,
         // under the 1000ms interactive grace).
         let d = policy.on_idle_tick(&mut s, 4_500);
-        assert!(matches!(d, Decision::Keep { .. }), "reattach cancelled retirement");
+        assert!(
+            matches!(d, Decision::Keep { .. }),
+            "reattach cancelled retirement"
+        );
     }
 
     #[test]

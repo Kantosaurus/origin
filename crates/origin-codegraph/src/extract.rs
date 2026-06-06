@@ -210,11 +210,7 @@ fn c_cpp_declarator_name(node: Node, lang: Language) -> Option<Node> {
     loop {
         if matches!(
             cur.kind(),
-            "identifier"
-                | "field_identifier"
-                | "qualified_identifier"
-                | "destructor_name"
-                | "operator_name"
+            "identifier" | "field_identifier" | "qualified_identifier" | "destructor_name" | "operator_name"
         ) {
             return Some(cur);
         }
@@ -309,7 +305,12 @@ fn node_kind_for(lang: Language, ts_kind: &str) -> Option<NodeKind> {
                 "function_declaration",
             )
             | (
-                Language::Python | Language::C | Language::Cpp | Language::Bash | Language::Php | Language::Scala,
+                Language::Python
+                    | Language::C
+                    | Language::Cpp
+                    | Language::Bash
+                    | Language::Php
+                    | Language::Scala,
                 "function_definition",
             )
             | (Language::Haskell, "signature"),

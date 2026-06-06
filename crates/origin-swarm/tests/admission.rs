@@ -23,7 +23,13 @@ use tokio::sync::Mutex as TokioMutex;
 const GIB: u64 = 1 << 30;
 const NEVER: Duration = Duration::from_secs(3600);
 
-const fn cfg(reserve: u64, headroom: u64, static_ceiling: u32, hard_max: Option<u32>, poll: Duration) -> GateCfg {
+const fn cfg(
+    reserve: u64,
+    headroom: u64,
+    static_ceiling: u32,
+    hard_max: Option<u32>,
+    poll: Duration,
+) -> GateCfg {
     GateCfg {
         reserve_bytes: reserve,
         headroom_bytes: headroom,
@@ -53,9 +59,15 @@ async fn collect_until_park(g: &Arc<AdmissionGate>, budget: Duration) -> Vec<Adm
 // RED 2 — the >=1 forward-progress floor admits even at zero free memory.
 #[tokio::test]
 async fn always_admits_one_under_pressure() {
-    let g = gate(ScriptedProbe::constant(0, 16 * GIB), cfg(GIB, GIB, 100, None, NEVER));
+    let g = gate(
+        ScriptedProbe::constant(0, 16 * GIB),
+        cfg(GIB, GIB, 100, None, NEVER),
+    );
     let ticket = tokio::time::timeout(Duration::from_millis(200), g.admit()).await;
-    assert!(ticket.is_ok(), "first admit must never block, even with 0 free memory");
+    assert!(
+        ticket.is_ok(),
+        "first admit must never block, even with 0 free memory"
+    );
     assert_eq!(g.in_flight(), 1);
 }
 
@@ -77,16 +89,27 @@ async fn zero_ceilings_serialize_never_deadlock() {
         },
     ));
     let held = collect_until_park(&g, Duration::from_millis(100)).await;
-    assert_eq!(held.len(), 1, "the floor must admit the first worker even when every ceiling is 0");
+    assert_eq!(
+        held.len(),
+        1,
+        "the floor must admit the first worker even when every ceiling is 0"
+    );
 }
 
 // RED 3 — admitted concurrency tracks live free memory: 8 GiB free, 1 GiB
 // reserve, 1 GiB headroom ⇒ 7 fit (keep 1 GiB back), the 8th parks.
 #[tokio::test]
 async fn admit_tracks_scripted_memory() {
-    let g = gate(ScriptedProbe::constant(8 * GIB, 16 * GIB), cfg(GIB, GIB, 100, None, NEVER));
+    let g = gate(
+        ScriptedProbe::constant(8 * GIB, 16 * GIB),
+        cfg(GIB, GIB, 100, None, NEVER),
+    );
     let held = collect_until_park(&g, Duration::from_millis(100)).await;
-    assert_eq!(held.len(), 7, "8 GiB free − 1 GiB headroom, 1 GiB each ⇒ 7 concurrent");
+    assert_eq!(
+        held.len(),
+        7,
+        "8 GiB free − 1 GiB headroom, 1 GiB each ⇒ 7 concurrent"
+    );
 }
 
 // RED 4 — when exactly one fits, the second parks, then RESUMES when the first
@@ -94,18 +117,27 @@ async fn admit_tracks_scripted_memory() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn second_admit_blocks_then_resumes() {
     // 2 GiB free, 1.5 GiB reserve, 1 GiB headroom ⇒ only the floor's 1 fits.
-    let g = gate(ScriptedProbe::constant(2 * GIB, 8 * GIB), cfg(3 * GIB / 2, GIB, 100, None, NEVER));
+    let g = gate(
+        ScriptedProbe::constant(2 * GIB, 8 * GIB),
+        cfg(3 * GIB / 2, GIB, 100, None, NEVER),
+    );
     let first = g.admit().await;
     assert_eq!(g.in_flight(), 1);
 
     let g2 = Arc::clone(&g);
     let second = tokio::spawn(async move { g2.admit().await });
     tokio::time::sleep(Duration::from_millis(80)).await;
-    assert!(!second.is_finished(), "second admit must park while the first holds memory");
+    assert!(
+        !second.is_finished(),
+        "second admit must park while the first holds memory"
+    );
 
     drop(first); // releases the reserve + notifies
     let resumed = tokio::time::timeout(Duration::from_secs(2), second).await;
-    assert!(resumed.is_ok(), "second admit must resume once the first completes");
+    assert!(
+        resumed.is_ok(),
+        "second admit must resume once the first completes"
+    );
 }
 
 // RED 5 — a parked admit resumes when an EXTERNAL process frees memory, via the
@@ -127,7 +159,10 @@ async fn resume_on_recovery_without_completion() {
 
     probe.set_available(16 * GIB); // external recovery, no completion
     let resumed = tokio::time::timeout(Duration::from_secs(2), second).await;
-    assert!(resumed.is_ok(), "parked admit must resume after a re-probe sees recovery");
+    assert!(
+        resumed.is_ok(),
+        "parked admit must resume after a re-probe sees recovery"
+    );
 }
 
 // RED 6 — under 50 concurrent admits, the committed-reserve accounting + atomic
@@ -135,7 +170,10 @@ async fn resume_on_recovery_without_completion() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_double_admit_under_concurrency() {
     // 4 GiB free, 1 GiB reserve, 1 GiB headroom ⇒ floor 1 + 2 more = 3.
-    let g = gate(ScriptedProbe::constant(4 * GIB, 16 * GIB), cfg(GIB, GIB, 100, None, NEVER));
+    let g = gate(
+        ScriptedProbe::constant(4 * GIB, 16 * GIB),
+        cfg(GIB, GIB, 100, None, NEVER),
+    );
     let held: Arc<Mutex<Vec<AdmissionTicket>>> = Arc::new(Mutex::new(Vec::new()));
     let mut tasks = Vec::new();
     for _ in 0..50u32 {
@@ -150,15 +188,26 @@ async fn no_double_admit_under_concurrency() {
     for t in tasks {
         let _ = t.await;
     }
-    assert_eq!(held.lock().unwrap().len(), 3, "exactly 3 fit; the other 47 must park, never double-admit");
+    assert_eq!(
+        held.lock().unwrap().len(),
+        3,
+        "exactly 3 fit; the other 47 must park, never double-admit"
+    );
 }
 
 // RED 7 — a hard cap overrides abundant memory.
 #[tokio::test]
 async fn hard_max_overrides_memory() {
-    let g = gate(ScriptedProbe::constant(64 * GIB, 64 * GIB), cfg(GIB, GIB, 100, Some(3), NEVER));
+    let g = gate(
+        ScriptedProbe::constant(64 * GIB, 64 * GIB),
+        cfg(GIB, GIB, 100, Some(3), NEVER),
+    );
     let held = collect_until_park(&g, Duration::from_millis(100)).await;
-    assert_eq!(held.len(), 3, "ORIGIN_SWARM_MAX=3 caps concurrency regardless of free RAM");
+    assert_eq!(
+        held.len(),
+        3,
+        "ORIGIN_SWARM_MAX=3 caps concurrency regardless of free RAM"
+    );
 }
 
 // RED 8 — a blind probe degrades to a bounded default, never unbounded, no panic.
@@ -170,21 +219,35 @@ async fn probe_unavailable_degrades_to_bounded() {
         cfg(GIB, GIB, 3, None, NEVER),
     ));
     let held = collect_until_park(&g, Duration::from_millis(100)).await;
-    assert_eq!(held.len(), 3, "blind probe must bound concurrency to the static ceiling");
+    assert_eq!(
+        held.len(),
+        3,
+        "blind probe must bound concurrency to the static ceiling"
+    );
 }
 
 // RED 9 — a misconfigured hard cap of 1 serializes but never wedges the floor.
 #[tokio::test]
 async fn hard_max_one_serializes() {
-    let g = gate(ScriptedProbe::constant(64 * GIB, 64 * GIB), cfg(GIB, GIB, 100, Some(1), NEVER));
+    let g = gate(
+        ScriptedProbe::constant(64 * GIB, 64 * GIB),
+        cfg(GIB, GIB, 100, Some(1), NEVER),
+    );
     let held = collect_until_park(&g, Duration::from_millis(100)).await;
-    assert_eq!(held.len(), 1, "hard_max=1 ⇒ serial, but the first always proceeds");
+    assert_eq!(
+        held.len(),
+        1,
+        "hard_max=1 ⇒ serial, but the first always proceeds"
+    );
 }
 
 // RED 10a — the RAII ticket releases its reserve when the holding task is cancelled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ticket_release_on_cancel() {
-    let g = gate(ScriptedProbe::constant(64 * GIB, 64 * GIB), cfg(GIB, GIB, 100, None, NEVER));
+    let g = gate(
+        ScriptedProbe::constant(64 * GIB, 64 * GIB),
+        cfg(GIB, GIB, 100, None, NEVER),
+    );
     let ticket = g.admit().await;
     assert_eq!(g.in_flight(), 1);
     let task = tokio::spawn(async move {
@@ -195,13 +258,20 @@ async fn ticket_release_on_cancel() {
     task.abort();
     let _ = task.await; // cancelled → ticket dropped on unwind
     tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(g.in_flight(), 0, "cancelled holder must release its admission slot");
+    assert_eq!(
+        g.in_flight(),
+        0,
+        "cancelled holder must release its admission slot"
+    );
 }
 
 // RED 10b — the RAII ticket releases its reserve when the holding task panics.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ticket_release_on_panic() {
-    let g = gate(ScriptedProbe::constant(64 * GIB, 64 * GIB), cfg(GIB, GIB, 100, None, NEVER));
+    let g = gate(
+        ScriptedProbe::constant(64 * GIB, 64 * GIB),
+        cfg(GIB, GIB, 100, None, NEVER),
+    );
     let ticket = g.admit().await;
     assert_eq!(g.in_flight(), 1);
     let task = tokio::spawn(async move {
@@ -209,14 +279,21 @@ async fn ticket_release_on_panic() {
         panic!("boom");
     });
     let _ = task.await; // JoinError(panic) → Drop ran during unwind
-    assert_eq!(g.in_flight(), 0, "panicking holder must release its admission slot");
+    assert_eq!(
+        g.in_flight(),
+        0,
+        "panicking holder must release its admission slot"
+    );
 }
 
 // RED 11 — two sequential admits on one task never self-deadlock (decide is a
 // pure sync fn; the lock is dropped before the park await).
 #[tokio::test]
 async fn two_sequential_admits_no_self_deadlock() {
-    let g = gate(ScriptedProbe::constant(64 * GIB, 64 * GIB), cfg(GIB, GIB, 100, None, NEVER));
+    let g = gate(
+        ScriptedProbe::constant(64 * GIB, 64 * GIB),
+        cfg(GIB, GIB, 100, None, NEVER),
+    );
     let ok = tokio::time::timeout(Duration::from_secs(1), async {
         let _a = g.admit().await;
         let _b = g.admit().await;
@@ -289,7 +366,10 @@ fn peak_worker(current: Arc<AtomicUsize>, max_seen: Arc<AtomicUsize>) -> WorkerF
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn coordinator_serializes_under_tight_gate() {
     let tmp = TempDir::new().unwrap();
-    let tight = gate(ScriptedProbe::constant(GIB, 2 * GIB), cfg(GIB, GIB, 100, Some(1), NEVER));
+    let tight = gate(
+        ScriptedProbe::constant(GIB, 2 * GIB),
+        cfg(GIB, GIB, 100, Some(1), NEVER),
+    );
     let coord = Coordinator::new(plan_handle(&tmp), "tight").with_memory_gate(tight);
 
     let current = Arc::new(AtomicUsize::new(0));
@@ -315,7 +395,10 @@ async fn coordinator_serializes_under_tight_gate() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn coordinator_parallelizes_under_generous_gate() {
     let tmp = TempDir::new().unwrap();
-    let generous = gate(ScriptedProbe::constant(64 * GIB, 64 * GIB), cfg(GIB, 0, 100, None, NEVER));
+    let generous = gate(
+        ScriptedProbe::constant(64 * GIB, 64 * GIB),
+        cfg(GIB, 0, 100, None, NEVER),
+    );
     let coord = Coordinator::new(plan_handle(&tmp), "generous").with_memory_gate(generous);
 
     let current = Arc::new(AtomicUsize::new(0));

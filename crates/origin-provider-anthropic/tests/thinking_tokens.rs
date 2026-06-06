@@ -62,9 +62,7 @@ fn set_thinking_tokens_emits_budget_and_bumps_max_tokens() {
         "budget_tokens must echo the requested thinking budget"
     );
 
-    let max_tokens = body["max_tokens"]
-        .as_u64()
-        .expect("max_tokens must be a number");
+    let max_tokens = body["max_tokens"].as_u64().expect("max_tokens must be a number");
     assert!(
         max_tokens > u64::from(budget),
         "max_tokens ({max_tokens}) must exceed the thinking budget ({budget}) per Anthropic's rule"
@@ -79,5 +77,8 @@ fn large_budget_still_keeps_max_tokens_above_it() {
     let budget: u32 = 32_000;
     let body = origin_provider_anthropic::encode_request_for_test(&req_with(Some(budget)));
     let max_tokens = body["max_tokens"].as_u64().expect("number");
-    assert!(max_tokens > u64::from(budget), "max_tokens must exceed a large budget too");
+    assert!(
+        max_tokens > u64::from(budget),
+        "max_tokens must exceed a large budget too"
+    );
 }

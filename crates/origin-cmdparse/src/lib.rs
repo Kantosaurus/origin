@@ -240,9 +240,7 @@ fn is_env_assignment(tok: &str) -> bool {
         return false;
     }
     let mut chars = name.chars();
-    let first_ok = chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
     first_ok && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -321,8 +319,7 @@ fn detect_base64_to_shell(lower: &str, risks: &mut Vec<Risk>) {
             || lower.contains("base64 -"));
     if decodes && pipes_into_shell(lower) {
         risks.push(Risk::Dangerous(
-            "base64-decoded content is piped into a shell, executing obfuscated code"
-                .to_string(),
+            "base64-decoded content is piped into a shell, executing obfuscated code".to_string(),
         ));
     }
 }

@@ -213,9 +213,9 @@ impl ModelCache {
     /// treated as fresh (the saturating difference is zero).
     #[must_use]
     pub fn is_stale(&self, provider: &str, now_unix: u64, ttl_secs: u64) -> bool {
-        self.providers.get(provider).is_none_or(|entry| {
-            now_unix.saturating_sub(entry.fetched_at_unix) > ttl_secs
-        })
+        self.providers
+            .get(provider)
+            .is_none_or(|entry| now_unix.saturating_sub(entry.fetched_at_unix) > ttl_secs)
     }
 
     /// Serialize the whole cache to a JSON string for on-disk persistence.
@@ -299,10 +299,7 @@ mod tests {
 
     #[test]
     fn merge_catalog_dedups_and_is_builtin_first() {
-        let builtin = vec![
-            "claude-sonnet-4-6".to_string(),
-            "claude-opus-4-8".to_string(),
-        ];
+        let builtin = vec!["claude-sonnet-4-6".to_string(), "claude-opus-4-8".to_string()];
         let discovered = vec![
             ModelInfo::new("gpt-4o".to_string(), None, true),
             // Duplicate of a builtin id: must not reappear.
@@ -314,12 +311,7 @@ mod tests {
         let merged = merge_catalog(&builtin, &discovered);
         assert_eq!(
             merged,
-            [
-                "claude-sonnet-4-6",
-                "claude-opus-4-8",
-                "gpt-4o",
-                "gpt-4o-mini"
-            ]
+            ["claude-sonnet-4-6", "claude-opus-4-8", "gpt-4o", "gpt-4o-mini"]
         );
     }
 
@@ -353,13 +345,13 @@ mod tests {
         cache.put(
             "anthropic",
             42,
-            vec![ModelInfo::new(
-                "claude-opus-4-8".to_string(),
-                Some(200_000),
-                true,
-            )],
+            vec![ModelInfo::new("claude-opus-4-8".to_string(), Some(200_000), true)],
         );
-        cache.put("openai", 7, vec![ModelInfo::new("gpt-4o".to_string(), None, true)]);
+        cache.put(
+            "openai",
+            7,
+            vec![ModelInfo::new("gpt-4o".to_string(), None, true)],
+        );
         let json = cache.to_json().unwrap();
         let restored = ModelCache::from_json(&json).unwrap();
         assert_eq!(restored, cache);

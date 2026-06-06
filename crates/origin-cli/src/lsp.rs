@@ -70,7 +70,10 @@ fn ensure(ext: &str) {
         if on_path {
             println!("auto     : ORIGIN_LSP_AUTO set; `{program}` already on PATH (no install needed)");
         } else {
-            println!("auto     : ORIGIN_LSP_AUTO set; running install: {}", server.install);
+            println!(
+                "auto     : ORIGIN_LSP_AUTO set; running install: {}",
+                server.install
+            );
             match run_install(server.install) {
                 Ok(status) if status.success() => {
                     println!("auto     : install completed successfully");
@@ -88,27 +91,27 @@ fn ensure(ext: &str) {
 fn run_install(install_cmd: &str) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(windows)]
     {
-        std::process::Command::new("cmd").arg("/C").arg(install_cmd).status()
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .arg(install_cmd)
+            .status()
     }
     #[cfg(not(windows))]
     {
-        std::process::Command::new("sh").arg("-c").arg(install_cmd).status()
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(install_cmd)
+            .status()
     }
 }
 
 /// Print every server in the builtin registry as a fixed-width table.
 fn ls() {
     let servers = origin_lspfleet::registry();
-    println!(
-        "{:<14} {:<28} {:<22} EXTENSIONS",
-        "LANGUAGE", "SERVER", "LAUNCH"
-    );
+    println!("{:<14} {:<28} {:<22} EXTENSIONS", "LANGUAGE", "SERVER", "LAUNCH");
     for s in servers {
         let exts = s.extensions.join(",");
-        println!(
-            "{:<14} {:<28} {:<22} {exts}",
-            s.language, s.server_id, s.launch
-        );
+        println!("{:<14} {:<28} {:<22} {exts}", s.language, s.server_id, s.launch);
     }
     println!("\n{} servers in the builtin registry.", servers.len());
     println!("(install a server with its `install` command; origin never auto-installs without consent.)");

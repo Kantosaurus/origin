@@ -31,8 +31,8 @@ pub fn run(sub: &AmbientSub) -> Result<()> {
 /// persisted session it renders the "nothing ran overnight" digest. Either way
 /// the standing task rotation is shown so the surface is informative.
 fn report() {
-    let morning =
-        load_persisted_report().unwrap_or_else(|| origin_ambient::MorningReport::new(Vec::new(), 0, Vec::new()));
+    let morning = load_persisted_report()
+        .unwrap_or_else(|| origin_ambient::MorningReport::new(Vec::new(), 0, Vec::new()));
     print!("{}", morning.to_markdown());
 
     // Show the standing overnight plan the daemon loop would run (the task
@@ -58,10 +58,7 @@ fn load_persisted_report() -> Option<origin_ambient::MorningReport> {
     let home = std::env::var_os("ORIGIN_HOME")
         .map(std::path::PathBuf::from)
         .or_else(dirs::home_dir)?;
-    let path = home
-        .join(".origin")
-        .join("overnight")
-        .join("latest.json");
+    let path = home.join(".origin").join("overnight").join("latest.json");
     let s = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&s).ok()
 }

@@ -231,7 +231,11 @@ pub fn from_pi(session: &ImportedSession, external_model_id: Option<&str>) -> Re
 /// keeping a single typed dispatch point lets the daemon-IPC follow-up route a
 /// detected/declared format without re-deriving the match.
 #[must_use]
-pub fn reconstruct(session: &ImportedSession, kind: SourceKind, external_model_id: Option<&str>) -> ResumedSession {
+pub fn reconstruct(
+    session: &ImportedSession,
+    kind: SourceKind,
+    external_model_id: Option<&str>,
+) -> ResumedSession {
     reconstruct_session(session, kind, external_model_id)
 }
 
@@ -328,7 +332,11 @@ pub fn reconstruct_from_path(
     }
 
     Err(last_err.unwrap_or_else(|| {
-        SourceError::NotFound(format!("no {} session found under {}", kind.as_str(), path.display()))
+        SourceError::NotFound(format!(
+            "no {} session found under {}",
+            kind.as_str(),
+            path.display()
+        ))
     }))
 }
 
@@ -478,7 +486,10 @@ mod tests {
         assert_eq!(suggest_model(Some("claude-3-5-haiku-latest")), "claude-haiku-4-6");
         assert_eq!(suggest_model(Some("gpt-5-codex")), "gpt-5-codex");
         assert_eq!(suggest_model(Some("o3-mini")), "gpt-5-codex");
-        assert_eq!(suggest_model(Some("totally-unknown-model")), DEFAULT_SUGGESTED_MODEL);
+        assert_eq!(
+            suggest_model(Some("totally-unknown-model")),
+            DEFAULT_SUGGESTED_MODEL
+        );
         assert_eq!(suggest_model(None), DEFAULT_SUGGESTED_MODEL);
         assert_eq!(suggest_model(Some("   ")), DEFAULT_SUGGESTED_MODEL);
         assert!(!suggest_model(None).is_empty());
@@ -551,7 +562,10 @@ mod tests {
             None,
         )
         .expect_err("missing path must error");
-        assert!(matches!(err, crate::source::SourceError::NotFound(_)), "got {err:?}");
+        assert!(
+            matches!(err, crate::source::SourceError::NotFound(_)),
+            "got {err:?}"
+        );
     }
 
     /// Resolve a Claude Code transcript when the user points at the harness

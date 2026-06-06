@@ -88,12 +88,7 @@ pub fn reduce(buffer: &mut String, ev: KeyEvent, op_in_flight: bool) -> InputAct
 /// (restoring the pre-search draft); Enter accepts the match and submits it. Any
 /// other key accepts the match into the buffer and is then re-dispatched as a
 /// normal edit (search is now off, so the recursion is at most one level deep).
-fn reduce_reverse_search(
-    editor: &mut Editor,
-    ev: KeyEvent,
-    op_in_flight: bool,
-    width: usize,
-) -> InputAction {
+fn reduce_reverse_search(editor: &mut Editor, ev: KeyEvent, op_in_flight: bool, width: usize) -> InputAction {
     match (ev.code, ev.modifiers) {
         (KeyCode::Char('r'), m) if m.contains(KeyModifiers::CONTROL) => {
             editor.reverse_search_again();
@@ -638,8 +633,14 @@ mod tests {
     #[test]
     fn reduce_editor_inserts_and_submits() {
         let mut ed = Editor::new();
-        assert_eq!(reduce_editor(&mut ed, k(KeyCode::Char('h')), false, 80), InputAction::Insert('h'));
-        assert_eq!(reduce_editor(&mut ed, k(KeyCode::Char('i')), false, 80), InputAction::Insert('i'));
+        assert_eq!(
+            reduce_editor(&mut ed, k(KeyCode::Char('h')), false, 80),
+            InputAction::Insert('h')
+        );
+        assert_eq!(
+            reduce_editor(&mut ed, k(KeyCode::Char('i')), false, 80),
+            InputAction::Insert('i')
+        );
         assert_eq!(ed.buffer(), "hi");
         assert_eq!(
             reduce_editor(&mut ed, k(KeyCode::Enter), false, 80),
@@ -663,7 +664,11 @@ mod tests {
         ed.set_buffer("first".to_string());
         reduce_editor(&mut ed, k(KeyCode::Enter), false, 80); // submit → pushed to history
         reduce_editor(&mut ed, k(KeyCode::Up), false, 80); // recall
-        assert_eq!(ed.buffer(), "first", "Up past the top recalls the previous prompt");
+        assert_eq!(
+            ed.buffer(),
+            "first",
+            "Up past the top recalls the previous prompt"
+        );
     }
 
     const fn ctrl(c: char) -> KeyEvent {
@@ -703,7 +708,10 @@ mod tests {
         reduce_editor(&mut ed, k(KeyCode::Char('c')), false, 80);
         assert_eq!(ed.buffer(), "cargo build");
         // Esc cancels search (does NOT quit) and restores the draft.
-        assert_eq!(reduce_editor(&mut ed, k(KeyCode::Esc), false, 80), InputAction::Noop);
+        assert_eq!(
+            reduce_editor(&mut ed, k(KeyCode::Esc), false, 80),
+            InputAction::Noop
+        );
         assert!(!ed.reverse_search_active());
         assert_eq!(ed.buffer(), "draft");
     }
@@ -715,7 +723,11 @@ mod tests {
         assert_eq!(permission_answer(KeyCode::Char('n')), Some(false));
         assert_eq!(permission_answer(KeyCode::Char('N')), Some(false));
         assert_eq!(permission_answer(KeyCode::Esc), Some(false), "Esc denies");
-        assert_eq!(permission_answer(KeyCode::Char('x')), None, "other keys not an answer");
+        assert_eq!(
+            permission_answer(KeyCode::Char('x')),
+            None,
+            "other keys not an answer"
+        );
         assert_eq!(permission_answer(KeyCode::Enter), None);
     }
 
@@ -991,21 +1003,39 @@ mod tests {
 
     #[test]
     fn vim_normal_hjkl_moves() {
-        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('h'))), VimAction::MoveLeft);
-        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('j'))), VimAction::MoveDown);
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char('h'))),
+            VimAction::MoveLeft
+        );
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char('j'))),
+            VimAction::MoveDown
+        );
         assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('k'))), VimAction::MoveUp);
-        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('l'))), VimAction::MoveRight);
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char('l'))),
+            VimAction::MoveRight
+        );
     }
 
     #[test]
     fn vim_normal_line_and_word_motions() {
-        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('0'))), VimAction::LineStart);
-        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('$'))), VimAction::LineEnd);
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char('0'))),
+            VimAction::LineStart
+        );
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char('$'))),
+            VimAction::LineEnd
+        );
         assert_eq!(
             vim_key(VimMode::Normal, k(KeyCode::Char('w'))),
             VimAction::WordForward
         );
-        assert_eq!(vim_key(VimMode::Normal, k(KeyCode::Char('b'))), VimAction::WordBack);
+        assert_eq!(
+            vim_key(VimMode::Normal, k(KeyCode::Char('b'))),
+            VimAction::WordBack
+        );
     }
 
     #[test]
@@ -1107,7 +1137,10 @@ mod tests {
 
     #[test]
     fn parse_knowledge_ls_and_rm() {
-        assert!(matches!(parse_knowledge_command("/knowledge ls"), Some(KnowledgeSub::Ls)));
+        assert!(matches!(
+            parse_knowledge_command("/knowledge ls"),
+            Some(KnowledgeSub::Ls)
+        ));
         match parse_knowledge_command("/knowledge rm foo") {
             Some(KnowledgeSub::Rm { id }) => assert_eq!(id, "foo"),
             _ => panic!("expected Rm"),
@@ -1118,14 +1151,32 @@ mod tests {
     fn parse_knowledge_rejects_malformed_and_non_knowledge() {
         // Not a `/knowledge` line at all.
         assert!(parse_knowledge_command("hello world").is_none());
-        assert!(parse_knowledge_command("/knowledgefoo").is_none(), "word boundary required");
+        assert!(
+            parse_knowledge_command("/knowledgefoo").is_none(),
+            "word boundary required"
+        );
         // Malformed `/knowledge` invocations.
         assert!(parse_knowledge_command("/knowledge").is_none(), "no verb");
-        assert!(parse_knowledge_command("/knowledge add foo").is_none(), "add needs text");
-        assert!(parse_knowledge_command("/knowledge search").is_none(), "search needs a query");
-        assert!(parse_knowledge_command("/knowledge rm").is_none(), "rm needs an id");
-        assert!(parse_knowledge_command("/knowledge rm foo bar").is_none(), "rm id is one token");
-        assert!(parse_knowledge_command("/knowledge bogus x").is_none(), "unknown verb");
+        assert!(
+            parse_knowledge_command("/knowledge add foo").is_none(),
+            "add needs text"
+        );
+        assert!(
+            parse_knowledge_command("/knowledge search").is_none(),
+            "search needs a query"
+        );
+        assert!(
+            parse_knowledge_command("/knowledge rm").is_none(),
+            "rm needs an id"
+        );
+        assert!(
+            parse_knowledge_command("/knowledge rm foo bar").is_none(),
+            "rm id is one token"
+        );
+        assert!(
+            parse_knowledge_command("/knowledge bogus x").is_none(),
+            "unknown verb"
+        );
     }
 }
 
@@ -1165,8 +1216,14 @@ mod tests_args {
 
     #[test]
     fn clear_parses_to_clear_all() {
-        assert!(matches!(parse_clear_command("/clear"), Some(ClientMessage::ClearAll)));
-        assert!(matches!(parse_clear_command("  /clear  "), Some(ClientMessage::ClearAll)));
+        assert!(matches!(
+            parse_clear_command("/clear"),
+            Some(ClientMessage::ClearAll)
+        ));
+        assert!(matches!(
+            parse_clear_command("  /clear  "),
+            Some(ClientMessage::ClearAll)
+        ));
     }
 
     #[test]

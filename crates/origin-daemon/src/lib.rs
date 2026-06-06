@@ -34,16 +34,16 @@ pub mod workflows;
 
 pub use memory_wiring::{MemoryDispatchHandle, MemoryWiring};
 
-pub mod subsystems;
-pub mod scheduler;
 pub mod ambient;
-pub mod webhook;
-pub mod routing;
-pub mod overnight;
-pub mod mem_garden;
 pub mod hooks_runtime;
-pub mod swarm_worker;
-pub mod subagents_md;
-pub mod supervisor;
+pub mod mem_garden;
+pub mod overnight;
+pub mod routing;
+pub mod scheduler;
 pub mod selfdev;
+pub mod subagents_md;
+pub mod subsystems;
+pub mod supervisor;
+pub mod swarm_worker;
 pub mod teams;
+pub mod webhook;

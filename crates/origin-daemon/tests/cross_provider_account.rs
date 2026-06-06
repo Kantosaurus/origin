@@ -15,8 +15,8 @@
 use std::sync::Arc;
 
 use origin_daemon::provider_factory::{
-    build_provider_for, build_provider_for_account, get_current_account, set_global,
-    update_global_account, ProviderFactory,
+    build_provider_for, build_provider_for_account, get_current_account, set_global, update_global_account,
+    ProviderFactory,
 };
 use origin_keyvault::KeyVault;
 use origin_provider::catalog::Catalog;

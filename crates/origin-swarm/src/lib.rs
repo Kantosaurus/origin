@@ -52,9 +52,7 @@ pub use lifecycle::Lifecycle;
 pub use prefix_inherit::PrefixSnapshot;
 pub use report::CompletionReport;
 pub use rpc::PlanHandle;
-pub use spec::{
-    Budget, DecisionRecord, McpServerSpec, ReportStatus, TaskRef, Usage, WorkerSpec,
-};
+pub use spec::{Budget, DecisionRecord, McpServerSpec, ReportStatus, TaskRef, Usage, WorkerSpec};
 pub use team::{
     report_summary, MissionEntry, MissionEvent, MissionLog, Team, TeamError, TeamEvent, TeamRegistry,
     Teammate, TeammateStatus,

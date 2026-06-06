@@ -39,7 +39,8 @@ impl Provider for TwoTaskProvider {
             let mk = |id: &str, goal: &str| Block::ToolUse {
                 id: id.into(),
                 name: "Task".into(),
-                input_json: serde_json::to_vec(&serde_json::json!({"goal": goal, "allowed_tools": []})).unwrap(),
+                input_json: serde_json::to_vec(&serde_json::json!({"goal": goal, "allowed_tools": []}))
+                    .unwrap(),
                 cache_marker: None,
             };
             vec![mk("t1", "alpha"), mk("t2", "beta")]
@@ -103,20 +104,28 @@ async fn two_task_calls_in_one_turn_run_concurrently() {
     });
     // Unlimited memory gate so this test isolates the agent-loop's parallel
     // dispatch from the memory-admission policy (covered in origin-swarm).
-    let mut coord =
-        Coordinator::new(plan, "parallel-dispatch-test").with_memory_gate(origin_swarm::AdmissionGate::unlimited_for_test());
+    let mut coord = Coordinator::new(plan, "parallel-dispatch-test")
+        .with_memory_gate(origin_swarm::AdmissionGate::unlimited_for_test());
     coord.set_default_worker(worker);
 
     let provider = TwoTaskProvider {
         turn: AtomicU32::new(0),
     };
     let mut session = Session::new("test-session", "scripted-model");
-    let mut opts = LoopOptions::default().with_cas(Arc::clone(&cas)).without_streaming();
+    let mut opts = LoopOptions::default()
+        .with_cas(Arc::clone(&cas))
+        .without_streaming();
     opts.coordinator = Some(Arc::new(coord));
 
-    run_loop(&mut session, "spawn two sub-agents", &provider, &AlwaysAllow, &opts)
-        .await
-        .expect("run_loop");
+    run_loop(
+        &mut session,
+        "spawn two sub-agents",
+        &provider,
+        &AlwaysAllow,
+        &opts,
+    )
+    .await
+    .expect("run_loop");
 
     assert_eq!(
         max_seen.load(Ordering::SeqCst),

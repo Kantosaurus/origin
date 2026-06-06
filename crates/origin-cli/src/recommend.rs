@@ -151,10 +151,7 @@ fn fold_latency(samples: &[(String, u64)]) -> Vec<LocalRanked> {
 /// `None` — the probe is strictly best-effort and never panics.
 #[must_use]
 fn probe_ollama_latency_ms() -> Option<u64> {
-    let addr = (OLLAMA_HOST, OLLAMA_PORT)
-        .to_socket_addrs()
-        .ok()?
-        .next()?;
+    let addr = (OLLAMA_HOST, OLLAMA_PORT).to_socket_addrs().ok()?.next()?;
     let start = Instant::now();
     let mut stream = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).ok()?;
     stream.set_read_timeout(Some(PROBE_TIMEOUT)).ok()?;
@@ -228,10 +225,13 @@ pub fn run(models: &[String], write: bool) -> anyhow::Result<()> {
     // daemon is unreachable (or no local ids were given) `local_ranked` is empty
     // and every candidate flows through the unchanged cost-only ranking below,
     // keeping that output byte-identical.
-    let locals: Vec<String> = candidates.iter().filter(|m| is_local_ollama(m)).cloned().collect();
+    let locals: Vec<String> = candidates
+        .iter()
+        .filter(|m| is_local_ollama(m))
+        .cloned()
+        .collect();
     let local_ranked = fold_latency(&measure_local(&locals));
-    let local_set: std::collections::HashSet<&str> =
-        local_ranked.iter().map(|l| l.model.as_str()).collect();
+    let local_set: std::collections::HashSet<&str> = local_ranked.iter().map(|l| l.model.as_str()).collect();
 
     // Cost-rank the candidates that were not pulled into the latency section.
     let cost_candidates: Vec<String> = candidates
@@ -367,7 +367,10 @@ mod tests {
         let r = rank(&v(DEFAULT_CANDIDATES));
         assert_eq!(r.len(), DEFAULT_CANDIDATES.len(), "every default must be priced");
         for w in r.windows(2) {
-            assert!(w[0].blended_per_mtok <= w[1].blended_per_mtok, "must be sorted ascending");
+            assert!(
+                w[0].blended_per_mtok <= w[1].blended_per_mtok,
+                "must be sorted ascending"
+            );
         }
     }
 
@@ -432,7 +435,10 @@ mod tests {
         }];
         let (label, name) = recommend_best(&ranked, &local).expect("local row present");
         assert_eq!(name, "ollama/llama3.2");
-        assert!(label.contains("95 ms"), "label surfaces measured latency: {label}");
+        assert!(
+            label.contains("95 ms"),
+            "label surfaces measured latency: {label}"
+        );
     }
 
     #[test]

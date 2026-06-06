@@ -124,10 +124,7 @@ pub fn message_get_metadata_url(id: &str, headers: &[&str]) -> String {
     } else {
         headers
     };
-    let mut url = format!(
-        "{GMAIL_BASE}/messages/{}?format=metadata",
-        encode_component(id)
-    );
+    let mut url = format!("{GMAIL_BASE}/messages/{}?format=metadata", encode_component(id));
     for h in chosen {
         url.push_str("&metadataHeaders=");
         url.push_str(&encode_component(h));
@@ -149,10 +146,8 @@ mod tests {
     use super::*;
 
     fn sample_creds() -> Credentials {
-        Credentials::from_json(
-            r#"{"client_id":"cid","client_secret":"csecret","refresh_token":"rtok"}"#,
-        )
-        .unwrap()
+        Credentials::from_json(r#"{"client_id":"cid","client_secret":"csecret","refresh_token":"rtok"}"#)
+            .unwrap()
     }
 
     #[test]
@@ -207,7 +202,10 @@ mod tests {
         let url = message_get_metadata_url("18c", &[]);
         assert!(url.starts_with(&format!("{GMAIL_BASE}/messages/18c?format=metadata")));
         for h in DEFAULT_METADATA_HEADERS {
-            assert!(url.contains(&format!("metadataHeaders={h}")), "missing {h}: {url}");
+            assert!(
+                url.contains(&format!("metadataHeaders={h}")),
+                "missing {h}: {url}"
+            );
         }
     }
 

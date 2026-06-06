@@ -59,8 +59,7 @@ fn load() -> Result<ScheduleFile> {
 
 fn save(f: &ScheduleFile) -> Result<()> {
     let path = store_path()?;
-    let body =
-        toml::to_string_pretty(f).map_err(|e| anyhow::anyhow!("serializing schedule.toml: {e}"))?;
+    let body = toml::to_string_pretty(f).map_err(|e| anyhow::anyhow!("serializing schedule.toml: {e}"))?;
     std::fs::write(&path, body).map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
     Ok(())
 }

@@ -123,8 +123,7 @@ impl LspClient {
             .ok_or_else(|| LspError::Spawn("no stdout".into()))?;
 
         let stdin = Arc::new(Mutex::new(stdin));
-        let diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> = Arc::new(RwLock::new(HashMap::new()));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
 
         // Reader loop.
@@ -221,12 +220,7 @@ impl LspClient {
     /// * [`LspError::Protocol`] if the channel closes early (server died) or the
     ///   response carries an `error`.
     /// * [`LspError::Io`] if writing the request frame fails.
-    pub async fn request(
-        &self,
-        method: &str,
-        params: Value,
-        timeout: Duration,
-    ) -> Result<Value, LspError> {
+    pub async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, LspError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
@@ -391,9 +385,7 @@ impl LspClient {
         } else {
             ("callHierarchy/outgoingCalls", "to")
         };
-        let result = self
-            .request(method, json!({ "item": item }), timeout)
-            .await?;
+        let result = self.request(method, json!({ "item": item }), timeout).await?;
         Ok(parse_call_hierarchy_items(&result, key))
     }
 
@@ -606,13 +598,8 @@ pub(crate) fn parse_call_hierarchy_items(v: &Value, key: &str) -> Vec<CallHierar
 /// Read the 0-based `(line, character)` from an LSP `range.start`, saturating to
 /// `u32::MAX` on overflow and defaulting absent fields to `0`.
 fn range_start(range: &Value) -> (u32, u32) {
-    let line = u32::try_from(
-        range
-            .pointer("/start/line")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-    )
-    .unwrap_or(u32::MAX);
+    let line =
+        u32::try_from(range.pointer("/start/line").and_then(Value::as_u64).unwrap_or(0)).unwrap_or(u32::MAX);
     let col = u32::try_from(
         range
             .pointer("/start/character")
@@ -716,8 +703,8 @@ async fn handle_diagnostics(v: &Value, diags: &Arc<RwLock<HashMap<PathBuf, Vec<D
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{
-        dispatch_response, file_uri_to_path, handle_diagnostics, parse_call_hierarchy_items,
-        parse_locations, percent_decode, Diagnostic, Location, PendingMap,
+        dispatch_response, file_uri_to_path, handle_diagnostics, parse_call_hierarchy_items, parse_locations,
+        percent_decode, Diagnostic, Location, PendingMap,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -748,8 +735,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_diagnostics_parses_publish_payload() {
-        let diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> = Arc::new(RwLock::new(HashMap::new()));
         let payload = json!({
             "method": "textDocument/publishDiagnostics",
             "params": {
@@ -765,7 +751,12 @@ mod tests {
             }
         });
         handle_diagnostics(&payload, &diags).await;
-        let got = diags.read().await.get(&PathBuf::from("/tmp/a.rs")).cloned().unwrap();
+        let got = diags
+            .read()
+            .await
+            .get(&PathBuf::from("/tmp/a.rs"))
+            .cloned()
+            .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].line, 9);
         assert_eq!(got[0].col, 4);
@@ -776,8 +767,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_diagnostics_defaults_missing_fields() {
-        let diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> = Arc::new(RwLock::new(HashMap::new()));
         // No severity, no code, no range → severity defaults to 2 (warning),
         // line/col default to 0, and the key is still inserted (empty-but-present).
         let payload = json!({
@@ -785,7 +775,12 @@ mod tests {
             "params": { "uri": "file:///tmp/b.rs", "diagnostics": [ { "message": "bare" } ] }
         });
         handle_diagnostics(&payload, &diags).await;
-        let got = diags.read().await.get(&PathBuf::from("/tmp/b.rs")).cloned().unwrap();
+        let got = diags
+            .read()
+            .await
+            .get(&PathBuf::from("/tmp/b.rs"))
+            .cloned()
+            .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].severity, 2);
         assert_eq!(got[0].line, 0);
@@ -925,7 +920,11 @@ mod tests {
         assert_eq!(locs.len(), 1);
         assert_eq!(
             locs[0],
-            Location { file: PathBuf::from("/tmp/def.rs"), line: 5, col: 9 }
+            Location {
+                file: PathBuf::from("/tmp/def.rs"),
+                line: 5,
+                col: 9
+            }
         );
     }
 

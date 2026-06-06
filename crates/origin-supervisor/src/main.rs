@@ -226,8 +226,7 @@ fn apply_relaunch_decision(
         }
     };
     let valid = manifest.as_ref().is_some_and(new_binary_valid);
-    let RelaunchDecision::SwapTo(new_binary) = decide_relaunch(code, manifest.as_ref(), valid)
-    else {
+    let RelaunchDecision::SwapTo(new_binary) = decide_relaunch(code, manifest.as_ref(), valid) else {
         // RestartSame (and the never-emitted Rollback): today's behaviour — just
         // restart the current binary.
         return;

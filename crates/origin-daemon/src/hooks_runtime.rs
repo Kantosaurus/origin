@@ -21,9 +21,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use origin_hooks::{
-    dispatch_event, HookEventKind, HookOverride, HooksConfig, LifecycleEvent, ShellPool,
-};
+use origin_hooks::{dispatch_event, HookEventKind, HookOverride, HooksConfig, LifecycleEvent, ShellPool};
 use tokio::sync::OnceCell;
 
 /// Live hook pools, one per configured [`HookEntry`](origin_hooks::HookEntry).

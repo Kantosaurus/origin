@@ -101,7 +101,11 @@ impl Source for CodexSource {
         let sessions_root = root.join("sessions");
         // Codex normally nests under `sessions/`; fall back to the root itself
         // so a user can point straight at a directory of `*.jsonl` transcripts.
-        let walk_root = if sessions_root.exists() { sessions_root } else { root.to_path_buf() };
+        let walk_root = if sessions_root.exists() {
+            sessions_root
+        } else {
+            root.to_path_buf()
+        };
 
         let mut bundle = MigrateBundle::default();
 

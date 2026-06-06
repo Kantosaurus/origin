@@ -167,7 +167,11 @@ impl ScriptedProbe {
 impl MemoryProbe for ScriptedProbe {
     fn available_bytes(&self) -> MemReading {
         let mut q = self.available.lock().unwrap_or_else(PoisonError::into_inner);
-        let v = if q.len() > 1 { q.pop_front() } else { q.front().copied() };
+        let v = if q.len() > 1 {
+            q.pop_front()
+        } else {
+            q.front().copied()
+        };
         v.map_or(MemReading::Unavailable, MemReading::Available)
     }
     fn total_bytes(&self) -> MemReading {
@@ -214,8 +218,7 @@ impl GateCfg {
             .unwrap_or_else(|| u32::try_from((cores * 8).max(64)).unwrap_or(64));
 
         // Clamped `.max(1)` so a `=0` misconfig can never wedge the >=1 floor.
-        let hard_max = env_u64("ORIGIN_SWARM_MAX")
-            .map(|n| u32::try_from(n).unwrap_or(u32::MAX).max(1));
+        let hard_max = env_u64("ORIGIN_SWARM_MAX").map(|n| u32::try_from(n).unwrap_or(u32::MAX).max(1));
 
         let governor = env_flag("ORIGIN_SWARM_MEM_GOVERNOR", true);
 
@@ -271,7 +274,10 @@ fn env_u64(key: &str) -> Option<u64> {
 
 fn env_flag(key: &str, default: bool) -> bool {
     std::env::var(key).map_or(default, |v| {
-        !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
     })
 }
 
@@ -353,7 +359,9 @@ pub struct AdmissionGate {
 
 impl std::fmt::Debug for AdmissionGate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AdmissionGate").field("cfg", &self.cfg).finish_non_exhaustive()
+        f.debug_struct("AdmissionGate")
+            .field("cfg", &self.cfg)
+            .finish_non_exhaustive()
     }
 }
 
@@ -550,7 +558,7 @@ mod tests {
         c.hard_max = Some(1); // from_env clamps a `=0` misconfig up to 1
         let mut g = GateInner::default();
         assert!(decide(&mut g, &c, MemReading::Available(u64::MAX))); // floor
-        // admitted now 1; hard_max 1 ⇒ next refused.
+                                                                      // admitted now 1; hard_max 1 ⇒ next refused.
         assert!(!decide(&mut g, &c, MemReading::Available(u64::MAX)));
     }
 }

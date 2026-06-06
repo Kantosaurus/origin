@@ -18,7 +18,10 @@ pub enum SessionsAction {
     Resume(String),
     Rm(String),
     /// Rewind a session's transcript, keeping the first `keep` turns.
-    Rewind { session_id: String, keep: u32 },
+    Rewind {
+        session_id: String,
+        keep: u32,
+    },
 }
 
 /// Actions accepted by [`keyring`].
@@ -67,7 +70,11 @@ pub async fn usage() -> Result<()> {
             }
             println!(
                 "{:<14} {:<24} {:>14} {:>14} {:>10}",
-                "", "TOTAL", "", "", origin_cost::fmt_usd(total)
+                "",
+                "TOTAL",
+                "",
+                "",
+                origin_cost::fmt_usd(total)
             );
             Ok(())
         }

@@ -119,9 +119,7 @@ impl Cassette {
     /// Returns `None` when no recorded request shares the shape.
     #[must_use]
     pub fn match_next(&self, req: &ReqShape) -> Option<&Interaction> {
-        self.interactions
-            .iter()
-            .find(|i| shapes_match(&i.request, req))
+        self.interactions.iter().find(|i| shapes_match(&i.request, req))
     }
 
     /// Serialize the cassette to pretty JSON.
@@ -245,9 +243,7 @@ const fn is_token_char(ch: char) -> bool {
 
 /// `true` when `name` is a header whose value must always be redacted.
 fn is_secret_header(name: &str) -> bool {
-    SECRET_HEADERS
-        .iter()
-        .any(|h| name.eq_ignore_ascii_case(h))
+    SECRET_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
 }
 
 /// Whether a standalone token looks like a secret (used by body scrubbing).
@@ -275,8 +271,7 @@ pub fn contains_secret(s: &str) -> bool {
     if has_live_sk_prefix(s) {
         return true;
     }
-    s.split(|c: char| !is_token_char(c))
-        .any(looks_like_opaque_token)
+    s.split(|c: char| !is_token_char(c)).any(looks_like_opaque_token)
 }
 
 /// `true` when `marker` appears in `s` followed by something other than the
@@ -333,11 +328,7 @@ pub fn assert_redacted(c: &Cassette) -> Result<(), CassetteError> {
 }
 
 /// Gate a single header list, mapping any leak to a located error.
-fn check_headers(
-    idx: usize,
-    side: &str,
-    headers: &[(String, String)],
-) -> Result<(), CassetteError> {
+fn check_headers(idx: usize, side: &str, headers: &[(String, String)]) -> Result<(), CassetteError> {
     for (name, value) in headers {
         if is_secret_header(name) && value != REDACTED {
             return Err(CassetteError::UnredactedSecret(format!(
