@@ -61,8 +61,7 @@ pub fn load_manifest(path: &Path) -> Result<Option<RelaunchManifest>> {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("reading relaunch manifest at {}", path.display()));
+            return Err(err).with_context(|| format!("reading relaunch manifest at {}", path.display()));
         }
     };
     let manifest: RelaunchManifest = serde_json::from_slice(&bytes)
@@ -234,18 +233,14 @@ where
 
     #[cfg(target_os = "macos")]
     {
-        non_empty("HOME").map(|home| {
-            PathBuf::from(home)
-                .join("Library")
-                .join("Application Support")
-        })
+        non_empty("HOME").map(|home| PathBuf::from(home).join("Library").join("Application Support"))
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        non_empty("XDG_DATA_HOME").map(PathBuf::from).or_else(|| {
-            non_empty("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
-        })
+        non_empty("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| non_empty("HOME").map(|home| PathBuf::from(home).join(".local").join("share")))
     }
 }
 
@@ -397,10 +392,7 @@ mod tests {
             "HOME" => Some(std::ffi::OsString::from("/Users/u")),
             _ => None,
         });
-        assert_eq!(
-            got,
-            Some(PathBuf::from("/Users/u/Library/Application Support"))
-        );
+        assert_eq!(got, Some(PathBuf::from("/Users/u/Library/Application Support")));
     }
 
     #[test]
@@ -574,9 +566,19 @@ mod tests {
             ("at threshold, in window", 3, Duration::from_secs(10), true),
             ("above threshold, in window", 5, Duration::from_secs(59), true),
             ("at threshold but past window", 3, Duration::from_secs(60), false),
-            ("at threshold but well past window", 9, Duration::from_secs(600), false),
+            (
+                "at threshold but well past window",
+                9,
+                Duration::from_secs(600),
+                false,
+            ),
             ("zero crashes", 0, Duration::from_secs(1), false),
-            ("at threshold at window edge (just under)", 3, Duration::from_millis(59_999), true),
+            (
+                "at threshold at window edge (just under)",
+                3,
+                Duration::from_millis(59_999),
+                true,
+            ),
         ];
         for (name, crashes, elapsed, expected) in cases {
             assert_eq!(
@@ -592,7 +594,17 @@ mod tests {
         use std::time::Duration;
         // A threshold of 0 is meaningless ("roll back after no crashes"); guard
         // against it so a swapped binary is never rolled back without a crash.
-        assert!(!should_rollback(0, Duration::from_secs(1), 0, Duration::from_secs(60)));
-        assert!(!should_rollback(5, Duration::from_secs(1), 0, Duration::from_secs(60)));
+        assert!(!should_rollback(
+            0,
+            Duration::from_secs(1),
+            0,
+            Duration::from_secs(60)
+        ));
+        assert!(!should_rollback(
+            5,
+            Duration::from_secs(1),
+            0,
+            Duration::from_secs(60)
+        ));
     }
 }

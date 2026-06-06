@@ -153,10 +153,7 @@ pub fn check_path(p: &SecurityPolicy, path: &str) -> Decision {
 /// component can be found.
 fn extract_host(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or(after_scheme);
     let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     // Trim an optional port. IPv6 literals are bracketed; handle them first.
     let host = host_port.strip_prefix('[').map_or_else(

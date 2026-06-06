@@ -49,8 +49,7 @@ impl Credentials {
     /// Returns [`Error::CredentialFormat`] if the JSON is missing any of
     /// `client_id`, `client_secret`, or `refresh_token`.
     pub fn from_json(json: &str) -> Result<Self> {
-        let raw: RawCreds =
-            serde_json::from_str(json).map_err(|e| Error::CredentialFormat(e.to_string()))?;
+        let raw: RawCreds = serde_json::from_str(json).map_err(|e| Error::CredentialFormat(e.to_string()))?;
         Ok(Self {
             client_id: Secret::new(raw.client_id),
             client_secret: Secret::new(raw.client_secret),
@@ -119,7 +118,10 @@ mod tests {
         let c = Credentials::from_json(SAMPLE).unwrap();
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("GOCSPX-supersecret"), "client_secret leaked: {dbg}");
-        assert!(!dbg.contains("1//refresh-token-value"), "refresh_token leaked: {dbg}");
+        assert!(
+            !dbg.contains("1//refresh-token-value"),
+            "refresh_token leaked: {dbg}"
+        );
         assert!(!dbg.contains("googleusercontent"), "client_id leaked: {dbg}");
         assert!(dbg.contains("<redacted>"));
     }

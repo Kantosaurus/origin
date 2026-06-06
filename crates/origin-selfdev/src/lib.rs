@@ -77,11 +77,10 @@ mod relaunch;
 pub use cargo::CargoRunner;
 pub use context::{FileReloadStore, ReloadContext, ReloadStore, StoreError};
 pub use driver::{
-    BuildRunner, Rollback, RollbackOutcome, SelfDevConfig, SelfDevDriver, SelfDevError,
-    SelfDevEvent, SelfDevState, RestartAuthority, RestartDecision, TestRunner,
+    BuildRunner, RestartAuthority, RestartDecision, Rollback, RollbackOutcome, SelfDevConfig, SelfDevDriver,
+    SelfDevError, SelfDevEvent, SelfDevState, TestRunner,
 };
 pub use queue::{BuildJob, BuildQueue};
 pub use relaunch::{
-    FileRelaunchStore, RelaunchManifest, RelaunchRequest, RelaunchStore,
-    SELFDEV_RELAUNCH_EXIT_CODE,
+    FileRelaunchStore, RelaunchManifest, RelaunchRequest, RelaunchStore, SELFDEV_RELAUNCH_EXIT_CODE,
 };

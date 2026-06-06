@@ -142,5 +142,8 @@ async fn records_then_replays_stream_without_network() {
         "replay must reproduce the recorded TextDeltas (got: {text})"
     );
     // The scrubbed secret comes back as the redaction sentinel, never the raw key.
-    assert!(!text.contains("sk-live"), "replayed text must not carry a live secret");
+    assert!(
+        !text.contains("sk-live"),
+        "replayed text must not carry a live secret"
+    );
 }

@@ -30,9 +30,7 @@ impl LspServer {
     /// on ASCII), where `ext` is given without a leading dot.
     #[must_use]
     pub fn handles_extension(&self, ext: &str) -> bool {
-        self.extensions
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case(ext))
+        self.extensions.iter().any(|e| e.eq_ignore_ascii_case(ext))
     }
 }
 
@@ -70,50 +68,314 @@ pub struct Diagnostic {
 ///
 /// Fields are: language, server id, install command, launch command, extensions.
 static REGISTRY: &[LspServer] = &[
-    LspServer { language: "rust", server_id: "rust-analyzer", install: "rustup component add rust-analyzer", launch: "rust-analyzer", extensions: &["rs"] },
-    LspServer { language: "go", server_id: "gopls", install: "go install golang.org/x/tools/gopls@latest", launch: "gopls", extensions: &["go"] },
-    LspServer { language: "python", server_id: "pyright", install: "npm install -g pyright", launch: "pyright-langserver --stdio", extensions: &["py", "pyi"] },
-    LspServer { language: "typescript", server_id: "typescript-language-server", install: "npm install -g typescript typescript-language-server", launch: "typescript-language-server --stdio", extensions: &["ts", "tsx", "js", "jsx", "mjs", "cjs"] },
-    LspServer { language: "c", server_id: "clangd", install: "apt-get install -y clangd", launch: "clangd", extensions: &["c", "h"] },
-    LspServer { language: "cpp", server_id: "clangd-cpp", install: "apt-get install -y clangd", launch: "clangd", extensions: &["cpp", "cc", "cxx", "hpp", "hh", "hxx"] },
-    LspServer { language: "java", server_id: "jdtls", install: "brew install jdtls", launch: "jdtls", extensions: &["java"] },
-    LspServer { language: "lua", server_id: "lua-language-server", install: "brew install lua-language-server", launch: "lua-language-server", extensions: &["lua"] },
-    LspServer { language: "ruby", server_id: "solargraph", install: "gem install solargraph", launch: "solargraph stdio", extensions: &["rb", "erb"] },
-    LspServer { language: "php", server_id: "intelephense", install: "npm install -g intelephense", launch: "intelephense --stdio", extensions: &["php"] },
-    LspServer { language: "csharp", server_id: "omnisharp", install: "dotnet tool install -g omnisharp", launch: "omnisharp -lsp", extensions: &["cs"] },
-    LspServer { language: "kotlin", server_id: "kotlin-language-server", install: "brew install kotlin-language-server", launch: "kotlin-language-server", extensions: &["kt", "kts"] },
-    LspServer { language: "swift", server_id: "sourcekit-lsp", install: "xcode-select --install", launch: "sourcekit-lsp", extensions: &["swift"] },
-    LspServer { language: "scala", server_id: "metals", install: "coursier install metals", launch: "metals", extensions: &["scala", "sc"] },
-    LspServer { language: "haskell", server_id: "haskell-language-server", install: "ghcup install hls", launch: "haskell-language-server-wrapper --lsp", extensions: &["hs", "lhs"] },
-    LspServer { language: "elixir", server_id: "elixir-ls", install: "mix escript.install hex elixir_ls", launch: "elixir-ls", extensions: &["ex", "exs"] },
-    LspServer { language: "erlang", server_id: "erlang-ls", install: "rebar3 escriptize", launch: "erlang_ls", extensions: &["erl", "hrl"] },
-    LspServer { language: "clojure", server_id: "clojure-lsp", install: "brew install clojure-lsp/brew/clojure-lsp-native", launch: "clojure-lsp", extensions: &["clj", "cljs", "cljc", "edn"] },
-    LspServer { language: "dart", server_id: "dart-language-server", install: "dart pub global activate dart_language_server", launch: "dart language-server", extensions: &["dart"] },
-    LspServer { language: "zig", server_id: "zls", install: "brew install zls", launch: "zls", extensions: &["zig"] },
-    LspServer { language: "nim", server_id: "nimlsp", install: "nimble install nimlsp", launch: "nimlsp", extensions: &["nim", "nims"] },
-    LspServer { language: "ocaml", server_id: "ocaml-lsp", install: "opam install ocaml-lsp-server", launch: "ocamllsp", extensions: &["ml", "mli"] },
-    LspServer { language: "fsharp", server_id: "fsautocomplete", install: "dotnet tool install -g fsautocomplete", launch: "fsautocomplete", extensions: &["fs", "fsi", "fsx"] },
-    LspServer { language: "julia", server_id: "julia-languageserver", install: "julia -e 'using Pkg; Pkg.add(\"LanguageServer\")'", launch: "julia --startup-file=no -e 'using LanguageServer; runserver()'", extensions: &["jl"] },
-    LspServer { language: "r", server_id: "r-languageserver", install: "Rscript -e 'install.packages(\"languageserver\")'", launch: "R --slave -e 'languageserver::run()'", extensions: &["r"] },
-    LspServer { language: "perl", server_id: "perlnavigator", install: "npm install -g perlnavigator-server", launch: "perlnavigator --stdio", extensions: &["pl", "pm"] },
-    LspServer { language: "bash", server_id: "bash-language-server", install: "npm install -g bash-language-server", launch: "bash-language-server start", extensions: &["sh", "bash"] },
-    LspServer { language: "html", server_id: "vscode-html-language-server", install: "npm install -g vscode-langservers-extracted", launch: "vscode-html-language-server --stdio", extensions: &["html", "htm"] },
-    LspServer { language: "css", server_id: "vscode-css-language-server", install: "npm install -g vscode-langservers-extracted", launch: "vscode-css-language-server --stdio", extensions: &["css", "scss", "less"] },
-    LspServer { language: "json", server_id: "vscode-json-language-server", install: "npm install -g vscode-langservers-extracted", launch: "vscode-json-language-server --stdio", extensions: &["json", "jsonc"] },
-    LspServer { language: "yaml", server_id: "yaml-language-server", install: "npm install -g yaml-language-server", launch: "yaml-language-server --stdio", extensions: &["yaml", "yml"] },
-    LspServer { language: "toml", server_id: "taplo", install: "cargo install taplo-cli --locked", launch: "taplo lsp stdio", extensions: &["toml"] },
-    LspServer { language: "markdown", server_id: "marksman", install: "brew install marksman", launch: "marksman server", extensions: &["md", "markdown"] },
-    LspServer { language: "vue", server_id: "vue-language-server", install: "npm install -g @vue/language-server", launch: "vue-language-server --stdio", extensions: &["vue"] },
-    LspServer { language: "svelte", server_id: "svelteserver", install: "npm install -g svelte-language-server", launch: "svelteserver --stdio", extensions: &["svelte"] },
-    LspServer { language: "astro", server_id: "astro-ls", install: "npm install -g @astrojs/language-server", launch: "astro-ls --stdio", extensions: &["astro"] },
-    LspServer { language: "terraform", server_id: "terraform-ls", install: "brew install hashicorp/tap/terraform-ls", launch: "terraform-ls serve", extensions: &["tf", "tfvars"] },
-    LspServer { language: "dockerfile", server_id: "dockerfile-language-server", install: "npm install -g dockerfile-language-server-nodejs", launch: "docker-langserver --stdio", extensions: &["dockerfile"] },
-    LspServer { language: "sql", server_id: "sqls", install: "go install github.com/sqls-server/sqls@latest", launch: "sqls", extensions: &["sql"] },
-    LspServer { language: "graphql", server_id: "graphql-lsp", install: "npm install -g graphql-language-service-cli", launch: "graphql-lsp server -m stream", extensions: &["graphql", "gql"] },
-    LspServer { language: "vim", server_id: "vim-language-server", install: "npm install -g vim-language-server", launch: "vim-language-server --stdio", extensions: &["vim"] },
-    LspServer { language: "tex", server_id: "texlab", install: "cargo install texlab --locked", launch: "texlab", extensions: &["tex", "bib"] },
-    LspServer { language: "cmake", server_id: "cmake-language-server", install: "pip install cmake-language-server", launch: "cmake-language-server", extensions: &["cmake"] },
-    LspServer { language: "groovy", server_id: "groovy-language-server", install: "brew install groovy-language-server", launch: "groovy-language-server", extensions: &["groovy", "gradle"] },
+    LspServer {
+        language: "rust",
+        server_id: "rust-analyzer",
+        install: "rustup component add rust-analyzer",
+        launch: "rust-analyzer",
+        extensions: &["rs"],
+    },
+    LspServer {
+        language: "go",
+        server_id: "gopls",
+        install: "go install golang.org/x/tools/gopls@latest",
+        launch: "gopls",
+        extensions: &["go"],
+    },
+    LspServer {
+        language: "python",
+        server_id: "pyright",
+        install: "npm install -g pyright",
+        launch: "pyright-langserver --stdio",
+        extensions: &["py", "pyi"],
+    },
+    LspServer {
+        language: "typescript",
+        server_id: "typescript-language-server",
+        install: "npm install -g typescript typescript-language-server",
+        launch: "typescript-language-server --stdio",
+        extensions: &["ts", "tsx", "js", "jsx", "mjs", "cjs"],
+    },
+    LspServer {
+        language: "c",
+        server_id: "clangd",
+        install: "apt-get install -y clangd",
+        launch: "clangd",
+        extensions: &["c", "h"],
+    },
+    LspServer {
+        language: "cpp",
+        server_id: "clangd-cpp",
+        install: "apt-get install -y clangd",
+        launch: "clangd",
+        extensions: &["cpp", "cc", "cxx", "hpp", "hh", "hxx"],
+    },
+    LspServer {
+        language: "java",
+        server_id: "jdtls",
+        install: "brew install jdtls",
+        launch: "jdtls",
+        extensions: &["java"],
+    },
+    LspServer {
+        language: "lua",
+        server_id: "lua-language-server",
+        install: "brew install lua-language-server",
+        launch: "lua-language-server",
+        extensions: &["lua"],
+    },
+    LspServer {
+        language: "ruby",
+        server_id: "solargraph",
+        install: "gem install solargraph",
+        launch: "solargraph stdio",
+        extensions: &["rb", "erb"],
+    },
+    LspServer {
+        language: "php",
+        server_id: "intelephense",
+        install: "npm install -g intelephense",
+        launch: "intelephense --stdio",
+        extensions: &["php"],
+    },
+    LspServer {
+        language: "csharp",
+        server_id: "omnisharp",
+        install: "dotnet tool install -g omnisharp",
+        launch: "omnisharp -lsp",
+        extensions: &["cs"],
+    },
+    LspServer {
+        language: "kotlin",
+        server_id: "kotlin-language-server",
+        install: "brew install kotlin-language-server",
+        launch: "kotlin-language-server",
+        extensions: &["kt", "kts"],
+    },
+    LspServer {
+        language: "swift",
+        server_id: "sourcekit-lsp",
+        install: "xcode-select --install",
+        launch: "sourcekit-lsp",
+        extensions: &["swift"],
+    },
+    LspServer {
+        language: "scala",
+        server_id: "metals",
+        install: "coursier install metals",
+        launch: "metals",
+        extensions: &["scala", "sc"],
+    },
+    LspServer {
+        language: "haskell",
+        server_id: "haskell-language-server",
+        install: "ghcup install hls",
+        launch: "haskell-language-server-wrapper --lsp",
+        extensions: &["hs", "lhs"],
+    },
+    LspServer {
+        language: "elixir",
+        server_id: "elixir-ls",
+        install: "mix escript.install hex elixir_ls",
+        launch: "elixir-ls",
+        extensions: &["ex", "exs"],
+    },
+    LspServer {
+        language: "erlang",
+        server_id: "erlang-ls",
+        install: "rebar3 escriptize",
+        launch: "erlang_ls",
+        extensions: &["erl", "hrl"],
+    },
+    LspServer {
+        language: "clojure",
+        server_id: "clojure-lsp",
+        install: "brew install clojure-lsp/brew/clojure-lsp-native",
+        launch: "clojure-lsp",
+        extensions: &["clj", "cljs", "cljc", "edn"],
+    },
+    LspServer {
+        language: "dart",
+        server_id: "dart-language-server",
+        install: "dart pub global activate dart_language_server",
+        launch: "dart language-server",
+        extensions: &["dart"],
+    },
+    LspServer {
+        language: "zig",
+        server_id: "zls",
+        install: "brew install zls",
+        launch: "zls",
+        extensions: &["zig"],
+    },
+    LspServer {
+        language: "nim",
+        server_id: "nimlsp",
+        install: "nimble install nimlsp",
+        launch: "nimlsp",
+        extensions: &["nim", "nims"],
+    },
+    LspServer {
+        language: "ocaml",
+        server_id: "ocaml-lsp",
+        install: "opam install ocaml-lsp-server",
+        launch: "ocamllsp",
+        extensions: &["ml", "mli"],
+    },
+    LspServer {
+        language: "fsharp",
+        server_id: "fsautocomplete",
+        install: "dotnet tool install -g fsautocomplete",
+        launch: "fsautocomplete",
+        extensions: &["fs", "fsi", "fsx"],
+    },
+    LspServer {
+        language: "julia",
+        server_id: "julia-languageserver",
+        install: "julia -e 'using Pkg; Pkg.add(\"LanguageServer\")'",
+        launch: "julia --startup-file=no -e 'using LanguageServer; runserver()'",
+        extensions: &["jl"],
+    },
+    LspServer {
+        language: "r",
+        server_id: "r-languageserver",
+        install: "Rscript -e 'install.packages(\"languageserver\")'",
+        launch: "R --slave -e 'languageserver::run()'",
+        extensions: &["r"],
+    },
+    LspServer {
+        language: "perl",
+        server_id: "perlnavigator",
+        install: "npm install -g perlnavigator-server",
+        launch: "perlnavigator --stdio",
+        extensions: &["pl", "pm"],
+    },
+    LspServer {
+        language: "bash",
+        server_id: "bash-language-server",
+        install: "npm install -g bash-language-server",
+        launch: "bash-language-server start",
+        extensions: &["sh", "bash"],
+    },
+    LspServer {
+        language: "html",
+        server_id: "vscode-html-language-server",
+        install: "npm install -g vscode-langservers-extracted",
+        launch: "vscode-html-language-server --stdio",
+        extensions: &["html", "htm"],
+    },
+    LspServer {
+        language: "css",
+        server_id: "vscode-css-language-server",
+        install: "npm install -g vscode-langservers-extracted",
+        launch: "vscode-css-language-server --stdio",
+        extensions: &["css", "scss", "less"],
+    },
+    LspServer {
+        language: "json",
+        server_id: "vscode-json-language-server",
+        install: "npm install -g vscode-langservers-extracted",
+        launch: "vscode-json-language-server --stdio",
+        extensions: &["json", "jsonc"],
+    },
+    LspServer {
+        language: "yaml",
+        server_id: "yaml-language-server",
+        install: "npm install -g yaml-language-server",
+        launch: "yaml-language-server --stdio",
+        extensions: &["yaml", "yml"],
+    },
+    LspServer {
+        language: "toml",
+        server_id: "taplo",
+        install: "cargo install taplo-cli --locked",
+        launch: "taplo lsp stdio",
+        extensions: &["toml"],
+    },
+    LspServer {
+        language: "markdown",
+        server_id: "marksman",
+        install: "brew install marksman",
+        launch: "marksman server",
+        extensions: &["md", "markdown"],
+    },
+    LspServer {
+        language: "vue",
+        server_id: "vue-language-server",
+        install: "npm install -g @vue/language-server",
+        launch: "vue-language-server --stdio",
+        extensions: &["vue"],
+    },
+    LspServer {
+        language: "svelte",
+        server_id: "svelteserver",
+        install: "npm install -g svelte-language-server",
+        launch: "svelteserver --stdio",
+        extensions: &["svelte"],
+    },
+    LspServer {
+        language: "astro",
+        server_id: "astro-ls",
+        install: "npm install -g @astrojs/language-server",
+        launch: "astro-ls --stdio",
+        extensions: &["astro"],
+    },
+    LspServer {
+        language: "terraform",
+        server_id: "terraform-ls",
+        install: "brew install hashicorp/tap/terraform-ls",
+        launch: "terraform-ls serve",
+        extensions: &["tf", "tfvars"],
+    },
+    LspServer {
+        language: "dockerfile",
+        server_id: "dockerfile-language-server",
+        install: "npm install -g dockerfile-language-server-nodejs",
+        launch: "docker-langserver --stdio",
+        extensions: &["dockerfile"],
+    },
+    LspServer {
+        language: "sql",
+        server_id: "sqls",
+        install: "go install github.com/sqls-server/sqls@latest",
+        launch: "sqls",
+        extensions: &["sql"],
+    },
+    LspServer {
+        language: "graphql",
+        server_id: "graphql-lsp",
+        install: "npm install -g graphql-language-service-cli",
+        launch: "graphql-lsp server -m stream",
+        extensions: &["graphql", "gql"],
+    },
+    LspServer {
+        language: "vim",
+        server_id: "vim-language-server",
+        install: "npm install -g vim-language-server",
+        launch: "vim-language-server --stdio",
+        extensions: &["vim"],
+    },
+    LspServer {
+        language: "tex",
+        server_id: "texlab",
+        install: "cargo install texlab --locked",
+        launch: "texlab",
+        extensions: &["tex", "bib"],
+    },
+    LspServer {
+        language: "cmake",
+        server_id: "cmake-language-server",
+        install: "pip install cmake-language-server",
+        launch: "cmake-language-server",
+        extensions: &["cmake"],
+    },
+    LspServer {
+        language: "groovy",
+        server_id: "groovy-language-server",
+        install: "brew install groovy-language-server",
+        launch: "groovy-language-server",
+        extensions: &["groovy", "gradle"],
+    },
 ];
 
 /// Returns the full static language-server registry.
@@ -135,9 +397,7 @@ pub fn server_for_extension(ext: &str) -> Option<&'static LspServer> {
 /// is case-insensitive on ASCII.
 #[must_use]
 pub fn server_for_language(lang: &str) -> Option<&'static LspServer> {
-    REGISTRY
-        .iter()
-        .find(|s| s.language.eq_ignore_ascii_case(lang))
+    REGISTRY.iter().find(|s| s.language.eq_ignore_ascii_case(lang))
 }
 
 /// Sorts diagnostics by `(file, line, severity)` and removes exact duplicates.
@@ -180,8 +440,7 @@ pub fn summary(diags: &[Diagnostic]) -> (u32, u32) {
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
     use super::{
-        aggregate, registry, server_for_extension, server_for_language, summary, Diagnostic,
-        Severity,
+        aggregate, registry, server_for_extension, server_for_language, summary, Diagnostic, Severity,
     };
 
     fn diag(file: &str, line: u32, col: u32, sev: Severity, msg: &str) -> Diagnostic {
@@ -204,11 +463,7 @@ mod tests {
             assert!(!s.server_id.is_empty(), "empty server_id for {}", s.language);
             assert!(!s.install.is_empty(), "empty install for {}", s.server_id);
             assert!(!s.launch.is_empty(), "empty launch for {}", s.server_id);
-            assert!(
-                !s.extensions.is_empty(),
-                "no extensions for {}",
-                s.server_id
-            );
+            assert!(!s.extensions.is_empty(), "no extensions for {}", s.server_id);
             for e in s.extensions {
                 assert!(!e.is_empty(), "empty extension in {}", s.server_id);
             }

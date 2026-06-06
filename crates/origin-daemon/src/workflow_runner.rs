@@ -37,10 +37,8 @@ const DEFAULT_STEP_TOOLS: &[&str] = &["Read", "Grep", "Glob", "Edit", "Write"];
 /// Per-step worker budget. Generous wall/token ceilings (a step is a full
 /// sub-agent turn) with the same tool-call cap the `Task` default uses.
 const STEP_BUDGET: Budget = Budget::new(
-    /* max_wall_ms */ 300_000,
-    /* max_input_tokens */ 1_000_000,
-    /* max_output_tokens */ 256_000,
-    /* max_tool_calls */ 32,
+    /* max_wall_ms */ 300_000, /* max_input_tokens */ 1_000_000,
+    /* max_output_tokens */ 256_000, /* max_tool_calls */ 32,
 );
 
 /// Errors raised while computing layers or running a workflow.

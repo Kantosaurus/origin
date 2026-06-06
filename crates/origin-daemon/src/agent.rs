@@ -100,10 +100,8 @@ async fn checkpoint_with_commit_hooks(label: &str) -> Option<String> {
     .await;
     let sha = checkpoint_with_label(label);
     if let Some(sha) = sha.as_ref() {
-        crate::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::PostCommit {
-            sha: sha.clone(),
-        })
-        .await;
+        crate::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::PostCommit { sha: sha.clone() })
+            .await;
     }
     sha
 }
@@ -199,7 +197,8 @@ async fn maybe_compact_session(session: &mut Session, opts: &LoopOptions) {
         if let Some(store) = opts.session_store.as_ref() {
             for &i in &output.compacted_indices {
                 if let Some(original) = session.messages.get(i) {
-                    let _ = store.snapshot_original(&session.id, u32::try_from(i).unwrap_or(u32::MAX), original);
+                    let _ =
+                        store.snapshot_original(&session.id, u32::try_from(i).unwrap_or(u32::MAX), original);
                 }
             }
         }
@@ -912,12 +911,10 @@ fn patch_target_paths(patch: &str) -> Vec<String> {
 /// candidates to the diagnostics probe set, which is itself default-off.
 fn edited_paths_from_tool(name: &str, args: &Value) -> Vec<String> {
     match name {
-        "Edit" | "Write" | "MultiEdit" => {
-            match args.get("file_path").and_then(Value::as_str) {
-                Some(p) if !p.is_empty() => vec![p.to_string()],
-                _ => Vec::new(),
-            }
-        }
+        "Edit" | "Write" | "MultiEdit" => match args.get("file_path").and_then(Value::as_str) {
+            Some(p) if !p.is_empty() => vec![p.to_string()],
+            _ => Vec::new(),
+        },
         "ApplyPatch" => args
             .get("patch")
             .and_then(Value::as_str)
@@ -1002,7 +999,9 @@ fn deliver_file_shift(collab: &SwarmCollab, notice: &origin_swarm::FileShiftNoti
     // across the loop body. A poisoned lock is recovered, never propagated:
     // collab delivery is advisory and must not tear down the turn.
     let targets: Vec<(origin_swarm::WorkerId, Arc<origin_swarm::Mailbox>)> = {
-        let map = mailboxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = mailboxes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         notice
             .readers
             .iter()
@@ -1060,7 +1059,9 @@ fn drain_own_swarm_notices(collab: &SwarmCollab) -> String {
         return String::new();
     };
     let own = {
-        let map = mailboxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = mailboxes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.get(&collab.worker_id).map(Arc::clone)
     };
     let Some(own) = own else {
@@ -1141,7 +1142,8 @@ where
 
 /// A worker-scoped runtime tool registry (gap 9b: inline-MCP-per-subagent).
 /// Maps a (namespaced) tool name to a [`DynTool`] the worker may invoke.
-pub type RuntimeTools = std::sync::Arc<std::collections::HashMap<String, std::sync::Arc<dyn origin_tools::DynTool>>>;
+pub type RuntimeTools =
+    std::sync::Arc<std::collections::HashMap<String, std::sync::Arc<dyn origin_tools::DynTool>>>;
 
 tokio::task_local! {
     /// Per-worker inline-MCP tools (gap 9b). A swarm worker that declared `mcp:`
@@ -1269,9 +1271,7 @@ mod swarm_collab_wiring_tests {
 
     /// Build a live shared mailbox map registering both workers, mirroring what
     /// `Coordinator::spawn_with` does per worker under the collab gate.
-    fn shared_map(
-        ids: &[origin_swarm::WorkerId],
-    ) -> origin_swarm::SharedMailboxes {
+    fn shared_map(ids: &[origin_swarm::WorkerId]) -> origin_swarm::SharedMailboxes {
         let mut map: HashMap<origin_swarm::WorkerId, Arc<origin_swarm::Mailbox>> = HashMap::new();
         for id in ids {
             map.insert(*id, Arc::new(origin_swarm::Mailbox::new()));
@@ -1323,10 +1323,17 @@ mod swarm_collab_wiring_tests {
         let a_box = map.get(&reader).expect("reader mailbox present");
         let b_box = map.get(&editor).expect("editor mailbox present");
         let a_msgs = a_box.drain();
-        assert_eq!(a_msgs.len(), 1, "reader must receive exactly one file-shift notice");
+        assert_eq!(
+            a_msgs.len(),
+            1,
+            "reader must receive exactly one file-shift notice"
+        );
         assert_eq!(a_msgs[0].from, editor, "notice is from the editor");
         assert_eq!(a_msgs[0].scope, origin_swarm::MsgScope::Direct(reader));
-        assert!(a_msgs[0].body.contains("src/lib.rs"), "notice names the edited path");
+        assert!(
+            a_msgs[0].body.contains("src/lib.rs"),
+            "notice names the edited path"
+        );
         assert!(b_box.is_empty(), "editor must not notify itself");
 
         std::env::remove_var("ORIGIN_SWARM_COLLAB");
@@ -1425,11 +1432,7 @@ mod swarm_collab_wiring_tests {
         );
         let many = [
             origin_swarm::Message::new(editor, origin_swarm::MsgScope::Direct(me), body),
-            origin_swarm::Message::new(
-                other_editor,
-                origin_swarm::MsgScope::Broadcast,
-                body2,
-            ),
+            origin_swarm::Message::new(other_editor, origin_swarm::MsgScope::Broadcast, body2),
         ];
         let rendered_many = render_swarm_notices(&many);
         assert_eq!(
@@ -1469,13 +1472,13 @@ mod swarm_collab_wiring_tests {
         let mailboxes = shared_map(&[me, editor]);
         {
             let map = mailboxes.lock().unwrap_or_else(PoisonError::into_inner);
-            map.get(&me).expect("my mailbox present").push(
-                origin_swarm::Message::new(
+            map.get(&me)
+                .expect("my mailbox present")
+                .push(origin_swarm::Message::new(
                     editor,
                     origin_swarm::MsgScope::Direct(me),
                     "file-shift: src/lib.rs was edited by worker; re-check your view",
-                ),
-            );
+                ));
         }
         let collab = SwarmCollab {
             worker_id: me,
@@ -1764,10 +1767,7 @@ impl LoopOptions {
 /// account is treated as absent. `None` from both sources ⇒ the loop falls back
 /// to the process-wide global account, byte-identical to the pre-per-request wire.
 #[must_use]
-pub fn resolve_session_account(
-    req_account: Option<&str>,
-    conn_slot: &Option<Arc<str>>,
-) -> Option<Arc<str>> {
+pub fn resolve_session_account(req_account: Option<&str>, conn_slot: &Option<Arc<str>>) -> Option<Arc<str>> {
     match req_account {
         Some(a) if !a.is_empty() => Some(Arc::from(a)),
         _ => conn_slot.clone(),
@@ -1792,10 +1792,7 @@ mod session_account_tests {
     #[test]
     fn falls_back_to_connection_slot_when_request_absent_or_empty() {
         let slot: Option<Arc<str>> = Some(Arc::from("conn-acct"));
-        assert_eq!(
-            resolve_session_account(None, &slot).as_deref(),
-            Some("conn-acct")
-        );
+        assert_eq!(resolve_session_account(None, &slot).as_deref(), Some("conn-acct"));
         assert_eq!(
             resolve_session_account(Some(""), &slot).as_deref(),
             Some("conn-acct"),
@@ -2611,8 +2608,7 @@ async fn run_loop_inner(
     // dispatch passes `None`, so the loop is byte-identical to before. On the
     // next `Grep`, every prior line is elided so a re-run never re-spends tokens
     // on regions the model has already seen.
-    let grep_truncate_enabled =
-        std::env::var("ORIGIN_AGENTGREP_TRUNCATE").as_deref() == Ok("1");
+    let grep_truncate_enabled = std::env::var("ORIGIN_AGENTGREP_TRUNCATE").as_deref() == Ok("1");
     let mut grep_exposure: Vec<origin_tools::builtins::grep_tool::ExposureWindow> = Vec::new();
 
     // Task 3/4 (metrics + pain telemetry). Session-wide latency clock and tool
@@ -2632,8 +2628,7 @@ async fn run_loop_inner(
     // build never even evaluates it (kept `#[cfg]`-gated to avoid an unused
     // binding).
     #[cfg(feature = "otel")]
-    let gen_ai_capture_content =
-        std::env::var("ORIGIN_OTEL_CAPTURE_CONTENT").as_deref() == Ok("1");
+    let gen_ai_capture_content = std::env::var("ORIGIN_OTEL_CAPTURE_CONTENT").as_deref() == Ok("1");
 
     // Browser-security (B): ENFORCED per-session browser-action counter. Counts
     // dispatched browser-class tools (`Browser`/`WebFetch`/`WebSearch`) so the
@@ -2692,17 +2687,10 @@ async fn run_loop_inner(
                 // ⇒ fall back to the active provider with the session model.
                 let built = match opts.session_account.as_deref() {
                     Some(acct) => {
-                        crate::provider_factory::build_provider_for_account(
-                            &pick.provider,
-                            &pick.model,
-                            acct,
-                        )
-                        .await
-                    }
-                    None => {
-                        crate::provider_factory::build_provider_for(&pick.provider, &pick.model)
+                        crate::provider_factory::build_provider_for_account(&pick.provider, &pick.model, acct)
                             .await
                     }
+                    None => crate::provider_factory::build_provider_for(&pick.provider, &pick.model).await,
                 };
                 match built {
                     Some(p) => {
@@ -2723,9 +2711,7 @@ async fn run_loop_inner(
         // as a `<swarm-notices>` block. No collab context, or an empty drain ⇒
         // empty string ⇒ nothing appended ⇒ byte-identical turn. Draining
         // consumes the notices so each is shown exactly once.
-        let swarm_notices_block = SWARM_COLLAB
-            .try_with(drain_own_swarm_notices)
-            .unwrap_or_default();
+        let swarm_notices_block = SWARM_COLLAB.try_with(drain_own_swarm_notices).unwrap_or_default();
         // Per-turn system prompt. When the optional post-edit LSP-diagnostics
         // feature produced a block on the previous turn, append it here so the
         // model sees the feedback its edit generated. The swarm-notices block (if
@@ -3007,7 +2993,11 @@ async fn run_loop_inner(
             // gate is set, so the message/choice *structure* always emits but the
             // text only when explicitly enabled.
             let user_content = if gen_ai_capture_content { user_text } else { "" };
-            let assistant_content = if gen_ai_capture_content { assistant_text.as_str() } else { "" };
+            let assistant_content = if gen_ai_capture_content {
+                assistant_text.as_str()
+            } else {
+                ""
+            };
             gen_ai_span.record_message("user", user_content);
             gen_ai_span.record_message("assistant", assistant_content);
             // Finish reason: the model issued tool calls iff any ToolUse block is
@@ -3029,7 +3019,10 @@ async fn run_loop_inner(
             // so the `gen_ai.tool.message` carries the tool-call *input* (gated)
             // rather than the result — the call structure that the span owns.
             for b in &resp.assistant.blocks {
-                if let Block::ToolUse { id, name, input_json, .. } = b {
+                if let Block::ToolUse {
+                    id, name, input_json, ..
+                } = b
+                {
                     let description = registry_iter()
                         .find(|m| m.name == name.as_str())
                         .map_or("", |m| m.description);
@@ -3053,8 +3046,7 @@ async fn run_loop_inner(
         // prompts rank this model on measured signal. A success also clears any
         // exhaustion flag (self-healing quota-fallback). No router ⇒ no-op.
         if let Some(lr) = &opts.router {
-            let latency_ms =
-                u64::try_from(provider_call_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let latency_ms = u64::try_from(provider_call_start.elapsed().as_millis()).unwrap_or(u64::MAX);
             // Use the provider actually called this turn (the rebuilt one for a
             // cross-provider pick) so health/quota signal is attributed to the
             // right `provider/model`, exactly as the same-provider path does.
@@ -3065,8 +3057,7 @@ async fn run_loop_inner(
         // earliest assistant signal — the ttfua fallback used when the turn
         // never dispatches a tool. Recorded once; later turns leave it.
         if first_token_ms.is_none() {
-            first_token_ms =
-                Some(u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX));
+            first_token_ms = Some(u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX));
         }
 
         // Charge this turn's provider call against the cumulative counters
@@ -3176,8 +3167,7 @@ async fn run_loop_inner(
 
             // End-of-turn / loop-end side effects. All are best-effort and
             // default-off (env- or feature-gated); none can fail the turn.
-            let agent_time_ms =
-                u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let agent_time_ms = u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX);
             // Per-turn shadow-git checkpoint, bracketed by the PreCommit/PostCommit
             // lifecycle hooks. Fired only when this loop mutated the workspace and
             // `ORIGIN_CHECKPOINTS=1`; with the gate unset (the default) it — and
@@ -3237,8 +3227,7 @@ async fn run_loop_inner(
                             Err(e) => format!("Error: {e}").into_bytes(),
                         }
                     } else {
-                        format!("Error: tool `{name}` is not in this sub-agent's allow-list")
-                            .into_bytes()
+                        format!("Error: tool `{name}` is not in this sub-agent's allow-list").into_bytes()
                     };
                     tool_results.push(Block::ToolResult {
                         tool_use_id: id,
@@ -3306,8 +3295,7 @@ async fn run_loop_inner(
             // downgraded Allow→Deny so the design phase cannot mutate the
             // workspace. `false` (the default) ⇒ no effect.
             if decision.outcome == Outcome::Allow {
-                decision =
-                    apply_read_only_overlay(decision, opts.read_only, meta.side_effects, meta.name);
+                decision = apply_read_only_overlay(decision, opts.read_only, meta.side_effects, meta.name);
             }
 
             // Browser-security (A) — conseca domain-allowlist overlay. Same
@@ -3584,8 +3572,7 @@ async fn run_loop_inner(
             tool_time_ms = tool_time_ms
                 .saturating_add(u64::try_from(dispatch_start.elapsed().as_millis()).unwrap_or(u64::MAX));
             if first_tool_ms.is_none() {
-                first_tool_ms =
-                    Some(u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX));
+                first_tool_ms = Some(u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX));
             }
 
             // Real-time swarm collaboration (WS-L, jcode L238). Reaching here
@@ -3706,13 +3693,17 @@ async fn run_loop_inner(
         // resolves in ~max(worker) time, not the sum. Each result backfills the
         // placeholder slot pushed during the loop (preserving tool_use order).
         if let Some(coord) = opts.coordinator.as_deref() {
-            let task_ordinal = registry_iter()
-                .find(|m| m.name == "Task")
-                .map_or_else(|| origin_tools::ProfileOrdinal(0), |m| m.sandbox_profile.ordinal());
+            let task_ordinal = registry_iter().find(|m| m.name == "Task").map_or_else(
+                || origin_tools::ProfileOrdinal(0),
+                |m| m.sandbox_profile.ordinal(),
+            );
             for (idx, id, goal, handle) in std::mem::take(&mut pending_tasks) {
-                let result_bytes = match origin_tools::builtins::task::task_await(coord, &handle, &goal).await {
+                let result_bytes = match origin_tools::builtins::task::task_await(coord, &handle, &goal).await
+                {
                     Ok(output) => serde_json::to_string(&output)
-                        .unwrap_or_else(|e| format!("{{\"status\":\"error\",\"summary\":\"Task json: {e}\"}}"))
+                        .unwrap_or_else(|e| {
+                            format!("{{\"status\":\"error\",\"summary\":\"Task json: {e}\"}}")
+                        })
                         .into_bytes(),
                     Err(e) => format!("Error: {e}").into_bytes(),
                 };
@@ -4875,8 +4866,8 @@ async fn dispatch_tool(
         // requested op (search | get | list_threads). Mirrors WebFetch's error
         // mapping: bad arguments → BadArgs, everything else → ToolFailure.
         "gmail" => {
-            let a = origin_gmail::GmailArgs::from_value(args)
-                .map_err(|e| LoopError::BadArgs(e.to_string()))?;
+            let a =
+                origin_gmail::GmailArgs::from_value(args).map_err(|e| LoopError::BadArgs(e.to_string()))?;
             origin_gmail::run_tool(a)
                 .await
                 .map_err(|e| LoopError::ToolFailure(e.to_string()))
@@ -4896,8 +4887,9 @@ async fn dispatch_tool(
         // to the linear `{workflow:<name>}` skill-mask activation path, which this
         // arm does not touch.
         "RunWorkflow" => {
-            let coord = coordinator
-                .ok_or_else(|| LoopError::ToolFailure("RunWorkflow: swarm coordinator not configured".into()))?;
+            let coord = coordinator.ok_or_else(|| {
+                LoopError::ToolFailure("RunWorkflow: swarm coordinator not configured".into())
+            })?;
             run_workflow_tool(args, coord, skill_catalog).await
         }
         other => Err(LoopError::UnknownTool(other.into())),
@@ -4945,8 +4937,7 @@ async fn run_workflow_tool(
     let report = crate::workflow_runner::run_workflow(workflow, coordinator, catalog)
         .await
         .map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: {e}")))?;
-    serde_json::to_string(&report)
-        .map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: json: {e}")))
+    serde_json::to_string(&report).map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: json: {e}")))
 }
 
 /// Execute the `AuthorWorkflow` tool.
@@ -4960,10 +4951,7 @@ async fn run_workflow_tool(
 ///
 /// Errors map to `BadArgs` (missing/empty `goal`) or `ToolFailure` (no skill
 /// catalog configured, authoring failure, or persistence I/O).
-fn author_workflow_tool(
-    args: &Value,
-    skill_catalog: Option<&SkillCatalog>,
-) -> Result<String, LoopError> {
+fn author_workflow_tool(args: &Value, skill_catalog: Option<&SkillCatalog>) -> Result<String, LoopError> {
     let goal = args
         .get("goal")
         .and_then(Value::as_str)
@@ -5075,8 +5063,7 @@ fn browser_visual_result(
     resp: &origin_browser::SnapshotResp,
 ) -> Result<String, LoopError> {
     let console: &[String] = resp.console.as_deref().unwrap_or_default();
-    let capture =
-        origin_browser::VisualCapture::from_action(browser_screenshot_path(verb), console);
+    let capture = origin_browser::VisualCapture::from_action(browser_screenshot_path(verb), console);
     if capture.is_empty() {
         return serde_json::to_string(resp)
             .map_err(|e| LoopError::ToolFailure(format!("Browser: json: {e}")));
@@ -5095,8 +5082,7 @@ fn browser_visual_result(
             "console": capture.console_text(),
         }
     });
-    serde_json::to_string(&envelope)
-        .map_err(|e| LoopError::ToolFailure(format!("Browser: json: {e}")))
+    serde_json::to_string(&envelope).map_err(|e| LoopError::ToolFailure(format!("Browser: json: {e}")))
 }
 
 /// Rebuild the code graph for each detected-language group, aggregating the
@@ -5121,8 +5107,7 @@ fn rebuild_groups(
 ) -> Result<origin_codegraph::rebuild::RebuildReport, origin_codegraph::rebuild::RebuildError> {
     let mut agg = origin_codegraph::rebuild::RebuildReport::default();
     for (lang, group_paths) in groups {
-        let report =
-            origin_tools::builtins::graph_rebuild::graph_rebuild_tool(idx, group_paths, lang)?;
+        let report = origin_tools::builtins::graph_rebuild::graph_rebuild_tool(idx, group_paths, lang)?;
         agg.nodes_added += report.nodes_added;
         agg.nodes_updated += report.nodes_updated;
         agg.errors.extend(report.errors);
@@ -5254,26 +5239,22 @@ async fn run_bash_streaming(
     // Generous wall-clock ceiling: the supervisor enforces `timeout_secs` on
     // the child; this only bounds our polling loop in the pathological case
     // where status never flips terminal.
-    let deadline =
-        std::time::Instant::now() + Duration::from_secs(u64::from(timeout_secs) + 5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(u64::from(timeout_secs) + 5);
 
-    let flush_lines =
-        |pending: &mut String, chunk_count: &mut u32| -> Vec<String> {
-            let mut lines = Vec::new();
-            while let Some(nl) = pending.find('\n') {
-                let line: String = pending.drain(..=nl).collect();
-                // Drop the trailing '\n' for display; ToolChunk is per-line.
-                let line = line.trim_end_matches('\n').to_string();
-                *chunk_count += 1;
-                lines.push(line);
-            }
-            lines
-        };
+    let flush_lines = |pending: &mut String, chunk_count: &mut u32| -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Some(nl) = pending.find('\n') {
+            let line: String = pending.drain(..=nl).collect();
+            // Drop the trailing '\n' for display; ToolChunk is per-line.
+            let line = line.trim_end_matches('\n').to_string();
+            *chunk_count += 1;
+            lines.push(line);
+        }
+        lines
+    };
 
     let (status_str, exit_code) = loop {
-        let chunk = sup
-            .read_since(pid, next, 64 * 1024)
-            .map_err(|e| e.message)?;
+        let chunk = sup.read_since(pid, next, 64 * 1024).map_err(|e| e.message)?;
         if !chunk.bytes.is_empty() {
             acc.push_str(&chunk.bytes);
             pending.push_str(&chunk.bytes);
@@ -5299,9 +5280,7 @@ async fn run_bash_streaming(
         if chunk.status.is_terminal() {
             // Drain any remaining buffered bytes the per-read cap left behind.
             loop {
-                let more = sup
-                    .read_since(pid, next, 64 * 1024)
-                    .map_err(|e| e.message)?;
+                let more = sup.read_since(pid, next, 64 * 1024).map_err(|e| e.message)?;
                 if more.bytes.is_empty() {
                     break;
                 }
@@ -6331,9 +6310,19 @@ mod dispatch_table_tests {
             "body": "the quick brown fox",
             "tags": ["test", "roundtrip"]
         });
-        let save_out = dispatch_tool(save_meta, &save_args, None, None, None, Some(&handle), None, None, None)
-            .await
-            .expect("mem_save must succeed");
+        let save_out = dispatch_tool(
+            save_meta,
+            &save_args,
+            None,
+            None,
+            None,
+            Some(&handle),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("mem_save must succeed");
         let save_json: serde_json::Value =
             serde_json::from_str(&save_out).expect("mem_save output must be valid JSON");
         assert!(
@@ -6345,9 +6334,19 @@ mod dispatch_table_tests {
             .find(|m| m.name == "mem_search")
             .expect("mem_search registered");
         let search_args = serde_json::json!({"query": "quick brown", "k": 5});
-        let search_out = dispatch_tool(search_meta, &search_args, None, None, None, Some(&handle), None, None, None)
-            .await
-            .expect("mem_search must succeed");
+        let search_out = dispatch_tool(
+            search_meta,
+            &search_args,
+            None,
+            None,
+            None,
+            Some(&handle),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("mem_search must succeed");
         let hits: serde_json::Value =
             serde_json::from_str(&search_out).expect("mem_search output must be valid JSON");
         let arr = hits.as_array().expect("mem_search must return an array");
@@ -6432,9 +6431,19 @@ mod dispatch_table_tests {
             "allowed_tools": []
         });
 
-        let out = dispatch_tool(meta, &args, None, None, None, None, Some(coordinator.as_ref()), None, None)
-            .await
-            .expect("Task with coordinator must succeed");
+        let out = dispatch_tool(
+            meta,
+            &args,
+            None,
+            None,
+            None,
+            None,
+            Some(coordinator.as_ref()),
+            None,
+            None,
+        )
+        .await
+        .expect("Task with coordinator must succeed");
 
         // Assert the output is valid JSON with the expected shape.
         let v: serde_json::Value = serde_json::from_str(&out).expect("TaskOutput must be valid JSON");
@@ -6531,10 +6540,7 @@ mod wiring_tests {
             "tool:Write main.py"
         );
         assert_eq!(
-            per_tool_checkpoint_label(
-                "ApplyPatch",
-                &["src/a.rs".to_string(), "src/b.rs".to_string()]
-            ),
+            per_tool_checkpoint_label("ApplyPatch", &["src/a.rs".to_string(), "src/b.rs".to_string()]),
             "tool:ApplyPatch src/a.rs,src/b.rs"
         );
     }
@@ -6582,14 +6588,22 @@ mod wiring_tests {
     #[test]
     fn edited_paths_extracts_from_edit_tools() {
         let edit = serde_json::json!({ "file_path": "src/lib.rs", "old_string": "a", "new_string": "b" });
-        assert_eq!(edited_paths_from_tool("Edit", &edit), vec!["src/lib.rs".to_string()]);
+        assert_eq!(
+            edited_paths_from_tool("Edit", &edit),
+            vec!["src/lib.rs".to_string()]
+        );
         let write = serde_json::json!({ "file_path": "main.py", "content": "x" });
-        assert_eq!(edited_paths_from_tool("Write", &write), vec!["main.py".to_string()]);
+        assert_eq!(
+            edited_paths_from_tool("Write", &write),
+            vec!["main.py".to_string()]
+        );
         let multi = serde_json::json!({ "file_path": "a.ts", "edits": [] });
-        assert_eq!(edited_paths_from_tool("MultiEdit", &multi), vec!["a.ts".to_string()]);
+        assert_eq!(
+            edited_paths_from_tool("MultiEdit", &multi),
+            vec!["a.ts".to_string()]
+        );
 
-        let patch =
-            serde_json::json!({ "patch": "*** Update File: src/a.rs\n+++ b/src/b.rs\n" });
+        let patch = serde_json::json!({ "patch": "*** Update File: src/a.rs\n+++ b/src/b.rs\n" });
         let got = edited_paths_from_tool("ApplyPatch", &patch);
         assert!(got.contains(&"src/a.rs".to_string()));
         assert!(got.contains(&"src/b.rs".to_string()));
@@ -6624,16 +6638,19 @@ mod wiring_tests {
             reason: "base allowed".into(),
         };
         let out = apply_governance_overlay(allow, "Edit", &opts);
-        assert_eq!(out.outcome, Outcome::Allow, "default (no overlay) must not change Allow");
+        assert_eq!(
+            out.outcome,
+            Outcome::Allow,
+            "default (no overlay) must not change Allow"
+        );
     }
 
     /// Task 3(b): a policy that denies a tool downgrades a base Allow to Deny,
     /// while leaving a non-denied tool as Allow.
     #[test]
     fn governance_overlay_policy_deny_downgrades_allow() {
-        let layer =
-            origin_policy::parse_layer("denied_tools = [\"Bash\"]", origin_policy::Tier::Admin)
-                .expect("valid layer");
+        let layer = origin_policy::parse_layer("denied_tools = [\"Bash\"]", origin_policy::Tier::Admin)
+            .expect("valid layer");
         let opts = LoopOptions {
             policy: Some(Arc::new(origin_policy::PolicyEngine::new(vec![layer]))),
             ..LoopOptions::default()
@@ -6930,9 +6947,9 @@ mod wiring_tests {
 
         // The harvested windows are exactly what `grep_v2` consults to elide a
         // re-run's already-seen lines.
-        assert!(exposure.iter().any(|w| w.file == "src/a.rs"
-            && w.start_line == 10
-            && w.end_line == 10));
+        assert!(exposure
+            .iter()
+            .any(|w| w.file == "src/a.rs" && w.start_line == 10 && w.end_line == 10));
     }
 
     /// AGENT-LOOP Task 2: the editfmt apply path is OFF by default, and when a
@@ -7142,9 +7159,7 @@ mod wiring_tests {
     /// `SnapshotResp` JSON — identical to the gate-off path (no empty envelope).
     #[test]
     fn browser_visual_empty_capture_is_bare_response() {
-        let verb = origin_browser::Verb::Snapshot {
-            session: "s".into(),
-        };
+        let verb = origin_browser::Verb::Snapshot { session: "s".into() };
         let resp = origin_browser::SnapshotResp {
             ok: true,
             r#ref: None,
@@ -7231,7 +7246,10 @@ mod wiring_tests {
             v["visual"]["attachments"].as_array().expect("array").is_empty(),
             "no screenshot ⇒ no image attachment"
         );
-        assert!(v["visual"]["console"].as_str().expect("console").contains("[warn] slow"));
+        assert!(v["visual"]["console"]
+            .as_str()
+            .expect("console")
+            .contains("[warn] slow"));
     }
 }
 
@@ -7259,7 +7277,9 @@ mod bash_streaming_tests {
         // Route through `spawn_in` like all daemon code (Realtime ≈ per-stream
         // relay): keeps the no-raw-`tokio::spawn` invariant uniform, including
         // in tests, so the spawn-audit stays green.
-        let driver = spawn_in(TaskClass::Realtime, async move { run_bash_streaming(&args, Some(&tx)).await });
+        let driver = spawn_in(TaskClass::Realtime, async move {
+            run_bash_streaming(&args, Some(&tx)).await
+        });
 
         // The first chunk must arrive before the full sleep elapses.
         let first = tokio::time::timeout(Duration::from_millis(800), rx.recv())
@@ -7296,7 +7316,10 @@ mod bash_streaming_tests {
         assert_eq!(v["exit_code"], 0);
         // The LLM still receives the fully accumulated body.
         let stdout = v["stdout"].as_str().expect("stdout");
-        assert!(stdout.contains("early") && stdout.contains("late"), "stdout: {stdout:?}");
+        assert!(
+            stdout.contains("early") && stdout.contains("late"),
+            "stdout: {stdout:?}"
+        );
     }
 
     /// Silent commands (no stdout/stderr) still surface a terminal affordance
@@ -7310,7 +7333,10 @@ mod bash_streaming_tests {
 
         let mut saw_result = false;
         while let Some(ev) = rx.recv().await {
-            if let StreamEvent::ToolResult { tool, ok, preview, .. } = ev {
+            if let StreamEvent::ToolResult {
+                tool, ok, preview, ..
+            } = ev
+            {
                 assert_eq!(tool, "Bash");
                 assert!(ok);
                 assert!(preview.contains("no output"), "preview: {preview}");
@@ -7335,7 +7361,10 @@ mod bash_streaming_tests {
         });
         let started = Instant::now();
         let bytes = run_bash_streaming(&args, Some(&tx)).await.expect("bash ok");
-        assert!(started.elapsed() < Duration::from_millis(500), "background must return fast");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "background must return fast"
+        );
         drop(tx);
 
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
@@ -7343,7 +7372,10 @@ mod bash_streaming_tests {
         assert!(v["pid"].as_u64().is_some());
 
         // No chunks streamed for the background path.
-        assert!(rx.recv().await.is_none(), "background path must not stream chunks");
+        assert!(
+            rx.recv().await.is_none(),
+            "background path must not stream chunks"
+        );
     }
 
     /// A `None` sink (headless runs, tests) still completes and returns the full

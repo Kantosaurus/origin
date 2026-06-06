@@ -40,11 +40,7 @@ fn step(id: usize, skill: &str, args: &str, deps: &[usize]) -> WorkflowStep {
     WorkflowStep {
         id,
         skill: skill.into(),
-        args: if args.is_empty() {
-            None
-        } else {
-            Some(args.into())
-        },
+        args: if args.is_empty() { None } else { Some(args.into()) },
         depends_on: deps.to_vec(),
     }
 }

@@ -356,16 +356,10 @@ mod tests {
             genai::REQUEST_FREQUENCY_PENALTY,
             "gen_ai.request.frequency_penalty"
         );
-        assert_eq!(
-            genai::REQUEST_PRESENCE_PENALTY,
-            "gen_ai.request.presence_penalty"
-        );
+        assert_eq!(genai::REQUEST_PRESENCE_PENALTY, "gen_ai.request.presence_penalty");
         assert_eq!(genai::REQUEST_STOP_SEQUENCES, "gen_ai.request.stop_sequences");
         assert_eq!(genai::REQUEST_SEED, "gen_ai.request.seed");
-        assert_eq!(
-            genai::REQUEST_ENCODING_FORMATS,
-            "gen_ai.request.encoding_formats"
-        );
+        assert_eq!(genai::REQUEST_ENCODING_FORMATS, "gen_ai.request.encoding_formats");
         assert_eq!(genai::REQUEST_CHOICE_COUNT, "gen_ai.request.choice.count");
     }
 
@@ -398,10 +392,7 @@ mod tests {
         assert_eq!(genai::SERVER_PORT, "server.port");
         assert_eq!(genai::ERROR_TYPE, "error.type");
         assert_eq!(genai::CLIENT_TOKEN_USAGE, "gen_ai.client.token.usage");
-        assert_eq!(
-            genai::SERVER_REQUEST_DURATION,
-            "gen_ai.server.request.duration"
-        );
+        assert_eq!(genai::SERVER_REQUEST_DURATION, "gen_ai.server.request.duration");
         assert_eq!(
             genai::TIME_PER_OUTPUT_TOKEN,
             "gen_ai.server.time_per_output_token"

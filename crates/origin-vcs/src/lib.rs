@@ -140,11 +140,7 @@ pub struct DraftPatch {
 impl DraftPatch {
     /// Construct a draft patch.
     #[must_use]
-    pub fn new(
-        id: impl Into<String>,
-        summary: impl Into<String>,
-        provenance: impl Into<String>,
-    ) -> Self {
+    pub fn new(id: impl Into<String>, summary: impl Into<String>, provenance: impl Into<String>) -> Self {
         Self {
             id: id.into(),
             summary: summary.into(),
@@ -206,14 +202,7 @@ impl<'a> ShadowGit<'a> {
         let files_changed = u32::try_from(files).unwrap_or(u32::MAX);
 
         let body = format!("origin-checkpoint ms={now_ms} files={files_changed}");
-        self.git(&[
-            "commit",
-            "--allow-empty",
-            "--message",
-            label,
-            "--message",
-            &body,
-        ])?;
+        self.git(&["commit", "--allow-empty", "--message", label, "--message", &body])?;
         let id = self.git(&["rev-parse", "HEAD"])?.trim().to_string();
 
         Ok(Checkpoint {
@@ -381,10 +370,7 @@ impl<'a> Worktree<'a> {
 /// panics the caller.
 #[must_use]
 pub fn parse_checkpoints(git_log: &str) -> Vec<Checkpoint> {
-    git_log
-        .split(RECORD_SEP)
-        .filter_map(parse_record)
-        .collect()
+    git_log.split(RECORD_SEP).filter_map(parse_record).collect()
 }
 
 /// Parse one `\x1e`-delimited record into a [`Checkpoint`], or `None` if blank.
@@ -469,10 +455,10 @@ mod tests {
     #[test]
     fn snapshot_issues_add_and_commit_and_returns_checkpoint() {
         let mock = MockGit::scripted(vec![
-            Ok(String::new()),          // add -A
-            Ok("a.rs\nb.rs\n".into()),  // diff --cached --name-only -> 2 files
-            Ok(String::new()),          // commit
-            Ok("deadbeef\n".into()),    // rev-parse HEAD
+            Ok(String::new()),         // add -A
+            Ok("a.rs\nb.rs\n".into()), // diff --cached --name-only -> 2 files
+            Ok(String::new()),         // commit
+            Ok("deadbeef\n".into()),   // rev-parse HEAD
         ]);
         let sg = ShadowGit::new(&mock, ".origin/shadow.git".to_string());
         let cp = sg.snapshot("turn 7: refactor parser", 1_700_000_000_000).unwrap();
@@ -485,14 +471,18 @@ mod tests {
         let calls = mock.calls();
         // Every call must target the shadow git dir.
         assert!(calls.iter().all(|c| c.contains(&"--git-dir".to_string())));
-        assert!(calls.iter().all(|c| c.contains(&".origin/shadow.git".to_string())));
+        assert!(calls
+            .iter()
+            .all(|c| c.contains(&".origin/shadow.git".to_string())));
         assert!(has_call_with(&calls, "add"));
         assert!(has_call_with(&calls, "commit"));
         // The commit carried our label.
-        assert!(calls
-            .iter()
-            .any(|c| c.contains(&"commit".to_string())
-                && c.contains(&"turn 7: refactor parser".to_string())));
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains(&"commit".to_string())
+                    && c.contains(&"turn 7: refactor parser".to_string()))
+        );
     }
 
     #[test]
@@ -524,10 +514,7 @@ mod tests {
 
         let calls = mock.calls();
         // First: existence check; second: the checkout.
-        assert_eq!(
-            calls[0],
-            vec!["--git-dir", "shadow", "cat-file", "-e", "cafe"]
-        );
+        assert_eq!(calls[0], vec!["--git-dir", "shadow", "cat-file", "-e", "cafe"]);
         assert_eq!(
             calls[1],
             vec!["--git-dir", "shadow", "checkout", "cafe", "--", "."]
@@ -545,7 +532,13 @@ mod tests {
         assert_eq!(
             calls[1],
             vec![
-                "--git-dir", "shadow", "checkout", "cafe", "--", "src/a.rs", "src/b.rs"
+                "--git-dir",
+                "shadow",
+                "checkout",
+                "cafe",
+                "--",
+                "src/a.rs",
+                "src/b.rs"
             ]
         );
     }
@@ -557,10 +550,7 @@ mod tests {
         sg.restore("cafe", &RestoreMode::Full).unwrap();
 
         let calls = mock.calls();
-        assert_eq!(
-            calls[1],
-            vec!["--git-dir", "shadow", "reset", "--hard", "cafe"]
-        );
+        assert_eq!(calls[1], vec!["--git-dir", "shadow", "reset", "--hard", "cafe"]);
     }
 
     #[test]
@@ -568,9 +558,7 @@ mod tests {
         // cat-file -e fails -> mapped to NotFound, and no checkout is attempted.
         let mock = MockGit::scripted(vec![Err(VcsError::Git("missing object".into()))]);
         let sg = ShadowGit::new(&mock, "shadow".to_string());
-        let err = sg
-            .restore("ghost", &RestoreMode::WorkingTree)
-            .unwrap_err();
+        let err = sg.restore("ghost", &RestoreMode::WorkingTree).unwrap_err();
         assert_eq!(err, VcsError::NotFound("ghost".to_string()));
         assert_eq!(mock.calls().len(), 1, "must not run checkout after a miss");
     }
@@ -595,8 +583,7 @@ mod tests {
         assert!(parse_checkpoints("").is_empty());
         assert!(parse_checkpoints("   \n  ").is_empty());
 
-        let single =
-            format!("h1{FIELD_SEP}only{FIELD_SEP}origin-checkpoint ms=42 files=9{RECORD_SEP}");
+        let single = format!("h1{FIELD_SEP}only{FIELD_SEP}origin-checkpoint ms=42 files=9{RECORD_SEP}");
         let cps = parse_checkpoints(&single);
         assert_eq!(cps.len(), 1);
         assert_eq!(cps[0].created_at_unix_ms, 42);
@@ -696,12 +683,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0],
-            vec![
-                "worktree",
-                "remove",
-                "--force",
-                path.to_string_lossy().as_ref()
-            ]
+            vec!["worktree", "remove", "--force", path.to_string_lossy().as_ref()]
         );
     }
 

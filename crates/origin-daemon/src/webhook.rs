@@ -87,12 +87,7 @@ async fn run_listener(addr: String, token: String, sock_path: String, model: Str
     }
 }
 
-async fn handle(
-    req: Request<Incoming>,
-    token: &str,
-    sock_path: &str,
-    model: &str,
-) -> Response<Full<Bytes>> {
+async fn handle(req: Request<Incoming>, token: &str, sock_path: &str, model: &str) -> Response<Full<Bytes>> {
     if req.method() != Method::POST {
         return json_response(StatusCode::METHOD_NOT_ALLOWED, "{\"error\":\"POST only\"}");
     }

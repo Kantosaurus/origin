@@ -247,9 +247,15 @@ mod tests {
         let cargo = vec!["Cargo.toml".to_owned()];
         let node = vec!["package.json".to_owned()];
         let py = vec!["pyproject.toml".to_owned()];
-        assert!(build_overview(&cargo, None, Some("x")).manifest_summary.starts_with("Rust"));
-        assert!(build_overview(&node, None, Some("xx")).manifest_summary.starts_with("Node.js"));
-        assert!(build_overview(&py, None, None).manifest_summary.starts_with("Python"));
+        assert!(build_overview(&cargo, None, Some("x"))
+            .manifest_summary
+            .starts_with("Rust"));
+        assert!(build_overview(&node, None, Some("xx"))
+            .manifest_summary
+            .starts_with("Node.js"));
+        assert!(build_overview(&py, None, None)
+            .manifest_summary
+            .starts_with("Python"));
         assert_eq!(
             build_overview(&[], None, None).manifest_summary,
             "no recognized manifest"

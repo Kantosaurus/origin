@@ -34,10 +34,7 @@ pub async fn web_fetch(url: &str) -> Result<String, String> {
 #[must_use]
 pub fn parse_urls(args: &Value) -> Vec<String> {
     if let Some(arr) = args.get("urls").and_then(Value::as_array) {
-        return arr
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_owned))
-            .collect();
+        return arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect();
     }
     args.get("url")
         .and_then(Value::as_str)
@@ -177,7 +174,10 @@ mod tests {
             "missing truncation note: {out}"
         );
         // The 21st URL (index 20) was dropped; the first is present.
-        assert!(!out.contains("## https://h20.test"), "21st URL should be dropped: {out}");
+        assert!(
+            !out.contains("## https://h20.test"),
+            "21st URL should be dropped: {out}"
+        );
         assert!(out.contains("## https://h0.test"), "first URL missing: {out}");
         assert_eq!(out.matches("## https://h").count(), MAX_URLS);
     }

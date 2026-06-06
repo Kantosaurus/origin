@@ -319,10 +319,7 @@ mod tests {
     #[test]
     fn from_base_url_classifies_hosts() {
         assert_eq!(from_base_url("https://api.openai.com/v1"), Backend::OpenAi);
-        assert_eq!(
-            from_base_url("https://api.cerebras.ai/v1"),
-            Backend::Cerebras
-        );
+        assert_eq!(from_base_url("https://api.cerebras.ai/v1"), Backend::Cerebras);
         assert_eq!(from_base_url("https://api.groq.com/openai/v1"), Backend::Groq);
         assert_eq!(from_base_url("http://localhost:8000/v1"), Backend::VLlm);
         assert_eq!(from_base_url("http://localhost:11434/v1"), Backend::Ollama);
@@ -354,8 +351,7 @@ mod tests {
 
     #[test]
     fn redact_url_secrets_hides_api_key_and_userinfo() {
-        let redacted =
-            redact_url_secrets("https://user:pass@host.example/v1?api_key=sk-secret&model=x");
+        let redacted = redact_url_secrets("https://user:pass@host.example/v1?api_key=sk-secret&model=x");
         assert!(redacted.contains("api_key=***"));
         assert!(!redacted.contains("sk-secret"));
         assert!(redacted.contains("user:***@"));
@@ -369,10 +365,7 @@ mod tests {
             redact_url_secrets("https://host/v1?token=abc&q=1"),
             "https://host/v1?token=***&q=1"
         );
-        assert_eq!(
-            redact_url_secrets("https://host/v1?q=1"),
-            "https://host/v1?q=1"
-        );
+        assert_eq!(redact_url_secrets("https://host/v1?q=1"), "https://host/v1?q=1");
     }
 
     #[test]
@@ -413,10 +406,7 @@ mod tests {
             map_model_name(Backend::Groq, "llama-3.1-70b"),
             "llama-3.1-70b-versatile"
         );
-        assert_eq!(
-            map_model_name(Backend::Cerebras, "llama-3.1-8b"),
-            "llama3.1-8b"
-        );
+        assert_eq!(map_model_name(Backend::Cerebras, "llama-3.1-8b"), "llama3.1-8b");
         // Identity on unknown model / backend without an alias table.
         assert_eq!(map_model_name(Backend::Groq, "gpt-4o"), "gpt-4o");
         assert_eq!(map_model_name(Backend::OpenAi, "gpt-4o"), "gpt-4o");

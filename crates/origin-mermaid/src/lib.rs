@@ -190,10 +190,10 @@ pub fn render_ascii(d: &Diagram) -> String {
         out.push_str(&label_of(&node.id));
         out.push('\n');
         for edge in outgoing {
-            let arrow = edge.label.as_ref().map_or_else(
-                || "    -->".to_string(),
-                |text| format!("    -- {text} -->"),
-            );
+            let arrow = edge
+                .label
+                .as_ref()
+                .map_or_else(|| "    -->".to_string(), |text| format!("    -- {text} -->"));
             out.push_str(&arrow);
             out.push(' ');
             out.push_str(&label_of(&edge.to));
@@ -443,10 +443,8 @@ mod tests {
 
     #[test]
     fn unsupported_lines_ignored_gracefully() {
-        let d = parse(
-            "graph TD\n %% a comment\n classDef foo fill:#f00\n A[Real] --> B[Node]\n subgraph s",
-        )
-        .unwrap();
+        let d = parse("graph TD\n %% a comment\n classDef foo fill:#f00\n A[Real] --> B[Node]\n subgraph s")
+            .unwrap();
         // Only the real edge/nodes survive; junk lines are skipped.
         assert_eq!(d.edges.len(), 1);
         assert!(d.nodes.iter().any(|n| n.label == "Real"));

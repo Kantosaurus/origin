@@ -141,9 +141,18 @@ fn apply_unified_diff(patch: &str) -> Result<Value, ToolError> {
 /// Each variant carries the exact bytes/paths so the commit pass performs no
 /// further validation or computation.
 enum Staged {
-    Write { native: String, bytes: Vec<u8> },
-    Delete { native: String },
-    Rename { from: String, to: String, bytes: Vec<u8> },
+    Write {
+        native: String,
+        bytes: Vec<u8>,
+    },
+    Delete {
+        native: String,
+    },
+    Rename {
+        from: String,
+        to: String,
+        bytes: Vec<u8>,
+    },
 }
 
 /// Running tally of operations, mirrored into the JSON result.
@@ -218,11 +227,7 @@ fn stage_op(op: &Op, plan: &mut Vec<Staged>, counts: &mut OpCounts) -> Result<()
             counts.deleted += 1;
             plan.push(Staged::Delete { native });
         }
-        Op::Update {
-            path,
-            hunks,
-            move_to,
-        } => {
+        Op::Update { path, hunks, move_to } => {
             let native = to_native_path(path);
             let bytes = std::fs::read(&native)
                 .map_err(|e| ToolError::new(ErrClass::Io, "not_found", format!("{path}: {e}")))?;
@@ -276,9 +281,8 @@ fn commit_plan(plan: Vec<Staged>) -> Result<(), ToolError> {
                 atomic_write(&native, &bytes)?;
             }
             Staged::Delete { native } => {
-                std::fs::remove_file(&native).map_err(|e| {
-                    ToolError::new(ErrClass::Io, "permission", format!("{native}: {e}"))
-                })?;
+                std::fs::remove_file(&native)
+                    .map_err(|e| ToolError::new(ErrClass::Io, "permission", format!("{native}: {e}")))?;
             }
             Staged::Rename { from, to, bytes } => {
                 create_parent_dirs(&to)?;
@@ -286,9 +290,8 @@ fn commit_plan(plan: Vec<Staged>) -> Result<(), ToolError> {
                 // one. (A bare rename would lose the in-place hunk edits.)
                 atomic_write(&to, &bytes)?;
                 if to != from {
-                    std::fs::remove_file(&from).map_err(|e| {
-                        ToolError::new(ErrClass::Io, "permission", format!("{from}: {e}"))
-                    })?;
+                    std::fs::remove_file(&from)
+                        .map_err(|e| ToolError::new(ErrClass::Io, "permission", format!("{from}: {e}")))?;
                 }
             }
         }
@@ -302,11 +305,7 @@ fn create_parent_dirs(native: &str) -> Result<(), ToolError> {
     if let Some(parent) = std::path::Path::new(native).parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                ToolError::new(
-                    ErrClass::Io,
-                    "permission",
-                    format!("{}: {e}", parent.display()),
-                )
+                ToolError::new(ErrClass::Io, "permission", format!("{}: {e}", parent.display()))
             })?;
         }
     }
@@ -383,11 +382,7 @@ impl MarkerParser {
                 if let Some(h) = cur {
                     hunks.push(h);
                 }
-                self.ops.push(Op::Update {
-                    path,
-                    hunks,
-                    move_to,
-                });
+                self.ops.push(Op::Update { path, hunks, move_to });
             }
         }
     }
@@ -438,9 +433,7 @@ impl MarkerParser {
                 // Add File bodies are `+`-prefixed; tolerate a bare line too.
                 lines.push(raw.strip_prefix('+').unwrap_or(raw).to_string());
             }
-            Block::Update {
-                path, hunks, cur, ..
-            } => {
+            Block::Update { path, hunks, cur, .. } => {
                 if let Some(rest) = line.strip_prefix("@@ -") {
                     if let Some(h) = cur.take() {
                         hunks.push(h);

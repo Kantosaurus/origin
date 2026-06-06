@@ -253,11 +253,7 @@ fn redact_text(text: &str) -> String {
         .map(|tok| (String::new(), tok.to_string()))
         .collect();
     origin_telemetry::redact(&mut props);
-    props
-        .into_iter()
-        .map(|(_, v)| v)
-        .collect::<Vec<_>>()
-        .join(" ")
+    props.into_iter().map(|(_, v)| v).collect::<Vec<_>>().join(" ")
 }
 
 /// Truncate `s` to at most `max` bytes without splitting a UTF-8 codepoint.
@@ -276,7 +272,13 @@ fn cap_bytes(s: &str, max: usize) -> String {
 /// backslashes, and any control/newline byte) with spaces.
 fn sanitize_field(s: &str) -> String {
     s.chars()
-        .map(|c| if c == '"' || c == '\\' || c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if c == '"' || c == '\\' || c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -311,9 +313,7 @@ fn inbox_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        cap_bytes, content_hash, render_draft, sanitize_field, split_roles,
-    };
+    use super::{cap_bytes, content_hash, render_draft, sanitize_field, split_roles};
     use origin_core::types::{Block, Message, Role};
 
     #[test]
@@ -373,7 +373,9 @@ mod tests {
         assert_ne!(content_hash("ab", "c"), content_hash("a", "bc"));
         // Key is fixed-width lowercase hex, safe as a filename stem.
         assert_eq!(a.len(), 16);
-        assert!(a.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(a
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]

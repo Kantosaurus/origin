@@ -97,7 +97,11 @@ async fn records_then_replays_chat_without_network() {
     let resp = provider.chat(make_req()).await.expect("replay chat");
     std::env::remove_var("ORIGIN_CASSETTE");
 
-    assert_eq!(resp.assistant.blocks.len(), 1, "replay returns the recorded block");
+    assert_eq!(
+        resp.assistant.blocks.len(),
+        1,
+        "replay returns the recorded block"
+    );
     match &resp.assistant.blocks[0] {
         Block::Text { text, .. } => {
             // The scrubbed secret comes back as the redaction sentinel, never raw.

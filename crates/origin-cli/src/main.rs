@@ -198,11 +198,12 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
         } => {
             // Run-level `--thinking-tokens` wins; otherwise inherit the startup
             // seed. `0` is a hard error (matches the global flag's contract).
-            let thinking_tokens =
-                match origin_cli::config::validate_thinking_tokens(thinking_tokens.or_else(thinking_tokens_seed)) {
-                    Ok(v) => v,
-                    Err(e) => return Some(Err(anyhow::anyhow!("{e}"))),
-                };
+            let thinking_tokens = match origin_cli::config::validate_thinking_tokens(
+                thinking_tokens.or_else(thinking_tokens_seed),
+            ) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(anyhow::anyhow!("{e}"))),
+            };
             origin_cli::headless::run(origin_cli::headless::RunArgs {
                 text,
                 json,
@@ -263,9 +264,7 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
                 origin_cli::providers::refresh(provider.as_deref());
                 Ok(())
             }
-            ProvidersSub::Recommend { models, write } => {
-                origin_cli::recommend::run(&models, write)
-            }
+            ProvidersSub::Recommend { models, write } => origin_cli::recommend::run(&models, write),
         },
         Cmd::Init => origin_cli::init::run().await,
         Cmd::Import(a) => import_subcommand(&a),
@@ -286,9 +285,7 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
         Cmd::Memory { sub } => origin_cli::memory_inbox::run_memory(sub),
         Cmd::Scout { repo_url, cache } => origin_cli::scout::run(&repo_url, cache),
         Cmd::Watch { root, ext } => origin_cli::watch::run(root, ext),
-        Cmd::CopyContext { instruction, files } => {
-            origin_cli::clipboard::copy_context(instruction, &files)
-        }
+        Cmd::CopyContext { instruction, files } => origin_cli::clipboard::copy_context(instruction, &files),
         Cmd::ApplyClipboard => origin_cli::clipboard::apply_clipboard(),
         Cmd::Dictate {
             interleave,
@@ -324,17 +321,8 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
             client_secret,
             port,
         } => {
-            origin_cli::gaps_cmds::gmail(
-                op,
-                query,
-                id,
-                max,
-                include_body,
-                client_id,
-                client_secret,
-                port,
-            )
-            .await
+            origin_cli::gaps_cmds::gmail(op, query, id, max, include_body, client_id, client_secret, port)
+                .await
         }
         Cmd::Workflow { sub } => origin_cli::gaps_cmds::workflow(sub).await,
         Cmd::Selfdev { sub } => origin_cli::gaps_cmds::selfdev(sub).await,
@@ -567,8 +555,16 @@ async fn run() -> Result<()> {
     // Keep a handle to read the cumulative usage for the farewell summary after
     // the event loop consumes its own `app` handle.
     let app_for_summary = app.clone();
-    let result =
-        run_event_loop(app, handle, &path, &mut model, &session_id, plan_panel, composer_for_events).await;
+    let result = run_event_loop(
+        app,
+        handle,
+        &path,
+        &mut model,
+        &session_id,
+        plan_panel,
+        composer_for_events,
+    )
+    .await;
 
     render_task.abort();
     // Restore now (before the farewell) so "bye" prints on the normal screen;
@@ -866,11 +862,7 @@ async fn handle_key_event(
         if let Some(allow) = permission_answer(ev.code) {
             let pending = app.lock().pending_permission.take();
             if let Some(p) = pending {
-                let _ = send_decision(
-                    path,
-                    &ClientMessage::PermissionDecision { id: p.id, allow },
-                )
-                .await;
+                let _ = send_decision(path, &ClientMessage::PermissionDecision { id: p.id, allow }).await;
                 // The deny verb routes through the `permission.denied` catalog key
                 // (En "denied" — byte-identical); the allow verb has no key and
                 // stays in code. The `<tool> <args>` suffix is unchanged.
@@ -1318,10 +1310,9 @@ async fn handle_submit(
                     &origin_cli::locale::linef("cmd.outputstyle.set", &[("label", style.label())]),
                 );
             }
-            None => app.lock().add_line(
-                "error> ",
-                origin_cli::locale::line("cmd.outputstyle.usage"),
-            ),
+            None => app
+                .lock()
+                .add_line("error> ", origin_cli::locale::line("cmd.outputstyle.usage")),
         }
         handle.mark_dirty();
         return;
@@ -1371,9 +1362,10 @@ async fn handle_submit(
             .map(str::trim)
         {
             match origin_cli::vcs::rewind_to(cp_id, true) {
-                Ok(()) => app
-                    .lock()
-                    .add_line("system> ", &format!("reverted working tree from checkpoint {cp_id}")),
+                Ok(()) => app.lock().add_line(
+                    "system> ",
+                    &format!("reverted working tree from checkpoint {cp_id}"),
+                ),
                 Err(e) => app.lock().add_line("error> ", &format!("{e}")),
             }
         } else if arg.is_empty() {
@@ -1554,10 +1546,19 @@ async fn handle_submit(
         );
         a.add_line("tab> ", "/theme /permissions /mouse /copy /clear /help");
         a.add_line("system> ", "keys:");
-        a.add_line("tab> ", "Enter submit \u{00B7} Shift+Enter newline \u{00B7} Tab complete");
+        a.add_line(
+            "tab> ",
+            "Enter submit \u{00B7} Shift+Enter newline \u{00B7} Tab complete",
+        );
         a.add_line("tab> ", "\u{2190}/\u{2192} move \u{00B7} Home/End line \u{00B7} \u{2191}/\u{2193} history \u{00B7} Backspace/Delete");
-        a.add_line("tab> ", "PageUp/PageDown \u{00B7} Shift+\u{2191}/\u{2193} scroll \u{00B7} End jump to bottom");
-        a.add_line("tab> ", "Ctrl+C interrupt/quit \u{00B7} Ctrl+D exit \u{00B7} Esc dismiss popup");
+        a.add_line(
+            "tab> ",
+            "PageUp/PageDown \u{00B7} Shift+\u{2191}/\u{2193} scroll \u{00B7} End jump to bottom",
+        );
+        a.add_line(
+            "tab> ",
+            "Ctrl+C interrupt/quit \u{00B7} Ctrl+D exit \u{00B7} Esc dismiss popup",
+        );
         drop(a);
         handle.mark_dirty();
         return;
@@ -1998,9 +1999,7 @@ async fn handle_prompt_turn(
 /// Default-off: with no buffered text, no `hooks.json`, or no `MessageDisplay`
 /// hook this is `None` ⇒ the output-style transform alone decides the render
 /// (byte-identical to the no-hook path).
-async fn fire_message_display_hook(
-    app: &SharedApp,
-) -> Option<origin_outputstyle::DisplayAction> {
+async fn fire_message_display_hook(app: &SharedApp) -> Option<origin_outputstyle::DisplayAction> {
     let text = app.lock().current_assistant_text().map(str::to_owned)?;
     origin_cli::display_hook::message_display_action(&text).await
 }
@@ -2015,7 +2014,11 @@ fn attach_file(path: &str) -> anyhow::Result<origin_multimodal::ContentBlock> {
 // `redundant_pub_crate`: the `tokio::select!` below expands to `pub(crate)`
 // helper items; in this bin crate (a private-module root) that trips the lint —
 // a known macro false positive, not author-written `pub(crate)` visibility.
-#[allow(clippy::too_many_arguments, clippy::redundant_pub_crate, clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::redundant_pub_crate,
+    clippy::too_many_lines
+)]
 async fn call_daemon(
     path: &str,
     model: &str,
@@ -2724,7 +2727,11 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
         let searched = sibling
             .as_ref()
             .map_or_else(|| "<no exe dir>".to_string(), |p| p.display().to_string());
-        let what = if supervised { "origin-supervisor" } else { "origin-daemon" };
+        let what = if supervised {
+            "origin-supervisor"
+        } else {
+            "origin-daemon"
+        };
         anyhow::anyhow!(
             "could not spawn {what}: {e}\n\
              daemon searched: {searched}, then PATH for `origin-daemon`\n\

@@ -472,11 +472,9 @@ async fn run_background_check_inner() -> Result<(), UpdateError> {
     // on the same filesystem (rename across filesystems is not atomic on
     // Windows and can fail on Linux).
     let exe = current_exe()?;
-    let parent = exe.parent().ok_or_else(|| {
-        UpdateError::Io(std::io::Error::other(
-            "exe has no parent",
-        ))
-    })?;
+    let parent = exe
+        .parent()
+        .ok_or_else(|| UpdateError::Io(std::io::Error::other("exe has no parent")))?;
     let download_path = parent.join(format!("{asset_name}.download"));
     let sig_path = parent.join(sig_name);
 

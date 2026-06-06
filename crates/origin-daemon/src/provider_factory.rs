@@ -213,7 +213,12 @@ impl ProviderFactory {
         };
         match self.build(&id, account).await {
             Ok(p) => {
-                tracing::debug!(provider = id.as_str(), model, account, "router cross-provider rebuild ok");
+                tracing::debug!(
+                    provider = id.as_str(),
+                    model,
+                    account,
+                    "router cross-provider rebuild ok"
+                );
                 Some(p)
             }
             Err(e) => {
@@ -684,10 +689,7 @@ mod tests {
             editor: editor.clone(),
         };
 
-        assert_eq!(
-            factory.route(strat.clone(), Phase::Plan, &[]),
-            Some(architect)
-        );
+        assert_eq!(factory.route(strat.clone(), Phase::Plan, &[]), Some(architect));
         assert_eq!(factory.route(strat, Phase::Edit, &[]), Some(editor));
 
         // QuotaFallback with an empty chain yields no model.
@@ -707,7 +709,11 @@ mod tests {
         let vault = KeyVault::in_memory();
         // Seed a credential so the Anthropic ApiKey wire build succeeds offline.
         vault
-            .set("anthropic", "default", origin_keyvault::Secret::new("sk-test".to_string()))
+            .set(
+                "anthropic",
+                "default",
+                origin_keyvault::Secret::new("sk-test".to_string()),
+            )
             .await
             .expect("seed credential");
         let factory = ProviderFactory::new(vault, cat);

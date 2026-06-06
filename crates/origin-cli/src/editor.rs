@@ -580,7 +580,12 @@ mod tests {
 
     fn seeded() -> Editor {
         let mut e = Editor::new();
-        for s in ["cargo build", "cargo test --workspace", "git status", "cargo clippy"] {
+        for s in [
+            "cargo build",
+            "cargo test --workspace",
+            "git status",
+            "cargo clippy",
+        ] {
             e.push_history(s);
         }
         e

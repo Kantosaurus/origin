@@ -608,11 +608,10 @@ mod tests {
 
     #[test]
     fn with_worktrees_renders_worktrees_section() {
-        let r = MorningReport::new(vec!["ran tests".to_string()], 100, vec![])
-            .with_worktrees(vec![
-                "/tmp/origin-wt/tests-1".to_string(),
-                "/tmp/origin-wt/docs-1".to_string(),
-            ]);
+        let r = MorningReport::new(vec!["ran tests".to_string()], 100, vec![]).with_worktrees(vec![
+            "/tmp/origin-wt/tests-1".to_string(),
+            "/tmp/origin-wt/docs-1".to_string(),
+        ]);
         assert_eq!(r.worktrees.len(), 2);
         let md = r.to_markdown();
         assert!(md.contains("## Worktrees"), "section must appear: {md}");

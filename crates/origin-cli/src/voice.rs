@@ -11,9 +11,7 @@ use std::io::{BufRead as _, BufReader};
 use std::process::{Command, Stdio};
 
 use anyhow::Result;
-use origin_voice::{
-    build_command, validate, DictationConfig, DictationMode, DictationSession, Transcript,
-};
+use origin_voice::{build_command, validate, DictationConfig, DictationMode, DictationSession, Transcript};
 
 /// Run `origin dictate`: drive an STT engine and print the assembled prompt.
 ///

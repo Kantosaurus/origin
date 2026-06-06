@@ -13,6 +13,7 @@ use origin_core::types::Role;
 use origin_daemon::agent::{LoopOptions, SessionStoreSummaryDeliverer};
 use origin_daemon::auth::BearerStore;
 use origin_daemon::config::{bearer_ttl_secs, governance_path, load_governance, Governance};
+use origin_daemon::ipc_prompter::{IpcPrompter, PermissionRegistry};
 use origin_daemon::memory_wiring::MemoryWiring;
 use origin_daemon::pairing::{Pairing, RedeemResult};
 use origin_daemon::plan_bus::PlanBus;
@@ -30,7 +31,6 @@ use origin_ipc::transport::{Listener, SharedConnection};
 use origin_keyvault::{KeyVault, Secret};
 use origin_mem::{Embedder, MemIndex};
 use origin_metrics::Metrics;
-use origin_daemon::ipc_prompter::{IpcPrompter, PermissionRegistry};
 use origin_permission::prompt::{AlwaysAllow, Prompter};
 use origin_provider::catalog::Catalog;
 use origin_provider::Provider;
@@ -340,10 +340,7 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     // mid-loop for a CROSS-PROVIDER router pick (foundation L84 / kilo L265). This
     // is inert unless `ORIGIN_ROUTER` is set and a pick lands on a different
     // provider; credentials still resolve only through this factory's vault.
-    origin_daemon::provider_factory::set_global(
-        Arc::new(factory.clone()),
-        initial_account.clone(),
-    );
+    origin_daemon::provider_factory::set_global(Arc::new(factory.clone()), initial_account.clone());
     let initial_provider_str = if let Ok(v) = env::var("ORIGIN_PROVIDER") {
         v
     } else {
@@ -931,15 +928,7 @@ fn spawn_handler_task(
                     }
                 }
                 ClientMessage::SwitchAccount { provider, account_id } => {
-                    if !handle_switch(
-                        &conn,
-                        &active,
-                        &factory,
-                        &active_account,
-                        &provider,
-                        &account_id,
-                    )
-                    .await
+                    if !handle_switch(&conn, &active, &factory, &active_account, &provider, &account_id).await
                     {
                         break;
                     }
@@ -1250,11 +1239,7 @@ fn spawn_handler_task(
                         break;
                     }
                 }
-                ClientMessage::TeamAssign {
-                    team,
-                    teammate,
-                    task,
-                } => {
+                ClientMessage::TeamAssign { team, teammate, task } => {
                     if !handle_team_assign(&conn, &coordinator, team, teammate, task).await {
                         break;
                     }
@@ -1296,8 +1281,7 @@ fn spawn_handler_task(
         // `SessionStart`; a no-op without `~/.origin/hooks.json` (the default).
         let ended_session_id = last_known_session_id.lock().await.clone();
         if let Some(sid) = ended_session_id {
-            origin_daemon::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::SessionEnd)
-                .await;
+            origin_daemon::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::SessionEnd).await;
 
             // Supervisor lifecycle (origin-supervisor): the client disconnected
             // but the daemon process stays alive, so move this session to
@@ -1607,8 +1591,7 @@ async fn handle_request(
     // `~/.origin/hooks.json` (the default) this is a no-op ⇒ byte-identical.
     let is_new_session = session.messages.is_empty();
     if is_new_session {
-        origin_daemon::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::SessionStart)
-            .await;
+        origin_daemon::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::SessionStart).await;
     }
 
     let (tx_sub, mut rx_sub) = mpsc::channel::<Subscriber>(1);
@@ -2214,11 +2197,9 @@ async fn handle_iterate_pending(
         // `UserInterrupt` pain bucket. Emitted only on the interrupt branch (a
         // pushed-back follow-up is a continuation, not a cancellation), so the
         // reason is precise. Default-off ⇒ no event.
-        origin_daemon::agent::record_session_stop_pain(
-            origin_daemon::agent::SessionStopPain::reason_only(
-                origin_telemetry::SessionStopReason::UserInterrupt,
-            ),
-        );
+        origin_daemon::agent::record_session_stop_pain(origin_daemon::agent::SessionStopPain::reason_only(
+            origin_telemetry::SessionStopReason::UserInterrupt,
+        ));
     } else if let Some(msg) = parsed {
         // A follow-up Prompt, an admin call, etc. — consumed here would lose
         // the user's intent, so push it back for the outer loop to dispatch.
@@ -2676,9 +2657,7 @@ async fn handle_admin(
             },
         },
         ClientMessage::ResumeSession { session_id } => resume_session_event(session_store, &session_id),
-        ClientMessage::ResumeForeign { source, path } => {
-            resume_foreign_event(session_store, &source, &path)
-        }
+        ClientMessage::ResumeForeign { source, path } => resume_foreign_event(session_store, &source, &path),
         ClientMessage::ExportSession { session_id, format } => {
             export_session_event(session_store, &session_id, &format)
         }
@@ -2767,23 +2746,21 @@ fn build_usage_rows(snap: &origin_metrics::Snapshot) -> Vec<origin_daemon::proto
         }
     }
     acc.into_iter()
-        .map(
-            |((provider, model), (tokens_in, tokens_out))| {
-                // Cost from output + fresh-input tokens (the metrics registry
-                // does not split cache tiers per model, so this is a floor).
-                let cost_usd = origin_cost::price_for(&model).map_or(0.0, |p| {
-                    let u = origin_cost::TokenUsage::new(tokens_in, tokens_out, 0, 0);
-                    origin_cost::cost_of(&p, &u).total()
-                });
-                origin_daemon::protocol::UsageRow {
-                    provider,
-                    model,
-                    tokens_in,
-                    tokens_out,
-                    cost_usd,
-                }
-            },
-        )
+        .map(|((provider, model), (tokens_in, tokens_out))| {
+            // Cost from output + fresh-input tokens (the metrics registry
+            // does not split cache tiers per model, so this is a floor).
+            let cost_usd = origin_cost::price_for(&model).map_or(0.0, |p| {
+                let u = origin_cost::TokenUsage::new(tokens_in, tokens_out, 0, 0);
+                origin_cost::cost_of(&p, &u).total()
+            });
+            origin_daemon::protocol::UsageRow {
+                provider,
+                model,
+                tokens_in,
+                tokens_out,
+                cost_usd,
+            }
+        })
         .collect()
 }
 
@@ -3144,8 +3121,7 @@ async fn drive_selfdev_cycle(
     let model = std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".to_string());
     let edit_session = format!("selfdev-{job_id}");
     if let Err(e) =
-        origin_daemon::scheduler::dispatch_prompt(sock_path, &model, edit_session, &description)
-            .await
+        origin_daemon::scheduler::dispatch_prompt(sock_path, &model, edit_session, &description).await
     {
         // The self-edit prompt failed; treat as a build-stage failure so the
         // machine rolls back to the pre-edit checkpoint on the same binary.
@@ -3395,10 +3371,7 @@ fn selfdev_rollback(
 /// rejected the transition (already logged). The driver mutex is locked *inside*
 /// the blocking closure so the long cargo invocation does not block the async
 /// runtime, and is released before this returns.
-async fn run_blocking_step<F>(
-    state: &'static origin_daemon::selfdev::SelfDevState,
-    step: F,
-) -> Option<bool>
+async fn run_blocking_step<F>(state: &'static origin_daemon::selfdev::SelfDevState, step: F) -> Option<bool>
 where
     F: FnOnce(&mut origin_selfdev::SelfDevDriver) -> Result<bool, origin_selfdev::SelfDevError>
         + Send
@@ -3445,10 +3418,7 @@ fn abort_to_idle(state: &origin_daemon::selfdev::SelfDevState) {
 /// [`abort_to_idle`] when no edit ever landed (so there is nothing to restore).
 struct NoopRollback;
 impl origin_selfdev::Rollback for NoopRollback {
-    fn rollback(
-        &self,
-        _job: &origin_selfdev::BuildJob,
-    ) -> Result<origin_selfdev::RollbackOutcome, String> {
+    fn rollback(&self, _job: &origin_selfdev::BuildJob) -> Result<origin_selfdev::RollbackOutcome, String> {
         Ok(origin_selfdev::RollbackOutcome::NothingToRestore)
     }
 }

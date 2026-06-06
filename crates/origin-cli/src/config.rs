@@ -199,9 +199,7 @@ pub const fn validate_thinking_tokens(value: Option<u32>) -> Result<Option<u32>,
 /// the literal target, avoiding any cycle risk.
 #[must_use]
 pub fn resolve_alias(aliases: &BTreeMap<String, String>, model: &str) -> String {
-    aliases
-        .get(model)
-        .map_or_else(|| model.to_string(), Clone::clone)
+    aliases.get(model).map_or_else(|| model.to_string(), Clone::clone)
 }
 
 /// Parse repeated ad-hoc `name=target` alias definitions (from `--alias`).
@@ -358,10 +356,7 @@ mod tests {
         aliases.insert("fast".to_string(), "anthropic/claude-haiku-4".to_string());
         aliases.insert("bare".to_string(), "gpt-4o".to_string());
         // Defined alias → provider/model target.
-        assert_eq!(
-            resolve_alias(&aliases, "fast"),
-            "anthropic/claude-haiku-4"
-        );
+        assert_eq!(resolve_alias(&aliases, "fast"), "anthropic/claude-haiku-4");
         // Defined alias → bare model id target.
         assert_eq!(resolve_alias(&aliases, "bare"), "gpt-4o");
     }
@@ -401,7 +396,10 @@ mod tests {
             "o = gpt-4o".to_string(),                    // trims whitespace
         ];
         let merged = merge_alias_specs(&base, &specs).expect("parse");
-        assert_eq!(merged.get("fast").map(String::as_str), Some("anthropic/claude-haiku-4"));
+        assert_eq!(
+            merged.get("fast").map(String::as_str),
+            Some("anthropic/claude-haiku-4")
+        );
         assert_eq!(merged.get("o").map(String::as_str), Some("gpt-4o"));
     }
 

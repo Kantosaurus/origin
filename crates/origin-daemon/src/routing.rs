@@ -243,14 +243,8 @@ mod tests {
         );
         // Turn 1 = Plan ⇒ opus; later turns = Edit ⇒ haiku. Both on the active
         // provider, so the model is overridden.
-        assert_eq!(
-            lr.choose_model(1, "anthropic").as_deref(),
-            Some("claude-opus-4")
-        );
-        assert_eq!(
-            lr.choose_model(2, "anthropic").as_deref(),
-            Some("claude-haiku-4")
-        );
+        assert_eq!(lr.choose_model(1, "anthropic").as_deref(), Some("claude-opus-4"));
+        assert_eq!(lr.choose_model(2, "anthropic").as_deref(), Some("claude-haiku-4"));
     }
 
     #[test]
@@ -264,10 +258,7 @@ mod tests {
         // anthropic provider for a gemini model).
         assert_eq!(lr.choose_model(1, "anthropic"), None);
         // When the active provider matches, the override applies.
-        assert_eq!(
-            lr.choose_model(1, "gemini").as_deref(),
-            Some("gemini-2.5-pro")
-        );
+        assert_eq!(lr.choose_model(1, "gemini").as_deref(), Some("gemini-2.5-pro"));
     }
 
     #[test]
@@ -289,10 +280,7 @@ mod tests {
     fn quota_fallback_skips_exhausted_then_recovers_on_success() {
         let lr = LiveRouter::new(
             Strategy::QuotaFallback {
-                chain: vec![
-                    ModelRef::new("anthropic", "a"),
-                    ModelRef::new("anthropic", "b"),
-                ],
+                chain: vec![ModelRef::new("anthropic", "a"), ModelRef::new("anthropic", "b")],
             },
             Vec::new(),
         );
@@ -319,8 +307,14 @@ mod tests {
         // The zero-config sentinel must build even with no companion env vars,
         // defaulting to phase-aware routing on the latest Anthropic pair.
         let lr = LiveRouter::from_env_with("auto", |_| None).expect("auto always builds");
-        assert_eq!(lr.choose_model(1, "anthropic").as_deref(), Some("claude-opus-4-8"));
-        assert_eq!(lr.choose_model(2, "anthropic").as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(
+            lr.choose_model(1, "anthropic").as_deref(),
+            Some("claude-opus-4-8")
+        );
+        assert_eq!(
+            lr.choose_model(2, "anthropic").as_deref(),
+            Some("claude-haiku-4-5")
+        );
     }
 
     #[test]

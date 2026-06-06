@@ -46,8 +46,7 @@ mod tests {
     /// exact same JSON value the `origin-workflowgen` crate produces.
     #[test]
     fn schema_matches_crate() {
-        let from_literal: serde_json::Value =
-            serde_json::from_str(AUTHOR_WORKFLOW_INPUT_SCHEMA).unwrap();
+        let from_literal: serde_json::Value = serde_json::from_str(AUTHOR_WORKFLOW_INPUT_SCHEMA).unwrap();
         assert_eq!(from_literal, origin_workflowgen::tool_input_schema());
     }
 }

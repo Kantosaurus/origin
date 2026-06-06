@@ -52,7 +52,10 @@ mod tests {
 
     #[test]
     fn parses_each_named_style() {
-        assert_eq!(parse_style_command("/style explanatory"), Some(Style::Explanatory));
+        assert_eq!(
+            parse_style_command("/style explanatory"),
+            Some(Style::Explanatory)
+        );
         assert_eq!(parse_style_command("/style learning"), Some(Style::Learning));
         assert_eq!(parse_style_command("/style concise"), Some(Style::Concise));
         assert_eq!(parse_style_command("/style default"), Some(Style::Default));

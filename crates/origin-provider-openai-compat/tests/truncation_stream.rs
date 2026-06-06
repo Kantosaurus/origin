@@ -68,11 +68,8 @@ async fn length_finish_on_quirky_backend_tags_turn_end() {
 
 #[tokio::test]
 async fn max_tokens_finish_on_quirky_backend_tags_turn_end() {
-    let payloads = drain_turn_end_payloads(
-        response_from_sse(sse_with_finish("max_tokens")),
-        Backend::VLlm,
-    )
-    .await;
+    let payloads =
+        drain_turn_end_payloads(response_from_sse(sse_with_finish("max_tokens")), Backend::VLlm).await;
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0], TURNEND_TRUNCATED_MARKER);
 }
@@ -94,8 +91,7 @@ async fn length_finish_on_openai_backend_is_noop() {
 async fn clean_stop_finish_leaves_turn_end_empty() {
     // A natural `stop` finish — even on a quirky backend — is not a truncation,
     // so the TurnEnd payload stays empty.
-    let payloads =
-        drain_turn_end_payloads(response_from_sse(sse_with_finish("stop")), Backend::Other).await;
+    let payloads = drain_turn_end_payloads(response_from_sse(sse_with_finish("stop")), Backend::Other).await;
     assert_eq!(payloads.len(), 1);
     assert!(
         payloads[0].is_empty(),

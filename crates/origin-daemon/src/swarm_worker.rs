@@ -26,9 +26,7 @@ use async_trait::async_trait;
 use origin_permission::prompt::Prompter;
 use origin_provider::Provider;
 use origin_swarm::{CompletionReport, McpServerSpec, ReportStatus, Usage, WorkerContext, WorkerFn};
-use origin_tools::{
-    DynTool, SandboxProfile, SideEffects, Tier, ToolMeta, Urgency, DEFAULT_TOKEN_BUDGET,
-};
+use origin_tools::{DynTool, SandboxProfile, SideEffects, Tier, ToolMeta, Urgency, DEFAULT_TOKEN_BUDGET};
 use tokio::sync::RwLock;
 
 use crate::agent::{run_loop, scope_runtime_tools, scope_swarm_collab, LoopOptions, SwarmCollab};
@@ -39,9 +37,7 @@ use crate::session::Session;
 /// the worker-scoped runtime registry plus the namespaced tool names to add to
 /// the worker's allow-list. Best-effort: a server that fails to spawn or list its
 /// tools is logged and skipped (the worker still runs without it).
-async fn build_runtime_tools(
-    specs: &[McpServerSpec],
-) -> (HashMap<String, Arc<dyn DynTool>>, Vec<String>) {
+async fn build_runtime_tools(specs: &[McpServerSpec]) -> (HashMap<String, Arc<dyn DynTool>>, Vec<String>) {
     let mut map: HashMap<String, Arc<dyn DynTool>> = HashMap::new();
     let mut names: Vec<String> = Vec::new();
     for spec in specs {
@@ -87,8 +83,7 @@ async fn build_runtime_tools(
                 token_budget: DEFAULT_TOKEN_BUDGET,
                 hot: false,
             };
-            let proxy =
-                origin_mcp::proxy::McpToolProxy::new(Arc::clone(&client), meta, tool.name.clone());
+            let proxy = origin_mcp::proxy::McpToolProxy::new(Arc::clone(&client), meta, tool.name.clone());
             map.insert(full.clone(), Arc::new(proxy) as Arc<dyn DynTool>);
             names.push(full);
         }
@@ -173,9 +168,10 @@ async fn run_worker(
     let provider = active.read().await.clone();
     // Per-agent routing (openclaude): use the worker's explicit model override
     // when set, else the daemon default.
-    let model = ctx.spec.model.clone().unwrap_or_else(|| {
-        std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".to_string())
-    });
+    let model =
+        ctx.spec.model.clone().unwrap_or_else(|| {
+            std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".to_string())
+        });
     let mut session = Session::new(provider.name(), &model);
 
     // gap 9b: spin up this sub-agent's declared inline-MCP servers and expose
@@ -213,9 +209,7 @@ async fn run_worker(
     // of every sibling that had read a path this worker just edited. When the
     // handle is absent (the default) we call the bare `run_loop`, so the loop
     // sees an unset task-local and behaves exactly as before — byte-identical.
-    let run = async {
-        run_loop(&mut session, &goal, provider.as_ref(), &prompter, &opts).await
-    };
+    let run = async { run_loop(&mut session, &goal, provider.as_ref(), &prompter, &opts).await };
     // gap 9b: install the worker's inline-MCP runtime registry for the duration
     // of its loop so the dispatch path can resolve + invoke those tools (empty
     // map ⇒ no effect). Heap-box the (large) composed future.
@@ -271,7 +265,9 @@ mod tests {
     use origin_tools::{registry_iter, ToolMeta};
 
     fn meta(name: &str) -> &'static ToolMeta {
-        registry_iter().find(|m| m.name == name).expect("tool must be registered")
+        registry_iter()
+            .find(|m| m.name == name)
+            .expect("tool must be registered")
     }
 
     #[tokio::test]

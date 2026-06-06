@@ -217,22 +217,16 @@ pub fn load_sources() -> CompletionSources {
     // Keep `skills` and `skill_descriptions` index-aligned: build them in one
     // pass so a later wave can render the frontmatter description next to each
     // candidate.
-    let (skills, skill_descriptions): (Vec<String>, Vec<String>) =
-        origin_skills::load_all(&skills_dir)
-            .map(|v| {
-                v.into_iter()
-                    .map(|s| (s.front.name, s.front.description))
-                    .unzip()
-            })
-            .unwrap_or_default();
+    let (skills, skill_descriptions): (Vec<String>, Vec<String>) = origin_skills::load_all(&skills_dir)
+        .map(|v| v.into_iter().map(|s| (s.front.name, s.front.description)).unzip())
+        .unwrap_or_default();
     let workflows: Vec<String> = crate::workflows::load_from(&workflows_path)
         .ok()
         .flatten()
         .map(|f| f.workflows.into_iter().map(|w| w.name).collect())
         .unwrap_or_default();
     let verbs: Vec<String> = BUILTIN_VERBS.iter().map(|(v, _)| (*v).to_string()).collect();
-    let verb_descriptions: Vec<String> =
-        BUILTIN_VERBS.iter().map(|(_, d)| (*d).to_string()).collect();
+    let verb_descriptions: Vec<String> = BUILTIN_VERBS.iter().map(|(_, d)| (*d).to_string()).collect();
     CompletionSources {
         skills,
         skill_descriptions,
@@ -405,7 +399,10 @@ mod tests {
             sources.verbs
         );
         for present in ["theme", "help"] {
-            assert!(sources.verbs.iter().any(|v| v == present), "`{present}` should be a built-in verb");
+            assert!(
+                sources.verbs.iter().any(|v| v == present),
+                "`{present}` should be a built-in verb"
+            );
         }
     }
 

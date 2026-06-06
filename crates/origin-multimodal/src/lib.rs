@@ -311,8 +311,7 @@ pub fn to_content_block(bytes: &[u8], filename: Option<&str>) -> Result<ContentB
 /// Implemented by hand to avoid an extra dependency.
 #[must_use]
 pub fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut chunks = bytes.chunks_exact(3);
     for chunk in &mut chunks {
@@ -346,9 +345,7 @@ pub fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
-    use super::{
-        base64_encode, classify, to_content_block, ContentBlock, MediaError, MediaKind,
-    };
+    use super::{base64_encode, classify, to_content_block, ContentBlock, MediaError, MediaKind};
 
     #[test]
     fn classify_png_by_magic() {

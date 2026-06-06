@@ -134,8 +134,8 @@ impl Provider for OpenAiCompat {
                     .await
                     .map_err(|e| ProviderError::Api(format!("decode: {e}")))?;
                 cassette::record(path, "POST", &url, &req_body_text, 200, &text)?;
-                let wire: wire::WireResponse = serde_json::from_str(&text)
-                    .map_err(|e| ProviderError::Api(format!("decode: {e}")))?;
+                let wire: wire::WireResponse =
+                    serde_json::from_str(&text).map_err(|e| ProviderError::Api(format!("decode: {e}")))?;
                 return Ok(decode_response(wire, backend));
             }
             let wire: wire::WireResponse = resp
@@ -333,10 +333,10 @@ mod cassette {
     /// Returns [`ProviderError::Api`] if the cassette cannot be read/parsed, no
     /// matching interaction exists, or the recorded status is non-OK.
     pub fn replay(path: &str, method: &str, url: &str, req_body: &str) -> Result<String, ProviderError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| ProviderError::Api(format!("cassette read: {e}")))?;
-        let cassette = Cassette::from_json(&text)
-            .map_err(|e| ProviderError::Api(format!("cassette parse: {e}")))?;
+        let text =
+            std::fs::read_to_string(path).map_err(|e| ProviderError::Api(format!("cassette read: {e}")))?;
+        let cassette =
+            Cassette::from_json(&text).map_err(|e| ProviderError::Api(format!("cassette parse: {e}")))?;
         let probe = ReqShape {
             method: method.to_string(),
             url: url.to_string(),
@@ -464,8 +464,7 @@ fn decode_response(wire: wire::WireResponse, backend: Backend) -> ChatResponse {
     let mut blocks: Vec<Block> = Vec::new();
     if let Some(choice) = wire.choices.into_iter().next() {
         // Surface a length-limit truncation as a diagnostic for quirky backends.
-        if backend != Backend::OpenAi
-            && origin_shimquirks::detect_truncation(choice.finish_reason.as_deref())
+        if backend != Backend::OpenAi && origin_shimquirks::detect_truncation(choice.finish_reason.as_deref())
         {
             tracing::warn!(
                 finish_reason = choice.finish_reason.as_deref().unwrap_or_default(),
@@ -562,7 +561,9 @@ mod decode_tests {
         let resp = decode_response(wire, Backend::Other);
         assert_eq!(resp.assistant.blocks.len(), 1, "raw text replaced by tool use");
         match &resp.assistant.blocks[0] {
-            Block::ToolUse { id, name, input_json, .. } => {
+            Block::ToolUse {
+                id, name, input_json, ..
+            } => {
                 assert_eq!(name, "get_weather");
                 assert_eq!(id, "shimquirks_get_weather");
                 let args: serde_json::Value = serde_json::from_slice(input_json).unwrap();

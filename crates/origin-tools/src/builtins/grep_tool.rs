@@ -89,16 +89,26 @@ pub fn parse_dsl(pattern: &str) -> Option<Result<DslQuery, ToolError>> {
     let body = pattern.strip_prefix(DSL_PREFIX)?;
     let err = |msg: &str| ToolError::new(ErrClass::Validation, "dsl", msg.to_string());
     let parsed = body.split_once(':').map_or_else(
-        || Err(err("agentgrep DSL expects `<verb>:<operand>` (e.g. outline:src/lib.rs)")),
+        || {
+            Err(err(
+                "agentgrep DSL expects `<verb>:<operand>` (e.g. outline:src/lib.rs)",
+            ))
+        },
         |(verb, operand)| {
             let operand = operand.trim();
             if operand.is_empty() {
                 return Err(err("agentgrep DSL operand must not be empty"));
             }
             match verb.trim() {
-                "outline" => Ok(DslQuery::Outline { path: operand.to_string() }),
-                "refs" => Ok(DslQuery::Refs { symbol: operand.to_string() }),
-                other => Err(err(&format!("unknown agentgrep verb `{other}` (expected outline|refs)"))),
+                "outline" => Ok(DslQuery::Outline {
+                    path: operand.to_string(),
+                }),
+                "refs" => Ok(DslQuery::Refs {
+                    symbol: operand.to_string(),
+                }),
+                other => Err(err(&format!(
+                    "unknown agentgrep verb `{other}` (expected outline|refs)"
+                ))),
             }
         },
     );
@@ -202,8 +212,8 @@ fn run_refs(symbol: &str, args: &GrepArgs) -> Result<Value, ToolError> {
     // A word-boundary matcher gives a cheap pre-filter; `line_has_word` then
     // confirms identifier boundaries precisely before a hit is recorded.
     let pattern = format!(r"\b{}\b", regex_escape(symbol));
-    let matcher = RegexMatcher::new(&pattern)
-        .map_err(|e| ToolError::new(ErrClass::Regex, "invalid", e.to_string()))?;
+    let matcher =
+        RegexMatcher::new(&pattern).map_err(|e| ToolError::new(ErrClass::Regex, "invalid", e.to_string()))?;
     let mut walker = WalkBuilder::new(&root);
     walker.follow_links(false).standard_filters(true);
     if let Some(t) = &args.r#type {
@@ -267,8 +277,9 @@ fn run_refs(symbol: &str, args: &GrepArgs) -> Result<Value, ToolError> {
 /// Identifiers are typically `[A-Za-z0-9_]`, but a caller may pass something
 /// containing metacharacters; escaping keeps the generated matcher safe.
 fn regex_escape(s: &str) -> String {
-    const META: &[char] =
-        &['.', '^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '\\'];
+    const META: &[char] = &[
+        '.', '^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '\\',
+    ];
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if META.contains(&c) {
@@ -420,8 +431,7 @@ pub fn grep_v2(args: GrepArgs) -> Result<Value, ToolError> {
     // on already-seen regions. Default-off (gate unset) OR no `exposure` ⇒
     // `match_results` is untouched, so the result is byte-identical to before.
     // `files_with_matches` / `count` modes are never affected.
-    if std::env::var("ORIGIN_AGENTGREP_TRUNCATE").as_deref() == Ok("1")
-        && matches!(mode, OutputMode::Content)
+    if std::env::var("ORIGIN_AGENTGREP_TRUNCATE").as_deref() == Ok("1") && matches!(mode, OutputMode::Content)
     {
         if let Some(exposure) = args.exposure.as_ref() {
             // Elided matches are simply dropped; there is no metadata slot
@@ -489,7 +499,7 @@ const DEF_LEADERS: &[&str] = &[
     "final class",
     "static func", // Swift
     "class func",
-    "suspend fun", // Kotlin
+    "suspend fun",    // Kotlin
     "local function", // Lua
     "public static",
     "private static",
@@ -537,8 +547,8 @@ const VISIBILITY_LEADERS: &[&str] = &["public ", "private ", "protected ", "inte
 /// loop constructs — a line such as `if (cond) {` must NOT be mistaken for a
 /// definition by the structural `name(...)`/`name() {` heuristics below.
 const CALL_NOT_DEF_KEYWORDS: &[&str] = &[
-    "if", "for", "while", "switch", "return", "catch", "do", "else", "case",
-    "throw", "match", "with", "when", "elif", "until",
+    "if", "for", "while", "switch", "return", "catch", "do", "else", "case", "throw", "match", "with",
+    "when", "elif", "until",
 ];
 
 /// Resolve the nearest enclosing definition for a 1-based match line by scanning
@@ -579,9 +589,7 @@ fn is_definition_line(trimmed: &str) -> bool {
     // (`pub`, `pub(crate)`, `static`, `final`, …) so `pub fn`, `static func`,
     // `open class`, etc. resolve to their definition keyword.
     let stripped = strip_leading_modifiers(trimmed);
-    if stripped.len() != trimmed.len()
-        && DEF_LEADERS.iter().any(|lead| leader_matches(stripped, lead))
-    {
+    if stripped.len() != trimmed.len() && DEF_LEADERS.iter().any(|lead| leader_matches(stripped, lead)) {
         return true;
     }
     haskell_signature(trimmed) || zig_type_binding(trimmed) || brace_header(trimmed)
@@ -594,10 +602,32 @@ fn is_definition_line(trimmed: &str) -> bool {
 /// re-test runs on the original line first, so `const fn` / `static func` are
 /// already covered before this peel applies.
 const MODIFIERS: &[&str] = &[
-    "pub", "public", "private", "protected", "internal", "export", "default",
-    "final", "abstract", "sealed", "open", "override", "async", "static",
-    "inline", "extern", "unsafe", "virtual", "partial", "suspend", "lateinit",
-    "readonly", "declare", "implicit", "lazy", "annotation",
+    "pub",
+    "public",
+    "private",
+    "protected",
+    "internal",
+    "export",
+    "default",
+    "final",
+    "abstract",
+    "sealed",
+    "open",
+    "override",
+    "async",
+    "static",
+    "inline",
+    "extern",
+    "unsafe",
+    "virtual",
+    "partial",
+    "suspend",
+    "lateinit",
+    "readonly",
+    "declare",
+    "implicit",
+    "lazy",
+    "annotation",
 ];
 
 /// Peel leading [`MODIFIERS`] (and Rust `pub(crate)` scopes) from a trimmed line,
@@ -607,7 +637,10 @@ fn strip_leading_modifiers(line: &str) -> &str {
     loop {
         let trimmed = cur.trim_start();
         // Rust `pub(crate)` / `pub(super)` visibility scope.
-        if let Some(rest) = trimmed.strip_prefix("pub(").and_then(|a| a.find(')').map(|c| &a[c + 1..])) {
+        if let Some(rest) = trimmed
+            .strip_prefix("pub(")
+            .and_then(|a| a.find(')').map(|c| &a[c + 1..]))
+        {
             cur = rest;
             continue;
         }
@@ -677,7 +710,9 @@ fn haskell_signature(trimmed: &str) -> bool {
     }
     head.split(',').all(|part| {
         let p = part.trim();
-        !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\'')
+        !p.is_empty()
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\'')
     })
 }
 
@@ -800,16 +835,19 @@ mod agentgrep_tests {
 
     mod dsl {
         use super::lines;
-        use crate::builtins::grep_tool::{
-            outline_symbols, parse_dsl, refs_in_source, DslQuery,
-        };
+        use crate::builtins::grep_tool::{outline_symbols, parse_dsl, refs_in_source, DslQuery};
 
         #[test]
         fn parse_outline_query() {
             let q = parse_dsl("agentgrep:outline:src/lib.rs")
                 .expect("recognized")
                 .expect("ok");
-            assert_eq!(q, DslQuery::Outline { path: "src/lib.rs".into() });
+            assert_eq!(
+                q,
+                DslQuery::Outline {
+                    path: "src/lib.rs".into()
+                }
+            );
         }
 
         #[test]
@@ -817,7 +855,12 @@ mod agentgrep_tests {
             let q = parse_dsl("agentgrep:refs:do_thing")
                 .expect("recognized")
                 .expect("ok");
-            assert_eq!(q, DslQuery::Refs { symbol: "do_thing".into() });
+            assert_eq!(
+                q,
+                DslQuery::Refs {
+                    symbol: "do_thing".into()
+                }
+            );
         }
 
         #[test]
@@ -825,7 +868,12 @@ mod agentgrep_tests {
             let q = parse_dsl("agentgrep:outline:  a/b.rs  ")
                 .expect("recognized")
                 .expect("ok");
-            assert_eq!(q, DslQuery::Outline { path: "a/b.rs".into() });
+            assert_eq!(
+                q,
+                DslQuery::Outline {
+                    path: "a/b.rs".into()
+                }
+            );
         }
 
         #[test]
@@ -862,7 +910,11 @@ mod agentgrep_tests {
             let names: Vec<&str> = syms.iter().map(|(_, s)| s.as_str()).collect();
             assert_eq!(
                 names,
-                vec!["pub fn first() {}", "fn second(x: u8) {", "struct Point { x: u8 }"]
+                vec![
+                    "pub fn first() {}",
+                    "fn second(x: u8) {",
+                    "struct Point { x: u8 }"
+                ]
             );
             // Line numbers are 1-based and track the source.
             assert_eq!(syms[0], (2u64, "pub fn first() {}".to_string()));
@@ -876,7 +928,8 @@ mod agentgrep_tests {
 
         #[test]
         fn refs_returns_lines_with_enclosing_symbol() {
-            let src = "fn caller() {\n    let r = target();\n    target();\n}\nfn other() {\n    noop();\n}\n";
+            let src =
+                "fn caller() {\n    let r = target();\n    target();\n}\nfn other() {\n    noop();\n}\n";
             let hits = refs_in_source(&lines(src), "target");
             assert_eq!(hits.len(), 2);
             // Both references resolve to their enclosing `fn caller`.

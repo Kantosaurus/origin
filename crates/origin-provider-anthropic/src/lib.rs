@@ -454,9 +454,8 @@ impl Provider for Anthropic {
         }
 
         let byte_stream = resp.bytes_stream();
-        let async_read = tokio_util::io::StreamReader::new(
-            byte_stream.map(|r| r.map_err(std::io::Error::other)),
-        );
+        let async_read =
+            tokio_util::io::StreamReader::new(byte_stream.map(|r| r.map_err(std::io::Error::other)));
         crate::streaming::parse_into_ring(async_read, ring)
             .await
             .map_err(|e| ProviderError::Api(e.to_string()))?;
@@ -816,16 +815,11 @@ mod cassette {
     /// # Errors
     /// Returns [`ProviderError::Api`] if the cassette cannot be read/parsed, no
     /// matching interaction exists, or the recorded status is non-OK.
-    pub fn replay(
-        path: &str,
-        method: &str,
-        url: &str,
-        req_body: &str,
-    ) -> Result<String, ProviderError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| ProviderError::Api(format!("cassette read: {e}")))?;
-        let cassette = Cassette::from_json(&text)
-            .map_err(|e| ProviderError::Api(format!("cassette parse: {e}")))?;
+    pub fn replay(path: &str, method: &str, url: &str, req_body: &str) -> Result<String, ProviderError> {
+        let text =
+            std::fs::read_to_string(path).map_err(|e| ProviderError::Api(format!("cassette read: {e}")))?;
+        let cassette =
+            Cassette::from_json(&text).map_err(|e| ProviderError::Api(format!("cassette parse: {e}")))?;
         let probe = ReqShape {
             method: method.to_string(),
             url: url.to_string(),

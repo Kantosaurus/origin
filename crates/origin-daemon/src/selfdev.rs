@@ -40,8 +40,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use origin_selfdev::{
-    ReloadContext, RestartAuthority, RestartDecision, Rollback, RollbackOutcome, SelfDevConfig,
-    SelfDevDriver,
+    ReloadContext, RestartAuthority, RestartDecision, Rollback, RollbackOutcome, SelfDevConfig, SelfDevDriver,
 };
 use origin_vcs::{GitRunner, RestoreMode, ShadowGit, VcsError};
 
@@ -426,10 +425,7 @@ mod tests {
         let ctx = ReloadContext::new("j1");
 
         // No approval ⇒ Deny.
-        assert!(matches!(
-            authority.authorize(&ctx),
-            RestartDecision::Deny(_)
-        ));
+        assert!(matches!(authority.authorize(&ctx), RestartDecision::Deny(_)));
 
         // After approve ⇒ Grant, exactly once (the flag is consumed).
         state.approve();
@@ -494,7 +490,10 @@ mod tests {
         let target = Path::new("C:/work/target");
         let exe = Path::new("C:/bin/origin-daemon.exe");
         let got = resolve_new_artifact_path(target, "debug", exe).expect("file name present");
-        assert_eq!(got.file_name().and_then(|n| n.to_str()), Some("origin-daemon.exe"));
+        assert_eq!(
+            got.file_name().and_then(|n| n.to_str()),
+            Some("origin-daemon.exe")
+        );
         assert!(got.ends_with(Path::new("target/debug/origin-daemon.exe")));
     }
 
@@ -530,18 +529,9 @@ mod tests {
             decide_relaunch_action(true, true),
             RelaunchAction::ExitForRelaunch
         );
-        assert_eq!(
-            decide_relaunch_action(false, true),
-            RelaunchAction::LogOnly
-        );
-        assert_eq!(
-            decide_relaunch_action(true, false),
-            RelaunchAction::LogOnly
-        );
-        assert_eq!(
-            decide_relaunch_action(false, false),
-            RelaunchAction::LogOnly
-        );
+        assert_eq!(decide_relaunch_action(false, true), RelaunchAction::LogOnly);
+        assert_eq!(decide_relaunch_action(true, false), RelaunchAction::LogOnly);
+        assert_eq!(decide_relaunch_action(false, false), RelaunchAction::LogOnly);
     }
 
     #[test]

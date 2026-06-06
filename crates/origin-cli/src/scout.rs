@@ -19,14 +19,7 @@ struct CmdClone;
 impl CloneRunner for CmdClone {
     fn shallow_clone(&self, url: &str, dest: &str) -> Result<(), ScoutError> {
         let output = Command::new("git")
-            .args([
-                "clone",
-                "--depth",
-                "1",
-                "--filter=blob:none",
-                url,
-                dest,
-            ])
+            .args(["clone", "--depth", "1", "--filter=blob:none", url, dest])
             .output()
             .map_err(|e| ScoutError::Git(format!("spawning git: {e}")))?;
         if output.status.success() {
@@ -115,7 +108,11 @@ pub fn run(repo_url: &str, cache: Option<String>) -> Result<()> {
     }
 
     let files = collect_files(&dest_path);
-    let readme = read_first(&dest_path, &files, &["README.md", "README.rst", "README.txt", "README"]);
+    let readme = read_first(
+        &dest_path,
+        &files,
+        &["README.md", "README.rst", "README.txt", "README"],
+    );
     let manifest = read_first(
         &dest_path,
         &files,

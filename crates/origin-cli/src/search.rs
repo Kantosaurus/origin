@@ -9,8 +9,7 @@
 
 use anyhow::Result;
 use origin_websearch::{
-    endpoint_for, ground, parse_brave_json, parse_duckduckgo_html, parse_tavily_json, rank, Engine,
-    SearchHit,
+    endpoint_for, ground, parse_brave_json, parse_duckduckgo_html, parse_tavily_json, rank, Engine, SearchHit,
 };
 
 /// Parse the `--engine` flag into an [`Engine`], defaulting to `DuckDuckGo`.

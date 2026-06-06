@@ -29,8 +29,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use origin_plan::ActorId;
 use origin_swarm::{
-    report_summary, Budget, Coordinator, TeamError, TeamEvent, TeamRegistry, TeammateStatus,
-    WorkerId, WorkerSpec,
+    report_summary, Budget, Coordinator, TeamError, TeamEvent, TeamRegistry, TeammateStatus, WorkerId,
+    WorkerSpec,
 };
 
 use crate::protocol::StreamEvent;
@@ -43,10 +43,8 @@ const DEFAULT_TEAMMATE_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
 /// Default per-teammate budget. Mirrors the `Task` sub-agent default tool-call
 /// cap; the wall/token ceilings are generous since a teammate is a full turn.
 const TEAMMATE_BUDGET: Budget = Budget::new(
-    /* max_wall_ms */ 300_000,
-    /* max_input_tokens */ 1_000_000,
-    /* max_output_tokens */ 256_000,
-    /* max_tool_calls */ 32,
+    /* max_wall_ms */ 300_000, /* max_input_tokens */ 1_000_000,
+    /* max_output_tokens */ 256_000, /* max_tool_calls */ 32,
 );
 
 /// Process-global team registry. `None` until the first `TeamCreate`; an empty
@@ -292,7 +290,11 @@ mod tests {
         // MissionLog recorded registered + assigned.
         let status = status_event(&name).unwrap();
         match status {
-            StreamEvent::TeamStatus { mission_log, teammates, .. } => {
+            StreamEvent::TeamStatus {
+                mission_log,
+                teammates,
+                ..
+            } => {
                 assert!(mission_log.contains("[registered]"));
                 assert!(mission_log.contains("[assigned]"));
                 assert_eq!(teammates, vec!["scout: working: survey the repo".to_string()]);
@@ -343,7 +345,9 @@ mod tests {
 
         let idle = TeamEvent::TeammateIdle { teammate: w };
         match event_to_stream("gamma", &idle) {
-            StreamEvent::TeamEventFired { event_kind, summary, .. } => {
+            StreamEvent::TeamEventFired {
+                event_kind, summary, ..
+            } => {
                 assert_eq!(event_kind, "teammate_idle");
                 assert!(summary.is_empty());
             }

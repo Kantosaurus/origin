@@ -22,8 +22,7 @@ use origin_clipboard::{
 pub fn copy_context(instruction: Option<String>, files: &[String]) -> Result<()> {
     let mut bundle_files: Vec<(String, String)> = Vec::with_capacity(files.len());
     for path in files {
-        let contents =
-            std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+        let contents = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
         bundle_files.push((path.clone(), contents));
     }
     let count = bundle_files.len();

@@ -42,9 +42,9 @@ fn body_has_image_url(req: &Request) -> bool {
             && m.get("content")
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|parts| {
-                    parts.iter().any(|p| {
-                        p.get("type").and_then(serde_json::Value::as_str) == Some("image_url")
-                    })
+                    parts
+                        .iter()
+                        .any(|p| p.get("type").and_then(serde_json::Value::as_str) == Some("image_url"))
                 })
     })
 }

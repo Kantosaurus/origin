@@ -102,7 +102,10 @@ fn load_drafts() -> Result<Vec<Draft>> {
 /// Resolve a draft by exact id or a unique prefix (git-short-sha style), since
 /// the 16-hex content-hash ids are unwieldy to type in full.
 fn resolve<'a>(drafts: &'a [Draft], id: &str) -> Result<&'a Draft> {
-    let matches: Vec<&Draft> = drafts.iter().filter(|d| d.id == id || d.id.starts_with(id)).collect();
+    let matches: Vec<&Draft> = drafts
+        .iter()
+        .filter(|d| d.id == id || d.id.starts_with(id))
+        .collect();
     match matches.as_slice() {
         [one] => Ok(one),
         [] => anyhow::bail!("no draft matches id `{id}`"),
@@ -118,7 +121,14 @@ fn list_drafts() -> Result<String> {
     }
     let mut out = format!("{} draft(s) in the memory inbox:\n", drafts.len());
     for d in &drafts {
-        let preview: String = d.body.lines().next().unwrap_or_default().chars().take(70).collect();
+        let preview: String = d
+            .body
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(70)
+            .collect();
         let tags = if d.tags.is_empty() {
             String::new()
         } else {
@@ -176,11 +186,8 @@ fn open_store_handle() -> Result<Arc<origin_daemon::MemoryDispatchHandle>> {
     );
     let sql = Arc::new(origin_store::Store::open(&db_path).context("opening SQLite store")?);
     let store = Arc::new(origin_mem::MemoryStore::new(sql, cas));
-    let wiring = origin_daemon::MemoryWiring::new(
-        store,
-        None,
-        Arc::new(RwLock::new(origin_mem::MemIndex::new())),
-    );
+    let wiring =
+        origin_daemon::MemoryWiring::new(store, None, Arc::new(RwLock::new(origin_mem::MemIndex::new())));
     Ok(wiring.handle())
 }
 

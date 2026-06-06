@@ -88,7 +88,10 @@ pub struct IpcPrompter {
 impl IpcPrompter {
     /// Create a prompter that emits asks over `event_tx` and parks on `registry`.
     #[must_use]
-    pub const fn new(event_tx: mpsc::Sender<StreamEvent>, registry: std::sync::Arc<PermissionRegistry>) -> Self {
+    pub const fn new(
+        event_tx: mpsc::Sender<StreamEvent>,
+        registry: std::sync::Arc<PermissionRegistry>,
+    ) -> Self {
         Self { event_tx, registry }
     }
 

@@ -56,9 +56,7 @@ fn from_extension_unknown_is_none() {
 fn parses_minimal_c_cpp_csharp_ruby_bash() {
     let c = Language::C.parse(b"int main(void){return 0;}").expect("parse c");
     assert_eq!(c.root_node().kind(), "translation_unit");
-    let cpp = Language::Cpp
-        .parse(b"int main(){return 0;}")
-        .expect("parse cpp");
+    let cpp = Language::Cpp.parse(b"int main(){return 0;}").expect("parse cpp");
     assert_eq!(cpp.root_node().kind(), "translation_unit");
     let cs = Language::CSharp
         .parse(b"class C { void M() {} }")
@@ -140,10 +138,7 @@ fn from_path_unknown_or_missing_extension_is_none() {
 
 #[test]
 fn from_path_is_case_insensitive() {
-    assert_eq!(
-        Language::from_path(Path::new("LIB.RS")),
-        Some(Language::Rust)
-    );
+    assert_eq!(Language::from_path(Path::new("LIB.RS")), Some(Language::Rust));
 }
 
 #[test]

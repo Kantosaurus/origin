@@ -195,8 +195,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::float_cmp)]
 
     use super::{
-        aggregate_by_contestant, build, rank_entries, render_json, render_markdown,
-        LeaderboardEntry,
+        aggregate_by_contestant, build, rank_entries, render_json, render_markdown, LeaderboardEntry,
     };
     use crate::metrics::TaskResult;
 
@@ -264,7 +263,11 @@ mod tests {
         let e = &agg[0];
         assert_eq!(e.contestant, "m1");
         assert_eq!(e.tasks, 2);
-        assert!((e.mean_pass_at_k - 0.75).abs() < 1e-9, "pass@k={}", e.mean_pass_at_k);
+        assert!(
+            (e.mean_pass_at_k - 0.75).abs() < 1e-9,
+            "pass@k={}",
+            e.mean_pass_at_k
+        );
         assert!((e.mean_wall_ms - 25.0).abs() < 1e-9, "wall={}", e.mean_wall_ms);
     }
 

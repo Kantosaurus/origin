@@ -156,10 +156,7 @@ pub fn dedup(findings: Vec<Finding>) -> Vec<Finding> {
             best.insert(key, f);
         }
     }
-    order
-        .into_iter()
-        .filter_map(|k| best.remove(&k))
-        .collect()
+    order.into_iter().filter_map(|k| best.remove(&k)).collect()
 }
 
 /// Keep findings meeting `s`'s confidence threshold, sorted by confidence
@@ -232,8 +229,9 @@ pub fn triage(title: &str, body: &str) -> IssueLabel {
         let count = |toks: &[String]| -> u32 {
             keywords
                 .iter()
-                .map(|kw| u32::try_from(toks.iter().filter(|t| t.as_str() == *kw).count())
-                    .unwrap_or(u32::MAX))
+                .map(|kw| {
+                    u32::try_from(toks.iter().filter(|t| t.as_str() == *kw).count()).unwrap_or(u32::MAX)
+                })
                 .sum()
         };
         // Title signal counts double — it is the strongest intent cue.
@@ -283,22 +281,74 @@ pub fn similarity(a: &str, b: &str) -> f32 {
 /// Keyword tables for [`triage`]. Kept module-private and intentionally small;
 /// the *mechanism* (scored keyword voting) is the contribution.
 const BUG_WORDS: &[&str] = &[
-    "bug", "crash", "panic", "error", "broken", "fail", "fails", "failed",
-    "failure", "exception", "regression", "freeze", "hang", "incorrect",
-    "wrong", "unexpected", "reproduce", "stacktrace", "traceback", "segfault",
+    "bug",
+    "crash",
+    "panic",
+    "error",
+    "broken",
+    "fail",
+    "fails",
+    "failed",
+    "failure",
+    "exception",
+    "regression",
+    "freeze",
+    "hang",
+    "incorrect",
+    "wrong",
+    "unexpected",
+    "reproduce",
+    "stacktrace",
+    "traceback",
+    "segfault",
 ];
 const FEATURE_WORDS: &[&str] = &[
-    "feature", "request", "add", "support", "please", "would", "could",
-    "enhancement", "improve", "improvement", "proposal", "suggestion",
-    "implement", "ability", "allow", "wish", "nice",
+    "feature",
+    "request",
+    "add",
+    "support",
+    "please",
+    "would",
+    "could",
+    "enhancement",
+    "improve",
+    "improvement",
+    "proposal",
+    "suggestion",
+    "implement",
+    "ability",
+    "allow",
+    "wish",
+    "nice",
 ];
 const DOCS_WORDS: &[&str] = &[
-    "docs", "doc", "documentation", "readme", "typo", "comment", "comments",
-    "guide", "tutorial", "example", "clarify", "wording", "spelling",
+    "docs",
+    "doc",
+    "documentation",
+    "readme",
+    "typo",
+    "comment",
+    "comments",
+    "guide",
+    "tutorial",
+    "example",
+    "clarify",
+    "wording",
+    "spelling",
 ];
 const QUESTION_WORDS: &[&str] = &[
-    "how", "why", "what", "question", "help", "confused", "unclear",
-    "possible", "supported", "where", "which", "anyone",
+    "how",
+    "why",
+    "what",
+    "question",
+    "help",
+    "confused",
+    "unclear",
+    "possible",
+    "supported",
+    "where",
+    "which",
+    "anyone",
 ];
 
 /// Split text into lowercase alphanumeric tokens, dropping punctuation.
@@ -455,7 +505,13 @@ mod tests {
     #[test]
     fn finding_clamps_confidence() {
         assert_eq!(Finding::new(Dimension::Bug, "a", 1, "t", "", 5.0).confidence, 1.0);
-        assert_eq!(Finding::new(Dimension::Bug, "a", 1, "t", "", -1.0).confidence, 0.0);
-        assert_eq!(Finding::new(Dimension::Bug, "a", 1, "t", "", f32::NAN).confidence, 0.0);
+        assert_eq!(
+            Finding::new(Dimension::Bug, "a", 1, "t", "", -1.0).confidence,
+            0.0
+        );
+        assert_eq!(
+            Finding::new(Dimension::Bug, "a", 1, "t", "", f32::NAN).confidence,
+            0.0
+        );
     }
 }

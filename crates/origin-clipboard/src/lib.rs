@@ -285,7 +285,11 @@ pub fn os_paste_command() -> (&'static str, Vec<String>) {
     } else if cfg!(target_os = "windows") {
         (
             "powershell",
-            vec!["-NoProfile".to_string(), "-Command".to_string(), "Get-Clipboard".to_string()],
+            vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "Get-Clipboard".to_string(),
+            ],
         )
     } else {
         (

@@ -344,7 +344,10 @@ mod tests {
             km.resolve(ev(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Action::Cancel
         );
-        assert_eq!(km.resolve(ev(KeyCode::Up, KeyModifiers::NONE)), Action::HistoryPrev);
+        assert_eq!(
+            km.resolve(ev(KeyCode::Up, KeyModifiers::NONE)),
+            Action::HistoryPrev
+        );
         assert_eq!(
             km.resolve(ev(KeyCode::Down, KeyModifiers::NONE)),
             Action::HistoryNext
@@ -359,14 +362,20 @@ mod tests {
     fn unbound_event_resolves_to_none() {
         let km = KeyMap::builtin();
         // A plain character is not a bound chord — the caller falls through.
-        assert_eq!(km.resolve(ev(KeyCode::Char('x'), KeyModifiers::NONE)), Action::None);
+        assert_eq!(
+            km.resolve(ev(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Action::None
+        );
     }
 
     #[test]
     fn empty_toml_is_builtin() {
         let km = KeyMap::from_toml_str("   \n").unwrap();
         assert_eq!(km.resolve(ev(KeyCode::Enter, KeyModifiers::NONE)), Action::Submit);
-        assert_eq!(km.resolve(ev(KeyCode::Up, KeyModifiers::NONE)), Action::HistoryPrev);
+        assert_eq!(
+            km.resolve(ev(KeyCode::Up, KeyModifiers::NONE)),
+            Action::HistoryPrev
+        );
     }
 
     #[test]
@@ -412,7 +421,10 @@ mod tests {
             Chord::parse("shift+enter"),
             Some(Chord::new(KeyCode::Enter, KeyModifiers::SHIFT))
         );
-        assert_eq!(Chord::parse("esc"), Some(Chord::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert_eq!(
+            Chord::parse("esc"),
+            Some(Chord::new(KeyCode::Esc, KeyModifiers::NONE))
+        );
         assert_eq!(
             Chord::parse("ctrl+alt+x"),
             Some(Chord::new(
@@ -474,7 +486,11 @@ mod tests {
             "rebound chord canonicalizes to the builtin event"
         );
         let up = ev(KeyCode::Up, KeyModifiers::NONE);
-        assert_eq!(km.canonicalize(up), up, "freed default chord passes through unchanged");
+        assert_eq!(
+            km.canonicalize(up),
+            up,
+            "freed default chord passes through unchanged"
+        );
         // Untouched defaults still canonicalize to themselves.
         let enter = ev(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(km.canonicalize(enter), enter);
@@ -504,9 +520,15 @@ mod tests {
         // the empty-config path `load` takes, asserted here without mutating the
         // shared process env (which would race other tests in this binary).
         let km = KeyMap::from_toml_str("").unwrap();
-        assert!(!km.is_overridden(), "absent/empty file ⇒ builtin (not overridden)");
+        assert!(
+            !km.is_overridden(),
+            "absent/empty file ⇒ builtin (not overridden)"
+        );
         assert_eq!(km.resolve(ev(KeyCode::Enter, KeyModifiers::NONE)), Action::Submit);
-        assert_eq!(km.resolve(ev(KeyCode::Up, KeyModifiers::NONE)), Action::HistoryPrev);
+        assert_eq!(
+            km.resolve(ev(KeyCode::Up, KeyModifiers::NONE)),
+            Action::HistoryPrev
+        );
     }
 
     #[test]

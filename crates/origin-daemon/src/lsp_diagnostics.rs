@@ -218,11 +218,17 @@ fn ensure_binary(program: &str, server: &origin_lspfleet::LspServer) -> bool {
 fn run_install(install_cmd: &str) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(windows)]
     {
-        std::process::Command::new("cmd").arg("/C").arg(install_cmd).status()
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .arg(install_cmd)
+            .status()
     }
     #[cfg(not(windows))]
     {
-        std::process::Command::new("sh").arg("-c").arg(install_cmd).status()
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(install_cmd)
+            .status()
     }
 }
 
@@ -237,7 +243,10 @@ async fn probe_file(workspace_root: &Path, path: &Path) -> Vec<Diagnostic> {
         return Vec::new();
     };
     if !ensure_binary(resolved.program, resolved.server) {
-        tracing::debug!(program = resolved.program, "LSP server binary unavailable; skipping diagnostics");
+        tracing::debug!(
+            program = resolved.program,
+            "LSP server binary unavailable; skipping diagnostics"
+        );
         return Vec::new();
     }
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -296,8 +305,8 @@ pub async fn lsp_diagnostics_block(workspace_root: &Path, edited: &BTreeSet<Stri
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{
-        collapse_ws, count_severities, enabled, format_diagnostics_block, render_one,
-        resolve_launch, severity_label,
+        collapse_ws, count_severities, enabled, format_diagnostics_block, render_one, resolve_launch,
+        severity_label,
     };
     use origin_lsp_client::Diagnostic;
     use std::path::{Path, PathBuf};
@@ -403,7 +412,16 @@ mod tests {
     fn format_block_caps_lines_with_overflow_summary() {
         let total = super::MAX_DIAG_LINES + 5;
         let diags: Vec<Diagnostic> = (0..total)
-            .map(|i| diag("a.rs", u32::try_from(i).unwrap_or(u32::MAX), 0, 2, &format!("w{i}"), None))
+            .map(|i| {
+                diag(
+                    "a.rs",
+                    u32::try_from(i).unwrap_or(u32::MAX),
+                    0,
+                    2,
+                    &format!("w{i}"),
+                    None,
+                )
+            })
             .collect();
         let block = format_diagnostics_block(&diags).unwrap();
         assert!(block.contains("… and 5 more"));

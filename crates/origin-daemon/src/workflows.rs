@@ -106,8 +106,8 @@ pub fn save_to(p: &Path, file: &WorkflowsFile) -> std::io::Result<()> {
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let body = toml::to_string_pretty(file)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let body =
+        toml::to_string_pretty(file).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let tmp = p.with_extension("toml.tmp");
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, p)?;

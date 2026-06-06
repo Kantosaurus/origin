@@ -75,7 +75,9 @@ fn seed(dir: &TempDir) -> (Arc<SessionStore>, Session) {
         let m = Message::new(Role::User).with_block(Block::text(body));
         session.messages.push(m.clone());
         store.persist_message(SID, i, &m).expect("persist msg");
-        store.update_summary(SID, i, &format!("sum-{i}")).expect("summary");
+        store
+            .update_summary(SID, i, &format!("sum-{i}"))
+            .expect("summary");
     }
     // A large recent turn pushes the accumulated transcript over the soft cap so
     // the post-turn compaction call actually fires.
@@ -94,8 +96,7 @@ fn scripted(tool_path: &str) -> ScriptedProvider {
             assistant: Message::new(Role::Assistant).with_block(Block::ToolUse {
                 id: "tu".into(),
                 name: "Read".into(),
-                input_json: serde_json::to_vec(&serde_json::json!({ "file_path": tool_path }))
-                    .expect("json"),
+                input_json: serde_json::to_vec(&serde_json::json!({ "file_path": tool_path })).expect("json"),
                 cache_marker: None,
             }),
             usage: Usage::default(),

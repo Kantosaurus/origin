@@ -175,8 +175,7 @@ fn read_png_if_present(path: &str) -> Option<Vec<u8>> {
 /// `origin_multimodal::base64_encode` byte-for-byte.
 #[must_use]
 pub fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut chunks = bytes.chunks_exact(3);
     for chunk in &mut chunks {
@@ -210,9 +209,7 @@ pub fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{
-        base64_encode, sanitize_console, VisualCapture, MAX_CONSOLE_LINES, MAX_CONSOLE_LINE_CHARS,
-    };
+    use super::{base64_encode, sanitize_console, VisualCapture, MAX_CONSOLE_LINES, MAX_CONSOLE_LINE_CHARS};
 
     // A minimal valid-looking PNG header (magic + a few bytes). The visual
     // module only checks the magic prefix, not full PNG validity.

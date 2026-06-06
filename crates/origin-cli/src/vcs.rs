@@ -49,8 +49,7 @@ fn ensure_shadow(runner: &CmdGit, shadow: &Path, cwd: &Path) -> Result<()> {
         return Ok(());
     }
     if let Some(parent) = shadow.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
     }
     let shadow_s = shadow.to_string_lossy();
     let cwd_s = cwd.to_string_lossy();
@@ -280,7 +279,10 @@ mod tests {
 
     #[test]
     fn empty_list_renders_placeholder() {
-        assert_eq!(format_checkpoint_lines(&[]), vec!["no checkpoints yet".to_string()]);
+        assert_eq!(
+            format_checkpoint_lines(&[]),
+            vec!["no checkpoints yet".to_string()]
+        );
     }
 
     #[test]

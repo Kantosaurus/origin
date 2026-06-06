@@ -153,13 +153,15 @@ pub fn apply(hunk: &Hunk, original: &str) -> Result<String, EditFmtError> {
 #[must_use]
 pub fn best_format_for(model: &str) -> EditFormat {
     let m = model.to_ascii_lowercase();
-    if m.starts_with("claude") || m.contains("anthropic") || m.starts_with("sonnet")
-        || m.starts_with("opus") || m.starts_with("haiku")
+    if m.starts_with("claude")
+        || m.contains("anthropic")
+        || m.starts_with("sonnet")
+        || m.starts_with("opus")
+        || m.starts_with("haiku")
     {
         return EditFormat::SearchReplace;
     }
-    if m.starts_with("gpt-4") || m.starts_with("gpt4") || m.starts_with("o1") || m.starts_with("o3")
-    {
+    if m.starts_with("gpt-4") || m.starts_with("gpt4") || m.starts_with("o1") || m.starts_with("o3") {
         return EditFormat::Udiff;
     }
     if m.starts_with("deepseek") {
@@ -320,9 +322,7 @@ fn parse_search_replace(text: &str, require_fence: bool) -> Result<Vec<Hunk>, Ed
         }
     }
     if hunks.is_empty() {
-        return Err(EditFmtError::Parse(
-            "no search/replace block found".to_string(),
-        ));
+        return Err(EditFmtError::Parse("no search/replace block found".to_string()));
     }
     Ok(hunks)
 }

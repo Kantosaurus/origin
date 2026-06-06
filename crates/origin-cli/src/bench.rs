@@ -103,7 +103,8 @@ fn read_recorded_results(path: &str) -> Result<Vec<TaskResult>> {
         );
     }
     let body = std::fs::read(p).with_context(|| format!("reading --from file `{path}`"))?;
-    serde_json::from_slice(&body).with_context(|| format!("parsing --from file `{path}` as a TaskResult array"))
+    serde_json::from_slice(&body)
+        .with_context(|| format!("parsing --from file `{path}` as a TaskResult array"))
 }
 
 /// Group a flat list of single-run results into per-task multi-sample sets.
@@ -170,8 +171,7 @@ fn contestant_bin() -> PathBuf {
 
 /// Resolve the task-set root for the live path.
 fn tasks_root() -> PathBuf {
-    std::env::var_os("ORIGIN_BENCH_TASKS")
-        .map_or_else(|| PathBuf::from("bench/tasks"), PathBuf::from)
+    std::env::var_os("ORIGIN_BENCH_TASKS").map_or_else(|| PathBuf::from("bench/tasks"), PathBuf::from)
 }
 
 /// Aggregate one or more recorded `TaskResult` files into a ranked
@@ -275,15 +275,11 @@ mod tests {
     fn recorded_report_json_round_trips_a_tiny_results_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("results.json");
-        let rows = vec![
-            result("origin", "t1", true),
-            result("origin", "t1", false),
-        ];
+        let rows = vec![result("origin", "t1", true), result("origin", "t1", false)];
         let body = serde_json::to_string(&rows).expect("serialize results");
         std::fs::write(&path, body).expect("write results");
 
-        let report =
-            report_from_recorded(path.to_str().expect("utf8 path"), 2).expect("build report");
+        let report = report_from_recorded(path.to_str().expect("utf8 path"), 2).expect("build report");
         assert_eq!(report.k, 2);
         assert_eq!(report.tasks.len(), 1);
         assert_eq!(report.tasks[0].samples, 2);
@@ -325,14 +321,8 @@ mod tests {
         let a = dir.path().join("a.json");
         let b = dir.path().join("b.json");
         // model "A" passes both tasks; model "B" fails both.
-        let rows_a = vec![
-            result_w("A", "t1", true, 10),
-            result_w("A", "t2", true, 10),
-        ];
-        let rows_b = vec![
-            result_w("B", "t1", false, 10),
-            result_w("B", "t2", false, 10),
-        ];
+        let rows_a = vec![result_w("A", "t1", true, 10), result_w("A", "t2", true, 10)];
+        let rows_b = vec![result_w("B", "t1", false, 10), result_w("B", "t2", false, 10)];
         std::fs::write(&a, serde_json::to_string(&rows_a).expect("ser")).expect("write a");
         std::fs::write(&b, serde_json::to_string(&rows_b).expect("ser")).expect("write b");
 
@@ -349,8 +339,7 @@ mod tests {
 
     #[test]
     fn leaderboard_rejects_missing_from() {
-        let err = leaderboard_from(&["definitely-not-real.json".to_string()], 2)
-            .expect_err("should fail");
+        let err = leaderboard_from(&["definitely-not-real.json".to_string()], 2).expect_err("should fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("definitely-not-real.json"), "got: {msg}");
     }

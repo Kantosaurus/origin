@@ -153,9 +153,7 @@ async fn run(sock_path: String) {
             }
         }
 
-        match crate::scheduler::dispatch_prompt_with_usage(&sock_path, &model, session_id, &prompt)
-            .await
-        {
+        match crate::scheduler::dispatch_prompt_with_usage(&sock_path, &model, session_id, &prompt).await {
             // Real per-turn usage drained from the dispatch reply. A non-zero
             // total is recorded verbatim; a zero total means the daemon emitted
             // no `Usage` event, so we fall back to the estimate via `None`.
@@ -278,15 +276,18 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        isolation_prompt, observe_task_tokens, real_or_estimate, task_prompt, AmbientTask,
-        TASK_COST_TOKENS,
+        isolation_prompt, observe_task_tokens, real_or_estimate, task_prompt, AmbientTask, TASK_COST_TOKENS,
     };
     use origin_ambient::{OvernightDriver, OvernightPlan};
 
     #[test]
     fn isolation_prompt_appends_worktree_and_branch_after_base() {
         let base = task_prompt(AmbientTask::Tests);
-        let out = isolation_prompt(base, std::path::Path::new("/wt/0-tests"), "origin/ambient/tests-0");
+        let out = isolation_prompt(
+            base,
+            std::path::Path::new("/wt/0-tests"),
+            "origin/ambient/tests-0",
+        );
         // The base task instruction is preserved as a prefix; the isolation
         // instruction (path + branch) is appended.
         assert!(out.starts_with(base));

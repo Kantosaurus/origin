@@ -115,9 +115,8 @@ fn load_or_create_key(dir: &Path) -> std::io::Result<[u8; KEY_LEN]> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let mut k = [0u8; KEY_LEN];
-            getrandom::getrandom(&mut k).map_err(|e| {
-                std::io::Error::other(format!("getrandom failed: {e}"))
-            })?;
+            getrandom::getrandom(&mut k)
+                .map_err(|e| std::io::Error::other(format!("getrandom failed: {e}")))?;
             std::fs::write(&path, k)?;
             // Tighten perms on unix. On windows std has no portable chmod —
             // we rely on the enclosing state dir already being user-private

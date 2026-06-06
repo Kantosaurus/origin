@@ -111,9 +111,7 @@ fn try_load_embedder() -> Option<Embedder> {
 /// An empty vector is exactly what [`Doc::text`] stores, so a failed embed is
 /// indistinguishable from a text-only document downstream.
 fn embed_or_empty(embedder: Option<&Embedder>, text: &str) -> Vec<f32> {
-    embedder
-        .and_then(|e| e.embed(text).ok())
-        .unwrap_or_default()
+    embedder.and_then(|e| e.embed(text).ok()).unwrap_or_default()
 }
 
 fn add(id: &str, text: &str) -> Result<String> {

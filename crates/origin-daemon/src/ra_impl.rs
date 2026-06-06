@@ -194,7 +194,14 @@ impl NavigationHandle for DaemonRa {
         };
         let text = Self::nav_source(path)?;
         let locs = c
-            .definition(path, "rust", &text, line.saturating_sub(1), col.saturating_sub(1), NAV_TIMEOUT)
+            .definition(
+                path,
+                "rust",
+                &text,
+                line.saturating_sub(1),
+                col.saturating_sub(1),
+                NAV_TIMEOUT,
+            )
             .await
             .map_err(|e| nav_request_err(&e))?;
         Ok(locs.into_iter().map(to_nav_location).collect())
@@ -232,7 +239,14 @@ impl NavigationHandle for DaemonRa {
         };
         let text = Self::nav_source(path)?;
         let items = c
-            .incoming_calls(path, "rust", &text, line.saturating_sub(1), col.saturating_sub(1), NAV_TIMEOUT)
+            .incoming_calls(
+                path,
+                "rust",
+                &text,
+                line.saturating_sub(1),
+                col.saturating_sub(1),
+                NAV_TIMEOUT,
+            )
             .await
             .map_err(|e| nav_request_err(&e))?;
         Ok(items.into_iter().map(to_nav_call).collect())
@@ -244,7 +258,14 @@ impl NavigationHandle for DaemonRa {
         };
         let text = Self::nav_source(path)?;
         let items = c
-            .outgoing_calls(path, "rust", &text, line.saturating_sub(1), col.saturating_sub(1), NAV_TIMEOUT)
+            .outgoing_calls(
+                path,
+                "rust",
+                &text,
+                line.saturating_sub(1),
+                col.saturating_sub(1),
+                NAV_TIMEOUT,
+            )
             .await
             .map_err(|e| nav_request_err(&e))?;
         Ok(items.into_iter().map(to_nav_call).collect())

@@ -43,8 +43,7 @@ mod tests {
     /// schema changes, this fails until the literal is updated to match.
     #[test]
     fn schema_matches_crate() {
-        let from_literal: serde_json::Value =
-            serde_json::from_str(GMAIL_INPUT_SCHEMA).unwrap();
+        let from_literal: serde_json::Value = serde_json::from_str(GMAIL_INPUT_SCHEMA).unwrap();
         assert_eq!(from_literal, origin_gmail::input_schema());
     }
 }

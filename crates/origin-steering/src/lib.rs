@@ -65,11 +65,7 @@ impl SteeringQueue {
         if self.hints.is_empty() {
             return None;
         }
-        let block = self
-            .hints
-            .drain(..)
-            .collect::<Vec<String>>()
-            .join("\n");
+        let block = self.hints.drain(..).collect::<Vec<String>>().join("\n");
         Some(block)
     }
 }

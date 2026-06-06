@@ -48,13 +48,25 @@ pub struct ScrollLine {
 
 impl ScrollLine {
     const fn styled(text: String, fg: u32, bg: u32, bold: bool) -> Self {
-        Self { text, fg, bg, bold, literal: false }
+        Self {
+            text,
+            fg,
+            bg,
+            bold,
+            literal: false,
+        }
     }
 
     /// A pre-formatted line drawn verbatim (no markdown parsing). Used for
     /// tool headers, diff rows, and streamed command output.
     const fn verbatim(text: String, fg: u32, bg: u32) -> Self {
-        Self { text, fg, bg, bold: false, literal: true }
+        Self {
+            text,
+            fg,
+            bg,
+            bold: false,
+            literal: true,
+        }
     }
 }
 
@@ -436,11 +448,7 @@ impl App {
     /// [`VimMode::Normal`] (vim convention), matching [`Self::toggle_vim`].
     pub const fn set_vim_active(&mut self, active: bool) {
         self.vim_active = active;
-        self.vim_mode = if active {
-            VimMode::Normal
-        } else {
-            VimMode::Insert
-        };
+        self.vim_mode = if active { VimMode::Normal } else { VimMode::Insert };
     }
 
     /// Whether the opt-in vim layer is active this session. `false` ⇒ the vim
@@ -697,8 +705,12 @@ impl App {
                 ));
             }
             "system> " => {
-                self.scrollback
-                    .push(ScrollLine::styled(format!("  {body}"), self.palette().muted, 0, false));
+                self.scrollback.push(ScrollLine::styled(
+                    format!("  {body}"),
+                    self.palette().muted,
+                    0,
+                    false,
+                ));
             }
             "ok> " => {
                 self.scrollback.push(ScrollLine::styled(
@@ -717,12 +729,20 @@ impl App {
                 ));
             }
             "tab> " => {
-                self.scrollback
-                    .push(ScrollLine::styled(format!("    {body}"), self.palette().muted, 0, false));
+                self.scrollback.push(ScrollLine::styled(
+                    format!("    {body}"),
+                    self.palette().muted,
+                    0,
+                    false,
+                ));
             }
             _ => {
-                self.scrollback
-                    .push(ScrollLine::styled(format!("  {body}"), self.palette().body, 0, false));
+                self.scrollback.push(ScrollLine::styled(
+                    format!("  {body}"),
+                    self.palette().body,
+                    0,
+                    false,
+                ));
             }
         }
         self.scroll_offset = 0;
@@ -838,7 +858,8 @@ impl App {
     }
 
     pub fn add_tool_line(&mut self, text: String) {
-        self.scrollback.push(ScrollLine::verbatim(text, self.palette().tool, 0));
+        self.scrollback
+            .push(ScrollLine::verbatim(text, self.palette().tool, 0));
     }
 
     /// Push a tool-activity line with a leading `▸` "running" marker, recording
@@ -849,8 +870,11 @@ impl App {
     pub fn start_tool_line(&mut self, text: &str) {
         self.finish_tool_line(true);
         self.running_tool_row = Some(self.scrollback.len());
-        self.scrollback
-            .push(ScrollLine::verbatim(format!("  \u{25B8} {text}"), self.palette().tool, 0));
+        self.scrollback.push(ScrollLine::verbatim(
+            format!("  \u{25B8} {text}"),
+            self.palette().tool,
+            0,
+        ));
         self.scroll_offset = 0;
     }
 
@@ -914,9 +938,7 @@ impl App {
             // otherwise the active output style may rewrite or hide it. No hook
             // *and* no style (or the default) ⇒ identity ⇒ `Some(raw)` unchanged,
             // so rendering is byte-identical. `None` suppresses the message.
-            let Some(text) =
-                origin_outputstyle::resolve_display(&raw, self.output_style, hook_action)
-            else {
+            let Some(text) = origin_outputstyle::resolve_display(&raw, self.output_style, hook_action) else {
                 return;
             };
             if !text.is_empty() {
@@ -945,15 +967,18 @@ impl App {
                         // `- [x]` lines render with a checkbox glyph. Pure
                         // fall-through: non-task lines yield `None` and keep the
                         // byte-identical default styling below.
-                        self.scrollback
-                            .push(ScrollLine::styled(format!("  {task}"), self.palette().body, 0, false));
+                        self.scrollback.push(ScrollLine::styled(
+                            format!("  {task}"),
+                            self.palette().body,
+                            0,
+                            false,
+                        ));
                     } else {
                         let (fg, bold) = md_line_style(line, self.palette());
                         // Strip ATX heading markers (`## `) — the color/weight
                         // from `md_line_style` already conveys the hierarchy, so
                         // the literal hashes are clutter. Non-headings unchanged.
-                        let rendered =
-                            strip_heading_markers(line).unwrap_or_else(|| line.to_string());
+                        let rendered = strip_heading_markers(line).unwrap_or_else(|| line.to_string());
                         self.scrollback
                             .push(ScrollLine::styled(format!("  {rendered}"), fg, 0, bold));
                     }
@@ -1022,8 +1047,7 @@ impl App {
                 .iter()
                 .map(|vl| &buf[vl.byte_start..vl.byte_end])
                 .collect();
-            let line_count = clamp_u16(wrapped.len())
-                .clamp(MIN_INPUT_ROWS, MAX_INPUT_ROWS);
+            let line_count = clamp_u16(wrapped.len()).clamp(MIN_INPUT_ROWS, MAX_INPUT_ROWS);
             let card_h = line_count + 1;
             let card_total = card_h + 2;
             let at_bottom = rows.saturating_sub(card_total);
@@ -1047,7 +1071,15 @@ impl App {
             if let Some(buf) = self.current_assistant.as_ref() {
                 live_buf = format!("  {buf}");
                 // Live assistant text is prose → markdown-parsed (literal=false).
-                wrap_into(&live_buf, pal.body, 0, false, false, cols_usize, &mut visual_lines);
+                wrap_into(
+                    &live_buf,
+                    pal.body,
+                    0,
+                    false,
+                    false,
+                    cols_usize,
+                    &mut visual_lines,
+                );
             }
 
             let total = visual_lines.len();
@@ -1084,7 +1116,13 @@ impl App {
             draw_scroll_indicator(main, &layout, offset);
             self.draw_notices(main, &layout);
             draw_input_card_bg(main, &layout);
-            self.draw_input_text(main, &layout, &wrapped, input_layout.cursor_row, input_layout.cursor_col);
+            self.draw_input_text(
+                main,
+                &layout,
+                &wrapped,
+                input_layout.cursor_row,
+                input_layout.cursor_col,
+            );
             self.draw_status_line(main, &layout);
             draw_keybind_hint(main, &layout, self.spinner.active || self.goal_status.is_some());
             self.draw_suggestions_popup(main, &layout);
@@ -1152,9 +1190,10 @@ impl App {
             let status_row = layout.at_bottom.saturating_sub(1);
             if status_row < layout.rows {
                 let (msg, fg) = match tier {
-                    StallTier::Soft(secs) => {
-                        (format!("\u{2026} still working\u{2026} {secs}s"), layout.palette.muted)
-                    }
+                    StallTier::Soft(secs) => (
+                        format!("\u{2026} still working\u{2026} {secs}s"),
+                        layout.palette.muted,
+                    ),
                     StallTier::Hard(secs) => (
                         format!("\u{26A0} no daemon activity for {secs}s \u{2014} Ctrl+C to interrupt"),
                         layout.palette.red,
@@ -1166,7 +1205,11 @@ impl App {
                     layout.cl.saturating_add(2),
                     &msg,
                     layout.cr,
-                    Style { fg, bg: 0, bold: false },
+                    Style {
+                        fg,
+                        bg: 0,
+                        bold: false,
+                    },
                 );
             }
         }
@@ -1247,7 +1290,12 @@ impl App {
                 main.put(
                     r,
                     c,
-                    Cell::new(glyph, layout.palette.bright, layout.palette.surface_raised, Attr::REVERSE),
+                    Cell::new(
+                        glyph,
+                        layout.palette.bright,
+                        layout.palette.surface_raised,
+                        Attr::REVERSE,
+                    ),
                 );
             }
         }
@@ -1295,7 +1343,12 @@ impl App {
                 main.put(
                     layout.r_status,
                     c,
-                    Cell::new(self.spinner.frame_char(), pal.accent, pal.surface_raised, Attr::PLAIN),
+                    Cell::new(
+                        self.spinner.frame_char(),
+                        pal.accent,
+                        pal.surface_raised,
+                        Attr::PLAIN,
+                    ),
                 );
             }
             c = c.saturating_add(2);
@@ -1322,7 +1375,11 @@ impl App {
         // Fill the remainder with the raised surface so the status line spans the
         // full card width like the input rows above it.
         while c < layout.cr {
-            main.put(layout.r_status, c, Cell::new(' ', 0, pal.surface_raised, Attr::PLAIN));
+            main.put(
+                layout.r_status,
+                c,
+                Cell::new(' ', 0, pal.surface_raised, Attr::PLAIN),
+            );
             c = c.saturating_add(1);
         }
     }
@@ -1359,7 +1416,11 @@ impl App {
                 break;
             }
             for c in layout.cl..layout.cr.min(layout.cols) {
-                main.put(r, c, Cell::new(' ', 0, layout.palette.surface_raised, Attr::PLAIN));
+                main.put(
+                    r,
+                    c,
+                    Cell::new(' ', 0, layout.palette.surface_raised, Attr::PLAIN),
+                );
             }
             let (ind_fg, txt_fg) = if row == selected {
                 (layout.palette.accent, layout.palette.body)
@@ -1460,13 +1521,22 @@ fn draw_scroll_indicator(main: &mut Grid, layout: &CardLayout, offset: usize) {
 fn draw_input_card_bg(main: &mut Grid, layout: &CardLayout) {
     for r in layout.r_top..=layout.r_status.min(layout.rows.saturating_sub(1)) {
         for c in layout.cl..layout.cr.min(layout.cols) {
-            main.put(r, c, Cell::new(' ', 0, layout.palette.surface_raised, Attr::PLAIN));
+            main.put(
+                r,
+                c,
+                Cell::new(' ', 0, layout.palette.surface_raised, Attr::PLAIN),
+            );
         }
         if layout.cl < layout.cols {
             main.put(
                 r,
                 layout.cl,
-                Cell::new('\u{2503}', layout.palette.accent, layout.palette.surface_raised, Attr::PLAIN),
+                Cell::new(
+                    '\u{2503}',
+                    layout.palette.accent,
+                    layout.palette.surface_raised,
+                    Attr::PLAIN,
+                ),
             );
         }
     }
@@ -1559,11 +1629,7 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine], pal: theme::Palette) 
     }
 
     for r in 0..rows {
-        side.put(
-            r,
-            0,
-            Cell::new('\u{2502}', pal.border, pal.panel_bg, Attr::PLAIN),
-        );
+        side.put(r, 0, Cell::new('\u{2502}', pal.border, pal.panel_bg, Attr::PLAIN));
     }
 
     if plan_lines.is_empty() {
@@ -1598,17 +1664,9 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine], pal: theme::Palette) 
     );
 
     for c in 1..cols {
-        side.put(
-            1,
-            c,
-            Cell::new('\u{2500}', pal.border, pal.panel_bg, Attr::PLAIN),
-        );
+        side.put(1, c, Cell::new('\u{2500}', pal.border, pal.panel_bg, Attr::PLAIN));
     }
-    side.put(
-        1,
-        0,
-        Cell::new('\u{251C}', pal.border, pal.panel_bg, Attr::PLAIN),
-    );
+    side.put(1, 0, Cell::new('\u{251C}', pal.border, pal.panel_bg, Attr::PLAIN));
 
     // cline L171: render the plan as a live focus-chain checkbox todo list.
     // The checkbox marker (`[ ]`/`[~]`/`[x]`) carries the GFM-style state; the
@@ -2245,7 +2303,9 @@ mod tests {
         app.start_tool_line("[Bash] false");
         app.finish_tool_line(false);
         assert!(
-            app.scrollback.last().is_some_and(|l| l.text.contains('\u{2718}') && l.fg == theme::RED),
+            app.scrollback
+                .last()
+                .is_some_and(|l| l.text.contains('\u{2718}') && l.fg == theme::RED),
             "failure shows ✘ in red"
         );
     }
@@ -2255,8 +2315,16 @@ mod tests {
         let mut app = App::new("anthropic", "m", CompletionSources::default());
         app.start_tool_line("[Bash] first");
         app.start_tool_line("[Bash] second");
-        let ticks = app.scrollback.iter().filter(|l| l.text.contains('\u{2714}')).count();
-        let arrows = app.scrollback.iter().filter(|l| l.text.contains('\u{25B8}')).count();
+        let ticks = app
+            .scrollback
+            .iter()
+            .filter(|l| l.text.contains('\u{2714}'))
+            .count();
+        let arrows = app
+            .scrollback
+            .iter()
+            .filter(|l| l.text.contains('\u{25B8}'))
+            .count();
         assert_eq!(ticks, 1, "previous tool resolved to ✔");
         assert_eq!(arrows, 1, "only the current tool still shows ▸");
     }
@@ -2283,7 +2351,9 @@ mod tests {
             app.scrollback.len()
         );
         assert!(
-            app.scrollback.last().is_some_and(|l| l.text == format!("line {}", total - 1)),
+            app.scrollback
+                .last()
+                .is_some_and(|l| l.text == format!("line {}", total - 1)),
             "the newest line must be retained"
         );
     }
@@ -2401,15 +2471,41 @@ mod tests {
 
     #[test]
     fn status_spans_have_legibility_hierarchy() {
-        let spans = status_spans(theme::Palette::default(), "Code", Some("Thinking"), "claude", "1.2k\u{2191} 300\u{2193}", 0.84, 3.4, None, false);
+        let spans = status_spans(
+            theme::Palette::default(),
+            "Code",
+            Some("Thinking"),
+            "claude",
+            "1.2k\u{2191} 300\u{2193}",
+            0.84,
+            3.4,
+            None,
+            false,
+        );
         assert_eq!(spans[0].text, "Code");
         assert_eq!(spans[0].fg, theme::ACCENT);
         assert!(spans[0].bold, "workflow leads bold");
-        assert!(spans.iter().any(|s| s.text == "Thinking" && s.fg == theme::ACCENT_DIM));
-        assert!(spans.iter().any(|s| s.text == "claude" && s.fg == theme::DIM), "model is dim");
-        assert!(spans.iter().any(|s| s.text == "$0.840" && s.fg == theme::BODY), "cost is body-bright");
-        assert!(spans.iter().any(|s| s.text == "3.4s" && s.fg == theme::BODY), "elapsed is body-bright");
-        assert!(spans.iter().any(|s| s.text.contains('\u{2191}') && s.fg == theme::MUTED), "tokens muted");
+        assert!(spans
+            .iter()
+            .any(|s| s.text == "Thinking" && s.fg == theme::ACCENT_DIM));
+        assert!(
+            spans.iter().any(|s| s.text == "claude" && s.fg == theme::DIM),
+            "model is dim"
+        );
+        assert!(
+            spans.iter().any(|s| s.text == "$0.840" && s.fg == theme::BODY),
+            "cost is body-bright"
+        );
+        assert!(
+            spans.iter().any(|s| s.text == "3.4s" && s.fg == theme::BODY),
+            "elapsed is body-bright"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.text.contains('\u{2191}') && s.fg == theme::MUTED),
+            "tokens muted"
+        );
         assert!(!spans.iter().any(|s| s.text.contains("cache cold")));
     }
 
@@ -2422,18 +2518,42 @@ mod tests {
         app.stop_turn_timer();
         let pct = app.ctx_pct().expect("a turn ran");
         assert!((70..=80).contains(&pct), "≈75% of 200k, got {pct}");
-        let spans = status_spans(theme::Palette::default(), "Code", None, "m", "0", 0.0, 0.0, Some(pct), false);
+        let spans = status_spans(
+            theme::Palette::default(),
+            "Code",
+            None,
+            "m",
+            "0",
+            0.0,
+            0.0,
+            Some(pct),
+            false,
+        );
         assert!(
-            spans.iter().any(|s| s.text == format!("ctx {pct}%") && s.fg == theme::YELLOW),
+            spans
+                .iter()
+                .any(|s| s.text == format!("ctx {pct}%") && s.fg == theme::YELLOW),
             "ctx span warns yellow at >=75%"
         );
     }
 
     #[test]
     fn status_spans_append_cold_nudge_in_yellow() {
-        let spans = status_spans(theme::Palette::default(), "Code", None, "m", "0\u{2191} 0\u{2193}", 0.0, 0.0, None, true);
+        let spans = status_spans(
+            theme::Palette::default(),
+            "Code",
+            None,
+            "m",
+            "0\u{2191} 0\u{2193}",
+            0.0,
+            0.0,
+            None,
+            true,
+        );
         assert!(
-            spans.last().is_some_and(|s| s.text.contains("cache cold") && s.fg == theme::YELLOW),
+            spans
+                .last()
+                .is_some_and(|s| s.text.contains("cache cold") && s.fg == theme::YELLOW),
             "cold nudge trails in yellow"
         );
     }
@@ -2467,7 +2587,11 @@ mod tests {
         );
         assert_eq!(g.get(0, 0).glyph, u32::from('\u{4e16}'), "wide glyph at col 0");
         assert!(g.get(0, 1).is_continuation(), "col 1 is a continuation cell");
-        assert_eq!(g.get(0, 2).glyph, u32::from('x'), "next char at col 2, not drifted");
+        assert_eq!(
+            g.get(0, 2).glyph,
+            u32::from('x'),
+            "next char at col 2, not drifted"
+        );
     }
 
     #[test]
@@ -2493,14 +2617,30 @@ mod tests {
 
     #[test]
     fn wrap_segment_breaks_at_word_boundary() {
-        assert_eq!(wrap_segment("hello world", 20), vec!["hello world"], "fits on one line");
-        assert_eq!(wrap_segment("hello world", 7), vec!["hello", "world"], "break between words");
-        assert_eq!(wrap_segment("a b c d e", 5), vec!["a b c", "d e"], "pack greedily");
+        assert_eq!(
+            wrap_segment("hello world", 20),
+            vec!["hello world"],
+            "fits on one line"
+        );
+        assert_eq!(
+            wrap_segment("hello world", 7),
+            vec!["hello", "world"],
+            "break between words"
+        );
+        assert_eq!(
+            wrap_segment("a b c d e", 5),
+            vec!["a b c", "d e"],
+            "pack greedily"
+        );
     }
 
     #[test]
     fn wrap_segment_hard_breaks_overlong_word() {
-        assert_eq!(wrap_segment("abcdefghij", 4), vec!["abcd", "efgh", "ij"], "no spaces → hard break");
+        assert_eq!(
+            wrap_segment("abcdefghij", 4),
+            vec!["abcd", "efgh", "ij"],
+            "no spaces → hard break"
+        );
     }
 
     #[test]
@@ -2516,7 +2656,11 @@ mod tests {
     fn stall_tier_classifies_quiet_into_soft_and_hard() {
         let soft = Duration::from_secs(11);
         let hard = Duration::from_secs(28);
-        assert_eq!(stall_tier(Duration::from_secs(5), soft, hard), None, "below soft: nothing");
+        assert_eq!(
+            stall_tier(Duration::from_secs(5), soft, hard),
+            None,
+            "below soft: nothing"
+        );
         assert_eq!(
             stall_tier(Duration::from_secs(11), soft, hard),
             Some(StallTier::Soft(11)),
@@ -2532,7 +2676,10 @@ mod tests {
             Some(StallTier::Hard(28)),
             "at hard threshold escalates"
         );
-        assert_eq!(stall_tier(Duration::from_secs(90), soft, hard), Some(StallTier::Hard(90)));
+        assert_eq!(
+            stall_tier(Duration::from_secs(90), soft, hard),
+            Some(StallTier::Hard(90))
+        );
     }
 
     #[test]
@@ -2589,8 +2736,7 @@ mod tests {
             "reset must re-paint the startup banner"
         );
         assert!(
-            !app
-                .scrollback
+            !app.scrollback
                 .iter()
                 .any(|l| l.text.contains("hello") || l.text.contains("did a thing")),
             "conversation rows must be gone after reset"
@@ -2791,7 +2937,12 @@ mod tests {
         // `surface_raised` (the input-card background), with its coordinate.
         fn card_bg(app: &App) -> (u16, u16) {
             let mut composer = Composer::new(60, 12);
-            let mut widget = StreamWidget::new(Rect { row: 0, col: 0, cols: 60, rows: 6 });
+            let mut widget = StreamWidget::new(Rect {
+                row: 0,
+                col: 0,
+                cols: 60,
+                rows: 6,
+            });
             app.draw(&mut composer, &mut widget);
             let want = app.palette().surface_raised;
             let grid = composer.main_grid();
@@ -2810,7 +2961,12 @@ mod tests {
         // Default: that cell equals the legacy constant — chrome is byte-identical.
         {
             let mut composer = Composer::new(60, 12);
-            let mut widget = StreamWidget::new(Rect { row: 0, col: 0, cols: 60, rows: 6 });
+            let mut widget = StreamWidget::new(Rect {
+                row: 0,
+                col: 0,
+                cols: 60,
+                rows: 6,
+            });
             app.draw(&mut composer, &mut widget);
             assert_eq!(
                 composer.main_grid().get(row, col).bg,
@@ -2823,7 +2979,12 @@ mod tests {
         let hc = theme::palette(Theme::HighContrast).surface_raised;
         assert_ne!(hc, theme::SURFACE_RAISED, "HighContrast must differ from Default");
         let mut composer = Composer::new(60, 12);
-        let mut widget = StreamWidget::new(Rect { row: 0, col: 0, cols: 60, rows: 6 });
+        let mut widget = StreamWidget::new(Rect {
+            row: 0,
+            col: 0,
+            cols: 60,
+            rows: 6,
+        });
         app.draw(&mut composer, &mut widget);
         assert_eq!(
             composer.main_grid().get(row, col).bg,
@@ -2858,8 +3019,8 @@ mod tests {
     fn apply_vim_action_moves_cursor_and_switches_mode() {
         let mut app = App::new("anthropic", "m", CompletionSources::default());
         app.input.set_buffer("hello".to_string()); // editor caret at end (char 5)
-        // Drive the editor caret to char 2 so the vim layer (which seeds from the
-        // editor caret) starts there.
+                                                   // Drive the editor caret to char 2 so the vim layer (which seeds from the
+                                                   // editor caret) starts there.
         app.input.move_left();
         app.input.move_left();
         app.input.move_left(); // 5 -> 2
@@ -2898,8 +3059,7 @@ mod tests {
         // startup with a user override.
         let mut app = App::new("anthropic", "m", CompletionSources::default());
         assert!(!app.keymap().is_overridden(), "defaults to builtin");
-        let km = crate::keybindings::KeyMap::from_toml_str("history-prev = \"ctrl+p\"")
-            .expect("parse");
+        let km = crate::keybindings::KeyMap::from_toml_str("history-prev = \"ctrl+p\"").expect("parse");
         app.set_keymap(km);
         assert!(app.keymap().is_overridden());
     }

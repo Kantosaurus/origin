@@ -638,8 +638,17 @@ mod tests {
         let cat = builtin_catalog();
         let ids: HashSet<&str> = cat.iter().map(|e| e.id.as_ref()).collect();
         for id in [
-            "cerebras", "groq", "fireworks", "mistral", "deepseek", "together", "moonshot",
-            "kimi", "xai", "nebius", "litellm",
+            "cerebras",
+            "groq",
+            "fireworks",
+            "mistral",
+            "deepseek",
+            "together",
+            "moonshot",
+            "kimi",
+            "xai",
+            "nebius",
+            "litellm",
         ] {
             assert!(ids.contains(id), "missing first-class provider: {id}");
         }

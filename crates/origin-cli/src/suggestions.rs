@@ -49,14 +49,9 @@ pub fn suggest(buffer: &str, sources: &CompletionSources) -> SuggestionState {
     if let Some(partial) = token.strip_prefix("{workflow:") {
         let partial = partial.strip_suffix('}').unwrap_or(partial);
         // Workflows carry no descriptions; pass an empty parallel list.
-        return match_candidates(
-            token,
-            partial,
-            prefix_len,
-            &sources.workflows,
-            &[],
-            |full| format!("{{workflow:{full}}}"),
-        );
+        return match_candidates(token, partial, prefix_len, &sources.workflows, &[], |full| {
+            format!("{{workflow:{full}}}")
+        });
     }
     // Skill shapes (`/-` deactivate, `/` activate) match the combined
     // verb+skill candidate list with descriptions kept index-aligned.
@@ -159,14 +154,12 @@ fn match_candidates(
     // Ghost text is a TRUE case-sensitive PREFIX of the trailing token so it
     // never proposes characters the user didn't actually type. Only when
     // there's exactly one match AND it extends the token verbatim.
-    let ghost = if candidates.len() == 1
-        && candidates[0].starts_with(token)
-        && candidates[0].len() > token.len()
-    {
-        candidates[0][token.len()..].to_string()
-    } else {
-        String::new()
-    };
+    let ghost =
+        if candidates.len() == 1 && candidates[0].starts_with(token) && candidates[0].len() > token.len() {
+            candidates[0][token.len()..].to_string()
+        } else {
+            String::new()
+        };
 
     SuggestionState {
         candidates,
@@ -437,10 +430,7 @@ mod tests {
 
     fn srcs_with_verbs() -> CompletionSources {
         CompletionSources {
-            skills: vec![
-                "systematic-debugging".into(),
-                "impeccable".into(),
-            ],
+            skills: vec!["systematic-debugging".into(), "impeccable".into()],
             skill_descriptions: vec!["debug methodically".into(), "polish UI".into()],
             verbs: vec!["effort".into(), "clear".into()],
             verb_descriptions: vec!["set reasoning effort".into(), "clear the chat".into()],
@@ -544,6 +534,9 @@ mod tests {
             .iter()
             .zip(s.descriptions.iter())
             .find(|(c, _)| *c == "/effort");
-        assert_eq!(pair, Some((&"/effort".to_string(), &"set reasoning effort".to_string())));
+        assert_eq!(
+            pair,
+            Some((&"/effort".to_string(), &"set reasoning effort".to_string()))
+        );
     }
 }

@@ -110,9 +110,8 @@ impl<'de> Deserialize<'de> for HookEventKind {
         D: Deserializer<'de>,
     {
         let label = String::deserialize(deserializer)?;
-        Self::from_label(&label).ok_or_else(|| {
-            serde::de::Error::custom(format!("unknown hook event kind `{label}`"))
-        })
+        Self::from_label(&label)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown hook event kind `{label}`")))
     }
 }
 
@@ -325,40 +324,64 @@ mod tests {
             HookEventKind::PreCompress
         );
         assert_eq!(
-            LifecycleEvent::Notification { message: String::new() }.kind(),
+            LifecycleEvent::Notification {
+                message: String::new()
+            }
+            .kind(),
             HookEventKind::Notification
         );
     }
 
     #[test]
     fn from_label_accepts_canonical_origin_names() {
-        assert_eq!(HookEventKind::from_label("pre_tool"), Some(HookEventKind::PreTool));
+        assert_eq!(
+            HookEventKind::from_label("pre_tool"),
+            Some(HookEventKind::PreTool)
+        );
         assert_eq!(
             HookEventKind::from_label("message_display"),
             Some(HookEventKind::MessageDisplay)
         );
-        assert_eq!(HookEventKind::from_label("before_model"), Some(HookEventKind::BeforeModel));
-        assert_eq!(HookEventKind::from_label("pre_compress"), Some(HookEventKind::PreCompress));
+        assert_eq!(
+            HookEventKind::from_label("before_model"),
+            Some(HookEventKind::BeforeModel)
+        );
+        assert_eq!(
+            HookEventKind::from_label("pre_compress"),
+            Some(HookEventKind::PreCompress)
+        );
         assert_eq!(HookEventKind::from_label("nope"), None);
     }
 
     #[test]
     fn from_label_accepts_claude_aliases() {
         // Claude event names map onto the equivalent origin event kinds.
-        assert_eq!(HookEventKind::from_label("PreToolUse"), Some(HookEventKind::PreTool));
-        assert_eq!(HookEventKind::from_label("PostToolUse"), Some(HookEventKind::PostTool));
+        assert_eq!(
+            HookEventKind::from_label("PreToolUse"),
+            Some(HookEventKind::PreTool)
+        );
+        assert_eq!(
+            HookEventKind::from_label("PostToolUse"),
+            Some(HookEventKind::PostTool)
+        );
         assert_eq!(
             HookEventKind::from_label("UserPromptSubmit"),
             Some(HookEventKind::PrePrompt)
         );
         assert_eq!(HookEventKind::from_label("Stop"), Some(HookEventKind::PostPrompt));
-        assert_eq!(HookEventKind::from_label("PreCompact"), Some(HookEventKind::PreCompress));
+        assert_eq!(
+            HookEventKind::from_label("PreCompact"),
+            Some(HookEventKind::PreCompress)
+        );
         assert_eq!(
             HookEventKind::from_label("Notification"),
             Some(HookEventKind::Notification)
         );
         // Case- and whitespace-insensitive.
-        assert_eq!(HookEventKind::from_label("  pretooluse "), Some(HookEventKind::PreTool));
+        assert_eq!(
+            HookEventKind::from_label("  pretooluse "),
+            Some(HookEventKind::PreTool)
+        );
     }
 
     #[test]

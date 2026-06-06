@@ -40,3 +40,6 @@ desktop.ini
 *.log
 *.tmp
 *.bak
+
+# Superpowers local session state (brainstorm servers, pids) — never tracked
+.superpowers/

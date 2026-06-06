@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Reasoning-effort controls: `/effort <level>` and `/fast`.
-#![allow(clippy::must_use_candidate, clippy::module_name_repetitions, clippy::enum_variant_names)]
+#![allow(
+    clippy::must_use_candidate,
+    clippy::module_name_repetitions,
+    clippy::enum_variant_names
+)]
 //!
 //! These mirror claude-code's `/effort` slider and `/fast` mode. The resolved
 //! value is an [`Option<ReasoningEffort>`] that threads onto the prompt path; a
@@ -85,10 +89,7 @@ mod tests {
 
     #[test]
     fn fast_command_maps_to_fast() {
-        assert_eq!(
-            parse_effort_command("/fast"),
-            Some(Some(ReasoningEffort::Fast))
-        );
+        assert_eq!(parse_effort_command("/fast"), Some(Some(ReasoningEffort::Fast)));
     }
 
     #[test]

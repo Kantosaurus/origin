@@ -104,9 +104,8 @@ fn fetch_node(
 /// Convert a BLOB slice into a fixed 32-byte handle, surfacing a malformed
 /// shape as an index error rather than panicking.
 fn to32(bytes: &[u8]) -> Result<[u8; 32], QueryError> {
-    <[u8; 32]>::try_from(bytes).map_err(|_| {
-        QueryError::Index(origin_codegraph::index::IndexError::HandleShape(bytes.len()))
-    })
+    <[u8; 32]>::try_from(bytes)
+        .map_err(|_| QueryError::Index(origin_codegraph::index::IndexError::HandleShape(bytes.len())))
 }
 
 crate::origin_tool! {

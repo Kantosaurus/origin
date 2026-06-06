@@ -342,8 +342,16 @@ impl Civil {
         let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100); // [0, 365]
         let month_index = (5 * day_of_year + 2) / 153; // [0, 11], March-based
         let day_of_month = day_of_year - (153 * month_index + 2) / 5 + 1; // [1, 31]
-        let calendar_month = if month_index < 10 { month_index + 3 } else { month_index - 9 }; // [1, 12]
-        let year = if calendar_month <= 2 { civil_year + 1 } else { civil_year };
+        let calendar_month = if month_index < 10 {
+            month_index + 3
+        } else {
+            month_index - 9
+        }; // [1, 12]
+        let year = if calendar_month <= 2 {
+            civil_year + 1
+        } else {
+            civil_year
+        };
 
         Self {
             year,
@@ -505,9 +513,18 @@ mod tests {
 
     #[test]
     fn parse_every_all_units() {
-        assert_eq!(parse_schedule("@every 30s").unwrap(), Schedule::Interval { ms: 30_000 });
-        assert_eq!(parse_schedule("@every 2h").unwrap(), Schedule::Interval { ms: 2 * MS_PER_HOUR });
-        assert_eq!(parse_schedule("@every 1d").unwrap(), Schedule::Interval { ms: MS_PER_DAY });
+        assert_eq!(
+            parse_schedule("@every 30s").unwrap(),
+            Schedule::Interval { ms: 30_000 }
+        );
+        assert_eq!(
+            parse_schedule("@every 2h").unwrap(),
+            Schedule::Interval { ms: 2 * MS_PER_HOUR }
+        );
+        assert_eq!(
+            parse_schedule("@every 1d").unwrap(),
+            Schedule::Interval { ms: MS_PER_DAY }
+        );
     }
 
     #[test]
@@ -523,7 +540,12 @@ mod tests {
     #[test]
     fn daily_fires_at_minute_of_day() {
         let s = parse_schedule("@daily 09:30").unwrap();
-        assert_eq!(s, Schedule::DailyAt { minute_of_day: 9 * 60 + 30 });
+        assert_eq!(
+            s,
+            Schedule::DailyAt {
+                minute_of_day: 9 * 60 + 30
+            }
+        );
         // At UTC midnight, the next 09:30 is later the same day.
         let expected = (9 * 60 + 30) * MS_PER_MINUTE;
         assert_eq!(s.next_after(0), Some(expected));
@@ -584,8 +606,12 @@ mod tests {
 
     #[test]
     fn webhook_and_fsevent_have_no_schedule() {
-        let wh = TriggerKind::Webhook { path: "/hooks/x".to_string() };
-        let fs = TriggerKind::FsEvent { glob: "src/**/*.rs".to_string() };
+        let wh = TriggerKind::Webhook {
+            path: "/hooks/x".to_string(),
+        };
+        let fs = TriggerKind::FsEvent {
+            glob: "src/**/*.rs".to_string(),
+        };
         assert_eq!(wh.next_after(1_000), None);
         assert_eq!(fs.next_after(1_000), None);
     }

@@ -30,9 +30,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use origin_resume_token::ResumeToken;
-use origin_supervisor::{
-    Decision, LifecycleConfig, LifecyclePolicy, MemReading, SessionClass, SessionState,
-};
+use origin_supervisor::{Decision, LifecycleConfig, LifecyclePolicy, MemReading, SessionClass, SessionState};
 
 /// Opt-in gate for *destructive* enforcement. Unset (the default): a retire or
 /// shed decision only drops the supervisor's in-memory tracking and logs — it
@@ -241,9 +239,9 @@ fn tick() {
         let reading = MemReading::from_rss(rss);
         let plan = state.policy.plan_shed(&sessions, reading, now);
         if !plan.is_empty() {
-            let decisions = state.policy.apply_shed(&mut sessions, &plan, now, unix, |s| {
-                base_token_for(&s.session_id)
-            });
+            let decisions = state
+                .policy
+                .apply_shed(&mut sessions, &plan, now, unix, |s| base_token_for(&s.session_id));
             for d in &decisions {
                 apply_decision(state, d);
             }
@@ -358,7 +356,10 @@ mod tests {
         // never panic, which is the contract the tick relies on.
         let rss = sample_rss_bytes();
         #[cfg(target_os = "linux")]
-        assert!(rss.map_or(true, |b| b > 0), "linux RSS should be positive when present");
+        assert!(
+            rss.map_or(true, |b| b > 0),
+            "linux RSS should be positive when present"
+        );
         #[cfg(not(target_os = "linux"))]
         assert!(rss.is_none(), "non-linux RSS is None (mem-shed skipped)");
     }
@@ -381,10 +382,9 @@ mod tests {
         let base = base_token_for("sess-x");
         let (decision, token) = LifecyclePolicy::on_detach(&mut s, 1_000, 42, base).unwrap();
         match decision {
-            Decision::Handoff { kind, .. } => assert!(matches!(
-                kind,
-                origin_supervisor::HandoffKind::Detached
-            )),
+            Decision::Handoff { kind, .. } => {
+                assert!(matches!(kind, origin_supervisor::HandoffKind::Detached));
+            }
             other => panic!("expected detach handoff, got {other:?}"),
         }
         assert_eq!(token.detached_at_unix, Some(42));

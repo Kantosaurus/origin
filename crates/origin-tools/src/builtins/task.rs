@@ -142,7 +142,11 @@ pub async fn task_spawn(coord: &Coordinator, input: TaskInput) -> Result<WorkerH
 /// # Errors
 /// Returns [`TaskError::Swarm`] if `await_completion` fails (e.g. the worker
 /// reported `Failed`).
-pub async fn task_await(coord: &Coordinator, handle: &WorkerHandle, goal: &str) -> Result<TaskOutput, TaskError> {
+pub async fn task_await(
+    coord: &Coordinator,
+    handle: &WorkerHandle,
+    goal: &str,
+) -> Result<TaskOutput, TaskError> {
     let report = coord.await_completion(handle).await?;
     let status = match report.status {
         ReportStatus::Completed => "completed",

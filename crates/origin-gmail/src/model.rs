@@ -315,7 +315,13 @@ mod tests {
         }"#;
         let page = parse_messages_list(json).unwrap();
         assert_eq!(page.items.len(), 2);
-        assert_eq!(page.items[0], MessageRef { id: "18c".into(), thread_id: "t1".into() });
+        assert_eq!(
+            page.items[0],
+            MessageRef {
+                id: "18c".into(),
+                thread_id: "t1".into()
+            }
+        );
         assert_eq!(page.next_page_token.as_deref(), Some("PAGE2"));
     }
 

@@ -28,10 +28,8 @@ fn req_with(thinking_tokens: Option<u32>) -> ChatRequest {
 
 #[test]
 fn thinking_tokens_is_a_noop_on_the_wire() {
-    let none_body =
-        serde_json::to_value(encode_request(&req_with(None), false)).expect("serialize");
-    let some_body =
-        serde_json::to_value(encode_request(&req_with(Some(8_192)), false)).expect("serialize");
+    let none_body = serde_json::to_value(encode_request(&req_with(None), false)).expect("serialize");
+    let some_body = serde_json::to_value(encode_request(&req_with(Some(8_192)), false)).expect("serialize");
 
     // The two bodies must be identical: thinking-tokens does not perturb the
     // OpenAI-compat wire at all.

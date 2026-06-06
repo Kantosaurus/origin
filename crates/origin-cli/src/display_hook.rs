@@ -22,9 +22,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use origin_hooks::{
-    dispatch_event, HookEventKind, HookOverride, HooksConfig, LifecycleEvent, ShellPool,
-};
+use origin_hooks::{dispatch_event, HookEventKind, HookOverride, HooksConfig, LifecycleEvent, ShellPool};
 use origin_outputstyle::DisplayAction;
 use tokio::sync::OnceCell;
 
@@ -42,9 +40,7 @@ impl MessageDisplayHook {
     /// hook is simply off, never an error.
     async fn build() -> Option<Self> {
         let cfg = load_config()?;
-        let entry = cfg
-            .entries_for(HookEventKind::MessageDisplay)
-            .next()?;
+        let entry = cfg.entries_for(HookEventKind::MessageDisplay).next()?;
         match ShellPool::new(entry.spec(), entry.effective_pool_size()).await {
             Ok(pool) => {
                 tracing::info!(program = %entry.program, "display-hook: MessageDisplay hook active");
@@ -140,9 +136,7 @@ mod tests {
         // No opinion ⇒ `None` ⇒ the output-style transform keeps deciding.
         assert_eq!(override_to_action(&HookOverride::Passthrough), None);
         assert_eq!(
-            override_to_action(&HookOverride::Allow {
-                reason: "ok".into()
-            }),
+            override_to_action(&HookOverride::Allow { reason: "ok".into() }),
             None
         );
     }
@@ -172,10 +166,7 @@ mod tests {
         // A missing hooks.json loads as an empty config ⇒ no hook ⇒ the loader
         // selects nothing (pure: no env mutation, no shell spawned). Mirrors the
         // `entries_for(MessageDisplay)` selection `build` performs.
-        let cfg = HooksConfig::load(std::path::Path::new(
-            "/no/such/display-hook-xyz/hooks.json",
-        ))
-        .unwrap();
+        let cfg = HooksConfig::load(std::path::Path::new("/no/such/display-hook-xyz/hooks.json")).unwrap();
         assert!(cfg.is_empty());
         assert!(cfg.entries_for(HookEventKind::MessageDisplay).next().is_none());
     }
@@ -193,8 +184,7 @@ mod tests {
     fn config_with_message_display_entry_is_selected() {
         // Positive selection: a `MessageDisplay` hook is found by the same
         // `entries_for` lookup `build` uses before spawning a pool.
-        let json =
-            r#"{ "hooks": [ { "event": "message_display", "program": "redact.sh" } ] }"#;
+        let json = r#"{ "hooks": [ { "event": "message_display", "program": "redact.sh" } ] }"#;
         let cfg = HooksConfig::from_json_str(json).unwrap();
         let entry = cfg.entries_for(HookEventKind::MessageDisplay).next();
         assert!(entry.is_some());
@@ -212,18 +202,9 @@ mod tests {
         .unwrap();
         assert_eq!(resolve_display("secret", None, Some(&hide)), None);
         // Replace rewrites.
-        let repl = override_to_action(&HookOverride::Mutate {
-            patch: "new".into(),
-        })
-        .unwrap();
-        assert_eq!(
-            resolve_display("old", None, Some(&repl)),
-            Some("new".to_string())
-        );
+        let repl = override_to_action(&HookOverride::Mutate { patch: "new".into() }).unwrap();
+        assert_eq!(resolve_display("old", None, Some(&repl)), Some("new".to_string()));
         // Absent action ⇒ identity render.
-        assert_eq!(
-            resolve_display("keep", None, None),
-            Some("keep".to_string())
-        );
+        assert_eq!(resolve_display("keep", None, None), Some("keep".to_string()));
     }
 }

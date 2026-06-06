@@ -177,11 +177,7 @@ impl GenAiSpanGuard {
 #[inline]
 #[must_use]
 #[allow(clippy::module_name_repetitions, clippy::needless_pass_by_value)]
-pub const fn gen_ai_span(
-    _system: &str,
-    _request_model: &str,
-    _operation: &str,
-) -> GenAiSpanGuard {
+pub const fn gen_ai_span(_system: &str, _request_model: &str, _operation: &str) -> GenAiSpanGuard {
     GenAiSpanGuard
 }
 
@@ -438,11 +434,7 @@ mod otel_impl {
     /// provider echoed no response model.
     ///
     /// Pure and total: no I/O, no globals — directly unit-testable.
-    fn gen_ai_attributes(
-        system: &str,
-        request_model: &str,
-        response_model: &str,
-    ) -> Vec<KeyValue> {
+    fn gen_ai_attributes(system: &str, request_model: &str, response_model: &str) -> Vec<KeyValue> {
         let system_key = gen_ai_attr_for_label("provider").unwrap_or(genai::SYSTEM);
         let request_model_key = gen_ai_attr_for_label("model").unwrap_or(genai::REQUEST_MODEL);
 
@@ -450,10 +442,7 @@ mod otel_impl {
         attrs.push(KeyValue::new(system_key, system.to_owned()));
         attrs.push(KeyValue::new(request_model_key, request_model.to_owned()));
         if !response_model.is_empty() {
-            attrs.push(KeyValue::new(
-                genai::RESPONSE_MODEL,
-                response_model.to_owned(),
-            ));
+            attrs.push(KeyValue::new(genai::RESPONSE_MODEL, response_model.to_owned()));
         }
         attrs
     }
@@ -500,10 +489,7 @@ mod otel_impl {
         }
         match outcome {
             Some(Outcome::FinishReason(reason)) if !reason.is_empty() => {
-                attrs.push(KeyValue::new(
-                    genai::RESPONSE_FINISH_REASONS,
-                    reason.to_owned(),
-                ));
+                attrs.push(KeyValue::new(genai::RESPONSE_FINISH_REASONS, reason.to_owned()));
             }
             Some(Outcome::Error(error_type)) if !error_type.is_empty() => {
                 attrs.push(KeyValue::new(genai::ERROR_TYPE, error_type.to_owned()));
@@ -545,10 +531,7 @@ mod otel_impl {
     }
 
     /// Build a `gen_ai.tool.message` event: tool-call id + (optional) content.
-    fn gen_ai_tool_message_event(
-        tool_call_id: &str,
-        content: &str,
-    ) -> (&'static str, Vec<KeyValue>) {
+    fn gen_ai_tool_message_event(tool_call_id: &str, content: &str) -> (&'static str, Vec<KeyValue>) {
         let mut attrs = Vec::with_capacity(2);
         push_str_attr(&mut attrs, genai::TOOL_CALL_ID, tool_call_id);
         push_str_attr(&mut attrs, genai::MESSAGE_CONTENT, content);
@@ -573,8 +556,7 @@ mod otel_impl {
 
     fn push_str_array(attrs: &mut Vec<KeyValue>, key: &'static str, values: &[String]) {
         if !values.is_empty() {
-            let arr: Vec<opentelemetry::StringValue> =
-                values.iter().map(|s| s.clone().into()).collect();
+            let arr: Vec<opentelemetry::StringValue> = values.iter().map(|s| s.clone().into()).collect();
             attrs.push(KeyValue::new(
                 key,
                 opentelemetry::Value::Array(opentelemetry::Array::String(arr)),
@@ -689,12 +671,7 @@ mod otel_impl {
     /// The read guard is held across the single record so the borrowed `inst`
     /// stays valid (mirrors [`record_gen_ai_usage`]).
     #[allow(clippy::significant_drop_tightening)]
-    pub fn record_time_to_first_token(
-        system: &str,
-        request_model: &str,
-        operation: &str,
-        ttft_ms: f64,
-    ) {
+    pub fn record_time_to_first_token(system: &str, request_model: &str, operation: &str, ttft_ms: f64) {
         let guard = match INSTRUMENTS.read() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -711,12 +688,7 @@ mod otel_impl {
     /// Records `tpot_ms` to the `gen_ai.server.time_per_output_token` histogram
     /// with the extended attribute set. No-op until the instruments are bound.
     #[allow(clippy::significant_drop_tightening)]
-    pub fn record_time_per_output_token(
-        system: &str,
-        request_model: &str,
-        operation: &str,
-        tpot_ms: f64,
-    ) {
+    pub fn record_time_per_output_token(system: &str, request_model: &str, operation: &str, tpot_ms: f64) {
         let guard = match INSTRUMENTS.read() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -872,11 +844,7 @@ mod otel_impl {
     /// the daemon may call it unconditionally.
     #[must_use]
     #[allow(clippy::module_name_repetitions)]
-    pub fn gen_ai_span(
-        system: &str,
-        request_model: &str,
-        operation: &str,
-    ) -> GenAiSpanGuard {
+    pub fn gen_ai_span(system: &str, request_model: &str, operation: &str) -> GenAiSpanGuard {
         use opentelemetry::global;
         use opentelemetry::trace::{SpanKind, Tracer as _};
 
@@ -907,8 +875,8 @@ mod otel_impl {
         use opentelemetry::Value;
 
         use super::{
-            gen_ai_attributes, gen_ai_attributes_ext, gen_ai_span, init_instruments,
-            record_gen_ai_usage, record_time_per_output_token, record_time_to_first_token, Outcome,
+            gen_ai_attributes, gen_ai_attributes_ext, gen_ai_span, init_instruments, record_gen_ai_usage,
+            record_time_per_output_token, record_time_to_first_token, Outcome,
         };
         use crate::keys::genai;
 
@@ -936,10 +904,7 @@ mod otel_impl {
                 .iter()
                 .find(|kv| kv.key.as_str() == genai::RESPONSE_MODEL)
                 .expect("gen_ai.response.model attribute must be present");
-            assert_eq!(
-                resp_model.value,
-                Value::from("claude-sonnet-4-6".to_string())
-            );
+            assert_eq!(resp_model.value, Value::from("claude-sonnet-4-6".to_string()));
 
             // Every key is a gen_ai.* convention name.
             for kv in &attrs {
@@ -969,9 +934,7 @@ mod otel_impl {
             let attrs = gen_ai_attributes("ollama", "llama3", "");
             assert_eq!(attrs.len(), 2);
             assert!(
-                attrs
-                    .iter()
-                    .all(|kv| kv.key.as_str() != genai::RESPONSE_MODEL),
+                attrs.iter().all(|kv| kv.key.as_str() != genai::RESPONSE_MODEL),
                 "blank response model must not appear as an attribute"
             );
         }
@@ -1005,9 +968,7 @@ mod otel_impl {
 
             // The base relabeled keys are still present.
             assert!(attrs.iter().any(|kv| kv.key.as_str() == genai::SYSTEM));
-            assert!(attrs
-                .iter()
-                .any(|kv| kv.key.as_str() == genai::REQUEST_MODEL));
+            assert!(attrs.iter().any(|kv| kv.key.as_str() == genai::REQUEST_MODEL));
         }
 
         /// An error outcome maps to the `error.type` attribute (not a finish
@@ -1037,15 +998,12 @@ mod otel_impl {
         /// emitted, and an empty outcome string is never a blank attribute.
         #[test]
         fn ext_attributes_omit_outcome_when_absent() {
-            let attrs =
-                gen_ai_attributes_ext("ollama", "llama3", "llama3", genai::OPERATION_CHAT, None);
+            let attrs = gen_ai_attributes_ext("ollama", "llama3", "llama3", genai::OPERATION_CHAT, None);
             assert!(attrs
                 .iter()
                 .all(|kv| kv.key.as_str() != genai::RESPONSE_FINISH_REASONS
                     && kv.key.as_str() != genai::ERROR_TYPE));
-            assert!(attrs
-                .iter()
-                .any(|kv| kv.key.as_str() == genai::OPERATION_NAME));
+            assert!(attrs.iter().any(|kv| kv.key.as_str() == genai::OPERATION_NAME));
         }
 
         /// Recording before any provider is installed is a safe no-op (does not
@@ -1073,22 +1031,20 @@ mod otel_impl {
                 // install() already calls init_instruments(); call again to prove
                 // idempotency / rebind against the now-current provider.
                 init_instruments();
-                record_gen_ai_usage("anthropic", "claude-sonnet-4-6", "claude-sonnet-4-6", 1_234, 567, 42.0, 3);
+                record_gen_ai_usage(
+                    "anthropic",
+                    "claude-sonnet-4-6",
+                    "claude-sonnet-4-6",
+                    1_234,
+                    567,
+                    42.0,
+                    3,
+                );
                 record_gen_ai_usage("openai", "gpt-4o", "", 10, 5, 1.0, 0);
                 // The two new latency histograms also drive through the real
                 // instruments with the extended (operation.name) attribute set.
-                record_time_to_first_token(
-                    "anthropic",
-                    "claude-sonnet-4-6",
-                    genai::OPERATION_CHAT,
-                    18.0,
-                );
-                record_time_per_output_token(
-                    "anthropic",
-                    "claude-sonnet-4-6",
-                    genai::OPERATION_CHAT,
-                    0.6,
-                );
+                record_time_to_first_token("anthropic", "claude-sonnet-4-6", genai::OPERATION_CHAT, 18.0);
+                record_time_per_output_token("anthropic", "claude-sonnet-4-6", genai::OPERATION_CHAT, 0.6);
                 // Skip Drop (would flush to the absent collector); the runtime
                 // tears the reader task down on exit.
                 std::mem::forget(provider);
@@ -1109,7 +1065,11 @@ mod otel_impl {
             let built = tokio::time::timeout(Duration::from_secs(20), async {
                 // Before install: the global tracer is the no-op provider, so
                 // starting + dropping a span is a safe no-op.
-                drop(gen_ai_span("anthropic", "claude-sonnet-4-6", genai::OPERATION_CHAT));
+                drop(gen_ai_span(
+                    "anthropic",
+                    "claude-sonnet-4-6",
+                    genai::OPERATION_CHAT,
+                ));
 
                 let provider = crate::exporter::otel::install(crate::exporter::otel::DEFAULT_ENDPOINT)
                     .expect("install must build a real pipeline");
@@ -1128,10 +1088,7 @@ mod otel_impl {
 
         /// Find an attribute value by its convention key.
         fn find<'a>(attrs: &'a [opentelemetry::KeyValue], key: &str) -> Option<&'a Value> {
-            attrs
-                .iter()
-                .find(|kv| kv.key.as_str() == key)
-                .map(|kv| &kv.value)
+            attrs.iter().find(|kv| kv.key.as_str() == key).map(|kv| &kv.value)
         }
 
         #[test]
@@ -1284,7 +1241,10 @@ mod otel_impl {
         #[test]
         fn response_attributes_carry_real_id_and_cached_tokens() {
             let attrs = super::gen_ai_response_attributes("sess-123#t2", 256);
-            assert_eq!(find(&attrs, genai::RESPONSE_ID), Some(&Value::from("sess-123#t2")));
+            assert_eq!(
+                find(&attrs, genai::RESPONSE_ID),
+                Some(&Value::from("sess-123#t2"))
+            );
             assert_eq!(
                 find(&attrs, genai::USAGE_CACHED_INPUT_TOKENS),
                 Some(&Value::I64(256))
@@ -1298,8 +1258,7 @@ mod otel_impl {
         async fn span_record_methods_run_without_panicking() {
             let built = tokio::time::timeout(Duration::from_secs(20), async {
                 let provider =
-                    crate::exporter::otel::install(crate::exporter::otel::DEFAULT_ENDPOINT)
-                        .expect("install");
+                    crate::exporter::otel::install(crate::exporter::otel::DEFAULT_ENDPOINT).expect("install");
                 {
                     let mut span = gen_ai_span("anthropic", "m", genai::OPERATION_CHAT);
                     span.set_request_params(super::RequestParams {
