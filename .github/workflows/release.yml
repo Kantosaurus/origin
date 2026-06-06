@@ -24,22 +24,17 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           # aarch64 Linux/Windows build on NATIVE ARM64 runners (GA for public
-          # repos) rather than cross-compiling: ONNX Runtime (ort, via
-          # origin-mem) has no aarch64 prebuilt for this ort version, so it
-          # statically compiles ORT from source — which fails to link in the
-          # `cross` container (old sysroot: undefined __libc_single_threaded /
-          # newer libstdc++ symbols) and produced no lib at all when x64->arm64
-          # cross-compiling Windows (unresolved OrtGetApiBase). Native arm64
-          # runners compile + link ORT with a modern toolchain, so the full trio
-          # builds on every target.
+          # repos). ort 2.0.0-rc.12 ships aarch64 ONNX Runtime prebuilts that
+          # download-binaries links cleanly on a native arm64 host; cross-building
+          # them on x64 runners hit sysroot/link gaps (undefined
+          # __libc_single_threaded for Linux; unresolved OrtGetApiBase for the
+          # x64->arm64 Windows cross), so we build them natively.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-          # x86_64 macOS builds on a NATIVE Intel runner: ort rc.12 links ONNX
-          # Runtime for Apple via an xcframework, which only resolves for the
-          # host arch — cross-building x64 on the arm64 `macos-latest` runner
-          # fails ("can't do xcframework linking for x86_64-apple-darwin").
-          - target: x86_64-apple-darwin
-            os: macos-13
+          # NOTE: x86_64 (Intel) macOS is intentionally NOT built — ort rc.12
+          # (ONNX Runtime 1.24.2) dropped the x86_64-apple-darwin prebuilt, and no
+          # ort version ships BOTH x64-macOS and arm64-Windows prebuilts. Apple
+          # Silicon (below) is covered; Intel Macs run the arm64 build via Rosetta 2.
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-pc-windows-msvc
