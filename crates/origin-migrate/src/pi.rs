@@ -90,7 +90,7 @@ fn is_message(line: &PiLine) -> bool {
 }
 
 impl Source for PiSource {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "pi"
     }
 

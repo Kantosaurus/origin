@@ -69,7 +69,7 @@ struct RawHit {
 /// [`SearchError::NoApiKey`] when no key is configured anywhere.
 pub async fn resolve_api_key(vault: &KeyVault) -> Result<String, SearchError> {
     match vault.get("tavily", "default").await {
-        Ok(secret) => Ok(secret.expose().to_string()),
+        Ok(secret) => Ok(secret.expose().clone()),
         Err(origin_keyvault::Error::NotFound { .. }) => {
             std::env::var("TAVILY_API_KEY").map_err(|_| SearchError::NoApiKey)
         }

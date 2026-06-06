@@ -51,9 +51,8 @@ async fn factory_missing_credential_surfaces_error() {
     let factory = ProviderFactory::new(vault, Catalog::builtin());
     let id = ProviderId::parse("anthropic", factory.catalog()).expect("anthropic id");
     let result = factory.build(&id, "default").await;
-    let err = match result {
-        Ok(_) => panic!("expected MissingCredential, got Ok"),
-        Err(e) => e,
+    let Err(err) = result else {
+        panic!("expected MissingCredential, got Ok");
     };
     let msg = format!("{err}");
     assert!(

@@ -46,8 +46,10 @@ use thiserror::Error;
 /// *higher* precedence: `System > Admin > Managed > Project > User`. Use
 /// [`Tier::precedence`] for an explicit numeric rank if comparing across types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum Tier {
     /// Lowest precedence: the individual user's own settings.
+    #[default]
     User,
     /// Project-scoped settings (e.g. a repo's checked-in policy).
     Project,
@@ -101,11 +103,6 @@ pub struct PolicyLayer {
     pub role: Option<String>,
 }
 
-impl Default for Tier {
-    fn default() -> Self {
-        Self::User
-    }
-}
 
 /// Errors that can arise while loading a [`PolicyLayer`] from TOML.
 #[derive(Debug, Error)]
@@ -157,7 +154,7 @@ impl PolicyEngine {
     /// original relative order is preserved (stable sort).
     fn by_precedence_desc(&self) -> Vec<&PolicyLayer> {
         let mut refs: Vec<&PolicyLayer> = self.layers.iter().collect();
-        refs.sort_by(|a, b| b.tier.precedence().cmp(&a.tier.precedence()));
+        refs.sort_by_key(|l| std::cmp::Reverse(l.tier.precedence()));
         refs
     }
 

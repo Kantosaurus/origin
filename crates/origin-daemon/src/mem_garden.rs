@@ -22,6 +22,7 @@
 //! byte-identical. *Closes: gemini-cli L200 (Auto Memory — background mining of
 //! sessions into a review inbox with secret redaction).*
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -232,9 +233,9 @@ fn render_draft(session_id: &str, tags: &[String], body: &str) -> Draft {
     let mut markdown = String::with_capacity(capped.len() + 128);
     markdown.push_str("---\n");
     markdown.push_str("source: auto-memory\n");
-    markdown.push_str(&format!("session: \"{safe_session}\"\n"));
-    markdown.push_str(&format!("tags: {tags_line}\n"));
-    markdown.push_str(&format!("hash: {key}\n"));
+    let _ = writeln!(markdown, "session: \"{safe_session}\"");
+    let _ = writeln!(markdown, "tags: {tags_line}");
+    let _ = writeln!(markdown, "hash: {key}");
     markdown.push_str("---\n\n");
     markdown.push_str(&capped);
     markdown.push('\n');

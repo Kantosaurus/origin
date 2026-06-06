@@ -655,7 +655,7 @@ fn leader_matches(trimmed: &str, leader: &str) -> bool {
     after
         .chars()
         .next()
-        .map_or(true, |c| !(c.is_ascii_alphanumeric() || c == '_'))
+        .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
 }
 
 /// Haskell top-level type signature: `name :: Type`. Requires the ` :: `

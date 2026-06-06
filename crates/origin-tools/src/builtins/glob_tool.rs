@@ -58,7 +58,7 @@ pub fn glob_v2(args: GlobArgs) -> Result<Value, ToolError> {
             .unwrap_or(SystemTime::UNIX_EPOCH);
         file_entries.push((entry.path().display().to_string(), mtime));
     }
-    file_entries.sort_by(|a, b| b.1.cmp(&a.1));
+    file_entries.sort_by_key(|e| std::cmp::Reverse(e.1));
     let arr: Vec<Value> = file_entries
         .into_iter()
         .take(head_limit)

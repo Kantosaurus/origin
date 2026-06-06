@@ -492,7 +492,6 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
                         Ok(env) => bus.publish(env),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             warn!(lagged = n, "plan bridge: fell behind PlanHandle broadcast");
-                            continue;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
@@ -1189,8 +1188,7 @@ fn spawn_handler_task(
                                 started_at_unix: prior
                                     .started_at
                                     .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0),
+                                    .map_or(0, |d| d.as_secs()),
                                 status: origin_goal::GoalStatusWire::Cleared {
                                     by: origin_goal::ClearReasonWire::UserSlash,
                                 },
@@ -2031,8 +2029,7 @@ fn cleared_resume_token(
             started_at_unix: state
                 .started_at
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+                .map_or(0, |d| d.as_secs()),
             status: origin_goal::GoalStatusWire::Cleared { by },
             last_status_tag: state.last_status_tag.clone().map(Into::into),
         }),
@@ -2811,7 +2808,6 @@ fn spawn_plan_relay(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     warn!(lagged = n, "plan relay: subscriber fell behind");
-                    continue;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
@@ -3366,8 +3362,7 @@ fn selfdev_checkpoint(workspace: &std::path::Path, job_id: &str) -> Option<Strin
     let shadow = origin_vcs::ShadowGit::new(&git, shadow_dir.to_string_lossy().into_owned());
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     match shadow.snapshot(&format!("selfdev pre-edit: {job_id}"), now_ms) {
         Ok(cp) => Some(cp.id),
         Err(e) => {
@@ -3679,7 +3674,7 @@ fn persist(session_store: &SessionStore, session: &Session) {
         #[allow(clippy::expect_used)]
         // Turn count in a session cannot exceed u32::MAX in practice.
         let turn = u32::try_from(i).expect("turn fits u32");
-        if let Err(e) = session_store.persist_message(&session.id.to_string(), turn, m) {
+        if let Err(e) = session_store.persist_message(&session.id.clone(), turn, m) {
             error!(error = %e, "persist_message failed");
         }
     }
@@ -3696,7 +3691,7 @@ fn submit_summarize_jobs(sidecar: &Sidecar, session_store: &Arc<SessionStore>, s
         }
         #[allow(clippy::expect_used)]
         let turn_index = u32::try_from(i).expect("turn fits u32");
-        let session_id = session.id.to_string();
+        let session_id = session.id.clone();
         let deliverer = SessionStoreSummaryDeliverer(Arc::clone(session_store));
         let _ = sidecar.submit(SidecarJob::Summarize {
             session_id,

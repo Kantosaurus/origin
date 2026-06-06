@@ -31,7 +31,7 @@ const OLLAMA_HOST: &str = "127.0.0.1";
 /// Default Ollama daemon port.
 const OLLAMA_PORT: u16 = 11434;
 /// Short probe timeout so an absent or wedged daemon cannot stall the command.
-const PROBE_TIMEOUT: Duration = Duration::from_millis(2_000);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Default candidates spanning the major families when the user names none.
 const DEFAULT_CANDIDATES: &[&str] = &[

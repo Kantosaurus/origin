@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Verifies that a speculative task fires *before* the tool_use block closes.
+/// Verifies that a speculative task fires *before* the `tool_use` block closes.
 /// Doesn't go through `run_loop`; instead exercises the parser-driven
 /// spawn shape directly so the unit captures the precise timing invariant.
 #[tokio::test]

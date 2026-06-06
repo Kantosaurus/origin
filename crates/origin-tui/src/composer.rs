@@ -250,12 +250,12 @@ impl Composer {
     }
 
     /// Mutable reference to the main pane grid.
-    pub fn main_grid(&mut self) -> &mut Grid {
+    pub const fn main_grid(&mut self) -> &mut Grid {
         &mut self.main
     }
 
     /// Mutable reference to the side panel grid.
-    pub fn side_grid(&mut self) -> &mut Grid {
+    pub const fn side_grid(&mut self) -> &mut Grid {
         &mut self.side
     }
 
@@ -267,7 +267,7 @@ impl Composer {
     }
 
     /// Mutable reference to the prompt bar grid.
-    pub fn prompt_grid(&mut self) -> &mut Grid {
+    pub const fn prompt_grid(&mut self) -> &mut Grid {
         &mut self.prompt
     }
 

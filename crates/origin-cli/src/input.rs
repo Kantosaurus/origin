@@ -305,7 +305,7 @@ pub fn parse_skill_command(line: &str) -> Option<ClientMessage> {
         if name.is_empty() || !args_str.is_empty() {
             return None;
         }
-        if RESERVED_SLASH_VERBS.iter().any(|v| name == *v) {
+        if RESERVED_SLASH_VERBS.contains(&name) {
             return None;
         }
         return Some(ClientMessage::DeactivateSkill {
@@ -315,7 +315,7 @@ pub fn parse_skill_command(line: &str) -> Option<ClientMessage> {
 
     // Activate form. Reserved-verb guard applies to the first `:`-segment.
     let first_segment = name_token.split(':').next().unwrap_or(name_token);
-    if RESERVED_SLASH_VERBS.iter().any(|v| first_segment == *v) {
+    if RESERVED_SLASH_VERBS.contains(&first_segment) {
         return None;
     }
     let args = if args_str.is_empty() {
@@ -913,6 +913,9 @@ mod tests {
     }
 
     #[test]
+    // The test inputs contain literal `{workflow:x}`-style braces on purpose
+    // (they are parser fixtures, not format strings).
+    #[allow(clippy::literal_string_with_formatting_args)]
     fn parse_workflow_command_rejects_malformed() {
         assert!(parse_workflow_command("{workflow:}").is_none());
         assert!(parse_workflow_command("{workflow}").is_none());

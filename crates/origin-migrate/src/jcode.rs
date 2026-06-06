@@ -8,7 +8,7 @@ use std::path::Path;
 pub struct JcodeSource;
 
 impl Source for JcodeSource {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "jcode"
     }
 

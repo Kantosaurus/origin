@@ -291,7 +291,7 @@ struct GateInner {
 /// `admitted < lane_ceiling AND admitted < hard_max(>=1) AND
 ///  (admitted == 0 OR Unavailable OR
 ///   (admitted < static_ceiling AND available - outstanding - reserve >= headroom))`.
-fn decide(g: &mut GateInner, cfg: &GateCfg, reading: MemReading) -> bool {
+const fn decide(g: &mut GateInner, cfg: &GateCfg, reading: MemReading) -> bool {
     // (a) Forward-progress floor FIRST: with nothing in flight, ALWAYS admit —
     // before EVERY ceiling and the memory test — so the gate can never deadlock
     // for ANY `GateCfg`. A misconfigured ceiling (`lane_ceiling`/`hard_max`/

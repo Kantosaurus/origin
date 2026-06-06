@@ -413,7 +413,7 @@ impl LifecyclePolicy {
 
     /// Record activity on a session: refresh its `last_active_ms`. A no-op for
     /// retired sessions.
-    pub fn on_activity(session: &mut SessionState, now_ms: u64) {
+    pub const fn on_activity(session: &mut SessionState, now_ms: u64) {
         if !session.attach.is_retired() {
             session.last_active_ms = now_ms;
         }

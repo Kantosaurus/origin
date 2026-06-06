@@ -101,7 +101,7 @@ pub fn path() -> Result<PathBuf, ConfigError> {
 /// auto-trigger onboarding on first run.
 #[must_use]
 pub fn exists() -> bool {
-    path().map(|p| p.exists()).unwrap_or(false)
+    path().is_ok_and(|p| p.exists())
 }
 
 /// Load the config from disk. Returns `Ok(None)` if the file does not exist,

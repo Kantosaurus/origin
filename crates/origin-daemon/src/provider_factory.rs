@@ -286,7 +286,7 @@ impl ProviderFactory {
                         .await
                     {
                         Ok(origin_keyvault::RefreshOutcome::Rotated { access }) => {
-                            Ok(StaticBearer::new(access.expose().to_string()))
+                            Ok(StaticBearer::new(access.expose().clone()))
                         }
                         Ok(origin_keyvault::RefreshOutcome::NotDue { .. } | _) => {
                             let secret = self
@@ -698,7 +698,7 @@ mod tests {
     }
 
     /// Cross-provider rebuild scaffold: a known id with a reachable credential
-    /// builds a provider offline (the Anthropic ApiKey wire never touches the
+    /// builds a provider offline (the Anthropic `ApiKey` wire never touches the
     /// network in `build`); an unknown id yields `None` instead of erroring so
     /// the agent loop can fall back to the active provider.
     #[tokio::test]

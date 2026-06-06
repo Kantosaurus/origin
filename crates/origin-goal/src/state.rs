@@ -115,7 +115,7 @@ impl GoalState {
     }
 
     /// Bookkeeping for the verifier's own token spend.
-    pub fn record_verifier_tokens(&mut self, input_tokens: u64, output_tokens: u64) {
+    pub const fn record_verifier_tokens(&mut self, input_tokens: u64, output_tokens: u64) {
         self.tokens_spent = self
             .tokens_spent
             .saturating_add(input_tokens.saturating_add(output_tokens));

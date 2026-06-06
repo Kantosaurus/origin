@@ -4,6 +4,7 @@
 use crate::error::{ErrClass, ToolError};
 use crate::text_fmt;
 use crate::{SideEffects, Tier, Urgency};
+use std::fmt::Write as _;
 
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Clone)]
@@ -57,7 +58,7 @@ fn read_text(bytes: &[u8], args: &ReadArgs) -> Result<String, ToolError> {
     let mut out = String::with_capacity(text.len());
     for (idx, line) in text.lines().enumerate().skip(offset).take(limit) {
         let line_no = idx + 1;
-        out.push_str(&format!("{line_no:>6}\t{line}\n"));
+        let _ = writeln!(out, "{line_no:>6}\t{line}");
     }
     Ok(out)
 }

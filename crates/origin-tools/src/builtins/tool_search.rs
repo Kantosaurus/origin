@@ -39,7 +39,7 @@ pub fn tool_search(args: &ToolSearchArgs) -> Result<Value, ToolError> {
         })
         .filter(|(s, _)| *s > 0)
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|e| std::cmp::Reverse(e.0));
     let arr: Vec<Value> = scored.into_iter().take(max).map(|(_, v)| v).collect();
     Ok(Value::Array(arr))
 }

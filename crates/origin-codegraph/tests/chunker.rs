@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 use origin_codegraph::{chunker, Language};
+use std::fmt::Write as _;
 
 /// Generate a synthetic Rust file with `n` simple functions named `fn_0`, `fn_1`, ...
 fn synth(n: usize) -> String {
     let mut s = String::new();
     for i in 0..n {
-        s.push_str(&format!("fn fn_{i}() {{ let _x = {i}; }}\n"));
+        let _ = writeln!(s, "fn fn_{i}() {{ let _x = {i}; }}");
     }
     s
 }

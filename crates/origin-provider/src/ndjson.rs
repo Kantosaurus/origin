@@ -29,10 +29,7 @@ pub fn from_reqwest(resp: reqwest::Response) -> impl Stream<Item = Result<String
             buf.extend_from_slice(&chunk);
 
             // Drain complete lines.
-            loop {
-                let Some(nl) = buf.iter().position(|b| *b == b'\n') else {
-                    break;
-                };
+            while let Some(nl) = buf.iter().position(|b| *b == b'\n') {
                 // Take bytes [0, nl) as the line; drop the trailing '\n'.
                 let mut line: Vec<u8> = buf.drain(..=nl).collect();
                 line.pop(); // remove '\n'

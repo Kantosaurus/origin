@@ -27,6 +27,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::fmt::Write as _;
+
 use serde::{Deserialize, Serialize};
 
 /// Minimum Rust toolchain `origin` builds against (workspace MSRV).
@@ -132,16 +134,16 @@ impl DoctorReport {
     #[must_use]
     pub fn to_text(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!("doctor: {}\n", self.worst().label()));
+        let _ = writeln!(out, "doctor: {}", self.worst().label());
         for c in &self.checks {
-            out.push_str(&format!("  [{}] {}: {}\n", c.health.label(), c.name, c.detail));
+            let _ = writeln!(out, "  [{}] {}: {}", c.health.label(), c.name, c.detail);
         }
         out.push_str("\nprivacy — outbound behaviours:\n");
         if self.phone_home.is_empty() {
             out.push_str("  (none)\n");
         } else {
             for p in &self.phone_home {
-                out.push_str(&format!("  - {p}\n"));
+                let _ = writeln!(out, "  - {p}");
             }
         }
         out

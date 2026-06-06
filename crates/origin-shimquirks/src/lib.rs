@@ -149,7 +149,7 @@ pub fn redact_url_secrets(url: &str) -> String {
 
     let (mut base, query) = head
         .split_once('?')
-        .map_or((head.to_owned(), None), |(b, q)| (b.to_owned(), Some(q)));
+        .map_or_else(|| (head.to_owned(), None), |(b, q)| (b.to_owned(), Some(q)));
 
     base = redact_userinfo(&base);
 

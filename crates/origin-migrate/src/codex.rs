@@ -93,7 +93,7 @@ fn is_message(line: &CodexLine) -> bool {
 }
 
 impl Source for CodexSource {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "codex"
     }
 

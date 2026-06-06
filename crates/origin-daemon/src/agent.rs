@@ -1282,7 +1282,7 @@ mod swarm_collab_wiring_tests {
     /// End-to-end wiring proof (WS-L, jcode L238): with the gate SET, a worker
     /// (B) that edits a path another worker (A) previously read must leave a
     /// file-shift notice in A's mailbox — exercising `scope_swarm_collab` +
-    /// the same `record_swarm_collab` hook the run_loop fires per tool call.
+    /// the same `record_swarm_collab` hook the `run_loop` fires per tool call.
     #[tokio::test]
     async fn editor_notifies_prior_reader_under_gate() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
@@ -3898,7 +3898,7 @@ const fn block_cache_marker_set(b: &Block) -> bool {
     }
 }
 
-fn clear_block_cache_marker(b: &mut Block) {
+const fn clear_block_cache_marker(b: &mut Block) {
     match b {
         Block::Text { cache_marker, .. }
         | Block::ToolUse { cache_marker, .. }
@@ -6359,7 +6359,7 @@ mod dispatch_table_tests {
         assert!(
             first["preview"]
                 .as_str()
-                .map_or(false, |p| p.contains("quick brown")),
+                .is_some_and(|p| p.contains("quick brown")),
             "hit preview must contain the saved body; got {first}"
         );
     }

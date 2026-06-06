@@ -15,7 +15,7 @@
 //!   Pro/Flash routing happen turn-by-turn.
 //! * The zero-cost path [`choose_model`](LiveRouter::choose_model) overrides the
 //!   turn's model **only** when the chosen
-//!   [`ModelRef`](origin_router::ModelRef)`.provider` matches the **active**
+//!   [`ModelRef`](origin_router::ModelRef) field `.provider` matches the **active**
 //!   provider the loop already holds (`run_loop` borrows one `&dyn Provider`).
 //! * Cross-provider picks are no longer pre-emptively dropped: the lower-level
 //!   [`choose_model_ref`](LiveRouter::choose_model_ref) surfaces the full

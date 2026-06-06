@@ -77,7 +77,6 @@ where
         match confirm(&skill) {
             ImportDecision::Reject => {
                 report.rejected += 1;
-                continue;
             }
             ImportDecision::Accept => {
                 let target_dir = dst.join(&skill.front.name);

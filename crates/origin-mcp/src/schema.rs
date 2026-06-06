@@ -32,7 +32,7 @@ pub struct SchemaCache {
 
 impl std::fmt::Debug for SchemaCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let len = self.inner.read().map(|g| g.len()).unwrap_or(0);
+        let len = self.inner.read().map_or(0, |g| g.len());
         f.debug_struct("SchemaCache").field("len", &len).finish()
     }
 }

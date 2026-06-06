@@ -164,7 +164,7 @@ struct RawPayload {
     #[serde(default)]
     body: Option<RawBody>,
     #[serde(default)]
-    parts: Vec<RawPayload>,
+    parts: Vec<Self>,
 }
 
 #[derive(Deserialize)]

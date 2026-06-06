@@ -17,6 +17,7 @@
 //! bug-hunter / security agent) run in the daemon/swarm review bot; this command
 //! ships the static, no-LLM dimensions that work entirely offline.
 
+use std::fmt::Write as _;
 use std::process::Command;
 
 use anyhow::Result;
@@ -476,16 +477,15 @@ pub fn render(findings: &[Finding], level: Strictness) -> String {
     let surfaced = filter(&merged, level);
 
     let mut out = String::new();
-    out.push_str(&format!(
-        "origin review — strictness {} (confidence >= {:.0}%)\n",
+    let _ = writeln!(
+        out,
+        "origin review — strictness {} (confidence >= {:.0}%)",
         strictness_name(level),
         level.threshold() * 100.0
-    ));
+    );
 
     if surfaced.is_empty() {
-        out.push_str(&format!(
-            "no findings at this strictness ({analyzed} candidate(s) analyzed).\n"
-        ));
+        let _ = writeln!(out, "no findings at this strictness ({analyzed} candidate(s) analyzed).");
         return out;
     }
 
@@ -495,21 +495,23 @@ pub fn render(findings: &[Finding], level: Strictness) -> String {
         } else {
             format!("{}:{}", f.file, f.line)
         };
-        out.push_str(&format!(
-            "{location}  [{}]  c{:.0}%  {}\n",
+        let _ = writeln!(
+            out,
+            "{location}  [{}]  c{:.0}%  {}",
             dimension_name(f.dimension),
             f.confidence * 100.0,
             f.title
-        ));
+        );
         if !f.detail.is_empty() {
-            out.push_str(&format!("    {}\n", f.detail));
+            let _ = writeln!(out, "    {}", f.detail);
         }
     }
 
-    out.push_str(&format!(
-        "\n{} finding(s) surfaced of {analyzed} candidate(s).\n",
+    let _ = writeln!(
+        out,
+        "\n{} finding(s) surfaced of {analyzed} candidate(s).",
         surfaced.len()
-    ));
+    );
     out
 }
 

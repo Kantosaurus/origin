@@ -290,7 +290,7 @@ async fn fetch_api_key(vault: &KeyVault, provider: &str, account: &str) -> Resul
     vault
         .get(provider, account)
         .await
-        .map(|s| s.expose().to_string())
+        .map(|s| s.expose().clone())
         .map_err(|e| format!("vault get {provider}:{account}: {e}"))
 }
 
@@ -301,7 +301,7 @@ async fn fetch_oauth_access(vault: &KeyVault, provider: &str, account: &str) -> 
     let blob = vault
         .get(provider, &key)
         .await
-        .map(|s| s.expose().to_string())
+        .map(|s| s.expose().clone())
         .map_err(|e| format!("vault get {provider}:{key}: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&blob).map_err(|e| format!("parse token json: {e}"))?;
     v.get("access")

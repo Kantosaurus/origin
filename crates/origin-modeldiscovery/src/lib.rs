@@ -213,7 +213,7 @@ impl ModelCache {
     /// treated as fresh (the saturating difference is zero).
     #[must_use]
     pub fn is_stale(&self, provider: &str, now_unix: u64, ttl_secs: u64) -> bool {
-        self.providers.get(provider).map_or(true, |entry| {
+        self.providers.get(provider).is_none_or(|entry| {
             now_unix.saturating_sub(entry.fetched_at_unix) > ttl_secs
         })
     }

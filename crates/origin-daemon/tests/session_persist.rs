@@ -12,7 +12,7 @@ fn round_trip_persists_messages() {
     let store = SessionStore::open(&db).expect("open store");
 
     let mut s = Session::new("anthropic", "claude-opus-4-7");
-    let sid = s.id.to_string();
+    let sid = s.id.clone();
     s.push(Message::new(Role::User).with_block(Block::text("hello")));
     s.push(Message::new(Role::Assistant).with_block(Block::text("hi")));
 

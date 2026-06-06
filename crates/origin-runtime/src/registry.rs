@@ -19,8 +19,7 @@ static INIT_LOCK: Mutex<()> = Mutex::new(());
 
 fn permits_for(class: TaskClass) -> usize {
     let cores = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(4);
+        .map_or(4, std::num::NonZeroUsize::get);
     match class {
         TaskClass::Critical => (cores * 4).max(8),
         TaskClass::Realtime => (cores * 2).max(4),

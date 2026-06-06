@@ -80,8 +80,7 @@ impl SupervisorState {
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// `true` iff destructive enforcement is opted into.
@@ -211,7 +210,7 @@ pub fn on_reattach(session_id: &str) -> bool {
     let Some(session) = map.get_mut(session_id) else {
         return false;
     };
-    LifecyclePolicy::on_reattach(session, now).map_or(false, |decision| {
+    LifecyclePolicy::on_reattach(session, now).is_some_and(|decision| {
         tracing::info!(session = %session_id, ?decision, "supervisor: session reattached");
         true
     })

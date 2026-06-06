@@ -95,6 +95,9 @@ impl Embedder {
     /// # Errors
     /// Propagates tokenizer and ONNX errors; returns [`EmbedderError::BadShape`]
     /// if the output rank is not `[batch=1, 384]`.
+    // The session guard must live through extraction: the output array view
+    // borrows the guarded session before the f32s are copied out into the Vec.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
         let enc = self
             .tokenizer

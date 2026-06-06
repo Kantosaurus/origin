@@ -3,7 +3,7 @@
 //! recorded bench results into a single ranked table (Markdown / JSON).
 //!
 //! Where [`crate::reliability`] reports per-task reliability for one run, this
-//! module collapses a flat `Vec<`[`TaskResult`]`>` (which may mix several
+//! module collapses a flat vector of [`TaskResult`] values (which may mix several
 //! contestants and repeated `(contestant, task)` rows) into one row per
 //! contestant — mean pass@k, mean flakiness and mean wall-clock — then ranks
 //! them: highest mean pass@k first, ties broken by lower flakiness, then faster

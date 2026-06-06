@@ -4,6 +4,7 @@
 //! Pure Rust path — no subprocess required. Used for one-shot reader-mode
 //! summaries where the router's snapshot/ref protocol would be overkill.
 
+use std::fmt::Write as _;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -112,9 +113,10 @@ pub fn render_combined_markdown(outcomes: &[UrlOutcome], truncated: Option<usize
     // Pre-size generously: header + a chunk per outcome.
     let mut out = String::with_capacity(64 + outcomes.len() * 256);
     if let Some(supplied) = truncated {
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "_Note: {supplied} URLs supplied; fetched the first {MAX_URLS}._\n\n"
-        ));
+        );
     }
     for (i, oc) in outcomes.iter().enumerate() {
         if i > 0 {
@@ -125,7 +127,9 @@ pub fn render_combined_markdown(outcomes: &[UrlOutcome], truncated: Option<usize
         out.push_str("\n\n");
         match &oc.result {
             Ok(md) => out.push_str(md),
-            Err(reason) => out.push_str(&format!("(fetch failed: {reason})")),
+            Err(reason) => {
+                let _ = write!(out, "(fetch failed: {reason})");
+            }
         }
     }
     out

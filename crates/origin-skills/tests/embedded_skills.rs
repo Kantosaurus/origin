@@ -27,7 +27,7 @@ fn embedded_includes_all_15_superpowers_skills() {
     ];
     for want in expected {
         assert!(
-            names.iter().any(|n| *n == want),
+            names.contains(&want),
             "missing embedded skill: {want}; got {names:?}"
         );
     }

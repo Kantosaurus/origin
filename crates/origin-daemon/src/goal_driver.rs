@@ -666,8 +666,7 @@ mod tests {
 
     #[test]
     fn truncate_for_verifier_keeps_tail_when_over_limit() {
-        let s: String = std::iter::repeat('a')
-            .take(VERIFIER_INPUT_MAX_CHARS + 100)
+        let s: String = std::iter::repeat_n('a', VERIFIER_INPUT_MAX_CHARS + 100)
             .collect();
         let out = truncate_for_verifier(&s);
         assert_eq!(out.len(), VERIFIER_INPUT_MAX_CHARS);

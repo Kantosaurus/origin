@@ -24,6 +24,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -285,7 +286,7 @@ impl MorningReport {
             }
         }
 
-        out.push_str(&format!("\n## Tokens spent\n\n{}\n", self.tokens_spent));
+        let _ = write!(out, "\n## Tokens spent\n\n{}\n", self.tokens_spent);
 
         out.push_str("\n## PRs opened\n\n");
         if self.prs_opened.is_empty() {

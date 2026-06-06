@@ -46,8 +46,7 @@ fn refs_root() -> Option<PathBuf> {
 fn unique_subdir(root: &std::path::Path, prefix: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     root.join(format!("{prefix}-{nanos}"))
 }
 

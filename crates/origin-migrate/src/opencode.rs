@@ -32,7 +32,7 @@ struct OcSession {
 }
 
 impl Source for OpencodeSource {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "opencode"
     }
 

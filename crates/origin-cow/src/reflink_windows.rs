@@ -88,7 +88,6 @@ fn walk_and_clone(src: &Path, dst: &Path) -> Result<(), Error> {
             clone_one_file(&from, &to)?;
         } else {
             // Symlinks / sockets: skip silently (matches hardlink_fallback semantics).
-            continue;
         }
     }
     Ok(())
@@ -104,7 +103,7 @@ fn clone_one_file(src: &Path, dst: &Path) -> Result<(), Error> {
     let mut src_size: i64 = 0;
     // SAFETY: src_handle is a valid open handle from CreateFileW; we
     // pass a pointer to a stack-allocated i64 that lives for the call.
-    unsafe { GetFileSizeEx(src_handle, &mut src_size) }
+    unsafe { GetFileSizeEx(src_handle, &raw mut src_size) }
         .map_err(|e| unsupported(format!("GetFileSizeEx({}): {e}", src.display())))?;
 
     // Reflink and trim run against a sibling temp file; we only expose
@@ -162,7 +161,7 @@ fn clone_one_file(src: &Path, dst: &Path) -> Result<(), Error> {
             u32::try_from(std::mem::size_of::<DUPLICATE_EXTENTS_DATA>()).unwrap_or(u32::MAX),
             None,
             0,
-            Some(&mut bytes_returned),
+            Some(&raw mut bytes_returned),
             None,
         )
     };
@@ -233,8 +232,7 @@ fn temp_sibling(dst: &Path) -> std::path::PathBuf {
     // opened with CREATE_ALWAYS which would overwrite anyway.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     let file_name = dst
         .file_name()
         .map_or_else(|| String::from("reflink"), |s| s.to_string_lossy().into_owned());

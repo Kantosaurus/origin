@@ -182,7 +182,7 @@ pub fn rank(hits: Vec<SearchHit>, query: &str) -> Vec<SearchHit> {
             (score, hit)
         })
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|x| std::cmp::Reverse(x.0));
 
     let mut seen: Vec<String> = Vec::new();
     let mut out = Vec::new();

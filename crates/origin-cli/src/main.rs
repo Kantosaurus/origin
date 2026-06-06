@@ -800,7 +800,7 @@ async fn run_event_loop(
         }
         if let crossterm::event::Event::Key(ev) = event {
             match handle_key_event(ev, &app, &handle, &interrupt_tx, path, model, session_id).await {
-                KeyOutcome::Continue => continue,
+                KeyOutcome::Continue => {}
                 KeyOutcome::Break => break,
             }
         }

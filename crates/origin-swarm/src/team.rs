@@ -28,6 +28,7 @@
 //! purely the shared vocabulary plus the in-memory bookkeeping.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use thiserror::Error;
 
@@ -311,7 +312,7 @@ impl MissionLog {
                 out.push('\n');
             }
             // `#<n> [<label>] <id>` then an optional ` <note>` tail.
-            out.push_str(&format!("#{} [{}] {:032x}", i + 1, e.event.label(), e.teammate.value()));
+            let _ = write!(out, "#{} [{}] {:032x}", i + 1, e.event.label(), e.teammate.value());
             if !e.note.is_empty() {
                 out.push(' ');
                 out.push_str(&e.note);

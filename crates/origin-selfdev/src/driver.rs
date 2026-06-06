@@ -267,7 +267,7 @@ impl SelfDevDriver {
 
     /// Manually reset the storm guard, re-enabling self-dev. The daemon calls
     /// this only after an operator has acknowledged the failures.
-    pub fn reset_storm_guard(&mut self) {
+    pub const fn reset_storm_guard(&mut self) {
         self.consecutive_failures = 0;
     }
 

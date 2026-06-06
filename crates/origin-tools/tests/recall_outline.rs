@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use origin_cas::{Store, StoreConfig};
 use origin_tools::builtins::recall::{recall_tool, Region};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -51,7 +52,7 @@ fn outline_only_caps_at_200_entries() {
     let store = open_store();
     let mut body = String::new();
     for n in 0..250 {
-        body.push_str(&format!("fn x_{n}() {{}}\n"));
+        let _ = writeln!(body, "fn x_{n}() {{}}");
     }
     let h = store.put(body.as_bytes()).expect("put");
     let out = recall_tool(&store, *h.as_bytes(), Some(Region::OutlineOnly)).expect("ok");

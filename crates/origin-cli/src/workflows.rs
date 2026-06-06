@@ -94,7 +94,7 @@ pub fn path() -> Result<PathBuf, WorkflowsError> {
 /// `true` when `workflows.toml` is present on disk.
 #[must_use]
 pub fn exists() -> bool {
-    path().map(|p| p.exists()).unwrap_or(false)
+    path().is_ok_and(|p| p.exists())
 }
 
 /// Atomic save: write to `.tmp` sibling, then rename — same convention

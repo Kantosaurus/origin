@@ -120,7 +120,7 @@ impl Ring {
 pub fn parse(bytes: &[u8]) -> Result<(), RingError> {
     let mut cursor = 0usize;
     while cursor < bytes.len() {
-        if cursor.checked_add(4).map_or(true, |end| end > bytes.len()) {
+        if cursor.checked_add(4).is_none_or(|end| end > bytes.len()) {
             return Err(RingError::Decode("len prefix truncated".into()));
         }
         let len_bytes: [u8; 4] = bytes[cursor..cursor + 4]

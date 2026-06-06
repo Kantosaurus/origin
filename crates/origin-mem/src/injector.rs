@@ -169,8 +169,7 @@ pub const fn memory_id_to_u64(id: &MemoryId) -> u64 {
 fn now_ms_i64() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 #[allow(clippy::cast_precision_loss)] // age in days fits comfortably in f32

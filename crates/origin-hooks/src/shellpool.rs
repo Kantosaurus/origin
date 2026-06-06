@@ -136,7 +136,7 @@ impl ShellPool {
     pub async fn dispatch(&self, script: &str) -> Result<Vec<u8>, PoolError> {
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         let mut slot = self.workers[idx].lock().await;
-        let alive = slot.as_mut().map_or(false, Worker::is_alive);
+        let alive = slot.as_mut().is_some_and(Worker::is_alive);
         if !alive {
             *slot = Some(Worker::spawn(&self.spec)?);
             self.spawn_count.fetch_add(1, Ordering::Relaxed);

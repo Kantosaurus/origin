@@ -25,7 +25,8 @@ use origin_goal::{ClearReasonWire, GoalState};
 /// (`MaxIter` / `BudgetExhausted`).
 #[must_use]
 pub fn clear_all_event_for(prior: Option<&GoalState>) -> Option<StreamEvent> {
-    prior.map(|g| StreamEvent::GoalCleared {
+    let g = prior?;
+    Some(StreamEvent::GoalCleared {
         reason: ClearReasonWire::UserClearAll,
         iter: g.iter,
         tokens_spent: g.tokens_spent,

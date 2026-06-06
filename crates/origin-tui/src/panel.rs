@@ -164,8 +164,8 @@ impl Panel {
                         );
                     }
                 }
-                PanelEvent::ShowMetrics => continue,
-            };
+                PanelEvent::ShowMetrics => {}
+            }
         }
     }
 }

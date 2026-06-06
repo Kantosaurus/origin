@@ -82,7 +82,7 @@ impl SessionStore {
     /// # Errors
     /// Returns a sqlite error on write failure.
     pub fn persist_session(&self, s: &Session) -> Result<(), SessionStoreError> {
-        let id = s.id.to_string();
+        let id = s.id.clone();
         let provider = s.provider_name.clone();
         let model = s.model.clone();
         let now = now_ms();
@@ -366,11 +366,10 @@ fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| {
+        .map_or(0, |d| {
             // Saturating cast — won't overflow in our lifetime.
             i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
         })
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

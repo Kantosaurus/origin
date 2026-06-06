@@ -123,7 +123,7 @@ impl Spinner {
         self.start = Instant::now();
     }
 
-    pub fn stop(&mut self) {
+    pub const fn stop(&mut self) {
         self.active = false;
     }
 
@@ -434,7 +434,7 @@ impl App {
     /// session in vim Normal mode; `false` (the default) leaves the composer in
     /// direct-insert mode so the key path is byte-identical. Enabling starts in
     /// [`VimMode::Normal`] (vim convention), matching [`Self::toggle_vim`].
-    pub fn set_vim_active(&mut self, active: bool) {
+    pub const fn set_vim_active(&mut self, active: bool) {
         self.vim_active = active;
         self.vim_mode = if active {
             VimMode::Normal
@@ -593,7 +593,7 @@ impl App {
     /// Apply a streaming usage delta. Mirrors `record_usage` but takes no
     /// elapsed value — used while a turn is in flight so the token counts
     /// and cost in the status line update as events stream in.
-    pub fn record_usage_tokens(
+    pub const fn record_usage_tokens(
         &mut self,
         input_tokens: u32,
         output_tokens: u32,
@@ -662,15 +662,15 @@ impl App {
         self.usage.model = model.into();
     }
 
-    pub fn scroll_up(&mut self, n: usize) {
+    pub const fn scroll_up(&mut self, n: usize) {
         self.scroll_offset = self.scroll_offset.saturating_add(n);
     }
 
-    pub fn scroll_down(&mut self, n: usize) {
+    pub const fn scroll_down(&mut self, n: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
     }
 
-    pub fn scroll_to_bottom(&mut self) {
+    pub const fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
     }
 
@@ -781,7 +781,7 @@ impl App {
     /// state. Enabling always starts in [`VimMode::Normal`] (vim convention);
     /// disabling resets to [`VimMode::Insert`] so the composer is immediately
     /// back to byte-identical direct insert.
-    pub fn toggle_vim(&mut self) -> bool {
+    pub const fn toggle_vim(&mut self) -> bool {
         self.vim_active = !self.vim_active;
         self.vim_mode = if self.vim_active {
             VimMode::Normal
@@ -1616,6 +1616,9 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine], pal: theme::Palette) 
     // a glance.
     let checklist = render_focus_chain(plan_lines);
     let mut row: u16 = 2;
+    // `row` is a screen-row render cursor starting at 2 (not a 0-based index),
+    // and the loop early-breaks at `rows`, so enumerate doesn't fit cleanly.
+    #[allow(clippy::explicit_counter_loop)]
     for (pl, checkbox) in plan_lines.iter().zip(&checklist) {
         if row >= rows {
             break;
