@@ -152,32 +152,29 @@ impl Supervisor {
             .stdin(Stdio::null());
         cmd.kill_on_drop(true);
 
-        let child = cmd
-            .spawn()
-            .or_else(|_err| {
-                #[cfg(windows)]
-                {
-                    let mut fallback = Command::new("powershell");
-                    fallback.args(["-NoProfile", "-Command", command]);
-                    if let Some(cwd) = &opts.cwd {
-                        fallback.current_dir(cwd);
-                    }
-                    for (k, v) in &opts.env {
-                        fallback.env(k, v);
-                    }
-                    fallback
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .stdin(Stdio::null());
-                    fallback.kill_on_drop(true);
-                    fallback.spawn()
-                }
-                #[cfg(unix)]
-                {
-                    Err(_err)
-                }
-            })
-            .map_err(|e| ToolError::new(ErrClass::Bash, "spawn_failed", e.to_string()))?;
+        let spawned = cmd.spawn();
+        // On Windows, if the direct spawn fails (e.g. the command is a shell
+        // builtin), retry once through PowerShell. On Unix there is no fallback,
+        // so the spawn result is propagated as-is.
+        #[cfg(windows)]
+        let spawned = spawned.or_else(|_| {
+            let mut fallback = Command::new("powershell");
+            fallback.args(["-NoProfile", "-Command", command]);
+            if let Some(cwd) = &opts.cwd {
+                fallback.current_dir(cwd);
+            }
+            for (k, v) in &opts.env {
+                fallback.env(k, v);
+            }
+            fallback
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .stdin(Stdio::null());
+            fallback.kill_on_drop(true);
+            fallback.spawn()
+        });
+        let child =
+            spawned.map_err(|e| ToolError::new(ErrClass::Bash, "spawn_failed", e.to_string()))?;
 
         let table = self.inner.clone();
         tokio::spawn(supervise(pid, child, opts.timeout, table));

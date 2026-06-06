@@ -50,6 +50,7 @@ mod unix_only {
             std::thread::sleep(Duration::from_millis(50));
         }
         let _ = sup.kill();
+        let _ = sup.wait(); // reap the supervisor so it doesn't linger as a zombie
         assert!(
             restart_count >= 2,
             "supervisor should have launched the daemon at least twice (initial + 1 restart); got {restart_count}"

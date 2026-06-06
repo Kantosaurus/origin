@@ -46,12 +46,14 @@ mod unix_only {
             pending_tool_calls: Vec::new(),
             plan_seq: 0,
             goal: None,
+            detached_at_unix: None,
+            memory_estimate_bytes: None,
         };
         token.save(tmp.path()).expect("save");
         let loaded: Vec<ResumeToken> = ResumeToken::load_all(tmp.path()).expect("load");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].session_id, "smoke");
         // Compile-time check: the replay surface exists and is async.
-        let _ = std::ptr::addr_of!(ipc_resume::replay_all);
+        let _ = ipc_resume::replay_all;
     }
 }

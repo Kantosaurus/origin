@@ -101,12 +101,12 @@ fn enforce_enabled() -> bool {
 pub fn sample_rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-        // Fields are in pages: size, resident, shared, text, lib, data, dt.
-        let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
         // Page size is 4096 on every Linux target origin supports; reading it
         // dynamically would need libc (`sysconf`), which we avoid here.
         const PAGE_BYTES: u64 = 4096;
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        // Fields are in pages: size, resident, shared, text, lib, data, dt.
+        let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
         Some(resident_pages.saturating_mul(PAGE_BYTES))
     }
     #[cfg(not(target_os = "linux"))]
@@ -357,7 +357,7 @@ mod tests {
         let rss = sample_rss_bytes();
         #[cfg(target_os = "linux")]
         assert!(
-            rss.map_or(true, |b| b > 0),
+            rss.is_none_or(|b| b > 0),
             "linux RSS should be positive when present"
         );
         #[cfg(not(target_os = "linux"))]
