@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Linux backend — talks to the freedesktop Secret Service (gnome-keyring,
-//! KWallet, etc.) over D-Bus.
+//! `KWallet`, etc.) over D-Bus.
 //!
 //! Items are stored under attribute pairs:
 //!   `origin-provider = <provider>`
@@ -96,7 +96,7 @@ impl Backend for LinuxBackend {
             .await
             .map_err(|e| Error::Backend(format!("search_items: {e}")))?;
         let mut out = Vec::new();
-        for item in items.unlocked.into_iter().chain(items.locked.into_iter()) {
+        for item in items.unlocked.into_iter().chain(items.locked) {
             let item_attrs = item
                 .get_attributes()
                 .await
