@@ -7281,10 +7281,12 @@ mod bash_streaming_tests {
             run_bash_streaming(&args, Some(&tx)).await
         });
 
-        // The first chunk must arrive before the full sleep elapses.
-        let first = tokio::time::timeout(Duration::from_millis(800), rx.recv())
+        // Allow generous time for shell cold-start (pwsh on Windows can take
+        // >1s); the real-time guarantee is proven by the gap to the LATE chunk
+        // below, not by an absolute wall-clock deadline here.
+        let first = tokio::time::timeout(Duration::from_secs(8), rx.recv())
             .await
-            .expect("first ToolChunk must arrive before the command finishes")
+            .expect("first ToolChunk must arrive")
             .expect("channel open");
         let first_at = start.elapsed();
         match first {
@@ -7294,21 +7296,29 @@ mod bash_streaming_tests {
             }
             other => panic!("expected ToolChunk(early), got {other:?}"),
         }
-        assert!(
-            first_at < Duration::from_millis(800),
-            "first chunk streamed at {first_at:?}; output was buffered, not real-time"
-        );
 
-        // Drain the rest; the late line must also arrive.
+        // Drain the rest; capture WHEN the late line arrives.
         let mut saw_late = false;
+        let mut late_at = first_at;
         while let Some(ev) = rx.recv().await {
             if let StreamEvent::ToolChunk { content, .. } = ev {
                 if content == "late" {
                     saw_late = true;
+                    late_at = start.elapsed();
                 }
             }
         }
         assert!(saw_late, "late line never streamed");
+
+        // Real-time guarantee, decoupled from shell-startup latency: `early`
+        // must arrive measurably BEFORE `late` (which follows a ~1s sleep). If
+        // output were buffered until exit, both would surface together at the end.
+        // Shell cold-start offsets both timestamps equally, so the GAP is the
+        // platform-independent signal.
+        assert!(
+            late_at.saturating_sub(first_at) >= Duration::from_millis(500),
+            "early at {first_at:?}, late at {late_at:?}; gap too small — output looks buffered, not real-time"
+        );
 
         let bytes = driver.await.expect("task joined").expect("bash ok");
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
