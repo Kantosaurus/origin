@@ -173,8 +173,7 @@ impl Supervisor {
             fallback.kill_on_drop(true);
             fallback.spawn()
         });
-        let child =
-            spawned.map_err(|e| ToolError::new(ErrClass::Bash, "spawn_failed", e.to_string()))?;
+        let child = spawned.map_err(|e| ToolError::new(ErrClass::Bash, "spawn_failed", e.to_string()))?;
 
         let table = self.inner.clone();
         tokio::spawn(supervise(pid, child, opts.timeout, table));
