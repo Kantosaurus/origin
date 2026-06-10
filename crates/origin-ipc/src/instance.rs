@@ -110,7 +110,7 @@ impl InstanceId {
     /// Directory holding this instance's spawn-control files
     /// (`<home>/.origin/daemons`). Callers map over their (optional) home dir.
     #[must_use]
-    pub fn control_dir(home: PathBuf) -> PathBuf {
+    pub fn control_dir(home: &Path) -> PathBuf {
         home.join(".origin").join("daemons")
     }
 
@@ -119,7 +119,8 @@ impl InstanceId {
     /// home dir is resolvable.
     #[must_use]
     pub fn stamp_path(&self, home: Option<PathBuf>) -> Option<PathBuf> {
-        home.map(|h| Self::control_dir(h).join(format!("{}.stamp", self.hex)))
+        let dir = Self::control_dir(&home?);
+        Some(dir.join(format!("{}.stamp", self.hex)))
     }
 
     /// Path of the pid file recording the daemon/supervisor process ids spawned
@@ -127,7 +128,8 @@ impl InstanceId {
     /// another project's daemon. `None` when no home dir is resolvable.
     #[must_use]
     pub fn pid_path(&self, home: Option<PathBuf>) -> Option<PathBuf> {
-        home.map(|h| Self::control_dir(h).join(format!("{}.pid", self.hex)))
+        let dir = Self::control_dir(&home?);
+        Some(dir.join(format!("{}.pid", self.hex)))
     }
 }
 
