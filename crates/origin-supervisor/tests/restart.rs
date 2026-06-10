@@ -69,13 +69,23 @@ mod unix_only {
         if first < 1 {
             let _ = sup.kill();
             let _ = sup.wait();
-            panic!("supervisor never launched the daemon stub within 10s");
         }
+        assert!(first >= 1, "supervisor never launched the daemon stub within 10s");
 
-        // Kill the current stub instance to force the restart path.
-        let _ = Command::new("pkill")
-            .args(["-f", stub_path.to_str().expect("utf8")])
-            .status();
+        // Kill exactly the current stub instance (its PID is in the run log)
+        // to force the restart path. The old `pkill -f <stub>` also matched
+        // the SUPERVISOR's own cmdline (`--daemon-path <stub>`), so whether a
+        // restart was ever observed depended on signal-delivery order — the
+        // other half of the flake.
+        let stub_pid = std::fs::read_to_string(&runs_path)
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .last()
+                    .and_then(|l| l.split_whitespace().nth(1).map(str::to_owned))
+            })
+            .expect("run log records the stub pid");
+        let _ = Command::new("kill").args(["-9", &stub_pid]).status();
 
         let restart_count = wait_for_runs(&runs_path, 2, Duration::from_secs(10));
         let _ = sup.kill();
