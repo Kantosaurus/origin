@@ -108,25 +108,26 @@ impl InstanceId {
     }
 
     /// Directory holding this instance's spawn-control files
-    /// (`<home>/.origin/daemons`). `None` when no home dir is resolvable.
+    /// (`<home>/.origin/daemons`). Callers map over their (optional) home dir.
     #[must_use]
-    pub fn control_dir(home: Option<PathBuf>) -> Option<PathBuf> {
-        home.map(|h| h.join(".origin").join("daemons"))
+    pub fn control_dir(home: PathBuf) -> PathBuf {
+        home.join(".origin").join("daemons")
     }
 
     /// Path of the stamp file recording when this instance's daemon was last
-    /// spawned (mtime comparison drives newer-binary restarts).
+    /// spawned (mtime comparison drives newer-binary restarts). `None` when no
+    /// home dir is resolvable.
     #[must_use]
     pub fn stamp_path(&self, home: Option<PathBuf>) -> Option<PathBuf> {
-        Self::control_dir(home).map(|d| d.join(format!("{}.stamp", self.hex)))
+        home.map(|h| Self::control_dir(h).join(format!("{}.stamp", self.hex)))
     }
 
     /// Path of the pid file recording the daemon/supervisor process ids spawned
     /// for this instance, so a restart kills exactly those processes and never
-    /// another project's daemon.
+    /// another project's daemon. `None` when no home dir is resolvable.
     #[must_use]
     pub fn pid_path(&self, home: Option<PathBuf>) -> Option<PathBuf> {
-        Self::control_dir(home).map(|d| d.join(format!("{}.pid", self.hex)))
+        home.map(|h| Self::control_dir(h).join(format!("{}.pid", self.hex)))
     }
 }
 
