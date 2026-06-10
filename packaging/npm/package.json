@@ -2,7 +2,7 @@
   "name": "@kantosaurus/origin",
   "//name": "scripts/build.mjs sets name from PKG_PREFIX (lib/platform.js, default @kantosaurus/origin) at publish time; keep this in sync for local `npm pack`/readers.",
   "//version": "Placeholder. scripts/build.mjs --version stamps the real version (in lockstep with the Cargo workspace tag) at publish time; this committed value is never what ships.",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "description": "Origin — a fast, terminal-native AI coding agent. Install globally and run `origin` to launch the TUI.",
   "bin": {
     "origin": "bin/origin.js"
