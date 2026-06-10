@@ -102,6 +102,10 @@ fn push_sgr_inner(out: &mut Vec<u8>, fg: u32, bg: u32, attr: Attr, want_color: b
 
 fn push_glyph(out: &mut Vec<u8>, scalar: u32) {
     if let Some(ch) = char::from_u32(scalar) {
+        // Never emit a raw control character: it would move the terminal cursor
+        // (e.g. `\r` → column 0) and corrupt the frame. Substitute a space so the
+        // cell still advances the cursor by its one column.
+        let ch = if ch.is_control() { ' ' } else { ch };
         let mut buf = [0u8; 4];
         out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
     }

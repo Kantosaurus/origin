@@ -244,11 +244,53 @@ fn is_env_assignment(tok: &str) -> bool {
     first_ok && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Reduce a command token to its bare program name so detectors that key off
+/// the command are not fooled by an absolute/relative path or a leading
+/// backslash that suppresses a shell alias: `/bin/rm`, `./rm`, and `\rm` all
+/// resolve to `rm`. Surrounding quotes are stripped first.
+fn effective_command_name(tok: &str) -> &str {
+    let tok = tok.trim_matches(['"', '\'']).trim_start_matches('\\');
+    tok.rsplit(['/', '\\']).next().unwrap_or(tok)
+}
+
+/// Command words that wrap and then exec a *later* command, so anchoring a
+/// detector on the literal first word lets `sudo rm -rf ~` or `env rm -rf ~`
+/// slip through. Compared by bare program name.
+fn is_command_wrapper(tok: &str) -> bool {
+    matches!(
+        effective_command_name(tok),
+        "sudo"
+            | "doas"
+            | "env"
+            | "command"
+            | "builtin"
+            | "exec"
+            | "time"
+            | "nice"
+            | "ionice"
+            | "nohup"
+            | "setsid"
+            | "stdbuf"
+            | "xargs"
+    )
+}
+
+/// The program word of a command line, skipping leading `NAME=value`
+/// assignments and wrapper commands (`sudo`, `env`, ...) and normalized to its
+/// bare program name. Returns `None` for an empty/all-prefix command.
+fn effective_command(ws: &[String]) -> Option<&str> {
+    ws.iter()
+        .find(|w| !is_env_assignment(w) && !is_command_wrapper(w))
+        .map(|w| effective_command_name(w))
+}
+
 /// `rm -rf` (in any flag order) aimed at `~`, `$HOME`, `/`, or a `$HOME`-with
-/// -trailing-slash path is catastrophic.
+/// -trailing-slash path is catastrophic. The `rm` is matched by its bare
+/// program name after skipping env-assignment and wrapper prefixes, so
+/// `sudo rm -rf ~`, `/bin/rm -rf /`, and `\rm -rf ~` are all caught.
 fn detect_rm_rf_home(cmd: &str, risks: &mut Vec<Risk>) {
     let ws = words(cmd);
-    if ws.first().map(String::as_str) != Some("rm") {
+    if effective_command(&ws) != Some("rm") {
         return;
     }
     let has_recursive_force = ws.iter().skip(1).any(|w| is_rf_flag(w));
@@ -458,6 +500,34 @@ mod tests {
         // A specific subdirectory is not flagged by this detector.
         let a = analyze("rm -rf ./build");
         assert!(matches!(worst(&a), Risk::Safe), "build dir should be safe");
+    }
+
+    #[test]
+    fn rm_rf_home_via_command_prefix_is_still_dangerous() {
+        // A wrapper command, an absolute path, a leading alias-suppressing
+        // backslash, or an env-assignment prefix must not let `rm -rf ~` evade
+        // the Dangerous classification.
+        for line in [
+            "sudo rm -rf ~",
+            "doas rm -rf /",
+            "/bin/rm -rf ~",
+            "/usr/bin/rm -rf $HOME",
+            r"\rm -rf ~",
+            "env rm -rf /",
+            "nice rm -rf ~",
+            "sudo /bin/rm -rf ~",
+            "FOO=bar rm -rf ~",
+        ] {
+            let a = analyze(line);
+            assert!(
+                matches!(worst(&a), Risk::Dangerous(_)),
+                "expected Dangerous for {line:?}, got {:?}",
+                worst(&a)
+            );
+        }
+        // A wrapper in front of a benign command is not upgraded to Dangerous.
+        let a = analyze("sudo ls -la");
+        assert!(!matches!(worst(&a), Risk::Dangerous(_)));
     }
 
     #[test]

@@ -1,2 +1,6 @@
 # Clippy lint configuration.
 # Primary lint configuration lives in [workspace.lints.clippy] in Cargo.toml.
+
+# Proper nouns that `clippy::doc_markdown` would otherwise flag as
+# missing-backtick identifiers. `".."` extends clippy's built-in allow-list.
+doc-valid-idents = ["ReFS", "KWallet", ".."]

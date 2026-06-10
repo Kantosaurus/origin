@@ -212,7 +212,21 @@ impl Metrics {
                 }
                 labels_segment.push_str(k);
                 labels_segment.push_str("=\"");
-                labels_segment.push_str(v);
+                // Escape the value for the Prometheus text exposition format.
+                // Label values such as `model` come from upstream provider
+                // metadata (untrusted); written verbatim a value containing a
+                // double-quote, backslash, or newline would break out of the
+                // `name="value"` quoting and let a hostile value inject extra
+                // label pairs or whole counterfeit metric lines into the
+                // `/metrics` output. The exposition spec escapes exactly these.
+                for ch in v.chars() {
+                    match ch {
+                        '\\' => labels_segment.push_str("\\\\"),
+                        '"' => labels_segment.push_str("\\\""),
+                        '\n' => labels_segment.push_str("\\n"),
+                        other => labels_segment.push(other),
+                    }
+                }
                 labels_segment.push('"');
             }
             labels_segment.push('}');

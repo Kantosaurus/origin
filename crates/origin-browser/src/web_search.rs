@@ -46,10 +46,21 @@ struct ReqBody<'a> {
     api_key: &'a str,
     query: &'a str,
     max_results: usize,
+    /// Ask Tavily to synthesize a single source-grounded answer so the model can
+    /// use it directly instead of re-deriving one from the raw snippets — fewer
+    /// tokens spent reading hits, and a more accurate, cited result.
+    include_answer: bool,
+    /// `"basic"` (default, cheaper) is sufficient for the LLM-snippet use case;
+    /// avoids the higher per-call cost of `"advanced"`.
+    search_depth: &'static str,
 }
 #[derive(Deserialize)]
 struct RawResp {
     results: Vec<RawHit>,
+    /// The grounded answer, present only when `include_answer` was requested and
+    /// Tavily produced one. `default` keeps older/mocked responses parseable.
+    #[serde(default)]
+    answer: Option<String>,
 }
 #[derive(Deserialize)]
 struct RawHit {
@@ -105,11 +116,19 @@ pub async fn search_with_endpoint(
             api_key: &opts.api_key,
             query,
             max_results: opts.count,
+            include_answer: true,
+            search_depth: "basic",
         })
         .send()
         .await?;
     let raw: RawResp = resp.json().await.map_err(|e| SearchError::Parse(e.to_string()))?;
-    Ok(raw
+    Ok(hits_from_raw(raw))
+}
+
+/// Map a Tavily response to [`SearchHit`]s, prepending the grounded answer (when
+/// present) as the first hit so the model reads it before the raw snippets.
+fn hits_from_raw(raw: RawResp) -> Vec<SearchHit> {
+    let mut hits: Vec<SearchHit> = raw
         .results
         .into_iter()
         .map(|h| SearchHit {
@@ -117,7 +136,18 @@ pub async fn search_with_endpoint(
             url: h.url,
             snippet: h.content,
         })
-        .collect())
+        .collect();
+    if let Some(answer) = raw.answer.filter(|a| !a.trim().is_empty()) {
+        hits.insert(
+            0,
+            SearchHit {
+                title: "Answer (grounded by Tavily)".to_string(),
+                url: String::new(),
+                snippet: answer,
+            },
+        );
+    }
+    hits
 }
 
 #[cfg(test)]
@@ -131,6 +161,40 @@ mod tests {
     // serialization they race. A tokio Mutex is async-aware and safe to
     // hold across awaits (unlike std::sync::Mutex, which clippy flags).
     static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    #[test]
+    fn grounded_answer_is_prepended_as_first_hit() {
+        let raw = RawResp {
+            results: vec![RawHit {
+                title: "T".into(),
+                url: "u".into(),
+                content: "c".into(),
+            }],
+            answer: Some("the synthesized answer".into()),
+        };
+        let hits = hits_from_raw(raw);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "Answer (grounded by Tavily)");
+        assert_eq!(hits[0].snippet, "the synthesized answer");
+        assert_eq!(hits[1].title, "T");
+    }
+
+    #[test]
+    fn absent_or_blank_answer_leaves_results_unchanged() {
+        for answer in [None, Some(String::new()), Some("   ".to_string())] {
+            let raw = RawResp {
+                results: vec![RawHit {
+                    title: "T".into(),
+                    url: "u".into(),
+                    content: "c".into(),
+                }],
+                answer,
+            };
+            let hits = hits_from_raw(raw);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].title, "T");
+        }
+    }
 
     #[tokio::test]
     async fn resolve_returns_vault_value_when_present() {

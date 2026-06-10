@@ -87,7 +87,7 @@ pub fn maybe_spawn(sock_path: String) {
 /// The tick loop: every [`TICK`], reload the schedule file and dispatch the
 /// prompt of every trigger whose next-fire time landed in this tick's window.
 async fn run_loop(sock_path: String) {
-    let model = std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".to_string());
+    let model = std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-fable-5".to_string());
     // `last_tick_ms` is the lower bound of the window we check each tick: a
     // trigger fires when its next-fire time falls in `(last_tick_ms, now_ms]`.
     let mut last_tick_ms = now_ms();

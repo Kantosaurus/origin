@@ -162,6 +162,10 @@ fn push_sgr_inner(out: &mut Vec<u8>, fg: u32, bg: u32, attr: Attr, want_color: b
 
 fn push_glyph(out: &mut Vec<u8>, scalar: u32) {
     if let Some(ch) = char::from_u32(scalar) {
+        // Never emit a raw control character: it would move the terminal cursor
+        // (e.g. `\r` → column 0) and corrupt the frame. Substitute a space so the
+        // cell still advances the cursor by its one column.
+        let ch = if ch.is_control() { ' ' } else { ch };
         let mut buf = [0u8; 4];
         out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
     }
@@ -271,6 +275,35 @@ impl Composer {
         &mut self.prompt
     }
 
+    /// Snapshot the live main pane as one `String` per row — a glyph per cell,
+    /// so column indices line up with grid columns. The trailing half of a wide
+    /// glyph contributes a single space placeholder to keep that alignment.
+    ///
+    /// Used by the CLI to extract a click-drag selection as WYSIWYG text: index
+    /// by `[row][col]` exactly as the user sees it on screen.
+    #[must_use]
+    pub fn snapshot_main_text(&self) -> Vec<String> {
+        let cols = self.main.cols();
+        let rows = self.main.rows();
+        let mut out = Vec::with_capacity(rows as usize);
+        for r in 0..rows {
+            let mut line = String::with_capacity(cols as usize);
+            for c in 0..cols {
+                let cell = self.main.get(r, c);
+                // Continuation halves and the NUL sentinel (a freshly-allocated,
+                // not-yet-drawn grid) both render as a blank placeholder so the
+                // string stays column-aligned and free of control characters.
+                if cell.is_continuation() || cell.glyph == 0 {
+                    line.push(' ');
+                } else {
+                    line.push(char::from_u32(cell.glyph).unwrap_or(' '));
+                }
+            }
+            out.push(line);
+        }
+        out
+    }
+
     /// Diff each pane against its scratch, emit translated ANSI bytes, then
     /// swap scratch ↔ live so the next call diffs against the just-rendered
     /// state.
@@ -326,6 +359,47 @@ mod tests {
             s.contains("\u{4e16}x"),
             "wide glyph and next char must be adjacent (continuation emitted nothing): {s:?}"
         );
+    }
+
+    #[test]
+    fn emit_never_writes_a_raw_control_byte() {
+        // A control glyph that reaches a cell must NOT be emitted raw — a `\r`
+        // would return the terminal cursor to column 0 and corrupt the frame. It
+        // is substituted with a space so the cell still advances one column.
+        let mut c = Composer::new(6, 2);
+        {
+            let g = c.main_grid();
+            g.put(0, 0, Cell::new('a', 0, 0, Attr::PLAIN));
+            g.put(0, 1, Cell::new('\r', 0, 0, Attr::PLAIN));
+            g.put(0, 2, Cell::new('b', 0, 0, Attr::PLAIN));
+        }
+        let bytes = c.frame();
+        assert!(
+            !bytes.contains(&b'\r'),
+            "a carriage-return glyph must never be emitted raw"
+        );
+        let s = String::from_utf8(bytes).expect("utf-8");
+        assert!(s.contains("a b"), "control cell emitted as a space: {s:?}");
+    }
+
+    #[test]
+    fn snapshot_main_text_reads_glyphs_per_row() {
+        let mut c = Composer::new(6, 3); // main pane: 6 cols x 2 rows (prompt takes 1)
+        {
+            let g = c.main_grid();
+            g.fill(Cell::blank()); // mimic `App::draw`, which clears before drawing
+            g.put(0, 0, Cell::new('h', 0, 0, Attr::PLAIN));
+            g.put(0, 1, Cell::new('i', 0, 0, Attr::PLAIN));
+            // A wide glyph + its continuation on the second row.
+            g.put(1, 0, Cell::new('\u{4e16}', 0, 0, Attr::PLAIN));
+            g.put(1, 1, Cell::continuation(0));
+        }
+        let text = c.snapshot_main_text();
+        assert_eq!(text.len(), 2, "one string per main-pane row");
+        assert_eq!(text[0], "hi    ", "glyphs then blank cells, column-aligned");
+        // Wide glyph at col 0, space placeholder for its continuation at col 1,
+        // then four blank cells = six columns total.
+        assert_eq!(text[1], "\u{4e16}     ");
     }
 
     #[test]

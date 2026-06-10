@@ -591,6 +591,12 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     let path = env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path());
     let listener = Listener::bind(&path).await?;
     info!(path = %path, "origin-daemon listening");
+    // Record this daemon's pid in the per-instance control file so the CLI's
+    // newer-binary restart can kill exactly THIS daemon (by pid) instead of
+    // every `origin-daemon` on the machine (the old `taskkill /IM` / `pkill -f`
+    // behaviour that took down other projects' daemons). Best-effort: a failed
+    // write only degrades restart precision, never daemon bring-up.
+    write_instance_pid_file();
 
     // Default-off autonomous background loops (items J + K). Each is gated on
     // its own env var (`ORIGIN_SCHEDULER=1` / `ORIGIN_AMBIENT=1`); when unset
@@ -1007,9 +1013,16 @@ fn spawn_handler_task(
                     // with the system-prompt injection (see agent.rs::run_loop).
                     if let Some(skill) = skill_catalog.find(&name) {
                         let front = skill.front.clone();
+                        let body = skill.body.clone();
                         let allowed_tools: Vec<String> = {
                             let mut guard = active_skills.lock().await;
-                            guard.activate(front);
+                            // Carry the SKILL.md body so the per-turn system
+                            // prompt can inject the skill's instructions — not
+                            // just its `allowed-tools` mask. Without the body
+                            // the skill "loads" (mask + catalog marker) but the
+                            // model never receives its prompt and so never
+                            // carries it out.
+                            guard.activate_with_body(front, body);
                             // After activation, the intersection always exists (we just pushed a skill).
                             // Sort for stable wire output so clients see a deterministic order.
                             guard
@@ -1102,9 +1115,10 @@ fn spawn_handler_task(
                         StartOutcome::Stepped {
                             progress,
                             front,
+                            body,
                             skipped,
                         } => {
-                            active_skills.lock().await.activate(front);
+                            active_skills.lock().await.activate_with_body(front, body);
                             let step_index = u32::try_from(progress.current_step_index).unwrap_or(u32::MAX);
                             let total_steps = u32::try_from(progress.total_steps).unwrap_or(u32::MAX);
                             let skill = progress.current_skill.clone();
@@ -1674,8 +1688,8 @@ async fn handle_request(
                 let guard = active_skills.lock().await;
                 let snapshot_opt: Option<SkillRegistry> = if guard.allowed_tools().is_some() {
                     let mut snapshot = SkillRegistry::new();
-                    for s in guard.iter_active() {
-                        snapshot.activate(s.clone());
+                    for s in guard.iter_active_entries() {
+                        snapshot.activate_with_body(s.front.clone(), s.body.clone());
                     }
                     Some(snapshot)
                 } else {
@@ -2476,6 +2490,7 @@ async fn advance_workflow(
         AdvanceOutcome::Stepped {
             previous_skill,
             front,
+            body,
             skipped,
         } => {
             let name = progress.name.clone();
@@ -2484,7 +2499,7 @@ async fn advance_workflow(
             let skill = progress.current_skill.clone();
             let mut skills = active_skills.lock().await;
             skills.deactivate(&previous_skill);
-            skills.activate(front);
+            skills.activate_with_body(front, body);
             drop(skills);
             StreamEvent::WorkflowStepActive {
                 name,
@@ -3118,7 +3133,7 @@ async fn drive_selfdev_cycle(
     // Step 3: drive the self-edit by submitting `description` as a prompt onto
     // the live agent path under a `selfdev-` session id (is_self_dispatch_session
     // recognises this prefix, so it never resets the user's idle clock).
-    let model = std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".to_string());
+    let model = std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-fable-5".to_string());
     let edit_session = format!("selfdev-{job_id}");
     if let Err(e) =
         origin_daemon::scheduler::dispatch_prompt(sock_path, &model, edit_session, &description).await
@@ -3654,45 +3669,90 @@ fn persist(session_store: &SessionStore, session: &Session) {
 /// Must be called AFTER `persist` so the message rows exist when the deliverer
 /// fires `update_summary`.
 fn submit_summarize_jobs(sidecar: &Sidecar, session_store: &Arc<SessionStore>, session: &Session) {
-    let transcript = session.messages.clone();
-    for (i, m) in session.messages.iter().enumerate() {
+    // Skip turns that already carry a stored summary: a past turn's content is
+    // immutable, so its summary never needs recomputing. Without this guard the
+    // daemon re-summarized every assistant turn on every request — O(turns)
+    // redundant Haiku calls per prompt, each re-sending the whole transcript.
+    let already: std::collections::HashSet<u32> = session_store
+        .load_summaries(&session.id)
+        .map(|rows| rows.into_iter().filter_map(|(t, s)| s.map(|_| t)).collect())
+        .unwrap_or_default();
+
+    let messages = &session.messages;
+    for (i, m) in messages.iter().enumerate() {
         if m.role != Role::Assistant {
             continue;
         }
         #[allow(clippy::expect_used)]
         let turn_index = u32::try_from(i).expect("turn fits u32");
+        if already.contains(&turn_index) {
+            continue;
+        }
+        // Summarize ONLY this turn's slice (the preceding user prompt through the
+        // tool results before the next user turn), not the entire transcript.
+        // Sending the whole transcript made every turn's summary collapse to the
+        // latest-turn text, which compaction then baked into the *oldest* turns.
+        let (start, end) = turn_window(messages, i);
         let session_id = session.id.clone();
         let deliverer = SessionStoreSummaryDeliverer(Arc::clone(session_store));
         let _ = sidecar.submit(SidecarJob::Summarize {
             session_id,
             turn_index,
-            transcript: transcript.clone(),
+            transcript: messages[start..end].to_vec(),
             deliver_to: Box::new(deliverer),
         });
     }
 }
 
+/// The message-index window `[start, end)` covering the conversation turn whose
+/// assistant message is at `assistant_idx`: from the preceding user message (the
+/// prompt that opened the turn) up to — but not including — the next user
+/// message. This is the slice that summary `turn_index` should describe.
+fn turn_window(messages: &[origin_core::types::Message], assistant_idx: usize) -> (usize, usize) {
+    let start = messages[..assistant_idx]
+        .iter()
+        .rposition(|m| m.role == Role::User)
+        .unwrap_or(0);
+    let end = messages
+        .get(assistant_idx + 1..)
+        .and_then(|tail| tail.iter().position(|m| m.role == Role::User))
+        .map_or(messages.len(), |off| assistant_idx + 1 + off);
+    (start, end)
+}
+
+/// Append this process's pid to the per-instance pid file
+/// (`~/.origin/daemons/<id>.pid`). The CLI appends the supervisor/daemon pid
+/// it spawned; the daemon adds its own here because under supervision the CLI
+/// never learns the daemon child's pid. One pid per line; the restart path
+/// kills every listed pid and rewrites the file.
+fn write_instance_pid_file() {
+    use std::io::Write as _;
+    let id = origin_ipc::instance::InstanceId::for_cwd();
+    let Some(p) = id.pid_path(dirs::home_dir()) else {
+        return;
+    };
+    let _ = p.parent().map(std::fs::create_dir_all);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        let _ = writeln!(f, "{}", std::process::id());
+    }
+}
+
+/// Per-instance defaults — every path is scoped to the daemon's workspace
+/// (its cwd at startup, which the spawning CLI sets to the project root) via
+/// [`origin_ipc::instance::InstanceId`], so n projects run n isolated daemons
+/// with independent pipes, session DBs and CAS roots. Explicit env overrides
+/// (`ORIGIN_SOCK` / `ORIGIN_DB` / `ORIGIN_CAS_ROOT`) bypass the scoping for
+/// shared/global setups and tests.
 fn default_path() -> String {
-    #[cfg(unix)]
-    {
-        format!("{}/origin.sock", std::env::temp_dir().display())
-    }
-    #[cfg(windows)]
-    {
-        r"\\.\pipe\origin".to_string()
-    }
+    origin_ipc::instance::InstanceId::for_cwd().ipc_path()
 }
 
 fn default_db_path() -> String {
-    let mut p = std::env::temp_dir();
-    p.push("origin.db");
-    p.to_string_lossy().into_owned()
+    origin_ipc::instance::InstanceId::for_cwd().db_path()
 }
 
 fn default_cas_root() -> String {
-    let mut p = std::env::temp_dir();
-    p.push("origin-cas");
-    p.to_string_lossy().into_owned()
+    origin_ipc::instance::InstanceId::for_cwd().cas_root()
 }
 
 // ── install-ra subcommand ─────────────────────────────────────────────────────
@@ -3852,7 +3912,43 @@ fn spawn_metrics_endpoint(metrics: Metrics, addr: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{resume_foreign_event, SessionStore, StreamEvent};
+    use super::{resume_foreign_event, turn_window, SessionStore, StreamEvent};
+    use origin_core::types::{Block, Message, Role};
+
+    fn msg(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            blocks: vec![Block::text(text.to_string())],
+        }
+    }
+
+    #[test]
+    fn turn_window_isolates_each_turn() {
+        // user0, asst1, tool2, user3, asst4, tool5
+        let msgs = vec![
+            msg(Role::User, "u0"),
+            msg(Role::Assistant, "a1"),
+            msg(Role::Tool, "t2"),
+            msg(Role::User, "u3"),
+            msg(Role::Assistant, "a4"),
+            msg(Role::Tool, "t5"),
+        ];
+        // First assistant turn (idx 1) spans the opening user prompt through the
+        // tool result before the next user message: [0,3).
+        assert_eq!(turn_window(&msgs, 1), (0, 3));
+        // Second assistant turn (idx 4) spans its user prompt to end: [3,6).
+        assert_eq!(turn_window(&msgs, 4), (3, 6));
+        // Crucially the two windows are disjoint — distinct turns get distinct
+        // slices, so their summaries cannot collapse to the same text.
+        assert_ne!(turn_window(&msgs, 1), turn_window(&msgs, 4));
+    }
+
+    #[test]
+    fn turn_window_handles_leading_assistant_and_no_trailing_user() {
+        // An assistant turn with no preceding user message starts at 0.
+        let msgs = vec![msg(Role::Assistant, "a0"), msg(Role::Tool, "t1")];
+        assert_eq!(turn_window(&msgs, 0), (0, 2));
+    }
 
     /// End-to-end (sans IPC): reconstruct a Claude Code transcript at a path and
     /// persist it into a fresh origin session. The reply's `messages_loaded`
@@ -3881,7 +3977,7 @@ mod tests {
                 suggested_model,
             } => {
                 assert_eq!(messages_loaded, 3, "three transcript turns");
-                assert_eq!(suggested_model, "claude-sonnet-4-6");
+                assert_eq!(suggested_model, "claude-fable-5");
 
                 // The persisted row count must match what the reply reported.
                 let persisted = store.load_messages(&session_id).expect("load_messages");
@@ -3893,7 +3989,7 @@ mod tests {
                     .into_iter()
                     .find(|s| s.id == session_id)
                     .expect("new session present");
-                assert_eq!(summary.model, "claude-sonnet-4-6");
+                assert_eq!(summary.model, "claude-fable-5");
                 assert_eq!(summary.message_count, 3);
             }
             other => panic!("expected ForeignResumed, got {other:?}"),

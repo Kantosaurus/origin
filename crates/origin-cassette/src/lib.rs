@@ -142,8 +142,14 @@ impl Cassette {
 }
 
 /// Two request shapes match when their methods (case-insensitive) and URLs agree.
+///
+/// URLs are compared after redacting embedded secrets (userinfo and secret-like
+/// query/path tokens) so a *scrubbed* recorded URL still matches the *live*
+/// probe URL on replay — e.g. a provider that carries its key as `?key=...`
+/// (Gemini) is persisted redacted yet replays correctly.
 fn shapes_match(recorded: &ReqShape, probe: &ReqShape) -> bool {
-    recorded.url == probe.url && recorded.method.eq_ignore_ascii_case(&probe.method)
+    redact_url_secrets(&recorded.url) == redact_url_secrets(&probe.url)
+        && recorded.method.eq_ignore_ascii_case(&probe.method)
 }
 
 /// Header names whose values are always treated as secrets and fully redacted.
@@ -158,6 +164,9 @@ const SECRET_HEADERS: &[&str] = &["authorization", "x-api-key", "proxy-authoriza
 pub fn scrub_secrets(c: &mut Cassette) -> usize {
     let mut redacted = 0usize;
     for interaction in &mut c.interactions {
+        if scrub_url(&mut interaction.request.url) {
+            redacted += 1;
+        }
         redacted += scrub_headers(&mut interaction.request.headers);
         redacted += scrub_headers(&mut interaction.response.headers);
         if scrub_body(&mut interaction.request.body) {
@@ -168,6 +177,66 @@ pub fn scrub_secrets(c: &mut Cassette) -> usize {
         }
     }
     redacted
+}
+
+/// Redact credentials embedded in a request URL in place; returns `true` when
+/// the URL changed. Covers the userinfo component (`user:pass@host`) and any
+/// secret-looking query/path tokens (`api_key=`, `sk-`, Google `?key=` values,
+/// long opaque tokens) via the shared body scrubber.
+fn scrub_url(url: &mut String) -> bool {
+    let rewritten = redact_url_secrets(url);
+    if rewritten == *url {
+        false
+    } else {
+        *url = rewritten;
+        true
+    }
+}
+
+/// Deterministically redact the secret-bearing parts of a URL: replace the
+/// authority userinfo with [`REDACTED`] and run the token scrubber over the
+/// rest. Pure and idempotent, so it can both sanitize a stored URL and
+/// canonicalize URLs for replay matching.
+fn redact_url_secrets(url: &str) -> String {
+    redact_tokens(&redact_userinfo(url))
+}
+
+/// Replace the userinfo of a URL authority (`scheme://user:pass@host/...`) with
+/// the [`REDACTED`] sentinel, preserving scheme, host, port, and path. Inputs
+/// without a scheme separator or without userinfo are returned unchanged.
+fn redact_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_owned();
+    };
+    let authority_start = scheme_end + 3;
+    let rest = &url[authority_start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let Some(at) = authority.rfind('@') else {
+        return url.to_owned();
+    };
+    if &authority[..at] == REDACTED {
+        return url.to_owned();
+    }
+    let host = &authority[at + 1..];
+    format!(
+        "{}{REDACTED}@{host}{}",
+        &url[..authority_start],
+        &rest[authority_end..]
+    )
+}
+
+/// `true` when a URL authority still carries live (non-redacted) userinfo.
+fn url_has_live_userinfo(url: &str) -> bool {
+    let Some(scheme_end) = url.find("://") else {
+        return false;
+    };
+    let rest = &url[scheme_end + 3..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    authority
+        .rfind('@')
+        .is_some_and(|at| !authority[..at].is_empty() && &authority[..at] != REDACTED)
 }
 
 /// Redact secret-bearing header values; returns how many were changed.
@@ -319,10 +388,21 @@ fn looks_like_opaque_token(token: &str) -> bool {
 /// Returns [`CassetteError::UnredactedSecret`] describing the first leak found.
 pub fn assert_redacted(c: &Cassette) -> Result<(), CassetteError> {
     for (idx, interaction) in c.interactions.iter().enumerate() {
+        check_url(idx, &interaction.request.url)?;
         check_headers(idx, "request", &interaction.request.headers)?;
         check_body(idx, "request", &interaction.request.body)?;
         check_headers(idx, "response", &interaction.response.headers)?;
         check_body(idx, "response", &interaction.response.body)?;
+    }
+    Ok(())
+}
+
+/// Gate a request URL: reject live userinfo or any secret-looking token.
+fn check_url(idx: usize, url: &str) -> Result<(), CassetteError> {
+    if url_has_live_userinfo(url) || contains_secret(url) {
+        return Err(CassetteError::UnredactedSecret(format!(
+            "interaction {idx} request url"
+        )));
     }
     Ok(())
 }
@@ -397,6 +477,39 @@ mod tests {
     }
 
     #[test]
+    fn scrub_redacts_url_embedded_key_and_gate_catches_it() {
+        // Gemini-style key in the query string, plus userinfo credentials.
+        let secret_url =
+            "https://user:p4ssw0rd@generativelanguage.googleapis.com/v1/models?key=AIzaSyD1234567890abcDEFghijKLmnoPQRstuv";
+        let mut c = Cassette::new("urlkey");
+        c.record(Interaction {
+            request: req("POST", secret_url),
+            response: resp(200, "ok"),
+        });
+
+        // Before scrubbing, the CI gate must reject the unredacted URL.
+        assert!(assert_redacted(&c).is_err(), "gate must flag URL-embedded secret");
+
+        let n = scrub_secrets(&mut c);
+        assert!(n >= 1, "URL redaction should count");
+        let scrubbed = &c.interactions[0].request.url;
+        assert!(!scrubbed.contains("AIzaSyD1234567890abcDEFghijKLmnoPQRstuv"), "key leaked: {scrubbed}");
+        assert!(!scrubbed.contains("p4ssw0rd"), "userinfo leaked: {scrubbed}");
+        assert!(scrubbed.contains("generativelanguage.googleapis.com"), "host must survive: {scrubbed}");
+
+        // After scrubbing, the gate passes.
+        assert!(assert_redacted(&c).is_ok(), "scrubbed cassette must pass the gate");
+
+        // Replay still matches: the live probe carries the real key, the stored
+        // interaction is redacted, yet shape-matching canonicalizes both.
+        let probe = req("POST", secret_url);
+        assert!(
+            c.match_next(&probe).is_some(),
+            "redacted recording must still match the live secret-bearing probe"
+        );
+    }
+
+    #[test]
     fn scrub_collapses_bearer_token_in_body() {
         let mut c = Cassette::new("bearer");
         c.record(Interaction {
@@ -455,11 +568,11 @@ mod tests {
     fn assert_redacted_catches_body_leak() {
         let mut c = Cassette::new("bodyleak");
         c.record(Interaction {
-            request: req("GET", "https://h/x?api_key=supersecretvalue"),
+            // Clean URL so the gate reaches the body check (URL-embedded secrets
+            // are covered separately by scrub_redacts_url_embedded_key_*).
+            request: req("GET", "https://h/x"),
             response: resp(200, "ok"),
         });
-        // api_key= in the url body of the request is not scanned, but the body is;
-        // place the secret in the body to confirm body scanning works.
         c.interactions[0].request.body = "token=sk-abc".to_string();
         let err = assert_redacted(&c).unwrap_err();
         let CassetteError::UnredactedSecret(loc) = err else {

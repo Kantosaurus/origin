@@ -22,13 +22,17 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
     let stream = ndjson::from_reqwest(resp);
     pin_utils::pin_mut!(stream);
 
+    // One stable index per tool call so the daemon correlates the ToolUseStart
+    // with its args delta (the events are keyed on a 4-byte LE index prefix).
+    let mut tool_call_idx: u32 = 0;
+
     while let Some(item) = stream.next().await {
         let raw = item?;
         if raw.is_empty() {
             continue;
         }
 
-        let frame: WireFrame = match serde_json::from_str(&raw) {
+        let mut frame: WireFrame = match serde_json::from_str(&raw) {
             Ok(f) => f,
             Err(e) => return Err(ProviderError::Api(format!("ndjson json: {e}; raw={raw}"))),
         };
@@ -36,9 +40,33 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
         if !frame.message.content.is_empty() {
             ring.publish(&TokenEvent::new(
                 TokenKind::TextDelta,
-                frame.message.content.into_bytes(),
+                std::mem::take(&mut frame.message.content).into_bytes(),
             ))
             .map_err(|e| ProviderError::Api(e.to_string()))?;
+        }
+
+        // Ollama emits tool calls whole (not token-by-token). Forward each as a
+        // ToolUseStart (`idx ++ id ++ \0 ++ name`) plus a ToolUseDelta
+        // (`idx ++ args_json`), matching the daemon's tool-call event decoding.
+        if let Some(calls) = frame.message.tool_calls.take() {
+            for call in calls {
+                let idx = tool_call_idx;
+                tool_call_idx = tool_call_idx.saturating_add(1);
+                let id = format!("call_{}_{idx}", call.function.name);
+                let mut start = idx.to_le_bytes().to_vec();
+                start.extend_from_slice(id.as_bytes());
+                start.push(b'\0');
+                start.extend_from_slice(call.function.name.as_bytes());
+                ring.publish(&TokenEvent::new(TokenKind::ToolUseStart, start))
+                    .map_err(|e| ProviderError::Api(e.to_string()))?;
+
+                let args = serde_json::to_vec(&call.function.arguments)
+                    .map_err(|e| ProviderError::Api(format!("args json: {e}")))?;
+                let mut delta = idx.to_le_bytes().to_vec();
+                delta.extend_from_slice(&args);
+                ring.publish(&TokenEvent::new(TokenKind::ToolUseDelta, delta))
+                    .map_err(|e| ProviderError::Api(e.to_string()))?;
+            }
         }
 
         if frame.done {

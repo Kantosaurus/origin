@@ -85,8 +85,9 @@ function sha256(buf) {
 // Download the platform binary for `version` into `destPath`. When a
 // SHA256SUMS manifest is available, the binary's hash MUST match (corruption /
 // tamper guard); when no manifest is available we proceed on TLS integrity
-// alone (the stronger cosign + SLSA verification is what the in-binary updater
-// uses for subsequent updates). Marks the file executable on unix.
+// alone. (The in-binary self-updater is stricter: it REQUIRES a SHA256SUMS
+// match and refuses to stage on a missing manifest.) Marks the file executable
+// on unix.
 async function downloadBinary(version, destPath, target = currentTarget()) {
   if (!target) {
     throw new Error(`unsupported platform: ${process.platform}/${process.arch}`);

@@ -152,8 +152,18 @@ pub fn check_path(p: &SecurityPolicy, path: &str) -> Decision {
 /// query, or fragment, and lowercases the result. Returns `None` when no host
 /// component can be found.
 fn extract_host(url: &str) -> Option<String> {
-    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or(after_scheme);
+    // WHATWG URL parsing — which reqwest performs via the `url` crate before it
+    // dials — strips ASCII tab/newline/CR anywhere in the input, and for special
+    // schemes (http/https) treats a backslash exactly like a forward slash. A
+    // host extractor that does neither parses a *different* authority than the
+    // client actually connects to, so `https://evil.com\@allowed.com/` would be
+    // matched here as `allowed.com` while the request is sent to `evil.com`.
+    // That parser differential is a domain-allowlist bypass, so mirror both
+    // rules: drop the stripped characters and terminate the authority on `\`
+    // as well as `/ ? #`.
+    let cleaned: String = url.chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect();
+    let after_scheme = cleaned.split_once("://").map_or(cleaned.as_str(), |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '\\', '?', '#']).next().unwrap_or(after_scheme);
     let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     // Trim an optional port. IPv6 literals are bracketed; handle them first.
     let host = host_port.strip_prefix('[').map_or_else(
@@ -336,6 +346,42 @@ mod tests {
         assert_eq!(check_domain(&open, "example.com:8443"), Decision::Allow);
         assert!(matches!(
             check_domain(&open, "https://evil.com"),
+            Decision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn backslash_authority_does_not_bypass_allowlist() {
+        // WHATWG maps `\` to `/`, so reqwest dials `evil.com`, not `allowed.com`.
+        // The allow-list must see the same host the client connects to.
+        let open = SecurityPolicy {
+            allow_domains: vec!["allowed.com".to_owned()],
+            ..SecurityPolicy::default()
+        };
+        for url in [
+            r"https://evil.com\@allowed.com/",
+            r"https://evil.com\.allowed.com/",
+            r"https://evil.com\@allowed.com\path",
+        ] {
+            assert!(
+                matches!(check_domain(&open, url), Decision::Deny(_)),
+                "backslash authority `{url}` must not be matched as allowed.com"
+            );
+        }
+        // The legitimate host is still extracted correctly.
+        assert_eq!(extract_host(r"https://evil.com\@allowed.com/").as_deref(), Some("evil.com"));
+    }
+
+    #[test]
+    fn embedded_control_chars_do_not_bypass_allowlist() {
+        // WHATWG strips tab/newline/CR before parsing; `ev\nil.com` is `evil.com`.
+        let open = SecurityPolicy {
+            allow_domains: vec!["allowed.com".to_owned()],
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(extract_host("https://e\tv\nil.com/").as_deref(), Some("evil.com"));
+        assert!(matches!(
+            check_domain(&open, "https://allo\twed.com.evil.com/"),
             Decision::Deny(_)
         ));
     }

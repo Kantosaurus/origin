@@ -128,7 +128,17 @@ impl Embedder {
         if shape.len() != 2 || shape[0] != 1 || shape[1] != EMBED_DIM {
             return Err(EmbedderError::BadShape { got: shape.to_vec() });
         }
-        Ok(arr.iter().copied().collect())
+        // The memory index ranks with a dot-product metric (`DistDot`), so dot
+        // product equals cosine similarity ONLY when every stored AND query
+        // vector is unit length. The ONNX encoder does not normalize its output,
+        // and `embed` is the single source feeding both the insert path
+        // (memory_wiring) and the query path (injector/consolidator) — so
+        // normalize here once to keep the whole index on the unit sphere.
+        // Without this the cosine ranking is silently distorted by each vector's
+        // magnitude.
+        let mut out: Vec<f32> = arr.iter().copied().collect();
+        l2_normalize_in_place(&mut out);
+        Ok(out)
     }
 
     /// Minimal whitespace word-level tokenizer used when no sibling
@@ -146,5 +156,50 @@ impl Embedder {
         let mut tok = Tokenizer::new(wrapper);
         tok.with_pre_tokenizer(Some(Whitespace {}));
         Ok(tok)
+    }
+}
+
+/// Scale `v` to unit L2 norm in place. A zero (or non-finite) vector is left
+/// unchanged, since it has no finite unit direction.
+fn l2_normalize_in_place(v: &mut [f32]) {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 && norm.is_finite() {
+        let inv = 1.0 / norm;
+        for x in v.iter_mut() {
+            *x *= inv;
+        }
+    }
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::l2_normalize_in_place;
+
+    #[test]
+    fn normalizes_to_unit_norm() {
+        let mut v = vec![3.0_f32, 4.0]; // norm 5
+        l2_normalize_in_place(&mut v);
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6, "expected unit norm, got {norm}");
+        assert!((v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dot_of_unit_vectors_is_cosine() {
+        // Two vectors at a known angle: after normalization their dot product
+        // must equal cos(theta). Here a=(1,0), b=(1,1) → cos = 1/sqrt(2).
+        let mut a = vec![2.0_f32, 0.0];
+        let mut b = vec![5.0_f32, 5.0];
+        l2_normalize_in_place(&mut a);
+        l2_normalize_in_place(&mut b);
+        let dot: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+        assert!((dot - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6, "got {dot}");
+    }
+
+    #[test]
+    fn zero_vector_is_left_unchanged() {
+        let mut v = vec![0.0_f32; 4];
+        l2_normalize_in_place(&mut v);
+        assert!(v.iter().all(|&x| x == 0.0));
     }
 }

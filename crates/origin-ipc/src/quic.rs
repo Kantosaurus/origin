@@ -16,12 +16,18 @@ use std::sync::Arc;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, ServerConfig};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::{ClientConfig as RustlsClientConfig, RootCertStore, ServerConfig as RustlsServerConfig};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{
+    ClientConfig as RustlsClientConfig, DigitallySignedStruct, DistinguishedName,
+    ServerConfig as RustlsServerConfig, SignatureScheme,
+};
 use thiserror::Error;
 
 use crate::frame::{FrameKind, HEADER_LEN, MAX_FRAME_BYTES};
-use crate::tls::CertBundle;
+use crate::tls::{fingerprints_eq, sha256_fingerprint, CertBundle, CertFingerprint};
 
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Error)]
@@ -42,6 +48,18 @@ fn install_default_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// A fresh handle to the crypto provider whose signature-verification
+/// algorithms back the pinning verifiers below. Today this is the classical
+/// `ring` provider (TLS 1.3 with X25519 key exchange and Ed25519/ECDSA
+/// signatures). The transport's *authentication* anchor is the SHA-256 cert
+/// fingerprint (see [`crate::tls::CertFingerprint`]), which remains sound
+/// against a quantum adversary; migrating the *key exchange* to a hybrid
+/// X25519+ML-KEM group is a drop-in provider swap here once a pure-Rust
+/// post-quantum provider is vendored (tracked in `SECURITY.md`).
+fn provider() -> Arc<CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
 /// A QUIC listener bound to a local address, configured with mutual-friendly
 /// rustls server config built from `bundle`.
 #[allow(clippy::module_name_repetitions)]
@@ -50,7 +68,16 @@ pub struct QuicListener {
 }
 
 impl QuicListener {
-    /// Bind a new listener on `addr` using the cert/key from `bundle`.
+    /// Bind a new listener on `addr` using the cert/key from `bundle`, accepting
+    /// only clients whose certificate SHA-256 fingerprint is in
+    /// `allowed_clients`.
+    ///
+    /// Zero-trust: this enforces **mutual** TLS. Unlike the previous
+    /// `with_no_client_auth()` behavior — which accepted any peer that completed
+    /// the handshake against the (publicly distributed) server cert — a client
+    /// must now prove possession of a key whose cert is explicitly pinned. An
+    /// empty `allowed_clients` trusts **no** peer (fail closed), so a
+    /// misconfiguration denies access rather than silently opening it.
     ///
     /// The `async` keeps the API symmetric with [`QuicConnector::connect`]
     /// even though no `await` is currently required — future work
@@ -60,14 +87,23 @@ impl QuicListener {
     /// Returns [`QuicError::Tls`] if the rustls server config cannot be
     /// constructed, or [`QuicError::Io`] if the UDP socket cannot bind.
     #[allow(clippy::unused_async)]
-    pub async fn bind(addr: SocketAddr, bundle: CertBundle) -> Result<Self, QuicError> {
+    pub async fn bind(
+        addr: SocketAddr,
+        bundle: CertBundle,
+        allowed_clients: Vec<CertFingerprint>,
+    ) -> Result<Self, QuicError> {
         install_default_crypto_provider();
 
         let cert = CertificateDer::from(bundle.cert_der);
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bundle.key_der));
 
+        let verifier = Arc::new(PinnedClientCertVerifier {
+            allowed: allowed_clients,
+            provider: provider(),
+        });
+
         let mut rustls_config = RustlsServerConfig::builder()
-            .with_no_client_auth()
+            .with_client_cert_verifier(verifier)
             .with_single_cert(vec![cert], key)
             .map_err(|e| QuicError::Tls(format!("server cert: {e}")))?;
         // ALPN is not strictly required for our trust model but quinn requires
@@ -131,13 +167,22 @@ impl QuicListener {
 pub struct QuicConnector;
 
 impl QuicConnector {
-    /// Dial `addr` and complete a QUIC + rustls handshake using `ca_der` as
-    /// the single trusted root for this connection. Opens one bidirectional
-    /// stream on success.
+    /// Dial `addr` and complete a **mutually-authenticated** QUIC + rustls
+    /// handshake. The server's leaf certificate is pinned to
+    /// `server_fingerprint` (the SHA-256 hash distributed out-of-band in the
+    /// `origin://host:port#<fingerprint>` pairing URL), and the client presents
+    /// `client_bundle` so the server can pin it in return. Opens one
+    /// bidirectional stream on success.
+    ///
+    /// Pinning to a hash — rather than validating a CA chain — is both the
+    /// zero-trust anchor (only the exact paired daemon is trusted, no PKI to
+    /// subvert) and the post-quantum anchor (a quantum adversary who forges the
+    /// classical cert signature still cannot match the SHA-256 fingerprint).
     ///
     /// # Errors
     /// Returns [`QuicError::Tls`] on cert/config issues, [`QuicError::Io`] on
-    /// socket bind failure, or [`QuicError::Connect`] on handshake failure.
+    /// socket bind failure, or [`QuicError::Connect`] on handshake failure
+    /// (including a server whose certificate does not match the pin).
     ///
     /// # Panics
     /// Does not panic on well-formed input. The internal `.expect` calls
@@ -146,18 +191,24 @@ impl QuicConnector {
     pub async fn connect(
         addr: SocketAddr,
         server_name: &str,
-        ca_der: &[u8],
+        server_fingerprint: CertFingerprint,
+        client_bundle: &CertBundle,
     ) -> Result<QuicConnection, QuicError> {
         install_default_crypto_provider();
 
-        let mut roots = RootCertStore::empty();
-        roots
-            .add(CertificateDer::from(ca_der.to_vec()))
-            .map_err(|e| QuicError::Tls(format!("trust anchor: {e}")))?;
+        let verifier = Arc::new(PinnedServerCertVerifier {
+            expected: server_fingerprint,
+            provider: provider(),
+        });
+
+        let client_cert = CertificateDer::from(client_bundle.cert_der.clone());
+        let client_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_bundle.key_der.clone()));
 
         let mut rustls_config = RustlsClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_client_auth_cert(vec![client_cert], client_key)
+            .map_err(|e| QuicError::Tls(format!("client cert: {e}")))?;
         rustls_config.alpn_protocols = vec![b"origin/1".to_vec()];
 
         let quic_client = QuicClientConfig::try_from(rustls_config)
@@ -189,6 +240,114 @@ impl QuicConnector {
             endpoint,
             connection: Some(connection),
         })
+    }
+}
+
+/// Client-side verifier that pins the server's leaf certificate to an expected
+/// SHA-256 fingerprint instead of validating a CA chain.
+///
+/// The TLS handshake signature is still cryptographically verified against the
+/// pinned certificate's key, so this is genuine authentication — the fingerprint
+/// check simply replaces "any cert a CA vouches for" with "exactly the paired
+/// daemon's cert".
+#[derive(Debug)]
+struct PinnedServerCertVerifier {
+    expected: CertFingerprint,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for PinnedServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let got = sha256_fingerprint(end_entity.as_ref());
+        if fingerprints_eq(&got, &self.expected) {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "server certificate fingerprint does not match the pinned value".to_owned(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Server-side verifier that requires a client certificate whose SHA-256
+/// fingerprint is on a pinned allow-list. An empty allow-list trusts no client
+/// (fail closed).
+#[derive(Debug)]
+struct PinnedClientCertVerifier {
+    allowed: Vec<CertFingerprint>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ClientCertVerifier for PinnedClientCertVerifier {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        let got = sha256_fingerprint(end_entity.as_ref());
+        if self.allowed.iter().any(|f| fingerprints_eq(f, &got)) {
+            Ok(ClientCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "client certificate fingerprint is not on the pinned allow-list".to_owned(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
     }
 }
 

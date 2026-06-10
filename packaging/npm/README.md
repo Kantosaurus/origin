@@ -43,33 +43,31 @@ origin run "…"         # one-shot headless run
 
 ## Updates
 
-`origin` **auto-updates by default**. On launch it checks the npm registry in
-the background (at most once per day, never blocking startup) and, when a newer
-version is published, installs it via npm. The update applies the next time you
-run `origin`, which announces it once (`origin: updated to vX.Y.Z`).
+`origin` **auto-updates by default** via its built-in self-updater. On launch it
+checks the npm registry (at most once per day, cached) and, when a newer version
+is published, downloads the matching release binary, verifies its SHA-256 against
+the release `SHA256SUMS` (no `cosign` CLI required), swaps itself in place, and
+relaunches your command on the new version. The brief download happens only the
+first time a new release is seen.
 
-- **Global installs** (`npm i -g`): updated with `npm install -g @kantosaurus/origin@latest`.
-- **Local installs** (a project dependency): updated with
-  `npm install @kantosaurus/origin@latest --no-save` in the project root — this
-  refreshes the working copy in `node_modules` **without** rewriting the version
-  your `package.json` declares, so your committed dependency range is never
-  touched. A clean `npm ci` later restores the pinned version. (Skipped for
-  exotic layouts such as a pnpm virtual store, where a plain `npm install` would
-  be unsafe.)
-- It uses npm (registry integrity, no extra tooling), not the binary's built-in
-  cosign-verified self-updater — that would require the `cosign` CLI most npm
-  machines lack.
+- It only updates **npm-installed** binaries (those under `node_modules`); a
+  build from source or a `cargo install` is never touched. It rewrites only the
+  installed copy in `node_modules`, so a project's committed dependency range and
+  a later `npm ci` are unaffected.
+- Prefer npm to own updates? Set `ORIGINX_ALLOW_SELF_UPDATE=0` to fall back to a
+  non-blocking background `npm install` that applies on the next run, announced
+  once (`origin: updated to vX.Y.Z`).
 - Update on demand anytime: `npm update -g @kantosaurus/origin` (or
   `npm update @kantosaurus/origin` in a project).
 
-Disable it with `ORIGINX_NO_UPDATE=1`.
+Disable all auto-update with `ORIGIN_NO_UPDATE=1` (`ORIGINX_NO_UPDATE=1` too).
 
 ## Environment knobs
 
 | Variable                      | Effect                                                                       |
 | ----------------------------- | ---------------------------------------------------------------------------- |
-| `ORIGINX_NO_UPDATE=1`         | Disable the npm-channel auto-update. (`ORIGIN_NO_UPDATE` is honored too.)     |
-| `ORIGINX_ALLOW_SELF_UPDATE=1` | Use the binary's own cosign-verified self-updater instead of the npm channel. |
+| `ORIGINX_ALLOW_SELF_UPDATE=0` | Opt OUT of the binary's self-updater (ON by default); fall back to the npm-launcher channel. |
+| `ORIGINX_NO_UPDATE=1`         | Disable the npm-launcher background update. (`ORIGIN_NO_UPDATE` is honored too.) |
 | `ORIGIN_NO_UPDATE=1`          | Honored by both the launcher and the binary; disables all auto-update.       |
 | `ORIGINX_SKIP_DOWNLOAD=1`     | Skip the postinstall binary download (air-gapped / source builds).           |
 

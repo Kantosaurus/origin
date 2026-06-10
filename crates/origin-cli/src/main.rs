@@ -134,8 +134,10 @@ fn main() -> Result<()> {
 
 /// Synchronous auto-update step run before any subcommand dispatch. The flow is:
 ///   1. Swap in any binary staged from a prior run (rename `.new` over exe).
-///   2. Check the GitHub releases API for a newer tag. If newer, download
-///      + cosign-verify + stage as `<exe>.new` BEFORE proceeding.
+///   2. For npm-installed binaries only (dev/source builds are skipped), check
+///      the npm registry for a newer published version. If newer, download the
+///      matching GitHub-release asset, verify it against `SHA256SUMS` (sha256,
+///      no `cosign`), and stage as `<exe>.new` BEFORE proceeding.
 ///   3. If we just staged a new binary, swap it in and re-exec with the
 ///      same argv so the user's command runs on the new code path.
 ///
@@ -350,12 +352,63 @@ fn import_subcommand(a: &origin_cli::import::ImportArgs) -> Result<()> {
     Ok(())
 }
 
+/// DECAWM (terminal autowrap) off / on, as raw VT sequences.
+///
+/// The TUI renderer absolute-positions every cell with a cursor-position (CUP)
+/// escape and never relies on the terminal wrapping at the right margin. With
+/// autowrap **on**, emitting the screen's bottom-right cell makes an
+/// immediate-wrap terminal (legacy Windows conhost) scroll the alternate screen
+/// up by one line — which shifts the physical screen out from under the
+/// damage-diff shadow grid (`Composer::scratch_*`) and leaves stale, "disjointed"
+/// fragments and un-cleared highlights. We disable autowrap for the session and
+/// restore it on teardown. Deferred-wrap terminals (modern Windows Terminal,
+/// xterm) are unaffected either way, so this is safe everywhere.
+///
+/// See `crates/origin-tui/tests/autowrap_desync.rs` for the reproduction.
+const DISABLE_AUTOWRAP: &[u8] = b"\x1b[?7l";
+const ENABLE_AUTOWRAP: &[u8] = b"\x1b[?7h";
+
+/// Emit the DECAWM-off sequence. Split out (over a generic writer) so it can be
+/// unit-tested without driving a real terminal.
+fn disable_autowrap(w: &mut impl std::io::Write) -> std::io::Result<()> {
+    w.write_all(DISABLE_AUTOWRAP)
+}
+
+/// Emit the DECAWM-on sequence — restores the mode `disable_autowrap` cleared.
+fn enable_autowrap(w: &mut impl std::io::Write) -> std::io::Result<()> {
+    w.write_all(ENABLE_AUTOWRAP)
+}
+
+/// Write `bytes` to the terminal as one atomic unit: hold the stdout lock across
+/// the write *and* the flush so frame bytes and out-of-band escapes (OSC 52
+/// clipboard, mode toggles) emitted from different tasks can never interleave.
+fn emit_to_terminal(bytes: &[u8]) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(bytes);
+    let _ = out.flush();
+}
+
+/// Copy `text` to the clipboard two ways: an OSC 52 escape (works over SSH and
+/// remote terminals) and the local OS clipboard (reliable on the host). Both are
+/// best-effort; the OS write is offloaded to a blocking task so it never stalls
+/// the input loop.
+fn copy_text_to_clipboard(text: String) {
+    emit_to_terminal(origin_cli::clipboard::osc52_sequence(&text).as_bytes());
+    tokio::task::spawn_blocking(move || {
+        let _ = origin_cli::clipboard::copy_to_os_clipboard(&text);
+    });
+}
+
 /// Best-effort restore of the terminal to its pre-TUI state. Idempotent and
 /// error-swallowing so it is safe to call from a panic hook, a `Drop` guard, and
 /// the normal exit path. Reverses the setup in [`run`] (raw mode + alternate
-/// screen + mouse capture + hidden cursor).
+/// screen + mouse capture + hidden cursor + autowrap).
 fn restore_terminal() {
     let _ = disable_raw_mode();
+    // Re-enable autowrap (disabled on entry) before leaving the alt screen so the
+    // normal buffer behaves as the shell expects.
+    let _ = enable_autowrap(&mut std::io::stdout());
     let _ = execute!(
         std::io::stdout(),
         DisableBracketedPaste,
@@ -438,7 +491,7 @@ async fn run() -> Result<()> {
     }
 
     // Resolve TUI defaults from the saved config (falling back to env vars
-    // and finally to hard-coded "anthropic" / "claude-opus-4-7" / "default"
+    // and finally to hard-coded "anthropic" / "claude-fable-5" / "default"
     // so callers who declined / skipped onboarding still get a working
     // session). The provider/account pair is also forwarded to the daemon
     // when we auto-spawn it — the daemon itself only reads ORIGIN_PROVIDER /
@@ -449,7 +502,7 @@ async fn run() -> Result<()> {
             (
                 "anthropic".to_string(),
                 "default".to_string(),
-                "claude-opus-4-7".to_string(),
+                "claude-fable-5".to_string(),
             )
         },
         |c| {
@@ -505,6 +558,15 @@ async fn run() -> Result<()> {
         EnableBracketedPaste,
         Hide
     )?;
+    // Disable autowrap so the renderer's bottom-right cell writes never scroll the
+    // alternate screen (which would desync the damage-diff shadow grid and leave
+    // stale fragments). Restored by `restore_terminal`. See `DISABLE_AUTOWRAP`.
+    {
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        disable_autowrap(&mut out)?;
+        out.flush()?;
+    }
 
     let (composer, widget, app) = setup_tui(default_provider, &model);
     // Seed the session reasoning-effort from the startup `--effort` flag.
@@ -651,12 +713,19 @@ fn spawn_render_task(
                     if c.side_visible() {
                         origin_cli::tui::draw_side(c.side_grid(), &lines, pal);
                     }
+                    // Capture the rendered main pane for click-drag selection
+                    // extraction — only while a selection is active, so there is
+                    // no per-frame cost otherwise.
+                    {
+                        let mut a = app.lock();
+                        if a.selection.is_some() {
+                            a.screen_text = c.snapshot_main_text();
+                        }
+                    }
                     c.frame()
                 };
                 if !bytes.is_empty() {
-                    use std::io::Write as _;
-                    let _ = std::io::stdout().write_all(&bytes);
-                    let _ = std::io::stdout().flush();
+                    emit_to_terminal(&bytes);
                 }
             })
             .await;
@@ -666,10 +735,9 @@ fn spawn_render_task(
 /// Spawn the render heartbeat + stall watchdog. While a turn is active this
 /// ticks the spinner/elapsed clock independently of daemon events, so a hung
 /// daemon never looks like a dead screen. It also watches a cheap activity
-/// fingerprint: when it stops changing for `STALL_WARN_AFTER`, the daemon has
-/// gone silent and we raise a visible stall notice (so "wedged" no longer
-/// looks like "working"). The task runs for the life of the process; the
-/// handle is intentionally dropped.
+/// fingerprint: when it stops changing for `STALL_SOFT_AFTER`, the daemon is
+/// quiet and we show a gentle "still working…" reassurance. The task runs for
+/// the life of the process; the handle is intentionally dropped.
 fn spawn_stall_watchdog(app: SharedApp, handle: Handle) {
     spawn_in(TaskClass::Realtime, async move {
         let mut last_sig: u64 = 0;
@@ -685,11 +753,7 @@ fn spawn_stall_watchdog(app: SharedApp, handle: Handle) {
             let sig = a.activity_signature();
             if sig == last_sig {
                 let since = *quiet_since.get_or_insert_with(std::time::Instant::now);
-                a.stall = origin_cli::tui::stall_tier(
-                    since.elapsed(),
-                    origin_cli::tui::STALL_SOFT_AFTER,
-                    origin_cli::tui::STALL_WARN_AFTER,
-                );
+                a.stall = origin_cli::tui::stall_tier(since.elapsed(), origin_cli::tui::STALL_SOFT_AFTER);
             } else {
                 last_sig = sig;
                 quiet_since = Some(std::time::Instant::now());
@@ -764,10 +828,13 @@ async fn run_event_loop(
             handle.mark_dirty();
             continue;
         }
-        // Mouse wheel scroll: drive the scrollback offset directly. Each
-        // wheel tick advances by ~3 visual rows, matching the Shift+Arrow
-        // handler below. Other mouse events (clicks, drag) are ignored.
+        // Mouse: wheel ticks drive the scrollback offset (~3 visual rows each);
+        // left-button press/drag/release drives in-app text selection, which is
+        // auto-copied (OS clipboard + OSC 52) on release. These selection events
+        // only arrive while mouse capture is on (the default); with `/mouse off`
+        // the terminal handles native selection instead.
         if let crossterm::event::Event::Mouse(me) = &event {
+            use crossterm::event::MouseButton;
             match me.kind {
                 MouseEventKind::ScrollUp => {
                     app.lock().scroll_up(3);
@@ -775,6 +842,23 @@ async fn run_event_loop(
                 }
                 MouseEventKind::ScrollDown => {
                     app.lock().scroll_down(3);
+                    handle.mark_dirty();
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    app.lock().begin_selection(me.row, me.column);
+                    handle.mark_dirty();
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    app.lock().update_selection(me.row, me.column);
+                    handle.mark_dirty();
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    // Extract from the last captured frame and copy; keep the
+                    // highlight visible as the "copied" feedback.
+                    let text = app.lock().selection_text();
+                    if let Some(text) = text.filter(|t| !t.is_empty()) {
+                        copy_text_to_clipboard(text);
+                    }
                     handle.mark_dirty();
                 }
                 _ => {}
@@ -795,6 +879,11 @@ async fn run_event_loop(
             continue;
         }
         if let crossterm::event::Event::Key(ev) = event {
+            // Any keystroke dismisses an active selection/highlight (the user has
+            // moved on from selecting).
+            if app.lock().clear_selection() {
+                handle.mark_dirty();
+            }
             match handle_key_event(ev, &app, &handle, &interrupt_tx, path, model, session_id).await {
                 KeyOutcome::Continue => {}
                 KeyOutcome::Break => break,
@@ -816,10 +905,12 @@ enum KeyOutcome {
 /// the `continue`/fall-through behaviour of the original inline `match`.
 /// The input card's text width, derived from the current terminal size — used
 /// by the editor reducer for visual Home/End and Up/Down across wrapped lines.
-/// Mirrors the card geometry in `App::draw`.
+/// Mirrors the card geometry in `App::draw` (full-width card: `card_w = cols-2`,
+/// with a 2-column inner indent for the accent rule + padding, so the text
+/// width is `card_w - 2 == cols - 4`).
 fn input_text_width() -> usize {
     let cols = crossterm::terminal::size().map_or(80, |(c, _)| c);
-    let card_w = 75u16.min(cols.saturating_sub(4));
+    let card_w = cols.saturating_sub(2);
     usize::from(card_w.saturating_sub(2))
 }
 
@@ -1053,15 +1144,48 @@ async fn handle_input_action(
                 handle_submit(app, handle, path, model, &text, session_id, None).await;
                 app.lock().recompute_suggestions();
                 handle.mark_dirty();
-            } else if interrupt_tx.lock().await.is_some() {
-                // A prompt turn is already streaming on this connection;
-                // don't start a second concurrent turn on the same session.
-                app.lock()
-                    .add_line("system> ", origin_cli::locale::line("cmd.turn.busy"));
-                handle.mark_dirty();
             } else {
-                spawn_prompt_turn(text, app, handle, interrupt_tx, path, model, session_id).await;
+                // Hold the interrupt-slot lock across the busy check AND the
+                // queue push: the turn-end drain in `spawn_prompt_turn` pops
+                // the queue under this same lock before releasing the slot,
+                // so a message queued here can never slip between "turn
+                // ended" and "queue checked" and silently go stale.
+                let slot = interrupt_tx.lock().await;
+                if slot.is_some() {
+                    // A prompt turn is already streaming on this connection;
+                    // queue the message for auto-submission when it ends.
+                    // Up on the top-most input line edits queued messages.
+                    let pending = {
+                        let mut a = app.lock();
+                        a.input.queue_message(&text);
+                        a.recompute_suggestions();
+                        a.input.queued_len()
+                    };
+                    drop(slot);
+                    app.lock().add_line(
+                        "system> ",
+                        &origin_cli::locale::linef(
+                            "cmd.queue.added",
+                            &[("pending", pending.to_string().as_str())],
+                        ),
+                    );
+                    handle.mark_dirty();
+                } else {
+                    drop(slot);
+                    spawn_prompt_turn(text, app, handle, interrupt_tx, path, model, session_id).await;
+                }
             }
+        }
+        InputAction::QueueEdited => {
+            let pending = app.lock().input.queued_len();
+            app.lock().add_line(
+                "system> ",
+                &origin_cli::locale::linef(
+                    "cmd.queue.edited",
+                    &[("pending", pending.to_string().as_str())],
+                ),
+            );
+            handle.mark_dirty();
         }
         InputAction::Insert(_) | InputAction::Backspace | InputAction::Newline => {
             app.lock().recompute_suggestions();
@@ -1122,19 +1246,57 @@ async fn spawn_prompt_turn(
     let model_for_turn = model.to_string();
     let session_for_turn = session_id.to_string();
     spawn_in(TaskClass::Realtime, async move {
-        handle_prompt_turn(
-            &app_for_turn,
-            &handle_for_turn,
-            &path_for_turn,
-            &model_for_turn,
-            &text,
-            &session_for_turn,
-            Some(rx),
-        )
-        .await;
-        *interrupt_for_turn.lock().await = None;
-        app_for_turn.lock().spinner.stop();
-        handle_for_turn.mark_dirty();
+        let mut text = text;
+        let mut rx = Some(rx);
+        loop {
+            // IMPORTANT — queue-drain boundary semantics. `handle_prompt_turn`
+            // resolves only when the daemon writes the terminal Response
+            // (`PromptReply`) frame for this prompt, and the daemon writes
+            // that only after `drive_goal_loop` → `run_loop` has fully
+            // finished: every agentic model↔tool iteration of the task, and,
+            // when a `/goal` is active, every goal-driver iteration through
+            // verification. A queued message therefore NEVER lands mid-task —
+            // it starts a brand-new prompt exactly where a hand-typed
+            // follow-up would, after the daemon considers the whole task
+            // complete. (Tool calls within a task are daemon-internal; the
+            // CLI has no frame on which it could inject input mid-task even
+            // if it wanted to.)
+            handle_prompt_turn(
+                &app_for_turn,
+                &handle_for_turn,
+                &path_for_turn,
+                &model_for_turn,
+                &text,
+                &session_for_turn,
+                rx.take(),
+            )
+            .await;
+            // Drain the next queued message, if any, and chain straight into
+            // another turn. The pop happens under the interrupt-slot lock —
+            // the same lock the submit path holds while deciding queue-vs-
+            // spawn — so a message submitted during this window can never
+            // miss both the running turn and the drain. A fresh interrupt
+            // channel is installed per chained turn so Ctrl+C keeps working.
+            let mut slot = interrupt_for_turn.lock().await;
+            match app_for_turn.lock().input.pop_queued() {
+                Some(next) => {
+                    let (tx, new_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                    *slot = Some(tx);
+                    drop(slot);
+                    rx = Some(new_rx);
+                    text = next;
+                    begin_prompt_turn(&app_for_turn, &text);
+                    handle_for_turn.mark_dirty();
+                }
+                None => {
+                    *slot = None;
+                    drop(slot);
+                    app_for_turn.lock().spinner.stop();
+                    handle_for_turn.mark_dirty();
+                    break;
+                }
+            }
+        }
     });
 }
 
@@ -1497,15 +1659,17 @@ async fn handle_submit(
     {
         app.lock().add_line("you> ", text);
         let now_on = app.lock().set_mouse_capture(arg);
+        // Hold the stdout lock across the mode toggle so it can't interleave with
+        // a concurrent render-frame write.
         if now_on {
-            let _ = execute!(std::io::stdout(), EnableMouseCapture);
+            let _ = execute!(std::io::stdout().lock(), EnableMouseCapture);
         } else {
-            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+            let _ = execute!(std::io::stdout().lock(), DisableMouseCapture);
         }
         let msg = if now_on {
-            "mouse capture ON \u{2014} wheel scrolls; terminal select/copy is intercepted (/mouse off to copy)"
+            "mouse capture ON \u{2014} wheel scrolls; drag to select & auto-copy (/mouse off for terminal-native select)"
         } else {
-            "mouse capture OFF \u{2014} drag to select & copy; scroll with PageUp/Shift+\u{2191}\u{2193} (/mouse on to re-enable)"
+            "mouse capture OFF \u{2014} terminal-native select & copy; scroll with PageUp/Shift+\u{2191}\u{2193} (/mouse on to re-enable)"
         };
         app.lock().add_line("system> ", msg);
         handle.mark_dirty();
@@ -1569,17 +1733,17 @@ async fn handle_submit(
     if text.trim() == "/copy" {
         let mut a = app.lock();
         a.add_line("you> ", text);
-        let seq = a
+        let reply = a
             .last_assistant
             .as_deref()
             .filter(|t| !t.is_empty())
-            .map(origin_cli::clipboard::osc52_sequence);
-        if let Some(seq) = seq {
+            .map(str::to_string);
+        if let Some(reply) = reply {
             a.add_line("ok> ", origin_cli::locale::line("cmd.copy.ok"));
             drop(a);
-            use std::io::Write as _;
-            let _ = std::io::stdout().write_all(seq.as_bytes());
-            let _ = std::io::stdout().flush();
+            // Dual copy (OS clipboard + OSC 52) through the serialized writer,
+            // same path as click-drag selection.
+            copy_text_to_clipboard(reply);
         } else {
             a.add_line("system> ", origin_cli::locale::line("cmd.copy.empty"));
             drop(a);
@@ -1859,6 +2023,9 @@ async fn handle_prompt_turn(
             if let Some(summary) = origin_cli::tui::diff_elision_summary(total_diff, MAX_DIFF_ROWS) {
                 a.add_colored_line(summary, theme::MUTED, 0);
             }
+            // Blank separator so the edit's diff doesn't sit flush against the
+            // assistant's following reply (matches the on-result spacing).
+            a.add_blank_line();
             a.start_assistant_turn();
             // Drop the App guard before signalling the renderer so the lock
             // is not held across mark_dirty (significant_drop_tightening),
@@ -1906,6 +2073,10 @@ async fn handle_prompt_turn(
                     0,
                 );
             }
+            // Separate this tool's output from whatever follows (the next tool
+            // block or the assistant's reply) so the transcript doesn't read as
+            // one dense wall of text.
+            a.add_blank_line();
             drop(a);
             handle_for_result.mark_dirty();
         },
@@ -2472,10 +2643,12 @@ async fn pair_redeem(url: &str, code: &str, device_id: Option<String>) -> Result
             .unwrap_or_else(|| "unknown".into())
     });
     let parsed = origin_cli::admin_url::parse_origin_url(url)?;
-    let ca = parsed.fingerprint_to_ca_placeholder();
-    let mut c = origin_ipc::quic::QuicConnector::connect(parsed.addr, "origin-daemon", &ca)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let server_fp = parsed.server_fingerprint()?;
+    let client_bundle = origin_cli::admin_url::resolve_client_bundle()?;
+    let mut c =
+        origin_ipc::quic::QuicConnector::connect(parsed.addr, "origin-daemon", server_fp, &client_bundle)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     let msg = ClientMessage::PairRedeem {
         code: code.into(),
         device_id: device.clone(),
@@ -2500,15 +2673,12 @@ async fn pair_redeem(url: &str, code: &str, device_id: Option<String>) -> Result
     }
 }
 
+/// Default IPC path: per-project (derived from the cwd) so each workspace
+/// gets its own daemon. See [`origin_ipc::instance`]. `ORIGIN_SOCK` overrides
+/// at every call site (`env::var("ORIGIN_SOCK").unwrap_or_else(|_| default_path())`),
+/// which restores the old single-shared-daemon behaviour when desired.
 fn default_path() -> String {
-    #[cfg(unix)]
-    {
-        format!("{}/origin.sock", std::env::temp_dir().display())
-    }
-    #[cfg(windows)]
-    {
-        r"\\.\pipe\origin".to_string()
-    }
+    origin_ipc::instance::InstanceId::for_cwd().ipc_path()
 }
 
 /// Fast probe: try to open the IPC path. Returns `true` when something is
@@ -2555,13 +2725,22 @@ fn resolve_supervisor_binary() -> (std::ffi::OsString, bool) {
     }
 }
 
-/// Path to the stamp file written each time we spawn a daemon.
+/// Path to this workspace's spawn stamp, written each time we spawn a daemon
+/// for it (`~/.origin/daemons/<instance>.stamp`). Per-instance — restarting
+/// project A's daemon never invalidates project B's stamp.
 fn daemon_stamp_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".origin").join("daemon.stamp"))
+    origin_ipc::instance::InstanceId::for_cwd().stamp_path(dirs::home_dir())
+}
+
+/// Path to this workspace's daemon pid file
+/// (`~/.origin/daemons/<instance>.pid`). One pid per line: the CLI appends the
+/// supervisor/daemon pid it spawns; the daemon appends its own pid on bind.
+fn daemon_pid_path() -> Option<std::path::PathBuf> {
+    origin_ipc::instance::InstanceId::for_cwd().pid_path(dirs::home_dir())
 }
 
 /// Returns `true` when the daemon binary on disk is newer than the last spawn
-/// recorded in `~/.origin/daemon.stamp`.
+/// recorded in this workspace's stamp file.
 fn daemon_binary_is_newer(binary: &std::ffi::OsStr) -> bool {
     let Some(stamp) = daemon_stamp_path() else {
         return false;
@@ -2583,12 +2762,24 @@ fn touch_daemon_stamp() {
     }
 }
 
-/// Kill any running `origin-daemon` processes.
-fn kill_stale_daemon() {
+/// Append `pid` to this workspace's pid file.
+fn record_daemon_pid(pid: u32) {
+    use std::io::Write as _;
+    if let Some(p) = daemon_pid_path() {
+        let _ = p.parent().map(std::fs::create_dir_all);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+            let _ = writeln!(f, "{pid}");
+        }
+    }
+}
+
+/// Force-kill a single process by pid. Best-effort; exit status ignored
+/// (the pid may already be gone).
+fn kill_pid(pid: u32) {
     #[cfg(windows)]
     {
         let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/IM", "origin-daemon.exe"])
+            .args(["/F", "/PID", &pid.to_string()])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -2596,8 +2787,8 @@ fn kill_stale_daemon() {
     }
     #[cfg(unix)]
     {
-        let _ = std::process::Command::new("pkill")
-            .args(["-f", "origin-daemon"])
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -2605,31 +2796,26 @@ fn kill_stale_daemon() {
     }
 }
 
-/// Kill any running `origin-supervisor` processes.
+/// Kill exactly THIS workspace's daemon/supervisor processes — the pids listed
+/// in the per-instance pid file — then remove the file.
 ///
-/// Used before a fresh supervised launch when the daemon binary is newer: the
-/// running supervisor would otherwise immediately respawn the daemon we are
-/// about to replace, so we tear it down first. (Killing the supervisor does not
-/// reap its daemon child today, so callers pair this with [`kill_stale_daemon`].)
-fn kill_stale_supervisor() {
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/IM", "origin-supervisor.exe"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+/// This replaces the old image-name sweep (`taskkill /F /IM origin-daemon.exe`
+/// / `pkill -f origin-daemon`), which killed every project's daemon on the
+/// machine and made concurrent `origin` sessions impossible: starting origin
+/// in project B (after a rebuild) took down project A's live session. Killing
+/// by recorded pid scopes the restart to the one workspace being relaunched.
+/// The supervisor pid is listed first (the CLI records it at spawn), so it
+/// dies before its daemon child and cannot respawn what we kill next.
+fn kill_instance_daemon() {
+    let Some(p) = daemon_pid_path() else {
+        return;
+    };
+    if let Ok(content) = std::fs::read_to_string(&p) {
+        for pid in content.lines().filter_map(|l| l.trim().parse::<u32>().ok()) {
+            kill_pid(pid);
+        }
     }
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("pkill")
-            .args(["-f", "origin-supervisor"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
+    let _ = std::fs::remove_file(&p);
 }
 
 /// How long [`ensure_daemon_running`] waits for a freshly spawned daemon to
@@ -2663,13 +2849,11 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
     if daemon_reachable(path).await {
         if daemon_binary_is_newer(&cmd_path) {
             tracing::info!("daemon binary is newer than running daemon — restarting");
-            // Under supervision the running supervisor would immediately respawn
-            // the daemon we are about to kill; tear it down first so the fresh
-            // launch below is the sole owner.
-            if supervised {
-                kill_stale_supervisor();
-            }
-            kill_stale_daemon();
+            // Kill only THIS workspace's supervisor+daemon (recorded pids).
+            // The pid file lists the supervisor first, so it dies before it
+            // can respawn the daemon child killed right after. Other
+            // projects' daemons are untouched.
+            kill_instance_daemon();
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         } else {
             return Ok(());
@@ -2710,6 +2894,18 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
     command
         .env("ORIGIN_PROVIDER", provider)
         .env("ORIGIN_ACCOUNT", account)
+        // Pin the daemon's IPC path to the one WE resolved. With per-instance
+        // paths the daemon's own default derives from its cwd — already set to
+        // this workspace below — but an explicit env keeps the pair in lock-step
+        // even when the user set ORIGIN_SOCK or the cwd canonicalizes oddly.
+        .env("ORIGIN_SOCK", path)
+        // Run the daemon IN the workspace: tools (Bash/Read/Write), the code
+        // graph, and self-dev all resolve paths against the daemon's cwd, so a
+        // project-A daemon must not execute in project B's directory (or in
+        // whatever directory the first-ever `origin` happened to start from).
+        .current_dir(
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        )
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(log_stderr);
@@ -2717,10 +2913,20 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
-        // CREATE_NEW_PROCESS_GROUP (0x200) | DETACHED_PROCESS (0x08):
-        // detach from the parent console so Ctrl-C in the TUI doesn't take
-        // the daemon (or supervisor) down with it, and it survives this process.
-        command.creation_flags(0x0000_0208);
+        // CREATE_NEW_PROCESS_GROUP (0x200) | CREATE_NO_WINDOW (0x0800_0000):
+        // - CREATE_NEW_PROCESS_GROUP detaches the child from the parent's
+        //   Ctrl-C signal group so Ctrl-C in the TUI doesn't take the daemon
+        //   (or supervisor) down with it.
+        // - CREATE_NO_WINDOW runs the console-subsystem child without giving
+        //   it a console of its own, so no terminal window pops up. We use this
+        //   instead of DETACHED_PROCESS (0x08): DETACHED_PROCESS detaches the
+        //   child from the parent console, but because the daemon/supervisor are
+        //   console-subsystem binaries Windows then allocates a *new* console
+        //   window for them — that was the stray terminal. The child still
+        //   outlives this process (we never wait on it).
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
 
     let child = command.spawn().map_err(|e| {
@@ -2740,6 +2946,14 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
              or set ORIGIN_SOCK to an existing daemon's pipe path"
         )
     })?;
+    // Start a fresh pid ledger for this spawn generation: record the direct
+    // child (supervisor in supervised mode, else the daemon itself) FIRST so
+    // the targeted restart kills the supervisor before the daemon it would
+    // otherwise respawn. The daemon appends its own pid when it binds.
+    if let Some(p) = daemon_pid_path() {
+        let _ = std::fs::remove_file(&p);
+    }
+    record_daemon_pid(child.id());
     drop(child);
     touch_daemon_stamp();
 
@@ -2789,5 +3003,25 @@ mod tests {
         assert!(!is_slash_command("please run /vim"));
         assert!(!is_slash_command("/"));
         assert!(!is_slash_command("just a normal prompt"));
+    }
+
+    // Regression (stale/"disjointed" TUI text): the absolute-CUP renderer must
+    // run with autowrap disabled, or writing the screen's bottom-right cell
+    // scrolls the alt-screen and desyncs the damage-diff shadow grid. The setup
+    // emits DECAWM-off on entry and `restore_terminal` puts it back on exit.
+    #[test]
+    fn disable_autowrap_emits_decawm_off() {
+        let mut buf: Vec<u8> = Vec::new();
+        disable_autowrap(&mut buf).expect("writing to an in-memory buffer is infallible");
+        assert_eq!(buf.as_slice(), DISABLE_AUTOWRAP);
+        assert_eq!(buf.as_slice(), b"\x1b[?7l");
+    }
+
+    #[test]
+    fn enable_autowrap_emits_decawm_on() {
+        let mut buf: Vec<u8> = Vec::new();
+        enable_autowrap(&mut buf).expect("writing to an in-memory buffer is infallible");
+        assert_eq!(buf.as_slice(), ENABLE_AUTOWRAP);
+        assert_eq!(buf.as_slice(), b"\x1b[?7h");
     }
 }

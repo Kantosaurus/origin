@@ -98,7 +98,7 @@ pub fn maybe_spawn(sock_path: String) {
 /// Drive the plan to completion within its wall-clock window, then persist the
 /// morning report.
 async fn run(sock_path: String) {
-    let model = std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".to_string());
+    let model = std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-fable-5".to_string());
     let wall_ms = std::env::var("ORIGIN_OVERNIGHT_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())

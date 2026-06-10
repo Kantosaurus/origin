@@ -241,12 +241,7 @@ pub(crate) fn socket_path() -> String {
 }
 
 fn default_path() -> String {
-    #[cfg(unix)]
-    {
-        format!("{}/origin.sock", std::env::temp_dir().display())
-    }
-    #[cfg(windows)]
-    {
-        r"\\.\pipe\origin".to_string()
-    }
+    // Per-project daemon path (see `origin_ipc::instance`): admin one-shots
+    // address the daemon belonging to the workspace they're run from.
+    origin_ipc::instance::InstanceId::for_cwd().ipc_path()
 }

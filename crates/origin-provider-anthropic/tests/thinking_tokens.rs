@@ -82,3 +82,21 @@ fn large_budget_still_keeps_max_tokens_above_it() {
         "max_tokens must exceed a large budget too"
     );
 }
+
+#[test]
+fn modern_model_uses_adaptive_thinking_without_budget_tokens() {
+    // Claude 4.6/4.7/4.8 reject `{"type":"enabled","budget_tokens":n}` (a 400 on
+    // 4.7+); the encoder must emit adaptive thinking instead. `claude-x` above
+    // exercises the legacy enabled+budget branch for older models.
+    let mut req = req_with(Some(8_192));
+    req.model = "claude-opus-4-7".to_string();
+    let body = origin_provider_anthropic::encode_request_for_test(&req);
+    assert_eq!(
+        body["thinking"]["type"], "adaptive",
+        "claude-opus-4-7 must use adaptive thinking, not enabled+budget_tokens",
+    );
+    assert!(
+        body["thinking"].get("budget_tokens").is_none(),
+        "adaptive thinking must not carry budget_tokens",
+    );
+}

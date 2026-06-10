@@ -19,7 +19,7 @@ undocumented_unsafe_blocks = "deny"
 blake3 = "1"
 byteorder = "1"
 fastcdc = "3"
-lru = "0.12"
+lru = "0.16"
 memmap2 = "0.9"
 origin-replay = { path = "../origin-replay", optional = true }
 parking_lot = "0.12"

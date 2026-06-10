@@ -28,8 +28,8 @@ use crate::opencode::OpencodeSource;
 use crate::source::{ImportedMessage, ImportedSession, Source, SourceError};
 
 /// Origin catalog fallback used when an external model id cannot be mapped to a
-/// more specific entry. Matches the daemon's default (`claude-sonnet-4-6`).
-pub const DEFAULT_SUGGESTED_MODEL: &str = "claude-sonnet-4-6";
+/// more specific entry. Matches the daemon's default (`claude-fable-5`).
+pub const DEFAULT_SUGGESTED_MODEL: &str = "claude-fable-5";
 
 /// External-model-id -> origin-catalog-model remap table, ordered most-specific
 /// first so e.g. `claude-3-opus` resolves to an opus entry before the generic

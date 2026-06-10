@@ -131,16 +131,28 @@ async fn error_frame_surfaces_to_stderr_and_nonzero_exit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_url_routes_through_quic() {
     use origin_ipc::quic::QuicListener;
-    use origin_ipc::tls::generate_self_signed;
+    use origin_ipc::tls::{generate_self_signed, sha256_fingerprint, sha256_fingerprint_hex};
 
-    let bundle = generate_self_signed("origin-daemon").expect("cert");
-    let listener = QuicListener::bind("127.0.0.1:0".parse().expect("addr"), bundle.clone())
-        .await
-        .expect("bind quic");
+    let server_bundle = generate_self_signed("origin-daemon").expect("server cert");
+    let client_bundle = generate_self_signed("origin-client").expect("client cert");
+    let server_fp_hex = sha256_fingerprint_hex(&server_bundle.cert_der);
+    let client_fp = sha256_fingerprint(&client_bundle.cert_der);
+
+    // Mutual TLS: the server pins this specific client; the client presents the
+    // matching identity provisioned via env (DER cert + key files).
+    let listener = QuicListener::bind(
+        "127.0.0.1:0".parse().expect("addr"),
+        server_bundle,
+        vec![client_fp],
+    )
+    .await
+    .expect("bind quic");
     let addr = listener.local_addr();
     let dir = TempDir::new().expect("tempdir");
-    let ca_path = dir.path().join("ca.der");
-    std::fs::write(&ca_path, &bundle.ca_der).expect("write ca");
+    let client_cert_path = dir.path().join("client_cert.der");
+    let client_key_path = dir.path().join("client_key.der");
+    std::fs::write(&client_cert_path, &client_bundle.cert_der).expect("write client cert");
+    std::fs::write(&client_key_path, &client_bundle.key_der).expect("write client key");
 
     let server = tokio::spawn(async move {
         let mut conn = listener.accept().await.expect("accept");
@@ -163,9 +175,10 @@ async fn remote_url_routes_through_quic() {
     });
 
     let cmd = env!("CARGO_BIN_EXE_origin");
-    let url = format!("origin://{addr}#deadbeef");
+    let url = format!("origin://{addr}#{server_fp_hex}");
     let output = tokio::process::Command::new(cmd)
-        .env("ORIGIN_REMOTE_CA_DER_FILE", &ca_path)
+        .env("ORIGIN_REMOTE_CLIENT_CERT_FILE", &client_cert_path)
+        .env("ORIGIN_REMOTE_CLIENT_KEY_FILE", &client_key_path)
         .args(["run", "--remote", &url, "--json", "hi"])
         .output()
         .await

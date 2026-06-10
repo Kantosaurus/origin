@@ -45,6 +45,17 @@ pub struct Editor {
     draft: String,
     /// Active Ctrl-R reverse-incremental history search, if any.
     search: Option<RevSearch>,
+    /// Messages queued while a turn is in flight, in submission (FIFO)
+    /// order: `queued[0]` is the next to auto-submit. Pressing `Up` on the
+    /// top-most visual line edits these (newest first) before falling back
+    /// to history recall.
+    queued: Vec<String>,
+    /// When `Some(i)`, the buffer is editing `queued[i]` in place. Edits
+    /// commit back into the slot on navigation or Enter.
+    queue_pos: Option<usize>,
+    /// Stash for the in-flight buffer when the user starts editing the
+    /// queue. Restored when editing ends (commit or Down past the newest).
+    queue_draft: String,
 }
 
 /// Live Ctrl-R reverse-incremental history search state.
@@ -285,6 +296,152 @@ impl Editor {
                 true
             }
         }
+    }
+
+    // -- Queued messages ----------------------------------------------------
+
+    /// Append `text` to the message queue (called when the user submits
+    /// while a turn is already in flight). Empty texts are ignored.
+    pub fn queue_message(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.queued.push(text.to_string());
+        }
+    }
+
+    /// Number of queued messages.
+    #[must_use]
+    pub fn queued_len(&self) -> usize {
+        self.queued.len()
+    }
+
+    /// Read-only view of the queued messages (FIFO order).
+    #[must_use]
+    pub fn queued_messages(&self) -> &[String] {
+        &self.queued
+    }
+
+    /// Whether the buffer is currently editing a queued message.
+    #[must_use]
+    pub const fn editing_queue(&self) -> bool {
+        self.queue_pos.is_some()
+    }
+
+    /// Whether the editor is currently browsing prompt history (the buffer
+    /// shows a recalled history entry rather than fresh draft text). Used by
+    /// the key reducer to keep history browsing and queue editing distinct.
+    #[must_use]
+    pub const fn browsing_history(&self) -> bool {
+        self.history_pos.is_some()
+    }
+
+    /// Pop the next (oldest) queued message for auto-submission, if any.
+    /// If that slot is the one being edited, the live buffer content is
+    /// what's popped (the user's edits win) and editing ends.
+    pub fn pop_queued(&mut self) -> Option<String> {
+        if self.queued.is_empty() {
+            return None;
+        }
+        let text = match self.queue_pos {
+            Some(0) => {
+                // The user is editing the very message being dequeued: take
+                // the live buffer, restore their pre-edit draft.
+                self.queue_pos = None;
+                let live = std::mem::replace(&mut self.buffer, std::mem::take(&mut self.queue_draft));
+                self.cursor = self.buffer.len();
+                self.queued.remove(0);
+                live
+            }
+            Some(i) => {
+                // Editing a later slot: shift its index down by one.
+                self.queue_pos = Some(i - 1);
+                self.queued.remove(0)
+            }
+            None => self.queued.remove(0),
+        };
+        if text.is_empty() {
+            // An edit emptied this slot — skip it and try the next.
+            return self.pop_queued();
+        }
+        Some(text)
+    }
+
+    /// Begin editing the newest queued message, or step to the next-older
+    /// one when already editing. Stashes the live draft on entry; commits
+    /// the buffer back into the current slot before stepping. Returns
+    /// `true` when anything changed (i.e. there was a queue to edit).
+    ///
+    /// Invoked from `Up` on the top-most visual line — queued messages are
+    /// reviewed before history, since they are the messages most likely to
+    /// need a quick fix-up before the daemon consumes them.
+    pub fn queue_edit_up(&mut self) -> bool {
+        if self.queued.is_empty() {
+            return false;
+        }
+        let new_pos = match self.queue_pos {
+            None => {
+                // Entering the queue — stash the live draft.
+                self.queue_draft = std::mem::take(&mut self.buffer);
+                self.queued.len() - 1
+            }
+            Some(0) => return false, // already at the oldest queued message
+            Some(i) => {
+                self.commit_queue_edit(i);
+                i - 1
+            }
+        };
+        self.queue_pos = Some(new_pos);
+        self.buffer = self.queued[new_pos].clone();
+        self.cursor = self.buffer.len();
+        true
+    }
+
+    /// Step to the next-newer queued message, or restore the stashed draft
+    /// when stepping past the newest. Commits the buffer into the current
+    /// slot first. Returns `true` when anything changed. No-op (`false`)
+    /// when not editing the queue — the caller falls through to plain
+    /// history-down handling.
+    pub fn queue_edit_down(&mut self) -> bool {
+        let Some(i) = self.queue_pos else {
+            return false;
+        };
+        self.commit_queue_edit(i);
+        if i + 1 < self.queued.len() {
+            self.queue_pos = Some(i + 1);
+            self.buffer = self.queued[i + 1].clone();
+        } else {
+            // Past the newest — leave queue editing, restore the draft.
+            self.queue_pos = None;
+            self.buffer = std::mem::take(&mut self.queue_draft);
+        }
+        self.cursor = self.buffer.len();
+        true
+    }
+
+    /// Commit the live buffer back into queue slot `i`. An emptied slot is
+    /// kept (it's dropped at `pop_queued` time) so indices stay stable
+    /// while the user is mid-review.
+    fn commit_queue_edit(&mut self, i: usize) {
+        if let Some(slot) = self.queued.get_mut(i) {
+            slot.clone_from(&self.buffer);
+        }
+    }
+
+    /// Finish editing the current queue slot: commit the buffer into it and
+    /// restore the pre-edit draft. Used when Enter is pressed while editing
+    /// a queued message — the edit updates the queue rather than submitting
+    /// a new turn. Returns `true` when an edit was committed.
+    pub fn queue_edit_commit(&mut self) -> bool {
+        let Some(i) = self.queue_pos.take() else {
+            return false;
+        };
+        self.commit_queue_edit(i);
+        // Drop a slot the user deliberately emptied.
+        if self.queued.get(i).is_some_and(String::is_empty) {
+            self.queued.remove(i);
+        }
+        self.buffer = std::mem::take(&mut self.queue_draft);
+        self.cursor = self.buffer.len();
+        true
     }
 
     // -- Ctrl-R reverse-incremental history search -------------------------
@@ -695,6 +852,125 @@ mod tests {
         e.move_left();
         // Should jump back the full 'é', not land mid-codepoint.
         assert_eq!(e.cursor(), 1);
+    }
+
+    // -- queued-message editing --------------------------------------------
+
+    #[test]
+    fn queue_fifo_pop_order() {
+        let mut e = Editor::new();
+        e.queue_message("first");
+        e.queue_message("second");
+        e.queue_message(""); // ignored
+        assert_eq!(e.queued_len(), 2);
+        assert_eq!(e.pop_queued().as_deref(), Some("first"));
+        assert_eq!(e.pop_queued().as_deref(), Some("second"));
+        assert_eq!(e.pop_queued(), None);
+    }
+
+    #[test]
+    fn queue_edit_up_enters_newest_first_and_walks_older() {
+        let mut e = Editor::new();
+        e.queue_message("first");
+        e.queue_message("second");
+        e.set_buffer("draft".into());
+        assert!(e.queue_edit_up(), "Up at top enters the queue");
+        assert_eq!(e.buffer(), "second", "newest queued message first");
+        assert!(e.editing_queue());
+        assert!(e.queue_edit_up(), "Up again steps to the older message");
+        assert_eq!(e.buffer(), "first");
+        assert!(!e.queue_edit_up(), "at the oldest — no further");
+    }
+
+    #[test]
+    fn queue_edit_commits_changes_back_into_slot() {
+        let mut e = Editor::new();
+        e.queue_message("fix the bug");
+        e.set_buffer("draft".into());
+        assert!(e.queue_edit_up());
+        e.set_cursor_chars(e.buffer().chars().count());
+        e.insert_str(" in main.rs");
+        assert!(e.queue_edit_commit(), "Enter commits the edit");
+        assert!(!e.editing_queue());
+        assert_eq!(e.buffer(), "draft", "draft restored after commit");
+        assert_eq!(e.pop_queued().as_deref(), Some("fix the bug in main.rs"));
+    }
+
+    #[test]
+    fn queue_edit_down_commits_and_restores_draft() {
+        let mut e = Editor::new();
+        e.queue_message("alpha");
+        e.queue_message("beta");
+        e.set_buffer("draft".into());
+        e.queue_edit_up(); // editing "beta"
+        e.queue_edit_up(); // editing "alpha"
+        e.insert_str("!");
+        assert!(e.queue_edit_down(), "Down steps back to beta");
+        assert_eq!(e.buffer(), "beta");
+        assert!(e.queue_edit_down(), "Down past newest restores draft");
+        assert_eq!(e.buffer(), "draft");
+        assert!(!e.editing_queue());
+        // The alpha edit stuck.
+        assert_eq!(e.pop_queued().as_deref(), Some("alpha!"));
+        assert_eq!(e.pop_queued().as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn queue_edit_emptied_slot_is_dropped_on_commit() {
+        let mut e = Editor::new();
+        e.queue_message("delete me");
+        e.queue_edit_up();
+        // User selects-all + deletes: empty the buffer in place. (set_buffer
+        // clears history-browsing state but queue editing survives it.)
+        e.set_buffer(String::new());
+        assert!(e.editing_queue(), "queue editing survives a buffer replace");
+        assert!(e.queue_edit_commit());
+        assert_eq!(e.queued_len(), 0, "emptied slot dropped");
+        assert_eq!(e.pop_queued(), None);
+    }
+
+    #[test]
+    fn pop_queued_while_editing_slot_zero_takes_live_buffer() {
+        let mut e = Editor::new();
+        e.queue_message("original");
+        e.set_buffer("draft".into());
+        e.queue_edit_up(); // editing "original" (slot 0)
+        e.insert_str(" amended");
+        // Turn ends mid-edit: the drain must take the user's live edits.
+        assert_eq!(e.pop_queued().as_deref(), Some("original amended"));
+        assert!(!e.editing_queue());
+        assert_eq!(e.buffer(), "draft", "draft restored");
+    }
+
+    #[test]
+    fn pop_queued_while_editing_later_slot_shifts_index() {
+        let mut e = Editor::new();
+        e.queue_message("first");
+        e.queue_message("second");
+        e.set_buffer("draft".into());
+        e.queue_edit_up(); // editing "second" (slot 1)
+        assert_eq!(e.pop_queued().as_deref(), Some("first"));
+        assert!(e.editing_queue(), "still editing after the pop");
+        e.insert_str(" edited");
+        assert!(e.queue_edit_commit());
+        assert_eq!(e.pop_queued().as_deref(), Some("second edited"));
+    }
+
+    #[test]
+    fn queue_preferred_over_history_on_up() {
+        // With both history and a queue, Up at the top edits the queue.
+        let mut e = Editor::new();
+        e.push_history("old prompt");
+        e.queue_message("queued msg");
+        assert!(e.queue_edit_up());
+        assert_eq!(e.buffer(), "queued msg");
+        // Queue empty → falls back to history (caller's responsibility,
+        // mirrored in input::reduce_editor).
+        let mut e2 = Editor::new();
+        e2.push_history("old prompt");
+        assert!(!e2.queue_edit_up());
+        assert!(e2.history_up());
+        assert_eq!(e2.buffer(), "old prompt");
     }
 
     #[test]

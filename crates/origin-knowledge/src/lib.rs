@@ -173,13 +173,16 @@ impl Knowledge {
         self.docs.is_empty()
     }
 
-    /// Full-text search: rank documents by summed term frequency of the query's
-    /// tokens, returning the top `k` hits.
+    /// Full-text search: rank documents by **TF-IDF** of the query's tokens,
+    /// returning the top `k` hits.
     ///
-    /// Scoring is tf-style — each occurrence of a query term in a document adds
-    /// one to that document's score. Documents matching no query term are
-    /// omitted. An empty query (or `k == 0`) yields an empty result. Ties are
-    /// broken deterministically by ascending id.
+    /// Each query term contributes `tf × idf`, where `tf` is the term's
+    /// occurrence count in the document and `idf = ln(1 + N/df)` down-weights
+    /// terms that appear in many documents. Plain summed term frequency (the
+    /// previous scoring) let a common word dominate a rare, discriminative one;
+    /// IDF fixes that so a match on an unusual query term ranks higher.
+    /// Documents matching no query term are omitted. An empty query (or
+    /// `k == 0`) yields an empty result. Ties are broken by ascending id.
     #[must_use]
     pub fn search_text(&self, query: &str, k: usize) -> Vec<Hit> {
         if k == 0 {
@@ -189,17 +192,28 @@ impl Knowledge {
         if terms.is_empty() {
             return Vec::new();
         }
-        let mut scores: HashMap<usize, u32> = HashMap::new();
+        let n_docs = as_f32(u32::try_from(self.docs.len().max(1)).unwrap_or(u32::MAX));
+        let mut scores: HashMap<usize, f32> = HashMap::new();
         for term in terms {
             if let Some(postings) = self.index.get(&term) {
+                // Term frequency per document for this term.
+                let mut tf: HashMap<usize, u32> = HashMap::new();
                 for &doc_idx in postings {
-                    *scores.entry(doc_idx).or_insert(0) += 1;
+                    *tf.entry(doc_idx).or_insert(0) += 1;
+                }
+                // df = number of distinct documents containing the term; rarer
+                // terms (low df) are more discriminative, so they weigh more.
+                let df = as_f32(u32::try_from(tf.len().max(1)).unwrap_or(u32::MAX));
+                let idf = (n_docs / df).ln_1p();
+                for (doc_idx, count) in tf {
+                    let slot = scores.entry(doc_idx).or_insert(0.0);
+                    *slot = as_f32(count).mul_add(idf, *slot);
                 }
             }
         }
-        let hits = scores.into_iter().map(|(doc_idx, count)| Hit {
+        let hits = scores.into_iter().map(|(doc_idx, score)| Hit {
             id: self.docs[doc_idx].id.clone(),
-            score: as_f32(count),
+            score,
         });
         top_k(hits, k)
     }
@@ -328,6 +342,21 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].id, "a");
         assert_eq!(hits[1].id, "b");
+        assert!(hits[0].score > hits[1].score);
+    }
+
+    #[test]
+    fn text_search_weights_rare_terms_higher_via_idf() {
+        let mut k = Knowledge::new();
+        // "common" appears in a and b (low idf); "quantum" only in c (high idf).
+        k.add(Doc::text("a", "common alpha"));
+        k.add(Doc::text("b", "common gamma"));
+        k.add(Doc::text("c", "quantum delta"));
+        let hits = k.search_text("common quantum", 5);
+        // Each matching doc has exactly one query-term occurrence, so plain TF
+        // would tie them; TF-IDF lifts c (the rare "quantum" match) above the
+        // two docs that only matched the common term.
+        assert_eq!(hits[0].id, "c", "rare-term match must outrank common-term matches");
         assert!(hits[0].score > hits[1].score);
     }
 

@@ -9,7 +9,7 @@ pub mod streaming;
 mod token_source;
 pub mod wire;
 
-pub use token_source::{NoAuth, StaticBearer, StaticHeader, TokenSource};
+pub use token_source::{NoAuth, StaticBearer, StaticHeader, TokenError, TokenSource};
 
 use async_trait::async_trait;
 use origin_core::types::{Block, Message, Role};

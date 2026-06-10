@@ -35,6 +35,33 @@ const fn resolve_max_tokens(thinking_tokens: Option<u32>) -> u32 {
     }
 }
 
+/// Whether `model` uses *adaptive* thinking (`{"type":"adaptive"}`) rather than
+/// the legacy fixed-budget form. The Claude 4.6/4.7/4.8 families
+/// (e.g. `claude-opus-4-7`, `claude-opus-4-8`, `claude-sonnet-4-6`) require/
+/// recommend adaptive thinking — manual `budget_tokens` is deprecated on 4.6 and
+/// **returns a 400 on 4.7+**. Claude 4.5 and earlier use the legacy form.
+fn model_uses_adaptive_thinking(model: &str) -> bool {
+    ["-4-6", "-4-7", "-4-8"].iter().any(|tag| model.contains(tag))
+}
+
+/// Build the `thinking` block for `model` from a requested budget, choosing
+/// adaptive vs. legacy fixed-budget per [`model_uses_adaptive_thinking`].
+fn thinking_block(model: &str, budget_tokens: u32) -> wire::WireThinking {
+    if model_uses_adaptive_thinking(model) {
+        wire::WireThinking::Adaptive
+    } else {
+        wire::WireThinking::Enabled { budget_tokens }
+    }
+}
+
+/// Build the `output_config` block carrying the reasoning effort (Messages API
+/// `output_config.effort`, not a top-level `effort` field).
+const fn output_config(effort: ReasoningEffort) -> wire::WireOutputConfig {
+    wire::WireOutputConfig {
+        effort: Some(effort.as_anthropic_effort()),
+    }
+}
+
 const OAUTH_BETA_HEADERS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24";
 const CLAUDE_CLI_USER_AGENT: &str = "claude-cli/2.1.123 (external, sdk-cli)";
 const OAUTH_BILLING_HEADER: &str = "cc_version=2.1.123; cc_entrypoint=sdk-cli; cch=33f85;";
@@ -220,8 +247,10 @@ impl Anthropic {
             metadata: self.oauth_metadata.as_ref().map(|m| wire::WireMetadata {
                 user_id: m.user_id.clone(),
             }),
-            effort: req.effort.map(ReasoningEffort::as_wire_str),
-            thinking: req.thinking_tokens.map(wire::WireThinking::enabled),
+            output_config: req.effort.map(output_config),
+            thinking: req
+                .thinking_tokens
+                .map(|b| thinking_block(&req.model, b)),
         };
 
         let mut body_value =
@@ -358,18 +387,21 @@ impl Provider for Anthropic {
         if let Some(meta) = &self.oauth_metadata {
             body_json["metadata"] = serde_json::json!({ "user_id": meta.user_id });
         }
-        // Emit the effort hint only when set, so the unset path is byte-identical.
+        // Emit the effort hint only when set (nested under output_config, per the
+        // Messages API), so the unset path is byte-identical.
         if let Some(level) = req.effort {
-            body_json["effort"] = serde_json::Value::String(level.as_wire_str().to_string());
+            body_json["output_config"] = serde_json::json!({ "effort": level.as_anthropic_effort() });
         }
         // Emit the extended-thinking block only when a budget is set, so the
-        // unset path is byte-identical. `max_tokens` was already bumped above to
-        // exceed the budget, per Anthropic's requirement.
+        // unset path is byte-identical. Adaptive for 4.6/4.7/4.8 (manual
+        // budget_tokens 400s on 4.7+); legacy enabled+budget for older models —
+        // `max_tokens` was already bumped above to exceed the budget for those.
         if let Some(budget) = req.thinking_tokens {
-            body_json["thinking"] = serde_json::json!({
-                "type": "enabled",
-                "budget_tokens": budget,
-            });
+            body_json["thinking"] = if model_uses_adaptive_thinking(&req.model) {
+                serde_json::json!({ "type": "adaptive" })
+            } else {
+                serde_json::json!({ "type": "enabled", "budget_tokens": budget })
+            };
         }
         // Inject multimodal attachments into the last user message, mirroring the
         // non-streaming `chat` path (which injects via `build_chat_body`).
@@ -518,7 +550,16 @@ fn message_to_wire<'a>(m: &'a Message, plan: Option<&Plan>, msg_idx: usize) -> w
             let dynamic_marker_here = Some(block_idx) == last_emit_idx;
             let cache_control = if plan_marker_here || block_marker_here || dynamic_marker_here {
                 emitted_markers = emitted_markers.saturating_add(1);
-                Some(wire::WireCacheControl::ephemeral())
+                // Only the single most-stable boundary (tagged `Frozen` by the
+                // agent loop) gets the longer 1h TTL, and only when explicitly
+                // enabled — sending `ttl` requires the extended-cache-ttl beta,
+                // which the default impersonation header set does not carry.
+                let frozen = matches!(block_cache_boundary(b), Some(origin_core::types::CacheBoundary::Frozen));
+                Some(if frozen && ttl_1h_enabled() {
+                    wire::WireCacheControl::ephemeral_1h()
+                } else {
+                    wire::WireCacheControl::ephemeral()
+                })
             } else {
                 None
             };
@@ -543,6 +584,28 @@ const fn block_has_cache_marker(b: &Block) -> bool {
         | Block::ToolResult { cache_marker, .. } => cache_marker.is_some(),
         Block::Thinking { .. } => false,
     }
+}
+
+/// The `CacheBoundary` tier carried by a block's cache marker, if any.
+const fn block_cache_boundary(b: &Block) -> Option<origin_core::types::CacheBoundary> {
+    match b {
+        Block::Text { cache_marker, .. }
+        | Block::ToolUse { cache_marker, .. }
+        | Block::ToolResult { cache_marker, .. } => *cache_marker,
+        Block::Thinking { .. } => None,
+    }
+}
+
+/// Whether the opt-in 1-hour cache TTL is enabled (`ORIGIN_CACHE_TTL_1H=1`).
+///
+/// Off by default: emitting a `ttl` requires the Anthropic extended-cache-ttl
+/// beta, and the default request carries an impersonation beta-header set that
+/// must not be modified, so the longer TTL is opt-in until an account is known
+/// to support it. Read once and cached.
+fn ttl_1h_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ORIGIN_CACHE_TTL_1H").as_deref() == Ok("1"))
 }
 
 fn block_to_wire(b: &Block, cache_control: Option<wire::WireCacheControl>) -> Option<wire::WireBlock<'_>> {
@@ -890,8 +953,8 @@ pub fn encode_request_for_test(req: &ChatRequest) -> serde_json::Value {
         messages: wire_messages,
         tools: wire_tools,
         metadata: None,
-        effort: req.effort.map(ReasoningEffort::as_wire_str),
-        thinking: req.thinking_tokens.map(wire::WireThinking::enabled),
+        output_config: req.effort.map(output_config),
+        thinking: req.thinking_tokens.map(|b| thinking_block(&req.model, b)),
     };
     serde_json::to_value(&body).expect("WireRequest serialises to JSON")
 }

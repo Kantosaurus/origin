@@ -15,4 +15,4 @@ pub use embedded::load_embedded;
 pub use frontmatter::{parse_frontmatter, FrontmatterError, SkillFrontmatter};
 pub use import::{first_run_import, ImportDecision, ImportError, ImportReport};
 pub use loader::{load_all, load_skills_dir, LoaderError, Skill, SkillHash};
-pub use registry::SkillRegistry;
+pub use registry::{ActiveSkill, SkillRegistry};

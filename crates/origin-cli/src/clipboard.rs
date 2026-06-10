@@ -8,6 +8,7 @@
 //! formatting and parsing logic lives in the pure [`origin_clipboard`] crate.
 
 use std::io::Write as _;
+use std::path::{Component, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::Result;
@@ -33,6 +34,19 @@ pub fn copy_context(instruction: Option<String>, files: &[String]) -> Result<()>
     pipe_to_clipboard(prog, &args, &payload)?;
     println!("copied {count} files to clipboard");
     Ok(())
+}
+
+/// Write `text` to the local OS clipboard via the platform copy program.
+///
+/// Uses `clip`/`pbcopy`/`wl-copy`/`xclip`. Best-effort companion to
+/// [`osc52_sequence`]: the OSC 52 escape covers remote/SSH terminals, while this
+/// covers the local clipboard reliably.
+///
+/// # Errors
+/// Returns if the clipboard program cannot be spawned or exits non-zero.
+pub fn copy_to_os_clipboard(text: &str) -> Result<()> {
+    let (prog, args) = os_copy_command();
+    pipe_to_clipboard(prog, &args, text)
 }
 
 /// Spawns the clipboard-write program and feeds `payload` on its stdin.
@@ -96,11 +110,51 @@ pub fn apply_clipboard() -> Result<()> {
     Ok(())
 }
 
+/// Confine an LLM-supplied edit path to the current working directory tree.
+///
+/// `apply-clipboard` applies edit blocks parsed from untrusted model output. A
+/// pasted reply that names `/etc/cron.d/x`, `~/.ssh/authorized_keys`, a Windows
+/// `C:\...`/UNC path, or `../../../.bashrc` would otherwise turn a clipboard
+/// paste into an arbitrary file write anywhere the user can reach. Resolve the
+/// path lexically (without touching the filesystem, so a hostile symlink cannot
+/// race the check) and reject anything absolute, rooted, or escaping the
+/// working directory via `..`.
+fn confine_to_cwd(file: &str) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("resolving working directory: {e}"))?;
+    let raw = std::path::Path::new(file);
+    if raw.is_absolute() {
+        anyhow::bail!("refusing to write outside the working directory: absolute path `{file}`");
+    }
+    let mut normalized = PathBuf::new();
+    for comp in raw.components() {
+        match comp {
+            Component::Normal(seg) => normalized.push(seg),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    anyhow::bail!("refusing to write outside the working directory: `{file}` escapes via `..`");
+                }
+            }
+            // A drive prefix (`C:\`, `\\server\share`) or a bare root (`\foo`)
+            // is rooted even when `is_absolute` is false (e.g. `C:foo` on
+            // Windows); reject explicitly rather than silently rebasing it.
+            Component::Prefix(_) | Component::RootDir => {
+                anyhow::bail!("refusing to write outside the working directory: rooted path `{file}`");
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        anyhow::bail!("refusing to write: empty edit path");
+    }
+    Ok(cwd.join(normalized))
+}
+
 /// Applies one [`EditBlock`] to disk, returning a one-line summary.
 fn apply_edit(edit: &EditBlock) -> Result<String> {
     match edit {
         EditBlock::WholeFile { file, contents } => {
-            std::fs::write(file, contents).map_err(|e| anyhow::anyhow!("writing {file}: {e}"))?;
+            let path = confine_to_cwd(file)?;
+            std::fs::write(&path, contents).map_err(|e| anyhow::anyhow!("writing {file}: {e}"))?;
             Ok(format!("wrote {file} ({} bytes)", contents.len()))
         }
         EditBlock::SearchReplace {
@@ -108,8 +162,9 @@ fn apply_edit(edit: &EditBlock) -> Result<String> {
             search,
             replace,
         } => {
+            let path = confine_to_cwd(file)?;
             let original =
-                std::fs::read_to_string(file).map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?;
+                std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?;
             let Some(idx) = original.find(search.as_str()) else {
                 anyhow::bail!("search text not found in {file}");
             };
@@ -117,7 +172,7 @@ fn apply_edit(edit: &EditBlock) -> Result<String> {
             updated.push_str(&original[..idx]);
             updated.push_str(replace);
             updated.push_str(&original[idx + search.len()..]);
-            std::fs::write(file, updated).map_err(|e| anyhow::anyhow!("writing {file}: {e}"))?;
+            std::fs::write(&path, updated).map_err(|e| anyhow::anyhow!("writing {file}: {e}"))?;
             Ok(format!("patched {file}"))
         }
     }
@@ -158,7 +213,31 @@ pub fn osc52_sequence(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64_encode, osc52_sequence};
+    use super::{base64_encode, confine_to_cwd, osc52_sequence};
+
+    #[test]
+    fn confine_allows_paths_inside_cwd() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let p = confine_to_cwd("src/main.rs").expect("relative path allowed");
+        assert!(p.starts_with(&cwd), "resolved path must stay under cwd: {p:?}");
+        assert!(p.ends_with("src/main.rs") || p.ends_with(r"src\main.rs"));
+        // Interior `..` that does not escape is normalized, not rejected.
+        let p = confine_to_cwd("a/../b/c.txt").expect("non-escaping .. allowed");
+        assert!(p.starts_with(&cwd));
+        assert!(p.ends_with("b/c.txt") || p.ends_with(r"b\c.txt"));
+    }
+
+    #[test]
+    fn confine_rejects_traversal_and_absolute_paths() {
+        // `..` escaping the working directory.
+        assert!(confine_to_cwd("../../etc/passwd").is_err());
+        assert!(confine_to_cwd("a/../../b").is_err());
+        // An absolute path (built portably from the real cwd).
+        let abs = std::env::current_dir().expect("cwd").join("x");
+        assert!(confine_to_cwd(abs.to_str().expect("utf8")).is_err());
+        // Empty path.
+        assert!(confine_to_cwd("").is_err());
+    }
 
     #[test]
     fn base64_matches_known_vectors() {
