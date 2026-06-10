@@ -8,9 +8,9 @@ use std::process::ExitStatus;
 use std::process::Stdio;
 use tokio::process::Command;
 
-/// CREATE_NO_WINDOW: run the console-subsystem daemon child without giving it
+/// `CREATE_NO_WINDOW`: run the console-subsystem daemon child without giving it
 /// a console window of its own. The supervisor is launched windowless by the
-/// CLI (CREATE_NO_WINDOW), so a console-subsystem child spawned with no flags
+/// CLI (`CREATE_NO_WINDOW`), so a console-subsystem child spawned with no flags
 /// would otherwise allocate a *new* console window — the stray terminal. This
 /// flag suppresses it while keeping stdout/stderr inherited into the
 /// supervisor's (redirected) handles.
