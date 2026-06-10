@@ -40,7 +40,7 @@ const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 /// CoreFoundation short-attribute key for `kSecAttrAccount`.
 ///
 /// `security_framework`'s `SearchResult::simplify_dict` returns a
-/// `HashMap<String, String>` keyed on the CFString underlying
+/// `HashMap<String, String>` keyed on the `CFString` underlying
 /// `kSecAttr*` constants. The string value for `kSecAttrAccount` is
 /// the well-known four-letter Apple identifier `"acct"`; see
 /// `<Security/SecItem.h>` in the Apple SDK.
