@@ -18,13 +18,33 @@ pub struct WireCacheControl {
     /// Must be `"ephemeral"` per the Anthropic Messages API spec.
     #[serde(rename = "type")]
     pub kind: &'static str,
+    /// Optional explicit cache TTL (e.g. `"1h"`). Omitted ⇒ the API's default
+    /// 5-minute ephemeral cache. A 1-hour TTL keeps the stable system+tools+
+    /// early-history prefix warm across agentic gaps longer than 5 minutes, at
+    /// the cost of a ~2× cache write — worth it only on the most stable marker.
+    #[serde(rename = "ttl", skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<&'static str>,
 }
 
 impl WireCacheControl {
-    /// Construct the ephemeral cache-control marker.
+    /// Construct the default (5-minute) ephemeral cache-control marker.
     #[must_use]
     pub const fn ephemeral() -> Self {
-        Self { kind: "ephemeral" }
+        Self {
+            kind: "ephemeral",
+            ttl: None,
+        }
+    }
+
+    /// Ephemeral marker with an explicit 1-hour TTL, for the single most stable
+    /// prefix boundary. Requires the account/request to have the extended cache
+    /// TTL beta enabled.
+    #[must_use]
+    pub const fn ephemeral_1h() -> Self {
+        Self {
+            kind: "ephemeral",
+            ttl: Some("1h"),
+        }
     }
 }
 
@@ -39,43 +59,41 @@ pub struct WireRequest<'a> {
     pub tools: Vec<WireTool<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<WireMetadata>,
-    /// Reasoning-effort hint. `None` is omitted from the wire entirely, keeping
-    /// the request byte-identical to the pre-effort behavior.
+    /// Output config — currently only the reasoning `effort` level. The Messages
+    /// API takes effort as `output_config.effort`, NOT a top-level field; a
+    /// top-level `effort` is an unknown body param and is rejected with 400.
+    /// `None` is omitted entirely (byte-identical to the pre-effort behavior).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<&'static str>,
-    /// Extended-thinking control block. `None` is omitted from the wire
-    /// entirely, keeping the request byte-identical to the pre-thinking-tokens
-    /// behavior. `Some` emits `"thinking": {"type":"enabled","budget_tokens":n}`
-    /// (Anthropic Messages API); callers must ensure `max_tokens` exceeds the
-    /// budget.
+    pub output_config: Option<WireOutputConfig>,
+    /// Extended-thinking control block. `None` is omitted from the wire entirely
+    /// (byte-identical to the pre-thinking behavior). See [`WireThinking`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<WireThinking>,
 }
 
-/// Anthropic extended-thinking control block.
-///
-/// Serialises to `{"type":"enabled","budget_tokens": n}`. Only constructed when
-/// a turn's `thinking_tokens` is `Some`; the surrounding `WireRequest.thinking`
-/// is omitted otherwise so the unset path stays byte-identical.
+/// Anthropic `output_config` block (Messages API). Reasoning effort lives here,
+/// not at the top level: `{"output_config":{"effort":"high"}}`.
 #[derive(Serialize, Clone, Copy)]
-pub struct WireThinking {
-    /// Always `"enabled"` per the Messages API.
-    #[serde(rename = "type")]
-    pub kind: &'static str,
-    /// Token budget the model may spend on thinking. Must be strictly less than
-    /// the request's top-level `max_tokens`.
-    pub budget_tokens: u32,
+pub struct WireOutputConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<&'static str>,
 }
 
-impl WireThinking {
-    /// Construct an enabled extended-thinking block with the given budget.
-    #[must_use]
-    pub const fn enabled(budget_tokens: u32) -> Self {
-        Self {
-            kind: "enabled",
-            budget_tokens,
-        }
-    }
+/// Anthropic extended-thinking control block.
+///
+/// Two on-modes: `{"type":"adaptive"}` — the only mode accepted by Claude
+/// 4.7/4.8 and the recommended mode for 4.6/Sonnet 4.6; and the legacy
+/// `{"type":"enabled","budget_tokens":n}`, which is valid only on Claude 4.5 and
+/// earlier (it returns a 400 on 4.7+). The surrounding `WireRequest.thinking` is
+/// omitted when thinking is unset so the default path stays byte-identical.
+#[derive(Serialize, Clone, Copy)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WireThinking {
+    /// `{"type":"adaptive"}` — model decides when/how much to think.
+    Adaptive,
+    /// `{"type":"enabled","budget_tokens":n}` — legacy fixed-budget thinking.
+    /// `budget_tokens` must be strictly less than the request's `max_tokens`.
+    Enabled { budget_tokens: u32 },
 }
 
 #[derive(Serialize)]

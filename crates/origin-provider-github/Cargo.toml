@@ -14,6 +14,7 @@ workspace = true
 origin-core = { path = "../origin-core" }
 origin-keyvault = { path = "../origin-keyvault" }
 origin-provider = { path = "../origin-provider" }
+origin-provider-openai-compat = { path = "../origin-provider-openai-compat" }
 origin-stream = { path = "../origin-stream" }
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

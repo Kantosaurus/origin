@@ -21,6 +21,10 @@ pub enum InputAction {
     /// daemon and stays running — distinct from `Quit` which exits the
     /// process. See bug #5.
     Interrupt,
+    /// An edit to a queued message was committed back into its queue slot
+    /// (Enter while editing the queue). Nothing is submitted; the caller
+    /// just redraws and may surface a confirmation line.
+    QueueEdited,
     Noop,
 }
 
@@ -154,6 +158,13 @@ pub fn reduce_editor(editor: &mut Editor, ev: KeyEvent, op_in_flight: bool, widt
             InputAction::Newline
         }
         (KeyCode::Enter, _) => {
+            // Editing a queued message: Enter commits the edit back into the
+            // queue slot (it will auto-submit when its turn comes) instead of
+            // starting a new turn.
+            if editor.editing_queue() {
+                editor.queue_edit_commit();
+                return InputAction::QueueEdited;
+            }
             if editor.is_empty() {
                 InputAction::Noop
             } else {
@@ -188,14 +199,27 @@ pub fn reduce_editor(editor: &mut Editor, ev: KeyEvent, op_in_flight: bool, widt
             InputAction::Noop
         }
         (KeyCode::Up, _) => {
-            // Move up a visual line; at the top, recall older history.
+            // Move up a visual line. At the top-most line the precedence is:
+            //   1. already editing the queue → keep walking the queue (stop
+            //      at the oldest; never bleed into history mid-queue-edit);
+            //   2. already browsing history  → keep walking history;
+            //   3. queued messages exist     → edit them (newest first);
+            //   4. otherwise                 → recall older history.
+            // Queue editing and history browsing stay mutually exclusive so
+            // one mode's draft stash can't clobber the other's.
             if !editor.move_up_visual(width) {
-                editor.history_up();
+                if editor.editing_queue() {
+                    let _ = editor.queue_edit_up();
+                } else if editor.browsing_history() || !editor.queue_edit_up() {
+                    editor.history_up();
+                }
             }
             InputAction::Noop
         }
         (KeyCode::Down, _) => {
-            if !editor.move_down_visual(width) {
+            // Symmetric: step down through the queue when editing it
+            // (committing the current edit), else plain history-down.
+            if !editor.move_down_visual(width) && !editor.queue_edit_down() {
                 editor.history_down();
             }
             InputAction::Noop
@@ -669,6 +693,87 @@ mod tests {
             "first",
             "Up past the top recalls the previous prompt"
         );
+    }
+
+    #[test]
+    fn reduce_editor_up_on_top_line_edits_queued_message_before_history() {
+        let mut ed = Editor::new();
+        ed.push_history("older history entry");
+        ed.queue_message("queued while busy");
+        assert_eq!(reduce_editor(&mut ed, k(KeyCode::Up), false, 80), InputAction::Noop);
+        assert_eq!(
+            ed.buffer(),
+            "queued while busy",
+            "Up on the top line must open the queued message, not history"
+        );
+        assert!(ed.editing_queue());
+    }
+
+    #[test]
+    fn reduce_editor_enter_while_editing_queue_commits_not_submits() {
+        let mut ed = Editor::new();
+        ed.queue_message("queued");
+        reduce_editor(&mut ed, k(KeyCode::Up), false, 80); // open queue slot
+        reduce_editor(&mut ed, k(KeyCode::Char('!')), false, 80); // edit it
+        let action = reduce_editor(&mut ed, k(KeyCode::Enter), false, 80);
+        assert_eq!(
+            action,
+            InputAction::QueueEdited,
+            "Enter during a queue edit must commit, not submit a new turn"
+        );
+        assert!(!ed.editing_queue());
+        assert_eq!(ed.pop_queued().as_deref(), Some("queued!"));
+    }
+
+    #[test]
+    fn reduce_editor_up_in_multiline_input_moves_cursor_before_queue() {
+        let mut ed = Editor::new();
+        ed.queue_message("queued");
+        ed.set_buffer("line one\nline two".to_string()); // cursor at end (line two)
+        assert_eq!(reduce_editor(&mut ed, k(KeyCode::Up), false, 80), InputAction::Noop);
+        assert!(
+            !ed.editing_queue(),
+            "Up below the top line is cursor movement, not queue editing"
+        );
+        assert_eq!(ed.buffer(), "line one\nline two");
+        // Now ON the top line: next Up opens the queue.
+        assert_eq!(reduce_editor(&mut ed, k(KeyCode::Up), false, 80), InputAction::Noop);
+        assert!(ed.editing_queue(), "Up on the top-most line edits the queue");
+        assert_eq!(ed.buffer(), "queued");
+    }
+
+    #[test]
+    fn reduce_editor_down_leaves_queue_edit_and_restores_draft() {
+        let mut ed = Editor::new();
+        ed.queue_message("queued");
+        ed.set_buffer("my draft".to_string());
+        reduce_editor(&mut ed, k(KeyCode::Up), false, 80); // edit queue
+        assert_eq!(ed.buffer(), "queued");
+        reduce_editor(&mut ed, k(KeyCode::Down), false, 80); // step out
+        assert_eq!(ed.buffer(), "my draft", "draft restored on Down past newest");
+        assert!(!ed.editing_queue());
+    }
+
+    #[test]
+    fn reduce_editor_history_browse_does_not_enter_queue() {
+        let mut ed = Editor::new();
+        ed.push_history("old one");
+        ed.push_history("old two");
+        ed.queue_message("queued");
+        reduce_editor(&mut ed, k(KeyCode::Up), false, 80); // queue first
+        assert!(ed.editing_queue());
+        reduce_editor(&mut ed, k(KeyCode::Down), false, 80); // back out
+        assert!(!ed.editing_queue());
+        // Drain the queue, then Up must walk history.
+        let _ = ed.pop_queued();
+        reduce_editor(&mut ed, k(KeyCode::Up), false, 80);
+        assert_eq!(ed.buffer(), "old two", "empty queue falls back to history");
+        assert!(ed.browsing_history());
+        // Mid-history Up keeps walking history (queue stays untouched).
+        ed.queue_message("late arrival");
+        reduce_editor(&mut ed, k(KeyCode::Up), false, 80);
+        assert_eq!(ed.buffer(), "old one", "browsing history keeps priority over queue");
+        assert!(!ed.editing_queue());
     }
 
     const fn ctrl(c: char) -> KeyEvent {

@@ -34,6 +34,9 @@ pub enum StartOutcome {
     Stepped {
         progress: WorkflowProgress,
         front: SkillFrontmatter,
+        /// The resolved step skill's `SKILL.md` body, so the caller can
+        /// activate it WITH its instructions (not just the tool mask).
+        body: String,
         skipped: Vec<String>,
     },
     /// No step in the workflow had a catalog match. Caller should treat
@@ -52,6 +55,8 @@ pub enum AdvanceOutcome {
     Stepped {
         previous_skill: String,
         front: SkillFrontmatter,
+        /// The resolved step skill's `SKILL.md` body (see `StartOutcome`).
+        body: String,
         skipped: Vec<String>,
     },
     /// No more resolvable steps. `previous_skill` is the trailing skill
@@ -83,6 +88,7 @@ impl WorkflowProgress {
                 return StartOutcome::Stepped {
                     progress,
                     front: skill.front.clone(),
+                    body: skill.body.clone(),
                     skipped,
                 };
             }
@@ -107,6 +113,7 @@ impl WorkflowProgress {
                 return AdvanceOutcome::Stepped {
                     previous_skill: previous,
                     front: skill.front.clone(),
+                    body: skill.body.clone(),
                     skipped,
                 };
             }
@@ -163,12 +170,14 @@ mod tests {
             StartOutcome::Stepped {
                 progress,
                 front,
+                body,
                 skipped,
             } => {
                 assert_eq!(progress.current_skill, "alpha");
                 assert_eq!(progress.current_step_index, 0);
                 assert_eq!(progress.total_steps, 2);
                 assert_eq!(front.name, "alpha");
+                assert!(body.contains("body"), "step carries its SKILL.md body");
                 assert!(skipped.is_empty());
             }
             other => panic!("expected Stepped, got {other:?}"),
@@ -185,6 +194,7 @@ mod tests {
             StartOutcome::Stepped {
                 progress,
                 front,
+                body: _,
                 skipped,
             } => {
                 assert_eq!(front.name, "beta");
@@ -223,6 +233,7 @@ mod tests {
             AdvanceOutcome::Stepped {
                 previous_skill,
                 front,
+                body: _,
                 skipped,
             } => {
                 assert_eq!(previous_skill, "alpha");

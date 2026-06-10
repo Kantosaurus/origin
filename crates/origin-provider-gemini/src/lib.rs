@@ -207,8 +207,14 @@ fn decode_response(wire: wire::WireResponse) -> ChatResponse {
             }
             if let Some(fc) = part.function_call {
                 let input_json = serde_json::to_vec(&fc.args).unwrap_or_default();
+                // Pack Gemini's real call id as `name#id` so the tool-result
+                // encoder can echo it back (correct mapping for parallel
+                // same-name calls); fall back to `call_<name>` when absent.
+                let id = fc
+                    .id
+                    .map_or_else(|| format!("call_{}", fc.name), |real| format!("{}#{real}", fc.name));
                 blocks.push(Block::ToolUse {
-                    id: format!("call_{}", fc.name),
+                    id,
                     name: fc.name,
                     input_json,
                     cache_marker: None,

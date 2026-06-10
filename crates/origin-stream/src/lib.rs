@@ -155,22 +155,7 @@ impl Subscriber {
     /// Propagates rkyv decode errors.
     pub async fn next(&mut self) -> Result<Option<TokenEvent>, RingError> {
         loop {
-            let write = self.ring.inner.write_cursor.load(Ordering::Acquire);
-            if self.read_cursor < write {
-                let buf = self.ring.inner.buf.lock();
-                let len_bytes: [u8; 4] = buf[self.read_cursor..self.read_cursor + 4]
-                    .try_into()
-                    .map_err(|_| RingError::Decode("len prefix".into()))?;
-                let len = u32::from_be_bytes(len_bytes) as usize;
-                let start = self.read_cursor + 4;
-                let end = start + len;
-                let slice = &buf[start..end];
-                let archived = check_archived_root::<TokenEvent>(slice)
-                    .map_err(|e| RingError::Decode(format!("{e:?}")))?;
-                let ev: TokenEvent = archived
-                    .deserialize(&mut Infallible)
-                    .map_err(|e| RingError::Decode(format!("{e:?}")))?;
-                self.read_cursor = end;
+            if let Some(ev) = self.read_ready()? {
                 return Ok(Some(ev));
             }
             if self.ring.inner.closed.load(Ordering::Acquire) {
@@ -178,8 +163,8 @@ impl Subscriber {
                 // record may have been published immediately before the close.
                 // The Acquire load of `closed` synchronizes-with the producer's
                 // Release stores, so a fresh write_cursor load here observes any
-                // record written before the close. The initial check at the top
-                // of the loop could have read a stale (pre-publish) cursor.
+                // record written before the close. The initial check inside
+                // `read_ready` could have read a stale (pre-publish) cursor.
                 if self.ring.inner.write_cursor.load(Ordering::Acquire) > self.read_cursor {
                     continue;
                 }
@@ -194,5 +179,41 @@ impl Subscriber {
             }
             notified.await;
         }
+    }
+
+    /// Non-blocking read: return the next already-published `TokenEvent`, or
+    /// `Ok(None)` when the subscriber has caught up to the producer. Never
+    /// awaits, and does **not** distinguish "caught up" from "closed" — use
+    /// [`Self::next`] for end-of-stream detection. Lets a consumer drain a burst
+    /// of ready records (and coalesce them) without a task yield per record.
+    ///
+    /// # Errors
+    /// Propagates rkyv decode errors.
+    pub fn try_next(&mut self) -> Result<Option<TokenEvent>, RingError> {
+        self.read_ready()
+    }
+
+    /// Decode the record at `read_cursor` when one is available (read cursor is
+    /// behind the write cursor), advancing the cursor; otherwise `Ok(None)`.
+    fn read_ready(&mut self) -> Result<Option<TokenEvent>, RingError> {
+        let write = self.ring.inner.write_cursor.load(Ordering::Acquire);
+        if self.read_cursor >= write {
+            return Ok(None);
+        }
+        let buf = self.ring.inner.buf.lock();
+        let len_bytes: [u8; 4] = buf[self.read_cursor..self.read_cursor + 4]
+            .try_into()
+            .map_err(|_| RingError::Decode("len prefix".into()))?;
+        let len = u32::from_be_bytes(len_bytes) as usize;
+        let start = self.read_cursor + 4;
+        let end = start + len;
+        let slice = &buf[start..end];
+        let archived = check_archived_root::<TokenEvent>(slice)
+            .map_err(|e| RingError::Decode(format!("{e:?}")))?;
+        let ev: TokenEvent = archived
+            .deserialize(&mut Infallible)
+            .map_err(|e| RingError::Decode(format!("{e:?}")))?;
+        self.read_cursor = end;
+        Ok(Some(ev))
     }
 }

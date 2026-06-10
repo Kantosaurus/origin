@@ -72,6 +72,33 @@ fn fast_index_keeps_distinct_rows_for_distinct_label_values() {
 }
 
 #[test]
+fn untrusted_label_value_cannot_inject_exposition_lines() {
+    // `model` is not allow-listed — it flows from upstream provider metadata,
+    // which the threat model treats as untrusted. A hostile value containing a
+    // double-quote + newline must be escaped, not allowed to break out of the
+    // quoted label and forge an extra metric line in the `/metrics` output.
+    let m = Metrics::new();
+    let evil = "x\"} 1\norigin_pwned_total{a=\"b\"} 999\nmodel=\"y";
+    let interned = Box::leak(evil.to_string().into_boxed_str()) as &'static str;
+    m.tokens_in_total("anthropic", interned).inc_by(1);
+
+    let text = m.encode_text().expect("encode");
+    // No counterfeit metric line was injected.
+    assert!(
+        !text.lines().any(|l| l.starts_with("origin_pwned_total")),
+        "exposition injection succeeded: {text}"
+    );
+    // The dangerous characters are escaped per the text-format spec.
+    assert!(text.contains("\\\""), "double-quote not escaped: {text}");
+    assert!(text.contains("\\n"), "newline not escaped: {text}");
+    // Every emitted *data* row (not the HELP/TYPE headers) is still a single
+    // well-formed sample ending in its value, never split by the injection.
+    for line in text.lines().filter(|l| l.starts_with("origin_tokens_in_total{")) {
+        assert!(line.ends_with(" 1"), "row corrupted by injection: {line:?}");
+    }
+}
+
+#[test]
 fn cardinality_is_bounded() {
     // Unknown tool names collapse into `_other_` via the label allowlist.
     let m = Metrics::new();

@@ -72,20 +72,57 @@ pub fn compact(input: &CompactionInput<'_>) -> CompactionOutput {
             compacted_indices: Vec::new(),
         };
     }
-    let mut out = input.transcript.to_vec();
-    let mut compacted = Vec::with_capacity(COMPACT_OLDEST_N_TURNS);
-    for (i, sum) in input.summaries.iter().enumerate().take(input.transcript.len()) {
-        if compacted.len() >= COMPACT_OLDEST_N_TURNS {
+    let transcript = input.transcript;
+
+    // Pick the oldest summarizable turns, as before.
+    let mut selected: Vec<usize> = Vec::with_capacity(COMPACT_OLDEST_N_TURNS);
+    for (i, sum) in input.summaries.iter().enumerate().take(transcript.len()) {
+        if selected.len() >= COMPACT_OLDEST_N_TURNS {
             break;
         }
-        let Some(summary) = sum.as_ref() else {
-            continue;
-        };
-        let role = input.transcript[i].role;
+        if sum.is_some() {
+            selected.push(i);
+        }
+    }
+
+    // Close the selection under tool_use/tool_result pairing. A tool turn spans
+    // TWO adjacent messages — an `Assistant` message carrying `tool_use` blocks
+    // followed by a `Role::Tool` message carrying the matching `tool_result`s.
+    // Folding one half into a text summary without the other leaves a dangling
+    // `tool_use` or an orphaned `tool_result`, which the Anthropic Messages API
+    // rejects with "unexpected tool_use_id found in tool_result blocks ... Each
+    // tool_result block must have a corresponding tool_use block in the previous
+    // message." So whenever we compact one half, compact its partner too — even
+    // if the partner has no summary of its own (it gets a bare marker) and even
+    // if that pushes us past `COMPACT_OLDEST_N_TURNS` (the cap is a soft
+    // heuristic; correctness wins).
+    let has_tool_use = |i: usize| transcript[i].blocks.iter().any(|b| matches!(b, Block::ToolUse { .. }));
+    let has_tool_result =
+        |i: usize| transcript[i].blocks.iter().any(|b| matches!(b, Block::ToolResult { .. }));
+    let mut to_compact: std::collections::BTreeSet<usize> = selected.iter().copied().collect();
+    for &i in &selected {
+        if has_tool_use(i) && i + 1 < transcript.len() && has_tool_result(i + 1) {
+            to_compact.insert(i + 1);
+        }
+        if has_tool_result(i) && i > 0 && has_tool_use(i - 1) {
+            to_compact.insert(i - 1);
+        }
+    }
+
+    let mut out = transcript.to_vec();
+    let mut compacted = Vec::with_capacity(to_compact.len());
+    for i in to_compact {
+        let role = transcript[i].role;
+        // Prefer the turn's own summary; a partner folded in only for pairing
+        // (e.g. the tool half) may have none, so fall back to a bare marker.
+        let text = input.summaries.get(i).and_then(Option::as_ref).map_or_else(
+            || format!("[compacted turn {i}]"),
+            |summary| format!("[compacted turn {i}] {summary}"),
+        );
         out[i] = Message {
             role,
             blocks: vec![Block::Text {
-                text: format!("[compacted turn {i}] {summary}"),
+                text,
                 cache_marker: None,
             }],
         };
@@ -188,6 +225,109 @@ mod tests {
                 cache_marker: None,
             }],
         }
+    }
+
+    /// An assistant turn that issued one `tool_use`.
+    fn assistant_tool_use(id: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            blocks: vec![
+                Block::Text {
+                    text: "calling a tool".into(),
+                    cache_marker: None,
+                },
+                Block::ToolUse {
+                    id: id.into(),
+                    name: "read".into(),
+                    input_json: b"{}".to_vec(),
+                    cache_marker: None,
+                },
+            ],
+        }
+    }
+
+    /// The `Role::Tool` message carrying the matching `tool_result`.
+    fn tool_result(id: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            blocks: vec![Block::ToolResult {
+                tool_use_id: id.into(),
+                handle: None,
+                inline: Some(b"file contents".to_vec()),
+                cache_marker: None,
+            }],
+        }
+    }
+
+    /// The Anthropic Messages API invariant: every `tool_result` must have a
+    /// matching `tool_use` in the immediately-preceding message. Returns the
+    /// first orphaned `tool_use_id`, or `None` if the transcript is well-formed.
+    fn first_orphan(transcript: &[Message]) -> Option<String> {
+        for (i, msg) in transcript.iter().enumerate() {
+            for block in &msg.blocks {
+                if let Block::ToolResult { tool_use_id, .. } = block {
+                    let prev_has_match = i > 0
+                        && transcript[i - 1]
+                            .blocks
+                            .iter()
+                            .any(|b| matches!(b, Block::ToolUse { id, .. } if id == tool_use_id));
+                    if !prev_has_match {
+                        return Some(tool_use_id.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn compaction_never_orphans_a_tool_result_with_sparse_summaries() {
+        // Regression: compacting the assistant half of a tool turn (folding away
+        // its `tool_use`) while leaving the paired `Role::Tool` message intact
+        // produces a `tool_result` with no preceding `tool_use` — which the
+        // Anthropic API rejects with "unexpected tool_use_id found in tool_result
+        // blocks ...". Summaries are sparse in production (loaded per-turn from
+        // the store), so the assistant turn can have a summary while its tool turn
+        // does not.
+        let mut transcript = vec![user("do a thing"), assistant_tool_use("A"), tool_result("A")];
+        for k in 0..6 {
+            transcript.push(user(&format!("later turn {k}")));
+        }
+        let mut summaries: Vec<Option<String>> = vec![None; transcript.len()];
+        summaries[1] = Some("read a file".into()); // assistant turn only — tool turn (2) has none
+
+        let out = maybe_compact_transcript(&transcript, &summaries, 1)
+            .await
+            .expect("over-cap must compact");
+        assert_eq!(
+            first_orphan(&out),
+            None,
+            "compaction must not orphan a tool_result from its tool_use",
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_does_not_split_a_tool_pair_at_the_n_boundary() {
+        // Even with every turn summarizable, COMPACT_OLDEST_N_TURNS can fall
+        // BETWEEN an assistant(tool_use) and its tool(result), folding the
+        // assistant but not the result. Layout: [0]=user, then pairs at
+        // (1,2),(3,4),(5,6),(7,8) — the N=4 cut lands inside pair (3,4).
+        let mut transcript = vec![user("start")];
+        for k in 0..4 {
+            transcript.push(assistant_tool_use(&format!("T{k}")));
+            transcript.push(tool_result(&format!("T{k}")));
+        }
+        let summaries: Vec<Option<String>> =
+            (0..transcript.len()).map(|i| Some(format!("s{i}"))).collect();
+
+        let out = maybe_compact_transcript(&transcript, &summaries, 1)
+            .await
+            .expect("over-cap must compact");
+        assert_eq!(
+            first_orphan(&out),
+            None,
+            "the COMPACT_OLDEST_N_TURNS boundary must not split a tool_use/tool_result pair",
+        );
     }
 
     #[test]

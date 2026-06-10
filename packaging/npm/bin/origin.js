@@ -49,13 +49,24 @@ if (!bin) {
   );
 }
 
-// Auto-update is ON by default, via the npm channel (not the binary's built-in
-// cosign-verified updater, which would need the `cosign` CLI that npm machines
-// rarely have, and would re-download on every launch once a release exists).
+// Auto-update is ON by default, via the binary's own self-updater: it checks
+// the npm registry, downloads + sha256-verifies the matching release asset (no
+// `cosign` CLI required), and swaps the binary in place. Set
+// ORIGINX_ALLOW_SELF_UPDATE=0 to fall back to the npm-launcher channel
+// (`npm update`-style) instead; ORIGIN_NO_UPDATE/ORIGINX_NO_UPDATE disables all
+// updates.
 //
-//   ORIGINX_ALLOW_SELF_UPDATE=<any>  use the binary's own updater instead
+//   ORIGINX_ALLOW_SELF_UPDATE=0      fall back to the npm-launcher channel
 //   ORIGIN_NO_UPDATE / ORIGINX_NO_UPDATE = <any>  disable updates entirely
-const selfUpdate = Boolean(process.env.ORIGINX_ALLOW_SELF_UPDATE);
+//
+// `Boolean(process.env.X)` is truthy for "0"/"false", so parse the flag
+// explicitly to honor an opt-out value.
+function envBool(name, dflt) {
+  const v = process.env[name];
+  if (v === undefined || v === '') return dflt;
+  return !/^(0|false|no|off)$/i.test(v.trim());
+}
+const selfUpdate = envBool('ORIGINX_ALLOW_SELF_UPDATE', true);
 const optedOut = Boolean(process.env.ORIGIN_NO_UPDATE || process.env.ORIGINX_NO_UPDATE);
 
 // Announce an update that a previous background run applied (now active here).
@@ -70,9 +81,9 @@ if (!selfUpdate && !optedOut) {
   spawnBackgroundUpdate(pkg.version);
 }
 
-// Unless the user explicitly opted into the binary's self-updater, suppress it
-// (it would overwrite npm-managed files and require cosign) and let npm own the
-// update lifecycle. A user-set ORIGIN_NO_UPDATE is always respected.
+// When the user opted OUT of the binary's self-updater (ORIGINX_ALLOW_SELF_UPDATE=0),
+// suppress it and let the npm channel own the update lifecycle. A user-set
+// ORIGIN_NO_UPDATE is always respected.
 const env = { ...process.env };
 if (!selfUpdate && env.ORIGIN_NO_UPDATE === undefined) {
   env.ORIGIN_NO_UPDATE = '1';

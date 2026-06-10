@@ -460,7 +460,7 @@ impl ProviderFactory {
             #[cfg(not(feature = "ollama"))]
             WireFormat::Ollama => Err(FactoryError::UnknownProvider("ollama".into())),
             #[cfg(feature = "github-models")]
-            WireFormat::GitHubCopilot => Ok(Arc::new(origin_provider_github::GitHubModels::new(
+            WireFormat::GitHubCopilot => Ok(Arc::new(origin_provider_github::copilot::provider(
                 self.vault.clone(),
                 account,
             ))),

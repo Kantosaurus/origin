@@ -3964,7 +3964,7 @@ dependencies = [
 
 [[package]]
 name = "origin-alloc"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "libc",
  "serial_test",
@@ -3977,7 +3977,7 @@ dependencies = [
 
 [[package]]
 name = "origin-ambient"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3985,7 +3985,7 @@ dependencies = [
 
 [[package]]
 name = "origin-bench"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -4000,7 +4000,7 @@ dependencies = [
 
 [[package]]
 name = "origin-browser"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "html2md",
  "origin-keyvault",
@@ -4018,7 +4018,7 @@ dependencies = [
 
 [[package]]
 name = "origin-cas"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "blake3",
  "byteorder",
@@ -4039,7 +4039,7 @@ dependencies = [
 
 [[package]]
 name = "origin-cassette"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4048,7 +4048,7 @@ dependencies = [
 
 [[package]]
 name = "origin-cli"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4108,6 +4108,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -4123,21 +4124,21 @@ dependencies = [
 
 [[package]]
 name = "origin-clipboard"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "origin-cmdparse"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "origin-codegraph"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "blake3",
  "criterion",
@@ -4173,7 +4174,7 @@ dependencies = [
 
 [[package]]
 name = "origin-conseca"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4182,7 +4183,7 @@ dependencies = [
 
 [[package]]
 name = "origin-core"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "proptest",
  "rkyv",
@@ -4192,14 +4193,14 @@ dependencies = [
 
 [[package]]
 name = "origin-cost"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "origin-cow"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "libc",
  "nix 0.28.0",
@@ -4210,7 +4211,7 @@ dependencies = [
 
 [[package]]
 name = "origin-daemon"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4302,7 +4303,7 @@ dependencies = [
 
 [[package]]
 name = "origin-doctor"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4311,14 +4312,14 @@ dependencies = [
 
 [[package]]
 name = "origin-editfmt"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "origin-export"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4327,7 +4328,7 @@ dependencies = [
 
 [[package]]
 name = "origin-gmail"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "base64 0.22.1",
  "origin-keyvault",
@@ -4341,7 +4342,7 @@ dependencies = [
 
 [[package]]
 name = "origin-goal"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -4351,7 +4352,7 @@ dependencies = [
 
 [[package]]
 name = "origin-hooks"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "criterion",
  "origin-sandbox",
@@ -4364,11 +4365,11 @@ dependencies = [
 
 [[package]]
 name = "origin-i18n"
-version = "0.0.1"
+version = "0.9.1"
 
 [[package]]
 name = "origin-ipc"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "bytes",
  "hex",
@@ -4392,7 +4393,7 @@ dependencies = [
 
 [[package]]
 name = "origin-keyvault"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "age",
  "async-trait",
@@ -4417,7 +4418,7 @@ dependencies = [
 
 [[package]]
 name = "origin-knowledge"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4426,7 +4427,7 @@ dependencies = [
 
 [[package]]
 name = "origin-lsp-client"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4437,11 +4438,11 @@ dependencies = [
 
 [[package]]
 name = "origin-lspfleet"
-version = "0.0.1"
+version = "0.9.1"
 
 [[package]]
 name = "origin-mcp"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "eventsource-stream",
@@ -4463,7 +4464,7 @@ dependencies = [
 
 [[package]]
 name = "origin-mem"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "bitvec",
  "blake3",
@@ -4489,11 +4490,11 @@ dependencies = [
 
 [[package]]
 name = "origin-mermaid"
-version = "0.0.1"
+version = "0.9.1"
 
 [[package]]
 name = "origin-metrics"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
@@ -4506,7 +4507,7 @@ dependencies = [
 
 [[package]]
 name = "origin-migrate"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "blake3",
  "globset",
@@ -4525,7 +4526,7 @@ dependencies = [
 
 [[package]]
 name = "origin-modeldiscovery"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4534,7 +4535,7 @@ dependencies = [
 
 [[package]]
 name = "origin-multimodal"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "image",
  "pdf-extract",
@@ -4545,7 +4546,7 @@ dependencies = [
 
 [[package]]
 name = "origin-notify"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4554,7 +4555,7 @@ dependencies = [
 
 [[package]]
 name = "origin-oidc"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4563,7 +4564,7 @@ dependencies = [
 
 [[package]]
 name = "origin-outputstyle"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4572,7 +4573,7 @@ dependencies = [
 
 [[package]]
 name = "origin-permission"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "growable-bloom-filter",
@@ -4584,7 +4585,7 @@ dependencies = [
 
 [[package]]
 name = "origin-plan"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "bincode",
  "origin-cas",
@@ -4598,7 +4599,7 @@ dependencies = [
 
 [[package]]
 name = "origin-planner"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "proptest",
  "thiserror 1.0.69",
@@ -4606,7 +4607,7 @@ dependencies = [
 
 [[package]]
 name = "origin-plugin"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -4615,7 +4616,7 @@ dependencies = [
 
 [[package]]
 name = "origin-policy"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -4624,7 +4625,7 @@ dependencies = [
 
 [[package]]
 name = "origin-postedit"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4633,7 +4634,7 @@ dependencies = [
 
 [[package]]
 name = "origin-provider"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4658,7 +4659,7 @@ dependencies = [
 
 [[package]]
 name = "origin-provider-anthropic"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "dirs",
@@ -4686,7 +4687,7 @@ dependencies = [
 
 [[package]]
 name = "origin-provider-bedrock"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "aws-credential-types",
@@ -4705,12 +4706,13 @@ dependencies = [
 
 [[package]]
 name = "origin-provider-gemini"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "futures-util",
  "origin-cas",
  "origin-core",
+ "origin-multimodal",
  "origin-provider",
  "origin-stream",
  "pin-utils",
@@ -4723,12 +4725,13 @@ dependencies = [
 
 [[package]]
 name = "origin-provider-github"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "origin-core",
  "origin-keyvault",
  "origin-provider",
+ "origin-provider-openai-compat",
  "origin-stream",
  "reqwest",
  "serde",
@@ -4739,11 +4742,12 @@ dependencies = [
 
 [[package]]
 name = "origin-provider-ollama"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "futures-util",
  "origin-core",
+ "origin-multimodal",
  "origin-provider",
  "origin-stream",
  "pin-utils",
@@ -4756,7 +4760,7 @@ dependencies = [
 
 [[package]]
 name = "origin-provider-openai"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "origin-core",
@@ -4770,7 +4774,7 @@ dependencies = [
 
 [[package]]
 name = "origin-provider-openai-compat"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -4795,7 +4799,7 @@ dependencies = [
 
 [[package]]
 name = "origin-provider-openrouter"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "origin-core",
@@ -4809,7 +4813,7 @@ dependencies = [
 
 [[package]]
 name = "origin-replay"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "blake3",
  "origin-core",
@@ -4825,7 +4829,7 @@ dependencies = [
 
 [[package]]
 name = "origin-repomap"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -4833,7 +4837,7 @@ dependencies = [
 
 [[package]]
 name = "origin-resume-token"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "blake3",
  "getrandom 0.2.17",
@@ -4848,14 +4852,14 @@ dependencies = [
 
 [[package]]
 name = "origin-review"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "origin-router"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4864,7 +4868,7 @@ dependencies = [
 
 [[package]]
 name = "origin-runtime"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "parking_lot",
  "thiserror 1.0.69",
@@ -4874,7 +4878,7 @@ dependencies = [
 
 [[package]]
 name = "origin-sandbox"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "caps",
  "landlock",
@@ -4889,7 +4893,7 @@ dependencies = [
 
 [[package]]
 name = "origin-schedule"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -4897,7 +4901,7 @@ dependencies = [
 
 [[package]]
 name = "origin-scout"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4906,7 +4910,7 @@ dependencies = [
 
 [[package]]
 name = "origin-selfdev"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4916,7 +4920,7 @@ dependencies = [
 
 [[package]]
 name = "origin-shimquirks"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde_json",
  "thiserror 1.0.69",
@@ -4924,7 +4928,7 @@ dependencies = [
 
 [[package]]
 name = "origin-sidecar"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "mockall",
@@ -4940,7 +4944,7 @@ dependencies = [
 
 [[package]]
 name = "origin-skills"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "blake3",
  "include_dir",
@@ -4953,7 +4957,7 @@ dependencies = [
 
 [[package]]
 name = "origin-smr"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "bytecheck",
  "crossbeam-utils",
@@ -4965,14 +4969,14 @@ dependencies = [
 
 [[package]]
 name = "origin-steering"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "origin-store"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "refinery",
  "rusqlite",
@@ -4983,7 +4987,7 @@ dependencies = [
 
 [[package]]
 name = "origin-stream"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "bytes",
  "parking_lot",
@@ -4994,7 +4998,7 @@ dependencies = [
 
 [[package]]
 name = "origin-supervisor"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -5014,7 +5018,7 @@ dependencies = [
 
 [[package]]
 name = "origin-swarm"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "bincode",
  "origin-cas",
@@ -5033,7 +5037,7 @@ dependencies = [
 
 [[package]]
 name = "origin-telemetry"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5042,7 +5046,7 @@ dependencies = [
 
 [[package]]
 name = "origin-tools"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -5080,7 +5084,7 @@ dependencies = [
 
 [[package]]
 name = "origin-trace"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "arrow",
  "chrono",
@@ -5095,7 +5099,7 @@ dependencies = [
 
 [[package]]
 name = "origin-tui"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -5121,7 +5125,7 @@ dependencies = [
 
 [[package]]
 name = "origin-vcs"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5130,7 +5134,7 @@ dependencies = [
 
 [[package]]
 name = "origin-voice"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -5138,7 +5142,7 @@ dependencies = [
 
 [[package]]
 name = "origin-watch"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -5147,7 +5151,7 @@ dependencies = [
 
 [[package]]
 name = "origin-websearch"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5156,7 +5160,7 @@ dependencies = [
 
 [[package]]
 name = "origin-workflowgen"
-version = "0.0.1"
+version = "0.9.1"
 dependencies = [
  "serde",
  "serde_json",

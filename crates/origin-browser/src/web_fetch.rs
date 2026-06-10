@@ -53,6 +53,23 @@ pub async fn fetch(url: &str, opts: FetchOptions) -> Result<FetchResult, FetchEr
     let client = reqwest::Client::builder()
         .timeout(opts.timeout)
         .user_agent(&opts.user_agent)
+        // Only follow redirects that stay on the original request's host. The
+        // caller authorizes the *initial* URL against the domain allow-list;
+        // without this, an allow-listed page could 3xx-bounce the fetch to an
+        // arbitrary host (an internal service, a cloud metadata endpoint, an
+        // exfil sink), escaping the allow-list. Cross-host redirects are
+        // stopped rather than followed.
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let origin_host = attempt.previous().first().and_then(|u| u.host_str());
+            let next_host = attempt.url().host_str();
+            if attempt.previous().len() > 10 {
+                attempt.error("too many redirects")
+            } else if origin_host.is_none() || origin_host == next_host {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
         .build()?;
     let mut resp = client.get(url).send().await?;
     let final_url = resp.url().to_string();

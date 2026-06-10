@@ -42,7 +42,7 @@ pub fn maybe_spawn(sock_path: String) {
             return;
         }
     };
-    let model = std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".to_string());
+    let model = std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-fable-5".to_string());
     tracing::info!(%addr, "webhook: ORIGIN_WEBHOOK set — starting authenticated listener");
     tokio::spawn(async move {
         run_listener(addr, token, sock_path, model).await;

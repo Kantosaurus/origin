@@ -1,16 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 use origin_ipc::frame::{encode, FrameKind};
 use origin_ipc::quic::{QuicConnector, QuicListener};
-use origin_ipc::tls::generate_self_signed;
+use origin_ipc::tls::{generate_self_signed, sha256_fingerprint};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_clients_round_trip_concurrently() {
-    let bundle = generate_self_signed("origin-test").expect("generate");
-    let listener = QuicListener::bind("127.0.0.1:0".parse().expect("static literal"), bundle.clone())
-        .await
-        .expect("bind");
+    let server_bundle = generate_self_signed("origin-test").expect("generate server");
+    // Both clients share one pinned identity for this test; the server pins it.
+    let client_bundle = generate_self_signed("origin-client").expect("generate client");
+    let server_fp = sha256_fingerprint(&server_bundle.cert_der);
+    let client_fp = sha256_fingerprint(&client_bundle.cert_der);
+
+    let listener = QuicListener::bind(
+        "127.0.0.1:0".parse().expect("static literal"),
+        server_bundle,
+        vec![client_fp],
+    )
+    .await
+    .expect("bind");
     let addr = listener.local_addr();
-    let server_ca = bundle.ca_der.clone();
 
     // Server: accept two clients, echo whatever request body they send.
     let server = tokio::spawn(async move {
@@ -26,10 +34,10 @@ async fn two_clients_round_trip_concurrently() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     });
 
-    let ca_alpha = server_ca.clone();
-    let ca_beta = server_ca.clone();
+    let client_alpha = client_bundle.clone();
+    let client_beta = client_bundle.clone();
     let alpha = tokio::spawn(async move {
-        let mut client = QuicConnector::connect(addr, "origin-test", &ca_alpha)
+        let mut client = QuicConnector::connect(addr, "origin-test", server_fp, &client_alpha)
             .await
             .expect("connect alpha");
         client
@@ -41,7 +49,7 @@ async fn two_clients_round_trip_concurrently() {
         assert_eq!(&body, b"alpha");
     });
     let beta = tokio::spawn(async move {
-        let mut client = QuicConnector::connect(addr, "origin-test", &ca_beta)
+        let mut client = QuicConnector::connect(addr, "origin-test", server_fp, &client_beta)
             .await
             .expect("connect beta");
         client

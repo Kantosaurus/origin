@@ -143,7 +143,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
 
     let fmt = OutputFormat::resolve(json, output_format.as_deref())?;
     let raw_model =
-        model.unwrap_or_else(|| std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".into()));
+        model.unwrap_or_else(|| std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-fable-5".into()));
     // Resolve the requested model against the merged alias map (config
     // `[aliases]` + ad-hoc `--alias`). Undefined alias / literal id ⇒
     // pass-through (byte-identical to no aliases).
@@ -157,10 +157,16 @@ pub async fn run(args: RunArgs) -> Result<()> {
         }
         Some(url) => {
             let parsed = crate::admin_url::parse_origin_url(&url)?;
-            let ca = parsed.fingerprint_to_ca_placeholder();
-            let qc = origin_ipc::quic::QuicConnector::connect(parsed.addr, "origin-daemon", &ca)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let server_fp = parsed.server_fingerprint()?;
+            let client_bundle = crate::admin_url::resolve_client_bundle()?;
+            let qc = origin_ipc::quic::QuicConnector::connect(
+                parsed.addr,
+                "origin-daemon",
+                server_fp,
+                &client_bundle,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             Conn::Remote(qc)
         }
     };
@@ -423,14 +429,9 @@ fn encode_attachments(paths: &[String]) -> Result<Vec<origin_multimodal::Content
 }
 
 fn default_path() -> String {
-    #[cfg(unix)]
-    {
-        format!("{}/origin.sock", std::env::temp_dir().display())
-    }
-    #[cfg(windows)]
-    {
-        r"\\.\pipe\origin".to_string()
-    }
+    // Per-project daemon path (see `origin_ipc::instance`): a headless run
+    // addresses the daemon belonging to the workspace it's run from.
+    origin_ipc::instance::InstanceId::for_cwd().ipc_path()
 }
 
 #[cfg(test)]

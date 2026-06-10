@@ -130,19 +130,87 @@ fn per_tool_checkpoints_enabled() -> bool {
     std::env::var("ORIGIN_CHECKPOINTS_PER_TOOL").as_deref() == Ok("1")
 }
 
+/// Fraction (numerator / denominator) of a model's context window at which the
+/// live compactor fires — leaving headroom for the system prompt, tool schemas,
+/// and the assistant's response. 3/5 = 60 %.
+const COMPACT_WINDOW_NUM: usize = 3;
+const COMPACT_WINDOW_DEN: usize = 5;
+/// Bytes-per-token used to convert a token window into the byte heuristic the
+/// live cap check operates on (matches the ~4 implicit in
+/// [`crate::compactor::estimate_transcript_bytes`]).
+const BYTES_PER_TOKEN: usize = 4;
+
 /// The transcript-byte soft cap above which the live in-loop compactor folds the
 /// oldest summarized turns into their summaries (firing `PreCompress`).
 ///
-/// Defaults to [`crate::compactor::DEFAULT_SOFT_CAP_BYTES`] (200 KiB). The
-/// `ORIGIN_COMPACT_SOFT_CAP` env var overrides it with a decimal byte count for
-/// tuning/tests; an unset or unparseable value falls back to the default. The
-/// default cap is large enough that a short interactive session never reaches
-/// it, so the live compaction call-site is a no-op (byte-identical) by default.
-fn compaction_soft_cap() -> usize {
-    std::env::var("ORIGIN_COMPACT_SOFT_CAP")
+/// Sized to the running model's real context window when known: a large-context
+/// model (e.g. Claude's 200 K) no longer compacts needlessly at the old fixed
+/// 200 KiB (~50 K tokens, only a quarter of its window). `ORIGIN_COMPACT_SOFT_CAP`
+/// still overrides everything (tuning/tests); an unknown model falls back to
+/// [`crate::compactor::DEFAULT_SOFT_CAP_BYTES`] (byte-identical to before).
+fn compaction_soft_cap(model: &str) -> usize {
+    if let Some(bytes) = std::env::var("ORIGIN_COMPACT_SOFT_CAP")
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(crate::compactor::DEFAULT_SOFT_CAP_BYTES)
+    {
+        return bytes;
+    }
+    model_context_window(model).map_or(crate::compactor::DEFAULT_SOFT_CAP_BYTES, |window| {
+        let w = usize::try_from(window).unwrap_or(usize::MAX);
+        w.saturating_mul(BYTES_PER_TOKEN)
+            .saturating_mul(COMPACT_WINDOW_NUM)
+            / COMPACT_WINDOW_DEN
+    })
+}
+
+/// Best-effort context window (in tokens) for well-known model families, used
+/// only to size the compaction trigger. Matched by lowercased substring so
+/// version suffixes (`claude-opus-4-7-20250115`) still resolve. Returns `None`
+/// for unrecognized models, so the caller keeps the conservative fixed default.
+/// Full per-model accuracy would come from wiring the live model-discovery
+/// `context_window` through to the loop; this static table covers the common
+/// families without that plumbing.
+fn model_context_window(model: &str) -> Option<u32> {
+    let m = model.to_ascii_lowercase();
+    if m.contains("claude")
+        || m.contains("fable")
+        || m.contains("opus")
+        || m.contains("sonnet")
+        || m.contains("haiku")
+    {
+        Some(200_000)
+    } else if m.contains("gemini") {
+        Some(1_000_000)
+    } else if m.contains("gpt-4") || m.contains("gpt-5") {
+        Some(128_000)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod compaction_cap_tests {
+    use super::{model_context_window, BYTES_PER_TOKEN, COMPACT_WINDOW_DEN, COMPACT_WINDOW_NUM};
+
+    #[test]
+    fn context_window_resolves_known_families() {
+        assert_eq!(model_context_window("claude-opus-4-7-20250115"), Some(200_000));
+        assert_eq!(model_context_window("claude-fable-5"), Some(200_000));
+        assert_eq!(model_context_window("gemini-2.5-pro"), Some(1_000_000));
+        assert_eq!(model_context_window("gpt-4o-mini"), Some(128_000));
+        assert_eq!(model_context_window("some-unknown-local-model"), None);
+    }
+
+    #[test]
+    fn large_window_models_get_a_larger_cap_than_the_fixed_default() {
+        // 200k tokens × 4 bytes × 3/5 = 480 KB, well above the 200 KiB default —
+        // so a Claude session no longer compacts at ~25 % of its real window.
+        let window = model_context_window("claude-opus-4-7").expect("known");
+        let cap = usize::try_from(window).expect("fits") * BYTES_PER_TOKEN * COMPACT_WINDOW_NUM
+            / COMPACT_WINDOW_DEN;
+        assert_eq!(cap, 480_000);
+        assert!(cap > crate::compactor::DEFAULT_SOFT_CAP_BYTES);
+    }
 }
 
 /// Live, in-loop transcript compaction (P5.4 runtime wiring).
@@ -164,7 +232,7 @@ fn compaction_soft_cap() -> usize {
 /// short session is unaffected. Compaction never errors — a missing summary just
 /// leaves that turn intact.
 async fn maybe_compact_session(session: &mut Session, opts: &LoopOptions) {
-    let cap = compaction_soft_cap();
+    let cap = compaction_soft_cap(&session.model);
     // Cheap pre-check before building the summaries vector: if we are under the
     // cap there is nothing to do and we must not allocate or fire a hook.
     if crate::compactor::estimate_transcript_bytes(&session.messages) <= cap {
@@ -1903,6 +1971,15 @@ pub(crate) struct SpeculativeRegistry {
 }
 
 impl SpeculativeRegistry {
+    /// Pure tools whose dispatch arm requires a live subsystem handle
+    /// (`memory`, `code_graph`, …) that the speculative path cannot provide.
+    /// Speculating these is worse than useless: the spawn below passes `None`
+    /// for every handle, so they would ALWAYS precompute a spurious
+    /// "subsystem not configured" failure that then shadows the fully-wired
+    /// main dispatch. They must flow through the main path instead.
+    const NEEDS_SUBSYSTEM_HANDLE: &'static [&'static str] =
+        &["mem_search", "ask", "graph_query", "graph_path", "graph_summarize"];
+
     fn spawn(
         &mut self,
         tool_use_id: String,
@@ -1914,12 +1991,16 @@ impl SpeculativeRegistry {
         if !matches!(meta.side_effects, SideEffects::Pure) {
             return;
         }
+        // Handle-dependent tools opt out — see `NEEDS_SUBSYSTEM_HANDLE`.
+        if Self::NEEDS_SUBSYSTEM_HANDLE.contains(&meta.name) {
+            return;
+        }
         let handle = spawn_in(TaskClass::Critical, async move {
             // Speculative tasks pass `None` for every subsystem handle.
-            // Tools that need a handle (graph_*, ask, mem_*, Task) flow
-            // through the main dispatch path. Task is Mutating so it never
-            // speculatively dispatches anyway; the None for coordinator here
-            // is API consistency.
+            // Tools that need a handle (graph_*, ask, mem_*, Task) never
+            // reach here (Mutating tier or the NEEDS_SUBSYSTEM_HANDLE
+            // guard above) and flow through the main dispatch path, which
+            // threads the live handles from `LoopOptions`.
             let text = dispatch_tool(meta, &args, cas.as_deref(), None, None, None, None, None, None).await?;
             Ok::<_, LoopError>(text.into_bytes())
         });
@@ -2400,7 +2481,48 @@ async fn run_loop_inner(
         })
         .unwrap_or_default();
 
-    // Build the workflows block. Mirrors the skills catalog: one line per
+    // Build the ACTIVE-skills block. The catalog block above only lists every
+    // skill's one-line description; it does NOT carry the instructions an
+    // activated skill is supposed to make the model follow. Those live in the
+    // skill's `SKILL.md` body. Without injecting that body, a `/<name>`
+    // activation "loads" (its `allowed-tools` mask + catalog `*` marker take
+    // effect) but the model never receives the skill's prompt and so never
+    // carries it out. Here we surface the full body of every currently-active
+    // skill (in activation order) so the directives reach the model.
+    let active_skills_block = opts
+        .skills
+        .as_ref()
+        .map(|reg| {
+            use std::fmt::Write as _;
+            let mut out = String::new();
+            for entry in reg.iter_active_entries() {
+                let body = entry.body.trim();
+                if body.is_empty() {
+                    continue;
+                }
+                if out.is_empty() {
+                    out.push_str(
+                        "<origin-active-skills>\n\
+                         The following skills are ACTIVE this turn. Treat each \
+                         skill's instructions as authoritative directives you \
+                         MUST follow for the rest of this session until the \
+                         skill is deactivated.\n",
+                    );
+                }
+                let _ = write!(
+                    out,
+                    "\n<skill name=\"{}\">\n{}\n</skill>\n",
+                    entry.front.name, body
+                );
+            }
+            if out.is_empty() {
+                String::new()
+            } else {
+                out.push_str("</origin-active-skills>");
+                out
+            }
+        })
+        .unwrap_or_default();
     // workflow so the model can answer "what workflows do you have?" without
     // hallucinating from the tools list. Empty file → empty block.
     let workflows_block = opts
@@ -2560,14 +2682,19 @@ async fn run_loop_inner(
     // roots, tell the model it may read/edit across them. Empty ⇒ byte-identical.
     let roots_block = workspace_roots_block(&session.roots);
     let recalled_system = {
+        // NOTE: `goal_block`, `lsp_diag_block`, and `swarm_notices_block` are
+        // deliberately NOT in this array — they are volatile (goal iteration
+        // counters change every goal-driver pass; diagnostics/notices change
+        // per turn) and are carried as a trailing message block instead, so the
+        // cached system+tools prefix stays byte-stable across the whole run.
         let parts: [&str; 11] = [
             &repo_map_block,
             identity_block,
             &directive_block,
             &catalog_block,
+            &active_skills_block,
             &workflows_block,
             &recall_block_wrapped,
-            &goal_block,
             &style_block,
             &roots_block,
             &edit_format_block,
@@ -2719,20 +2846,24 @@ async fn run_loop_inner(
         // state once issues are fixed and there are no pending sibling notices) ⇒
         // `recalled_system` is reused verbatim, keeping the wire — and the prompt
         // cache — unchanged.
-        let turn_system = {
-            let mut s = recalled_system.clone();
-            if !lsp_diag_block.is_empty() {
-                s.push_str("\n\n");
-                s.push_str(&lsp_diag_block);
+        // Volatile per-turn / per-goal-iteration context (goal status, LSP
+        // diagnostics, sibling-swarm notices) rides as a TRAILING message block
+        // rather than being concatenated into the system prompt. The model still
+        // reads it (now as the most-recent context, before it responds), but it
+        // no longer mutates the cached system+tools prefix — so a goal
+        // iteration's changing counters, or freshly-arrived diagnostics, stop
+        // invalidating that whole prefix on every request.
+        let volatile_context = {
+            let mut blocks: Vec<&str> = Vec::new();
+            for b in [&goal_block, &lsp_diag_block, &swarm_notices_block] {
+                if !b.is_empty() {
+                    blocks.push(b);
+                }
             }
-            if !swarm_notices_block.is_empty() {
-                s.push_str("\n\n");
-                s.push_str(&swarm_notices_block);
-            }
-            s
+            blocks.join("\n\n")
         };
-        let req = ChatRequest {
-            system: turn_system,
+        let mut req = ChatRequest {
+            system: recalled_system.clone(),
             messages: session.snapshot(),
             model: turn_model.clone(),
             tools: tools_schema.clone(),
@@ -2747,6 +2878,21 @@ async fn run_loop_inner(
                 Vec::new()
             },
         };
+        if !volatile_context.is_empty() {
+            // Append to the last message (a user prompt on turn 1, a tool-result
+            // user-role message afterward) — Anthropic accepts text alongside
+            // tool_result in one user turn. Only start a new user message in the
+            // (unexpected) case that the last message is an assistant turn.
+            match req.messages.last_mut() {
+                Some(last) if !matches!(last.role, Role::Assistant) => {
+                    last.blocks.push(Block::text(volatile_context));
+                }
+                _ => req.messages.push(Message {
+                    role: Role::User,
+                    blocks: vec![Block::text(volatile_context)],
+                }),
+            }
+        }
 
         // Retry transient `ProviderError::RateLimit` here so a single 429
         // doesn't kill the turn. We honour the server-supplied `retry-after`
@@ -2843,8 +2989,15 @@ async fn run_loop_inner(
                         // Live router (kilocode quota-fallback): a rate-limit
                         // marks this model exhausted so a `QuotaFallback` chain
                         // skips it next turn/prompt. A later success clears it.
+                        // Also fold the failure into the health EMA (with the
+                        // time-to-error as latency) so `ema_error_rate` reflects
+                        // real failures — previously `record` was only ever
+                        // called with ok=true, leaving the error EMA dead.
                         if let Some(lr) = &opts.router {
                             lr.mark_exhausted(turn_provider.name(), &turn_model);
+                            let failed_ms =
+                                u64::try_from(provider_call_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                            lr.record(turn_provider.name(), &turn_model, failed_ms, false);
                         }
                         // Surface the backoff to the CLI so a 60s sleep
                         // doesn't look identical to a hang. `attempt` here is
@@ -3862,10 +4015,18 @@ fn apply_turn_cache_markers(messages: &mut [Message], plan: Option<&origin_plann
         }
     }
 
-    // Path (2): block-level cache_marker on each chosen ToolResult block.
-    for &(mi, bi) in &chosen {
+    // Path (2): block-level cache_marker on each chosen ToolResult block. The
+    // earliest of the latest-N boundaries (rank 0) anchors the most stable
+    // prefix (system + tools + oldest retained history), so it is tagged
+    // `Frozen` — the only boundary worth the longer 1h cache TTL (when enabled);
+    // the rest rotate as the session grows and stay on the default 5m TTL.
+    for (rank, &(mi, bi)) in chosen.iter().enumerate() {
         if let Block::ToolResult { cache_marker, .. } = &mut messages[mi].blocks[bi] {
-            *cache_marker = Some(CacheBoundary::Sticky);
+            *cache_marker = Some(if rank == 0 {
+                CacheBoundary::Frozen
+            } else {
+                CacheBoundary::Sticky
+            });
         }
     }
 
@@ -5433,8 +5594,7 @@ fn tool_activity_summary(name: &str, args: &Value) -> String {
             let root = args.get("root").and_then(Value::as_str).unwrap_or(".");
             // Cap the pattern so a long regex doesn't blow past the
             // status column. Root is short by nature.
-            let pat_short: String = pat.chars().take(40).collect();
-            format!("{pat_short} @ {root}")
+            format!("{} @ {root}", summary_preview(pat, 60))
         }
         "Glob" => args
             .get("pattern")
@@ -5443,7 +5603,7 @@ fn tool_activity_summary(name: &str, args: &Value) -> String {
             .to_string(),
         "Bash" => {
             let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
-            cmd.chars().take(80).collect()
+            summary_preview(cmd, 160)
         }
         "WebFetch" => args.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
         // PII-safe preview: surface only the `op`, never the `query` (a Gmail
@@ -5451,13 +5611,51 @@ fn tool_activity_summary(name: &str, args: &Value) -> String {
         "gmail" => args.get("op").and_then(Value::as_str).unwrap_or("").to_string(),
         "AuthorWorkflow" => {
             let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
-            goal.chars().take(60).collect()
+            summary_preview(goal, 80)
         }
         "RunWorkflow" => args.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
-        _ => {
-            let s = args.to_string();
-            s.chars().take(60).collect()
-        }
+        _ => summary_preview(&args.to_string(), 80),
+    }
+}
+
+/// One-line, length-bounded preview of a value for a tool-activity header.
+///
+/// Collapses internal whitespace (so a multi-line command renders as a single
+/// header row instead of several) and appends an ellipsis when the value is
+/// longer than `max` chars — so a truncated command reads as intentionally
+/// shortened rather than abruptly cut off mid-token. `max` counts characters
+/// before the ellipsis.
+fn summary_preview(s: &str, max: usize) -> String {
+    let collapsed: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > max {
+        let head: String = collapsed.chars().take(max).collect();
+        format!("{head}\u{2026}")
+    } else {
+        collapsed
+    }
+}
+
+#[cfg(test)]
+mod summary_preview_tests {
+    use super::summary_preview;
+
+    #[test]
+    fn short_value_is_unchanged() {
+        assert_eq!(summary_preview("ls -la", 80), "ls -la");
+    }
+
+    #[test]
+    fn long_value_truncates_with_a_trailing_ellipsis() {
+        let out = summary_preview(&"a".repeat(200), 160);
+        assert_eq!(out.chars().count(), 161, "160 chars + ellipsis");
+        assert!(out.ends_with('\u{2026}'), "must signal truncation: {out:?}");
+    }
+
+    #[test]
+    fn whitespace_and_newlines_collapse_to_one_line() {
+        let out = summary_preview("git commit -m\n  'multi\n  line'", 80);
+        assert!(!out.contains('\n'), "must be a single line: {out:?}");
+        assert_eq!(out, "git commit -m 'multi line'");
     }
 }
 
@@ -6077,6 +6275,46 @@ mod dispatch_table_tests {
         assert!(
             unrecognized.is_empty(),
             "tools registered in the inventory but not handled by dispatch_tool: {unrecognized:?}"
+        );
+    }
+
+    /// Regression: handle-dependent Pure tools (`mem_search`, `ask`,
+    /// `graph_query`, …) must NEVER be speculatively dispatched. The
+    /// speculative path passes `None` for every subsystem handle, so a
+    /// speculated `mem_search` always precomputes
+    /// `ToolFailure("memory subsystem not configured")` — and the main loop
+    /// prefers that precomputed result over fresh dispatch, shadowing the
+    /// fully-wired `LoopOptions::memory_handle`. The user-visible symptom was
+    /// memory tools failing with "not configured" on a daemon whose memory
+    /// subsystem was healthy.
+    #[tokio::test]
+    async fn speculative_spawn_skips_handle_dependent_tools() {
+        let mut reg = SpeculativeRegistry::default();
+        for (tool, args) in [
+            ("mem_search", serde_json::json!({"query": "x"})),
+            ("ask", serde_json::json!({"query": "x"})),
+            ("graph_query", serde_json::json!({"kind": "communities"})),
+            ("graph_path", serde_json::json!({"from": "00", "to": "00"})),
+            ("graph_summarize", serde_json::json!({"community_id": 0})),
+        ] {
+            let meta = registry_iter().find(|m| m.name == tool).expect("registered");
+            reg.spawn(format!("id-{tool}"), meta, args, None);
+            assert!(
+                reg.take(&format!("id-{tool}")).await.is_none(),
+                "{tool} must not speculatively dispatch (its arm needs a live subsystem handle)"
+            );
+        }
+        // Control: a handle-free Pure tool (Read) still speculates.
+        let read_meta = registry_iter().find(|m| m.name == "Read").expect("Read registered");
+        reg.spawn(
+            "id-read".into(),
+            read_meta,
+            serde_json::json!({"file_path": "Cargo.toml"}),
+            None,
+        );
+        assert!(
+            reg.take("id-read").await.is_some(),
+            "handle-free Pure tools must still speculate"
         );
     }
 

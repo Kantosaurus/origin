@@ -166,7 +166,7 @@ async fn relay_drains_all_events_before_response_frame() {
     });
 
     let mut client = Connector::connect(&path_clone).await.expect("connect");
-    let mut event_count = 0usize;
+    let mut total_text = String::new();
     let mut saw_turn_end = false;
     let mut saw_response = false;
     let mut response_before_turn_end = false;
@@ -184,7 +184,7 @@ async fn relay_drains_all_events_before_response_frame() {
                 }
                 let ev: StreamEvent = serde_json::from_slice(&body).expect("decode event");
                 match ev {
-                    StreamEvent::TextDelta { .. } => event_count += 1,
+                    StreamEvent::TextDelta { text } => total_text.push_str(&text),
                     StreamEvent::TurnEnd => {
                         if saw_response {
                             response_before_turn_end = true;
@@ -203,7 +203,14 @@ async fn relay_drains_all_events_before_response_frame() {
     }
 
     assert!(saw_response, "must receive a Response frame");
-    assert_eq!(event_count, 100, "all TextDeltas must arrive before Response");
+    // The relay coalesces consecutive ready TextDeltas into fewer frames, so we
+    // assert on the total delivered *content* (no text lost) rather than the
+    // frame count, which is now an implementation detail.
+    assert_eq!(
+        total_text,
+        "x".repeat(100),
+        "all TextDelta content must arrive before Response"
+    );
     assert!(saw_turn_end, "TurnEnd must arrive before Response");
     assert!(
         !response_before_turn_end,

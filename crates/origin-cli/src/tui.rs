@@ -155,31 +155,21 @@ impl Spinner {
 /// ~10s of a silent spinner, without the alarm of the hard tier.
 pub const STALL_SOFT_AFTER: Duration = Duration::from_secs(11);
 
-/// Quiet time before the hard "no daemon activity" alarm (with the interrupt
-/// hint). Was 60s — a full silent minute is well past the doubt threshold, so
-/// the watchdog fired too late to be reassuring.
-pub const STALL_WARN_AFTER: Duration = Duration::from_secs(28);
-
 /// Which stall notice (if any) to show after `quiet` seconds of daemon silence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StallTier {
     /// Gentle reassurance — a long turn may just be thinking. No interrupt hint.
     Soft(u64),
-    /// Sustained silence — likely wedged; surface the Ctrl+C interrupt hint.
-    Hard(u64),
 }
 
-/// Pure stall decision: classify `quiet` against the soft/hard thresholds.
+/// Pure stall decision: `Soft` once `quiet` reaches `soft`, otherwise `None`.
 ///
-/// `None` below `soft`, `Soft` between, `Hard` at/above `hard`. Kept free of
-/// `Instant` so it is deterministically testable.
+/// Kept free of `Instant` so it is deterministically testable. There is no
+/// hard/alarm tier — a slow turn reads as "still working", never as an error.
 #[must_use]
-pub fn stall_tier(quiet: Duration, soft: Duration, hard: Duration) -> Option<StallTier> {
-    let secs = quiet.as_secs();
-    if quiet >= hard {
-        Some(StallTier::Hard(secs))
-    } else if quiet >= soft {
-        Some(StallTier::Soft(secs))
+pub fn stall_tier(quiet: Duration, soft: Duration) -> Option<StallTier> {
+    if quiet >= soft {
+        Some(StallTier::Soft(quiet.as_secs()))
     } else {
         None
     }
@@ -225,6 +215,36 @@ pub fn notify_turn_complete(enabled: bool, succeeded: bool) -> bool {
     true
 }
 
+/// A click-drag text selection over the rendered screen.
+///
+/// In 0-based screen-cell coordinates `(row, col)`: `anchor` is where the drag
+/// started; `head` is the current/release position. Either ordering is valid —
+/// consumers normalize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: (u16, u16),
+    pub head: (u16, u16),
+}
+
+impl Selection {
+    /// `(top_left, bottom_right)` endpoints, so callers don't care whether the
+    /// user dragged up-and-left or down-and-right.
+    #[must_use]
+    pub fn normalized(self) -> ((u16, u16), (u16, u16)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// A zero-width selection (a plain click with no drag) selects nothing.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.anchor == self.head
+    }
+}
+
 // App-state aggregate: each bool is an independent, unrelated session toggle
 // (plan mode, vim, desktop notify, permission prompting). Grouping them into a
 // sub-struct would obscure rather than clarify.
@@ -251,10 +271,10 @@ pub struct App {
     /// input card by `draw`.
     pub goal_status: Option<String>,
     /// Stall watchdog: the [`StallTier`] when the render heartbeat has seen no
-    /// daemon activity for [`STALL_SOFT_AFTER`]/[`STALL_WARN_AFTER`] during an
-    /// in-flight turn. `None` whenever the daemon is producing output or no turn
-    /// is running. Rendered as a notice so a quiet/wedged daemon stops looking
-    /// like an indefinitely-spinning spinner.
+    /// daemon activity for [`STALL_SOFT_AFTER`] during an in-flight turn. `None`
+    /// whenever the daemon is producing output or no turn is running. Rendered as
+    /// a gentle "still working…" notice so a quiet daemon stops looking like an
+    /// indefinitely-spinning spinner.
     pub stall: Option<StallTier>,
     /// Session reasoning-effort level (`fast`/`low`/`medium`/`high`/`max`) as a
     /// canonical wire token, or `None` to leave the provider wire unchanged.
@@ -323,10 +343,10 @@ pub struct App {
     /// flip it to `✔`/`✘` when the tool completes. `None` when no tool is in
     /// flight.
     running_tool_row: Option<usize>,
-    /// Whether terminal mouse capture is on. Default `true` (wheel scrolls, but
-    /// the terminal's native drag-select/copy is intercepted) — byte-identical
-    /// with the historic behaviour. `/mouse off` releases capture so the user
-    /// can select & copy; scrollback stays reachable via PageUp/Shift+arrows.
+    /// Whether terminal mouse capture is on. Default `true`: the wheel scrolls
+    /// and left-drag selects text in-app (auto-copied on release). `/mouse off`
+    /// releases capture for terminal-native selection instead; scrollback stays
+    /// reachable via PageUp/Shift+arrows either way.
     pub mouse_capture: bool,
     /// The most recent finalized assistant reply, for `/copy` (OSC 52). `None`
     /// until the first reply completes.
@@ -345,6 +365,16 @@ pub struct App {
     /// the key path byte-identical. The live key handler consults it via
     /// [`Self::keymap`] before the default reducer.
     keymap: KeyMap,
+    /// In-progress / completed click-drag text selection (screen-cell coords),
+    /// drawn as a reverse-video highlight and auto-copied on mouse release.
+    /// `None` when nothing is selected. Only meaningful while mouse capture is
+    /// on (the default); with `/mouse off` the terminal selects natively.
+    pub selection: Option<Selection>,
+    /// The most recently rendered main-pane text — one `String` per row, glyph
+    /// per cell — captured each frame *while a selection is active* so
+    /// [`Self::selection_text`] extracts exactly what is on screen. Empty
+    /// otherwise (no per-frame cost when not selecting).
+    pub screen_text: Vec<String>,
 }
 
 /// State backing the live cache-cold status-line nudge. All times are
@@ -424,7 +454,71 @@ impl App {
             last_ctx_tokens: 0,
             ctx_at_start: 0,
             keymap: KeyMap::default(),
+            selection: None,
+            screen_text: Vec::new(),
         }
+    }
+
+    /// Begin a click-drag selection anchored at screen cell `(row, col)`. A new
+    /// anchor also clears any prior (already-copied) highlight.
+    pub const fn begin_selection(&mut self, row: u16, col: u16) {
+        self.selection = Some(Selection {
+            anchor: (row, col),
+            head: (row, col),
+        });
+    }
+
+    /// Extend the in-progress selection to screen cell `(row, col)`. No-op when
+    /// no selection is active.
+    pub const fn update_selection(&mut self, row: u16, col: u16) {
+        if let Some(sel) = &mut self.selection {
+            sel.head = (row, col);
+        }
+    }
+
+    /// Drop the current selection/highlight. Returns whether one was cleared, so
+    /// the caller can decide whether a repaint is needed.
+    pub const fn clear_selection(&mut self) -> bool {
+        self.selection.take().is_some()
+    }
+
+    /// Extract the selected text from the last captured screen snapshot, exactly
+    /// as it appears on screen (trailing blanks trimmed per line, empty trailing
+    /// lines dropped). `None` when the selection is empty or off the snapshot.
+    #[must_use]
+    pub fn selection_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        if sel.is_empty() || self.screen_text.is_empty() {
+            return None;
+        }
+        let ((r1, c1), (r2, c2)) = sel.normalized();
+        let last_row = self.screen_text.len().saturating_sub(1);
+        let (r1, r2) = (r1 as usize, (r2 as usize).min(last_row));
+        let mut lines: Vec<String> = Vec::new();
+        for (r, row) in self.screen_text.iter().enumerate().take(r2 + 1).skip(r1) {
+            let chars: Vec<char> = row.chars().collect();
+            let width = chars.len();
+            let start = if r == r1 { c1 as usize } else { 0 };
+            // Inclusive of the cell under the release point on the final row.
+            let end = if r == r2 {
+                (c2 as usize + 1).min(width)
+            } else {
+                width
+            };
+            let slice: String = if start < end {
+                chars[start..end].iter().collect()
+            } else {
+                String::new()
+            };
+            lines.push(slice.trim_end().to_string());
+        }
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        Some(lines.join("\n"))
     }
 
     /// The session's composer [`KeyMap`]. Defaults to the builtin map (==
@@ -581,9 +675,10 @@ impl App {
     /// A cheap fingerprint of everything a daemon stream event can change
     /// (scrollback rows, the in-flight assistant buffer, token counters). The
     /// render heartbeat compares this across ticks: if it stays unchanged for
-    /// [`STALL_WARN_AFTER`] while a turn is active, the daemon has gone silent —
-    /// a possible stall. The animating spinner frame is intentionally excluded
-    /// so a silent-but-spinning UI still registers as "no activity".
+    /// [`STALL_SOFT_AFTER`] while a turn is active, the daemon is quiet and we
+    /// show a "still working…" reassurance. The animating spinner frame is
+    /// intentionally excluded so a silent-but-spinning UI still registers as
+    /// "no activity".
     #[must_use]
     pub fn activity_signature(&self) -> u64 {
         const P: u64 = 1_099_511_628_211; // FNV prime, used only for mixing
@@ -754,6 +849,21 @@ impl App {
         self.scrollback.push(ScrollLine::verbatim(text, fg, bg));
         // This is the high-volume append path (streamed Bash, diffs); cap here.
         self.trim_scrollback();
+    }
+
+    /// Append a single blank separator row so a finished tool block (its output
+    /// and any "+N bytes omitted" footer) doesn't sit flush against the next
+    /// tool block or the assistant's reply. No-op when the last row is already
+    /// blank, so stacked producers never accumulate double gaps.
+    pub fn add_blank_line(&mut self) {
+        let already_blank = self
+            .scrollback
+            .last()
+            .is_some_and(|l| l.text.trim().is_empty());
+        if !already_blank {
+            self.scrollback.push(ScrollLine::verbatim(String::new(), 0, 0));
+            self.trim_scrollback();
+        }
     }
 
     /// Drop the oldest rows when scrollback exceeds [`MAX_SCROLLBACK`] (plus
@@ -1032,7 +1142,14 @@ impl App {
             // re-themes the chrome immediately. Default ⇒ the legacy constants.
             let pal = self.palette();
 
-            let card_w = 75u16.min(cols.saturating_sub(4));
+            // The input card spans (nearly) the full terminal width: a single
+            // column of margin on each side keeps the left accent rule and the
+            // right keybind hint off the very edge. (Previously the card was
+            // capped at 75 columns and centered, leaving large empty margins on
+            // wide terminals.) Keep this geometry in sync with
+            // `main::input_text_width`, which the editor reducer uses for
+            // visual Home/End and Up/Down across wrapped lines.
+            let card_w = cols.saturating_sub(2);
             let cl = cols.saturating_sub(card_w) / 2;
             let cr = cl + card_w;
             let cs = cl + 2;
@@ -1126,6 +1243,11 @@ impl App {
             self.draw_status_line(main, &layout);
             draw_keybind_hint(main, &layout, self.spinner.active || self.goal_status.is_some());
             self.draw_suggestions_popup(main, &layout);
+            // Reverse-video overlay for an active click-drag selection, drawn last
+            // so it sits on top of all content.
+            if let Some(sel) = self.selection {
+                apply_selection_highlight(main, sel);
+            }
         }
         clear_prompt_grid(composer.prompt_grid(), self.palette());
     }
@@ -1181,32 +1303,20 @@ impl App {
             }
         }
 
-        // Stall watchdog notice. A soft tier reassures ("still working…") after
-        // a short quiet; the hard tier alarms (red + interrupt hint) on
-        // sustained silence so a wedged daemon reads as "possibly stuck" instead
-        // of an indefinitely-spinning spinner. Takes the row the goal status
-        // would use — a stall is the more urgent signal.
-        if let Some(tier) = self.stall {
+        // Stall watchdog notice: a gentle "still working…" reassurance after a
+        // short quiet, so a long turn doesn't read as a dead screen. Muted, never
+        // an alarm. Takes the row the goal status would otherwise use.
+        if let Some(StallTier::Soft(secs)) = self.stall {
             let status_row = layout.at_bottom.saturating_sub(1);
             if status_row < layout.rows {
-                let (msg, fg) = match tier {
-                    StallTier::Soft(secs) => (
-                        format!("\u{2026} still working\u{2026} {secs}s"),
-                        layout.palette.muted,
-                    ),
-                    StallTier::Hard(secs) => (
-                        format!("\u{26A0} no daemon activity for {secs}s \u{2014} Ctrl+C to interrupt"),
-                        layout.palette.red,
-                    ),
-                };
                 write_str_styled(
                     main,
                     status_row,
                     layout.cl.saturating_add(2),
-                    &msg,
+                    &format!("\u{2026} still working\u{2026} {secs}s"),
                     layout.cr,
                     Style {
-                        fg,
+                        fg: layout.palette.muted,
                         bg: 0,
                         bold: false,
                     },
@@ -1602,6 +1712,30 @@ fn clear_prompt_grid(prompt: &mut Grid, pal: theme::Palette) {
     }
 }
 
+/// Overlay a click-drag selection as reverse-video on the main grid. For each
+/// cell within the (normalized) selection range, OR in the `REVERSE` attribute,
+/// preserving glyph/fg/bg so the highlighted text stays readable. Screen-cell
+/// coordinates map 1:1 to the main pane (offset `0,0`); out-of-range rows/cols
+/// (e.g. into the side panel) are clamped away.
+fn apply_selection_highlight(main: &mut Grid, sel: Selection) {
+    let rows = main.rows();
+    let cols = main.cols();
+    let ((r1, c1), (r2, c2)) = sel.normalized();
+    let mut r = r1;
+    while r <= r2 && r < rows {
+        let start = if r == r1 { c1 } else { 0 };
+        let end = if r == r2 { c2 } else { cols.saturating_sub(1) };
+        let mut c = start;
+        while c <= end && c < cols {
+            let mut cell = main.get(r, c);
+            cell.attr |= Attr::REVERSE.bits();
+            main.put(r, c, cell);
+            c = c.saturating_add(1);
+        }
+        r = r.saturating_add(1);
+    }
+}
+
 // Bug #4: implement the `goal_render::GoalRender` sink directly on `App`
 // so `main.rs::call_daemon`'s event arm becomes a one-liner pass-through
 // instead of a duplicated match on every Goal* variant.
@@ -1782,6 +1916,16 @@ pub fn render_focus_chain(plan_lines: &[PlanLine]) -> Vec<String> {
 /// Display width of a single char in terminal cells (`0`-width control chars
 /// count as 1). Bounded to `u16`; no real glyph width approaches the clamp.
 fn char_cell_width(c: char) -> u16 {
+    // Control characters (`\r`, `\t`, ESC, `\b`, …) have NO display width and must
+    // never be rendered into a cell: emitting one raw moves the terminal cursor
+    // (e.g. `\r` returns it to column 0), corrupting the row and permanently
+    // desyncing the damage-diff shadow grid from the screen. Treat them as
+    // zero-width so the render skips them entirely. This matters on Windows,
+    // where tool/file output carries `\r\n` line endings — the wrapper splits on
+    // `\n` but leaves the `\r`.
+    if c.is_control() {
+        return 0;
+    }
     u16::try_from(UnicodeWidthChar::width(c).unwrap_or(1)).unwrap_or(1)
 }
 
@@ -2052,47 +2196,53 @@ fn render_md_line(grid: &mut Grid, row: u16, text: &str, max_cols: u16, style: S
 
     while i < len && col < max_cols {
         if chars[i] == '*' && i + 1 < len && chars[i + 1] == '*' {
+            // Bold span. A closing `**` on this line ends it; an *unclosed* marker
+            // (the span wraps to the next visual line, or is still streaming in)
+            // styles to end-of-line with the marker hidden — rather than leaking a
+            // literal `**` fragment into the rendered text.
             let close = find_closing(&chars, i + 2, '*', '*');
-            if let Some(end) = close {
-                i += 2;
-                while i < end && col < max_cols {
-                    let w = char_cell_width(chars[i]);
-                    if col + w > max_cols {
-                        break;
-                    }
-                    grid.put(row, col, Cell::new(chars[i], pal.bright, bg, Attr::BOLD));
-                    if w == 2 {
-                        grid.put(row, col + 1, Cell::continuation(bg));
-                    }
-                    col += w;
-                    i += 1;
+            let (end, after) = close.map_or((len, len), |e| (e, e + 2));
+            i += 2;
+            while i < end && col < max_cols {
+                let w = char_cell_width(chars[i]);
+                if col + w > max_cols {
+                    break;
                 }
-                i = end + 2;
-                continue;
+                grid.put(row, col, Cell::new(chars[i], pal.bright, bg, Attr::BOLD));
+                if w == 2 {
+                    grid.put(row, col + 1, Cell::continuation(bg));
+                }
+                col += w;
+                i += 1;
             }
+            i = after;
+            continue;
         }
         if chars[i] == '`' && !(i + 1 < len && chars[i + 1] == '`') {
-            if let Some(end) = chars[i + 1..].iter().position(|&c| c == '`').map(|p| i + 1 + p) {
-                i += 1;
-                while i < end && col < max_cols {
-                    let w = char_cell_width(chars[i]);
-                    if col + w > max_cols {
-                        break;
-                    }
-                    grid.put(
-                        row,
-                        col,
-                        Cell::new(chars[i], pal.code_fg, pal.code_bg, Attr::PLAIN),
-                    );
-                    if w == 2 {
-                        grid.put(row, col + 1, Cell::continuation(pal.code_bg));
-                    }
-                    col += w;
-                    i += 1;
+            // Inline code span — same unclosed-marker handling as bold above: a
+            // dangling backtick styles to end-of-line rather than rendering a
+            // literal `` ` ``.
+            let close = chars[i + 1..].iter().position(|&c| c == '`').map(|p| i + 1 + p);
+            let (end, after) = close.map_or((len, len), |e| (e, e + 1));
+            i += 1;
+            while i < end && col < max_cols {
+                let w = char_cell_width(chars[i]);
+                if col + w > max_cols {
+                    break;
                 }
-                i = end + 1;
-                continue;
+                grid.put(
+                    row,
+                    col,
+                    Cell::new(chars[i], pal.code_fg, pal.code_bg, Attr::PLAIN),
+                );
+                if w == 2 {
+                    grid.put(row, col + 1, Cell::continuation(pal.code_bg));
+                }
+                col += w;
+                i += 1;
             }
+            i = after;
+            continue;
         }
 
         let w = char_cell_width(chars[i]);
@@ -2377,6 +2527,24 @@ mod tests {
     }
 
     #[test]
+    fn add_blank_line_suppresses_consecutive_blanks() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.add_colored_line("    line one".to_string(), 0, 0);
+        app.add_blank_line();
+        app.add_blank_line(); // second one is a no-op — no double gap
+        assert_eq!(app.scrollback.len(), 2, "one content row + one blank only");
+        // A whitespace-only tool-output row also counts as blank for dedup.
+        app.add_colored_line("    ".to_string(), 0, 0);
+        let before = app.scrollback.len();
+        app.add_blank_line();
+        assert_eq!(
+            app.scrollback.len(),
+            before,
+            "blank after a whitespace-only row is suppressed"
+        );
+    }
+
+    #[test]
     fn assistant_prose_lines_are_not_literal() {
         let mut app = App::new("anthropic", "m", CompletionSources::default());
         app.start_assistant_turn();
@@ -2653,32 +2821,23 @@ mod tests {
     }
 
     #[test]
-    fn stall_tier_classifies_quiet_into_soft_and_hard() {
+    fn stall_tier_shows_soft_reassurance_only() {
         let soft = Duration::from_secs(11);
-        let hard = Duration::from_secs(28);
         assert_eq!(
-            stall_tier(Duration::from_secs(5), soft, hard),
+            stall_tier(Duration::from_secs(5), soft),
             None,
             "below soft: nothing"
         );
         assert_eq!(
-            stall_tier(Duration::from_secs(11), soft, hard),
+            stall_tier(Duration::from_secs(11), soft),
             Some(StallTier::Soft(11)),
             "at soft threshold"
         );
+        // No hard/alarm tier: even sustained silence stays a soft reassurance.
         assert_eq!(
-            stall_tier(Duration::from_secs(27), soft, hard),
-            Some(StallTier::Soft(27)),
-            "between thresholds stays soft"
-        );
-        assert_eq!(
-            stall_tier(Duration::from_secs(28), soft, hard),
-            Some(StallTier::Hard(28)),
-            "at hard threshold escalates"
-        );
-        assert_eq!(
-            stall_tier(Duration::from_secs(90), soft, hard),
-            Some(StallTier::Hard(90))
+            stall_tier(Duration::from_secs(90), soft),
+            Some(StallTier::Soft(90)),
+            "long quiet still reads as 'still working', never an alarm"
         );
     }
 
@@ -2710,7 +2869,7 @@ mod tests {
     fn stop_turn_timer_clears_stall_notice() {
         let mut app = App::new("anthropic", "m", CompletionSources::default());
         app.start_turn_timer();
-        app.stall = Some(StallTier::Hard(90));
+        app.stall = Some(StallTier::Soft(90));
         app.stop_turn_timer();
         assert_eq!(app.stall, None, "ending a turn must clear the stall notice");
     }
@@ -2724,7 +2883,7 @@ mod tests {
         app.add_line("ok> ", "did a thing");
         app.current_assistant = Some("partial reply".to_string());
         app.goal_status = Some("goal active".to_string());
-        app.stall = Some(StallTier::Hard(42));
+        app.stall = Some(StallTier::Soft(42));
         app.scroll_offset = 7;
 
         app.reset_to_login(80, 24);
@@ -3076,5 +3235,185 @@ mod tests {
         // The next warm turn clears the nudge.
         run_turn(&mut app, 1_700, 2_200, 5_000);
         assert!(!app.cache_cold(), "a warm turn clears the cold marker");
+    }
+
+    // ── Fix #2: unclosed markdown markers ───────────────────────────────────
+
+    /// Read a grid row's glyphs into a `String` (trailing blanks trimmed).
+    fn row_text(grid: &Grid, row: u16) -> String {
+        (0..grid.cols())
+            .map(|c| char::from_u32(grid.get(row, c).glyph).unwrap_or(' '))
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn unclosed_bold_marker_is_hidden_and_styles_to_end_of_line() {
+        // A `**bold` that never closes on this visual line (it wrapped / is still
+        // streaming) must NOT leak literal `*` glyphs; the remainder is bolded.
+        let pal = theme::Palette::default();
+        let mut grid = Grid::new(20, 1);
+        let style = Style {
+            fg: pal.body,
+            bg: 0,
+            bold: false,
+        };
+        render_md_line(&mut grid, 0, "**bold", 20, style, pal);
+        assert_eq!(row_text(&grid, 0), "bold", "marker hidden, text kept");
+        assert!(
+            (0..grid.cols()).all(|c| grid.get(0, c).glyph != u32::from(b'*')),
+            "no literal '*' should be rendered",
+        );
+        // The visible glyphs carry the BOLD attribute.
+        assert_eq!(grid.get(0, 0).attr & Attr::BOLD.bits(), Attr::BOLD.bits());
+    }
+
+    #[test]
+    fn unclosed_code_marker_is_hidden() {
+        let pal = theme::Palette::default();
+        let mut grid = Grid::new(20, 1);
+        let style = Style {
+            fg: pal.body,
+            bg: 0,
+            bold: false,
+        };
+        render_md_line(&mut grid, 0, "`code", 20, style, pal);
+        assert_eq!(row_text(&grid, 0), "code");
+        assert!(
+            (0..grid.cols()).all(|c| grid.get(0, c).glyph != u32::from(b'`')),
+            "no literal backtick should be rendered",
+        );
+    }
+
+    #[test]
+    fn closed_bold_still_renders_without_markers() {
+        // Regression guard: the normal closed case is unchanged.
+        let pal = theme::Palette::default();
+        let mut grid = Grid::new(20, 1);
+        let style = Style {
+            fg: pal.body,
+            bg: 0,
+            bold: false,
+        };
+        render_md_line(&mut grid, 0, "a **b** c", 20, style, pal);
+        assert_eq!(row_text(&grid, 0), "a b c");
+    }
+
+    // ── Feature: click-drag selection extraction ────────────────────────────
+
+    fn app_with_screen(rows: &[&str]) -> App {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.screen_text = rows.iter().map(|s| (*s).to_string()).collect();
+        app
+    }
+
+    #[test]
+    fn selection_text_single_line_is_inclusive_of_both_ends() {
+        let mut app = app_with_screen(&["hello world"]);
+        app.begin_selection(0, 0);
+        app.update_selection(0, 4); // covers cols 0..=4 → "hello"
+        assert_eq!(app.selection_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn selection_text_spans_multiple_rows() {
+        let mut app = app_with_screen(&["first line", "second line", "third line"]);
+        app.begin_selection(0, 6); // "line" on row 0
+        app.update_selection(2, 4); // "third" on row 2 (cols 0..=4)
+        assert_eq!(
+            app.selection_text().as_deref(),
+            Some("line\nsecond line\nthird"),
+        );
+    }
+
+    #[test]
+    fn selection_text_normalizes_a_reversed_drag() {
+        // Dragging up-and-left must yield the same text as down-and-right.
+        let mut app = app_with_screen(&["abcdef"]);
+        app.begin_selection(0, 5);
+        app.update_selection(0, 2); // reversed: head before anchor
+        assert_eq!(app.selection_text().as_deref(), Some("cdef"));
+    }
+
+    #[test]
+    fn selection_text_trims_trailing_blanks_and_empty_lines() {
+        let mut app = app_with_screen(&["text      ", "          "]);
+        app.begin_selection(0, 0);
+        app.update_selection(1, 9); // whole 2x10 block
+        assert_eq!(
+            app.selection_text().as_deref(),
+            Some("text"),
+            "trailing spaces and the all-blank second line are dropped",
+        );
+    }
+
+    #[test]
+    fn empty_or_unset_selection_yields_nothing() {
+        let mut app = app_with_screen(&["abc"]);
+        assert_eq!(app.selection_text(), None, "no selection → None");
+        app.begin_selection(0, 1); // zero-width (no drag)
+        assert_eq!(app.selection_text(), None, "zero-width selection → None");
+        assert!(app.clear_selection());
+        assert!(!app.clear_selection(), "second clear is a no-op");
+    }
+
+    #[test]
+    fn selection_highlight_sets_reverse_on_covered_cells() {
+        let mut grid = Grid::new(10, 2);
+        for c in 0..10 {
+            grid.put(0, c, Cell::glyph('x'));
+            grid.put(1, c, Cell::glyph('y'));
+        }
+        let sel = Selection {
+            anchor: (0, 2),
+            head: (0, 5),
+        };
+        apply_selection_highlight(&mut grid, sel);
+        for c in 0..10 {
+            let reversed = grid.get(0, c).attr & Attr::REVERSE.bits() != 0;
+            assert_eq!(
+                reversed,
+                (2..=5).contains(&c),
+                "only cols 2..=5 on row 0 are reversed (col {c})",
+            );
+        }
+        assert!(
+            (0..10).all(|c| grid.get(1, c).attr & Attr::REVERSE.bits() == 0),
+            "row 1 is untouched",
+        );
+    }
+
+    // Regression: Windows `\r\n` line endings (the wrapper splits on `\n` but
+    // leaves the `\r`) must never reach a cell. A `\r` rendered into a cell and
+    // emitted raw returns the terminal cursor to column 0 mid-row, corrupting the
+    // line and permanently desyncing the damage-diff shadow grid — the real cause
+    // of the stale-fragment corruption.
+    #[test]
+    fn control_chars_are_zero_width_and_never_rendered() {
+        assert_eq!(char_cell_width('\r'), 0, "carriage return must be zero-width");
+        assert_eq!(char_cell_width('\t'), 0);
+        assert_eq!(char_cell_width('\u{1b}'), 0, "ESC must be zero-width");
+        assert_eq!(char_cell_width('a'), 1);
+
+        // A line with an embedded `\r` renders as if it were absent — no control
+        // glyph reaches the grid, and following text is not pushed off.
+        let mut grid = Grid::new(10, 1);
+        write_str_styled(
+            &mut grid,
+            0,
+            0,
+            "ab\rcd",
+            10,
+            Style { fg: 0, bg: 0, bold: false },
+        );
+        let row: String = (0..4)
+            .map(|c| char::from_u32(grid.get(0, c).glyph).unwrap_or('?'))
+            .collect();
+        assert_eq!(row, "abcd", "the `\\r` must be dropped, not rendered into a cell");
+        assert!(
+            (0..10).all(|c| grid.get(0, c).glyph != u32::from(b'\r')),
+            "no cell may hold a carriage-return glyph",
+        );
     }
 }

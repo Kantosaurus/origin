@@ -170,7 +170,7 @@ async fn run_worker(
     // when set, else the daemon default.
     let model =
         ctx.spec.model.clone().unwrap_or_else(|| {
-            std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".to_string())
+            std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-fable-5".to_string())
         });
     let mut session = Session::new(provider.name(), &model);
 

@@ -4,7 +4,7 @@ members = ["crates/*", "xtask"]
 exclude = ["crates/origin-daemon/fuzz"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.9.1"
 edition = "2021"
 rust-version = "1.83"
 license = "Apache-2.0"

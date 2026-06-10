@@ -6,6 +6,7 @@
 //! [`tls`] carry the same frames over QUIC with mutual TLS for remote clients.
 
 pub mod frame;
+pub mod instance;
 pub mod quic;
 pub mod tls;
 pub mod transport;

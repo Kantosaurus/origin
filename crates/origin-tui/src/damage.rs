@@ -69,7 +69,7 @@ pub fn diff(prev: &Grid, next: &Grid) -> Vec<Run> {
                 col += 1;
                 continue;
             }
-            let start = col;
+            let mut start = col;
             while col < cols {
                 let c_off2 = usize::from(col) * CELL_BYTES;
                 if row_prev[c_off2..c_off2 + CELL_BYTES] == row_next[c_off2..c_off2 + CELL_BYTES] {
@@ -77,10 +77,21 @@ pub fn diff(prev: &Grid, next: &Grid) -> Vec<Run> {
                 }
                 col += 1;
             }
+            // If a run begins on the trailing half of a wide glyph, the emitter
+            // would skip that continuation cell without advancing the cursor and
+            // shift the rest of the run one column left. Extend the run left to
+            // include the wide glyph so the pair is always emitted together. The
+            // wide-glyph cell to the left is necessarily unchanged here (or it
+            // would already be part of this run), so re-emitting it is harmless.
+            let mut run_len = col - start;
+            if start > 0 && next.get(row, start).is_continuation() {
+                start -= 1;
+                run_len += 1;
+            }
             out.push(Run {
                 row,
                 col: start,
-                len: col - start,
+                len: run_len,
             });
         }
     }

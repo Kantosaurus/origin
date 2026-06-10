@@ -89,7 +89,7 @@ pub fn maybe_spawn(sock_path: String) {
 /// when the user has been idle long enough *and* the budget policy permits —
 /// and, if so, dispatch its prompt onto the live agent path.
 async fn run_loop(sock_path: String, idle: Arc<IdleTracker>) {
-    let model = std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-opus-4-7".to_string());
+    let model = std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-fable-5".to_string());
     let min_idle_ms = std::env::var("ORIGIN_AMBIENT_IDLE_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())

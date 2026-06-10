@@ -159,8 +159,33 @@ pub fn encode_request(req: &ChatRequest, stream: bool) -> WireRequest<'_> {
         } else {
             None
         },
-        reasoning_effort: req.effort.map(origin_provider::ReasoningEffort::as_wire_str),
+        // `reasoning_effort` is only accepted by reasoning models; non-reasoning
+        // chat models (e.g. gpt-4o) return a 400 "Unknown parameter". Gate on the
+        // model id and map to a valid OpenAI value (never the internal `fast`/
+        // `max` tokens, which OpenAI rejects).
+        reasoning_effort: req
+            .effort
+            .filter(|_| is_reasoning_model(&req.model))
+            .map(origin_provider::ReasoningEffort::as_openai_effort),
     }
+}
+
+/// Heuristic for whether `model` is an OpenAI-style *reasoning* model that
+/// accepts the `reasoning_effort` parameter. Conservative on purpose: a false
+/// negative just omits the (optional) hint, while a false positive would 400 a
+/// plain chat model. Covers `OpenAI`'s o-series + gpt-5, plus the common
+/// reasoning naming used across `OpenAI`-compatible providers
+/// (deepseek-reasoner, *-thinking).
+fn is_reasoning_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.starts_with("o5")
+        || m.contains("gpt-5")
+        || m.contains("reasoner")
+        || m.contains("reasoning")
+        || m.contains("thinking")
 }
 
 fn encode_message_into(m: &Message, out: &mut Vec<WireMessage>) {

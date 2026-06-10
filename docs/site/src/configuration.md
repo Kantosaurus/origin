@@ -27,7 +27,7 @@ a shard is corrupted.
 ```toml
 # Default model for new sessions. Per-session overrides via `origin run --model`.
 [model]
-default = "anthropic:claude-opus-4-7"
+default = "anthropic:claude-fable-5"
 sidecar = "anthropic:claude-haiku-4"     # always-on small model
 embedding = "local:minilm-l6-v2"          # bundled ONNX
 

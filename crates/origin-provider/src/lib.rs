@@ -89,6 +89,34 @@ impl ReasoningEffort {
         }
     }
 
+    /// The Anthropic Messages API `output_config.effort` value for this level.
+    ///
+    /// Anthropic accepts only `low|medium|high|xhigh|max` — there is no `fast`,
+    /// so [`Self::Fast`] maps to the closest valid low-latency level, `low`.
+    #[must_use]
+    pub const fn as_anthropic_effort(self) -> &'static str {
+        match self {
+            Self::Fast | Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+
+    /// The `OpenAI` `reasoning_effort` value for this level.
+    ///
+    /// `OpenAI` reasoning models accept `low|medium|high` universally (`minimal`
+    /// and `xhigh` are model-specific). `fast` and `max` are not valid values,
+    /// so [`Self::Fast`] maps to `low` and [`Self::Max`] to `high`.
+    #[must_use]
+    pub const fn as_openai_effort(self) -> &'static str {
+        match self {
+            Self::Fast | Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High | Self::Max => "high",
+        }
+    }
+
     /// Parse a canonical wire token (`fast`/`low`/`medium`/`high`/`max`,
     /// case-insensitive) back into a level. Returns `None` for anything else
     /// so callers can leave the wire byte-identical when the token is unknown.

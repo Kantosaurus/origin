@@ -44,7 +44,7 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
             auth: xapikey(),
             base_url: "https://api.anthropic.com".into(),
             chat_path: "/v1/messages".into(),
-            default_model: "claude-sonnet-4-6".into(),
+            default_model: "claude-fable-5".into(),
             capabilities: Capabilities {
                 prompt_cache: true,
                 thinking: true,
@@ -73,7 +73,7 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
             }),
             base_url: "https://api.anthropic.com".into(),
             chat_path: "/v1/messages".into(),
-            default_model: "claude-sonnet-4-6".into(),
+            default_model: "claude-fable-5".into(),
             capabilities: Capabilities {
                 prompt_cache: true,
                 thinking: true,

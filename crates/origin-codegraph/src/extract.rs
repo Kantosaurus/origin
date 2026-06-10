@@ -63,6 +63,19 @@ pub struct CodeEdge {
     pub kind: EdgeKind,
 }
 
+impl EdgeKind {
+    /// Canonical lowercase tag stored in the `code_edges.kind` column.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Calls => "calls",
+            Self::Mentions => "mentions",
+            Self::Implements => "implements",
+            Self::Extends => "extends",
+        }
+    }
+}
+
 /// Errors produced while walking a parsed tree.
 // `ExtractError` matches the public API in the Phase 7 plan; the
 // `Extract` prefix disambiguates from `LangError`.
@@ -122,6 +135,94 @@ pub fn extract_nodes_with_cas(
         }
     }
     Ok(nodes)
+}
+
+/// Extract intra-file reference edges among `nodes`.
+///
+/// For every definition that has a body, each identifier reference inside that
+/// body naming *another* definition in `nodes` produces an edge: a name followed
+/// by `(` resolving to a function/method is a [`EdgeKind::Calls`] edge, anything
+/// else is [`EdgeKind::Mentions`]. Resolution is name-based and file-local — it
+/// does not chase references across files or disambiguate shadowed names — so
+/// edges are intended to be stored at `Confidence::Inferred`. This populates the
+/// previously-empty edge layer (the node-only extractor left every relationship
+/// query returning nothing) with useful, mostly-correct structure.
+///
+/// # Errors
+/// Propagates [`ExtractError::Lang`] on parse failure and [`ExtractError::Utf8`]
+/// if a reference slice is not valid UTF-8.
+#[allow(clippy::module_name_repetitions)]
+pub fn extract_edges(lang: Language, src: &[u8], nodes: &[CodeNode]) -> Result<Vec<CodeEdge>, ExtractError> {
+    if nodes.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let defs: std::collections::HashMap<&str, NodeKind> =
+        nodes.iter().map(|n| (n.name.as_str(), n.kind)).collect();
+    let tree = lang.parse(src)?;
+    let refs = collect_identifier_refs(tree.root_node(), src)?;
+
+    let mut edges = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String, EdgeKind)> = std::collections::HashSet::new();
+    for n in nodes {
+        let Some(body) = n.body_range else { continue };
+        for (name, pos, call) in &refs {
+            if *pos < body.start || *pos >= body.end || name == &n.name {
+                continue;
+            }
+            let Some(&target_kind) = defs.get(name.as_str()) else {
+                continue;
+            };
+            let kind = edge_kind_for(*call, target_kind);
+            if seen.insert((n.name.clone(), name.clone(), kind)) {
+                edges.push(CodeEdge {
+                    from: n.name.clone(),
+                    to: name.clone(),
+                    kind,
+                });
+            }
+        }
+    }
+    Ok(edges)
+}
+
+/// A name followed by `(` that resolves to a callable is a call; otherwise the
+/// reference is a (weaker) mention.
+const fn edge_kind_for(call: bool, target: NodeKind) -> EdgeKind {
+    match (call, target) {
+        (true, NodeKind::Function | NodeKind::Method) => EdgeKind::Calls,
+        _ => EdgeKind::Mentions,
+    }
+}
+
+/// Collect every identifier-like leaf in the tree as `(text, start_byte,
+/// followed_by_open_paren)`. Iterative DFS so a deeply-nested file can't blow
+/// the stack. Identifiers inside string/comment literals are *not* identifier
+/// nodes in tree-sitter grammars, so they are naturally excluded.
+fn collect_identifier_refs(root: Node, src: &[u8]) -> Result<Vec<(String, usize, bool)>, ExtractError> {
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if matches!(
+            n.kind(),
+            "identifier" | "type_identifier" | "field_identifier" | "constant"
+        ) {
+            let start = n.start_byte();
+            let end = n.end_byte().min(src.len());
+            if start < end {
+                let text = std::str::from_utf8(&src[start..end])?;
+                let call = src
+                    .get(end..)
+                    .and_then(|rest| rest.iter().find(|b| !b.is_ascii_whitespace()))
+                    == Some(&b'(');
+                out.push((text.to_owned(), start, call));
+            }
+        }
+        let mut cursor = n.walk();
+        for child in n.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    Ok(out)
 }
 
 fn walk(node: Node, lang: Language, src: &[u8], out: &mut Vec<CodeNode>) -> Result<(), ExtractError> {
@@ -399,4 +500,42 @@ fn node_kind_for(lang: Language, ts_kind: &str) -> Option<NodeKind> {
         return Some(NodeKind::Module);
     }
     None
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::{extract_edges, extract_nodes, EdgeKind};
+    use crate::lang::Language;
+
+    #[test]
+    fn intra_file_call_produces_one_deduped_calls_edge() {
+        let src = b"fn helper() -> i32 { 1 }\nfn caller() -> i32 { helper() + helper() }";
+        let nodes = extract_nodes(Language::Rust, src).expect("nodes");
+        assert!(nodes.len() >= 2, "expected helper + caller, got {nodes:?}");
+        let edges = extract_edges(Language::Rust, src, &nodes).expect("edges");
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.from == "caller" && e.to == "helper" && e.kind == EdgeKind::Calls),
+            "expected caller->helper Calls edge, got {edges:?}"
+        );
+        // helper's body references nothing, so no edge originates from it.
+        assert!(!edges.iter().any(|e| e.from == "helper"));
+        // The two helper() calls collapse to a single edge.
+        assert_eq!(
+            edges
+                .iter()
+                .filter(|e| e.from == "caller" && e.to == "helper")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn independent_definitions_produce_no_edges() {
+        let src = b"fn a() {}\nfn b() {}";
+        let nodes = extract_nodes(Language::Rust, src).expect("nodes");
+        let edges = extract_edges(Language::Rust, src, &nodes).expect("edges");
+        assert!(edges.is_empty(), "independent fns have no edges, got {edges:?}");
+    }
 }

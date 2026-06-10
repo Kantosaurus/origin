@@ -133,6 +133,20 @@ fn decode_frame(frame: wire::WireFrame) -> ChatResponse {
             cache_marker: None,
         });
     }
+    // Surface tool calls. Ollama tool_calls carry no id, so synthesize one per
+    // call (`call_<name>_<idx>`) — the index disambiguates parallel same-name
+    // calls for the agent loop's tool_use/tool_result matching.
+    if let Some(calls) = frame.message.tool_calls {
+        for (idx, call) in calls.into_iter().enumerate() {
+            let input_json = serde_json::to_vec(&call.function.arguments).unwrap_or_default();
+            blocks.push(Block::ToolUse {
+                id: format!("call_{}_{idx}", call.function.name),
+                name: call.function.name,
+                input_json,
+                cache_marker: None,
+            });
+        }
+    }
     let assistant = Message {
         role: Role::Assistant,
         blocks,

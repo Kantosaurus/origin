@@ -64,3 +64,31 @@ fn mismatched_dims_panic() {
     let b = Grid::new(11, 5);
     let _ = diff(&a, &b);
 }
+
+#[test]
+fn run_starting_on_continuation_extends_left_to_the_wide_glyph() {
+    // A wide glyph occupies two cells: the glyph itself plus a continuation
+    // (trailing-half) cell. If only the continuation cell differs between frames,
+    // a naive diff would emit a run that STARTS on the continuation — which the
+    // emitter skips without advancing the cursor, shifting the row. The run must
+    // be extended left to include the wide glyph so the pair repaints together.
+    let mut a = Grid::new(8, 1);
+    a.put(0, 0, Cell::new('\u{4e16}', 0, 0, origin_tui::Attr::PLAIN)); // wide glyph
+    a.put(0, 1, Cell::continuation(0)); // its trailing half
+    let mut b = a.clone();
+    // Change ONLY the continuation cell (different bg), leaving the wide glyph
+    // byte-identical, so the changed region begins on the continuation cell.
+    b.put(0, 1, Cell::continuation(0x0010_2030));
+
+    let runs = diff(&a, &b);
+    assert_eq!(runs.len(), 1, "exactly one changed region");
+    assert_eq!(
+        runs[0],
+        Run {
+            row: 0,
+            col: 0, // extended left from col 1 to include the wide glyph
+            len: 2,
+        },
+        "run must cover the wide glyph + its continuation",
+    );
+}

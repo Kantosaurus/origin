@@ -70,13 +70,90 @@ pub async fn bash_v2(args: BashArgs, sup: &Supervisor) -> Result<Value, ToolErro
             return Ok(json!({
                 "status": status_str,
                 "exit_code": exit_code,
-                "stdout": acc,
+                "stdout": cap_stdout(acc),
             }));
         }
         if std::time::Instant::now() > deadline {
-            return Ok(json!({"status": "timed_out", "exit_code": -1, "stdout": acc}));
+            return Ok(json!({"status": "timed_out", "exit_code": -1, "stdout": cap_stdout(acc)}));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Byte budget for returned stdout (~24k tokens at ~4 bytes/token, just under
+/// the tool's declared `token_budget` of 25k). A chatty command (a build log,
+/// `find /`, a stack dump) would otherwise flood the model's context with its
+/// entire output every turn it stays in history.
+const STDOUT_BYTE_BUDGET: usize = 96_000;
+
+/// Cap `out` to [`STDOUT_BYTE_BUDGET`], preserving the head and the tail
+/// (command errors and exit summaries usually surface at the *end*) and noting
+/// the elided middle. Truncates on UTF-8 char boundaries so the JSON stays valid.
+fn cap_stdout(out: String) -> String {
+    if out.len() <= STDOUT_BYTE_BUDGET {
+        return out;
+    }
+    let head_budget = STDOUT_BYTE_BUDGET * 2 / 3;
+    let tail_budget = STDOUT_BYTE_BUDGET - head_budget;
+    let head_end = floor_char_boundary(&out, head_budget);
+    let tail_start = ceil_char_boundary(&out, out.len() - tail_budget);
+    let elided = tail_start.saturating_sub(head_end);
+    format!(
+        "{}\n... [{elided} bytes elided to fit the tool output budget] ...\n{}",
+        &out[..head_end],
+        &out[tail_start..]
+    )
+}
+
+/// Largest char boundary `<= i` (stable-Rust stand-in for the nightly
+/// `str::floor_char_boundary`).
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Smallest char boundary `>= i`.
+fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::cap_stdout;
+
+    #[test]
+    fn short_output_is_unchanged() {
+        let s = "hello world".to_string();
+        assert_eq!(cap_stdout(s.clone()), s);
+    }
+
+    #[test]
+    fn long_output_keeps_head_and_tail_and_notes_elision() {
+        let head = "H".repeat(80_000);
+        let tail = "TAIL_MARKER_AT_END";
+        let s = format!("{head}{}{tail}", "M".repeat(80_000));
+        let capped = cap_stdout(s);
+        assert!(capped.len() < 100_000, "must be capped: {}", capped.len());
+        assert!(capped.starts_with("HHHH"), "head preserved");
+        assert!(capped.ends_with(tail), "tail preserved (errors surface at end)");
+        assert!(capped.contains("bytes elided"), "elision noted");
+    }
+
+    #[test]
+    fn cap_respects_utf8_boundaries() {
+        // A multibyte char straddling the budget must not be split.
+        let s = format!("{}é{}", "a".repeat(95_999), "z".repeat(5_000));
+        let capped = cap_stdout(s);
+        // Round-trips as valid UTF-8 (String is always valid; the slices must be too).
+        assert!(capped.is_char_boundary(0));
     }
 }
 

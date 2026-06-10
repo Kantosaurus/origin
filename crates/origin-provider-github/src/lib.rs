@@ -10,6 +10,8 @@
 //! restarting the daemon.
 #![allow(clippy::module_name_repetitions)]
 
+pub mod copilot;
+
 use async_trait::async_trait;
 use origin_core::types::{Block, Message, Role};
 use origin_keyvault::KeyVault;

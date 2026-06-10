@@ -7,14 +7,15 @@
 //! For P7.8 we bump `nodes_added` for every emitted node; the test asserts on
 //! the sum, so the under-counting on `updated` is intentional and bounded.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::extract::extract_nodes;
-use crate::index::{CodeGraphIndex, IndexError};
+use crate::extract::{extract_edges, extract_nodes};
+use crate::index::{CodeGraphIndex, EntityId, IndexError};
 use crate::lang::Language;
-use crate::record::CodeNodeRecord;
+use crate::record::{CodeNodeRecord, Confidence};
 
 /// Aggregate counters for a rebuild pass. `errors` collects per-file diagnostics
 /// without aborting the pass, so a single bad file can't stall the whole hook.
@@ -83,8 +84,14 @@ fn rebuild_one(
     let bytes = std::fs::read(path)?;
     let nodes = extract_nodes(lang, &bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    // Resolve intra-file reference edges before the nodes vec is consumed below.
+    let edges = extract_edges(lang, &bytes, &nodes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     let mut added = 0;
     let updated = 0; // see module docs — opaque to caller in P7.8.
+    // Map this file's definition names to their entity ids so name-resolved
+    // edges can be keyed by `EntityId` for `insert_edge`.
+    let mut name_to_id: HashMap<String, EntityId> = HashMap::with_capacity(nodes.len());
     for n in nodes {
         // tree-sitter byte offsets are bounded by `bytes.len()`; clamp
         // defensively so a future grammar change can't panic the slice.
@@ -105,8 +112,19 @@ fn rebuild_one(
             signature,
             body,
         };
-        idx.insert_node(&rec)?;
+        let id = idx.insert_node(&rec)?;
+        name_to_id.insert(rec.name.clone(), id);
         added += 1;
+    }
+    // Wire file-local reference edges. Endpoints not defined in this file (cross-
+    // file references) are skipped here — they resolve once the defining file is
+    // indexed and re-walked. Stored at `Confidence::Inferred` (name-heuristic).
+    for e in edges {
+        if let (Some(&from), Some(&to)) = (name_to_id.get(&e.from), name_to_id.get(&e.to)) {
+            if from != to {
+                idx.insert_edge(from, to, e.kind.as_str(), Confidence::Inferred, e.to.as_bytes())?;
+            }
+        }
     }
     Ok((added, updated))
 }
