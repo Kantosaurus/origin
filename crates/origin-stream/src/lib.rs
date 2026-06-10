@@ -208,8 +208,8 @@ impl Subscriber {
         let start = self.read_cursor + 4;
         let end = start + len;
         let slice = &buf[start..end];
-        let archived = check_archived_root::<TokenEvent>(slice)
-            .map_err(|e| RingError::Decode(format!("{e:?}")))?;
+        let archived =
+            check_archived_root::<TokenEvent>(slice).map_err(|e| RingError::Decode(format!("{e:?}")))?;
         let ev: TokenEvent = archived
             .deserialize(&mut Infallible)
             .map_err(|e| RingError::Decode(format!("{e:?}")))?;

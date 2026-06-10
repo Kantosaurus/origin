@@ -38,7 +38,10 @@ fn default_none_omits_effort_keys() {
 fn set_effort_emits_output_config_effort_with_valid_value() {
     // Must be nested under output_config, never top-level (top-level 400s).
     let body = origin_provider_anthropic::encode_request_for_test(&req_with(Some(ReasoningEffort::High)));
-    assert!(body.get("effort").is_none(), "must NOT send a top-level effort field");
+    assert!(
+        body.get("effort").is_none(),
+        "must NOT send a top-level effort field"
+    );
     assert_eq!(body["output_config"]["effort"], "high");
 
     // `fast` is not a valid Anthropic effort value — it maps to `low`.

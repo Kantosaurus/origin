@@ -700,7 +700,10 @@ mod tests {
         let mut ed = Editor::new();
         ed.push_history("older history entry");
         ed.queue_message("queued while busy");
-        assert_eq!(reduce_editor(&mut ed, k(KeyCode::Up), false, 80), InputAction::Noop);
+        assert_eq!(
+            reduce_editor(&mut ed, k(KeyCode::Up), false, 80),
+            InputAction::Noop
+        );
         assert_eq!(
             ed.buffer(),
             "queued while busy",
@@ -730,14 +733,20 @@ mod tests {
         let mut ed = Editor::new();
         ed.queue_message("queued");
         ed.set_buffer("line one\nline two".to_string()); // cursor at end (line two)
-        assert_eq!(reduce_editor(&mut ed, k(KeyCode::Up), false, 80), InputAction::Noop);
+        assert_eq!(
+            reduce_editor(&mut ed, k(KeyCode::Up), false, 80),
+            InputAction::Noop
+        );
         assert!(
             !ed.editing_queue(),
             "Up below the top line is cursor movement, not queue editing"
         );
         assert_eq!(ed.buffer(), "line one\nline two");
         // Now ON the top line: next Up opens the queue.
-        assert_eq!(reduce_editor(&mut ed, k(KeyCode::Up), false, 80), InputAction::Noop);
+        assert_eq!(
+            reduce_editor(&mut ed, k(KeyCode::Up), false, 80),
+            InputAction::Noop
+        );
         assert!(ed.editing_queue(), "Up on the top-most line edits the queue");
         assert_eq!(ed.buffer(), "queued");
     }
@@ -772,7 +781,11 @@ mod tests {
         // Mid-history Up keeps walking history (queue stays untouched).
         ed.queue_message("late arrival");
         reduce_editor(&mut ed, k(KeyCode::Up), false, 80);
-        assert_eq!(ed.buffer(), "old one", "browsing history keeps priority over queue");
+        assert_eq!(
+            ed.buffer(),
+            "old one",
+            "browsing history keeps priority over queue"
+        );
         assert!(!ed.editing_queue());
     }
 

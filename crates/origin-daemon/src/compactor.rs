@@ -96,9 +96,18 @@ pub fn compact(input: &CompactionInput<'_>) -> CompactionOutput {
     // if the partner has no summary of its own (it gets a bare marker) and even
     // if that pushes us past `COMPACT_OLDEST_N_TURNS` (the cap is a soft
     // heuristic; correctness wins).
-    let has_tool_use = |i: usize| transcript[i].blocks.iter().any(|b| matches!(b, Block::ToolUse { .. }));
-    let has_tool_result =
-        |i: usize| transcript[i].blocks.iter().any(|b| matches!(b, Block::ToolResult { .. }));
+    let has_tool_use = |i: usize| {
+        transcript[i]
+            .blocks
+            .iter()
+            .any(|b| matches!(b, Block::ToolUse { .. }))
+    };
+    let has_tool_result = |i: usize| {
+        transcript[i]
+            .blocks
+            .iter()
+            .any(|b| matches!(b, Block::ToolResult { .. }))
+    };
     let mut to_compact: std::collections::BTreeSet<usize> = selected.iter().copied().collect();
     for &i in &selected {
         if has_tool_use(i) && i + 1 < transcript.len() && has_tool_result(i + 1) {
@@ -317,8 +326,7 @@ mod tests {
             transcript.push(assistant_tool_use(&format!("T{k}")));
             transcript.push(tool_result(&format!("T{k}")));
         }
-        let summaries: Vec<Option<String>> =
-            (0..transcript.len()).map(|i| Some(format!("s{i}"))).collect();
+        let summaries: Vec<Option<String>> = (0..transcript.len()).map(|i| Some(format!("s{i}"))).collect();
 
         let out = maybe_compact_transcript(&transcript, &summaries, 1)
             .await

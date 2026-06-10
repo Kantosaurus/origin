@@ -1180,10 +1180,7 @@ async fn handle_input_action(
             let pending = app.lock().input.queued_len();
             app.lock().add_line(
                 "system> ",
-                &origin_cli::locale::linef(
-                    "cmd.queue.edited",
-                    &[("pending", pending.to_string().as_str())],
-                ),
+                &origin_cli::locale::linef("cmd.queue.edited", &[("pending", pending.to_string().as_str())]),
             );
             handle.mark_dirty();
         }
@@ -2911,9 +2908,7 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
         // graph, and self-dev all resolve paths against the daemon's cwd, so a
         // project-A daemon must not execute in project B's directory (or in
         // whatever directory the first-ever `origin` happened to start from).
-        .current_dir(
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        )
+        .current_dir(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(log_stderr);

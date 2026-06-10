@@ -3478,10 +3478,7 @@ mod tests {
         let mut app = app_with_screen(&["first line", "second line", "third line"]);
         app.begin_selection(0, 6); // "line" on row 0
         app.update_selection(2, 4); // "third" on row 2 (cols 0..=4)
-        assert_eq!(
-            app.selection_text().as_deref(),
-            Some("line\nsecond line\nthird"),
-        );
+        assert_eq!(app.selection_text().as_deref(), Some("line\nsecond line\nthird"),);
     }
 
     #[test]
@@ -3562,7 +3559,11 @@ mod tests {
             0,
             "ab\rcd",
             10,
-            Style { fg: 0, bg: 0, bold: false },
+            Style {
+                fg: 0,
+                bg: 0,
+                bold: false,
+            },
         );
         let row: String = (0..4)
             .map(|c| char::from_u32(grid.get(0, c).glyph).unwrap_or('?'))

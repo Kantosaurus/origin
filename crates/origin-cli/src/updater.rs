@@ -289,8 +289,7 @@ fn find_origin_package_json(exe: &Path) -> Option<(PathBuf, String)> {
         let pj = d.join("package.json");
         if let Ok(bytes) = std::fs::read(&pj) {
             if let Ok(meta) = serde_json::from_slice::<PackageMeta>(&bytes) {
-                let is_origin =
-                    meta.name == NPM_PACKAGE || meta.name.starts_with("@kantosaurus/origin-");
+                let is_origin = meta.name == NPM_PACKAGE || meta.name.starts_with("@kantosaurus/origin-");
                 let v = meta.version.trim();
                 if is_origin && parse_semver(strip_v_prefix(v)).is_some() {
                     return Some((pj, v.to_string()));
@@ -455,11 +454,7 @@ async fn fetch_checksums(version: &str) -> Option<String> {
 /// # Errors
 /// [`UpdateError::ChecksumFailed`] when no manifest entry exists or the digest
 /// doesn't match.
-fn verify_sha256_bytes(
-    bytes: &[u8],
-    checksums: Option<&str>,
-    asset_name: &str,
-) -> Result<(), UpdateError> {
+fn verify_sha256_bytes(bytes: &[u8], checksums: Option<&str>, asset_name: &str) -> Result<(), UpdateError> {
     let expected = checksums
         .and_then(|text| expected_hash_for(text, asset_name))
         .ok_or_else(|| {
@@ -602,9 +597,7 @@ async fn check_and_stage_inner() -> bool {
     let asset_url = release_asset_url(&latest, &asset_name);
 
     eprintln!("origin {current} → {latest}: downloading…");
-    tracing::info!(
-        "updater: update available (current={current} latest={latest}); downloading {asset_name}"
-    );
+    tracing::info!("updater: update available (current={current} latest={latest}); downloading {asset_name}");
 
     let exe = match current_exe() {
         Ok(p) => p,
@@ -732,7 +725,10 @@ mod tests {
             other => panic!("unexpected test host OS: {other}"),
         };
         assert!(name.contains(needle), "asset {name} should contain {needle}");
-        assert!(name.starts_with("origin-"), "asset {name} should start with origin-");
+        assert!(
+            name.starts_with("origin-"),
+            "asset {name} should start with origin-"
+        );
     }
 
     #[test]
@@ -791,10 +787,16 @@ mod tests {
         let pj = pkg.join("package.json");
 
         std::fs::write(&pj, r#"{"name":"some-other-pkg","version":"1.2.3"}"#).expect("w");
-        assert!(npm_version_for_exe(&exe).is_none(), "foreign package must be ignored");
+        assert!(
+            npm_version_for_exe(&exe).is_none(),
+            "foreign package must be ignored"
+        );
 
         std::fs::write(&pj, r#"{"name":"@kantosaurus/origin","version":"garbage"}"#).expect("w");
-        assert!(npm_version_for_exe(&exe).is_none(), "non-semver version must be ignored");
+        assert!(
+            npm_version_for_exe(&exe).is_none(),
+            "non-semver version must be ignored"
+        );
 
         std::fs::write(&pj, r#"{"name":"@kantosaurus/origin","version":"0.9.0"}"#).expect("w");
         assert_eq!(npm_version_for_exe(&exe).as_deref(), Some("0.9.0"));

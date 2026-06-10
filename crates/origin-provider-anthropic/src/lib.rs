@@ -248,9 +248,7 @@ impl Anthropic {
                 user_id: m.user_id.clone(),
             }),
             output_config: req.effort.map(output_config),
-            thinking: req
-                .thinking_tokens
-                .map(|b| thinking_block(&req.model, b)),
+            thinking: req.thinking_tokens.map(|b| thinking_block(&req.model, b)),
         };
 
         let mut body_value =
@@ -554,7 +552,10 @@ fn message_to_wire<'a>(m: &'a Message, plan: Option<&Plan>, msg_idx: usize) -> w
                 // agent loop) gets the longer 1h TTL, and only when explicitly
                 // enabled — sending `ttl` requires the extended-cache-ttl beta,
                 // which the default impersonation header set does not carry.
-                let frozen = matches!(block_cache_boundary(b), Some(origin_core::types::CacheBoundary::Frozen));
+                let frozen = matches!(
+                    block_cache_boundary(b),
+                    Some(origin_core::types::CacheBoundary::Frozen)
+                );
                 Some(if frozen && ttl_1h_enabled() {
                     wire::WireCacheControl::ephemeral_1h()
                 } else {

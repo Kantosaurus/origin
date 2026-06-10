@@ -162,8 +162,13 @@ fn extract_host(url: &str) -> Option<String> {
     // rules: drop the stripped characters and terminate the authority on `\`
     // as well as `/ ? #`.
     let cleaned: String = url.chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect();
-    let after_scheme = cleaned.split_once("://").map_or(cleaned.as_str(), |(_, rest)| rest);
-    let authority = after_scheme.split(['/', '\\', '?', '#']).next().unwrap_or(after_scheme);
+    let after_scheme = cleaned
+        .split_once("://")
+        .map_or(cleaned.as_str(), |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '\\', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
     let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     // Trim an optional port. IPv6 literals are bracketed; handle them first.
     let host = host_port.strip_prefix('[').map_or_else(
@@ -369,7 +374,10 @@ mod tests {
             );
         }
         // The legitimate host is still extracted correctly.
-        assert_eq!(extract_host(r"https://evil.com\@allowed.com/").as_deref(), Some("evil.com"));
+        assert_eq!(
+            extract_host(r"https://evil.com\@allowed.com/").as_deref(),
+            Some("evil.com")
+        );
     }
 
     #[test]

@@ -102,14 +102,32 @@ fn print_transcript(p: &Palette) {
     println!("  {}{BOLD}## Heading 2 — what changed{RESET}", fg(p.h2));
     println!("  {}### Heading 3 — details{RESET}", fg(p.h3));
     println!();
-    println!("  {}{BOLD}\u{276F}{RESET} {}refactor the damage diff to use SIMD{RESET}", fg(p.accent), fg(p.user));
+    println!(
+        "  {}{BOLD}\u{276F}{RESET} {}refactor the damage diff to use SIMD{RESET}",
+        fg(p.accent),
+        fg(p.user)
+    );
     println!();
-    println!("  {}Sure — I'll start by reading the current implementation, then{RESET}", fg(p.body));
-    println!("  {}rewrite the inner loop with `wide::u8x32` lanes.{RESET}", fg(p.body));
+    println!(
+        "  {}Sure — I'll start by reading the current implementation, then{RESET}",
+        fg(p.body)
+    );
+    println!(
+        "  {}rewrite the inner loop with `wide::u8x32` lanes.{RESET}",
+        fg(p.body)
+    );
     println!();
-    println!("  {}\u{25CF} Read{RESET} {}crates/origin-tui/src/damage.rs{RESET}", fg(p.tool), fg(p.muted));
+    println!(
+        "  {}\u{25CF} Read{RESET} {}crates/origin-tui/src/damage.rs{RESET}",
+        fg(p.tool),
+        fg(p.muted)
+    );
     println!("  {}  \u{2514} 412 lines{RESET}", fg(p.dim));
-    println!("  {}\u{25CF} Edit{RESET} {}crates/origin-tui/src/damage.rs{RESET}", fg(p.tool), fg(p.muted));
+    println!(
+        "  {}\u{25CF} Edit{RESET} {}crates/origin-tui/src/damage.rs{RESET}",
+        fg(p.tool),
+        fg(p.muted)
+    );
     println!();
     // Code block on its own background.
     let code_lines = [
@@ -122,15 +140,34 @@ fn print_transcript(p: &Palette) {
     }
     println!();
     // Diff rows.
-    println!("  {}{}- if row[i] != prev[i] {{ dirty.push(i); }}                   {RESET}", bg(theme::DIFF_DEL_BG), fg(theme::DIFF_DEL_FG));
-    println!("  {}{}+ if mask != u32::MAX {{ dirty.push(i); }}                    {RESET}", bg(theme::DIFF_ADD_BG), fg(theme::DIFF_ADD_FG));
+    println!(
+        "  {}{}- if row[i] != prev[i] {{ dirty.push(i); }}                   {RESET}",
+        bg(theme::DIFF_DEL_BG),
+        fg(theme::DIFF_DEL_FG)
+    );
+    println!(
+        "  {}{}+ if mask != u32::MAX {{ dirty.push(i); }}                    {RESET}",
+        bg(theme::DIFF_ADD_BG),
+        fg(theme::DIFF_ADD_FG)
+    );
     println!();
     // Status line states.
-    println!("  {}\u{2713} 42 tests passed{RESET}   {}\u{26A0} 3 warnings{RESET}   {}\u{2717} 1 failure{RESET}", fg(p.green), fg(p.yellow), fg(p.red));
+    println!(
+        "  {}\u{2713} 42 tests passed{RESET}   {}\u{26A0} 3 warnings{RESET}   {}\u{2717} 1 failure{RESET}",
+        fg(p.green),
+        fg(p.yellow),
+        fg(p.red)
+    );
     println!();
     // Panel chrome.
     println!("  {}{rule}{RESET}", fg(p.rule));
-    println!("  {}{}{BOLD} PLAN {RESET}{}{}  1. read damage.rs   2. SIMD inner loop   3. bench       {RESET}", bg(p.panel_bg), fg(p.panel_header), bg(p.panel_bg), fg(p.body));
+    println!(
+        "  {}{}{BOLD} PLAN {RESET}{}{}  1. read damage.rs   2. SIMD inner loop   3. bench       {RESET}",
+        bg(p.panel_bg),
+        fg(p.panel_header),
+        bg(p.panel_bg),
+        fg(p.body)
+    );
     println!("  {}{rule}{RESET}", fg(p.rule));
     println!();
     println!("  {}{}{BOLD} input \u{2502} {RESET}{}{} type a message\u{2026}                                      {RESET}", bg(p.surface_raised), fg(p.accent), bg(p.surface_raised), fg(p.muted));
@@ -141,14 +178,31 @@ fn print_transcript(p: &Palette) {
 fn print_ansi_helpers() {
     println!("  {}", ansi::heading("origin — first run"));
     println!("  {}", ansi::section_rule(64));
-    println!("  {} {}", ansi::step_number(1, 3), ansi::bright("Pick a provider"));
-    println!("    {} {}", ansi::prompt_arrow(), ansi::highlight_row(" anthropic (recommended) "));
+    println!(
+        "  {} {}",
+        ansi::step_number(1, 3),
+        ansi::bright("Pick a provider")
+    );
+    println!(
+        "    {} {}",
+        ansi::prompt_arrow(),
+        ansi::highlight_row(" anthropic (recommended) ")
+    );
     println!("      {}", ansi::muted("openai"));
     println!("      {}", ansi::muted("ollama (local)"));
     println!("  {} {}", ansi::step_number(2, 3), ansi::bright("Port skills"));
-    println!("    {} {}", ansi::green("\u{2713}"), ansi::accent("3 skills found in ~/.claude/skills"));
+    println!(
+        "    {} {}",
+        ansi::green("\u{2713}"),
+        ansi::accent("3 skills found in ~/.claude/skills")
+    );
     println!("  {} {}", ansi::step_number(3, 3), ansi::bright("Verify"));
-    println!("    {}  {}  {}", ansi::green("ok: keyvault"), ansi::yellow("warn: no GPU"), ansi::red("err: none"));
+    println!(
+        "    {}  {}  {}",
+        ansi::green("ok: keyvault"),
+        ansi::yellow("warn: no GPU"),
+        ansi::red("err: none")
+    );
 }
 
 fn render_theme(t: Theme, swatches: bool, transcript: bool) {
@@ -203,7 +257,10 @@ fn main() {
     // The ansi.rs helpers are Default-theme only; show them once.
     println!();
     println!("\u{2554}{}\u{2557}", "\u{2550}".repeat(68));
-    println!("\u{2551} {BOLD}{:<67}{RESET}\u{2551}", "pre-TUI chrome (ansi.rs — onboarding/init)");
+    println!(
+        "\u{2551} {BOLD}{:<67}{RESET}\u{2551}",
+        "pre-TUI chrome (ansi.rs — onboarding/init)"
+    );
     println!("\u{255A}{}\u{255D}", "\u{2550}".repeat(68));
     println!();
     print_ansi_helpers();

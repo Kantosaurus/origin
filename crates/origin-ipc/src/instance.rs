@@ -58,7 +58,10 @@ impl InstanceId {
         // paths hash their raw lossy form.
         let norm = canon.to_string_lossy().to_lowercase();
         let hex = format!("{:016x}", fnv1a(norm.as_bytes()));
-        Self { workspace: canon, hex }
+        Self {
+            workspace: canon,
+            hex,
+        }
     }
 
     /// Derive the instance id for the current working directory.
@@ -83,11 +86,7 @@ impl InstanceId {
         }
         #[cfg(unix)]
         {
-            format!(
-                "{}/origin-{}.sock",
-                std::env::temp_dir().display(),
-                self.hex
-            )
+            format!("{}/origin-{}.sock", std::env::temp_dir().display(), self.hex)
         }
     }
 

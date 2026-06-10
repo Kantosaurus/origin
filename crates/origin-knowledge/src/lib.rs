@@ -356,7 +356,10 @@ mod tests {
         // Each matching doc has exactly one query-term occurrence, so plain TF
         // would tie them; TF-IDF lifts c (the rare "quantum" match) above the
         // two docs that only matched the common term.
-        assert_eq!(hits[0].id, "c", "rare-term match must outrank common-term matches");
+        assert_eq!(
+            hits[0].id, "c",
+            "rare-term match must outrank common-term matches"
+        );
         assert!(hits[0].score > hits[1].score);
     }
 

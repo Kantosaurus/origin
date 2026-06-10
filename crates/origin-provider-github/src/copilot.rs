@@ -63,7 +63,10 @@ pub fn provider_with_base(vault: KeyVault, account: impl Into<String>, base: &st
         extra_headers: vec![
             ("Copilot-Integration-Id".to_string(), INTEGRATION_ID.to_string()),
             ("Editor-Version".to_string(), EDITOR_VERSION.to_string()),
-            ("Editor-Plugin-Version".to_string(), EDITOR_PLUGIN_VERSION.to_string()),
+            (
+                "Editor-Plugin-Version".to_string(),
+                EDITOR_PLUGIN_VERSION.to_string(),
+            ),
             ("User-Agent".to_string(), USER_AGENT.to_string()),
         ],
     })
