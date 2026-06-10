@@ -81,6 +81,13 @@ mod tests {
     use super::{line, linef, resolve};
     use origin_i18n::{t, tf, Lang};
 
+    /// Tests that read AND tests that set the process-global lang override
+    /// serialize on this lock. Without it, `process_override_flows_through_
+    /// resolve_none` can flip the override to French between a parallel
+    /// reader's `resolve(None)` snapshot and its later `line`/`linef` calls,
+    /// making the two sides of an equality assert resolve different locales.
+    static OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn override_takes_precedence() {
         assert_eq!(resolve(Some("es")), Lang::Es);
@@ -208,6 +215,9 @@ mod tests {
     // the resolved-locale catalog text for the key (proving they route, not hardcode).
     #[test]
     fn newly_routed_keys_route_through_locale_helpers() {
+        let _guard = OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let lang = resolve(None);
         assert_eq!(line("thinking"), t(lang, "thinking"));
         assert_eq!(line("permission.denied"), t(lang, "permission.denied"));
@@ -268,7 +278,11 @@ mod tests {
         // (and thus `line`/`linef`, which both pass `None`) render the French
         // catalog string — proving the `--lang` wiring reaches the chrome path.
         // The override OnceLock is process-wide; this is the sole test that sets
-        // it, so it cannot race another test that also sets a value.
+        // it, so it cannot race another SETTER — but readers comparing across
+        // the flip still race, hence the shared lock.
+        let _guard = OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         super::set_locale_override("fr");
         assert_eq!(resolve(None), Lang::Fr);
         assert_eq!(line("bye"), "Au revoir");
