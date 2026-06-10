@@ -77,7 +77,7 @@ origin-notify   = { path = "../origin-notify" }
 origin-multimodal = { path = "../origin-multimodal" }
 origin-gmail    = { path = "../origin-gmail" }
 origin-workflowgen = { path = "../origin-workflowgen" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "blocking"] }
 which = "8"
 sha2 = "0.10"
 rand = "0.8"
