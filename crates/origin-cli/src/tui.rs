@@ -854,12 +854,10 @@ impl App {
     /// Append a single blank separator row so a finished tool block (its output
     /// and any "+N bytes omitted" footer) doesn't sit flush against the next
     /// tool block or the assistant's reply. No-op when the last row is already
-    /// blank, so stacked producers never accumulate double gaps.
+    /// blank (so stacked producers never accumulate double gaps) and on empty
+    /// scrollback (nothing to separate — no leading blank at the top).
     pub fn add_blank_line(&mut self) {
-        let already_blank = self
-            .scrollback
-            .last()
-            .is_some_and(|l| l.text.trim().is_empty());
+        let already_blank = self.scrollback.last().is_none_or(|l| l.text.trim().is_empty());
         if !already_blank {
             self.scrollback.push(ScrollLine::verbatim(String::new(), 0, 0));
             self.trim_scrollback();
@@ -979,6 +977,11 @@ impl App {
     /// before starting the new one — so at most one `▸` is ever visible.
     pub fn start_tool_line(&mut self, text: &str) {
         self.finish_tool_line(true);
+        // A streaming tool (e.g. Bash) may end without an explicit result
+        // event, leaving its output flush against this header. Guarantee
+        // exactly one separator row between blocks — no-op when the
+        // on-result path already appended it.
+        self.add_blank_line();
         self.running_tool_row = Some(self.scrollback.len());
         self.scrollback.push(ScrollLine::verbatim(
             format!("  \u{25B8} {text}"),
@@ -1052,6 +1055,10 @@ impl App {
                 return;
             };
             if !text.is_empty() {
+                // Same separator invariant as `start_tool_line`: a preceding
+                // block whose trailing blank never arrived (streamed Bash
+                // without a result event) must not end flush against the reply.
+                self.add_blank_line();
                 let mut in_code_block = false;
                 for line in text.split('\n') {
                     let trimmed = line.trim_start();
@@ -1946,8 +1953,12 @@ fn char_display_width(s: &str) -> u16 {
 /// Breaks at the last space that fits rather than mid-word; a single word longer
 /// than `width` is hard-broken (unavoidable). Leading spaces on a continuation
 /// line are dropped. `width == 0` or an empty `s` yields `s` unwrapped.
-fn wrap_segment(s: &str, width: usize) -> Vec<&str> {
-    if width == 0 || s.is_empty() {
+/// Word-boundary wrap with a distinct width for continuation lines: the
+/// first piece wraps at `first_width`, every later piece at `rest_width`.
+/// The caller renders continuations shifted right by the difference (hanging
+/// indent), so each rendered row still spans the full terminal width.
+fn wrap_segment_hanging(s: &str, first_width: usize, rest_width: usize) -> Vec<&str> {
+    if first_width == 0 || s.is_empty() {
         return vec![s];
     }
     // (byte offset, char, display width) per char.
@@ -1956,6 +1967,7 @@ fn wrap_segment(s: &str, width: usize) -> Vec<&str> {
         .map(|(byte, ch)| (byte, ch, UnicodeWidthChar::width(ch).unwrap_or(1)))
         .collect();
     let len = chars.len();
+    let mut width = first_width;
     let mut lines: Vec<&str> = Vec::new();
     let mut start = 0usize; // char index of the current line's first char
     let mut col = 0usize; // accumulated display width of the current line
@@ -1969,6 +1981,7 @@ fn wrap_segment(s: &str, width: usize) -> Vec<&str> {
             last_space = Some(i);
         }
         if col + cw > width && i > start {
+            width = rest_width;
             if let Some(sp) = last_space.filter(|&sp| sp > start) {
                 // Break at the space: drop it; continuation skips further spaces.
                 lines.push(&s[chars[start].0..chars[sp].0]);
@@ -2178,18 +2191,33 @@ fn render_scroll_line(grid: &mut Grid, row: u16, vl: &VisualLine<'_>, cols: u16,
         bg: vl.bg,
         bold: vl.bold,
     };
+    // Pre-fill the hang gap with the line's background so wrapped code-block
+    // rows stay a solid band instead of showing a default-bg notch.
+    if vl.indent > 0 && vl.bg != 0 {
+        for c in 0..vl.indent.min(cols) {
+            grid.put(row, c, Cell::new(' ', vl.fg, vl.bg, Attr::PLAIN));
+        }
+    }
     if vl.literal {
-        write_str_styled(grid, row, 0, vl.text, cols, style);
+        write_str_styled(grid, row, vl.indent, vl.text, cols, style);
     } else {
-        render_md_line(grid, row, vl.text, cols, style, pal);
+        render_md_line(grid, row, vl.text, cols, style, pal, vl.indent);
     }
 }
 
-fn render_md_line(grid: &mut Grid, row: u16, text: &str, max_cols: u16, style: Style, pal: theme::Palette) {
+fn render_md_line(
+    grid: &mut Grid,
+    row: u16,
+    text: &str,
+    max_cols: u16,
+    style: Style,
+    pal: theme::Palette,
+    start_col: u16,
+) {
     let base_fg = style.fg;
     let bg = style.bg;
     let attr_plain = if style.bold { Attr::BOLD } else { Attr::PLAIN };
-    let mut col: u16 = 0;
+    let mut col: u16 = start_col;
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
     let mut i = 0;
@@ -2322,6 +2350,10 @@ struct VisualLine<'a> {
     /// Carries [`ScrollLine::literal`] through wrapping so the draw loop knows
     /// whether to markdown-parse this row or write it verbatim.
     literal: bool,
+    /// Columns to shift this piece right when drawn. Non-zero only on wrap
+    /// continuations, which hang under their source line's leading indent
+    /// instead of snapping back to column 0.
+    indent: u16,
 }
 
 fn wrap_into<'a>(
@@ -2344,18 +2376,27 @@ fn wrap_into<'a>(
                 bg,
                 bold,
                 literal,
+                indent: 0,
             });
             continue;
         }
+        // Hanging indent: continuation pieces align under the source line's
+        // leading spaces instead of snapping back to column 0. Disabled when
+        // the indent would eat half the width (pathologically narrow grids).
+        let lead = sub.len() - sub.trim_start_matches(' ').len();
+        let indent = if lead * 2 >= cols { 0 } else { lead };
         // Word-boundary wrap so prose breaks between words, not mid-word.
-        for piece in wrap_segment(sub, cols) {
+        let mut first = true;
+        for piece in wrap_segment_hanging(sub, cols, cols - indent) {
             out.push(VisualLine {
                 text: piece,
                 fg,
                 bg,
                 bold,
                 literal,
+                indent: if first { 0 } else { clamp_u16(indent) },
             });
+            first = false;
         }
     }
 }
@@ -2545,6 +2586,71 @@ mod tests {
     }
 
     #[test]
+    fn start_tool_line_separates_from_unterminated_stream_output() {
+        // A streaming tool (e.g. Bash) may end without an explicit result
+        // event, so the on-result separator never runs; the next header must
+        // not sit flush against the previous block's last output row.
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.start_tool_line("[Bash] first");
+        app.add_colored_line("    streamed output".to_string(), 0, 0);
+        app.start_tool_line("[Read] second");
+        let n = app.scrollback.len();
+        assert!(app.scrollback[n - 1].text.contains("[Read] second"));
+        assert!(
+            app.scrollback[n - 2].text.trim().is_empty(),
+            "exactly one separator row before the new header"
+        );
+        assert!(app.scrollback[n - 3].text.contains("streamed output"));
+    }
+
+    #[test]
+    fn start_tool_line_does_not_double_separator() {
+        // When the result path already appended the trailing separator, the
+        // next header must not add a second blank on top of it.
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.start_tool_line("[Bash] first");
+        app.add_colored_line("    out".to_string(), 0, 0);
+        app.add_blank_line(); // on-result separator
+        app.start_tool_line("[Read] second");
+        let n = app.scrollback.len();
+        assert!(app.scrollback[n - 1].text.contains("[Read] second"));
+        assert!(app.scrollback[n - 2].text.trim().is_empty());
+        assert!(
+            app.scrollback[n - 3].text.contains("out"),
+            "no double blank between blocks"
+        );
+    }
+
+    #[test]
+    fn first_tool_line_has_no_leading_blank() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.start_tool_line("[Bash] first");
+        assert_eq!(app.scrollback.len(), 1, "no separator at the top of scrollback");
+        assert!(app.scrollback[0].text.contains("[Bash] first"));
+    }
+
+    #[test]
+    fn assistant_reply_separates_from_unterminated_stream_output() {
+        // Same invariant for the assistant's reply: streamed tool output with
+        // no result event must not end flush against the reply text.
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.start_tool_line("[Bash] first");
+        app.add_colored_line("    streamed output".to_string(), 0, 0);
+        app.start_assistant_turn();
+        app.append_to_current_assistant("done");
+        app.finalize_assistant_turn(0);
+        let reply_row = app
+            .scrollback
+            .iter()
+            .position(|l| l.text.contains("done"))
+            .expect("reply rendered");
+        assert!(
+            app.scrollback[reply_row - 1].text.trim().is_empty(),
+            "separator row between tool output and the reply"
+        );
+    }
+
+    #[test]
     fn assistant_prose_lines_are_not_literal() {
         let mut app = App::new("anthropic", "m", CompletionSources::default());
         app.start_assistant_turn();
@@ -2567,6 +2673,7 @@ mod tests {
             bg: 0,
             bold: false,
             literal: true,
+            indent: 0,
         };
         render_scroll_line(&mut g, 0, &lit, 12, theme::Palette::default());
         assert_eq!(g.get(0, 0).glyph, u32::from('*'), "literal line keeps leading *");
@@ -2578,12 +2685,62 @@ mod tests {
             bg: 0,
             bold: false,
             literal: false,
+            indent: 0,
         };
         render_scroll_line(&mut g2, 0, &prose, 12, theme::Palette::default());
         assert_eq!(
             g2.get(0, 0).glyph,
             u32::from('x'),
             "prose line parses **bold**, dropping the markers"
+        );
+    }
+
+    #[test]
+    fn wrapped_continuation_lines_keep_leading_indent() {
+        let mut lines = Vec::new();
+        // 4-space indented tool output, width 12: continuation pieces must
+        // hang under the content instead of snapping back to column 0.
+        wrap_into("    abcdef ghij klmn", 0, 0, false, true, 12, &mut lines);
+        assert!(
+            lines.len() >= 2,
+            "must wrap, got {:?}",
+            lines.iter().map(|l| l.text).collect::<Vec<_>>()
+        );
+        assert_eq!(lines[0].text, "    abcdef");
+        assert_eq!(lines[0].indent, 0, "first piece carries its own literal indent");
+        assert!(
+            lines[1..].iter().all(|l| l.indent == 4),
+            "continuations hang at the content's indent, got {:?}",
+            lines.iter().map(|l| l.indent).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn wrap_indent_disabled_on_very_narrow_terminal() {
+        let mut lines = Vec::new();
+        // Indent (4) would eat half of the 6-col width — fall back to col 0
+        // so pathological narrow terminals never render slivers of text.
+        wrap_into("    abcdefghij", 0, 0, false, true, 6, &mut lines);
+        assert!(lines.len() >= 2);
+        assert!(lines.iter().all(|l| l.indent == 0));
+    }
+
+    #[test]
+    fn render_scroll_line_draws_at_indent() {
+        let mut g = Grid::new(12, 1);
+        let vl = VisualLine {
+            text: "abc",
+            fg: theme::BODY,
+            bg: 0,
+            bold: false,
+            literal: true,
+            indent: 4,
+        };
+        render_scroll_line(&mut g, 0, &vl, 12, theme::Palette::default());
+        assert_eq!(
+            g.get(0, 4).glyph,
+            u32::from('a'),
+            "content starts at the hang column"
         );
     }
 
@@ -2786,17 +2943,17 @@ mod tests {
     #[test]
     fn wrap_segment_breaks_at_word_boundary() {
         assert_eq!(
-            wrap_segment("hello world", 20),
+            wrap_segment_hanging("hello world", 20, 20),
             vec!["hello world"],
             "fits on one line"
         );
         assert_eq!(
-            wrap_segment("hello world", 7),
+            wrap_segment_hanging("hello world", 7, 7),
             vec!["hello", "world"],
             "break between words"
         );
         assert_eq!(
-            wrap_segment("a b c d e", 5),
+            wrap_segment_hanging("a b c d e", 5, 5),
             vec!["a b c", "d e"],
             "pack greedily"
         );
@@ -2805,7 +2962,7 @@ mod tests {
     #[test]
     fn wrap_segment_hard_breaks_overlong_word() {
         assert_eq!(
-            wrap_segment("abcdefghij", 4),
+            wrap_segment_hanging("abcdefghij", 4, 4),
             vec!["abcd", "efgh", "ij"],
             "no spaces → hard break"
         );
@@ -2814,7 +2971,7 @@ mod tests {
     #[test]
     fn wrap_segment_drops_space_run_at_break() {
         assert_eq!(
-            wrap_segment("foo    bar", 4),
+            wrap_segment_hanging("foo    bar", 4, 4),
             vec!["foo", "bar"],
             "the whole space run is dropped, no trailing space"
         );
@@ -3259,7 +3416,7 @@ mod tests {
             bg: 0,
             bold: false,
         };
-        render_md_line(&mut grid, 0, "**bold", 20, style, pal);
+        render_md_line(&mut grid, 0, "**bold", 20, style, pal, 0);
         assert_eq!(row_text(&grid, 0), "bold", "marker hidden, text kept");
         assert!(
             (0..grid.cols()).all(|c| grid.get(0, c).glyph != u32::from(b'*')),
@@ -3278,7 +3435,7 @@ mod tests {
             bg: 0,
             bold: false,
         };
-        render_md_line(&mut grid, 0, "`code", 20, style, pal);
+        render_md_line(&mut grid, 0, "`code", 20, style, pal, 0);
         assert_eq!(row_text(&grid, 0), "code");
         assert!(
             (0..grid.cols()).all(|c| grid.get(0, c).glyph != u32::from(b'`')),
@@ -3296,7 +3453,7 @@ mod tests {
             bg: 0,
             bold: false,
         };
-        render_md_line(&mut grid, 0, "a **b** c", 20, style, pal);
+        render_md_line(&mut grid, 0, "a **b** c", 20, style, pal, 0);
         assert_eq!(row_text(&grid, 0), "a b c");
     }
 

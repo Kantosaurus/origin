@@ -2027,9 +2027,13 @@ async fn handle_prompt_turn(
             if let Some(summary) = origin_cli::tui::diff_elision_summary(total_diff, MAX_DIFF_ROWS) {
                 a.add_colored_line(summary, theme::MUTED, 0);
             }
-            // Blank separator so the edit's diff doesn't sit flush against the
-            // assistant's following reply (matches the on-result spacing).
-            a.add_blank_line();
+            // Blank separator so an edit's diff doesn't sit flush against the
+            // assistant's following reply. Only when diff rows were actually
+            // rendered — for every other tool this blank would wedge a gap
+            // between the header and its output, detaching them visually.
+            if total_diff > 0 {
+                a.add_blank_line();
+            }
             a.start_assistant_turn();
             // Drop the App guard before signalling the renderer so the lock
             // is not held across mark_dirty (significant_drop_tightening),
