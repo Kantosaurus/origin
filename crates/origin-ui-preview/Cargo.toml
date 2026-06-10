@@ -1,0 +1,19 @@
+[package]
+name = "origin-ui-preview"
+description = "Hot-reload terminal preview of the origin harness UI/UX (themes, palette, ANSI chrome)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Zero dependencies on purpose: this crate compiles only
+# origin-cli/src/theme.rs + ansi.rs (via #[path] includes) so the
+# edit -> rebuild -> rerender loop stays in the ~1 second range.
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "origin-ui-preview"
+path = "src/main.rs"
