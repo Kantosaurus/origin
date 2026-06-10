@@ -1278,23 +1278,27 @@ async fn spawn_prompt_turn(
             // miss both the running turn and the drain. A fresh interrupt
             // channel is installed per chained turn so Ctrl+C keeps working.
             let mut slot = interrupt_for_turn.lock().await;
-            match app_for_turn.lock().input.pop_queued() {
-                Some(next) => {
-                    let (tx, new_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-                    *slot = Some(tx);
-                    drop(slot);
-                    rx = Some(new_rx);
-                    text = next;
-                    begin_prompt_turn(&app_for_turn, &text);
-                    handle_for_turn.mark_dirty();
-                }
-                None => {
-                    *slot = None;
-                    drop(slot);
-                    app_for_turn.lock().spinner.stop();
-                    handle_for_turn.mark_dirty();
-                    break;
-                }
+            // Bind the pop result BEFORE branching: a `match` scrutinee's
+            // temporaries live to the end of the whole match, so matching on
+            // `app.lock().input.pop_queued()` directly kept the App guard
+            // alive across both arms — and the re-locks below self-deadlocked
+            // the single-threaded runtime (parking_lot is not reentrant),
+            // freezing the entire TUI at the end of every turn.
+            let queued = app_for_turn.lock().input.pop_queued();
+            if let Some(next) = queued {
+                let (tx, new_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                *slot = Some(tx);
+                drop(slot);
+                rx = Some(new_rx);
+                text = next;
+                begin_prompt_turn(&app_for_turn, &text);
+                handle_for_turn.mark_dirty();
+            } else {
+                *slot = None;
+                drop(slot);
+                app_for_turn.lock().spinner.stop();
+                handle_for_turn.mark_dirty();
+                break;
             }
         }
     });
