@@ -89,8 +89,8 @@ fn rebuild_one(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     let mut added = 0;
     let updated = 0; // see module docs — opaque to caller in P7.8.
-    // Map this file's definition names to their entity ids so name-resolved
-    // edges can be keyed by `EntityId` for `insert_edge`.
+                     // Map this file's definition names to their entity ids so name-resolved
+                     // edges can be keyed by `EntityId` for `insert_edge`.
     let mut name_to_id: HashMap<String, EntityId> = HashMap::with_capacity(nodes.len());
     for n in nodes {
         // tree-sitter byte offsets are bounded by `bytes.len()`; clamp

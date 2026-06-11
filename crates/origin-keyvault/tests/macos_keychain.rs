@@ -24,6 +24,7 @@
 
 #![cfg(target_os = "macos")]
 #![allow(clippy::unwrap_used)]
+#![allow(clippy::panic)]
 
 use origin_keyvault::{KeyVault, Secret};
 
@@ -32,8 +33,7 @@ use origin_keyvault::{KeyVault, Secret};
 fn unique_service_slug() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     format!("origin-test-list-{nanos}")
 }
 

@@ -210,9 +210,10 @@ fn decode_response(wire: wire::WireResponse) -> ChatResponse {
                 // Pack Gemini's real call id as `name#id` so the tool-result
                 // encoder can echo it back (correct mapping for parallel
                 // same-name calls); fall back to `call_<name>` when absent.
-                let id = fc
-                    .id
-                    .map_or_else(|| format!("call_{}", fc.name), |real| format!("{}#{real}", fc.name));
+                let id = fc.id.map_or_else(
+                    || format!("call_{}", fc.name),
+                    |real| format!("{}#{real}", fc.name),
+                );
                 blocks.push(Block::ToolUse {
                     id,
                     name: fc.name,

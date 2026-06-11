@@ -1977,8 +1977,13 @@ impl SpeculativeRegistry {
     /// for every handle, so they would ALWAYS precompute a spurious
     /// "subsystem not configured" failure that then shadows the fully-wired
     /// main dispatch. They must flow through the main path instead.
-    const NEEDS_SUBSYSTEM_HANDLE: &'static [&'static str] =
-        &["mem_search", "ask", "graph_query", "graph_path", "graph_summarize"];
+    const NEEDS_SUBSYSTEM_HANDLE: &'static [&'static str] = &[
+        "mem_search",
+        "ask",
+        "graph_query",
+        "graph_path",
+        "graph_summarize",
+    ];
 
     fn spawn(
         &mut self,
@@ -6305,7 +6310,9 @@ mod dispatch_table_tests {
             );
         }
         // Control: a handle-free Pure tool (Read) still speculates.
-        let read_meta = registry_iter().find(|m| m.name == "Read").expect("Read registered");
+        let read_meta = registry_iter()
+            .find(|m| m.name == "Read")
+            .expect("Read registered");
         reg.spawn(
             "id-read".into(),
             read_meta,

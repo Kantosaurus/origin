@@ -493,12 +493,21 @@ mod tests {
         let n = scrub_secrets(&mut c);
         assert!(n >= 1, "URL redaction should count");
         let scrubbed = &c.interactions[0].request.url;
-        assert!(!scrubbed.contains("AIzaSyD1234567890abcDEFghijKLmnoPQRstuv"), "key leaked: {scrubbed}");
+        assert!(
+            !scrubbed.contains("AIzaSyD1234567890abcDEFghijKLmnoPQRstuv"),
+            "key leaked: {scrubbed}"
+        );
         assert!(!scrubbed.contains("p4ssw0rd"), "userinfo leaked: {scrubbed}");
-        assert!(scrubbed.contains("generativelanguage.googleapis.com"), "host must survive: {scrubbed}");
+        assert!(
+            scrubbed.contains("generativelanguage.googleapis.com"),
+            "host must survive: {scrubbed}"
+        );
 
         // After scrubbing, the gate passes.
-        assert!(assert_redacted(&c).is_ok(), "scrubbed cassette must pass the gate");
+        assert!(
+            assert_redacted(&c).is_ok(),
+            "scrubbed cassette must pass the gate"
+        );
 
         // Replay still matches: the live probe carries the real key, the stored
         // interaction is redacted, yet shape-matching canonicalizes both.

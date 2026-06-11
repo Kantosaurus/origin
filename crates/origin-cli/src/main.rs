@@ -1180,10 +1180,7 @@ async fn handle_input_action(
             let pending = app.lock().input.queued_len();
             app.lock().add_line(
                 "system> ",
-                &origin_cli::locale::linef(
-                    "cmd.queue.edited",
-                    &[("pending", pending.to_string().as_str())],
-                ),
+                &origin_cli::locale::linef("cmd.queue.edited", &[("pending", pending.to_string().as_str())]),
             );
             handle.mark_dirty();
         }
@@ -1278,23 +1275,27 @@ async fn spawn_prompt_turn(
             // miss both the running turn and the drain. A fresh interrupt
             // channel is installed per chained turn so Ctrl+C keeps working.
             let mut slot = interrupt_for_turn.lock().await;
-            match app_for_turn.lock().input.pop_queued() {
-                Some(next) => {
-                    let (tx, new_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-                    *slot = Some(tx);
-                    drop(slot);
-                    rx = Some(new_rx);
-                    text = next;
-                    begin_prompt_turn(&app_for_turn, &text);
-                    handle_for_turn.mark_dirty();
-                }
-                None => {
-                    *slot = None;
-                    drop(slot);
-                    app_for_turn.lock().spinner.stop();
-                    handle_for_turn.mark_dirty();
-                    break;
-                }
+            // Bind the pop result BEFORE branching: a `match` scrutinee's
+            // temporaries live to the end of the whole match, so matching on
+            // `app.lock().input.pop_queued()` directly kept the App guard
+            // alive across both arms — and the re-locks below self-deadlocked
+            // the single-threaded runtime (parking_lot is not reentrant),
+            // freezing the entire TUI at the end of every turn.
+            let queued = app_for_turn.lock().input.pop_queued();
+            if let Some(next) = queued {
+                let (tx, new_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                *slot = Some(tx);
+                drop(slot);
+                rx = Some(new_rx);
+                text = next;
+                begin_prompt_turn(&app_for_turn, &text);
+                handle_for_turn.mark_dirty();
+            } else {
+                *slot = None;
+                drop(slot);
+                app_for_turn.lock().spinner.stop();
+                handle_for_turn.mark_dirty();
+                break;
             }
         }
     });
@@ -2023,9 +2024,13 @@ async fn handle_prompt_turn(
             if let Some(summary) = origin_cli::tui::diff_elision_summary(total_diff, MAX_DIFF_ROWS) {
                 a.add_colored_line(summary, theme::MUTED, 0);
             }
-            // Blank separator so the edit's diff doesn't sit flush against the
-            // assistant's following reply (matches the on-result spacing).
-            a.add_blank_line();
+            // Blank separator so an edit's diff doesn't sit flush against the
+            // assistant's following reply. Only when diff rows were actually
+            // rendered — for every other tool this blank would wedge a gap
+            // between the header and its output, detaching them visually.
+            if total_diff > 0 {
+                a.add_blank_line();
+            }
             a.start_assistant_turn();
             // Drop the App guard before signalling the renderer so the lock
             // is not held across mark_dirty (significant_drop_tightening),
@@ -2903,9 +2908,7 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
         // graph, and self-dev all resolve paths against the daemon's cwd, so a
         // project-A daemon must not execute in project B's directory (or in
         // whatever directory the first-ever `origin` happened to start from).
-        .current_dir(
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        )
+        .current_dir(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(log_stderr);

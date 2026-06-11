@@ -54,14 +54,22 @@ fn non_reasoning_model_never_sends_reasoning_effort() {
 fn reasoning_model_emits_mapped_valid_value() {
     // Reasoning models (o-series, gpt-5, *-thinking, *-reasoner) get the hint,
     // mapped to a value OpenAI accepts. `fast`/`max` are never sent verbatim.
-    assert_eq!(body_of("o3-mini", Some(ReasoningEffort::Medium), false)["reasoning_effort"], "medium");
-    assert_eq!(body_of("gpt-5", Some(ReasoningEffort::Low), true)["reasoning_effort"], "low");
     assert_eq!(
-        body_of("o4-mini", Some(ReasoningEffort::Fast), false)["reasoning_effort"], "low",
+        body_of("o3-mini", Some(ReasoningEffort::Medium), false)["reasoning_effort"],
+        "medium"
+    );
+    assert_eq!(
+        body_of("gpt-5", Some(ReasoningEffort::Low), true)["reasoning_effort"],
+        "low"
+    );
+    assert_eq!(
+        body_of("o4-mini", Some(ReasoningEffort::Fast), false)["reasoning_effort"],
+        "low",
         "Fast must map to `low` (OpenAI has no `fast`)",
     );
     assert_eq!(
-        body_of("deepseek-reasoner", Some(ReasoningEffort::Max), false)["reasoning_effort"], "high",
+        body_of("deepseek-reasoner", Some(ReasoningEffort::Max), false)["reasoning_effort"],
+        "high",
         "Max must map to `high` (OpenAI has no `max`)",
     );
 }

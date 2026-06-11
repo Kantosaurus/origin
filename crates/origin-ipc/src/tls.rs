@@ -60,7 +60,10 @@ pub fn sha256_fingerprint(cert_der: &[u8]) -> CertFingerprint {
 /// back to unauthenticated trust.
 #[must_use]
 pub fn parse_fingerprint_hex(s: &str) -> Option<CertFingerprint> {
-    let cleaned: String = s.chars().filter(|c| !matches!(c, ':' | ' ' | '\t' | '\n' | '\r')).collect();
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !matches!(c, ':' | ' ' | '\t' | '\n' | '\r'))
+        .collect();
     let bytes = hex::decode(cleaned).ok()?;
     let arr: CertFingerprint = bytes.try_into().ok()?;
     Some(arr)

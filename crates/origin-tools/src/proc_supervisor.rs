@@ -213,6 +213,13 @@ async fn supervise(
     timeout: Option<Duration>,
     table: Arc<Mutex<HashMap<ProcessId, ProcSlot>>>,
 ) {
+    // Ceiling on the post-kill cleanup awaits below. After a timeout kill the
+    // status flip must not hinge on cooperative behavior: the reap can miss a
+    // SIGCHLD wakeup (observed with multiple tokio runtimes in one process),
+    // and an orphaned grandchild of `sh -c` can inherit the pipe write-ends
+    // and hold them open long after the direct child is dead. Without these
+    // bounds the slot stayed `Running` for the orphan's whole lifetime.
+    const KILL_CLEANUP_BOUND: Duration = Duration::from_secs(2);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let mut readers = Vec::new();
@@ -243,12 +250,17 @@ async fn supervise(
             }
         }));
     }
+    let mut timed_out = false;
     let terminal_status = if let Some(d) = timeout {
         match tokio::time::timeout(d, child.wait()).await {
             Ok(Ok(status)) => ProcStatus::Exited(status.code().unwrap_or(-1)),
             Ok(Err(_e)) => ProcStatus::Exited(-1),
             Err(_elapsed) => {
-                let _ = child.kill().await;
+                timed_out = true;
+                // Deliver SIGKILL without awaiting the reap, then reap with a
+                // bound — the signal lands regardless; only the wait may wedge.
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(KILL_CLEANUP_BOUND, child.wait()).await;
                 ProcStatus::TimedOut
             }
         }
@@ -262,9 +274,17 @@ async fn supervise(
     // and the reader tasks will hit EOF. Wait for them to finish so every byte
     // is appended to the ring buffer BEFORE we flip the status to terminal —
     // otherwise a foreground reader observing the terminal status could return
-    // before in-flight output is captured.
-    for r in readers {
-        let _ = r.await;
+    // before in-flight output is captured. After a timeout kill the drain is
+    // bounded for the orphaned-grandchild reason above.
+    let drain = async move {
+        for r in readers {
+            let _ = r.await;
+        }
+    };
+    if timed_out {
+        let _ = tokio::time::timeout(KILL_CLEANUP_BOUND, drain).await;
+    } else {
+        drain.await;
     }
     let mut g = unlock(table.lock());
     if let Some(s) = g.get_mut(&pid) {

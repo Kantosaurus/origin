@@ -45,8 +45,16 @@ async fn timeout_terminates_long_process() {
         ..SpawnOpts::default()
     };
     let pid = sup.spawn(cmd, &opts).unwrap();
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    let chunk = sup.read_since(pid, 0, 4096).unwrap();
+    // Condition-based wait: poll until the 300ms timeout fires and the kill +
+    // reap flips the status to terminal. A fixed 1.5s sleep flaked on loaded
+    // CI runners; the generous ceiling never slows a healthy run because the
+    // loop exits as soon as the status turns terminal.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut chunk = sup.read_since(pid, 0, 4096).unwrap();
+    while !chunk.status.is_terminal() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        chunk = sup.read_since(pid, 0, 4096).unwrap();
+    }
     assert!(chunk.status.is_terminal(), "status was {:?}", chunk.status);
 }
 

@@ -322,12 +322,12 @@ impl OAuthClient {
             .form(form)
             .send()
             .await
-            .map_err(|e| Error::Backend(format!("oauth POST {}: {e}", self.token_url)))?;
+            .map_err(|e| Error::Backend(format!("oauth POST {}: {}", self.token_url, error_chain(&e))))?;
         let status = resp.status();
         let body = resp
             .text()
             .await
-            .map_err(|e| Error::Backend(format!("oauth read body: {e}")))?;
+            .map_err(|e| Error::Backend(format!("oauth read body: {}", error_chain(&e))))?;
         if !status.is_success() {
             return Err(Error::Backend(format!(
                 "oauth token endpoint returned {status}: {body}"
@@ -364,6 +364,21 @@ impl OAuthClient {
 
 fn oauth_key(account: &str) -> String {
     format!("{account}{OAUTH_SUFFIX}")
+}
+
+/// Formats `e` together with its full `source()` chain (joined with `: `).
+/// `reqwest::Error`'s top-level Display alone hides the decisive cause of a
+/// transport failure — e.g. `invalid peer certificate: UnknownIssuer` behind
+/// a TLS-intercepting proxy — so a single log line must carry the chain.
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    use std::fmt::Write as _;
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        let _ = write!(out, ": {s}");
+        src = s.source();
+    }
+    out
 }
 
 fn now_epoch_secs() -> u64 {

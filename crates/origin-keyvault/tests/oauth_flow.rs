@@ -182,6 +182,39 @@ async fn concurrent_refresh_if_due_makes_only_one_http_call() {
 }
 
 #[tokio::test]
+async fn transport_error_includes_cause_chain() {
+    // Regression: a transport-level send failure used to surface only
+    // reqwest's top-level Display ("error sending request for url (…)"),
+    // hiding the decisive cause buried in the `source()` chain (e.g.
+    // `invalid peer certificate: UnknownIssuer` behind a TLS-intercepting
+    // proxy, or `tcp connect error` here). The formatted Backend error must
+    // carry the full chain so a single log line is diagnosable.
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener); // port is now closed — connecting to it must fail
+        port
+    };
+
+    let vault = KeyVault::in_memory();
+    let client = OAuthClient::new("github", format!("http://127.0.0.1:{port}/token"), "client-id");
+    let err = client
+        .exchange(
+            &vault,
+            "default",
+            AuthCodeRequest::new("auth-code", "verifier", "https://example.invalid/callback"),
+        )
+        .await
+        .expect_err("exchange against a closed port must fail");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("tcp connect error"),
+        "transport error must include the underlying cause chain, got: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn refresh_if_due_skips_when_not_due() {
     let server = MockServer::start().await;
 

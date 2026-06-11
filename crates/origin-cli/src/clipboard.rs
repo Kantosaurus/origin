@@ -132,7 +132,9 @@ fn confine_to_cwd(file: &str) -> Result<PathBuf> {
             Component::CurDir => {}
             Component::ParentDir => {
                 if !normalized.pop() {
-                    anyhow::bail!("refusing to write outside the working directory: `{file}` escapes via `..`");
+                    anyhow::bail!(
+                        "refusing to write outside the working directory: `{file}` escapes via `..`"
+                    );
                 }
             }
             // A drive prefix (`C:\`, `\\server\share`) or a bare root (`\foo`)

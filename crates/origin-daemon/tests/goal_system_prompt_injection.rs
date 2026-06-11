@@ -1,22 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 //! End-to-end check that an active `/goal` actually causes `run_loop` to
-//! emit the `<origin-goal>` block in the assembled system prompt of every
-//! provider call. This is the regression net the Wave-4 harness couldn't
-//! cast — that harness short-circuited `run_loop` entirely and built its
-//! own minimal `ChatRequest`, so a missing-block bug in
-//! `agent.rs::run_loop` would have slipped by every existing T11-T16 test.
+//! deliver the `<origin-goal>` block to the provider on every call. This is
+//! the regression net the Wave-4 harness couldn't cast — that harness
+//! short-circuited `run_loop` entirely and built its own minimal
+//! `ChatRequest`, so a missing-block bug in `agent.rs::run_loop` would have
+//! slipped by every existing T11-T16 test.
 //!
-//! The Wave-9 follow-up harness now routes through real `run_loop`. This
-//! test:
-//!   1. Activates a goal whose condition contains a distinctive literal
-//!      ("fix the tests") so we can grep the captured system prompt for
-//!      it.
-//!   2. Runs one iteration with a scripted `in_progress` reply.
-//!   3. Asserts the captured main-loop `ChatRequest.system` contains the
-//!      opening `<origin-goal>` tag AND the literal condition text. Both
-//!      assertions matter: the tag check pins the wire shape, the
-//!      condition check pins the substitution path (i.e. confirms the
-//!      block isn't a static placeholder).
+//! Since the volatile-context split, the goal block is deliberately NOT part
+//! of `ChatRequest.system`: its per-iteration counters would invalidate the
+//! cached system+tools prefix on every request, so `run_loop` appends it as
+//! a trailing text block on the last (user-role) message instead. This test
+//! pins BOTH sides of that contract:
+//!   1. The block (tags + substituted condition) reaches the provider in the
+//!      trailing user-message text.
+//!   2. The system prompt stays goal-free, keeping the cache prefix stable.
 
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::panic)]
@@ -27,9 +24,9 @@ mod goal_helpers;
 use goal_helpers::{run_driver_loop_with_state, ScriptedProvider};
 
 #[tokio::test]
-async fn active_goal_renders_origin_goal_block_in_system_prompt() {
+async fn active_goal_renders_origin_goal_block_as_trailing_message() {
     // Single in_progress reply — we only need one main-loop call to
-    // capture the system prompt. The cap (max_iter=1) ensures the driver
+    // capture the request. The cap (max_iter=1) ensures the driver
     // stops after this iteration via MaxIter, so the test doesn't hang
     // waiting for more scripted replies.
     let provider = ScriptedProvider::new().with_main_reply(
@@ -55,41 +52,41 @@ async fn active_goal_renders_origin_goal_block_in_system_prompt() {
         1,
         "expected exactly one main-loop call; got {main_calls:?}"
     );
+    let user_text = &main_calls[0].last_user_text;
     let sys = &main_calls[0].system;
 
-    // 1) Wire-shape check: the `<origin-goal>` tag must appear in the
-    //    assembled system prompt. The closing tag check is paired so a
+    // 1) Wire-shape check: the `<origin-goal>` block must reach the provider
+    //    as trailing user-message text. The closing tag check is paired so a
     //    half-rendered block (open tag only) still trips this assertion.
     assert!(
-        sys.contains("<origin-goal>"),
-        "system prompt missing <origin-goal> opening tag; got:\n{sys}"
+        user_text.contains("<origin-goal>"),
+        "trailing user message missing <origin-goal> opening tag; got:\n{user_text}"
     );
     assert!(
-        sys.contains("</origin-goal>"),
-        "system prompt missing </origin-goal> closing tag; got:\n{sys}"
+        user_text.contains("</origin-goal>"),
+        "trailing user message missing </origin-goal> closing tag; got:\n{user_text}"
     );
 
     // 2) Substitution check: the literal goal condition must be inside
     //    the block. This guards against a regression that hard-coded a
     //    placeholder condition into the block.
     assert!(
-        sys.contains("fix the tests"),
-        "system prompt missing literal goal condition; got:\n{sys}"
+        user_text.contains("fix the tests"),
+        "trailing user message missing literal goal condition; got:\n{user_text}"
     );
 
-    // 3) Ordering check: `<origin-goal>` must come AFTER the identity
-    //    block. The agent.rs assembly places the goal block last so the
-    //    prompt-cache breakpoints sit on the static prefix; this is the
-    //    perf-relevant invariant.
-    let id_pos = sys
-        .find("<origin-identity>")
-        .or_else(|| sys.find("identity"))
-        .unwrap_or(0);
-    let goal_pos = sys.find("<origin-goal>").expect("checked above");
+    // 3) Cache-stability check: the volatile goal block must NOT leak into
+    //    the system prompt — its per-iteration counters would invalidate the
+    //    cached system+tools prefix on every request. The identity check
+    //    confirms the real assembled system prompt (not an empty stub) was
+    //    captured, so this assertion can't pass vacuously.
     assert!(
-        goal_pos > id_pos,
-        "<origin-goal> block must come after identity material so the cache prefix stays stable; \
-         goal_pos={goal_pos}, id_pos={id_pos}"
+        sys.contains("<origin-identity>"),
+        "captured system prompt looks like a stub; got:\n{sys}"
+    );
+    assert!(
+        !sys.contains("<origin-goal>"),
+        "goal block leaked into the system prompt (breaks the prompt-cache prefix); got:\n{sys}"
     );
 }
 
@@ -116,8 +113,9 @@ async fn no_active_goal_omits_origin_goal_block() {
     let main_calls = provider.captured();
     assert_eq!(main_calls.len(), 1);
     let sys = &main_calls[0].system;
+    let user_text = &main_calls[0].last_user_text;
     assert!(
-        !sys.contains("<origin-goal>"),
-        "no goal active → must not render the goal block; got:\n{sys}"
+        !sys.contains("<origin-goal>") && !user_text.contains("<origin-goal>"),
+        "no goal active → must not render the goal block anywhere; system:\n{sys}\nuser:\n{user_text}"
     );
 }

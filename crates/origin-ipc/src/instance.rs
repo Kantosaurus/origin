@@ -58,7 +58,10 @@ impl InstanceId {
         // paths hash their raw lossy form.
         let norm = canon.to_string_lossy().to_lowercase();
         let hex = format!("{:016x}", fnv1a(norm.as_bytes()));
-        Self { workspace: canon, hex }
+        Self {
+            workspace: canon,
+            hex,
+        }
     }
 
     /// Derive the instance id for the current working directory.
@@ -83,11 +86,7 @@ impl InstanceId {
         }
         #[cfg(unix)]
         {
-            format!(
-                "{}/origin-{}.sock",
-                std::env::temp_dir().display(),
-                self.hex
-            )
+            format!("{}/origin-{}.sock", std::env::temp_dir().display(), self.hex)
         }
     }
 
@@ -108,25 +107,28 @@ impl InstanceId {
     }
 
     /// Directory holding this instance's spawn-control files
-    /// (`<home>/.origin/daemons`). `None` when no home dir is resolvable.
+    /// (`<home>/.origin/daemons`). Callers map over their (optional) home dir.
     #[must_use]
-    pub fn control_dir(home: Option<PathBuf>) -> Option<PathBuf> {
-        home.map(|h| h.join(".origin").join("daemons"))
+    pub fn control_dir(home: &Path) -> PathBuf {
+        home.join(".origin").join("daemons")
     }
 
     /// Path of the stamp file recording when this instance's daemon was last
-    /// spawned (mtime comparison drives newer-binary restarts).
+    /// spawned (mtime comparison drives newer-binary restarts). `None` when no
+    /// home dir is resolvable.
     #[must_use]
     pub fn stamp_path(&self, home: Option<PathBuf>) -> Option<PathBuf> {
-        Self::control_dir(home).map(|d| d.join(format!("{}.stamp", self.hex)))
+        let dir = Self::control_dir(&home?);
+        Some(dir.join(format!("{}.stamp", self.hex)))
     }
 
     /// Path of the pid file recording the daemon/supervisor process ids spawned
     /// for this instance, so a restart kills exactly those processes and never
-    /// another project's daemon.
+    /// another project's daemon. `None` when no home dir is resolvable.
     #[must_use]
     pub fn pid_path(&self, home: Option<PathBuf>) -> Option<PathBuf> {
-        Self::control_dir(home).map(|d| d.join(format!("{}.pid", self.hex)))
+        let dir = Self::control_dir(&home?);
+        Some(dir.join(format!("{}.pid", self.hex)))
     }
 }
 

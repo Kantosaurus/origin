@@ -72,7 +72,10 @@ async fn exchanges_oauth_token_then_calls_copilot_chat_with_editor_headers() {
     let provider = origin_provider_github::copilot::provider_with_base(vault, "default", &server.uri());
     assert_eq!(provider.name(), "github-copilot");
 
-    let resp = provider.chat(req("ping")).await.expect("copilot chat should succeed");
+    let resp = provider
+        .chat(req("ping"))
+        .await
+        .expect("copilot chat should succeed");
 
     std::env::remove_var("ORIGIN_COPILOT_TOKEN_URL");
 
@@ -89,7 +92,8 @@ async fn exchanges_oauth_token_then_calls_copilot_chat_with_editor_headers() {
 async fn missing_vault_entry_maps_to_auth() {
     // No stored token -> the exchange can't even start -> ProviderError::Auth.
     let vault = KeyVault::in_memory();
-    let provider = origin_provider_github::copilot::provider_with_base(vault, "default", "http://127.0.0.1:1");
+    let provider =
+        origin_provider_github::copilot::provider_with_base(vault, "default", "http://127.0.0.1:1");
     let err = provider
         .chat(req("ping"))
         .await
