@@ -96,6 +96,19 @@ impl Worker {
     }
 }
 
+/// Errors that mean "this worker is dead or desynchronised — respawn it and
+/// retry the dispatch once": a closed stdout (StdoutClosed), leftover bytes
+/// past the frame terminator (FramingViolation), or a stdin write that hit a
+/// broken pipe because the child exited between the liveness check and the
+/// write (the `io::Error` rides the `Spawn` variant via its `#[from]`).
+fn respawnable(e: &PoolError) -> bool {
+    match e {
+        PoolError::StdoutClosed | PoolError::FramingViolation => true,
+        PoolError::Spawn(io) => io.kind() == std::io::ErrorKind::BrokenPipe,
+        _ => false,
+    }
+}
+
 /// Pre-spawned shell pool.
 pub struct ShellPool {
     spec: ShellSpec,
@@ -144,10 +157,8 @@ impl ShellPool {
         match slot.as_mut() {
             Some(w) => match w.dispatch(script).await {
                 Ok(b) => Ok(b),
-                // A dead worker (StdoutClosed) or a desynchronised one
-                // (FramingViolation) is replaced and the dispatch retried once.
-                Err(PoolError::StdoutClosed | PoolError::FramingViolation) => {
-                    // Respawn and retry once.
+                // A dead worker is replaced and the dispatch retried once.
+                Err(e) if respawnable(&e) => {
                     *slot = Some(Worker::spawn(&self.spec)?);
                     self.spawn_count.fetch_add(1, Ordering::Relaxed);
                     slot.as_mut()
