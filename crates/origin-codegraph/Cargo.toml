@@ -34,7 +34,7 @@ tree-sitter-c = "=0.21.4"
 tree-sitter-cpp = "=0.22.3"
 tree-sitter-c-sharp = "=0.21.3"
 tree-sitter-ruby = "=0.21.0"
-tree-sitter-bash = "=0.21.0"
+tree-sitter-bash = "=0.25.1"
 # Extended grammars (codegraph parity with the repomap heuristic scanner).
 # All pinned to the generation that links the tree-sitter 0.22.x core directly
 # via `language()` and is MSRV-1.83 / edition2021 safe.
