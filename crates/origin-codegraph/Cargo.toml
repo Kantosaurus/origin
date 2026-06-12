@@ -31,7 +31,7 @@ tree-sitter-java = "=0.21.0"
 # (the 0.21.x generation), depend on tree-sitter >=0.21 (compatible with the
 # pinned 0.22.6 core), and are edition 2021 (no edition2024 / MSRV 1.83-safe).
 tree-sitter-c = "=0.21.4"
-tree-sitter-cpp = "=0.22.3"
+tree-sitter-cpp = "=0.23.4"
 tree-sitter-c-sharp = "=0.21.3"
 tree-sitter-ruby = "=0.21.0"
 tree-sitter-bash = "=0.21.0"
