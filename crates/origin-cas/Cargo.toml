@@ -18,7 +18,7 @@ undocumented_unsafe_blocks = "deny"
 [dependencies]
 blake3 = "1"
 byteorder = "1"
-fastcdc = "3"
+fastcdc = "4"
 lru = "0.16"
 memmap2 = "0.9"
 origin-replay = { path = "../origin-replay", optional = true }
