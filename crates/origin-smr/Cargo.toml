@@ -25,7 +25,7 @@ undocumented_unsafe_blocks = "deny"
 [dependencies]
 rkyv = { version = "0.7", features = ["validation"] }
 crossbeam-utils = "0.8"
-thiserror = "1"
+thiserror = "2"
 bytecheck = "0.6"
 
 [target.'cfg(unix)'.dependencies]

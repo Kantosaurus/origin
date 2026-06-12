@@ -13,7 +13,7 @@ workspace = true
 [dependencies]
 rusqlite = { version = "0.31", features = ["bundled", "blob"] }
 refinery = { version = "0.8", features = ["rusqlite"] }
-thiserror = "1"
+thiserror = "2"
 tracing = "0.1"
 
 [dev-dependencies]

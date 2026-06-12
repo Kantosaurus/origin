@@ -25,7 +25,7 @@ default = []
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "dep:libc"]
 
 [dependencies]
-thiserror = "1"
+thiserror = "2"
 tracing = { workspace = true }
 
 # `tikv-jemalloc-sys` builds jemalloc via autotools and is unix-only.

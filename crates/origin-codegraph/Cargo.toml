@@ -20,7 +20,7 @@ petgraph = "0.6"
 regex = "1"
 rkyv = { version = "0.7", features = ["validation"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
-thiserror = "1"
+thiserror = "2"
 tree-sitter = "=0.22.6"
 tree-sitter-rust = "=0.21.2"
 tree-sitter-typescript = "=0.21.2"

@@ -17,7 +17,7 @@ reqwest = { workspace = true }
 readability = { workspace = true }
 html2md = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "sync", "time"] }
-thiserror = "1"
+thiserror = "2"
 regex = "1"
 tracing = { workspace = true }
 url = "2"
