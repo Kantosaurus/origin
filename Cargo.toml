@@ -30,7 +30,7 @@ growable-bloom-filter = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "registry"] }
 arrow = { version = "53", default-features = false, features = ["prettyprint"] }
-parquet = { version = "53", default-features = false, features = ["arrow", "snap"] }
+parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
 jsonschema = { version = "0.18", default-features = false }
 prometheus = { version = "0.13", default-features = false }
 opentelemetry = { version = "0.24", default-features = false, features = ["trace", "metrics"] }
