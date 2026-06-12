@@ -14,7 +14,7 @@ workspace = true
 origin-tools = { path = "../origin-tools" }
 origin-skills = { path = "../origin-skills" }
 async-trait = "0.1"
-thiserror = "1"
+thiserror = "2"
 growable-bloom-filter = { workspace = true }
 
 [dev-dependencies]

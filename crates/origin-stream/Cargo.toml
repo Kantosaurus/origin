@@ -17,7 +17,7 @@ undocumented_unsafe_blocks = "deny"
 bytes = "1"
 rkyv = { version = "0.7", features = ["validation", "bytecheck"] }
 tokio = { version = "1", features = ["sync"] }
-thiserror = "1"
+thiserror = "2"
 parking_lot = "0.12"
 
 [dev-dependencies]

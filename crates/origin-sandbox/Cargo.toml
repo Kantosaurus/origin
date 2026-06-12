@@ -28,7 +28,7 @@ no-sandbox = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-thiserror = "1"
+thiserror = "2"
 tracing = { workspace = true }
 
 # The Linux-only optional crates (`landlock`, `seccompiler`, `caps`) FFI into
