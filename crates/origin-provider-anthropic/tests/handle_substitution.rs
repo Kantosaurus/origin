@@ -64,10 +64,22 @@ async fn large_tool_result_emitted_as_reference_when_volatile() {
             cache_marker: None,
         }],
     };
+    // Precede the tool result with its matching assistant tool_use so the
+    // transcript satisfies the API pairing invariant — the wire encoder now
+    // defensively strips orphaned tool_results.
+    let tool_use = Message {
+        role: Role::Assistant,
+        blocks: vec![Block::ToolUse {
+            id: "id1".into(),
+            name: "Read".into(),
+            input_json: b"{}".to_vec(),
+            cache_marker: None,
+        }],
+    };
     let _ = client
         .chat(origin_provider::ChatRequest {
             system: String::new(),
-            messages: vec![msg],
+            messages: vec![tool_use, msg],
             model: "claude-3-5-haiku-20241022".into(),
             tools: vec![],
             effort: None,
@@ -78,7 +90,7 @@ async fn large_tool_result_emitted_as_reference_when_volatile() {
         .expect("ok");
 
     let body = captured.lock().expect("lock").clone().expect("captured");
-    let content = body["messages"][0]["content"][0]["content"]
+    let content = body["messages"][1]["content"][0]["content"]
         .as_str()
         .expect("content str");
     assert!(
@@ -150,10 +162,22 @@ async fn large_tool_result_inlined_when_handle_registered_sticky() {
             cache_marker: None,
         }],
     };
+    // Precede the tool result with its matching assistant tool_use so the
+    // transcript satisfies the API pairing invariant — the wire encoder now
+    // defensively strips orphaned tool_results.
+    let tool_use = Message {
+        role: Role::Assistant,
+        blocks: vec![Block::ToolUse {
+            id: "id1".into(),
+            name: "Read".into(),
+            input_json: b"{}".to_vec(),
+            cache_marker: None,
+        }],
+    };
     let _ = client
         .chat(origin_provider::ChatRequest {
             system: String::new(),
-            messages: vec![msg],
+            messages: vec![tool_use, msg],
             model: "claude-3-5-haiku-20241022".into(),
             tools: vec![],
             effort: None,
@@ -164,7 +188,7 @@ async fn large_tool_result_inlined_when_handle_registered_sticky() {
         .expect("ok");
 
     let body = captured.lock().expect("lock").clone().expect("captured");
-    let content = body["messages"][0]["content"][0]["content"]
+    let content = body["messages"][1]["content"][0]["content"]
         .as_str()
         .expect("content str");
     assert!(
@@ -241,10 +265,22 @@ async fn large_tool_result_referenced_when_handle_registered_sliding() {
             cache_marker: None,
         }],
     };
+    // Precede the tool result with its matching assistant tool_use so the
+    // transcript satisfies the API pairing invariant — the wire encoder now
+    // defensively strips orphaned tool_results.
+    let tool_use = Message {
+        role: Role::Assistant,
+        blocks: vec![Block::ToolUse {
+            id: "id1".into(),
+            name: "Read".into(),
+            input_json: b"{}".to_vec(),
+            cache_marker: None,
+        }],
+    };
     let _ = client
         .chat(origin_provider::ChatRequest {
             system: String::new(),
-            messages: vec![msg],
+            messages: vec![tool_use, msg],
             model: "claude-3-5-haiku-20241022".into(),
             tools: vec![],
             effort: None,
@@ -255,7 +291,7 @@ async fn large_tool_result_referenced_when_handle_registered_sliding() {
         .expect("ok");
 
     let body = captured.lock().expect("lock").clone().expect("captured");
-    let content = body["messages"][0]["content"][0]["content"]
+    let content = body["messages"][1]["content"][0]["content"]
         .as_str()
         .expect("content str");
     assert!(

@@ -719,7 +719,14 @@ fn expand_messages_for_wire(
         }
         out.push(Message { role: m.role, blocks });
     }
-    Ok(out)
+    // Defense-in-depth at the API boundary: drop any `tool_result` whose
+    // `tool_use` is missing from the preceding message. The Messages API rejects
+    // such an orphan with a hard `400 ... unexpected tool_use_id found in
+    // tool_result blocks`, taking down the whole turn over one malformed entry
+    // deep in the history (e.g. a stranded tail spliced on after a reused session
+    // id, or a compaction hole). Stripping it here keeps a corrupted transcript
+    // recoverable instead of fatal; a well-formed transcript is unchanged.
+    Ok(origin_core::types::strip_orphan_tool_results(out))
 }
 
 fn load_oauth_metadata(session_id: &str) -> wire::WireMetadata {

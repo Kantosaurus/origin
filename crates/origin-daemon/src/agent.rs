@@ -274,6 +274,14 @@ async fn maybe_compact_session(session: &mut Session, opts: &LoopOptions) {
     }
 }
 
+/// Whether first-occurrence array compression (`SchemaCrush`, the headroom
+/// `SmartCrusher` port) is active. Default-ON; set `ORIGIN_SCHEMA_CRUSH=0` (or
+/// `false`) to disable. Read at both the system-prompt explainer site and the
+/// tool-result dispatch site so the two never disagree about the wire shape.
+fn schema_crush_on() -> bool {
+    std::env::var("ORIGIN_SCHEMA_CRUSH").map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false"))
+}
+
 /// Build the commit-subject label for a per-tool checkpoint.
 ///
 /// Combines the `tool` name with the file path(s) it edited so the snapshot is
@@ -1029,8 +1037,10 @@ fn read_path_from_tool<'a>(name: &str, args: &'a Value) -> Option<&'a str> {
 /// `mailboxes` map is wired) or logs it (the fallback when per-worker mailbox
 /// plumbing is not reachable from here).
 fn record_swarm_collab(collab: &SwarmCollab, name: &str, args: &Value) {
-    // Gate: env must be set. Unset ⇒ no tracking ⇒ byte-identical.
-    if std::env::var_os("ORIGIN_SWARM_COLLAB").is_none() {
+    // Gate on the SAME predicate the coordinator uses to build the room state,
+    // so recording can never drift out of sync with collab being on. Default-ON;
+    // `ORIGIN_SWARM_COLLAB=0`/`false` disables ⇒ no tracking ⇒ byte-identical.
+    if !origin_swarm::collab_enabled() {
         return;
     }
     if let Some(path) = read_path_from_tool(name, args) {
@@ -2686,13 +2696,32 @@ async fn run_loop_inner(
     // Multi-root workspace block (cline): when the session was opened with extra
     // roots, tell the model it may read/edit across them. Empty ⇒ byte-identical.
     let roots_block = workspace_roots_block(&session.roots);
+    // SchemaCrush wire-shape explainer. When result compression is active, large
+    // homogeneous arrays arrive columnar-encoded and an oversized result may
+    // carry an offload sentinel pointing at a `Recall` handle. Teaching the model
+    // the shape keeps compression lossless from its point of view. Empty when the
+    // feature is disabled ⇒ byte-identical system prompt.
+    let result_encoding_block = if schema_crush_on() {
+        "<origin-result-encoding>\n\
+         To save tokens, some tool results are compressed. A compressed array is a TABLE: \
+         {\"__schema_crush\":1,\"columns\":[\"a\",\"b\",...],\"rows\":[[va,vb,...],...]} — each entry in \
+         `rows` is one record whose values align positionally with `columns` (rows[i][k] is the value of \
+         columns[k]). An optional `exceptions` map (keyed by row index, as a string) holds any off-schema \
+         rows verbatim. If a result carries an `__offloaded` object with a `recall` handle, the tail rows \
+         were elided — call the `Recall` tool with that handle to retrieve the full, uncompressed result. \
+         Read these tables directly; never ask the user to decompress them.\n\
+         </origin-result-encoding>"
+            .to_string()
+    } else {
+        String::new()
+    };
     let recalled_system = {
         // NOTE: `goal_block`, `lsp_diag_block`, and `swarm_notices_block` are
         // deliberately NOT in this array — they are volatile (goal iteration
         // counters change every goal-driver pass; diagnostics/notices change
         // per turn) and are carried as a trailing message block instead, so the
         // cached system+tools prefix stays byte-stable across the whole run.
-        let parts: [&str; 11] = [
+        let parts: [&str; 12] = [
             &repo_map_block,
             identity_block,
             &directive_block,
@@ -2704,6 +2733,7 @@ async fn run_loop_inner(
             &roots_block,
             &edit_format_block,
             &subagents_block,
+            &result_encoding_block,
         ];
         parts
             .iter()
@@ -2782,6 +2812,14 @@ async fn run_loop_inner(
     let mut tool_time_ms: u64 = 0;
     let mut first_tool_ms: Option<u64> = None;
     let mut first_token_ms: Option<u64> = None;
+
+    // SchemaCrush gate (headroom SmartCrusher port). Default-ON: large
+    // homogeneous JSON arrays are columnar-compressed on first emission; the
+    // model is taught the wire shape by the `<origin-result-encoding>` system
+    // block and can always `Recall` the full original, so it stays lossless from
+    // the model's point of view. Set ORIGIN_SCHEMA_CRUSH=0 (or "false") to
+    // disable, which restores the byte-identical per-tool-result path.
+    let schema_crush_enabled = schema_crush_on();
 
     for turn in 1..=opts.max_turns {
         // Distinct files this turn mutated (for the post-edit diagnostics probe).
@@ -3721,6 +3759,43 @@ async fn run_loop_inner(
                     }
                 }
             };
+
+            // SchemaCrush (headroom SmartCrusher port): compress a large,
+            // homogeneous JSON array tool result into a columnar table on its
+            // FIRST emission — the gap the byte-identical output-CAS dedup
+            // can't cover. Lossless when the columnar form fits; otherwise a
+            // bounded-lossy tail-offload whose sentinel points back to the
+            // full original via `Recall`. Gated behind ORIGIN_SCHEMA_CRUSH
+            // (default off ⇒ byte-identical); only fires for fresh, successful,
+            // non-mutating results with a CAS available to anchor retrieval.
+            let mut result_bytes = result_bytes;
+            if schema_crush_enabled
+                && cache_hit.is_none()
+                && matches!(meta.side_effects, SideEffects::Pure)
+            {
+                if let Some(cas) = opts.cas.as_ref() {
+                    // Anchor the FULL original in CAS first so the lossy
+                    // sentinel's `recall` handle resolves to the uncrushed body.
+                    if let Ok(orig_h) = cas.put(&result_bytes) {
+                        let orig_hex = hex::encode(orig_h.as_bytes());
+                        if let Some((crushed, outcome)) = origin_tools::array_crush::crush_result_bytes(
+                            &result_bytes,
+                            &orig_hex,
+                            origin_tools::array_crush::DEFAULT_MIN_BYTES,
+                            &origin_tools::array_crush::CrushConfig::default(),
+                        ) {
+                            tracing::debug!(
+                                tool = %name,
+                                before = result_bytes.len(),
+                                after = crushed.len(),
+                                ?outcome,
+                                "schema-crush applied"
+                            );
+                            result_bytes = crushed;
+                        }
+                    }
+                }
+            }
 
             // Stage C5 Task 1/2: reaching here means the tool produced a result
             // (every failure path `continue`d above). Fold this dispatch's

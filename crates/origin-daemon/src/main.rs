@@ -1574,13 +1574,35 @@ async fn handle_request(
                 }
                 s
             }
-            _ => {
+            Ok(_) => {
+                // No rows yet for this id — a brand-new session whose id the
+                // client supplied up front. Start fresh under that id.
                 let mut s = Session::new(provider.name(), &req.model);
                 // `clone_from` reuses the existing `id` allocation instead of
                 // dropping it and allocating a fresh `String` (clippy
                 // `assigning_clones`).
                 s.id.clone_from(sid);
                 s
+            }
+            Err(e) => {
+                // Load FAILED (rkyv decode / sqlite error) for an id that may
+                // well hold stored history. Do NOT fall through to a fresh empty
+                // session under the same id: the first persist would then
+                // overwrite — and `persist_transcript` would truncate away — the
+                // still-recoverable rows on disk, turning a transient read error
+                // into permanent data loss. Surface the error instead so the
+                // history stays intact for repair or a clean new session id.
+                let message = format!(
+                    "session load failed for {sid}: {e}; refusing to start a fresh \
+                     session under the same id (stored history is preserved on disk)"
+                );
+                error!(error = %e, session = %sid, "resume: load_messages failed; not clobbering stored history");
+                let _ = conn
+                    .lock()
+                    .await
+                    .write_frame(FrameKind::ErrorFrame, message.as_bytes())
+                    .await;
+                return PromptOutcome::Failed { message };
             }
         }
     } else {
@@ -3655,13 +3677,13 @@ fn persist(session_store: &SessionStore, session: &Session) {
     if let Err(e) = session_store.persist_session(session) {
         error!(error = %e, "persist_session failed");
     }
-    for (i, m) in session.messages.iter().enumerate() {
-        #[allow(clippy::expect_used)]
-        // Turn count in a session cannot exceed u32::MAX in practice.
-        let turn = u32::try_from(i).expect("turn fits u32");
-        if let Err(e) = session_store.persist_message(&session.id.clone(), turn, m) {
-            error!(error = %e, "persist_message failed");
-        }
+    // Persist the WHOLE transcript and drop any stale tail rows from a prior,
+    // longer persist of this same id. Without the tail drop a reused/reset
+    // session id would splice the old run's tail onto this one at the next
+    // resume, orphaning a `tool_result` and triggering an Anthropic 400 — see
+    // `SessionStore::persist_transcript`.
+    if let Err(e) = session_store.persist_transcript(&session.id, &session.messages) {
+        error!(error = %e, "persist_transcript failed");
     }
 }
 

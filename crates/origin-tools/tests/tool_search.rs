@@ -5,21 +5,23 @@ use origin_tools::builtins::tool_search::{tool_search, ToolSearchArgs};
 
 #[test]
 fn returns_deferred_tool_schema_by_exact_name() {
+    // `WebFetch` is deferred (not hot); `Recall` is now hot, so it is fetched
+    // from the base tool set rather than via ToolSearch.
     let out = tool_search(&ToolSearchArgs {
-        query: "select:Recall".into(),
+        query: "select:WebFetch".into(),
         max_results: None,
     })
     .unwrap();
     let arr = out.as_array().unwrap();
     assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["name"], "Recall");
+    assert_eq!(arr[0]["name"], "WebFetch");
     assert!(arr[0].get("input_schema").is_some());
 }
 
 #[test]
 fn returns_multiple_by_select_list() {
     let out = tool_search(&ToolSearchArgs {
-        query: "select:Recall,ask".into(),
+        query: "select:WebFetch,ask".into(),
         max_results: None,
     })
     .unwrap();

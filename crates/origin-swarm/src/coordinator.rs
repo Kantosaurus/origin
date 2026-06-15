@@ -32,12 +32,24 @@ use crate::rpc::PlanHandle;
 use crate::spec::WorkerSpec;
 use crate::worker::{default_noop_worker, SharedMailboxes, WorkerCollab, WorkerContext, WorkerFn};
 
-/// Env gate for real-time swarm collaboration (WS-L, jcode L238). When set at
+/// Env gate for real-time swarm collaboration (WS-L, jcode L238). At
 /// coordinator-construction time, every worker spawned by this coordinator is
-/// handed a [`WorkerCollab`] over a room-shared registry + mailbox map. Unset
-/// (the default) ⇒ no collab state is built and `WorkerContext::collab` is
-/// `None` ⇒ byte-identical.
+/// handed a [`WorkerCollab`] over a room-shared registry + mailbox map, so
+/// concurrently-running workers notify each other of file shifts. Default-ON;
+/// set this to `0`/`false` to disable, which leaves `WorkerContext::collab`
+/// `None` ⇒ byte-identical to before this feature existed.
 const SWARM_COLLAB_ENV: &str = "ORIGIN_SWARM_COLLAB";
+
+/// Whether real-time swarm collaboration is active.
+///
+/// Default-ON; the `ORIGIN_SWARM_COLLAB` env var disables it only when
+/// explicitly set to `0` or `false`. Exposed so the daemon's per-tool read/edit
+/// recorder gates on the exact same condition as the coordinator that builds the
+/// room state.
+#[must_use]
+pub fn collab_enabled() -> bool {
+    std::env::var(SWARM_COLLAB_ENV).map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false"))
+}
 
 /// Room-wide collaboration state shared across every worker in one coordinator.
 ///
@@ -134,10 +146,11 @@ impl Coordinator {
     /// the noop worker never sends).
     #[must_use]
     pub fn new(plan: PlanHandle, ring_name: impl Into<String>) -> Self {
-        // Real-time collaboration is default-off: only build the room state when
-        // the gate env is present, so an unset env leaves `collab: None` and
-        // every spawn is byte-identical to before this feature existed.
-        let collab = if std::env::var_os(SWARM_COLLAB_ENV).is_some() {
+        // Real-time collaboration is default-ON: build the room state so workers
+        // spawned by this coordinator cooperate (file-shift notices). Disabled
+        // only when `ORIGIN_SWARM_COLLAB` is explicitly `0`/`false`, which leaves
+        // `collab: None` and every spawn byte-identical to before this feature.
+        let collab = if collab_enabled() {
             Some(RoomCollab {
                 registry: Arc::new(FileRegistry::new()),
                 mailboxes: Arc::new(std::sync::Mutex::new(HashMap::new())),

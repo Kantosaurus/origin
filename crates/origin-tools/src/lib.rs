@@ -5,6 +5,7 @@
 /// via the `token_budget:` arm of `origin_tool!`.
 pub const DEFAULT_TOKEN_BUDGET: u32 = 25_000;
 
+pub mod array_crush;
 pub mod budget_writer;
 pub mod builtins;
 pub mod dispatch;
