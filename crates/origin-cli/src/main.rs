@@ -2501,14 +2501,20 @@ async fn send_skill_command(path: &str, msg: &ClientMessage) -> Result<String> {
         }
         // Terminal arms: delegate to the outcome mapper, which returns the
         // final summary/error string for this reply.
-        return skill_command_outcome(ev, &mut last_intermediate);
+        return skill_command_outcome(ev, msg, &mut last_intermediate);
     }
 }
 
 /// Map a terminal skill/workflow [`StreamEvent`] to the one-line summary (or
-/// error) that [`send_skill_command`] returns. `last_intermediate` carries a
+/// error) that [`send_skill_command`] returns. `req` is the originating client
+/// message, used to disambiguate the shared `AdminOk` reply (a mechanical
+/// `/clear` vs a `/-<name>` skill deactivation). `last_intermediate` carries a
 /// prior `GoalCleared` line that `/clear` (`AdminOk`) folds into its message.
-fn skill_command_outcome(ev: StreamEvent, last_intermediate: &mut Option<String>) -> Result<String> {
+fn skill_command_outcome(
+    ev: StreamEvent,
+    req: &ClientMessage,
+    last_intermediate: &mut Option<String>,
+) -> Result<String> {
     match ev {
         StreamEvent::SkillActive { name, allowed_tools } => {
             if allowed_tools.is_empty() {
@@ -2522,12 +2528,17 @@ fn skill_command_outcome(ev: StreamEvent, last_intermediate: &mut Option<String>
         }
         StreamEvent::SkillError { message } => Err(anyhow::anyhow!("{message}")),
         StreamEvent::AdminOk => {
-            // `/clear` arrives here after the GoalCleared (if any) was
-            // already absorbed into `last_intermediate`. Combine them
-            // into one line so the user sees both outcomes.
+            // `AdminOk` answers both `/clear` (mechanical context reset) and
+            // `/-<name>` (skill deactivation). `/clear` resets the view itself
+            // and shouldn't claim a skill was deactivated, so render a neutral
+            // outcome — folding in any prior `GoalCleared` line.
+            let base = match req {
+                ClientMessage::ClearAll => "context cleared",
+                _ => "skill deactivated",
+            };
             last_intermediate.take().map_or_else(
-                || Ok("skill deactivated".to_string()),
-                |prior| Ok(format!("skill deactivated; {prior}")),
+                || Ok(base.to_string()),
+                |prior| Ok(format!("{base}; {prior}")),
             )
         }
         StreamEvent::WorkflowActive { name, steps, skipped } => {
