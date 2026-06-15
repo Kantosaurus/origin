@@ -46,7 +46,7 @@ pub use admission::{
     default_probe, AdmissionGate, AdmissionTicket, GateCfg, MemReading, MemoryProbe, NullProbe, ScriptedProbe,
 };
 pub use collab::{FileRegistry, FileShiftNotice, Mailbox, Message, MsgScope};
-pub use coordinator::{Coordinator, WorkerHandle, WorkerId};
+pub use coordinator::{collab_enabled, Coordinator, WorkerHandle, WorkerId};
 pub use error::SwarmError;
 pub use lifecycle::Lifecycle;
 pub use prefix_inherit::PrefixSnapshot;

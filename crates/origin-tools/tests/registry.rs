@@ -42,7 +42,7 @@ fn every_tool_has_nonzero_token_budget() {
 }
 
 #[test]
-fn hot_set_contains_exactly_the_11() {
+fn hot_set_contains_exactly_the_expected_tools() {
     let hot: Vec<&str> = origin_tools::registry_iter()
         .filter(|m| m.hot)
         .map(|m| m.name)
@@ -59,6 +59,9 @@ fn hot_set_contains_exactly_the_11() {
         "Monitor",
         "Diagnostics",
         "ToolSearch",
+        // `Recall` is hot so the model can inflate a SchemaCrush offload handle
+        // in one step (no ToolSearch round-trip first).
+        "Recall",
     ];
     let mut got: Vec<&str> = hot.clone();
     got.sort_unstable();
