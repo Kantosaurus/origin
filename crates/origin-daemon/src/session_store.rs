@@ -135,6 +135,43 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Persist `messages` as the COMPLETE transcript for `session_id`,
+    /// replacing any previously-persisted transcript for that id.
+    ///
+    /// Each message is written at its positional 0-based `turn_index`, then any
+    /// stale rows with `turn_index >= messages.len()` are deleted.
+    ///
+    /// That final truncation is load-bearing. [`Self::persist_message`] is an
+    /// `INSERT OR REPLACE` keyed by `(session_id, turn_index)`, so re-persisting
+    /// a session whose transcript got SHORTER — a reused/reset session id, or a
+    /// rewind — would otherwise overwrite the prefix but leave the previous
+    /// run's higher-indexed rows stranded. A later [`Self::load_messages`] then
+    /// splices the new prefix onto that stale tail; if the splice boundary falls
+    /// between an assistant `tool_use` and its `tool_result`, the Anthropic
+    /// Messages API rejects the request with "unexpected `tool_use_id` found in
+    /// `tool_result` blocks ... Each `tool_result` block must have a
+    /// corresponding `tool_use` block in the previous message." Truncating the
+    /// tail keeps the persisted rows exactly equal to `messages`.
+    ///
+    /// # Errors
+    /// Propagates the first sqlite/rkyv error from the underlying writes.
+    pub fn persist_transcript(
+        &self,
+        session_id: &str,
+        messages: &[Message],
+    ) -> Result<(), SessionStoreError> {
+        for (i, m) in messages.iter().enumerate() {
+            let turn = u32::try_from(i).unwrap_or(u32::MAX);
+            self.persist_message(session_id, turn, m)?;
+        }
+        // Delete any rows left over from a previously-persisted longer transcript
+        // for this id, so the stored rows are exactly `messages` (no stranded
+        // tail to splice on at the next load — see the doc comment above).
+        let len = u32::try_from(messages.len()).unwrap_or(u32::MAX);
+        self.truncate_after(session_id, len)?;
+        Ok(())
+    }
+
     /// Update the `summary` column for an existing message row. No-op if the
     /// row does not exist. Idempotent.
     ///
@@ -183,7 +220,13 @@ impl SessionStore {
                 .map_err(|e| SessionStoreError::Rkyv(format!("{e:?}")))?;
             messages.push(m);
         }
-        Ok(messages)
+        // Defense-in-depth: a transcript persisted before the `persist_transcript`
+        // tail-truncation fix (or corrupted by any other upstream path) can carry
+        // an orphaned `tool_result` — e.g. a stranded tail spliced on after a
+        // reused session id. Repair it on the way out so resuming such a session
+        // self-heals instead of hard-failing the next provider call with
+        // `400 unexpected tool_use_id`.
+        Ok(origin_core::types::strip_orphan_tool_results(messages))
     }
 }
 
@@ -409,6 +452,105 @@ mod tests {
             Some(Block::Text { text, .. }) => text.clone(),
             _ => String::new(),
         }
+    }
+
+    /// An assistant turn that issued one `tool_use`.
+    fn assistant_tool_use(id: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            blocks: vec![
+                Block::text("calling a tool"),
+                Block::ToolUse {
+                    id: id.into(),
+                    name: "Read".into(),
+                    input_json: b"{}".to_vec(),
+                    cache_marker: None,
+                },
+            ],
+        }
+    }
+
+    /// The `Role::Tool` message carrying the matching `tool_result`.
+    fn tool_result_msg(id: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            blocks: vec![Block::ToolResult {
+                tool_use_id: id.into(),
+                handle: None,
+                inline: Some(b"result body".to_vec()),
+                cache_marker: None,
+            }],
+        }
+    }
+
+    /// First `tool_result` with no matching `tool_use` in the previous message,
+    /// i.e. the exact malformation the Anthropic Messages API rejects.
+    fn first_orphan(transcript: &[Message]) -> Option<String> {
+        for (i, msg) in transcript.iter().enumerate() {
+            for block in &msg.blocks {
+                if let Block::ToolResult { tool_use_id, .. } = block {
+                    let prev_has_match = i > 0
+                        && transcript[i - 1]
+                            .blocks
+                            .iter()
+                            .any(|b| matches!(b, Block::ToolUse { id, .. } if id == tool_use_id));
+                    if !prev_has_match {
+                        return Some(tool_use_id.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Regression for the live `400 unexpected tool_use_id` crash: re-persisting
+    /// a session whose transcript got SHORTER (a reused/reset session id) must
+    /// not leave the previous, longer run's tail rows stranded. Otherwise the
+    /// next `load_messages` splices the new prefix onto that stale tail, and when
+    /// the boundary lands between an assistant `tool_use` and its `tool_result`
+    /// the Anthropic API rejects the request. Mirrors the production seam: a long
+    /// run ending in a tool turn, then a short run ending in a terminal text turn
+    /// (a summary) with no tool_use.
+    #[test]
+    fn repersisting_a_shorter_transcript_does_not_strand_the_tail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(dir.path().join("sessions.db")).expect("open");
+        let sid = "sess-reuse";
+        store
+            .persist_session(&Session::new_with_id(sid.to_string(), "test-model".to_string()))
+            .expect("persist session");
+
+        // Run A: a well-formed long transcript ending in a tool turn — two
+        // assistant(tool_use)/tool(result) pairs.
+        let long = vec![
+            Message::new(Role::User).with_block(Block::text("A start")),
+            assistant_tool_use("toolu_OLD1"),
+            tool_result_msg("toolu_OLD1"),
+            assistant_tool_use("toolu_OLD2"),
+            tool_result_msg("toolu_OLD2"),
+        ];
+        store.persist_transcript(sid, &long).expect("persist long");
+        assert_eq!(store.load_messages(sid).expect("load").len(), 5);
+
+        // Run B reuses the SAME id but is SHORTER and ends in a terminal text
+        // turn (no tool_use) — exactly the production crash (turn 129 = summary).
+        let short = vec![
+            Message::new(Role::User).with_block(Block::text("B start")),
+            Message::new(Role::Assistant).with_block(Block::text("B: done, here's a summary")),
+        ];
+        store.persist_transcript(sid, &short).expect("persist short");
+
+        let loaded = store.load_messages(sid).expect("load");
+        assert_eq!(
+            loaded.len(),
+            2,
+            "stale tail rows from the longer run must be deleted, not spliced on"
+        );
+        assert_eq!(
+            first_orphan(&loaded),
+            None,
+            "a reused-and-shortened session must never load an orphaned tool_result",
+        );
     }
 
     #[test]

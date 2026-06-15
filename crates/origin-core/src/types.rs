@@ -124,3 +124,149 @@ impl Message {
         self
     }
 }
+
+/// Defensively enforce the Anthropic Messages API tool-pairing invariant.
+///
+/// Removes every `ToolResult` whose `tool_use_id` has no matching `ToolUse` in
+/// the immediately-preceding (kept) message, and drops any message left empty
+/// as a result.
+///
+/// The provider rejects an orphaned `tool_result` with a hard
+/// `400 ... unexpected tool_use_id found in tool_result blocks`. That can happen
+/// when a transcript is corrupted by an upstream bug — a reused session id whose
+/// stale tail got spliced on, a compaction hole, a hand-edited store, a
+/// migration — and a single malformed turn deep in the history takes down the
+/// whole request. Running a transcript through this pass right before it is
+/// loaded or sent makes such corruption self-healing instead of fatal.
+///
+/// A well-formed transcript is returned byte-identical. "Previous message" is
+/// evaluated against the message that precedes each entry in the *repaired*
+/// output, so dropping an orphaned tool turn never knocks a valid pair out of
+/// alignment.
+#[must_use]
+pub fn strip_orphan_tool_results(messages: Vec<Message>) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    for mut msg in messages {
+        // `tool_use` ids advertised by the last message we actually kept.
+        let prev_ids: std::collections::HashSet<String> = out
+            .last()
+            .map(|p| {
+                p.blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        Block::ToolUse { id, .. } => Some(id.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let has_orphan = msg.blocks.iter().any(
+            |b| matches!(b, Block::ToolResult { tool_use_id, .. } if !prev_ids.contains(tool_use_id.as_str())),
+        );
+        if has_orphan {
+            msg.blocks.retain(|b| match b {
+                Block::ToolResult { tool_use_id, .. } => prev_ids.contains(tool_use_id.as_str()),
+                _ => true,
+            });
+            // A tool turn whose every result was orphaned is now empty — drop it.
+            if msg.blocks.is_empty() {
+                continue;
+            }
+        }
+        out.push(msg);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tool_pairing_tests {
+    use super::{strip_orphan_tool_results, Block, Message, Role};
+
+    fn assistant_tool_use(id: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            blocks: vec![
+                Block::text("call"),
+                Block::ToolUse {
+                    id: id.into(),
+                    name: "Read".into(),
+                    input_json: b"{}".to_vec(),
+                    cache_marker: None,
+                },
+            ],
+        }
+    }
+    fn tool_result(id: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            blocks: vec![Block::ToolResult {
+                tool_use_id: id.into(),
+                handle: None,
+                inline: Some(b"r".to_vec()),
+                cache_marker: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn well_formed_transcript_is_unchanged() {
+        let t = vec![
+            Message::new(Role::User).with_block(Block::text("hi")),
+            assistant_tool_use("a"),
+            tool_result("a"),
+            Message::new(Role::Assistant).with_block(Block::text("done")),
+        ];
+        assert_eq!(strip_orphan_tool_results(t.clone()), t);
+    }
+
+    #[test]
+    fn orphan_after_terminal_text_turn_is_dropped() {
+        // The exact production seam: a terminal text summary turn followed by a
+        // stranded tool_result with no matching tool_use.
+        let t = vec![
+            Message::new(Role::User).with_block(Block::text("hi")),
+            Message::new(Role::Assistant).with_block(Block::text("done, here's a summary")),
+            tool_result("ghost"),
+        ];
+        let out = strip_orphan_tool_results(t);
+        assert_eq!(out.len(), 2);
+        assert!(out
+            .iter()
+            .all(|m| !m.blocks.iter().any(|b| matches!(b, Block::ToolResult { .. }))));
+    }
+
+    #[test]
+    fn matched_result_kept_orphan_in_same_message_dropped() {
+        let t = vec![
+            assistant_tool_use("a"),
+            Message {
+                role: Role::Tool,
+                blocks: vec![
+                    Block::ToolResult {
+                        tool_use_id: "a".into(),
+                        handle: None,
+                        inline: Some(b"ok".to_vec()),
+                        cache_marker: None,
+                    },
+                    Block::ToolResult {
+                        tool_use_id: "b".into(),
+                        handle: None,
+                        inline: Some(b"stale".to_vec()),
+                        cache_marker: None,
+                    },
+                ],
+            },
+        ];
+        let out = strip_orphan_tool_results(t);
+        assert_eq!(out.len(), 2);
+        let ids: Vec<&str> = out[1]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["a"]);
+    }
+}
