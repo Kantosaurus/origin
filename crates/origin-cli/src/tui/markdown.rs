@@ -8,10 +8,6 @@
 //! `~~strike~~`, and `[txt](url)` links (link text in `accent` + underline, the
 //! url hidden).
 
-// The painters here are consumed by the Wave-2 `mod.rs` draw orchestration,
-// which is being wired in parallel — until then they read as dead code.
-#![allow(dead_code)] // Wave 2 wires these into the draw flow.
-
 use origin_tui::grid::{Attr, Cell, Grid};
 
 use super::tokens::{char_cell_width, Tokens};

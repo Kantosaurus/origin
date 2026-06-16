@@ -23,7 +23,11 @@
 //! - **Streaming tolerance.** An unterminated string / unterminated block
 //!   comment simply runs to end-of-line; there is no look-ahead past the line.
 
-#![allow(dead_code)] // consumed by codeblock.rs (Wave-1 Task B) / Wave-2 wiring
+// `tint`/`Lang`/`Tok`/`Span` are consumed live by `mod.rs::render_code_tint`
+// (INT-2); `lang_from_label` is used only by `codeblock::layout_code`, which the
+// flat-model draw path does not call yet (see codeblock.rs), so a sliver stays
+// dead until the structured-render path lands.
+#![allow(dead_code)] // lang_from_label only used by the (deferred) codeblock path
 
 /// A source language the lexical tint understands. Unknown languages get no
 /// tint (an empty span list).

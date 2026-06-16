@@ -93,7 +93,10 @@ fn scrollback_does_not_lose_lines_behind_input_card() {
                 row.push(ch);
             }
         }
-        let trimmed = row.trim_start();
+        // The TUI rework (INT-2) runs a copper `┃` spine down the transcript
+        // gutter (col 0); strip it (and any surrounding spaces) before matching
+        // the `line-NN` content so the contiguity check still works.
+        let trimmed = row.trim_start_matches([' ', '\u{2503}']);
         if let Some(rest) = trimmed.strip_prefix("line-") {
             let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
             let rest_after = &rest[digits.len()..];

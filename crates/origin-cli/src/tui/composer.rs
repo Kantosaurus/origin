@@ -7,10 +7,6 @@
 //! cap); `draw_field`/`draw_hint` write directly into the [`Grid`] within their
 //! [`Region`], clipping to its bounds and reading every color from [`Tokens`].
 
-// The painters here are wired into the draw orchestration in Wave 2 (`mod.rs`);
-// until then their public surface + frame consts read as dead code.
-#![allow(dead_code)] // Wave 2 wires these into App::draw
-
 use origin_tui::grid::{Attr, Cell, Grid};
 
 use super::tokens::{char_cell_width, glyph, Region, Tokens};
@@ -25,9 +21,15 @@ fn u16c(n: usize) -> u16 {
 pub struct EditorView {
     /// The wrapped display lines of the input buffer.
     pub lines: Vec<String>,
-    /// Caret row within `lines`.
+    /// Caret row within `lines`. Part of the locked `EditorView` contract;
+    /// the reverse-video caret is currently overlaid by the orchestrator
+    /// (`mod.rs::draw_composer`) *after* the ghost-completion so it always wins
+    /// the cell, so the painter itself does not read these. Reserved for the
+    /// painter-owned caret in the INT-5 motion pass.
+    #[allow(dead_code)]
     pub cursor_row: usize,
-    /// Caret column (display cells) within its row.
+    /// Caret column (display cells) within its row. See [`Self::cursor_row`].
+    #[allow(dead_code)]
     pub cursor_col: usize,
     /// Placeholder shown when the buffer is empty.
     pub placeholder: String,

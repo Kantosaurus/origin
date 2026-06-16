@@ -8,9 +8,13 @@
 //! [`super::syntax::tint`]. The literal ` ``` ` fences the caller stripped are
 //! replaced by this clean framing.
 
-// The painters here are consumed by the Wave-2 `mod.rs` draw orchestration,
-// which is being wired in parallel — until then they read as dead code.
-#![allow(dead_code)] // Wave 2 wires these into the draw flow.
+// `layout_code` frames a whole fenced block (label row + body rows). The flat
+// post-wrap scrollback model that INT-2 renders against cannot supply a whole
+// block to the painter (it's already split into per-line `VisualLine`s), so the
+// draw path applies the syntax tint per code row directly (mod.rs::render_code_tint)
+// rather than calling `layout_code`. Kept for the structured-render path (a
+// future turn-grouped transcript), so it reads as dead for now.
+#![allow(dead_code)] // layout_code needs whole-block input the flat model lacks
 
 use super::syntax::{self, Tok};
 use super::tokens::{glyph, RenderRow, RowSpan, Tokens};

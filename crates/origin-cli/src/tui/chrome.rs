@@ -9,12 +9,6 @@
 //! never overflows `region.width` — the cwd is middle-truncated to make room for
 //! the (fixed-width, right-aligned) clock + context meter.
 
-// The painters + their input structs are the locked public surface; the
-// orchestrator in `mod.rs` only starts calling them in Wave 2 integration, so
-// until then they read as dead within the crate. (Same rationale as the Wave-0
-// stub's module attribute.)
-#![allow(dead_code)]
-
 use origin_tui::grid::{Attr, Cell, Grid};
 
 use super::tokens::{char_cell_width, glyph, Region, Tokens};

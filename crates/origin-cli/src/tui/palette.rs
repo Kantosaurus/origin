@@ -8,9 +8,11 @@
 //! [`Grid`] within their [`Region`], reading every color from [`Tokens`] and
 //! highlighting the selected row with `tok.sel_bg`.
 
-// The painters here are wired into the draw orchestration in Wave 2 (`mod.rs`);
-// until then their public surface reads as dead code.
-#![allow(dead_code)] // Wave 2 wires these into App::draw
+// `draw_slash` (described slash palette) is wired into the draw orchestration in
+// INT-2; `draw_mentions` + `MentionItem`/`MentionKind` await the `@`-picker wire
+// (mention candidates are not yet threaded to the popup — see the INT-2 report),
+// so the module stays partially dead until then.
+#![allow(dead_code)] // draw_mentions/@-picker pending; draw_slash is live
 
 use origin_tui::grid::{Attr, Cell, Grid};
 

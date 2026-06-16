@@ -394,6 +394,14 @@ pub struct App {
     /// [`Self::selection_text`] extracts exactly what is on screen. Empty
     /// otherwise (no per-frame cost when not selecting).
     pub screen_text: Vec<String>,
+    /// Current working directory (lossy string), resolved once at startup for
+    /// the persistent top chrome strip. Cached so the per-frame `draw` path
+    /// never touches the filesystem.
+    cwd: String,
+    /// Short git branch name for the top chrome strip, read cheaply from
+    /// `.git/HEAD` once at startup (no subprocess). `None` outside a repo or on
+    /// a detached HEAD. Cached so `draw` does no I/O.
+    branch: Option<String>,
 }
 
 /// State backing the live cache-cold status-line nudge. All times are
@@ -426,6 +434,30 @@ fn now_wallclock_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Best-effort short git branch name for the top chrome strip, read once at
+/// startup (never on the per-frame draw path).
+///
+/// Walks up from the current directory to find a `.git/HEAD` and parses the
+/// `ref: refs/heads/<branch>` line, returning the short branch name. Returns
+/// `None` outside a repo, on a detached HEAD (HEAD holds a raw SHA), or on any
+/// I/O error — the strip simply omits the `⎇ branch` segment in that case. No
+/// subprocess is spawned, so this is cheap enough even though it only runs once.
+fn git_branch_short() -> Option<String> {
+    let start = std::env::current_dir().ok()?;
+    let mut dir = start.as_path();
+    loop {
+        let head = dir.join(".git").join("HEAD");
+        if let Ok(contents) = std::fs::read_to_string(&head) {
+            let line = contents.trim();
+            // `ref: refs/heads/<branch>` ⇒ on a branch; a bare SHA ⇒ detached.
+            let branch = line.strip_prefix("ref:")?.trim();
+            let short = branch.rsplit('/').next().unwrap_or(branch);
+            return (!short.is_empty()).then(|| short.to_string());
+        }
+        dir = dir.parent()?;
+    }
 }
 
 const BANNER: &[&str] = &[
@@ -475,6 +507,10 @@ impl App {
             keymap: KeyMap::default(),
             selection: None,
             screen_text: Vec::new(),
+            cwd: std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            branch: git_branch_short(),
         }
     }
 
@@ -1078,6 +1114,7 @@ impl App {
                 // block whose trailing blank never arrived (streamed Bash
                 // without a result event) must not end flush against the reply.
                 self.add_blank_line();
+                let tok = crate::tui::tokens::Tokens::from_palette(self.palette());
                 let mut in_code_block = false;
                 for line in text.split('\n') {
                     let trimmed = line.trim_start();
@@ -1110,11 +1147,20 @@ impl App {
                             false,
                         ));
                     } else {
-                        let (fg, bold) = md_line_style(line, self.palette());
-                        // Strip ATX heading markers (`## `) — the color/weight
-                        // from `md_line_style` already conveys the hierarchy, so
-                        // the literal hashes are clutter. Non-headings unchanged.
-                        let rendered = strip_heading_markers(line).unwrap_or_else(|| line.to_string());
+                        // Classify the line via the shared markdown block model
+                        // (the single source of heading/quote/rule styling). It
+                        // resolves the fg + weight; ATX heading markers are then
+                        // stripped (the color/weight conveys the hierarchy, so the
+                        // literal hashes are clutter). Non-headings render verbatim
+                        // and pick up inline markdown at render time.
+                        let bs = markdown::block_style(line, &tok);
+                        let bold = bs.attr.bits() & Attr::BOLD.bits() != 0;
+                        let fg = if bs.fg == 0 { self.palette().body } else { bs.fg };
+                        let rendered = if matches!(bs.kind, markdown::BlockKind::H(_)) {
+                            strip_heading_markers(line).unwrap_or_else(|| line.to_string())
+                        } else {
+                            line.to_string()
+                        };
                         self.scrollback
                             .push(ScrollLine::styled(format!("  {rendered}"), fg, 0, bold));
                     }
@@ -1163,26 +1209,31 @@ impl App {
                 }
             }
 
-            // Snapshot the active palette once per frame; every chrome helper
-            // reads it (via CardLayout or a `pal` arg), so a `/theme` switch
-            // re-themes the chrome immediately. Default ⇒ the legacy constants.
+            // Snapshot the active palette + the derived Tokens once per frame.
+            // Painters read `tok`; the few legacy card helpers still take a
+            // `theme::Palette`, so keep `pal` too. A `/theme` switch re-themes
+            // everything because both derive from `self.palette()`.
             let pal = self.palette();
+            let tok = crate::tui::tokens::Tokens::from_palette(pal);
 
-            // The input card spans (nearly) the full terminal width: a single
-            // column of margin on each side keeps the left accent rule and the
-            // right keybind hint off the very edge. (Previously the card was
-            // capped at 75 columns and centered, leaving large empty margins on
-            // wide terminals.) Keep this geometry in sync with
-            // `main::input_text_width`, which the editor reducer uses for
-            // visual Home/End and Up/Down across wrapped lines.
-            let card_w = cols.saturating_sub(2);
-            let cl = cols.saturating_sub(card_w) / 2;
-            let cr = cl + card_w;
-            let cs = cl + 2;
-            let text_w = cr.saturating_sub(cs) as usize;
+            // ── Vertical regions (top → bottom) ──────────────────────────────
+            //   row 0           : top chrome strip (model · cwd · ⎇ branch …)
+            //   row 1           : full-width rule (+ "↑ N more" at the right)
+            //   rows CHROME_H.. : transcript (copper spine in col 0)
+            //   status zone     : spinner/phase/tokens/cost readout + rule
+            //   composer frame  : rounded ╭──╮ … ╰──╯ field
+            //   hint line       : ⏎ send · / skills · @ files …
+            //
+            // The composer spans the FULL width (left=0,width=cols); its text
+            // column is `left+3` and clips at `right-1`, giving a text width of
+            // `cols-4` — exactly what `main::input_text_width` computes, so the
+            // painted caret stays in lock-step with the editor reducer across
+            // wrapped lines. Do not narrow the composer without updating that fn.
+            let hint_h: u16 = 1;
 
-            // Lay out the input with the cursor mapped into the wrapped grid, so
-            // the painted caret matches the rendered lines exactly.
+            // Composer geometry: text width drives the editor wrap, which must
+            // match `main::input_text_width` (== cols - 4).
+            let text_w = cols.saturating_sub(4) as usize;
             let buf = self.input.buffer();
             let input_layout = crate::editor::wrap_with_cursor(buf, text_w, self.input.cursor());
             let wrapped: Vec<&str> = input_layout
@@ -1191,10 +1242,29 @@ impl App {
                 .map(|vl| &buf[vl.byte_start..vl.byte_end])
                 .collect();
             let line_count = clamp_u16(wrapped.len()).clamp(MIN_INPUT_ROWS, MAX_INPUT_ROWS);
-            let card_h = line_count + 1;
-            let card_total = card_h + 2;
-            let at_bottom = rows.saturating_sub(card_total);
-            let scrollback_limit = at_bottom.saturating_sub(INPUT_GAP_ROWS) as usize;
+            // Composer frame = top border + `line_count` text rows + bottom border.
+            let composer_h = line_count + 2;
+            let composer_top = rows.saturating_sub(hint_h).saturating_sub(composer_h);
+
+            // The status zone (readout + rule) and the top chrome strip are
+            // *optional* furniture: on a short grid the transcript wins the space
+            // so content never vanishes. Reserve each only while the rows above
+            // the composer can spare them and still leave the transcript room.
+            // `status_h` is 2 (readout + rule) when there's room, else 0.
+            let status_h: u16 = if composer_top >= 4 { 2 } else { 0 };
+            // `status_top`/`at_bottom`: the first row the transcript may NOT use
+            // (kept name for the notices zone). The transcript fills
+            // [chrome_h, status_top).
+            let status_top = composer_top.saturating_sub(status_h);
+            let at_bottom = status_top;
+            let chrome_h: u16 = if rows >= 8 && status_top >= 4 { 2 } else { 0 };
+            let transcript_top = chrome_h;
+            // Reserve a breathing row above the status zone so the last transcript
+            // line never sits flush against it — but drop it on a short grid where
+            // it would steal the only transcript row, so content always renders.
+            let avail = at_bottom.saturating_sub(transcript_top);
+            let gap = if avail > INPUT_GAP_ROWS { INPUT_GAP_ROWS } else { 0 };
+            let scrollback_limit = avail.saturating_sub(gap) as usize;
 
             let cols_usize = cols as usize;
             let mut visual_lines: Vec<VisualLine<'_>> = Vec::new();
@@ -1212,11 +1282,15 @@ impl App {
             }
             let live_buf;
             if let Some(buf) = self.current_assistant.as_ref() {
-                live_buf = format!("  {buf}");
-                // Live assistant text is prose → markdown-parsed (literal=false).
+                // Live assistant turn gets an explicit `◆ origin` role header
+                // (the one turn boundary the flat model still knows), then the
+                // streamed prose — markdown-parsed live (literal=false) so
+                // headings/code style as they stream rather than snapping at
+                // finalize.
+                live_buf = format!("\u{25C6} origin\n  {buf}");
                 wrap_into(
                     &live_buf,
-                    pal.body,
+                    tok.origin,
                     0,
                     false,
                     false,
@@ -1231,44 +1305,41 @@ impl App {
             let offset = self.scroll_offset.min(max_offset);
             let skip = total.saturating_sub(visible).saturating_sub(offset);
 
-            let mut row: u16 = 0;
+            let mut row: u16 = transcript_top;
             for vl in visual_lines.iter().skip(skip).take(visible) {
                 if row >= at_bottom {
                     break;
                 }
-                render_scroll_line(main, row, vl, cols, pal);
+                render_scroll_line(main, row, vl, cols, &tok);
                 row = row.saturating_add(1);
             }
 
-            let r_top = row.saturating_add(2).min(at_bottom);
-            let r_status = r_top + line_count;
-            let r_cap = r_status + 1;
-            let layout = CardLayout {
-                cols,
-                rows,
-                cl,
-                cr,
-                cs,
-                at_bottom,
-                r_top,
-                r_status,
-                r_cap,
-                palette: pal,
-            };
+            // ── Top chrome strip + rule (Stage 1) ────────────────────────────
+            self.draw_chrome_top(main, cols, chrome_h, &tok, offset);
 
-            draw_scroll_indicator(main, &layout, offset);
-            self.draw_notices(main, &layout);
-            draw_input_card_bg(main, &layout);
-            self.draw_input_text(
+            // ── Bottom status zone (Stage 5): readout + seating rule ─────────
+            self.draw_status_zone(main, status_top, status_h, cols, &tok);
+            // Goal / stall / permission notices overpaint the readout row — they
+            // are the more urgent signal when present.
+            self.draw_notices_zone(main, status_top, cols, &tok);
+
+            // ── Composer frame + caret + ghost completion (Stage 4) ──────────
+            let field_region = crate::tui::tokens::Region::new(composer_top, 0, cols, composer_h);
+            self.draw_composer(main, field_region, &wrapped, &input_layout, &tok);
+
+            // ── Hint line (Stage 4) ──────────────────────────────────────────
+            let hint_region =
+                crate::tui::tokens::Region::new(rows.saturating_sub(hint_h), 0, cols, hint_h);
+            crate::tui::composer::draw_hint(
                 main,
-                &layout,
-                &wrapped,
-                input_layout.cursor_row,
-                input_layout.cursor_col,
+                hint_region,
+                self.spinner.active || self.goal_status.is_some(),
+                &tok,
             );
-            self.draw_status_line(main, &layout);
-            draw_keybind_hint(main, &layout, self.spinner.active || self.goal_status.is_some());
-            self.draw_suggestions_popup(main, &layout);
+
+            // ── Slash / mention popup above the composer (Stage 5) ───────────
+            self.draw_suggestions_zone(main, composer_top, cols, &tok);
+
             // Reverse-video overlay for an active click-drag selection, drawn last
             // so it sits on top of all content.
             if let Some(sel) = self.selection {
@@ -1278,453 +1349,282 @@ impl App {
         clear_prompt_grid(composer.prompt_grid(), self.palette());
     }
 
-    /// Render the goal-status indicator and stall-watchdog notice on the
-    /// breathing-room row just above the input card. The stall notice (when
-    /// active) overpaints the goal status — a stall is the more urgent signal.
-    fn draw_notices(&self, main: &mut Grid, layout: &CardLayout) {
-        // Highest-priority notice: a pending permission ask blocks the turn, so
-        // it overpaints the goal/stall row. The user answers with y / n.
-        if let Some(ref ask) = self.pending_permission {
-            let status_row = layout.at_bottom.saturating_sub(1);
-            if status_row < layout.rows {
-                let msg = format!(
-                    "\u{26A0} {}  y = allow \u{00B7} n = deny",
-                    crate::locale::linef("permission.ask", &[("tool", &ask.tool), ("args", &ask.args)])
-                );
-                write_str_styled(
-                    main,
-                    status_row,
-                    layout.cl.saturating_add(2),
-                    &msg,
-                    layout.cr,
-                    Style {
-                        fg: layout.palette.yellow,
-                        bg: 0,
-                        bold: true,
-                    },
-                );
-            }
+    /// Stage 1 — paint the persistent top chrome strip (row 0) + a full-width
+    /// rule (row 1), with the "↑ N more" scroll indicator riding the rule's
+    /// right edge so it never collides with the strip. No-op when the terminal
+    /// is too short to spare the two rows (`chrome_h == 0`).
+    fn draw_chrome_top(
+        &self,
+        main: &mut Grid,
+        cols: u16,
+        chrome_h: u16,
+        tok: &crate::tui::tokens::Tokens,
+        offset: usize,
+    ) {
+        if chrome_h == 0 {
             return;
         }
-        // Bug #4: render the one-line goal-status indicator (when set)
-        // on the breathing-room row just above the input card. Centered
-        // inside the card width so it visually associates with the
-        // current operation rather than the scrollback above.
-        if let Some(ref status) = self.goal_status {
-            let status_row = layout.at_bottom.saturating_sub(1);
-            if status_row < layout.rows {
-                let pad = layout.cl.saturating_add(2);
-                write_str_styled(
-                    main,
-                    status_row,
-                    pad,
-                    status,
-                    layout.cr,
-                    Style {
-                        fg: layout.palette.accent,
-                        bg: 0,
-                        bold: false,
-                    },
-                );
-            }
+        let live_elapsed = self
+            .turn_started
+            .map_or(self.usage.elapsed, |t| self.usage.elapsed + t.elapsed());
+        let ctx = crate::tui::chrome::ChromeCtx {
+            model: self.usage.model.clone(),
+            cwd: self.cwd.clone(),
+            branch: self.branch.clone(),
+            elapsed: format_elapsed_clock(live_elapsed),
+            ctx_pct: self.ctx_pct().unwrap_or(0),
+        };
+        crate::tui::chrome::draw_top(
+            main,
+            crate::tui::tokens::Region::new(0, 0, cols, 1),
+            &ctx,
+            tok,
+        );
+        // Full-width rule on row 1, in accent_dim, seating the transcript.
+        for c in 0..cols {
+            main.put(1, c, Cell::new('\u{2500}', tok.accent_dim, 0, Attr::PLAIN));
         }
-
-        // Stall watchdog notice: a gentle "still working…" reassurance after a
-        // short quiet, so a long turn doesn't read as a dead screen. Muted, never
-        // an alarm. Takes the row the goal status would otherwise use.
-        if let Some(StallTier::Soft(secs)) = self.stall {
-            let status_row = layout.at_bottom.saturating_sub(1);
-            if status_row < layout.rows {
-                write_str_styled(
-                    main,
-                    status_row,
-                    layout.cl.saturating_add(2),
-                    &format!("\u{2026} still working\u{2026} {secs}s"),
-                    layout.cr,
-                    Style {
-                        fg: layout.palette.muted,
-                        bg: 0,
-                        bold: false,
-                    },
-                );
-            }
+        // "↑ N more" indicator overpaints the right edge of the rule.
+        if offset > 0 {
+            let indicator = format!(" \u{2191} {offset} more ");
+            let w = char_display_width(&indicator);
+            let start = cols.saturating_sub(w.saturating_add(1));
+            write_str_styled(
+                main,
+                1,
+                start,
+                &indicator,
+                cols,
+                Style {
+                    fg: tok.accent,
+                    bg: 0,
+                    bold: false,
+                },
+            );
         }
     }
 
-    /// Render the input card's text: the muted placeholder when empty, or the
-    /// (last six) wrapped input lines plus the ghost-suggestion completion.
-    fn draw_input_text(
+    /// Stage 5 — paint the bottom status zone (a spinner/phase/tokens/cost
+    /// readout plus a seating rule) via [`chrome::draw_status`], in its own quiet
+    /// zone above the composer (moved out of the input card).
+    fn draw_status_zone(
         &self,
         main: &mut Grid,
-        layout: &CardLayout,
-        wrapped: &[&str],
-        cursor_row: usize,
-        cursor_col: usize,
+        status_top: u16,
+        status_h: u16,
+        cols: u16,
+        tok: &crate::tui::tokens::Tokens,
     ) {
-        // Show at most the last `MAX_INPUT_ROWS` wrapped rows (the card's
-        // text area caps there and scrolls internally beyond it).
-        let vis_start = wrapped.len().saturating_sub(MAX_INPUT_ROWS as usize);
-        if self.input.is_empty() && self.current_assistant.is_none() {
-            if layout.r_top < layout.rows {
-                write_str_styled(
-                    main,
-                    layout.r_top,
-                    layout.cs,
-                    "Ask anything...",
-                    layout.cr,
-                    Style {
-                        fg: layout.palette.muted,
-                        bg: layout.palette.surface_raised,
-                        bold: false,
-                    },
-                );
+        let live_elapsed = self
+            .turn_started
+            .map_or(self.usage.elapsed, |t| self.usage.elapsed + t.elapsed());
+        let phase = turn_phase(self.spinner.active, self.current_assistant.as_deref());
+        // Phase prefers the live goal status when one is set (so the zone shows
+        // the active operation), else the localized Thinking/Responding label.
+        let phase_owned = self
+            .goal_status
+            .clone()
+            .or_else(|| localize_phase(phase).map(|p| format!("{}s {p}", live_elapsed.as_secs())));
+        let st = crate::tui::chrome::StatusCtx {
+            spinner: self
+                .spinner
+                .active
+                .then(|| self.spinner.frame_char().to_string()),
+            phase: phase_owned,
+            tokens: self
+                .usage
+                .input_tokens
+                .saturating_add(self.usage.output_tokens),
+            cost: Some(crate::status::cost_usd(&self.usage)),
+            in_flight: self.spinner.active || self.goal_status.is_some(),
+        };
+        crate::tui::chrome::draw_status(
+            main,
+            crate::tui::tokens::Region::new(status_top, 0, cols, status_h),
+            &st,
+            tok,
+        );
+    }
+
+    /// Render the goal / stall / permission notices on the status readout row.
+    /// They overpaint the quiet readout because each is the more urgent signal
+    /// when present; priority: permission > stall > goal (goal already shows as
+    /// the readout phase, so only stall/permission need to overpaint).
+    fn draw_notices_zone(
+        &self,
+        main: &mut Grid,
+        status_top: u16,
+        cols: u16,
+        tok: &crate::tui::tokens::Tokens,
+    ) {
+        let rows = main.rows();
+        if status_top >= rows {
+            return;
+        }
+        // Permission ask blocks the turn — highest priority, the user answers
+        // y / n (INT-3 will route this through the picker; INT-2 keeps y/n).
+        if let Some(ref ask) = self.pending_permission {
+            let msg = format!(
+                "\u{26A0} {}  y = allow \u{00B7} n = deny",
+                crate::locale::linef("permission.ask", &[("tool", &ask.tool), ("args", &ask.args)])
+            );
+            // Clear the readout row first so stale metrics don't bleed through.
+            for c in 0..cols {
+                main.put(status_top, c, Cell::new(' ', 0, 0, Attr::PLAIN));
             }
-        } else if !self.input.is_empty() {
-            for (i, line) in wrapped[vis_start..].iter().enumerate() {
-                let r = layout.r_top + clamp_u16(i);
-                if r >= layout.r_status || r >= layout.rows {
-                    break;
-                }
-                write_str_styled(
-                    main,
-                    r,
-                    layout.cs,
-                    line,
-                    layout.cr,
-                    Style {
-                        fg: layout.palette.bright,
-                        bg: layout.palette.surface_raised,
-                        bold: false,
-                    },
-                );
-                if vis_start + i == wrapped.len() - 1 && !self.suggestions.ghost.is_empty() {
-                    let gc = layout.cs + char_display_width(line);
+            write_str_styled(
+                main,
+                status_top,
+                1,
+                &msg,
+                cols,
+                Style {
+                    fg: tok.warn,
+                    bg: 0,
+                    bold: true,
+                },
+            );
+            return;
+        }
+        // Stall watchdog: a gentle "still working…" reassurance overpaints the
+        // readout (muted, never an alarm).
+        if let Some(StallTier::Soft(secs)) = self.stall {
+            for c in 0..cols {
+                main.put(status_top, c, Cell::new(' ', 0, 0, Attr::PLAIN));
+            }
+            write_str_styled(
+                main,
+                status_top,
+                1,
+                &format!("\u{2026} still working\u{2026} {secs}s"),
+                cols,
+                Style {
+                    fg: tok.muted,
+                    bg: 0,
+                    bold: false,
+                },
+            );
+        }
+    }
+
+    /// Stage 4 — paint the framed composer field via [`composer::draw_field`]
+    /// (rounded frame + `›` prompt + placeholder + soft-wrap cues + "▴ more
+    /// above"), then overlay the reverse-video caret and the ghost-suggestion
+    /// completion. The text geometry is `region.left+3 .. region.right()-1`, a
+    /// width of `cols-4`, matching `main::input_text_width` so the caret tracks
+    /// typing exactly across wrapped lines.
+    fn draw_composer(
+        &self,
+        main: &mut Grid,
+        region: crate::tui::tokens::Region,
+        wrapped: &[&str],
+        layout: &crate::editor::Layout,
+        tok: &crate::tui::tokens::Tokens,
+    ) {
+        // Internal scroll: show only the last MAX_INPUT_ROWS wrapped rows.
+        let max_rows = MAX_INPUT_ROWS as usize;
+        let scroll_top = wrapped.len().saturating_sub(max_rows);
+        let lines: Vec<String> = wrapped.iter().map(|s| (*s).to_string()).collect();
+        let ed = crate::tui::composer::EditorView {
+            lines,
+            cursor_row: layout.cursor_row,
+            cursor_col: layout.cursor_col,
+            placeholder: "Ask anything\u{2026}".to_string(),
+            scroll_top,
+            max_rows: MAX_INPUT_ROWS,
+        };
+        // The painter draws the frame, text, soft-wrap cues, and "▴ more above".
+        crate::tui::composer::draw_field(main, region, &ed, tok);
+
+        // Text geometry inside the frame (mirrors composer::draw_field).
+        let text_col = region.left + 3;
+        let last_col = region.right().saturating_sub(1); // right border column
+        let first_content = region.top + 1;
+        let frame_bottom = region.bottom().saturating_sub(1); // bottom border row
+
+        // Ghost-suggestion completion: trailing dim text after the last input
+        // row's content, when a single unique candidate is being offered.
+        if !self.suggestions.ghost.is_empty() && !wrapped.is_empty() {
+            let last_idx = wrapped.len() - 1;
+            if last_idx >= scroll_top {
+                let vis_row = clamp_u16(last_idx - scroll_top);
+                let r = first_content + vis_row;
+                if r < frame_bottom {
+                    let gc = text_col + char_display_width(wrapped[last_idx]);
                     write_str_styled(
                         main,
                         r,
                         gc,
                         &self.suggestions.ghost,
-                        layout.cr,
+                        last_col,
                         Style {
-                            fg: layout.palette.dim,
-                            bg: layout.palette.surface_raised,
+                            fg: tok.muted,
+                            bg: tok.raised,
                             bold: false,
                         },
                     );
                 }
             }
         }
-        // Paint the caret (a reversed cell) at the insertion point, over the
-        // text/placeholder, so the user always sees where they are typing.
-        if cursor_row >= vis_start {
-            let r = layout.r_top + clamp_u16(cursor_row - vis_start);
-            let c = layout.cs + clamp_u16(cursor_col);
-            if r < layout.r_status && r < layout.rows && c < layout.cr {
+
+        // Reverse-video caret at the insertion point — drawn LAST (over the text,
+        // placeholder, and ghost) so the user always sees the cursor even when it
+        // sits at end-of-input where the ghost begins. Preserves the underlying
+        // glyph so the character stays readable under the reverse cell.
+        if layout.cursor_row >= scroll_top {
+            let vis_row = clamp_u16(layout.cursor_row - scroll_top);
+            let r = first_content + vis_row;
+            let c = text_col + clamp_u16(layout.cursor_col);
+            if r < frame_bottom && c < last_col {
                 let glyph = char::from_u32(main.get(r, c).glyph)
                     .filter(|&g| g != ' ' && g != '\0')
                     .unwrap_or(' ');
-                main.put(
-                    r,
-                    c,
-                    Cell::new(
-                        glyph,
-                        layout.palette.bright,
-                        layout.palette.surface_raised,
-                        Attr::REVERSE,
-                    ),
-                );
+                main.put(r, c, Cell::new(glyph, tok.bright, tok.raised, Attr::REVERSE));
             }
         }
     }
 
-    /// Render the status line as ordered styled spans: the spinner glyph and
-    /// workflow lead in accent, a Thinking/Responding phase follows while a turn
-    /// is in flight, the live cost and elapsed are body-bright (the numbers a
-    /// user watches), token counts are muted, and the static model name is dim —
-    /// so the line has a focal point instead of a flat, near-invisible DIM wall.
-    fn draw_status_line(&self, main: &mut Grid, layout: &CardLayout) {
-        if layout.r_status >= layout.rows {
-            return;
-        }
-        let cost = crate::status::cost_usd(&self.usage);
-        let live_elapsed = self
-            .turn_started
-            .map_or(self.usage.elapsed, |t| self.usage.elapsed + t.elapsed());
-        let secs = live_elapsed.as_secs_f64();
-        let tok_in = format_tokens(self.usage.input_tokens);
-        let tok_out = format_tokens(self.usage.output_tokens);
-        let phase = turn_phase(self.spinner.active, self.current_assistant.as_deref());
-        // Localize the phase label: the "Thinking" pre-token state routes through
-        // the `thinking` catalog key (En "Thinking" — byte-identical). "Responding"
-        // has no catalog key and stays in code. `None` (idle) renders nothing.
-        let phase_owned = localize_phase(phase);
-        let tokens = format!("{tok_in}\u{2191} {tok_out}\u{2193}");
-        let pal = layout.palette;
-        let spans = status_spans(
-            pal,
-            &self.workflow,
-            phase_owned.as_deref(),
-            &self.usage.model,
-            &tokens,
-            cost,
-            secs,
-            self.ctx_pct(),
-            self.cache_cold.cold,
-        );
-
-        let mut c = layout.cs;
-        // The animated spinner glyph leads in accent while a turn is in flight.
-        if self.spinner.active {
-            if c < layout.cr {
-                main.put(
-                    layout.r_status,
-                    c,
-                    Cell::new(
-                        self.spinner.frame_char(),
-                        pal.accent,
-                        pal.surface_raised,
-                        Attr::PLAIN,
-                    ),
-                );
-            }
-            c = c.saturating_add(2);
-        }
-        for (i, span) in spans.iter().enumerate() {
-            if i > 0 {
-                let sep = Style {
-                    fg: pal.dim,
-                    bg: pal.surface_raised,
-                    bold: false,
-                };
-                c = write_span(main, layout.r_status, c, " \u{00B7} ", layout.cr, sep);
-            }
-            let span_style = Style {
-                fg: span.fg,
-                bg: pal.surface_raised,
-                bold: span.bold,
-            };
-            c = write_span(main, layout.r_status, c, &span.text, layout.cr, span_style);
-            if c >= layout.cr {
-                break;
-            }
-        }
-        // Fill the remainder with the raised surface so the status line spans the
-        // full card width like the input rows above it.
-        while c < layout.cr {
-            main.put(
-                layout.r_status,
-                c,
-                Cell::new(' ', 0, pal.surface_raised, Attr::PLAIN),
-            );
-            c = c.saturating_add(1);
-        }
-    }
-
-    /// Render the autocomplete suggestions popup directly above the input card.
-    /// Shows a scrolling window of up to [`suggestions::MAX_VISIBLE`] candidates
-    /// over the full match list, with the selected row highlighted, so every
-    /// skill is reachable by arrowing through the list.
-    fn draw_suggestions_popup(&self, main: &mut Grid, layout: &CardLayout) {
+    /// Stage 5 — render the autocomplete popup in the rows directly above the
+    /// composer. Slash/skill candidates route through [`palette::draw_slash`] so
+    /// each shows its DESCRIPTION (threaded from `SuggestionState::descriptions`,
+    /// previously computed then discarded). Non-slash candidates (e.g.
+    /// `{workflow:…}`) have no descriptions and render with an empty desc column.
+    fn draw_suggestions_zone(
+        &self,
+        main: &mut Grid,
+        composer_top: u16,
+        cols: u16,
+        tok: &crate::tui::tokens::Tokens,
+    ) {
         let total = self.suggestions.candidates.len();
-        if total == 0 {
+        if total == 0 || composer_top == 0 {
             return;
         }
         let win = crate::suggestions::MAX_VISIBLE;
         let offset = crate::suggestions::scroll_offset(total, self.suggestions.selected);
         let visible = total.saturating_sub(offset).min(win);
         let count = clamp_u16(visible);
-        let popup_bottom = layout.r_top.saturating_sub(1);
-        let popup_top = popup_bottom.saturating_sub(count);
-        let selected = self.suggestions.selected;
-        let more_above = offset > 0;
-        let more_below = offset + visible < total;
-        for (row, candidate) in self
+        // The popup sits in the `count` rows immediately above the composer.
+        let popup_top = composer_top.saturating_sub(count);
+        let items: Vec<crate::tui::palette::SlashItem> = self
             .suggestions
             .candidates
             .iter()
             .enumerate()
-            .skip(offset)
-            .take(visible)
-        {
-            let i = row - offset;
-            let r = popup_top + clamp_u16(i);
-            if r >= popup_bottom || r >= layout.rows {
-                break;
-            }
-            for c in layout.cl..layout.cr.min(layout.cols) {
-                main.put(
-                    r,
-                    c,
-                    Cell::new(' ', 0, layout.palette.surface_raised, Attr::PLAIN),
-                );
-            }
-            let (ind_fg, txt_fg) = if row == selected {
-                (layout.palette.accent, layout.palette.body)
-            } else {
-                (layout.palette.muted, layout.palette.muted)
-            };
-            // Indicator column: selection arrow takes priority; otherwise
-            // show scroll hints on the top/bottom rows when the list overflows.
-            let ind = if row == selected {
-                " \u{25B8} "
-            } else if i == 0 && more_above {
-                " \u{2191} "
-            } else if i + 1 == visible && more_below {
-                " \u{2193} "
-            } else {
-                "   "
-            };
-            let ps = layout.cl + 1;
-            write_str_styled(
-                main,
-                r,
-                ps,
-                ind,
-                layout.cr,
-                Style {
-                    fg: ind_fg,
-                    bg: layout.palette.surface_raised,
-                    bold: false,
-                },
-            );
-            let ind_w = char_display_width(ind);
-            write_str_styled(
-                main,
-                r,
-                ps + ind_w,
-                candidate,
-                layout.cr,
-                Style {
-                    fg: txt_fg,
-                    bg: layout.palette.surface_raised,
-                    bold: false,
-                },
-            );
-        }
-    }
-}
-
-/// Shared input-card geometry computed once in [`App::draw`] and threaded into
-/// each card-rendering helper, so they take a single `&CardLayout` instead of a
-/// long list of positional `u16` coordinates.
-struct CardLayout {
-    cols: u16,
-    rows: u16,
-    cl: u16,
-    cr: u16,
-    cs: u16,
-    at_bottom: u16,
-    r_top: u16,
-    r_status: u16,
-    r_cap: u16,
-    /// Active theme palette, snapshotted once per frame so every chrome helper
-    /// taking `&CardLayout` re-themes without a separate parameter.
-    palette: theme::Palette,
-}
-
-/// Render the "N more" scrollback indicator in the top-right corner when the
-/// viewport is scrolled up.
-fn draw_scroll_indicator(main: &mut Grid, layout: &CardLayout, offset: usize) {
-    if offset > 0 {
-        let indicator = format!(" \u{2191} {offset} more ");
-        // Position by DISPLAY width, not byte length: the `\u{2191}` (↑)
-        // arrow is 3 UTF-8 bytes but one terminal column, so `.len()`
-        // would push the indicator two columns too far left.
-        let indicator_w: usize = indicator
-            .chars()
-            .map(|c| UnicodeWidthChar::width(c).unwrap_or(1))
-            .sum();
-        let start_col = layout
-            .cols
-            .saturating_sub(clamp_u16(indicator_w).saturating_add(1));
-        write_str_styled(
+            .map(|(i, name)| crate::tui::palette::SlashItem {
+                name: name.clone(),
+                desc: self.suggestions.descriptions.get(i).cloned().unwrap_or_default(),
+            })
+            .collect();
+        crate::tui::palette::draw_slash(
             main,
-            0,
-            start_col,
-            &indicator,
-            layout.cols,
-            Style {
-                fg: layout.palette.accent,
-                bg: layout.palette.surface_raised,
-                bold: false,
-            },
+            crate::tui::tokens::Region::new(popup_top, 0, cols, count),
+            &items,
+            self.suggestions.selected,
+            tok,
         );
     }
-}
 
-/// Paint the raised-surface background of the input card and its left accent
-/// rule, spanning the card rows.
-fn draw_input_card_bg(main: &mut Grid, layout: &CardLayout) {
-    for r in layout.r_top..=layout.r_status.min(layout.rows.saturating_sub(1)) {
-        for c in layout.cl..layout.cr.min(layout.cols) {
-            main.put(
-                r,
-                c,
-                Cell::new(' ', 0, layout.palette.surface_raised, Attr::PLAIN),
-            );
-        }
-        if layout.cl < layout.cols {
-            main.put(
-                r,
-                layout.cl,
-                Cell::new(
-                    '\u{2503}',
-                    layout.palette.accent,
-                    layout.palette.surface_raised,
-                    Attr::PLAIN,
-                ),
-            );
-        }
-    }
-}
-
-/// The right-aligned keybind hint segments. While a turn is in flight the
-/// trailing `ctrl+c quit` becomes `ctrl+c interrupt`, matching the reducer
-/// (which remaps Ctrl+C to Interrupt during a turn) — so the hint never claims
-/// it will quit at the exact moment it will actually interrupt.
-const fn keybind_hint_parts(in_flight: bool, pal: theme::Palette) -> [(&'static str, u32); 6] {
-    let last_label = if in_flight { " interrupt" } else { " quit" };
-    [
-        ("shift+enter", pal.body),
-        (" newline  ", pal.muted),
-        ("tab", pal.body),
-        (" skills  ", pal.muted),
-        ("ctrl+c", pal.body),
-        (last_label, pal.muted),
-    ]
-}
-
-/// Render the keybind hint line beneath the input card (and the card's bottom
-/// accent corner), right-aligned within the card width.
-fn draw_keybind_hint(main: &mut Grid, layout: &CardLayout, in_flight: bool) {
-    if layout.r_cap < layout.rows {
-        if layout.cl < layout.cols {
-            main.put(
-                layout.r_cap,
-                layout.cl,
-                Cell::new('\u{2579}', layout.palette.accent, 0, Attr::PLAIN),
-            );
-        }
-        let hint_parts = keybind_hint_parts(in_flight, layout.palette);
-        let total_hw: u16 = hint_parts.iter().map(|(s, _)| char_display_width(s)).sum();
-        let mut hc = layout.cr.saturating_sub(total_hw);
-        for (text, fg) in &hint_parts {
-            let tw = char_display_width(text);
-            write_str_styled(
-                main,
-                layout.r_cap,
-                hc,
-                text,
-                hc + tw,
-                Style {
-                    fg: *fg,
-                    bg: 0,
-                    bold: false,
-                },
-            );
-            hc += tw;
-        }
-    }
 }
 
 /// Clear the (unused) prompt grid to the base surface color. The composer keeps
@@ -2032,9 +1932,10 @@ fn wrap_segment_hanging(s: &str, first_width: usize, rest_width: usize) -> Vec<&
 
 /// If `line` is an ATX markdown heading (`# `/`## `/`### ` after optional
 /// leading whitespace), return the text with the `#` markers and the one
-/// following space removed. Hierarchy is conveyed by [`md_line_style`]'s color
-/// and weight, so the literal hashes are visual clutter. Non-headings (and
-/// `#hashtag` with no space, or 4+ hashes) return `None` and render verbatim.
+/// following space removed. Hierarchy is conveyed by the heading color/weight
+/// (from [`markdown::block_style`]), so the literal hashes are visual clutter.
+/// Non-headings (and `#hashtag` with no space, or 4+ hashes) return `None` and
+/// render verbatim.
 fn strip_heading_markers(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
     let hashes = trimmed.chars().take_while(|&c| c == '#').count();
@@ -2044,32 +1945,6 @@ fn strip_heading_markers(line: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-fn md_line_style(line: &str, pal: theme::Palette) -> (u32, bool) {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with("### ") {
-        (pal.h3, true)
-    } else if trimmed.starts_with("## ") {
-        (pal.h2, true)
-    } else if trimmed.starts_with("# ") {
-        (pal.h1, true)
-    } else if trimmed.starts_with("---") && trimmed.chars().all(|c| c == '-' || c == ' ') {
-        (pal.rule, false)
-    } else if trimmed.starts_with("```") {
-        (pal.muted, false)
-    } else if trimmed.starts_with("> ") {
-        (pal.accent_dim, false)
-    } else {
-        (pal.body, false)
-    }
-}
-
-/// One styled segment of the status line.
-struct StatusSpan {
-    text: String,
-    fg: u32,
-    bold: bool,
 }
 
 /// The status phase label while a turn is active: `"Thinking"` before any
@@ -2101,81 +1976,6 @@ fn localize_phase(phase: Option<&str>) -> Option<String> {
     }
 }
 
-/// Build the ordered status-line segments (excluding the animated spinner glyph,
-/// which the caller prepends). Pure, for testability. Hierarchy: workflow leads
-/// in accent+bold, an optional phase follows in dimmed accent, the model name is
-/// dim, token counts muted, and the live cost/elapsed are body-bright. A cold
-/// nudge, when present, trails in yellow.
-#[allow(clippy::too_many_arguments)] // each is a distinct status segment; bundling would obscure
-fn status_spans(
-    pal: theme::Palette,
-    workflow: &str,
-    phase: Option<&str>,
-    model: &str,
-    tokens: &str,
-    cost: f64,
-    secs: f64,
-    ctx_pct: Option<u8>,
-    cache_cold: bool,
-) -> Vec<StatusSpan> {
-    let mut spans = vec![StatusSpan {
-        text: workflow.to_string(),
-        fg: pal.accent,
-        bold: true,
-    }];
-    if let Some(p) = phase {
-        spans.push(StatusSpan {
-            text: p.to_string(),
-            fg: pal.accent_dim,
-            bold: false,
-        });
-    }
-    spans.push(StatusSpan {
-        text: model.to_string(),
-        fg: pal.dim,
-        bold: false,
-    });
-    spans.push(StatusSpan {
-        text: tokens.to_string(),
-        fg: pal.muted,
-        bold: false,
-    });
-    spans.push(StatusSpan {
-        text: format!("${cost:.3}"),
-        fg: pal.body,
-        bold: false,
-    });
-    spans.push(StatusSpan {
-        text: format!("{secs:.1}s"),
-        fg: pal.body,
-        bold: false,
-    });
-    if let Some(pct) = ctx_pct {
-        // Context-window fill, warming to yellow then red as it approaches the
-        // limit (and an eventual compaction).
-        let fg = if pct >= 90 {
-            pal.red
-        } else if pct >= 75 {
-            pal.yellow
-        } else {
-            pal.muted
-        };
-        spans.push(StatusSpan {
-            text: format!("ctx {pct}%"),
-            fg,
-            bold: false,
-        });
-    }
-    if cache_cold {
-        spans.push(StatusSpan {
-            text: "\u{29D7} cache cold".to_string(),
-            fg: pal.yellow,
-            bold: false,
-        });
-    }
-    spans
-}
-
 /// Write `s` at (`row`, `col`) on the raised-surface background and return the
 /// next free column. Unlike [`write_str_styled`] it does not bg-fill to the row
 /// end, so spans can be chained left-to-right.
@@ -2204,7 +2004,23 @@ fn write_span(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16, style
 /// Literal lines (pre-formatted tool/diff/command output) are written verbatim
 /// so `**`/backticks survive; prose lines go through the inline-markdown
 /// renderer so `**bold**` and `` `code` `` style correctly.
-fn render_scroll_line(grid: &mut Grid, row: u16, vl: &VisualLine<'_>, cols: u16, pal: theme::Palette) {
+///
+/// Stage 2/3 of the TUI rework layers three things over the legacy line render:
+///   * a copper `┃` **spine** in the gutter (col 0) for every non-blank row, so
+///     the transcript reads as one threaded column;
+///   * **role headers** — a line opening with `❯` becomes the warm `you` header,
+///     and the `◆ origin` marker (prepended to the live assistant turn) renders
+///     in copper — giving the assistant a clear affordance;
+///   * **deeper markdown** via [`markdown::render_inline`] (italic/strike/links
+///     on top of bold/code) for prose, and a **syntax tint** (via
+///     [`syntax::tint`]) for code-block rows (those carrying the `code_bg`).
+fn render_scroll_line(
+    grid: &mut Grid,
+    row: u16,
+    vl: &VisualLine<'_>,
+    cols: u16,
+    tok: &crate::tui::tokens::Tokens,
+) {
     let style = Style {
         fg: vl.fg,
         bg: vl.bg,
@@ -2217,119 +2033,147 @@ fn render_scroll_line(grid: &mut Grid, row: u16, vl: &VisualLine<'_>, cols: u16,
             grid.put(row, c, Cell::new(' ', vl.fg, vl.bg, Attr::PLAIN));
         }
     }
-    if vl.literal {
+
+    let trimmed = vl.text.trim_start();
+    // Detect role markers (only on the first wrapped piece, indent == 0).
+    let is_user_header = vl.indent == 0 && trimmed.starts_with('\u{276F}'); // ❯
+    let is_origin_header = vl.indent == 0 && trimmed == "\u{25C6} origin"; // ◆ origin
+
+    if is_origin_header {
+        // Assistant turn affordance: ◆ origin in copper, bold, at col 2.
+        write_str_styled(
+            grid,
+            row,
+            2,
+            "\u{25C6} origin",
+            cols,
+            Style {
+                fg: tok.origin,
+                bg: 0,
+                bold: true,
+            },
+        );
+    } else if is_user_header {
+        // The user's turn: a warm `you` header, then their message in `you`.
+        let body = trimmed.strip_prefix('\u{276F}').unwrap_or(trimmed).trim_start();
+        let header = format!("you  {body}");
+        write_str_styled(
+            grid,
+            row,
+            2,
+            &header,
+            cols,
+            Style {
+                fg: tok.you,
+                bg: 0,
+                bold: true,
+            },
+        );
+    } else if vl.literal {
         write_str_styled(grid, row, vl.indent, vl.text, cols, style);
+    } else if vl.bg == tok.code_bg && vl.bg != 0 {
+        // Code-block row: lexically tint it via the dep-free syntax lexer (the
+        // visual essence of `codeblock::layout_code`; the framed label row can't
+        // be reconstructed from the flat post-wrap model — see report).
+        render_code_tint(grid, row, vl.text, cols, vl.indent, tok);
     } else {
-        render_md_line(grid, row, vl.text, cols, style, pal, vl.indent);
+        // Prose: deeper inline markdown (italic/strike/links + bold/code).
+        markdown::render_inline(grid, row, vl.text, cols, style, tok, vl.indent);
+    }
+
+    // Spine in the gutter (col 0) for non-blank transcript rows. Drawn last and
+    // ONLY when col 0 is currently blank/space, so it sits over the content's
+    // leading indent and never clobbers a glyph from content that starts flush
+    // left (raw diffs / command output via `add_colored_line`). This reconciles
+    // the spine with the existing `  ` content indent without double-indenting.
+    if !trimmed.is_empty() && cols > 0 {
+        let g0 = grid.get(row, 0).glyph;
+        let blank = g0 == 0 || g0 == u32::from(' ');
+        if blank {
+            grid.put(row, 0, Cell::new(crate::tui::tokens::glyph::SPINE, tok.spine, 0, Attr::PLAIN));
+        }
     }
 }
 
-fn render_md_line(
+/// Lexically tint one code-block row using [`syntax::tint`], mapping token
+/// classes to theme colors. Falls back to `code_fg` for untinted gaps; the whole
+/// row stays on the `code_bg` band. Untintable languages (or plain rows) render
+/// in `code_fg` verbatim.
+fn render_code_tint(
     grid: &mut Grid,
     row: u16,
     text: &str,
     max_cols: u16,
-    style: Style,
-    pal: theme::Palette,
     start_col: u16,
+    tok: &crate::tui::tokens::Tokens,
 ) {
-    let base_fg = style.fg;
-    let bg = style.bg;
-    let attr_plain = if style.bold { Attr::BOLD } else { Attr::PLAIN };
-    let mut col: u16 = start_col;
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-
-    while i < len && col < max_cols {
-        if chars[i] == '*' && i + 1 < len && chars[i + 1] == '*' {
-            // Bold span. A closing `**` on this line ends it; an *unclosed* marker
-            // (the span wraps to the next visual line, or is still streaming in)
-            // styles to end-of-line with the marker hidden — rather than leaking a
-            // literal `**` fragment into the rendered text.
-            let close = find_closing(&chars, i + 2, '*', '*');
-            let (end, after) = close.map_or((len, len), |e| (e, e + 2));
-            i += 2;
-            while i < end && col < max_cols {
-                let w = char_cell_width(chars[i]);
-                if col + w > max_cols {
-                    break;
-                }
-                grid.put(row, col, Cell::new(chars[i], pal.bright, bg, Attr::BOLD));
-                if w == 2 {
-                    grid.put(row, col + 1, Cell::continuation(bg));
-                }
-                col += w;
-                i += 1;
-            }
-            i = after;
-            continue;
+    use crate::tui::syntax::{self, Tok};
+    // The flat model doesn't carry the fence language to each wrapped row, so we
+    // best-effort tint as Rust (the dominant code in this tool's transcripts);
+    // unknown tokens simply fall back to code_fg, so a mis-guess only means a few
+    // un-tinted identifiers, never corruption.
+    let spans = syntax::tint(syntax::Lang::Rust, text);
+    let map = |k: Tok| match k {
+        Tok::Keyword => tok.accent,
+        Tok::Str => tok.ok,
+        Tok::Comment => tok.muted,
+        Tok::Num => tok.warn,
+        Tok::Ident => tok.code_fg,
+        Tok::Punct => tok.body,
+    };
+    let mut col = start_col;
+    let bytes = text.len();
+    let mut cursor = 0usize;
+    let emit = |grid: &mut Grid, from: usize, to: usize, fg: u32, col: &mut u16| {
+        if let Some(slice) = text.get(from..to) {
+            *col = write_span(
+                grid,
+                row,
+                *col,
+                slice,
+                max_cols,
+                Style {
+                    fg,
+                    bg: tok.code_bg,
+                    bold: false,
+                },
+            );
         }
-        if chars[i] == '`' && !(i + 1 < len && chars[i + 1] == '`') {
-            // Inline code span — same unclosed-marker handling as bold above: a
-            // dangling backtick styles to end-of-line rather than rendering a
-            // literal `` ` ``.
-            let close = chars[i + 1..].iter().position(|&c| c == '`').map(|p| i + 1 + p);
-            let (end, after) = close.map_or((len, len), |e| (e, e + 1));
-            i += 1;
-            while i < end && col < max_cols {
-                let w = char_cell_width(chars[i]);
-                if col + w > max_cols {
-                    break;
-                }
-                grid.put(
-                    row,
-                    col,
-                    Cell::new(chars[i], pal.code_fg, pal.code_bg, Attr::PLAIN),
-                );
-                if w == 2 {
-                    grid.put(row, col + 1, Cell::continuation(pal.code_bg));
-                }
-                col += w;
-                i += 1;
-            }
-            i = after;
-            continue;
-        }
-
-        let w = char_cell_width(chars[i]);
-        if col + w > max_cols {
+    };
+    for sp in &spans {
+        if sp.start >= bytes {
             break;
         }
-        grid.put(row, col, Cell::new(chars[i], base_fg, bg, attr_plain));
-        if w == 2 {
-            grid.put(row, col + 1, Cell::continuation(bg));
+        if sp.start > cursor {
+            emit(grid, cursor, sp.start, tok.code_fg, &mut col);
         }
-        col += w;
-        i += 1;
+        let end = (sp.start + sp.len).min(bytes);
+        emit(grid, sp.start, end, map(sp.kind), &mut col);
+        cursor = end;
     }
-
-    if bg != 0 {
-        while col < max_cols {
-            grid.put(row, col, Cell::new(' ', 0, bg, Attr::PLAIN));
-            col += 1;
-        }
+    if cursor < bytes {
+        emit(grid, cursor, bytes, tok.code_fg, &mut col);
+    }
+    // Fill the rest of the band to max_cols so the code block reads as a block.
+    while col < max_cols {
+        grid.put(row, col, Cell::new(' ', 0, tok.code_bg, Attr::PLAIN));
+        col += 1;
     }
 }
 
-const fn find_closing(chars: &[char], start: usize, c1: char, c2: char) -> Option<usize> {
-    let mut j = start;
-    while j + 1 < chars.len() {
-        if chars[j] == c1 && chars[j + 1] == c2 {
-            return Some(j);
-        }
-        j += 1;
-    }
-    None
-}
-
-fn format_tokens(n: u32) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", f64::from(n) / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", f64::from(n) / 1_000.0)
+/// Format a session elapsed duration as a compact clock for the top chrome
+/// strip: `12s`, `1m 04s`, `2h 03m`. Mirrors the spirit of the status line's
+/// `{secs:.1}s` but reads as a wall clock at the larger scales the persistent
+/// strip lives at.
+fn format_elapsed_clock(d: Duration) -> String {
+    let total = d.as_secs();
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
     } else {
-        n.to_string()
+        format!("{s}s")
     }
 }
 
@@ -2694,7 +2538,8 @@ mod tests {
             literal: true,
             indent: 0,
         };
-        render_scroll_line(&mut g, 0, &lit, 12, theme::Palette::default());
+        let tok = crate::tui::tokens::Tokens::default_tokens();
+        render_scroll_line(&mut g, 0, &lit, 12, &tok);
         assert_eq!(g.get(0, 0).glyph, u32::from('*'), "literal line keeps leading *");
 
         let mut g2 = Grid::new(12, 1);
@@ -2706,7 +2551,7 @@ mod tests {
             literal: false,
             indent: 0,
         };
-        render_scroll_line(&mut g2, 0, &prose, 12, theme::Palette::default());
+        render_scroll_line(&mut g2, 0, &prose, 12, &tok);
         assert_eq!(
             g2.get(0, 0).glyph,
             u32::from('x'),
@@ -2755,7 +2600,8 @@ mod tests {
             literal: true,
             indent: 4,
         };
-        render_scroll_line(&mut g, 0, &vl, 12, theme::Palette::default());
+        let tok = crate::tui::tokens::Tokens::default_tokens();
+        render_scroll_line(&mut g, 0, &vl, 12, &tok);
         assert_eq!(
             g.get(0, 4).glyph,
             u32::from('a'),
@@ -2813,48 +2659,13 @@ mod tests {
         assert_eq!(localize_phase(None), None);
     }
 
+    // The legibility hierarchy of the status readout (workflow/phase/model/
+    // tokens/cost/ctx coloring) now lives in `chrome::draw_status` and is tested
+    // there; the status-line span builder was retired with the input-card status
+    // line in the TUI rework (INT-2). The ctx-meter percentage is still computed
+    // by `App::ctx_pct` (consumed by the chrome strip), so it keeps its test.
     #[test]
-    fn status_spans_have_legibility_hierarchy() {
-        let spans = status_spans(
-            theme::Palette::default(),
-            "Code",
-            Some("Thinking"),
-            "claude",
-            "1.2k\u{2191} 300\u{2193}",
-            0.84,
-            3.4,
-            None,
-            false,
-        );
-        assert_eq!(spans[0].text, "Code");
-        assert_eq!(spans[0].fg, theme::ACCENT);
-        assert!(spans[0].bold, "workflow leads bold");
-        assert!(spans
-            .iter()
-            .any(|s| s.text == "Thinking" && s.fg == theme::ACCENT_DIM));
-        assert!(
-            spans.iter().any(|s| s.text == "claude" && s.fg == theme::DIM),
-            "model is dim"
-        );
-        assert!(
-            spans.iter().any(|s| s.text == "$0.840" && s.fg == theme::BODY),
-            "cost is body-bright"
-        );
-        assert!(
-            spans.iter().any(|s| s.text == "3.4s" && s.fg == theme::BODY),
-            "elapsed is body-bright"
-        );
-        assert!(
-            spans
-                .iter()
-                .any(|s| s.text.contains('\u{2191}') && s.fg == theme::MUTED),
-            "tokens muted"
-        );
-        assert!(!spans.iter().any(|s| s.text.contains("cache cold")));
-    }
-
-    #[test]
-    fn ctx_meter_tracks_turn_input_and_warns_when_full() {
+    fn ctx_meter_tracks_turn_input() {
         let mut app = App::new("anthropic", "claude-sonnet-4-6", CompletionSources::default());
         assert_eq!(app.ctx_pct(), None, "no turn yet");
         app.start_turn_timer();
@@ -2862,54 +2673,6 @@ mod tests {
         app.stop_turn_timer();
         let pct = app.ctx_pct().expect("a turn ran");
         assert!((70..=80).contains(&pct), "≈75% of 200k, got {pct}");
-        let spans = status_spans(
-            theme::Palette::default(),
-            "Code",
-            None,
-            "m",
-            "0",
-            0.0,
-            0.0,
-            Some(pct),
-            false,
-        );
-        assert!(
-            spans
-                .iter()
-                .any(|s| s.text == format!("ctx {pct}%") && s.fg == theme::YELLOW),
-            "ctx span warns yellow at >=75%"
-        );
-    }
-
-    #[test]
-    fn status_spans_append_cold_nudge_in_yellow() {
-        let spans = status_spans(
-            theme::Palette::default(),
-            "Code",
-            None,
-            "m",
-            "0\u{2191} 0\u{2193}",
-            0.0,
-            0.0,
-            None,
-            true,
-        );
-        assert!(
-            spans
-                .last()
-                .is_some_and(|s| s.text.contains("cache cold") && s.fg == theme::YELLOW),
-            "cold nudge trails in yellow"
-        );
-    }
-
-    #[test]
-    fn keybind_hint_shows_interrupt_while_in_flight() {
-        let idle = keybind_hint_parts(false, theme::Palette::default());
-        assert!(idle.iter().any(|(t, _)| *t == " quit"));
-        assert!(!idle.iter().any(|(t, _)| t.contains("interrupt")));
-        let busy = keybind_hint_parts(true, theme::Palette::default());
-        assert!(busy.iter().any(|(t, _)| *t == " interrupt"));
-        assert!(!busy.iter().any(|(t, _)| *t == " quit"));
     }
 
     #[test]
@@ -3424,18 +3187,22 @@ mod tests {
             .to_string()
     }
 
+    // Inline-markdown rendering now lives in `markdown::render_inline` (the
+    // legacy `render_md_line` was retired in the TUI rework, INT-2). These
+    // regression guards keep the streaming-friendly unclosed-marker behavior
+    // pinned from the mod.rs side; deeper coverage lives in markdown.rs's tests.
     #[test]
     fn unclosed_bold_marker_is_hidden_and_styles_to_end_of_line() {
         // A `**bold` that never closes on this visual line (it wrapped / is still
         // streaming) must NOT leak literal `*` glyphs; the remainder is bolded.
-        let pal = theme::Palette::default();
+        let tok = crate::tui::tokens::Tokens::default_tokens();
         let mut grid = Grid::new(20, 1);
         let style = Style {
-            fg: pal.body,
+            fg: tok.body,
             bg: 0,
             bold: false,
         };
-        render_md_line(&mut grid, 0, "**bold", 20, style, pal, 0);
+        markdown::render_inline(&mut grid, 0, "**bold", 20, style, &tok, 0);
         assert_eq!(row_text(&grid, 0), "bold", "marker hidden, text kept");
         assert!(
             (0..grid.cols()).all(|c| grid.get(0, c).glyph != u32::from(b'*')),
@@ -3447,14 +3214,14 @@ mod tests {
 
     #[test]
     fn unclosed_code_marker_is_hidden() {
-        let pal = theme::Palette::default();
+        let tok = crate::tui::tokens::Tokens::default_tokens();
         let mut grid = Grid::new(20, 1);
         let style = Style {
-            fg: pal.body,
+            fg: tok.body,
             bg: 0,
             bold: false,
         };
-        render_md_line(&mut grid, 0, "`code", 20, style, pal, 0);
+        markdown::render_inline(&mut grid, 0, "`code", 20, style, &tok, 0);
         assert_eq!(row_text(&grid, 0), "code");
         assert!(
             (0..grid.cols()).all(|c| grid.get(0, c).glyph != u32::from(b'`')),
@@ -3465,14 +3232,14 @@ mod tests {
     #[test]
     fn closed_bold_still_renders_without_markers() {
         // Regression guard: the normal closed case is unchanged.
-        let pal = theme::Palette::default();
+        let tok = crate::tui::tokens::Tokens::default_tokens();
         let mut grid = Grid::new(20, 1);
         let style = Style {
-            fg: pal.body,
+            fg: tok.body,
             bg: 0,
             bold: false,
         };
-        render_md_line(&mut grid, 0, "a **b** c", 20, style, pal, 0);
+        markdown::render_inline(&mut grid, 0, "a **b** c", 20, style, &tok, 0);
         assert_eq!(row_text(&grid, 0), "a b c");
     }
 
