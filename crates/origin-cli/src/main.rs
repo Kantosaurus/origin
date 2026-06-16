@@ -3011,6 +3011,36 @@ fn kill_pid(pid: u32) {
     }
 }
 
+/// Ask a process to terminate *gracefully* so it runs its cooperative shutdown
+/// (which flushes the CAS Hot tier + checkpoints SQLite) before exiting.
+///
+/// unix: SIGTERM — the daemon's `ctrlc` handler catches it. Windows: a
+/// `CREATE_NO_WINDOW` daemon has no console to receive a CTRL event, so there is
+/// no portable graceful signal; the caller force-kills instead and relies on the
+/// per-turn CAS flush in `persist` for durability.
+#[cfg(unix)]
+fn request_graceful_stop(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Whether `pid` is still alive (`kill -0`). unix only; used to end the graceful
+/// grace period early once the daemon has exited.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Kill exactly THIS workspace's daemon/supervisor processes — the pids listed
 /// in the per-instance pid file — then remove the file.
 ///
@@ -3025,10 +3055,31 @@ fn kill_instance_daemon() {
     let Some(p) = daemon_pid_path() else {
         return;
     };
-    if let Ok(content) = std::fs::read_to_string(&p) {
-        for pid in content.lines().filter_map(|l| l.trim().parse::<u32>().ok()) {
-            kill_pid(pid);
+    let pids: Vec<u32> = std::fs::read_to_string(&p)
+        .map(|c| c.lines().filter_map(|l| l.trim().parse::<u32>().ok()).collect())
+        .unwrap_or_default();
+
+    // unix: give the daemon a graceful SIGTERM first so it flushes the CAS Hot
+    // tier (else offloaded tool-result handles "cas miss" after the restart) and
+    // checkpoints SQLite, then force-kill anything that lingers. Bounded ~1s,
+    // ending early once every pid has exited. Windows has no portable graceful
+    // signal for a console-less daemon, so it force-kills straight away —
+    // durability there is guaranteed by the per-turn `persist`→`flush_all`.
+    #[cfg(unix)]
+    {
+        for pid in &pids {
+            request_graceful_stop(*pid);
         }
+        for _ in 0..10 {
+            if pids.iter().all(|pid| !pid_alive(*pid)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    for pid in &pids {
+        kill_pid(*pid); // force-kill survivors; a no-op if the pid already exited
     }
     let _ = std::fs::remove_file(&p);
 }

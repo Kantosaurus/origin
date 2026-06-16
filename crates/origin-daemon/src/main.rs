@@ -236,10 +236,13 @@ fn build_shutdown_driver(state: &Arc<std::sync::Mutex<DaemonState>>) -> Cooperat
     }
     if let Some(cas) = snapshot.cas.clone() {
         driver = driver.on(ShutdownPhase::FlushCasWriteBuffer, move || async move {
-            if let Err(e) = cas.flush_warm_pending() {
-                warn!(error = %e, "shutdown: cas flush_warm_pending failed");
+            // flush_all (not flush_warm_pending): also persist the resident Hot
+            // tier, else offloaded tool-result payloads still in Hot are dropped
+            // and their transcript handles "cas miss" after the next restart.
+            if let Err(e) = cas.flush_all() {
+                warn!(error = %e, "shutdown: cas flush_all failed");
             } else {
-                info!("shutdown: cas warm-pending bytes flushed");
+                info!("shutdown: cas in-memory bytes flushed to disk");
             }
         });
     }
@@ -1804,7 +1807,9 @@ async fn handle_request(
         };
         let opts = LoopOptions {
             max_turns: 200,
-            cas: Some(cas),
+            // Clone (not move) so the outer `cas` stays live for the per-turn
+            // `persist(..)` flush below, which makes tool-result handles durable.
+            cas: Some(Arc::clone(&cas)),
             code_graph: Some(Arc::clone(&code_graph)),
             mem_router: Some(Arc::clone(&mem_router)),
             relay_tx: Some(tx_sub.clone()),
@@ -2010,7 +2015,7 @@ async fn handle_request(
             }
             // Persist first so the rows exist before the sidecar deliverer
             // fires update_summary.
-            persist(session_store.as_ref(), &session);
+            persist(session_store.as_ref(), Some(&cas), &session);
             // Submit one Summarize job per assistant turn (P5.2, N2.5.a).
             submit_summarize_jobs(&sidecar, &session_store, &session);
             PromptOutcome::Succeeded
@@ -2042,7 +2047,7 @@ async fn handle_request(
                     return PromptOutcome::ConnectionDead;
                 }
             }
-            persist(session_store.as_ref(), &session);
+            persist(session_store.as_ref(), Some(&cas), &session);
             submit_summarize_jobs(&sidecar, &session_store, &session);
             PromptOutcome::Succeeded
         }
@@ -3250,7 +3255,9 @@ fn resume_foreign_event(session_store: &SessionStore, source: &str, path: &str) 
     // persist it through the SAME create+append path the agent loop uses.
     let mut session = Session::new(String::new(), resumed.suggested_model.clone());
     session.messages = resumed.messages;
-    persist(session_store, &session);
+    // Foreign-imported transcripts carry inline tool results (no CAS handles),
+    // so there is nothing to flush here.
+    persist(session_store, None, &session);
 
     // Saturate at u32::MAX — a transcript with >4 G messages is not feasible.
     #[allow(clippy::cast_possible_truncation)]
@@ -3937,9 +3944,21 @@ async fn write_event(conn: &SharedConnection, ev: &StreamEvent) -> Result<()> {
     Ok(())
 }
 
-fn persist(session_store: &SessionStore, session: &Session) {
+fn persist(session_store: &SessionStore, cas: Option<&Arc<Store>>, session: &Session) {
     if let Err(e) = session_store.persist_session(session) {
         error!(error = %e, "persist_session failed");
+    }
+    // Make the CAS payloads behind this transcript's tool-result handles durable
+    // BEFORE the transcript that references them is written. If a SIGKILL / crash
+    // / auto-update restart lands between the two, the on-disk transcript points
+    // only at already-flushed handles — never a dangling "cas miss". This is the
+    // durability guarantee on Windows, where the console-less daemon can't be
+    // signalled to run its graceful shutdown flush on a restart. `flush_all`
+    // (not `flush_warm_pending`) because recent tool results sit in the Hot tier.
+    if let Some(cas) = cas {
+        if let Err(e) = cas.flush_all() {
+            warn!(error = %e, "persist: cas flush_all failed (handles may dangle after a restart)");
+        }
     }
     // Persist the WHOLE transcript and drop any stale tail rows from a prior,
     // longer persist of this same id. Without the tail drop a reused/reset

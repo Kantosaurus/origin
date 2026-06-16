@@ -4167,7 +4167,16 @@ async fn run_loop_inner(
                 let body = store
                     .get(origin_cas::Hash::from_bytes(hit.handle))
                     .map_err(|e| LoopError::ToolFailure(e.to_string()))?
-                    .ok_or_else(|| LoopError::ToolFailure("cas miss on cached handle".into()))?;
+                    .unwrap_or_else(|| {
+                        // The memoized body was lost in a daemon restart; serve a
+                        // placeholder instead of failing the tool, so the turn
+                        // survives (matches the provider-side degradation).
+                        tracing::warn!(
+                            "cas miss on memoized tool handle; serving placeholder \
+                             (cached output lost across a daemon restart)"
+                        );
+                        origin_provider::CAS_MISS_PLACEHOLDER.as_bytes().to_vec()
+                    });
                 let annotated = format!(
                     "{}\n\n(cached from turn {})",
                     String::from_utf8_lossy(&body),

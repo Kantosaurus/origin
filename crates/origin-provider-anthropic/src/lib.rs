@@ -652,8 +652,9 @@ fn block_to_wire(b: &Block, cache_control: Option<wire::WireCacheControl>) -> Op
 /// Blocks with inline bytes (or unrelated kinds) are passed through unchanged.
 ///
 /// # Errors
-/// Returns `ProviderError::Api` if a handle is encountered without a CAS, or
-/// if the CAS lookup fails or misses.
+/// Returns `ProviderError::Api` if a handle is encountered without a CAS, or if
+/// the CAS lookup itself errors. A CAS *miss* degrades to an inline
+/// `CAS_MISS_PLACEHOLDER` (payload lost in a restart) rather than failing.
 fn expand_messages_for_wire(
     messages: &[Message],
     cas: Option<&std::sync::Arc<origin_cas::Store>>,
@@ -676,7 +677,16 @@ fn expand_messages_for_wire(
                 let bytes = store
                     .get(origin_cas::Hash::from_bytes(*h))
                     .map_err(|e| ProviderError::Api(format!("cas get: {e}")))?
-                    .ok_or_else(|| ProviderError::Api("cas miss for tool result handle".into()))?;
+                    .unwrap_or_else(|| {
+                        // Degrade rather than fail the turn: the payload was lost
+                        // in a daemon restart (Hot tier not flushed). Inline a
+                        // placeholder so the tool_use/tool_result pairing holds.
+                        tracing::warn!(
+                            "cas miss for tool result handle; substituting placeholder \
+                             (cached output lost across a daemon restart)"
+                        );
+                        origin_provider::CAS_MISS_PLACEHOLDER.as_bytes().to_vec()
+                    });
 
                 // N4.3: consult the per-handle band index in `O(1)`. The
                 // planner populates this via `Plan::register_handle` as

@@ -250,9 +250,61 @@ impl Store {
     /// if `warm_pending` is empty. Useful at shutdown so unflushed bytes
     /// survive a daemon restart instead of being dropped from RAM only.
     ///
+    /// NOTE: this seals only entries already *evicted* from Hot. It does **not**
+    /// persist content still resident in the Hot LRU — use [`flush_all`] for
+    /// that. (A shutdown/checkpoint that called only this left Hot-only
+    /// tool-result payloads RAM-only, so their transcript handles dangled with
+    /// a "cas miss" after the next daemon restart.)
+    ///
+    /// [`flush_all`]: Self::flush_all
+    ///
     /// # Errors
     /// Propagates I/O errors from the pack write.
     pub fn flush_warm_pending(&self) -> Result<(), StoreError> {
+        self.seal_warm_pack()
+    }
+
+    /// Persist **all** in-memory content — the resident Hot LRU as well as the
+    /// pending warm batch — to disk so nothing is RAM-only.
+    ///
+    /// Unlike [`flush_warm_pending`], this also copies the still-resident Hot
+    /// entries into a warm pack **without evicting them**, so reads stay fast
+    /// while the bytes become durable. Already-durable entries (present in a
+    /// warm/cold pack or the pending batch) are skipped, so repeated calls don't
+    /// re-write the same payloads.
+    ///
+    /// This is what keeps offloaded tool-result handles resolvable across a
+    /// daemon restart: a handle persisted in the transcript whose payload lived
+    /// only in Hot would otherwise "cas miss" after the next restart (which can
+    /// be a SIGKILL that never runs a graceful flush). Call it at each turn
+    /// checkpoint (so durability is independent of *how* the daemon dies) and at
+    /// shutdown.
+    ///
+    /// [`flush_warm_pending`]: Self::flush_warm_pending
+    ///
+    /// # Errors
+    /// Propagates I/O errors from the pack write.
+    pub fn flush_all(&self) -> Result<(), StoreError> {
+        {
+            let mut inner = self.inner.lock();
+            // Snapshot the Hot hashes (cheap — just the keys), then queue the
+            // ones not already durable. `peek` clones the payload without
+            // disturbing LRU order, and only for entries we actually persist.
+            let hot_hashes: Vec<Hash> = inner.hot.iter().map(|(h, _)| *h).collect();
+            for h in hot_hashes {
+                let already_durable = inner.warm_index.contains_key(&h)
+                    || inner.cold_index.contains_key(&h)
+                    || inner.warm_pending.iter().any(|(ph, _)| *ph == h);
+                if already_durable {
+                    continue;
+                }
+                if let Some(bytes) = inner.hot.peek(&h).cloned() {
+                    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                    inner.warm_bytes = inner.warm_bytes.saturating_add(len);
+                    inner.warm_pending.push((h, bytes));
+                }
+            }
+        }
         self.seal_warm_pack()
     }
 

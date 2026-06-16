@@ -183,6 +183,17 @@ pub enum ProviderError {
     RateLimit { retry_after_secs: u32, message: String },
 }
 
+/// Substituted in place of a tool result whose CAS payload is missing.
+///
+/// A handle can dangle when the daemon was killed/crashed before its Hot-tier
+/// CAS bytes were flushed (e.g. a SIGKILL auto-update restart), while the
+/// persisted transcript still references the handle. Rather than fail the whole
+/// turn with a fatal "cas miss", the providers inline this notice — keeping the
+/// `tool_use`/`tool_result` pairing intact (no Anthropic 400) so the
+/// conversation continues, and telling the model plainly that the output is gone.
+pub const CAS_MISS_PLACEHOLDER: &str =
+    "[tool result unavailable: its cached output was lost when the agent daemon restarted]";
+
 /// Inflate any CAS-handle-backed `ToolResult` blocks into inline bytes.
 ///
 /// The daemon stores every tool result as a CAS handle (`handle: Some`,
@@ -193,13 +204,15 @@ pub enum ProviderError {
 /// silently breaks. The Anthropic provider does this with extra Plan-aware
 /// `Reference` downgrading; every other provider can use this plain helper.
 ///
-/// Returns a cloned message vector with handles resolved. Mirrors the Anthropic
-/// provider's loud-failure contract: a handle with no CAS configured, or a CAS
-/// miss, is an error rather than a silently-empty result.
+/// Returns a cloned message vector with handles resolved. A handle present with
+/// no CAS configured is still a hard error (a misconfiguration). A CAS *miss*,
+/// however, degrades gracefully: the result is replaced with
+/// [`CAS_MISS_PLACEHOLDER`] (the payload was lost in a daemon restart) so the
+/// turn continues instead of failing the whole loop.
 ///
 /// # Errors
 /// Returns [`ProviderError::Api`] if a handle is present but no CAS is
-/// configured, or if the CAS lookup fails or misses.
+/// configured, or if the CAS lookup itself errors (a miss does not error).
 pub fn inflate_tool_result_handles(
     messages: &[Message],
     cas: Option<&std::sync::Arc<origin_cas::Store>>,
@@ -218,7 +231,13 @@ pub fn inflate_tool_result_handles(
                         let bytes = store
                             .get(origin_cas::Hash::from_bytes(h))
                             .map_err(|e| ProviderError::Api(format!("cas get: {e}")))?
-                            .ok_or_else(|| ProviderError::Api("cas miss for tool result handle".into()))?;
+                            .unwrap_or_else(|| {
+                                tracing::warn!(
+                                    "cas miss for tool result handle; substituting placeholder \
+                                     (cached output lost across a daemon restart)"
+                                );
+                                CAS_MISS_PLACEHOLDER.as_bytes().to_vec()
+                            });
                         *inline = Some(bytes);
                     }
                 }
