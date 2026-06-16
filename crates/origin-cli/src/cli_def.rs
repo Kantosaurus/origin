@@ -574,6 +574,14 @@ pub enum ScheduleSub {
         spec: String,
         /// Prompt template to run on fire.
         prompt: String,
+        /// Name of a reusable `[profiles.<name>]` variable set (defined in
+        /// `schedule.toml`) to apply when this trigger fires.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Inline per-trigger template variable `KEY=VALUE` (repeatable),
+        /// layered over the named `--profile`.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
     },
     /// List configured triggers and their next fire time.
     Ls,

@@ -91,6 +91,7 @@ const BUILTIN_VERBS: &[(&str, &str)] = &[
     ("mouse", "toggle mouse capture (off to select & copy)"),
     ("theme", "switch palette (default/dark/light/high-contrast)"),
     ("copy", "copy the last reply to the clipboard (OSC 52)"),
+    ("timeline", "view/revert shadow-git checkpoints"),
     ("help", "show the command + keybinding cheatsheet"),
     ("clear", "clear the conversation and goal"),
 ];

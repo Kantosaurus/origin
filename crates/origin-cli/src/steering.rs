@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Mid-turn steering for the interactive CLI.
 //!
-//! While a turn is in flight, text the user types is queued as a steering hint
-//! (via [`origin_steering::SteeringQueue`]) instead of being sent as a fresh
-//! prompt. On the next turn the queued hints are drained into a single block and
-//! appended AFTER the base prompt with [`origin_steering::merge_into_prompt`], so
-//! the cached prefix (system + prior turns + base user text) stays byte-identical
-//! for the provider's prefix cache (gap 8: KV-cache-safe interleaving).
+//! Steering hints are queued via [`origin_steering::SteeringQueue`] instead of
+//! being sent as fresh prompts. On the next turn the queued hints are drained
+//! into a single block and appended AFTER the base prompt with
+//! [`origin_steering::merge_into_prompt`], so the cached prefix (system + prior
+//! turns + base user text) stays byte-identical for the provider's prefix cache
+//! (gap 8: KV-cache-safe interleaving).
 //!
-//! This lands the queue plus a unit-tested cache-safe merge. Capturing keystrokes
-//! from the live TUI event loop into the queue is deferred to keep the wiring
-//! additive and green.
-// TODO(wire): push typed text into `SteeringQueue` from the interactive event
-// loop while a turn is in flight, then call `next_turn_prompt` when assembling
-// the next `ChatRequest`.
+//! This is wired end-to-end: the `/steer <text>` composer command (handled in
+//! `main.rs`'s `handle_submit`) pushes a hint onto `App.steering`, and
+//! [`next_turn_prompt`] is called from `handle_prompt_turn` when assembling the
+//! next turn's prompt, draining the queue into the trailing steering block.
+//!
+//! Deferred (the only remaining sub-feature): auto-capturing free-typed text
+//! *mid-turn* into the steering queue from the live TUI event loop. Today such
+//! text is enqueued as a follow-up message (`App.input.queue_message`) rather
+//! than as a steering hint; only the explicit `/steer` form reaches this queue.
 
 use origin_steering::{merge_into_prompt, SteeringQueue};
 

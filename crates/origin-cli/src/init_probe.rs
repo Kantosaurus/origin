@@ -207,7 +207,11 @@ impl ConnectivityProbe for LiveProbe {
 /// exchange that's beyond v1 scope).
 fn models_endpoint(entry: &ProviderEntry) -> Option<String> {
     match entry.wire {
-        WireFormat::OpenAIChat => Some(openai_models_path(&entry.chat_path)),
+        // Responses-API providers share OpenAI's `/models` listing; the
+        // `/responses` chat path falls through `openai_models_path`'s fallback.
+        WireFormat::OpenAIChat | WireFormat::OpenAIResponses => {
+            Some(openai_models_path(&entry.chat_path))
+        }
         WireFormat::Anthropic => Some("/v1/models".to_string()),
         WireFormat::Gemini => Some("/v1beta/models".to_string()),
         WireFormat::Ollama => Some("/api/tags".to_string()),
@@ -244,7 +248,7 @@ fn parse_models(wire: WireFormat, body: &str) -> Vec<String> {
         Err(_) => return Vec::new(),
     };
     match wire {
-        WireFormat::OpenAIChat | WireFormat::Anthropic => v
+        WireFormat::OpenAIChat | WireFormat::OpenAIResponses | WireFormat::Anthropic => v
             .get("data")
             .and_then(serde_json::Value::as_array)
             .map(|arr| {

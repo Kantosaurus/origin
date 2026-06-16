@@ -47,7 +47,6 @@ pub mod screen;
 pub mod search;
 pub mod status;
 pub mod steering;
-pub mod style;
 pub mod suggestions;
 pub mod theme;
 pub mod trace_cmd;
