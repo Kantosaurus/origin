@@ -111,6 +111,18 @@ pub fn picker_outcome_to_choice(outcome: &picker::PickerOutcome) -> (Vec<usize>,
     }
 }
 
+/// Which edge a scrollback line aligns to.
+///
+/// User prompts render `Right` (a warm band hugging the right edge, classic
+/// me-right chat); the agent and everything else stays `Left`. Defaulting to
+/// `Left` keeps every existing line unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineAlign {
+    #[default]
+    Left,
+    Right,
+}
+
 #[derive(Debug, Clone)]
 pub struct ScrollLine {
     pub text: String,
@@ -123,6 +135,9 @@ pub struct ScrollLine {
     /// (a diff must show the literal bytes). Prose (assistant turns) stays
     /// `false` so markdown still renders.
     pub literal: bool,
+    /// Which edge this line hugs. `Right` only for user prompts; everything
+    /// else stays `Left` (the legacy layout).
+    pub align: LineAlign,
 }
 
 impl ScrollLine {
@@ -133,6 +148,7 @@ impl ScrollLine {
             bg,
             bold,
             literal: false,
+            align: LineAlign::Left,
         }
     }
 
@@ -145,6 +161,21 @@ impl ScrollLine {
             bg,
             bold: false,
             literal: true,
+            align: LineAlign::Left,
+        }
+    }
+
+    /// A right-aligned prose line (the user's prompt). Drawn verbatim in the warm
+    /// `you` tone against the right edge — no inline-markdown parsing, so the
+    /// user's literal bytes show as typed.
+    const fn styled_right(text: String, fg: u32, bold: bool) -> Self {
+        Self {
+            text,
+            fg,
+            bg: 0,
+            bold,
+            literal: false,
+            align: LineAlign::Right,
         }
     }
 }
@@ -911,12 +942,13 @@ impl App {
     pub fn add_line(&mut self, prefix: &str, body: &str) {
         match prefix {
             "you> " => {
+                // Right-aligned warm band — the placement + tone + right rule are
+                // the "you" affordance, so no inline ❯ label is needed.
                 self.scrollback
                     .push(ScrollLine::styled(String::new(), 0, 0, false));
-                self.scrollback.push(ScrollLine::styled(
-                    format!("\u{276F} {body}"),
+                self.scrollback.push(ScrollLine::styled_right(
+                    body.to_string(),
                     self.palette().user,
-                    0,
                     true,
                 ));
                 self.scrollback
@@ -1453,14 +1485,12 @@ impl App {
             let mut visual_lines: Vec<VisualLine<'_>> = Vec::new();
 
             for entry in &self.scrollback {
+                // User prompts wrap into the right band; everything else full-width.
+                let right = entry.align == LineAlign::Right;
+                let wrap_cols = if right { right_band(cols) as usize } else { cols_usize };
                 wrap_into(
-                    &entry.text,
-                    entry.fg,
-                    entry.bg,
-                    entry.bold,
-                    entry.literal,
-                    cols_usize,
-                    &mut visual_lines,
+                    &entry.text, entry.fg, entry.bg, entry.bold, entry.literal, right,
+                    wrap_cols, &mut visual_lines,
                 );
             }
             // Live assistant turn gets an explicit `◆ origin` role header (the one
@@ -1473,7 +1503,7 @@ impl App {
                 .as_ref()
                 .map(|buf| format!("\u{25C6} origin\n  {buf}"));
             if let Some(text) = live_buf.as_deref() {
-                wrap_into(text, tok.origin, 0, false, false, cols_usize, &mut visual_lines);
+                wrap_into(text, tok.origin, 0, false, false, false, cols_usize, &mut visual_lines);
             }
             // Index of the live turn's *last* visual row, used to ride a streaming
             // caret on it. The live buffer is appended last, so when one is in
@@ -2327,9 +2357,10 @@ fn paint_streaming_caret(grid: &mut Grid, row: u16, cols: u16, tok: &crate::tui:
 /// Stage 2/3 of the TUI rework layers three things over the legacy line render:
 ///   * a copper `┃` **spine** in the gutter (col 0) for every non-blank row, so
 ///     the transcript reads as one threaded column;
-///   * **role headers** — a line opening with `❯` becomes the warm `you` header,
-///     and the `◆ origin` marker (prepended to the live assistant turn) renders
-///     in copper — giving the assistant a clear affordance;
+///   * **role placement** — a user prompt (`vl.right`) renders right-aligned in
+///     the warm `you` tone with a mirrored right rule, while the `◆ origin`
+///     marker (prepended to the live assistant turn) renders in copper on the
+///     left — giving each role a clear, asymmetric affordance;
 ///   * **deeper markdown** via [`markdown::render_inline`] (italic/strike/links
 ///     on top of bold/code) for prose, and a **syntax tint** (via
 ///     [`syntax::tint`]) for code-block rows (those carrying the `code_bg`).
@@ -2353,9 +2384,41 @@ fn render_scroll_line(
         }
     }
 
+    // Right-aligned user prompt: a warm band hugging the right edge. Rendered
+    // verbatim (not markdown) so the user's literal bytes show as typed, with a
+    // mirrored copper rule at the far-right column. Placed BEFORE the left-spine
+    // block so right rows never draw a left gutter spine.
+    if vl.right {
+        let w = char_display_width(vl.text);
+        // Exclusive right edge for content; leaves a 1-col gap before the rule at
+        // `cols - 1`.
+        let content_right = cols.saturating_sub(2);
+        let start = content_right.saturating_sub(w).max(1);
+        write_str_styled(
+            grid,
+            row,
+            start,
+            vl.text,
+            content_right,
+            Style {
+                fg: tok.you,
+                bg: 0,
+                bold: vl.bold,
+            },
+        );
+        // Mirrored right accent rule for non-blank rows, in the user tone.
+        if !vl.text.trim_start().is_empty() && cols > 0 {
+            grid.put(
+                row,
+                cols - 1,
+                Cell::new(crate::tui::tokens::glyph::SPINE, tok.you, 0, Attr::PLAIN),
+            );
+        }
+        return;
+    }
+
     let trimmed = vl.text.trim_start();
     // Detect role markers (only on the first wrapped piece, indent == 0).
-    let is_user_header = vl.indent == 0 && trimmed.starts_with('\u{276F}'); // ❯
     let is_origin_header = vl.indent == 0 && trimmed == "\u{25C6} origin"; // ◆ origin
 
     if is_origin_header {
@@ -2368,22 +2431,6 @@ fn render_scroll_line(
             cols,
             Style {
                 fg: tok.origin,
-                bg: 0,
-                bold: true,
-            },
-        );
-    } else if is_user_header {
-        // The user's turn: a warm `you` header, then their message in `you`.
-        let body = trimmed.strip_prefix('\u{276F}').unwrap_or(trimmed).trim_start();
-        let header = format!("you  {body}");
-        write_str_styled(
-            grid,
-            row,
-            2,
-            &header,
-            cols,
-            Style {
-                fg: tok.you,
                 bg: 0,
                 bold: true,
             },
@@ -2536,14 +2583,37 @@ struct VisualLine<'a> {
     /// continuations, which hang under their source line's leading indent
     /// instead of snapping back to column 0.
     indent: u16,
+    /// When `true`, this row is rendered right-aligned (a user prompt). Each row
+    /// is positioned independently against the right edge — `indent` is forced to
+    /// 0 (no hanging indent) since alignment, not a fixed start column, places it.
+    right: bool,
 }
 
+/// Width to wrap a right-aligned user message at: ~3/5 of the terminal, clamped
+/// to leave a left gutter and a right margin + rule. Degrades safely on tiny
+/// grids: on a narrow terminal the upper bound (`cols-4`) drops below the
+/// preferred floor (`min(cols,16)`), so the bounds are ordered as `lo =
+/// min(floor, hi)` BEFORE clamping — `u16::clamp` panics when `min > max`, so
+/// the order must be guaranteed (regression: a raw `clamp(16, cols-4)` crashed
+/// the render on any resize to 1..=19 cols once a user prompt was in scrollback).
+/// Returns 0 only when `cols` is 0. The `u32` intermediate avoids overflow on a
+/// very wide terminal; the result is always `<= cols`, so the `try_from` never
+/// actually fails (the `unwrap_or(cols)` is just a lint-clean fallback).
+fn right_band(cols: u16) -> u16 {
+    let b = u16::try_from(u32::from(cols) * 3 / 5).unwrap_or(cols);
+    let hi = cols.saturating_sub(4);
+    let lo = cols.min(16).min(hi);
+    b.clamp(lo, hi)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn wrap_into<'a>(
     text: &'a str,
     fg: u32,
     bg: u32,
     bold: bool,
     literal: bool,
+    right: bool,
     cols: usize,
     out: &mut Vec<VisualLine<'a>>,
 ) {
@@ -2559,7 +2629,25 @@ fn wrap_into<'a>(
                 bold,
                 literal,
                 indent: 0,
+                right,
             });
+            continue;
+        }
+        if right {
+            // Right-aligned: no hanging indent — every piece is positioned
+            // independently against the right edge by the renderer. Wrap at the
+            // full band width with a flat start column for each row.
+            for piece in wrap_segment_hanging(sub, cols, cols) {
+                out.push(VisualLine {
+                    text: piece,
+                    fg,
+                    bg,
+                    bold,
+                    literal,
+                    indent: 0,
+                    right,
+                });
+            }
             continue;
         }
         // Hanging indent: continuation pieces align under the source line's
@@ -2577,6 +2665,7 @@ fn wrap_into<'a>(
                 bold,
                 literal,
                 indent: if first { 0 } else { clamp_u16(indent) },
+                right,
             });
             first = false;
         }
@@ -2637,7 +2726,7 @@ mod tests {
     #[test]
     fn wrap_respects_unicode_width() {
         let mut lines = Vec::new();
-        wrap_into("ab\u{276F}cd", 0, 0, false, false, 4, &mut lines);
+        wrap_into("ab\u{276F}cd", 0, 0, false, false, false, 4, &mut lines);
         assert_eq!(lines.len(), 2, "wide char should cause wrap at col 4");
     }
 
@@ -2856,6 +2945,7 @@ mod tests {
             bold: false,
             literal: true,
             indent: 0,
+            right: false,
         };
         let tok = crate::tui::tokens::Tokens::default_tokens();
         render_scroll_line(&mut g, 0, &lit, 12, &tok);
@@ -2869,6 +2959,7 @@ mod tests {
             bold: false,
             literal: false,
             indent: 0,
+            right: false,
         };
         render_scroll_line(&mut g2, 0, &prose, 12, &tok);
         assert_eq!(
@@ -2883,7 +2974,7 @@ mod tests {
         let mut lines = Vec::new();
         // 4-space indented tool output, width 12: continuation pieces must
         // hang under the content instead of snapping back to column 0.
-        wrap_into("    abcdef ghij klmn", 0, 0, false, true, 12, &mut lines);
+        wrap_into("    abcdef ghij klmn", 0, 0, false, true, false, 12, &mut lines);
         assert!(
             lines.len() >= 2,
             "must wrap, got {:?}",
@@ -2903,7 +2994,7 @@ mod tests {
         let mut lines = Vec::new();
         // Indent (4) would eat half of the 6-col width — fall back to col 0
         // so pathological narrow terminals never render slivers of text.
-        wrap_into("    abcdefghij", 0, 0, false, true, 6, &mut lines);
+        wrap_into("    abcdefghij", 0, 0, false, true, false, 6, &mut lines);
         assert!(lines.len() >= 2);
         assert!(lines.iter().all(|l| l.indent == 0));
     }
@@ -2918,6 +3009,7 @@ mod tests {
             bold: false,
             literal: true,
             indent: 4,
+            right: false,
         };
         let tok = crate::tui::tokens::Tokens::default_tokens();
         render_scroll_line(&mut g, 0, &vl, 12, &tok);
@@ -2926,6 +3018,153 @@ mod tests {
             u32::from('a'),
             "content starts at the hang column"
         );
+    }
+
+    #[test]
+    fn user_line_is_right_aligned_no_marker() {
+        // The "you> " arm now pushes a right-aligned warm line carrying just the
+        // body — no ❯ marker, no "you  " label.
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.add_line("you> ", "hello");
+        let line = app
+            .scrollback
+            .iter()
+            .find(|l| l.text == "hello")
+            .expect("user body present verbatim");
+        assert_eq!(line.align, LineAlign::Right, "user prompt aligns right");
+        assert!(
+            !line.text.contains('\u{276F}'),
+            "the ❯ marker is dropped from the stored text"
+        );
+        assert!(
+            !app.scrollback.iter().any(|l| l.text.starts_with("you  ")),
+            "no inline `you  ` label is rendered"
+        );
+    }
+
+    #[test]
+    fn right_band_never_panics_on_any_width() {
+        // Regression: `right_band` clamped with `min = cols.min(16)`, `max =
+        // cols-4`, whose min > max for cols in 1..=19 — `u16::clamp` panics on
+        // min > max, crashing the live render on a narrow resize once a user
+        // prompt was in scrollback. Sweep every plausible width and assert it
+        // returns a sane band (and, implicitly, never panics).
+        for cols in 0u16..=200 {
+            let band = right_band(cols);
+            assert!(band <= cols, "band {band} must not exceed cols {cols}");
+        }
+    }
+
+    // Index of the rightmost non-blank cell on `row`, or None if the row is blank.
+    fn rightmost_glyph(g: &Grid, row: u16, cols: u16) -> Option<u16> {
+        let mut last = None;
+        for c in 0..cols {
+            let gl = g.get(row, c).glyph;
+            if gl != 0 && gl != u32::from(' ') {
+                last = Some(c);
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn right_aligned_user_line_hugs_right_edge_with_rule() {
+        let cols: u16 = 40;
+        let mut g = Grid::new(cols, 1);
+        let tok = crate::tui::tokens::Tokens::default_tokens();
+        let vl = VisualLine {
+            text: "hi there",
+            fg: tok.you,
+            bg: 0,
+            bold: true,
+            literal: false,
+            indent: 0,
+            right: true,
+        };
+        render_scroll_line(&mut g, 0, &vl, cols, &tok);
+
+        // The right rule sits at the far-right column, in the user tone.
+        let rule = g.get(0, cols - 1);
+        assert_eq!(
+            rule.glyph,
+            u32::from(crate::tui::tokens::glyph::SPINE),
+            "right rule at col cols-1"
+        );
+        assert_eq!(rule.fg, tok.you, "right rule painted in the user tone");
+
+        // Col 0 must NOT be a left spine on a right row.
+        let g0 = g.get(0, 0).glyph;
+        assert!(
+            g0 == 0 || g0 == u32::from(' '),
+            "no left spine on a right-aligned row, got {g0}"
+        );
+
+        // The text glyphs sit in the right portion of the grid (past the midpoint),
+        // ending just before the 1-col gap and the rule.
+        let w = char_display_width("hi there");
+        let content_right = cols - 2; // exclusive content edge
+        let start = content_right - w; // first glyph column
+        assert!(start > cols / 2, "text starts in the right half (start={start})");
+        assert_eq!(g.get(0, start).glyph, u32::from('h'), "first glyph at computed start");
+        assert_eq!(
+            rightmost_glyph(&g, 0, cols - 1),
+            Some(content_right - 1),
+            "last text glyph hugs the content-right edge (before the gap+rule)"
+        );
+    }
+
+    #[test]
+    fn wrapped_user_message_right_aligns_on_every_row() {
+        // A long body, narrow band: each produced row must independently hug the
+        // right edge (not just the first), with a right rule on each non-blank row.
+        let cols: u16 = 24;
+        let band = right_band(cols);
+        let body = "alpha beta gamma delta epsilon zeta";
+        let mut lines = Vec::new();
+        wrap_into(body, 0, 0, true, false, true, band as usize, &mut lines);
+        assert!(
+            lines.len() >= 2,
+            "must wrap into multiple rows, got {}",
+            lines.len()
+        );
+        assert!(
+            lines.iter().all(|l| l.right && l.indent == 0),
+            "every wrapped piece is right-aligned with indent 0"
+        );
+
+        let tok = crate::tui::tokens::Tokens::default_tokens();
+        for (i, vl) in lines.iter().enumerate() {
+            let mut g = Grid::new(cols, 1);
+            render_scroll_line(&mut g, 0, vl, cols, &tok);
+            let content_right = cols - 2;
+            let w = char_display_width(vl.text);
+            let start = (content_right.saturating_sub(w)).max(1);
+            // The last glyph of this row hugs the content-right edge.
+            assert_eq!(
+                rightmost_glyph(&g, 0, cols - 1),
+                Some(content_right - 1),
+                "row {i} ({:?}) does not hug the right edge",
+                vl.text
+            );
+            // First glyph lands at the computed right-aligned start.
+            let first = vl.text.chars().next().unwrap();
+            assert_eq!(
+                g.get(0, start).glyph,
+                u32::from(first),
+                "row {i} first glyph at the right-aligned start"
+            );
+            // Right rule present, no left spine.
+            assert_eq!(
+                g.get(0, cols - 1).glyph,
+                u32::from(crate::tui::tokens::glyph::SPINE),
+                "row {i} has the right rule"
+            );
+            let g0 = g.get(0, 0).glyph;
+            assert!(
+                g0 == 0 || g0 == u32::from(' '),
+                "row {i} has no left spine"
+            );
+        }
     }
 
     #[test]
