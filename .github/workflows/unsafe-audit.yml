@@ -13,41 +13,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  geiger:
+  unsafe-allowlist:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
-        with:
-          # Tooling job: use stable so `cargo install cargo-geiger` (latest) works.
-          # The unsafe count is toolchain-independent; CI gates the MSRV (1.83).
-          toolchain: stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Install cargo-geiger
-        run: cargo install cargo-geiger --locked
-      - name: Run cargo-geiger
+      # The workspace sets `unsafe_code = "forbid"` in the root Cargo.toml's
+      # [workspace.lints.rust], which the COMPILER enforces as a hard error for
+      # every crate that inherits it via `[lints] workspace = true`. The only way
+      # a crate can use `unsafe` is to inline its own [lints.rust] with
+      # `unsafe_code = "allow"`. So auditing those overrides is a deterministic,
+      # tool-independent equivalent of cargo-geiger — which broke on this virtual
+      # workspace manifest ("requires running against an actual package") and is
+      # not even needed here (the compiler already enforces the policy).
+      - name: Assert unsafe_code override only in approved crates
         run: |
-          cargo geiger --workspace --output-format Json > geiger.json
-      - name: Assert unsafe only in cas/tui/ipc
-        run: |
-          python - <<'PY'
-          import json, sys
-          data = json.load(open('geiger.json'))
-          allowed = {'origin-cas', 'origin-tui', 'origin-ipc'}
-          fail = []
-          for pkg in data['packages']:
-              name = pkg['package']['id']['name']
-              unsafe = pkg['unsafety']['used']
-              total = (unsafe['functions']['unsafe_']
-                       + unsafe['exprs']['unsafe_']
-                       + unsafe['item_impls']['unsafe_']
-                       + unsafe['item_traits']['unsafe_']
-                       + unsafe['methods']['unsafe_'])
-              if total > 0 and name not in allowed and name.startswith('origin-'):
-                  fail.append((name, total))
-          if fail:
-              for n, t in fail:
-                  print(f"FAIL: {n} has {t} unsafe items", file=sys.stderr)
+          python3 - <<'PY'
+          import glob, re, sys
+          # 1) The policy itself must be intact: the root workspace must still
+          #    `forbid` unsafe (otherwise inheriting crates could use unsafe with
+          #    no override for this audit to catch).
+          root = open("Cargo.toml", encoding="utf-8").read()
+          if not re.search(r'^\s*unsafe_code\s*=\s*"forbid"', root, re.M):
+              sys.exit("FAIL: root [workspace.lints.rust] unsafe_code = \"forbid\" is missing")
+          # 2) Crates with a documented `// SAFETY:`-disciplined need for unsafe.
+          #    Adding a crate here is a deliberate review point.
+          ALLOWED = {
+              "origin-alloc",     # global allocator (jemalloc) glue
+              "origin-cas",       # mmap + atomic cursors
+              "origin-keyvault",  # platform secret-store FFI
+              "origin-sandbox",   # seccomp / landlock syscalls
+              "origin-stream",    # raw cursor atomics
+              "origin-tui",       # SIMD (wide::u8x32)
+          }
+          offenders = []
+          for path in sorted(glob.glob("crates/*/Cargo.toml")):
+              text = open(path, encoding="utf-8").read()
+              m = re.search(r'^\s*name\s*=\s*"([^"]+)"', text, re.M)
+              name = m.group(1) if m else path
+              if re.search(r'^\s*unsafe_code\s*=\s*"(allow|warn)"', text, re.M):
+                  if name not in ALLOWED:
+                      offenders.append(name)
+          if offenders:
+              print("FAIL: unsafe_code override found outside the approved allowlist:",
+                    offenders, file=sys.stderr)
+              print("If a crate legitimately needs unsafe, add it to ALLOWED in "
+                    ".github/workflows/unsafe-audit.yml (a deliberate review point).",
+                    file=sys.stderr)
               sys.exit(1)
+          print("OK: unsafe_code override confined to", sorted(ALLOWED))
           PY
