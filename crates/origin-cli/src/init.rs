@@ -62,16 +62,27 @@ impl Role {
 /// Propagates failure from keyvault detection, config-path resolution, the
 /// inner [`run_with`] flow, or the post-init walkthrough.
 pub async fn run() -> Result<()> {
-    // `Stdin` / `Stdout` themselves are Send; only their `.lock()` guards are
-    // not. Wrap stdin in a `BufReader` for `BufRead` semantics — each
-    // `read_line` call acquires and releases the internal lock atomically, so
-    // no `!Send` guard ever spans an `.await`.
-    let r = std::io::BufReader::new(std::io::stdin());
-    let w = std::io::stdout();
+    use std::io::IsTerminal as _;
+
     let vault = KeyVault::detect().map_err(|e| anyhow!("keyvault detect: {e}"))?;
     let cfg_path = config::path().map_err(|e| anyhow!("config path: {e}"))?;
     let probe = LiveProbe::new();
-    run_with(r, w, &vault, &cfg_path, &probe).await?;
+
+    // Interactive TTYs get the crossterm picker; pipes / CI / the scripted
+    // tests keep the line-based wizard (`run_with`) unchanged. This is the only
+    // behavioral fork — `run_with`'s contract is untouched.
+    if std::io::stdin().is_terminal() {
+        let tok = crate::tui::tokens::Tokens::from_palette(crate::theme::Palette::default());
+        crate::onboarding::run_interactive(&vault, &cfg_path, &probe, &tok).await?;
+    } else {
+        // `Stdin` / `Stdout` themselves are Send; only their `.lock()` guards
+        // are not. Wrap stdin in a `BufReader` for `BufRead` semantics — each
+        // `read_line` call acquires and releases the internal lock atomically,
+        // so no `!Send` guard ever spans an `.await`.
+        let r = std::io::BufReader::new(std::io::stdin());
+        let w = std::io::stdout();
+        run_with(r, w, &vault, &cfg_path, &probe).await?;
+    }
     // Optional Tavily step — kept outside `run_with` so the existing test
     // scripts stay focused on the config-capture loop. Fresh stdin/stdout
     // because `run_with` consumed its own.
@@ -348,7 +359,11 @@ fn pick_provider<R: BufRead, W: Write>(r: &mut R, w: &mut W, cat: &Catalog) -> R
 
 /// Capture the credential matching the provider's [`AuthScheme`]. Persists
 /// directly to the vault; `None` / `Custom` do nothing beyond a notice.
-async fn capture_credentials<R: BufRead + Send, W: Write + Send>(
+///
+/// `pub(crate)` so the interactive onboarding flow
+/// ([`crate::onboarding::flow`]) reuses the exact same credential capture and
+/// vault persistence instead of duplicating it.
+pub(crate) async fn capture_credentials<R: BufRead + Send, W: Write + Send>(
     r: &mut R,
     w: &mut W,
     vault: &KeyVault,
@@ -424,7 +439,10 @@ async fn capture_credentials<R: BufRead + Send, W: Write + Send>(
 
 /// Run the probe and print a one-line summary. Returns the result; the
 /// caller decides whether the retry loop fires.
-async fn run_probe<W: Write + Send>(
+///
+/// `pub(crate)` so the interactive onboarding flow reuses the same probe call
+/// and one-line summary rather than re-implementing the `/models` check.
+pub(crate) async fn run_probe<W: Write + Send>(
     w: &mut W,
     probe: &dyn ConnectivityProbe,
     entry: &ProviderEntry,
@@ -486,17 +504,7 @@ fn pick_model<R: BufRead, W: Write>(
 
     // Sort the list with the catalog default first so a bare Enter selects
     // it. Other models follow in the order the provider returned them.
-    let mut ordered: Vec<String> = Vec::with_capacity(probe_result.models.len());
-    if probe_result.models.iter().any(|m| m == default) {
-        ordered.push(default.to_string());
-        for m in &probe_result.models {
-            if m != default {
-                ordered.push(m.clone());
-            }
-        }
-    } else {
-        ordered.extend(probe_result.models.iter().cloned());
-    }
+    let ordered = order_models(&probe_result.models, default);
 
     writeln!(w, "Available models for {}:", entry.id)?;
     for (i, m) in ordered.iter().enumerate() {
@@ -536,6 +544,27 @@ fn pick_model<R: BufRead, W: Write>(
         }
         writeln!(w, "  (out of range; try again)")?;
     }
+}
+
+/// Order a probed model list with `default` first (when present), preserving
+/// the provider's original order for the rest.
+///
+/// Factored out of [`pick_model`] so the interactive onboarding flow's
+/// `model_rows` builder shares the exact same default-first ordering as the
+/// line-based wizard.
+pub(crate) fn order_models(models: &[String], default: &str) -> Vec<String> {
+    let mut ordered: Vec<String> = Vec::with_capacity(models.len());
+    if models.iter().any(|m| m == default) {
+        ordered.push(default.to_string());
+        for m in models {
+            if m != default {
+                ordered.push(m.clone());
+            }
+        }
+    } else {
+        ordered.extend(models.iter().cloned());
+    }
+    ordered
 }
 
 const fn wire_section_label(w: WireFormat) -> &'static str {
