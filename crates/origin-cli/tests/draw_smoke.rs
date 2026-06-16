@@ -47,6 +47,67 @@ fn live_assistant_buffer_renders_in_main() {
     assert!(s.contains("hello world"));
 }
 
+/// Streaming caret (INT-5 motion pass): while a turn is in flight, a `▌`
+/// (U+258C) in the accent color must ride immediately after the last glyph of
+/// the live assistant text; once the turn finalizes into scrollback, no caret
+/// may remain (finalized text is static).
+#[test]
+fn streaming_caret_rides_live_text_and_vanishes_on_finalize() {
+    const CARET: u32 = 0x258C; // ▌ — must match tui::tokens::glyph::CARET
+
+    let render = |app: &mut App| -> (bool, bool) {
+        // Returns (caret_present, caret_immediately_after_text). The grid is
+        // scanned for the caret glyph and, when found, the cell to its left is
+        // checked to be a non-blank text glyph (the caret hugs the text).
+        let mut composer = Composer::new(40, 12);
+        let mut widget = StreamWidget::new(Rect {
+            row: 0,
+            col: 0,
+            cols: 40,
+            rows: 11,
+        });
+        app.draw(&mut composer, &mut widget);
+        let grid = composer.main_grid();
+        let mut present = false;
+        let mut hugs_text = false;
+        for r in 0..grid.rows() {
+            for c in 0..grid.cols() {
+                if grid.get(r, c).glyph == CARET {
+                    present = true;
+                    if c > 0 {
+                        let left = grid.get(r, c - 1).glyph;
+                        // Left neighbor is real text (not blank/space).
+                        if left != 0 && left != u32::from(' ') {
+                            hugs_text = true;
+                        }
+                    }
+                }
+            }
+        }
+        (present, hugs_text)
+    };
+
+    let mut app = App::new(
+        "anthropic",
+        "claude-opus-4-7".to_string(),
+        CompletionSources::default(),
+    );
+    app.start_assistant_turn();
+    app.append_to_current_assistant("hi there");
+    let (present, hugs) = render(&mut app);
+    assert!(present, "a streaming caret must render while the turn is in flight");
+    assert!(hugs, "the caret must sit immediately after the live text");
+
+    // Finalizing the turn flushes the buffer into scrollback and clears the
+    // live buffer, so the caret must disappear.
+    app.finalize_assistant_turn(1);
+    let (present_after, _) = render(&mut app);
+    assert!(
+        !present_after,
+        "no caret may remain once the turn finalizes into scrollback"
+    );
+}
+
 /// Regression: the input card is drawn over a band of rows near the bottom
 /// of the message area. The scrollback viewport must stop at the card's top
 /// edge, otherwise the lines that would land on the card's rows are

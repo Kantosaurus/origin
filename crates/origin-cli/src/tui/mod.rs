@@ -26,7 +26,7 @@ mod transcript;
 
 use std::time::{Duration, Instant};
 
-use origin_tui::composer::{Composer, PROMPT_ROWS};
+use origin_tui::composer::Composer;
 use origin_tui::grid::{Attr, Cell, Grid};
 use origin_tui::stream_widget::StreamWidget;
 use origin_tui::widgets::plan_panel::PlanLine;
@@ -526,14 +526,20 @@ fn git_branch_short() -> Option<String> {
     }
 }
 
-const BANNER: &[&str] = &[
-    " \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2588}\u{2557}   \u{2588}\u{2588}\u{2557}",
-    "\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D} \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}  \u{2588}\u{2588}\u{2551}",
-    "\u{2588}\u{2588}\u{2551}   \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255D}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}  \u{2588}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2554}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2551}",
-    "\u{2588}\u{2588}\u{2551}   \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}   \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}\u{255A}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}",
-    "\u{255A}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255D}\u{2588}\u{2588}\u{2551}  \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}\u{255A}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255D}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551} \u{255A}\u{2588}\u{2588}\u{2588}\u{2588}\u{2551}",
-    " \u{255A}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D} \u{255A}\u{2550}\u{255D}  \u{255A}\u{2550}\u{255D}\u{255A}\u{2550}\u{255D} \u{255A}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D} \u{255A}\u{2550}\u{255D}\u{255A}\u{2550}\u{255D}  \u{255A}\u{2550}\u{2550}\u{2550}\u{255D}",
-];
+/// The compact first-run wordmark line. Seeded verbatim as `◆ origin` so
+/// `render_scroll_line`'s `is_origin_header` path paints it in copper + bold —
+/// byte-identical to the live turn's `◆ origin` role header, so identity reads
+/// consistently. The old multi-line block-art banner is retired (spec §"Motion"
+/// / §"Identity / wordmark"): the persistent top chrome strip now carries
+/// identity (◆ origin · model · cwd · branch · clock · ctx%), so a giant
+/// scroll-away banner is redundant.
+const WORDMARK: &str = "\u{25C6} origin";
+
+/// The one-line first-run tip seeded under the wordmark. Tells a new user how to
+/// reach the two most useful affordances (`/` skills, `@` file mentions) without
+/// the old banner's bulk.
+const FIRST_RUN_TIP: &str =
+    "Ask anything — type your task and press \u{23CE}.  / browses skills · @ mentions files";
 
 impl App {
     #[must_use]
@@ -836,34 +842,37 @@ impl App {
         self.suggestions = crate::suggestions::suggest(self.input.buffer(), &self.sources);
     }
 
-    pub fn push_banner(&mut self, cols: u16, rows: u16) {
-        let main_rows = rows.saturating_sub(PROMPT_ROWS) as usize;
-        let content_height = BANNER.len() + 4;
-        let card_height = 4usize;
-        let group = content_height + 2 + card_height;
-        let top_pad = main_rows.saturating_sub(group) / 2;
-
-        for _ in 0..top_pad {
-            self.scrollback
-                .push(ScrollLine::styled(String::new(), 0, 0, false));
-        }
-        for line in BANNER {
-            let w = char_display_width(line) as usize;
-            let pad = (cols as usize).saturating_sub(w) / 2;
-            let padded = format!("{:>width$}{line}", "", width = pad);
-            self.scrollback
-                .push(ScrollLine::styled(padded, self.palette().accent_dim, 0, false));
-        }
-        for _ in 0..3 {
-            self.scrollback
-                .push(ScrollLine::styled(String::new(), 0, 0, false));
-        }
-        let tip = "\u{25CF} Tip  Type / to browse skills and workflows";
-        let tw = char_display_width(tip) as usize;
-        let tpad = (cols as usize).saturating_sub(tw) / 2;
-        let padded_tip = format!("{:>width$}{tip}", "", width = tpad);
+    /// Seed the first-run greeting: a single compact `◆ origin` wordmark line
+    /// plus one short tip. Replaces the retired multi-line ASCII block-art banner
+    /// (spec §"Identity / wordmark") — the persistent top chrome strip now owns
+    /// identity, so the greeting stays minimal and tasteful.
+    ///
+    /// `cols`/`rows` are kept in the signature (call sites + the `reset_to_login`
+    /// parity test pass them) but the greeting no longer centers itself in the
+    /// viewport: it's a two-row header pinned to the top of the transcript, the
+    /// way a real prompt-first terminal reads.
+    pub fn push_banner(&mut self, _cols: u16, _rows: u16) {
+        let tok = crate::tui::tokens::Tokens::from_palette(self.palette());
+        // One leading blank for breathing room above the wordmark.
         self.scrollback
-            .push(ScrollLine::styled(padded_tip, self.palette().muted, 0, false));
+            .push(ScrollLine::styled(String::new(), 0, 0, false));
+        // The wordmark: seeded verbatim as `◆ origin` (indent 0) so the
+        // `is_origin_header` render path paints `◆` in `tok.accent` + bold and
+        // "origin" alongside it — consistent with the live turn header.
+        // (The flat single-fg scrollline can't split the glyph/word into two
+        // tones, so both ride the one copper header style the renderer already
+        // applies; this is the intended identity color.)
+        self.scrollback
+            .push(ScrollLine::styled(WORDMARK.to_string(), tok.origin, 0, true));
+        // The tip, hang-indented under the wordmark in muted text.
+        self.scrollback.push(ScrollLine::styled(
+            format!("  {FIRST_RUN_TIP}"),
+            tok.muted,
+            0,
+            false,
+        ));
+        self.scrollback
+            .push(ScrollLine::styled(String::new(), 0, 0, false));
     }
 
     /// Wipe the in-session TUI view and restore the just-launched look, so
@@ -1454,24 +1463,25 @@ impl App {
                     &mut visual_lines,
                 );
             }
-            let live_buf;
-            if let Some(buf) = self.current_assistant.as_ref() {
-                // Live assistant turn gets an explicit `◆ origin` role header
-                // (the one turn boundary the flat model still knows), then the
-                // streamed prose — markdown-parsed live (literal=false) so
-                // headings/code style as they stream rather than snapping at
-                // finalize.
-                live_buf = format!("\u{25C6} origin\n  {buf}");
-                wrap_into(
-                    &live_buf,
-                    tok.origin,
-                    0,
-                    false,
-                    false,
-                    cols_usize,
-                    &mut visual_lines,
-                );
+            // Live assistant turn gets an explicit `◆ origin` role header (the one
+            // turn boundary the flat model still knows), then the streamed prose —
+            // markdown-parsed live (literal=false) so headings/code style as they
+            // stream rather than snapping at finalize. Owned outside the wrap so
+            // the `&str` slices in `visual_lines` outlive it.
+            let live_buf = self
+                .current_assistant
+                .as_ref()
+                .map(|buf| format!("\u{25C6} origin\n  {buf}"));
+            if let Some(text) = live_buf.as_deref() {
+                wrap_into(text, tok.origin, 0, false, false, cols_usize, &mut visual_lines);
             }
+            // Index of the live turn's *last* visual row, used to ride a streaming
+            // caret on it. The live buffer is appended last, so when one is in
+            // flight its final wrapped piece is the last element. `None` when no
+            // turn is in flight (finalized scrollback therefore never carries a
+            // caret — the buffer is `take`n on finalize).
+            let live_last_idx: Option<usize> =
+                live_buf.as_ref().and_then(|_| visual_lines.len().checked_sub(1));
 
             let total = visual_lines.len();
             let visible = scrollback_limit;
@@ -1484,12 +1494,25 @@ impl App {
             let picker_h_u16 = clamp_u16(picker_h);
             let transcript_bottom = at_bottom.saturating_sub(picker_h_u16);
             let mut row: u16 = transcript_top;
-            for vl in visual_lines.iter().skip(skip).take(visible) {
-                if row >= transcript_bottom {
-                    break;
+            let last_painted_row = paint_transcript_rows(
+                main, &visual_lines, skip, visible, &mut row, transcript_bottom, cols, &tok,
+            );
+
+            // ── Streaming caret (Stage 9, Motion) ────────────────────────────
+            // While a turn is in flight, ride a `▌` (in `accent`) after the last
+            // glyph of the live assistant text on its last visual row. Drawn as a
+            // single cell so the dirty-only diff repaints just that cell, and
+            // absent once the turn finalizes (the live buffer is `take`n, so
+            // `live_last_idx` is `None`).
+            // deferred: the per-running-tool micro-spinner + ▸→✔ completion tick
+            // (spec §Motion) need structured tool-block data the flat scrollback
+            // model doesn't carry yet — out of scope for this pass.
+            if let Some(idx) = live_last_idx {
+                // The live turn's last visual line lands at `transcript_top +
+                // (idx - skip)` iff it's within the painted window.
+                if let Some(crow) = caret_row_for(idx, skip, transcript_top, last_painted_row) {
+                    paint_streaming_caret(main, crow, cols, &tok);
                 }
-                render_scroll_line(main, row, vl, cols, &tok);
-                row = row.saturating_add(1);
             }
 
             // ── Interactive picker (Stage 5b) ────────────────────────────────
@@ -2213,6 +2236,86 @@ fn write_span(grid: &mut Grid, row: u16, col: u16, s: &str, max_cols: u16, style
         c += w;
     }
     c
+}
+
+/// Paint the visible transcript rows (`visual_lines[skip..]`, capped at
+/// `visible` and at `transcript_bottom`) starting at `*row`, advancing `*row`
+/// per painted line. Returns the first row past the last painted line (the
+/// exclusive bottom of the painted window), so the caller can tell which visual
+/// lines actually made it on screen. Extracted from `draw` to keep it under the
+/// line cap.
+#[allow(clippy::too_many_arguments)]
+fn paint_transcript_rows(
+    grid: &mut Grid,
+    visual_lines: &[VisualLine<'_>],
+    skip: usize,
+    visible: usize,
+    row: &mut u16,
+    transcript_bottom: u16,
+    cols: u16,
+    tok: &crate::tui::tokens::Tokens,
+) -> u16 {
+    for vl in visual_lines.iter().skip(skip).take(visible) {
+        if *row >= transcript_bottom {
+            break;
+        }
+        render_scroll_line(grid, *row, vl, cols, tok);
+        *row = row.saturating_add(1);
+    }
+    *row
+}
+
+/// The grid row the live turn's last visual line (`idx`) landed on, or `None`
+/// when it scrolled out of the painted window. The painted window covers visual
+/// indices `[skip, ..)` mapped to rows `[transcript_top, last_painted_row)`, so
+/// `idx` is on screen iff `idx >= skip` and its row is below `last_painted_row`.
+fn caret_row_for(
+    idx: usize,
+    skip: usize,
+    transcript_top: u16,
+    last_painted_row: u16,
+) -> Option<u16> {
+    let offset_in_window = idx.checked_sub(skip)?;
+    let crow = transcript_top.saturating_add(clamp_u16(offset_in_window));
+    (crow < last_painted_row).then_some(crow)
+}
+
+/// Paint the streaming caret (`▌`, in `accent`) on `row`, immediately after the
+/// last rendered glyph of the live assistant text.
+///
+/// Scans the already-painted row from the right for the last non-blank cell.
+/// Reading the *rendered* grid keeps this accurate even after inline-markdown
+/// markers are stripped, then places the caret in the first column past it.
+/// Respects width: the caret is one cell wide and is placed only when a free
+/// column remains before `cols`; on a full row it is skipped (never wrapped onto
+/// a new row), so the cell accounting below is never disturbed. Only this one
+/// cell changes frame-to-frame, keeping the dirty-only/damage-diff repaint minimal.
+fn paint_streaming_caret(grid: &mut Grid, row: u16, cols: u16, tok: &crate::tui::tokens::Tokens) {
+    if cols == 0 {
+        return;
+    }
+    // Find the rightmost occupied cell. A wide-glyph continuation counts as
+    // occupied so the caret lands past the full wide glyph, not on its tail.
+    let mut last_occupied: Option<u16> = None;
+    for col in 0..cols {
+        let cell = grid.get(row, col);
+        let blank = cell.glyph == 0 || cell.glyph == u32::from(' ');
+        if !blank || cell.is_continuation() {
+            last_occupied = Some(col);
+        }
+    }
+    // The first free column after the text; an empty row (no content yet) sits
+    // the caret at col 0 so an empty live turn still shows it.
+    let caret_col = last_occupied.map_or(0, |c| c.saturating_add(1));
+    if caret_col >= cols {
+        // Row is full — skip rather than overflow or wrap onto the next row.
+        return;
+    }
+    grid.put(
+        row,
+        caret_col,
+        Cell::new(crate::tui::tokens::glyph::CARET, tok.accent, 0, Attr::PLAIN),
+    );
 }
 
 /// Render one wrapped visual line into the grid.
