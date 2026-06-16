@@ -4,8 +4,14 @@
 use origin_browser::agent_browser::AgentBrowserClient;
 use origin_browser::protocol::Verb;
 
+mod common;
+
 #[tokio::test]
 async fn round_trips_a_verb_through_the_fake_cli() {
+    if !common::node_available() {
+        eprintln!("skipping round_trips_a_verb_through_the_fake_cli: `node` unavailable");
+        return;
+    }
     let fake = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fakes/agent_browser_fake.mjs");
     let mut client = AgentBrowserClient::spawn_with_command("node", &[fake.to_str().unwrap()])
         .await

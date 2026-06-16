@@ -138,6 +138,29 @@ impl MemoryStore {
         vector: &[f32; crate::EMBED_DIM],
         tags: &[&str],
     ) -> Result<MemoryId, StorageError> {
+        self.save_at(body, vector, tags, now_ms())
+    }
+
+    /// Like [`Self::save`], but stamps `created_at`/`last_seen_at` with an
+    /// explicit `created_at_ms` instead of the wall clock.
+    ///
+    /// Useful for deterministic ordering (e.g. imports/backfill, and tests that
+    /// must guarantee strictly-distinct creation timestamps without racing the
+    /// platform timer resolution). The minted [`MemoryId`] ULID's timestamp bits
+    /// also derive from `created_at_ms`, so distinct timestamps yield distinct
+    /// `memory_id_to_u64` ids; the ULID's random component keeps the full id
+    /// unique even when two calls share a millisecond.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::NoQuantizer`] if no quantizer has been installed.
+    /// Propagates SQL and CAS errors.
+    pub fn save_at(
+        &self,
+        body: &str,
+        vector: &[f32; crate::EMBED_DIM],
+        tags: &[&str],
+        created_at_ms: i64,
+    ) -> Result<MemoryId, StorageError> {
         // --- Quantise ---
         let encoded = {
             let guard = self.q_cache.read();
@@ -155,8 +178,18 @@ impl MemoryStore {
         let preview = truncate_to_64_bytes(body);
 
         // --- Timestamp ---
-        let now_ms = now_ms();
-        let id = Ulid::new();
+        let now_ms = created_at_ms;
+        // Mint the ULID from `created_at_ms` so its high 48 timestamp bits track
+        // the stored creation time. The normal `save` path passes `now_ms()`, so
+        // this matches the previous `Ulid::new()` behaviour there; for `save_at`
+        // with explicit timestamps it additionally guarantees that two distinct
+        // `created_at_ms` values yield distinct `memory_id_to_u64` (ULID high
+        // bits) ids — the random component still keeps the full ULID unique when
+        // timestamps collide. `from_datetime` clamps pre-epoch times.
+        let id = u64::try_from(created_at_ms).map_or_else(
+            |_| Ulid::new(),
+            |ms| Ulid::from_datetime(unix_ms_to_systemtime(ms)),
+        );
 
         // --- Tag resolution + memory INSERT (single atomic transaction) ---
         // Reinterpret i8 bytes as u8 for BLOB storage; bit pattern is preserved.
@@ -597,6 +630,12 @@ fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Convert a non-negative Unix-epoch millisecond count to a [`SystemTime`].
+/// Used to mint a ULID whose timestamp bits match a row's `created_at_ms`.
+fn unix_ms_to_systemtime(ms: u64) -> SystemTime {
+    UNIX_EPOCH + std::time::Duration::from_millis(ms)
 }
 
 /// Re-wrap a `RefError` into a `rusqlite::Error` so it can flow through the

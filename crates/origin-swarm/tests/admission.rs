@@ -18,7 +18,7 @@ use origin_swarm::{
     ReportStatus, ScriptedProbe, Usage, WorkerContext, WorkerFn, WorkerSpec,
 };
 use tempfile::TempDir;
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Barrier, Mutex as TokioMutex};
 
 const GIB: u64 = 1 << 30;
 const NEVER: Duration = Duration::from_secs(3600);
@@ -45,15 +45,34 @@ fn gate(probe: ScriptedProbe, cfg: GateCfg) -> Arc<AdmissionGate> {
     Arc::new(AdmissionGate::with_probe(Arc::new(probe), cfg))
 }
 
-/// Admit, holding every ticket, until the gate parks (the next admit can't be
-/// granted within `budget`). Returns the held tickets — their count is the
-/// concurrency the gate allowed.
-async fn collect_until_park(g: &Arc<AdmissionGate>, budget: Duration) -> Vec<AdmissionTicket> {
+/// Admit, holding every ticket, until the gate parks. Returns the held tickets —
+/// their count is the concurrency the gate allowed.
+///
+/// A *granted* admit returns synchronously (no I/O), so it never approaches the
+/// `budget` ceiling no matter how loaded the runner is; only a genuine park —
+/// where `admit()` awaits the gate's notify/poll — can hit it. (These tests use
+/// `poll = NEVER` and hold every ticket, so a parked admit will never resume on
+/// its own.) The ceiling is therefore set GENEROUSLY (2s) so a slow runner can
+/// never mistake a would-succeed admit for a park, and a park is only declared
+/// once it is SUSTAINED across `CONFIRM` consecutive timeouts — absorbing any
+/// lone scheduler hiccup — keeping the asserted counts exact.
+async fn collect_until_park(g: &Arc<AdmissionGate>) -> Vec<AdmissionTicket> {
+    const CEILING: Duration = Duration::from_secs(2);
+    const CONFIRM: u32 = 2;
     let mut held = Vec::new();
-    while let Ok(t) = tokio::time::timeout(budget, g.admit()).await {
-        held.push(t);
+    let mut timeouts = 0u32;
+    loop {
+        if let Ok(t) = tokio::time::timeout(CEILING, g.admit()).await {
+            held.push(t); // admitted ⇒ keep collecting
+            timeouts = 0; // reset: a grant breaks any tentative park streak
+        } else {
+            timeouts += 1;
+            if timeouts >= CONFIRM {
+                return held; // sustained park (CONFIRM consecutive timeouts) ⇒ done
+            }
+            // Lone timeout: re-probe once more before concluding.
+        }
     }
-    held
 }
 
 // RED 2 — the >=1 forward-progress floor admits even at zero free memory.
@@ -88,7 +107,7 @@ async fn zero_ceilings_serialize_never_deadlock() {
             poll: NEVER,
         },
     ));
-    let held = collect_until_park(&g, Duration::from_millis(100)).await;
+    let held = collect_until_park(&g).await;
     assert_eq!(
         held.len(),
         1,
@@ -104,7 +123,7 @@ async fn admit_tracks_scripted_memory() {
         ScriptedProbe::constant(8 * GIB, 16 * GIB),
         cfg(GIB, GIB, 100, None, NEVER),
     );
-    let held = collect_until_park(&g, Duration::from_millis(100)).await;
+    let held = collect_until_park(&g).await;
     assert_eq!(
         held.len(),
         7,
@@ -202,7 +221,7 @@ async fn hard_max_overrides_memory() {
         ScriptedProbe::constant(64 * GIB, 64 * GIB),
         cfg(GIB, GIB, 100, Some(3), NEVER),
     );
-    let held = collect_until_park(&g, Duration::from_millis(100)).await;
+    let held = collect_until_park(&g).await;
     assert_eq!(
         held.len(),
         3,
@@ -218,7 +237,7 @@ async fn probe_unavailable_degrades_to_bounded() {
         Arc::new(NullProbe),
         cfg(GIB, GIB, 3, None, NEVER),
     ));
-    let held = collect_until_park(&g, Duration::from_millis(100)).await;
+    let held = collect_until_park(&g).await;
     assert_eq!(
         held.len(),
         3,
@@ -233,7 +252,7 @@ async fn hard_max_one_serializes() {
         ScriptedProbe::constant(64 * GIB, 64 * GIB),
         cfg(GIB, GIB, 100, Some(1), NEVER),
     );
-    let held = collect_until_park(&g, Duration::from_millis(100)).await;
+    let held = collect_until_park(&g).await;
     assert_eq!(
         held.len(),
         1,
@@ -339,13 +358,31 @@ fn spec(goal: &str) -> WorkerSpec {
 }
 
 /// A worker that records the peak number of simultaneously-running workers.
-fn peak_worker(current: Arc<AtomicUsize>, max_seen: Arc<AtomicUsize>) -> WorkerFn {
+///
+/// Synchronization is explicit, not timing-based:
+/// - `Some(barrier)` ⇒ the worker bumps the counter, then blocks on the barrier
+///   until `barrier`'s party count have all arrived, so they provably overlap
+///   regardless of scheduling. Use for the generous-gate test.
+/// - `None` ⇒ a gate that serializes (`hard_max=1`) only ever lets one worker run,
+///   so it could never reach a multi-party barrier; a short hold suffices to let
+///   any (wrongly) co-scheduled worker register a peak > 1.
+fn peak_worker(
+    current: Arc<AtomicUsize>,
+    max_seen: Arc<AtomicUsize>,
+    barrier: Option<Arc<Barrier>>,
+) -> WorkerFn {
     Arc::new(move |ctx: WorkerContext| {
-        let (cur, mx) = (Arc::clone(&current), Arc::clone(&max_seen));
+        let (cur, mx, bar) = (Arc::clone(&current), Arc::clone(&max_seen), barrier.clone());
         Box::pin(async move {
             let now = cur.fetch_add(1, Ordering::SeqCst) + 1;
             mx.fetch_max(now, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            if let Some(b) = bar {
+                // All parties must arrive before any leaves ⇒ forced overlap.
+                b.wait().await;
+            } else {
+                // No barrier: hold briefly so a serialization bug would surface.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             cur.fetch_sub(1, Ordering::SeqCst);
             Ok(CompletionReport {
                 goal: ctx.spec.goal.clone(),
@@ -374,7 +411,10 @@ async fn coordinator_serializes_under_tight_gate() {
 
     let current = Arc::new(AtomicUsize::new(0));
     let max_seen = Arc::new(AtomicUsize::new(0));
-    let worker = peak_worker(Arc::clone(&current), Arc::clone(&max_seen));
+    // No barrier: a hard_max=1 gate must serialize, so a multi-party barrier could
+    // never be satisfied. The short hold inside `peak_worker` is enough for a
+    // serialization bug (two workers co-scheduled) to record a peak of 2.
+    let worker = peak_worker(Arc::clone(&current), Arc::clone(&max_seen), None);
 
     let h1 = coord.spawn_with(spec("a"), Arc::clone(&worker)).await.unwrap();
     let h2 = coord.spawn_with(spec("b"), Arc::clone(&worker)).await.unwrap();
@@ -394,6 +434,7 @@ async fn coordinator_serializes_under_tight_gate() {
 // fixed cap, is what bounds concurrency.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn coordinator_parallelizes_under_generous_gate() {
+    const WORKERS: usize = 3;
     let tmp = TempDir::new().unwrap();
     let generous = gate(
         ScriptedProbe::constant(64 * GIB, 64 * GIB),
@@ -403,7 +444,10 @@ async fn coordinator_parallelizes_under_generous_gate() {
 
     let current = Arc::new(AtomicUsize::new(0));
     let max_seen = Arc::new(AtomicUsize::new(0));
-    let worker = peak_worker(Arc::clone(&current), Arc::clone(&max_seen));
+    // A 3-party barrier: each admitted worker blocks until all three have arrived,
+    // proving they overlap without depending on a fixed sleep window.
+    let barrier = Arc::new(Barrier::new(WORKERS));
+    let worker = peak_worker(Arc::clone(&current), Arc::clone(&max_seen), Some(barrier));
 
     let h1 = coord.spawn_with(spec("a"), Arc::clone(&worker)).await.unwrap();
     let h2 = coord.spawn_with(spec("b"), Arc::clone(&worker)).await.unwrap();
@@ -414,7 +458,7 @@ async fn coordinator_parallelizes_under_generous_gate() {
 
     assert_eq!(
         max_seen.load(Ordering::SeqCst),
-        3,
+        WORKERS,
         "a generous memory gate must let all three workers run concurrently"
     );
 }

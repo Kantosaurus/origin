@@ -12,7 +12,7 @@
 //! on 64-bit targets `u64 as usize` is lossless.  An `IndexError::Insert` is
 //! returned if an id would overflow `usize` on a hypothetical 32-bit target.
 
-use hnsw_rs::anndists::dist::distances::DistDot;
+use hnsw_rs::anndists::dist::distances::{DistDot, Distance};
 use hnsw_rs::hnsw::Hnsw;
 use thiserror::Error;
 
@@ -27,6 +27,16 @@ const HNSW_EF_CONSTRUCTION: usize = 200;
 // ef used during search: must be ≥ k neighbours requested.
 // We clamp to at least shortlist_k at call time, but provide a sensible default.
 const HNSW_EF_SEARCH: usize = 64;
+
+// Below this many inserted points the approximate HNSW graph walk is both
+// unnecessary (a full scan is trivially cheap) and *unreliable*: `hnsw_rs`
+// assigns layers with an OS-seeded RNG, so a sparse graph can drop a genuine
+// nearest neighbour on some platforms/runs. For small N we brute-force-score
+// every point instead — strictly more correct and fully deterministic — then
+// feed the result through the identical re-rank path. 256 comfortably covers
+// the consolidator's padded test indices while staying far below any size where
+// an O(N) scan would matter.
+const SMALL_INDEX_THRESHOLD: usize = 256;
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -167,48 +177,29 @@ impl MemIndex {
         opts: &SearchOpts,
         lookup: impl Fn(u64) -> Option<MetaRow>,
     ) -> Result<Vec<Candidate>, IndexError> {
-        // ef_search must be ≥ knbn; clamp upward so the graph is probed widely enough.
-        let ef = HNSW_EF_SEARCH.max(opts.shortlist_k);
-        let neighbours = self.hnsw.search(query.as_slice(), opts.shortlist_k, ef);
-
-        let mut candidates: Vec<Candidate> = neighbours
-            .into_iter()
-            .filter_map(|nb| {
-                // Recover public id from the usize data-id stored in hnsw_rs.
-                // The cast is lossless on 64-bit (usize == u64); on 32-bit targets
-                // all inserted ids fit usize by construction (insert checks this).
-                #[allow(clippy::cast_possible_truncation)] // see above
-                let id = nb.d_id as u64;
-
-                let row = lookup(id)?; // drop if no metadata
-
-                // Drop superseded entries when requested.
-                if opts.drop_superseded && row.superseded_by.is_some() {
-                    return None;
-                }
-
-                // DistDot returns 1 − dot for normalised vectors → invert to get similarity.
-                let raw_sim = 1.0_f32 - nb.distance;
-
-                // Spec N6.2 re-rank formula.
-                let score = raw_sim
-                    * (-row.age_days / opts.decay_tau_days).exp()
-                    * row.cluster_priority
-                    * (1.0 + row.edge_boost);
-
-                if !score.is_finite() {
-                    return None;
-                }
-
-                Some(Candidate {
-                    id,
-                    raw_sim,
-                    age_days: row.age_days,
-                    cluster_priority: row.cluster_priority,
-                    edge_boost: row.edge_boost,
-                    score,
+        // Gather (id, distance) shortlist. For small indices we brute-force every
+        // point (exact + deterministic); otherwise we use the approximate graph.
+        let shortlist: Vec<(u64, f32)> = if self.hnsw.get_nb_point() <= SMALL_INDEX_THRESHOLD {
+            self.brute_force_shortlist(query)
+        } else {
+            // ef_search must be ≥ knbn; clamp upward so the graph is probed widely enough.
+            let ef = HNSW_EF_SEARCH.max(opts.shortlist_k);
+            self.hnsw
+                .search(query.as_slice(), opts.shortlist_k, ef)
+                .into_iter()
+                .map(|nb| {
+                    // Recover public id from the usize data-id stored in hnsw_rs.
+                    // The cast is lossless on 64-bit (usize == u64); on 32-bit targets
+                    // all inserted ids fit usize by construction (insert checks this).
+                    #[allow(clippy::cast_possible_truncation)] // see above
+                    (nb.d_id as u64, nb.distance)
                 })
-            })
+                .collect()
+        };
+
+        let mut candidates: Vec<Candidate> = shortlist
+            .into_iter()
+            .filter_map(|(id, distance)| Self::rerank_one(id, distance, opts, &lookup))
             .collect();
 
         // Stable sort: descending score, ascending id on tie.
@@ -221,6 +212,73 @@ impl MemIndex {
         candidates.truncate(opts.top_n);
 
         Ok(candidates)
+    }
+
+    /// Exact nearest-neighbour shortlist for small indices: score `query`
+    /// against every inserted point using the same `DistDot` metric the graph
+    /// uses, returning `(public_id, distance)` for each. No approximation, so
+    /// the result is identical on every platform and run.
+    fn brute_force_shortlist(&self, query: &[f32; EMBED_DIM]) -> Vec<(u64, f32)> {
+        // Guard the empty index: `hnsw_rs`'s point iterator unwraps a `None`
+        // entry-point when no points have been inserted, which would panic.
+        if self.hnsw.get_nb_point() == 0 {
+            return Vec::new();
+        }
+        let dist = DistDot {};
+        self.hnsw
+            .get_point_indexation()
+            .into_iter()
+            .map(|point| {
+                // Same metric the HNSW walk uses, so `1 - distance` recovers the
+                // identical cosine similarity downstream.
+                let distance = dist.eval(query.as_slice(), point.get_v());
+                // origin_id is the usize data-id we passed at insert time; lossless
+                // back to u64 on 64-bit, and all inserted ids fit usize by construction.
+                #[allow(clippy::cast_possible_truncation)]
+                let id = point.get_origin_id() as u64;
+                (id, distance)
+            })
+            .collect()
+    }
+
+    /// Apply the spec N6.2 re-rank formula to one `(id, distance)` shortlist
+    /// entry. Returns `None` when the id has no metadata, is superseded (and
+    /// `drop_superseded` is set), or produces a non-finite score. Shared by the
+    /// brute-force and HNSW search paths so both rank identically.
+    fn rerank_one(
+        id: u64,
+        distance: f32,
+        opts: &SearchOpts,
+        lookup: &impl Fn(u64) -> Option<MetaRow>,
+    ) -> Option<Candidate> {
+        let row = lookup(id)?; // drop if no metadata
+
+        // Drop superseded entries when requested.
+        if opts.drop_superseded && row.superseded_by.is_some() {
+            return None;
+        }
+
+        // DistDot returns 1 − dot for normalised vectors → invert to get similarity.
+        let raw_sim = 1.0_f32 - distance;
+
+        // Spec N6.2 re-rank formula.
+        let score = raw_sim
+            * (-row.age_days / opts.decay_tau_days).exp()
+            * row.cluster_priority
+            * (1.0 + row.edge_boost);
+
+        if !score.is_finite() {
+            return None;
+        }
+
+        Some(Candidate {
+            id,
+            raw_sim,
+            age_days: row.age_days,
+            cluster_priority: row.cluster_priority,
+            edge_boost: row.edge_boost,
+            score,
+        })
     }
 }
 

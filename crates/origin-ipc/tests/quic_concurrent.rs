@@ -22,16 +22,20 @@ async fn two_clients_round_trip_concurrently() {
 
     // Server: accept two clients, echo whatever request body they send.
     let server = tokio::spawn(async move {
+        let mut handles = Vec::with_capacity(2);
         for _ in 0..2 {
             let mut conn = listener.accept().await.expect("accept");
-            tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 let (_kind, body) = conn.read_frame().await.expect("read");
                 conn.write_frame(FrameKind::Response, &body).await.expect("write");
-            });
+            }));
         }
-        // Keep the listener (and its endpoint) alive long enough for the
-        // per-client tasks above to finish flushing their responses.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Deterministically await both per-client tasks (rather than sleeping a
+        // fixed interval) so the listener/endpoint stays alive until every
+        // response is flushed, regardless of runner speed.
+        for h in handles {
+            h.await.expect("per-client task");
+        }
     });
 
     let client_alpha = client_bundle.clone();

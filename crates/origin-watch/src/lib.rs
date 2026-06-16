@@ -250,7 +250,10 @@ mod tests {
 
     #[test]
     fn scan_dir_walks_mixed_files_in_temp_dir() {
-        let base = std::env::temp_dir().join(format!("origin-watch-test-{}", std::process::id()));
+        // Fresh, unique, auto-cleaned temp dir so a reused same-PID directory
+        // can never leak stale files into this scan.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
         let sub = base.join("nested");
         std::fs::create_dir_all(&sub).unwrap();
 
@@ -268,7 +271,7 @@ mod tests {
         let mut found = scan_dir(&cfg).unwrap();
         found.sort_by(|a, b| a.text.cmp(&b.text));
 
-        std::fs::remove_dir_all(&base).unwrap();
+        // `tmp` (tempfile::TempDir) auto-cleans on drop — no manual rm needed.
 
         assert_eq!(found.len(), 2);
         let texts: Vec<&str> = found.iter().map(|c| c.text.as_str()).collect();

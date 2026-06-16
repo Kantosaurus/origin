@@ -50,12 +50,21 @@ fn near_duplicates_get_supersede_proposal() {
     );
     let store = Arc::new(MemoryStore::new(Arc::clone(&sql), Arc::clone(&cas)));
     store.install_quantizer(&degenerate_quantizer()).expect("install");
+    // Stamp explicit, strictly-distinct creation timestamps rather than racing
+    // the platform timer with a `sleep` — a 2ms gap collides inside Windows'
+    // ~15ms timer resolution, flipping the older/newer ordering the supersede
+    // proposal depends on. `save_at` makes `id_b` provably newer than `id_a`.
+    let t0: i64 = 1_700_000_000_000;
     let id_a = store
-        .save("user is a rust engineer", &unit_vec(0.0), &[])
+        .save_at("user is a rust engineer", &unit_vec(0.0), &[], t0)
         .expect("save");
-    std::thread::sleep(std::time::Duration::from_millis(2));
     let id_b = store
-        .save("user is a senior rust engineer", &unit_vec(0.001), &[])
+        .save_at(
+            "user is a senior rust engineer",
+            &unit_vec(0.001),
+            &[],
+            t0 + 1_000,
+        )
         .expect("save");
 
     // Populate the HNSW index. The injector daemon ordinarily owns this, but
@@ -105,12 +114,20 @@ fn consolidator_uses_stable_memory_id_not_positional_index() {
     let store = Arc::new(MemoryStore::new(Arc::clone(&sql), Arc::clone(&cas)));
     store.install_quantizer(&degenerate_quantizer()).expect("install");
 
+    // Explicit strictly-distinct timestamps (see sibling test): avoids the
+    // same-millisecond collision a `sleep`-based gap suffers under Windows'
+    // coarse timer resolution, which would otherwise flip loser/winner.
+    let t0: i64 = 1_700_000_000_000;
     let id_a = store
-        .save("user is a rust engineer", &unit_vec(0.0), &[])
+        .save_at("user is a rust engineer", &unit_vec(0.0), &[], t0)
         .expect("save");
-    std::thread::sleep(std::time::Duration::from_millis(2));
     let id_b = store
-        .save("user is a senior rust engineer", &unit_vec(0.001), &[])
+        .save_at(
+            "user is a senior rust engineer",
+            &unit_vec(0.001),
+            &[],
+            t0 + 1_000,
+        )
         .expect("save");
 
     // Sanity: the stable ids are large (timestamp-derived) values, provably

@@ -73,11 +73,14 @@ async fn submit_summarize_drives_delivery() {
             deliver_to: Box::new(CountingSummary(counter.clone())),
         })
         .expect("submit");
-    for _ in 0..50 {
+    // Bounded poll with a generous ceiling (~10s) so a slow worker spin-up on a
+    // loaded CI runner can't trip the assertion; the loop still breaks early on
+    // success, so the larger ceiling only affects the slow path.
+    for _ in 0..400 {
         if counter.load(Ordering::Relaxed) > 0 {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     assert_eq!(counter.load(Ordering::Relaxed), 1, "deliverer should fire once");
     sidecar.shutdown().await;
@@ -96,11 +99,13 @@ async fn submit_extract_drives_delivery() {
             deliver_to: Box::new(CountingExtract(counter.clone())),
         })
         .expect("submit");
-    for _ in 0..50 {
+    // Bounded poll with a generous ceiling (~10s); breaks early on success, so
+    // the larger ceiling only buys headroom on a slow CI runner's worker spawn.
+    for _ in 0..400 {
         if counter.load(Ordering::Relaxed) > 0 {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     assert_eq!(counter.load(Ordering::Relaxed), 1);
     sidecar.shutdown().await;

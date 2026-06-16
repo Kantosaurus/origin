@@ -8923,9 +8923,15 @@ mod bash_streaming_tests {
     #[tokio::test]
     async fn streams_output_in_real_time() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
+        // Print, flush via newline, sleep ~1s, print again, then exit. The
+        // ~1s gap between `early` and `late` is the platform-independent
+        // real-time signal asserted below; only the shell syntax differs.
+        #[cfg(unix)]
+        let cmd = "echo early; sleep 1; echo late";
+        #[cfg(windows)]
+        let cmd = "Write-Output early; Start-Sleep -Seconds 1; Write-Output late";
         let args = serde_json::json!({
-            // Print, flush via newline, sleep ~1s, print again, then exit.
-            "command": "echo early; sleep 1; echo late",
+            "command": cmd,
             "timeout": 10,
         });
 
@@ -8993,7 +8999,13 @@ mod bash_streaming_tests {
     #[tokio::test]
     async fn silent_command_emits_terminal_result() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(8);
-        let args = serde_json::json!({ "command": "true", "timeout": 5 });
+        // A no-output, exit-0 command on both shells: `true` on POSIX `sh`,
+        // `$null` (evaluates, prints nothing) on PowerShell.
+        #[cfg(unix)]
+        let cmd = "true";
+        #[cfg(windows)]
+        let cmd = "$null";
+        let args = serde_json::json!({ "command": cmd, "timeout": 5 });
         let bytes = run_bash_streaming(&args, Some(&tx), None).await.expect("bash ok");
         drop(tx);
 
@@ -9021,15 +9033,28 @@ mod bash_streaming_tests {
     #[tokio::test]
     async fn background_returns_pid_without_streaming() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(8);
+        // The child sleeps for a long time AFTER printing. The non-blocking
+        // property is proven structurally: the call returns the pid long
+        // before that sleep could complete, so we never waited on the child.
+        // (The old `< 500ms` ceiling actually timed shell cold-start — pwsh on
+        // a loaded Windows runner can exceed it — not the property under test.)
+        #[cfg(unix)]
+        let cmd = "echo hi; sleep 30";
+        #[cfg(windows)]
+        let cmd = "Write-Output hi; Start-Sleep -Seconds 30";
         let args = serde_json::json!({
-            "command": "echo hi; sleep 1",
+            "command": cmd,
             "run_in_background": true,
         });
         let started = Instant::now();
         let bytes = run_bash_streaming(&args, Some(&tx), None).await.expect("bash ok");
+        // Returned far sooner than the child's 30s sleep ⇒ we did not block on
+        // it. The generous 10s ceiling absorbs even a pathologically slow shell
+        // cold-start while still proving the non-blocking guarantee.
         assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "background must return fast"
+            started.elapsed() < Duration::from_secs(10),
+            "background returned in {:?} — must not block on the child's 30s sleep",
+            started.elapsed()
         );
         drop(tx);
 
@@ -9048,7 +9073,11 @@ mod bash_streaming_tests {
     /// body — streaming is best-effort, execution is not.
     #[tokio::test]
     async fn no_sink_still_returns_full_body() {
-        let args = serde_json::json!({ "command": "echo a; echo b", "timeout": 5 });
+        #[cfg(unix)]
+        let cmd = "echo a; echo b";
+        #[cfg(windows)]
+        let cmd = "Write-Output a; Write-Output b";
+        let args = serde_json::json!({ "command": cmd, "timeout": 5 });
         let bytes = run_bash_streaming(&args, None, None).await.expect("bash ok");
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
         assert_eq!(v["status"], "exited");
@@ -9066,8 +9095,12 @@ mod bash_streaming_tests {
         // One supervisor shared across the spawn path and the read path, exactly
         // as the per-connection wiring in `main.rs` arranges.
         let shared = Supervisor::new();
+        #[cfg(unix)]
+        let cmd = "echo backgrounded";
+        #[cfg(windows)]
+        let cmd = "Write-Output backgrounded";
         let args = serde_json::json!({
-            "command": "echo backgrounded",
+            "command": cmd,
             "run_in_background": true,
         });
         let bytes = run_bash_streaming(&args, None, Some(&shared))

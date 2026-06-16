@@ -53,7 +53,15 @@ async fn background_returns_pid_immediately() {
     )
     .await
     .unwrap();
-    assert!(started.elapsed() < Duration::from_millis(500));
+    // The command would take ~1s if we waited for it. Returning in well under
+    // that proves run_in_background does not block on completion. The bound is
+    // loosened from 500ms to 900ms so a slow PowerShell cold-start on a loaded
+    // CI runner doesn't flake, while still being strictly below the 1s command.
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "background spawn blocked for {:?}, expected well under the 1s command",
+        started.elapsed()
+    );
     assert_eq!(out["status"], "started");
     assert!(out["pid"].as_u64().is_some());
 }

@@ -187,8 +187,15 @@ async fn transport_error_includes_cause_chain() {
     // reqwest's top-level Display ("error sending request for url (…)"),
     // hiding the decisive cause buried in the `source()` chain (e.g.
     // `invalid peer certificate: UnknownIssuer` behind a TLS-intercepting
-    // proxy, or `tcp connect error` here). The formatted Backend error must
-    // carry the full chain so a single log line is diagnosable.
+    // proxy, or `tcp connect error` / `Connection refused` here). The formatted
+    // Backend error must carry the full chain so a single log line is
+    // diagnosable.
+    //
+    // The exact provider-internal wording of the deepest cause varies by OS
+    // (Windows: "No connection could be made…", Linux/macOS: "Connection
+    // refused"/"tcp connect error"), so this asserts the STRUCTURAL property —
+    // that the formatted error appends a non-empty `source()` cause chain after
+    // reqwest's top-level Display — rather than any single OS-specific string.
     let port = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let port = listener.local_addr().expect("local addr").port();
@@ -208,9 +215,32 @@ async fn transport_error_includes_cause_chain() {
         .expect_err("exchange against a closed port must fail");
 
     let msg = err.to_string();
+
+    // 1) We took the transport path (POST send failure), not a status/parse error.
     assert!(
-        msg.contains("tcp connect error"),
-        "transport error must include the underlying cause chain, got: {msg}"
+        msg.contains("oauth POST"),
+        "transport error must come from the POST send path, got: {msg}"
+    );
+
+    // 2) Structural invariant: the cause chain is non-empty. `error_chain`
+    //    joins the reqwest error with each `source()` via `": "`. The prefix
+    //    contributes exactly one `": "` ("oauth POST <url>: <reqwest-display>");
+    //    any further `": "` separators prove at least one underlying source was
+    //    appended — i.e. the decisive cause is not hidden. This holds on every
+    //    OS regardless of the deepest cause's wording.
+    let separators = msg.matches(": ").count();
+    assert!(
+        separators >= 2,
+        "transport error must append a non-empty source/cause chain (>=2 `: ` \
+         separators), got {separators} in: {msg}"
+    );
+
+    // 3) And there is non-empty text after the last separator (the deepest
+    //    cause), so the chain is not merely a dangling delimiter.
+    let deepest = msg.rsplit(": ").next().unwrap_or_default();
+    assert!(
+        !deepest.trim().is_empty(),
+        "deepest cause in the chain must be non-empty, got: {msg}"
     );
 }
 

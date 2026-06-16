@@ -4020,6 +4020,7 @@ version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 
@@ -4972,6 +4973,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "encoding_rs",
+ "filetime",
  "fs4",
  "globset",
  "grep-matcher",
@@ -5070,6 +5072,7 @@ name = "origin-watch"
 version = "0.9.4"
 dependencies = [
  "serde",
+ "tempfile",
  "thiserror 1.0.69",
  "walkdir",
 ]

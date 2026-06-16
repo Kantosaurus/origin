@@ -81,3 +81,13 @@ pub(crate) fn note_critical_release() {
 pub(crate) fn critical_in_flight() -> i32 {
     registry().critical_busy.load(Ordering::SeqCst)
 }
+
+/// Number of `Critical` tasks that currently hold a permit (busy-counter).
+///
+/// Exposed for tests that need a deterministic readiness signal — e.g. to wait
+/// until a spawned `Critical` task has actually acquired its permit before
+/// spawning a `Bulk` task — instead of sleeping for a guessed interval.
+#[must_use]
+pub fn critical_tasks_in_flight() -> i32 {
+    critical_in_flight()
+}
