@@ -233,7 +233,27 @@ fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
-/// Map the current build host's OS+ARCH to the released asset filename.
+/// Map the current build host's OS+ARCH to its released target triple and binary
+/// extension. Shared by every per-binary asset-name builder.
+///
+/// # Errors
+/// [`UpdateError::UnsupportedPlatform`] when the host doesn't match a published
+/// target.
+fn target_triple_ext() -> Result<(&'static str, &'static str), UpdateError> {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    Ok(match (os, arch) {
+        ("linux", "x86_64") => ("x86_64-unknown-linux-gnu", ""),
+        ("linux", "aarch64") => ("aarch64-unknown-linux-gnu", ""),
+        ("macos", "x86_64") => ("x86_64-apple-darwin", ""),
+        ("macos", "aarch64") => ("aarch64-apple-darwin", ""),
+        ("windows", "x86_64") => ("x86_64-pc-windows-msvc", ".exe"),
+        ("windows", "aarch64") => ("aarch64-pc-windows-msvc", ".exe"),
+        _ => return Err(UpdateError::UnsupportedPlatform(format!("{os}/{arch}"))),
+    })
+}
+
+/// Map the current build host's OS+ARCH to the released **CLI** asset filename.
 ///
 /// The release workflow (`.github/workflows/release.yml`) stages binaries as
 /// `origin-<target-triple>[.exe]`, e.g. `origin-x86_64-pc-windows-msvc.exe`.
@@ -242,18 +262,55 @@ fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
 /// [`UpdateError::UnsupportedPlatform`] when the host doesn't match one of the
 /// published targets.
 pub fn current_target_asset_name() -> Result<String, UpdateError> {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    let (triple, ext) = match (os, arch) {
-        ("linux", "x86_64") => ("x86_64-unknown-linux-gnu", ""),
-        ("linux", "aarch64") => ("aarch64-unknown-linux-gnu", ""),
-        ("macos", "x86_64") => ("x86_64-apple-darwin", ""),
-        ("macos", "aarch64") => ("aarch64-apple-darwin", ""),
-        ("windows", "x86_64") => ("x86_64-pc-windows-msvc", ".exe"),
-        ("windows", "aarch64") => ("aarch64-pc-windows-msvc", ".exe"),
-        _ => return Err(UpdateError::UnsupportedPlatform(format!("{os}/{arch}"))),
-    };
+    let (triple, ext) = target_triple_ext()?;
     Ok(format!("origin-{triple}{ext}"))
+}
+
+/// One binary the self-updater keeps in lockstep: its GitHub-release asset
+/// basename and the on-disk path the staged `.new` is applied over.
+struct UpdateTarget {
+    /// Release asset filename, e.g. `origin-daemon-x86_64-pc-windows-msvc.exe`.
+    asset_name: String,
+    /// Destination path the staged `.new` is swapped over.
+    dest: PathBuf,
+}
+
+/// The full set of binaries one update swaps as a unit: the CLI (the running
+/// `cli_exe`) plus its sibling `origin-daemon` and `origin-supervisor` in the
+/// same `bin/` directory (the npm platform-package layout, where the daemon and
+/// supervisor live alongside the CLI).
+///
+/// Ordered **daemon, supervisor, CLI** so the apply step swaps the companions
+/// before the CLI — the CLI is the binary the next launch re-runs and the one
+/// whose newer mtime makes `ensure_daemon_running` restart the daemon, so its
+/// companions must already be in place. Fixing only the CLI (the old behavior)
+/// left a self-updated install running a stale daemon indefinitely.
+///
+/// Falls back to the CLI alone when the exe has no parent directory, preserving
+/// single-binary behavior for unusual layouts.
+///
+/// # Errors
+/// [`UpdateError::UnsupportedPlatform`] on an unpublished host.
+fn update_targets(cli_exe: &Path) -> Result<Vec<UpdateTarget>, UpdateError> {
+    let (triple, ext) = target_triple_ext()?;
+    let cli = UpdateTarget {
+        asset_name: format!("origin-{triple}{ext}"),
+        dest: cli_exe.to_path_buf(),
+    };
+    let Some(dir) = cli_exe.parent() else {
+        return Ok(vec![cli]);
+    };
+    Ok(vec![
+        UpdateTarget {
+            asset_name: format!("origin-daemon-{triple}{ext}"),
+            dest: dir.join(format!("origin-daemon{ext}")),
+        },
+        UpdateTarget {
+            asset_name: format!("origin-supervisor-{triple}{ext}"),
+            dest: dir.join(format!("origin-supervisor{ext}")),
+        },
+        cli,
+    ])
 }
 
 /// `https://github.com/<repo>/releases/download/v<version>/<asset>` — the exact
@@ -509,36 +566,85 @@ fn current_exe() -> Result<PathBuf, UpdateError> {
     std::env::current_exe().map_err(UpdateError::Io)
 }
 
-/// If a file exists at `<current_exe>.new`, atomically swap it into the running
-/// binary's spot:
+/// Swap in any binaries staged by a prior background worker — the CLI **and** its
+/// `origin-daemon`/`origin-supervisor` siblings — by renaming each `<dest>.new`
+/// over `<dest>`.
 ///
-/// 1. Rename the current exe to `<exe>.old` (Windows lets the live process keep
-///    using the renamed file).
-/// 2. Rename `<exe>.new` to the original exe path.
+/// Companions are applied before the CLI (the [`update_targets`] order) so the
+/// daemon/supervisor binaries are current by the time the CLI's newer mtime makes
+/// `ensure_daemon_running` restart the daemon. Each binary is an independent
+/// no-op when its `.new` is absent, so a CLI-only stage (or a missing sibling)
+/// still works. Returns `Ok(true)` when at least one swap occurred.
 ///
-/// Returns `Ok(true)` when a swap occurred, `Ok(false)` when no staged file was
-/// found, and `Err` on IO failure mid-swap.
+/// **Partial-apply safety:** the CLI is the *last* target, so it is swapped only
+/// after its companions succeed — we never advance the CLI past an old daemon
+/// (the dangerous "new CLI / old daemon" skew). If a swap fails mid-sequence the
+/// call returns `Err`, but the unapplied `.new` files persist and the next launch
+/// re-applies them (and `apply_one_staged` restores a dest it moved aside), so the
+/// state self-corrects rather than corrupting.
 ///
 /// # Errors
-/// [`UpdateError::Io`] on rename / canonicalize failures.
+/// [`UpdateError::Io`] on a rename failure mid-swap.
 pub fn apply_staged_if_present() -> Result<bool, UpdateError> {
     if std::env::var_os("ORIGIN_NO_UPDATE").is_some() {
         return Ok(false);
     }
-    let exe = current_exe()?;
-    let staged = staged_path(&exe);
+    let cli_exe = current_exe()?;
+    let targets = update_targets(&cli_exe).unwrap_or_else(|e| {
+        tracing::debug!("updater: update_targets failed ({e}); applying the CLI alone");
+        vec![UpdateTarget {
+            asset_name: String::new(),
+            dest: cli_exe.clone(),
+        }]
+    });
+    let mut applied = false;
+    for t in &targets {
+        applied |= apply_one_staged(&t.dest)?;
+    }
+    Ok(applied)
+}
+
+/// Atomically swap a single `<dest>.new` over `dest`:
+///
+/// 1. Rename the current `dest` to `<dest>.old` (Windows lets a live process keep
+///    using the renamed file, so this is safe even while the daemon runs).
+/// 2. Rename `<dest>.new` to `dest`.
+///
+/// Returns `Ok(false)` when no `.new` is staged. When `dest` itself is missing
+/// (a sibling that was never installed) the `.new` is moved into place directly.
+///
+/// # Errors
+/// [`UpdateError::Io`] on a rename failure mid-swap (the original is restored).
+fn apply_one_staged(dest: &Path) -> Result<bool, UpdateError> {
+    let staged = staged_path(dest);
     if !staged.exists() {
         return Ok(false);
     }
-    let old = old_path(&exe);
+    let old = old_path(dest);
     let _ = std::fs::remove_file(&old);
-    std::fs::rename(&exe, &old)?;
-    if let Err(e) = std::fs::rename(&staged, &exe) {
-        let _ = std::fs::rename(&old, &exe);
+    let moved_aside = dest.exists();
+    if moved_aside {
+        std::fs::rename(dest, &old)?;
+    }
+    if let Err(e) = std::fs::rename(&staged, dest) {
+        if moved_aside {
+            if let Err(re) = std::fs::rename(&old, dest) {
+                // Both renames failed: `dest` is momentarily absent, but `.new`
+                // still exists, so the next launch's apply moves it into place
+                // directly (the `dest.exists()` branch). Log loudly all the same.
+                tracing::warn!(
+                    "updater: staged-swap of {} failed and rollback also failed ({re}); \
+                     next launch will re-apply from {}.new",
+                    dest.display(),
+                    dest.display()
+                );
+            }
+        }
         return Err(UpdateError::Io(e));
     }
     tracing::info!(
-        "updater: swapped staged binary into place; previous binary preserved at {}",
+        "updater: swapped staged binary {} into place; previous preserved at {}",
+        dest.display(),
         old.display()
     );
     Ok(true)
@@ -707,57 +813,112 @@ async fn check_and_stage_inner() -> bool {
         return false;
     }
 
-    let asset_name = match current_target_asset_name() {
-        Ok(n) => n,
-        Err(e) => return skip_with_warn("current_target_asset_name", e),
-    };
-    let asset_url = release_asset_url(&latest, &asset_name);
-
-    eprintln!("origin {current} → {latest}: downloading…");
-    tracing::info!("updater: update available (current={current} latest={latest}); downloading {asset_name}");
-
     let exe = match current_exe() {
         Ok(p) => p,
         Err(e) => return skip_with_warn("current_exe", e),
     };
+    let targets = match update_targets(&exe) {
+        Ok(t) => t,
+        Err(e) => return skip_with_warn("update_targets", e),
+    };
+
+    eprintln!("origin {current} → {latest}: downloading…");
+    tracing::info!(
+        "updater: update available (current={current} latest={latest}); downloading {} binaries",
+        targets.len()
+    );
 
     // Pull the checksum manifest so verification can run; with cosign gone this
-    // is the sole integrity gate and is mandatory.
+    // is the sole integrity gate and is mandatory for every binary.
     let checksums = fetch_checksums(&latest).await;
 
-    download_verify_stage(&asset_url, checksums.as_deref(), &asset_name, &latest, &exe).await
+    stage_all_targets(&targets, checksums.as_deref(), &latest).await
 }
 
-/// Download, verify (SHA-256, mandatory), and stage. Cleans up partial
-/// downloads on any failure so a later run never picks up an unverified binary.
-async fn download_verify_stage(
+/// Download + verify + stage the whole CLI/daemon/supervisor set **all-or-nothing**.
+///
+/// Every asset is downloaded and SHA-256-verified IN FULL before *any* `.new` is
+/// staged, so a partial download can never produce a CLI-newer-than-daemon
+/// mismatch — the exact skew this fix exists to prevent (a CLI-only self-update
+/// once left the daemon frozen at an old version). On any download/verify failure
+/// nothing is staged; on a stage-write failure the already-staged `.new` files
+/// are removed so the next launch cannot apply a half-update.
+async fn stage_all_targets(targets: &[UpdateTarget], checksums: Option<&str>, version: &str) -> bool {
+    // Phase 1 — download + verify every binary into memory (no disk writes yet).
+    let mut verified: Vec<(&UpdateTarget, Vec<u8>)> = Vec::with_capacity(targets.len());
+    for t in targets {
+        let url = release_asset_url(version, &t.asset_name);
+        match download_and_verify(&url, checksums, &t.asset_name).await {
+            Ok(bytes) => verified.push((t, bytes)),
+            Err(e) => return skip_with_warn(&format!("download/verify {}", t.asset_name), e),
+        }
+    }
+
+    // Phase 2 — only now that ALL are verified, stage each as `<dest>.new`.
+    let mut staged: Vec<PathBuf> = Vec::with_capacity(verified.len());
+    for (t, bytes) in &verified {
+        match stage_verified_bytes(bytes, &t.asset_name, &t.dest) {
+            Ok(path) => staged.push(path),
+            Err(e) => {
+                // Roll back the already-staged `.new` files so the next launch
+                // can't apply a half-update. A removal that itself fails is
+                // logged (the leftover would be re-applied, but the all-or-nothing
+                // download means it's a verified binary, not a partial download).
+                for p in &staged {
+                    if let Err(re) = std::fs::remove_file(p) {
+                        tracing::warn!(
+                            "updater: cleanup of partially-staged {} failed: {re}",
+                            p.display()
+                        );
+                    }
+                }
+                return skip_with_warn(&format!("stage {}", t.asset_name), e);
+            }
+        }
+    }
+
+    // One package.json rewrite for the whole set (keyed off the CLI, the last
+    // target) so the next launch doesn't re-download the same release in a loop.
+    record_staged_version(&targets[targets.len() - 1].dest, version);
+    eprintln!("Update staged; will apply on next launch.");
+    tracing::info!(
+        "updater: staged {} binaries for swap-in on next launch",
+        staged.len()
+    );
+    true
+}
+
+/// Download `asset_url` and verify its SHA-256 against the release manifest
+/// (mandatory — a missing/garbled `SHA256SUMS` entry rejects the download).
+/// Returns the verified bytes; writes nothing to disk.
+///
+/// # Errors
+/// Network/HTTP failure, or [`UpdateError::ChecksumFailed`] on a verify miss.
+async fn download_and_verify(
     asset_url: &str,
     checksums: Option<&str>,
     asset_name: &str,
-    version: &str,
-    exe: &Path,
-) -> bool {
-    let bytes = match download_bytes(asset_url).await {
-        Ok(b) => b,
-        Err(e) => return skip_with_warn("download asset", e),
-    };
+) -> Result<Vec<u8>, UpdateError> {
+    let bytes = download_bytes(asset_url).await?;
+    verify_sha256_bytes(&bytes, checksums, asset_name)?;
+    Ok(bytes)
+}
 
-    eprintln!("Verifying download…");
-    if let Err(e) = verify_sha256_bytes(&bytes, checksums, asset_name) {
-        return skip_with_warn("verify", e);
-    }
-
-    // Write the verified bytes to a temp neighbor, then atomically publish to
-    // `<exe>.new`. Verifying the in-memory bytes (rather than a file we later
-    // rename) closes the verify→stage swap window; the final rename keeps
-    // staging atomic so a partial write never becomes a swapped-in binary.
-    let Some(parent) = exe.parent() else {
-        return skip_with_warn("exe parent", "exe has no parent directory");
-    };
+/// Write already-verified `bytes` to a temp neighbor of `dest`, mark it
+/// executable on unix, then atomically rename to `<dest>.new`. Returns the staged
+/// path. Cleans up the temp on any failure.
+///
+/// # Errors
+/// [`UpdateError::Io`] on write / chmod / rename failure, or when `dest` has no
+/// parent directory.
+fn stage_verified_bytes(bytes: &[u8], asset_name: &str, dest: &Path) -> Result<PathBuf, UpdateError> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| UpdateError::Io(std::io::Error::other("dest has no parent directory")))?;
     let tmp = parent.join(format!("{asset_name}.download"));
-    if let Err(e) = std::fs::write(&tmp, &bytes) {
+    if let Err(e) = std::fs::write(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp);
-        return skip_with_warn("stage write", e);
+        return Err(UpdateError::Io(e));
     }
     // The downloaded release asset must be executable on unix once swapped in;
     // `std::fs::write` creates a 0644 file, so set the mode here (matching the
@@ -767,20 +928,15 @@ async fn download_verify_stage(
         use std::os::unix::fs::PermissionsExt as _;
         if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)) {
             let _ = std::fs::remove_file(&tmp);
-            return skip_with_warn("stage chmod", e);
+            return Err(UpdateError::Io(e));
         }
     }
-    let staged = staged_path(exe);
+    let staged = staged_path(dest);
     if let Err(e) = std::fs::rename(&tmp, &staged) {
         let _ = std::fs::remove_file(&tmp);
-        return skip_with_warn("stage rename", e);
+        return Err(UpdateError::Io(e));
     }
-    // Record the new version so the next launch doesn't see the (un-rewritten)
-    // npm package.json and re-download this same release in a loop.
-    record_staged_version(exe, version);
-    eprintln!("Update staged; relaunching…");
-    tracing::info!("updater: staged {} for swap-in this invocation", staged.display());
-    true
+    Ok(staged)
 }
 
 #[cfg(test)]
@@ -1007,6 +1163,128 @@ mod tests {
         assert_eq!(parse_semver("1.2.3"), Some((1, 2, 3)));
         assert_eq!(parse_semver("1.2"), None);
         assert_eq!(parse_semver("1.2.3.4"), None);
+    }
+
+    // Host-specific binary extension, matching `target_triple_ext`.
+    const HOST_EXT: &str = if cfg!(windows) { ".exe" } else { "" };
+
+    #[test]
+    fn update_targets_covers_cli_daemon_supervisor_as_siblings() {
+        let dir = if cfg!(windows) {
+            Path::new("C:/app/bin")
+        } else {
+            Path::new("/opt/app/bin")
+        };
+        let cli = dir.join(format!("origin{HOST_EXT}"));
+        let targets = update_targets(&cli).expect("supported test host");
+
+        assert_eq!(targets.len(), 3, "CLI + daemon + supervisor");
+        // CLI is LAST so the apply step swaps companions before it.
+        assert_eq!(targets[2].dest, cli, "CLI must be the final target");
+        // Dests are siblings in the CLI's directory with the local (un-tripled) names.
+        assert_eq!(targets[0].dest, dir.join(format!("origin-daemon{HOST_EXT}")));
+        assert_eq!(targets[1].dest, dir.join(format!("origin-supervisor{HOST_EXT}")));
+        for t in &targets {
+            assert_eq!(t.dest.parent(), cli.parent(), "all binaries share one dir");
+        }
+        // Asset names are the triple-suffixed release names, distinct per binary.
+        assert!(targets[0].asset_name.starts_with("origin-daemon-"));
+        assert!(targets[1].asset_name.starts_with("origin-supervisor-"));
+        assert!(
+            targets[2].asset_name.starts_with("origin-")
+                && !targets[2].asset_name.starts_with("origin-daemon-")
+                && !targets[2].asset_name.starts_with("origin-supervisor-")
+        );
+        assert_eq!(
+            targets[2].asset_name,
+            current_target_asset_name().expect("host asset")
+        );
+    }
+
+    #[test]
+    fn update_targets_handles_bare_and_rootless_paths() {
+        // A bare relative exe still derives daemon/supervisor as siblings — its
+        // parent is Some("") (not None) — so the trio stays in lockstep.
+        let bare = update_targets(Path::new("origin")).expect("supported test host");
+        assert_eq!(bare.len(), 3);
+        assert_eq!(bare[2].dest, Path::new("origin"));
+        assert_eq!(bare[0].dest, Path::new(&format!("origin-daemon{HOST_EXT}")));
+
+        // A path with no parent at all degrades to single-binary behavior.
+        let rootless = update_targets(Path::new("")).expect("supported test host");
+        assert_eq!(rootless.len(), 1);
+    }
+
+    #[test]
+    fn stage_and_apply_round_trips_all_three_binaries() {
+        // Seed all three "installed" binaries, stage fresh bytes for each, apply,
+        // and confirm every dest holds its NEW content — the end-to-end swap the
+        // background worker + next-launch apply perform for the whole trio.
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let cli = dir.join(format!("origin{HOST_EXT}"));
+        let targets = update_targets(&cli).expect("supported test host");
+
+        for t in &targets {
+            std::fs::write(&t.dest, b"OLD").expect("seed old binary");
+        }
+
+        // Stage distinct new bytes for each dest (label by basename).
+        for t in &targets {
+            let name = t
+                .dest
+                .file_name()
+                .expect("dest name")
+                .to_string_lossy()
+                .into_owned();
+            let staged = stage_verified_bytes(format!("NEW:{name}").as_bytes(), &t.asset_name, &t.dest)
+                .expect("stage");
+            assert!(staged.exists(), "{} should be staged", t.asset_name);
+            assert_eq!(staged, staged_path(&t.dest));
+        }
+
+        // Apply every staged .new (CLI applied last per target order).
+        let mut applied = 0;
+        for t in &targets {
+            if apply_one_staged(&t.dest).expect("apply") {
+                applied += 1;
+            }
+        }
+        assert_eq!(applied, 3, "all three swapped");
+
+        for t in &targets {
+            let name = t
+                .dest
+                .file_name()
+                .expect("dest name")
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(
+                std::fs::read(&t.dest).expect("read dest"),
+                format!("NEW:{name}").into_bytes()
+            );
+        }
+
+        // A second apply is a no-op — no leftover .new files.
+        for t in &targets {
+            assert!(
+                !apply_one_staged(&t.dest).expect("re-apply"),
+                "no .new should remain"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_one_staged_moves_new_into_place_when_dest_missing() {
+        // A staged sibling whose original was never installed is moved in directly.
+        let tmp = tempdir().expect("tempdir");
+        let dest = tmp.path().join(format!("origin-daemon{HOST_EXT}"));
+        std::fs::write(staged_path(&dest), b"FRESH").expect("stage");
+        assert!(!dest.exists(), "precondition: dest missing");
+
+        assert!(apply_one_staged(&dest).expect("apply"));
+        assert_eq!(std::fs::read(&dest).expect("read dest"), b"FRESH");
+        assert!(!staged_path(&dest).exists());
     }
 
     #[tokio::test]
