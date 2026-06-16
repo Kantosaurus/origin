@@ -2098,6 +2098,17 @@ async fn handle_prompt_turn(
     // then drain any `/steer` hints and append them as a cache-safe suffix
     // (gemini model steering). No mention + empty queue ⇒ byte-identical to `text`.
     let directed = origin_cli::mentions::force_subagent(text);
+    // Resume-after-error: when the user types a bare "continue" / "try again"
+    // right after a turn whose visible output ended in an error, append a hint
+    // pointing the model at that recent error so it picks up where it left off
+    // (diagnose + retry the failed step) instead of restarting. No resume phrase,
+    // or no recent error in the last `RESUME_SCAN_LINES` rows ⇒ byte-identical.
+    let directed = {
+        let recent = app
+            .lock()
+            .recent_output_lines(origin_cli::resume::RESUME_SCAN_LINES);
+        origin_cli::resume::augment_for_resume(&directed, &recent).unwrap_or(directed)
+    };
     let user_text = origin_cli::steering::next_turn_prompt(&mut app.lock().steering, &directed);
     let read_only = app.lock().plan_mode;
     // Drain any `/attach`-staged attachments for this turn (empty ⇒ text-only).

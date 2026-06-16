@@ -906,6 +906,20 @@ impl App {
             .push(ScrollLine::styled(String::new(), 0, 0, false));
     }
 
+    /// The last `n` finalized scrollback line texts, most-recent-first. Used by
+    /// [`crate::resume::augment_for_resume`] to spot a recent error when the user
+    /// types a bare "continue" / "try again", so the agent resumes from the error
+    /// instead of restarting.
+    #[must_use]
+    pub fn recent_output_lines(&self, n: usize) -> Vec<String> {
+        self.scrollback
+            .iter()
+            .rev()
+            .take(n)
+            .map(|l| l.text.clone())
+            .collect()
+    }
+
     /// Wipe the in-session TUI view and restore the just-launched look, so
     /// `/clear` leaves the terminal as if origin had only just started.
     ///
