@@ -272,7 +272,10 @@ oncall = \"@dana\"
         assert_eq!(nightly.profile.as_deref(), Some("shared"));
         assert_eq!(nightly.env.get("extra").map(String::as_str), Some("inline-value"));
         let shared = f.profiles.get("shared").expect("[profiles.shared] preserved");
-        assert_eq!(shared.get("repo").map(String::as_str), Some("github.com/acme/widget"));
+        assert_eq!(
+            shared.get("repo").map(String::as_str),
+            Some("github.com/acme/widget")
+        );
         assert_eq!(shared.get("oncall").map(String::as_str), Some("@dana"));
     }
 

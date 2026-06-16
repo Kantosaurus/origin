@@ -200,7 +200,8 @@ impl Cassette {
 
     /// Set the replay cursor to `pos` (clamped to the number of interactions).
     pub fn set_cursor(&self, pos: usize) {
-        self.cursor.store(pos.min(self.interactions.len()), Ordering::Relaxed);
+        self.cursor
+            .store(pos.min(self.interactions.len()), Ordering::Relaxed);
     }
 
     /// Serialize the cassette to pretty JSON.

@@ -3844,9 +3844,7 @@ fn detach_last_turn(session_store: &SessionStore, session_id: &str) -> u32 {
         return token.last_turn;
     }
     match session_store.load_messages(session_id) {
-        Ok(msgs) if !msgs.is_empty() => {
-            u32::try_from(msgs.len().saturating_sub(1)).unwrap_or(u32::MAX)
-        }
+        Ok(msgs) if !msgs.is_empty() => u32::try_from(msgs.len().saturating_sub(1)).unwrap_or(u32::MAX),
         _ => 0,
     }
 }
@@ -4099,8 +4097,8 @@ fn spawn_metrics_endpoint(metrics: Metrics, addr: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        detach_last_turn, resume_foreign_event, resume_session_event, turn_window, Session,
-        SessionStore, StreamEvent,
+        detach_last_turn, resume_foreign_event, resume_session_event, turn_window, Session, SessionStore,
+        StreamEvent,
     };
     use origin_core::types::{Block, Message, Role};
     use origin_resume_token::ResumeToken;

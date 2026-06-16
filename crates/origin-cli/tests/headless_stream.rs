@@ -205,10 +205,9 @@ async fn remote_bearer_is_transmitted_on_the_wire() {
 
     // A bearer-gated listener (the daemon's production remote transport): the
     // client cert is accepted at TLS, and authorization rides on the bearer.
-    let listener =
-        QuicListener::bind_bearer_gated("127.0.0.1:0".parse().expect("addr"), server_bundle)
-            .await
-            .expect("bind bearer-gated");
+    let listener = QuicListener::bind_bearer_gated("127.0.0.1:0".parse().expect("addr"), server_bundle)
+        .await
+        .expect("bind bearer-gated");
     let addr = listener.local_addr();
     let dir = TempDir::new().expect("tempdir");
     let client_cert_path = dir.path().join("client_cert.der");

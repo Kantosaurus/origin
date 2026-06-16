@@ -209,9 +209,7 @@ fn models_endpoint(entry: &ProviderEntry) -> Option<String> {
     match entry.wire {
         // Responses-API providers share OpenAI's `/models` listing; the
         // `/responses` chat path falls through `openai_models_path`'s fallback.
-        WireFormat::OpenAIChat | WireFormat::OpenAIResponses => {
-            Some(openai_models_path(&entry.chat_path))
-        }
+        WireFormat::OpenAIChat | WireFormat::OpenAIResponses => Some(openai_models_path(&entry.chat_path)),
         WireFormat::Anthropic => Some("/v1/models".to_string()),
         WireFormat::Gemini => Some("/v1beta/models".to_string()),
         WireFormat::Ollama => Some("/api/tags".to_string()),

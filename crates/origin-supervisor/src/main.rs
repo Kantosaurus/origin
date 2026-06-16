@@ -76,8 +76,8 @@ fn new_binary_valid(manifest: &RelaunchManifest) -> bool {
 /// `SessionStore` stores resume tokens under `<dir-of-db>/resume`
 /// (`SessionStore::resume_dir`), so we mirror that derivation here.
 fn resolve_resume_dir() -> PathBuf {
-    let db_path = std::env::var("ORIGIN_DB")
-        .unwrap_or_else(|_| origin_ipc::instance::InstanceId::for_cwd().db_path());
+    let db_path =
+        std::env::var("ORIGIN_DB").unwrap_or_else(|_| origin_ipc::instance::InstanceId::for_cwd().db_path());
     let db = PathBuf::from(db_path);
     let dir = db.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     dir.join("resume")
@@ -478,8 +478,10 @@ mod tests {
         // Use a tiny retry budget so the test terminates fast; assert only
         // that an unreachable endpoint yields an error (so the caller
         // logs+swallows it) rather than a hang or panic.
-        let res =
-            drive_resume_replay_with(tokens, &endpoint, 2, std::time::Duration::from_millis(5));
-        assert!(res.is_err(), "unreachable endpoint must yield an error, not success");
+        let res = drive_resume_replay_with(tokens, &endpoint, 2, std::time::Duration::from_millis(5));
+        assert!(
+            res.is_err(),
+            "unreachable endpoint must yield an error, not success"
+        );
     }
 }

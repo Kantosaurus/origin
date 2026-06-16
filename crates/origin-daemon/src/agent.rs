@@ -384,7 +384,11 @@ async fn decide_permission(
     let allowed = prompter.ask(meta, args_preview).await;
     origin_permission::Decision {
         outcome: if allowed { Outcome::Allow } else { Outcome::Deny },
-        reason: if allowed { "user-approved".into() } else { "user-denied".into() },
+        reason: if allowed {
+            "user-approved".into()
+        } else {
+            "user-denied".into()
+        },
     }
 }
 
@@ -670,7 +674,12 @@ fn apply_path_overlay(
 /// Returns `None` when the model has no known price (unknown/local model): the
 /// caller then cannot meaningfully enforce a dollar cap and leaves the turn
 /// unconstrained, exactly as a missing cap would.
-fn estimate_spend_usd(model: &str, input_total: u64, output_total: u64, cache_read_total: u64) -> Option<f64> {
+fn estimate_spend_usd(
+    model: &str,
+    input_total: u64,
+    output_total: u64,
+    cache_read_total: u64,
+) -> Option<f64> {
     let price = origin_cost::price_for(model)?;
     let fresh_input = input_total.saturating_sub(cache_read_total);
     let usage = origin_cost::TokenUsage::new(fresh_input, output_total, cache_read_total, 0);
@@ -2440,7 +2449,21 @@ impl SpeculativeRegistry {
             // reach here (Mutating tier or the NEEDS_SUBSYSTEM_HANDLE
             // guard above) and flow through the main dispatch path, which
             // threads the live handles from `LoopOptions`.
-            let text = dispatch_tool(meta, &args, cas.as_deref(), None, None, None, None, None, None, None, None, None).await?;
+            let text = dispatch_tool(
+                meta,
+                &args,
+                cas.as_deref(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
             Ok::<_, LoopError>(text.into_bytes())
         });
         self.in_flight.insert(tool_use_id, handle);
@@ -3325,9 +3348,12 @@ async fn run_loop_inner(
             // cap). An unknown-priced model can't be costed ⇒ left unconstrained
             // (`estimate_spend_usd` returns `None`), exactly as no cap would be.
             if let Some(cap) = policy.spend_cap_usd() {
-                if let Some(spent) =
-                    estimate_spend_usd(&turn_model, total_input_tokens, total_output_tokens, total_cache_read_tokens)
-                {
+                if let Some(spent) = estimate_spend_usd(
+                    &turn_model,
+                    total_input_tokens,
+                    total_output_tokens,
+                    total_cache_read_tokens,
+                ) {
                     if spent > cap {
                         return Err(LoopError::GovernanceDenied(format!(
                             "cumulative spend ${spent:.4} exceeds the governance cap ${cap:.4}; \
@@ -4188,7 +4214,9 @@ async fn run_loop_inner(
                     // the child writes it, so long-running commands no
                     // longer feel hung. The LLM still receives the fully
                     // accumulated body via `Block::ToolResult` below.
-                    match run_bash_streaming(&args, opts.event_tx.as_ref(), opts.proc_supervisor.as_ref()).await {
+                    match run_bash_streaming(&args, opts.event_tx.as_ref(), opts.proc_supervisor.as_ref())
+                        .await
+                    {
                         Ok(bytes) => bytes,
                         Err(msg) => {
                             tracing::warn!(tool = %name, %msg, "Bash dispatch failed; returning error to model");
@@ -4293,10 +4321,7 @@ async fn run_loop_inner(
             // (default off ⇒ byte-identical); only fires for fresh, successful,
             // non-mutating results with a CAS available to anchor retrieval.
             let mut result_bytes = result_bytes;
-            if schema_crush_enabled
-                && cache_hit.is_none()
-                && matches!(meta.side_effects, SideEffects::Pure)
-            {
+            if schema_crush_enabled && cache_hit.is_none() && matches!(meta.side_effects, SideEffects::Pure) {
                 if let Some(cas) = opts.cas.as_ref() {
                     // Anchor the FULL original in CAS first so the lossy
                     // sentinel's `recall` handle resolves to the uncrushed body.
@@ -4987,8 +5012,8 @@ async fn dispatch_tool(
             // `Write{force:false}` over this file is permitted (the model has
             // seen it). Only record on a successful read.
             let read_path = args.file_path.clone();
-            let out = origin_tools::builtins::read::read_v2(args)
-                .map_err(|e| LoopError::ToolFailure(e.message));
+            let out =
+                origin_tools::builtins::read::read_v2(args).map_err(|e| LoopError::ToolFailure(e.message));
             if out.is_ok() {
                 if let Some(guard) = write_guard {
                     guard.note_read(&read_path);
@@ -6944,7 +6969,10 @@ mod dispatch_table_tests {
         let empty = serde_json::Value::Object(serde_json::Map::new());
         let mut unrecognized: Vec<String> = Vec::new();
         for meta in registry_iter() {
-            let result = dispatch_tool(meta, &empty, None, None, None, None, None, None, None, None, None, None).await;
+            let result = dispatch_tool(
+                meta, &empty, None, None, None, None, None, None, None, None, None, None,
+            )
+            .await;
             if let Err(LoopError::UnknownTool(name)) = &result {
                 unrecognized.push(name.clone());
             }
@@ -7006,25 +7034,31 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_explain")
             .expect("graph_explain registered");
         let args = serde_json::json!({"kind": "communities"});
-        let out = dispatch_tool(meta, &args, None, None, None, None, None, None, None, None, None, None)
-            .await
-            .expect("communities dispatch");
+        let out = dispatch_tool(
+            meta, &args, None, None, None, None, None, None, None, None, None, None,
+        )
+        .await
+        .expect("communities dispatch");
         assert_eq!(out, "all detected communities");
 
         let args = serde_json::json!({
             "kind": "recent_changes",
             "args": {"since_ms": 1_700_000_000_000_i64}
         });
-        let out = dispatch_tool(meta, &args, None, None, None, None, None, None, None, None, None, None)
-            .await
-            .expect("recent_changes dispatch");
+        let out = dispatch_tool(
+            meta, &args, None, None, None, None, None, None, None, None, None, None,
+        )
+        .await
+        .expect("recent_changes dispatch");
         assert!(out.contains("1700000000000"), "got: {out}");
 
         // Unknown kind surfaces as BadArgs, not ToolFailure or UnknownTool.
         let args = serde_json::json!({"kind": "bogus"});
-        let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None, None, None, None)
-            .await
-            .expect_err("bogus must fail");
+        let err = dispatch_tool(
+            meta, &args, None, None, None, None, None, None, None, None, None, None,
+        )
+        .await
+        .expect_err("bogus must fail");
         assert!(matches!(err, LoopError::BadArgs(_)));
     }
 
@@ -7047,9 +7081,11 @@ mod dispatch_table_tests {
             let meta = registry_iter()
                 .find(|m| m.name == name)
                 .unwrap_or_else(|| panic!("{name} not registered"));
-            let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None, None, None, None)
-                .await
-                .expect_err(name);
+            let err = dispatch_tool(
+                meta, &args, None, None, None, None, None, None, None, None, None, None,
+            )
+            .await
+            .expect_err(name);
             match err {
                 LoopError::ToolFailure(msg) => {
                     assert!(
@@ -7076,9 +7112,22 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_query")
             .expect("graph_query registered");
         let args = serde_json::json!({"kind": "communities"});
-        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None, None, None, None, None, None, None)
-            .await
-            .expect("graph_query dispatch");
+        let out = dispatch_tool(
+            meta,
+            &args,
+            None,
+            Some(&code_graph),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("graph_query dispatch");
         // Empty edge table yields an empty Partitions list.
         assert_eq!(
             out, r#"{"partitions":[]}"#,
@@ -7125,9 +7174,22 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_rebuild")
             .expect("graph_rebuild registered");
         let args = serde_json::json!({"paths": []});
-        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None, None, None, None, None, None, None)
-            .await
-            .expect("graph_rebuild dispatch");
+        let out = dispatch_tool(
+            meta,
+            &args,
+            None,
+            Some(&code_graph),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("graph_rebuild dispatch");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         let paths_seen = parsed["paths_seen"].as_u64().expect("paths_seen field");
         assert_eq!(paths_seen, 0, "expected 0 paths_seen, got: {out}");
@@ -7203,9 +7265,11 @@ mod dispatch_table_tests {
             .find(|m| m.name == "mem_search")
             .expect("mem_search registered");
         let args = serde_json::json!({"query": "anything"});
-        let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None, None, None, None)
-            .await
-            .expect_err("must fail without handle");
+        let err = dispatch_tool(
+            meta, &args, None, None, None, None, None, None, None, None, None, None,
+        )
+        .await
+        .expect_err("must fail without handle");
         match err {
             LoopError::ToolFailure(msg) => {
                 assert!(
@@ -7303,9 +7367,11 @@ mod dispatch_table_tests {
             "goal": "do something",
             "allowed_tools": []
         });
-        let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None, None, None, None)
-            .await
-            .expect_err("Task without coordinator must fail");
+        let err = dispatch_tool(
+            meta, &args, None, None, None, None, None, None, None, None, None, None,
+        )
+        .await
+        .expect_err("Task without coordinator must fail");
         match err {
             LoopError::ToolFailure(msg) => {
                 assert!(
@@ -7435,8 +7501,12 @@ mod dispatch_table_tests {
         // The per-session shared guard (as wired in main.rs).
         let guard = Arc::new(origin_tools::builtins::write::WriteGuard::default());
 
-        let read_meta = registry_iter().find(|m| m.name == "Read").expect("Read registered");
-        let write_meta = registry_iter().find(|m| m.name == "Write").expect("Write registered");
+        let read_meta = registry_iter()
+            .find(|m| m.name == "Read")
+            .expect("Read registered");
+        let write_meta = registry_iter()
+            .find(|m| m.name == "Write")
+            .expect("Write registered");
 
         // Sanity: WITHOUT the shared guard, a force=false overwrite is rejected.
         let write_args = serde_json::json!({
@@ -7445,7 +7515,18 @@ mod dispatch_table_tests {
             "force": false,
         });
         let no_guard = dispatch_tool(
-            write_meta, &write_args, None, None, None, None, None, None, None, None, None, None,
+            write_meta,
+            &write_args,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .await;
         assert!(
@@ -7456,20 +7537,45 @@ mod dispatch_table_tests {
         // Read through the SHARED guard: records the read.
         let read_args = serde_json::json!({ "file_path": path_str });
         dispatch_tool(
-            read_meta, &read_args, None, None, None, None, None, None, None, None, Some(&guard), None,
+            read_meta,
+            &read_args,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&guard),
+            None,
         )
         .await
         .expect("Read through shared guard must succeed");
 
         // Now Write{force:false} through the SAME guard must succeed.
         let write_ok = dispatch_tool(
-            write_meta, &write_args, None, None, None, None, None, None, None, None, Some(&guard), None,
+            write_meta,
+            &write_args,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&guard),
+            None,
         )
         .await
         .expect("Write force=false after a Read of the same file must succeed via the shared guard");
         assert_eq!(write_ok, "write ok");
         let on_disk = std::fs::read_to_string(&path).expect("read back");
-        assert_eq!(on_disk, "replacement-no-guard\n", "the overwrite must have landed");
+        assert_eq!(
+            on_disk, "replacement-no-guard\n",
+            "the overwrite must have landed"
+        );
     }
 }
 
@@ -8050,11 +8156,8 @@ mod wiring_tests {
             None,
         );
         let snap = metrics.snapshot();
-        let value_of = |family: &str| -> f64 {
-            snap.iter()
-                .find(|r| r.name == family)
-                .map_or(0.0, |r| r.value)
-        };
+        let value_of =
+            |family: &str| -> f64 { snap.iter().find(|r| r.name == family).map_or(0.0, |r| r.value) };
         assert!(
             (value_of("origin_tokens_in_total") - 1_234.0).abs() < f64::EPSILON,
             "tokens_in counter must advance to 1234; snapshot={:?}",
@@ -8367,12 +8470,16 @@ mod wiring_tests {
         let deny = origin_permission::prompt::AlwaysDeny;
         // No rules ⇒ the prompter is consulted, just like before.
         assert_eq!(
-            decide_permission(&meta, "git status", &allow, &no_skills, &opts).await.outcome,
+            decide_permission(&meta, "git status", &allow, &no_skills, &opts)
+                .await
+                .outcome,
             Outcome::Allow,
             "no rules + AlwaysAllow ⇒ allowed (unchanged)"
         );
         assert_eq!(
-            decide_permission(&meta, "git status", &deny, &no_skills, &opts).await.outcome,
+            decide_permission(&meta, "git status", &deny, &no_skills, &opts)
+                .await
+                .outcome,
             Outcome::Deny,
             "no rules + AlwaysDeny ⇒ denied (unchanged)"
         );
@@ -8390,9 +8497,20 @@ mod wiring_tests {
         let no_skills = SkillRegistry::new();
         let meta = rp_meta("Bash");
         // AlwaysAllow would normally allow; the deny rule pre-empts it.
-        let d = decide_permission(&meta, "rm -rf /", &origin_permission::prompt::AlwaysAllow, &no_skills, &opts).await;
+        let d = decide_permission(
+            &meta,
+            "rm -rf /",
+            &origin_permission::prompt::AlwaysAllow,
+            &no_skills,
+            &opts,
+        )
+        .await;
         assert_eq!(d.outcome, Outcome::Deny, "explicit deny rule blocks");
-        assert!(d.reason.contains("rule:Bash"), "reason names the rule: {}", d.reason);
+        assert!(
+            d.reason.contains("rule:Bash"),
+            "reason names the rule: {}",
+            d.reason
+        );
     }
 
     /// CONFIGURED: an explicit user `allow` rule auto-approves a
@@ -8407,9 +8525,20 @@ mod wiring_tests {
         let no_skills = SkillRegistry::new();
         let meta = rp_meta("Read");
         // AlwaysDeny would normally deny; the allow rule pre-empts it.
-        let d = decide_permission(&meta, "/etc/hosts", &origin_permission::prompt::AlwaysDeny, &no_skills, &opts).await;
+        let d = decide_permission(
+            &meta,
+            "/etc/hosts",
+            &origin_permission::prompt::AlwaysDeny,
+            &no_skills,
+            &opts,
+        )
+        .await;
         assert_eq!(d.outcome, Outcome::Allow, "explicit allow rule auto-approves");
-        assert!(d.reason.contains("rule:Read"), "reason names the rule: {}", d.reason);
+        assert!(
+            d.reason.contains("rule:Read"),
+            "reason names the rule: {}",
+            d.reason
+        );
     }
 
     /// CONFIGURED but NO matching rule: a tool with no rule still falls through
@@ -8423,10 +8552,32 @@ mod wiring_tests {
         };
         let no_skills = SkillRegistry::new();
         let meta = rp_meta("Bash"); // no rule for Bash
-        let d = decide_permission(&meta, "git status", &origin_permission::prompt::AlwaysDeny, &no_skills, &opts).await;
-        assert_eq!(d.outcome, Outcome::Deny, "unmatched tool falls through to prompter (AlwaysDeny)");
-        let d2 = decide_permission(&meta, "git status", &origin_permission::prompt::AlwaysAllow, &no_skills, &opts).await;
-        assert_eq!(d2.outcome, Outcome::Allow, "unmatched tool falls through to prompter (AlwaysAllow)");
+        let d = decide_permission(
+            &meta,
+            "git status",
+            &origin_permission::prompt::AlwaysDeny,
+            &no_skills,
+            &opts,
+        )
+        .await;
+        assert_eq!(
+            d.outcome,
+            Outcome::Deny,
+            "unmatched tool falls through to prompter (AlwaysDeny)"
+        );
+        let d2 = decide_permission(
+            &meta,
+            "git status",
+            &origin_permission::prompt::AlwaysAllow,
+            &no_skills,
+            &opts,
+        )
+        .await;
+        assert_eq!(
+            d2.outcome,
+            Outcome::Allow,
+            "unmatched tool falls through to prompter (AlwaysAllow)"
+        );
     }
 
     /// CONFINEMENT: skill-narrowing is final and outranks a user allow rule. A
@@ -8450,8 +8601,19 @@ mod wiring_tests {
             String::new(),
         );
         let meta = rp_meta("Bash");
-        let d = decide_permission(&meta, "rm -rf /", &origin_permission::prompt::AlwaysAllow, &skills, &opts).await;
-        assert_eq!(d.outcome, Outcome::Deny, "skill-narrowing wins over the user allow rule");
+        let d = decide_permission(
+            &meta,
+            "rm -rf /",
+            &origin_permission::prompt::AlwaysAllow,
+            &skills,
+            &opts,
+        )
+        .await;
+        assert_eq!(
+            d.outcome,
+            Outcome::Deny,
+            "skill-narrowing wins over the user allow rule"
+        );
         assert_eq!(d.reason, "skill-narrowed");
     }
 
@@ -8463,7 +8625,10 @@ mod wiring_tests {
     fn path_overlay_no_policy_is_byte_identical() {
         let opts = LoopOptions::default();
         assert!(opts.conseca.is_none());
-        let allow = Decision { outcome: Outcome::Allow, reason: "base".into() };
+        let allow = Decision {
+            outcome: Outcome::Allow,
+            reason: "base".into(),
+        };
         let args = serde_json::json!({ "file_path": "/etc/shadow" });
         assert_eq!(
             apply_path_overlay(allow, "Read", &args, &opts).outcome,
@@ -8484,7 +8649,10 @@ mod wiring_tests {
             })),
             ..LoopOptions::default()
         };
-        let allow = Decision { outcome: Outcome::Allow, reason: "base".into() };
+        let allow = Decision {
+            outcome: Outcome::Allow,
+            reason: "base".into(),
+        };
         let args = serde_json::json!({ "file_path": "/anywhere/at/all" });
         assert_eq!(
             apply_path_overlay(allow, "Read", &args, &opts).outcome,
@@ -8506,25 +8674,46 @@ mod wiring_tests {
             })),
             ..LoopOptions::default()
         };
-        let allow = || Decision { outcome: Outcome::Allow, reason: "base".into() };
+        let allow = || Decision {
+            outcome: Outcome::Allow,
+            reason: "base".into(),
+        };
 
         // Read inside the allow prefix ⇒ allowed.
         let ok = serde_json::json!({ "file_path": "/repo/src/main.rs" });
-        assert_eq!(apply_path_overlay(allow(), "Read", &ok, &opts).outcome, Outcome::Allow);
+        assert_eq!(
+            apply_path_overlay(allow(), "Read", &ok, &opts).outcome,
+            Outcome::Allow
+        );
         // Write inside a deny prefix ⇒ blocked.
         let bad = serde_json::json!({ "file_path": "/repo/secrets/key.pem" });
-        assert_eq!(apply_path_overlay(allow(), "Write", &bad, &opts).outcome, Outcome::Deny);
+        assert_eq!(
+            apply_path_overlay(allow(), "Write", &bad, &opts).outcome,
+            Outcome::Deny
+        );
         // Edit outside every allow prefix ⇒ blocked.
         let outside = serde_json::json!({ "file_path": "/tmp/x" });
-        assert_eq!(apply_path_overlay(allow(), "Edit", &outside, &opts).outcome, Outcome::Deny);
+        assert_eq!(
+            apply_path_overlay(allow(), "Edit", &outside, &opts).outcome,
+            Outcome::Deny
+        );
         // Bash cwd outside the allow prefix ⇒ blocked; cwd inside ⇒ allowed.
         let bash_bad = serde_json::json!({ "command": "ls", "cwd": "/tmp" });
-        assert_eq!(apply_path_overlay(allow(), "Bash", &bash_bad, &opts).outcome, Outcome::Deny);
+        assert_eq!(
+            apply_path_overlay(allow(), "Bash", &bash_bad, &opts).outcome,
+            Outcome::Deny
+        );
         let bash_ok = serde_json::json!({ "command": "ls", "cwd": "/repo/sub" });
-        assert_eq!(apply_path_overlay(allow(), "Bash", &bash_ok, &opts).outcome, Outcome::Allow);
+        assert_eq!(
+            apply_path_overlay(allow(), "Bash", &bash_ok, &opts).outcome,
+            Outcome::Allow
+        );
         // A non-path tool (and a Bash with no cwd) yields no paths ⇒ never gated.
         let bash_nocwd = serde_json::json!({ "command": "echo hi" });
-        assert_eq!(apply_path_overlay(allow(), "Bash", &bash_nocwd, &opts).outcome, Outcome::Allow);
+        assert_eq!(
+            apply_path_overlay(allow(), "Bash", &bash_nocwd, &opts).outcome,
+            Outcome::Allow
+        );
     }
 
     /// `conseca_target_paths` extracts the right path field per tool and yields
@@ -8557,7 +8746,10 @@ mod wiring_tests {
         let opts = LoopOptions::default();
         assert!(opts.policy.is_none());
         // Mirror the dispatch-site guard: a None policy is never consulted.
-        let allowed = opts.policy.as_ref().is_none_or(|p| p.is_model_allowed("any-model"));
+        let allowed = opts
+            .policy
+            .as_ref()
+            .is_none_or(|p| p.is_model_allowed("any-model"));
         assert!(allowed, "no policy ⇒ any model permitted (unchanged)");
     }
 
@@ -8566,18 +8758,28 @@ mod wiring_tests {
     /// models allowed.
     #[test]
     fn policy_model_denylist_rejects_named_model() {
-        let layer = origin_policy::parse_layer("denied_models = [\"expensive-model\"]", origin_policy::Tier::Admin)
-            .expect("valid layer");
+        let layer = origin_policy::parse_layer(
+            "denied_models = [\"expensive-model\"]",
+            origin_policy::Tier::Admin,
+        )
+        .expect("valid layer");
         let engine = origin_policy::PolicyEngine::new(vec![layer]);
-        assert!(!engine.is_model_allowed("expensive-model"), "denied model rejected");
-        assert!(engine.is_model_allowed("cheap-model"), "other models still allowed");
+        assert!(
+            !engine.is_model_allowed("expensive-model"),
+            "denied model rejected"
+        );
+        assert!(
+            engine.is_model_allowed("cheap-model"),
+            "other models still allowed"
+        );
     }
 
     /// CONFIGURED: an `allowed_models` policy rejects a model not on the list.
     #[test]
     fn policy_model_allowlist_rejects_unlisted_model() {
-        let layer = origin_policy::parse_layer("allowed_models = [\"only-this\"]", origin_policy::Tier::Admin)
-            .expect("valid layer");
+        let layer =
+            origin_policy::parse_layer("allowed_models = [\"only-this\"]", origin_policy::Tier::Admin)
+                .expect("valid layer");
         let engine = origin_policy::PolicyEngine::new(vec![layer]);
         assert!(engine.is_model_allowed("only-this"));
         assert!(!engine.is_model_allowed("something-else"));
@@ -8589,14 +8791,17 @@ mod wiring_tests {
     #[test]
     fn spend_estimator_prices_known_model_and_unknown_is_none() {
         // No cap ⇒ unconstrained (mirrors the guard's `if let Some(cap)`).
-        let engine = origin_policy::PolicyEngine::new(vec![
-            origin_policy::parse_layer("allowed_tools = [\"Read\"]", origin_policy::Tier::User).expect("layer"),
-        ]);
+        let engine = origin_policy::PolicyEngine::new(vec![origin_policy::parse_layer(
+            "allowed_tools = [\"Read\"]",
+            origin_policy::Tier::User,
+        )
+        .expect("layer")]);
         assert_eq!(engine.spend_cap_usd(), None, "no max_spend_usd ⇒ no cap");
 
         // A known model prices a positive cost that grows with tokens.
         let lo = estimate_spend_usd("claude-sonnet-4-6", 1_000, 1_000, 0).expect("known model prices");
-        let hi = estimate_spend_usd("claude-sonnet-4-6", 10_000_000, 10_000_000, 0).expect("known model prices");
+        let hi =
+            estimate_spend_usd("claude-sonnet-4-6", 10_000_000, 10_000_000, 0).expect("known model prices");
         assert!(hi > lo && lo >= 0.0, "cost grows with tokens: {lo} < {hi}");
         // An unknown/local model can't be priced ⇒ None ⇒ left unconstrained.
         assert!(
@@ -8610,8 +8815,10 @@ mod wiring_tests {
     /// total exceeds a tiny cap (would refuse the turn), a tiny total does not.
     #[test]
     fn spend_cap_min_and_estimate_compare() {
-        let admin = origin_policy::parse_layer("max_spend_usd = 50.0", origin_policy::Tier::Admin).expect("layer");
-        let user = origin_policy::parse_layer("max_spend_usd = 0.01", origin_policy::Tier::User).expect("layer");
+        let admin =
+            origin_policy::parse_layer("max_spend_usd = 50.0", origin_policy::Tier::Admin).expect("layer");
+        let user =
+            origin_policy::parse_layer("max_spend_usd = 0.01", origin_policy::Tier::User).expect("layer");
         let engine = origin_policy::PolicyEngine::new(vec![admin, user]);
         let cap = engine.spend_cap_usd().expect("cap set");
         assert!((cap - 0.01).abs() < f64::EPSILON, "cap is the min (0.01)");
@@ -8621,7 +8828,10 @@ mod wiring_tests {
         assert!(big > cap, "big spend ${big} exceeds cap ${cap} ⇒ turn refused");
         // A tiny total stays within the cap.
         let small = estimate_spend_usd("claude-sonnet-4-6", 10, 10, 0).expect("priced");
-        assert!(small <= cap, "tiny spend ${small} within cap ${cap} ⇒ turn proceeds");
+        assert!(
+            small <= cap,
+            "tiny spend ${small} within cap ${cap} ⇒ turn proceeds"
+        );
     }
 
     /// Task 2 DEFAULT-SAFE: with no `[post_edit]` config (`None`), the post-edit
@@ -8630,7 +8840,10 @@ mod wiring_tests {
     #[test]
     fn resolve_formatter_without_config_uses_builtin_table() {
         assert_eq!(resolve_formatter(None, "src/main.rs").as_deref(), Some("rustfmt"));
-        assert_eq!(resolve_formatter(None, "app/page.tsx").as_deref(), Some("prettier"));
+        assert_eq!(
+            resolve_formatter(None, "app/page.tsx").as_deref(),
+            Some("prettier")
+        );
         assert_eq!(resolve_formatter(None, "README"), None);
         // Identical to consulting the crate's builtin table directly.
         assert_eq!(
@@ -8649,7 +8862,10 @@ mod wiring_tests {
             ..origin_postedit::PostEditConfig::default()
         };
         // Override beats builtin for `.rs`.
-        assert_eq!(resolve_formatter(Some(&cfg), "lib.rs").as_deref(), Some("leptosfmt"));
+        assert_eq!(
+            resolve_formatter(Some(&cfg), "lib.rs").as_deref(),
+            Some("leptosfmt")
+        );
         // No override for `.go` ⇒ builtin table.
         assert_eq!(resolve_formatter(Some(&cfg), "main.go").as_deref(), Some("gofmt"));
         // Unknown extension ⇒ None.

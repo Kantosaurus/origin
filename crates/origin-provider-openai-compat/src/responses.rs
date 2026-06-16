@@ -69,8 +69,8 @@ impl Provider for OpenAiResponses {
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError> {
         let messages = origin_provider::inflate_tool_result_handles(&req.messages, self.cas.as_ref())?;
         let req = ChatRequest { messages, ..req };
-        let body =
-            serde_json::to_value(encode_request(&req)).map_err(|e| ProviderError::Api(format!("encode: {e}")))?;
+        let body = serde_json::to_value(encode_request(&req))
+            .map_err(|e| ProviderError::Api(format!("encode: {e}")))?;
         let url = format!(
             "{}{}",
             self.cfg.base_url.trim_end_matches('/'),
@@ -396,7 +396,10 @@ mod tests {
         };
         let body = serde_json::to_value(encode_request(&req)).unwrap();
         // Responses shape: `input` + `instructions`, NOT chat-completions `messages`.
-        assert!(body.get("messages").is_none(), "must not emit a chat `messages` array");
+        assert!(
+            body.get("messages").is_none(),
+            "must not emit a chat `messages` array"
+        );
         assert_eq!(body["instructions"], json!("you are codex"));
         let input = body["input"].as_array().expect("input array");
         assert_eq!(input.len(), 1);

@@ -65,7 +65,8 @@ fn near_duplicates_get_supersede_proposal() {
     // positionally (0, 1) would no longer be resolvable by the consolidator.
     let mut idx = MemIndex::new();
     idx.insert(memory_id_to_u64(&id_a), &unit_vec(0.0)).expect("ins");
-    idx.insert(memory_id_to_u64(&id_b), &unit_vec(0.001)).expect("ins");
+    idx.insert(memory_id_to_u64(&id_b), &unit_vec(0.001))
+        .expect("ins");
     let index = Arc::new(RwLock::new(idx));
     let cons = Consolidator::new(Arc::clone(&store), Arc::clone(&index));
 
@@ -117,7 +118,10 @@ fn consolidator_uses_stable_memory_id_not_positional_index() {
     // makes the two id schemes mutually exclusive.
     let uid_a = memory_id_to_u64(&id_a);
     let uid_b = memory_id_to_u64(&id_b);
-    assert!(uid_a > 1 && uid_b > 1, "stable ids must not collide with positional 0/1");
+    assert!(
+        uid_a > 1 && uid_b > 1,
+        "stable ids must not collide with positional 0/1"
+    );
     assert_ne!(uid_a, uid_b, "the two memories must have distinct stable ids");
 
     // Populate the index the way the daemon does: keyed by the stable id.
