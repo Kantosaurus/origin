@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use crate::error::ToolError;
-use crate::proc_supervisor::{ProcStatus, SpawnOpts, Supervisor};
+use crate::proc_supervisor::{KillOnDrop, ProcStatus, SpawnOpts, Supervisor};
 use crate::{SideEffects, Tier, Urgency};
 use serde_json::{json, Value};
 
@@ -46,7 +46,13 @@ pub async fn bash_v2(args: BashArgs, sup: &Supervisor) -> Result<Value, ToolErro
     if args.run_in_background {
         return Ok(json!({"status": "started", "pid": pid}));
     }
-    // Foreground: poll until status terminal, then return final body.
+    // Foreground: poll until status terminal, then return final body. The
+    // kill-on-drop guard hard-kills the child if THIS future is dropped mid-poll
+    // — the daemon's Ctrl+C interrupt path drops the whole turn future, and
+    // without the guard the detached supervisor task would keep the child alive
+    // to natural completion. Disarmed below on normal termination so a clean
+    // finish never fires a kill. Background spawns above never build the guard.
+    let mut kill_guard = KillOnDrop::new(sup, pid);
     let mut next = 0u64;
     let deadline = std::time::Instant::now() + Duration::from_secs(u64::from(timeout_secs) + 5);
     let mut acc = String::new();
@@ -55,6 +61,8 @@ pub async fn bash_v2(args: BashArgs, sup: &Supervisor) -> Result<Value, ToolErro
         acc.push_str(&chunk.bytes);
         next = chunk.next_offset;
         if chunk.status.is_terminal() {
+            // Normal termination — cancel the pending kill before we return.
+            kill_guard.disarm();
             // The per-read cap (64 KiB) may leave buffered output behind; the
             // process has terminated and its readers have been drained, so the
             // ring will not grow further — read until it is empty.
@@ -79,6 +87,11 @@ pub async fn bash_v2(args: BashArgs, sup: &Supervisor) -> Result<Value, ToolErro
             }));
         }
         if std::time::Instant::now() > deadline {
+            // Our poll loop hit its own ceiling (the supervisor enforces the
+            // real child timeout). Kill the child explicitly so a wedged process
+            // does not outlive the tool call, then return.
+            kill_guard.disarm();
+            sup.kill(pid);
             return Ok(json!({"status": "timed_out", "exit_code": -1, "stdout": cap_stdout(acc)}));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

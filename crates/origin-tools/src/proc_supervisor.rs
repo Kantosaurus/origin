@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::Notify;
 
 use crate::error::{ErrClass, ToolError};
 
@@ -68,6 +69,12 @@ struct ProcSlot {
     base_offset: u64,
     cap: usize,
     status: ProcStatus,
+    /// Fired by [`Supervisor::kill`] to ask the detached `supervise` task to
+    /// deliver a real OS kill (SIGKILL / `TerminateProcess`) to its child
+    /// immediately, rather than waiting for the natural exit or timeout. The
+    /// `supervise` task holds a clone and races a `notified()` future against
+    /// `child.wait()`. Always present; an empty `Notify` is cheap.
+    kill: Arc<Notify>,
 }
 
 impl ProcSlot {
@@ -163,6 +170,10 @@ impl Supervisor {
     pub fn spawn(&self, command: &str, opts: &SpawnOpts) -> Result<ProcessId, ToolError> {
         let pid = self.next.fetch_add(1, Ordering::Relaxed);
         let cap = opts.buffer_cap_bytes.unwrap_or(512 * 1024);
+        // Per-pid kill signal: `kill(pid)` fires this so the detached
+        // `supervise` task delivers an immediate OS kill. Cloned into the slot
+        // (so `kill` can find it) and into the task (so the task can wait on it).
+        let kill = Arc::new(Notify::new());
         {
             let mut guard = unlock(self.inner.lock());
             guard.insert(
@@ -172,6 +183,7 @@ impl Supervisor {
                     base_offset: 0,
                     cap,
                     status: ProcStatus::Running,
+                    kill: Arc::clone(&kill),
                 },
             );
         }
@@ -235,7 +247,7 @@ impl Supervisor {
         let child = spawned.map_err(|e| ToolError::new(ErrClass::Bash, "spawn_failed", e.to_string()))?;
 
         let table = self.inner.clone();
-        tokio::spawn(supervise(pid, child, opts.timeout, table));
+        tokio::spawn(supervise(pid, child, opts.timeout, table, kill));
         Ok(pid)
     }
 
@@ -254,14 +266,83 @@ impl Supervisor {
             .ok_or_else(|| ToolError::new(ErrClass::Validation, "unknown_pid", format!("no such pid {pid}")))
     }
 
-    /// Mark a process as killed in the slot table.
+    /// Deliver a real OS kill (SIGKILL / `TerminateProcess`) to the running
+    /// child and mark the slot `Killed`.
+    ///
+    /// The slot's status is flipped to `Killed` synchronously (so a foreground
+    /// poller observes a terminal status on its next read), and the per-pid
+    /// kill signal is fired so the detached `supervise` task — the sole owner of
+    /// the `Child` handle — races out of its `wait()` and calls `start_kill()`
+    /// on the OS process. Without the signal `kill` only set a flag while the
+    /// child kept running; with it the process is genuinely terminated.
+    ///
+    /// A no-op for an unknown / already-reaped pid.
     ///
     /// # Panics
     /// Never panics in normal operation.
     pub fn kill(&self, pid: ProcessId) {
         let mut guard = unlock(self.inner.lock());
-        if let Some(slot) = guard.get_mut(&pid) {
+        let Some(slot) = guard.get_mut(&pid) else {
+            return;
+        };
+        // Don't clobber a real terminal status (Exited/TimedOut) the
+        // `supervise` task may have already recorded.
+        if !slot.status.is_terminal() {
             slot.status = ProcStatus::Killed;
+        }
+        let kill = Arc::clone(&slot.kill);
+        // Release the table lock BEFORE the notify so we never hold the mutex
+        // across it (clippy `significant_drop_tightening`).
+        drop(guard);
+        // Wake the supervise task so it delivers the OS kill.
+        kill.notify_one();
+    }
+}
+
+/// RAII guard that hard-kills a supervised foreground process if its waiter is
+/// dropped before the process terminates.
+///
+/// A FOREGROUND `Bash` call polls the supervisor's ring buffer in a loop while
+/// the child runs. When the daemon's interrupt path drops the whole turn future
+/// (Ctrl+C → `select!` drops the loser), that poll future is dropped at its next
+/// `.await` — but the detached `supervise` task owns the `Child` and would keep
+/// it alive to natural completion. Holding this guard across the poll loop turns
+/// that drop into an immediate `Supervisor::kill(pid)`, `SIGKILLing` the child.
+///
+/// [`disarm`](KillOnDrop::disarm) cancels the kill once the process has
+/// terminated normally, so a clean foreground completion never fires a kill.
+/// BACKGROUND spawns (`run_in_background`) never construct this guard, so a
+/// backgrounded pid keeps running by design.
+#[derive(Debug)]
+pub struct KillOnDrop {
+    sup: Supervisor,
+    pid: ProcessId,
+    armed: bool,
+}
+
+impl KillOnDrop {
+    /// Arm a kill-on-drop guard for `pid` on `sup`. `sup` is `Arc`-backed, so
+    /// the clone is cheap.
+    #[must_use]
+    pub fn new(sup: &Supervisor, pid: ProcessId) -> Self {
+        Self {
+            sup: sup.clone(),
+            pid,
+            armed: true,
+        }
+    }
+
+    /// Cancel the pending kill — call this once the process has terminated on
+    /// its own (normal foreground completion) so dropping the guard is a no-op.
+    pub const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.sup.kill(self.pid);
         }
     }
 }
@@ -271,6 +352,7 @@ async fn supervise(
     mut child: Child,
     timeout: Option<Duration>,
     table: Arc<Mutex<HashMap<ProcessId, ProcSlot>>>,
+    kill: Arc<Notify>,
 ) {
     // Ceiling on the post-kill cleanup awaits below. After a timeout kill the
     // status flip must not hinge on cooperative behavior: the reap can miss a
@@ -309,38 +391,61 @@ async fn supervise(
             }
         }));
     }
-    let mut timed_out = false;
+    // `force_killed` covers BOTH the timeout kill and an explicit
+    // `Supervisor::kill` (the daemon's Ctrl+C hard-kill / foreground-bash
+    // kill-on-drop). Either way the child was SIGKILLed, so the post-kill drain
+    // is bounded for the same orphaned-grandchild reason as the timeout path.
+    let mut force_killed = false;
     let terminal_status = if let Some(d) = timeout {
-        match tokio::time::timeout(d, child.wait()).await {
-            Ok(Ok(status)) => ProcStatus::Exited(status.code().unwrap_or(-1)),
-            Ok(Err(_e)) => ProcStatus::Exited(-1),
-            Err(_elapsed) => {
-                timed_out = true;
+        tokio::select! {
+            // The wait races the timeout AND the explicit kill signal.
+            biased;
+            () = kill.notified() => {
+                force_killed = true;
                 // Deliver SIGKILL without awaiting the reap, then reap with a
                 // bound — the signal lands regardless; only the wait may wedge.
                 let _ = child.start_kill();
                 let _ = tokio::time::timeout(KILL_CLEANUP_BOUND, child.wait()).await;
-                ProcStatus::TimedOut
+                ProcStatus::Killed
             }
+            res = tokio::time::timeout(d, child.wait()) => match res {
+                Ok(Ok(status)) => ProcStatus::Exited(status.code().unwrap_or(-1)),
+                Ok(Err(_e)) => ProcStatus::Exited(-1),
+                Err(_elapsed) => {
+                    force_killed = true;
+                    let _ = child.start_kill();
+                    let _ = tokio::time::timeout(KILL_CLEANUP_BOUND, child.wait()).await;
+                    ProcStatus::TimedOut
+                }
+            },
         }
     } else {
-        match child.wait().await {
-            Ok(status) => ProcStatus::Exited(status.code().unwrap_or(-1)),
-            Err(_e) => ProcStatus::Exited(-1),
+        tokio::select! {
+            biased;
+            () = kill.notified() => {
+                force_killed = true;
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(KILL_CLEANUP_BOUND, child.wait()).await;
+                ProcStatus::Killed
+            }
+            res = child.wait() => match res {
+                Ok(status) => ProcStatus::Exited(status.code().unwrap_or(-1)),
+                Err(_e) => ProcStatus::Exited(-1),
+            },
         }
     };
     // The child has exited (or been killed), so its pipe write-ends are closed
     // and the reader tasks will hit EOF. Wait for them to finish so every byte
     // is appended to the ring buffer BEFORE we flip the status to terminal —
     // otherwise a foreground reader observing the terminal status could return
-    // before in-flight output is captured. After a timeout kill the drain is
+    // before in-flight output is captured. After a force-kill the drain is
     // bounded for the orphaned-grandchild reason above.
     let drain = async move {
         for r in readers {
             let _ = r.await;
         }
     };
-    if timed_out {
+    if force_killed {
         let _ = tokio::time::timeout(KILL_CLEANUP_BOUND, drain).await;
     } else {
         drain.await;

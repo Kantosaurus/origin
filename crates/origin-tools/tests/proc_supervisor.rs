@@ -132,6 +132,42 @@ async fn inherit_sandbox_profile_is_unchanged() {
     assert!(inherit.contains("inherit"), "inherit: {inherit:?}");
 }
 
+/// `Supervisor::kill` must deliver a real OS kill (SIGKILL / `TerminateProcess`)
+/// to the running child, not merely flip the slot's status flag. We spawn a
+/// process that prints forever (no timeout, so only an explicit kill can stop
+/// it), let it produce output, call `kill`, then assert the ring buffer STOPS
+/// growing — a still-running process would keep appending lines indefinitely.
+/// Before the real-kill wiring `kill` only flipped the status flag while the OS
+/// process kept printing, so the buffer kept growing.
+#[tokio::test]
+async fn kill_terminates_running_child() {
+    let sup = Supervisor::new();
+    // A tight print-loop so the buffer grows continuously while alive.
+    #[cfg(unix)]
+    let cmd = "while true; do echo tick; done";
+    #[cfg(windows)]
+    let cmd = "while ($true) { Write-Output tick }";
+    // No timeout: the only thing that can terminate this child is `kill`.
+    let pid = sup.spawn(cmd, &SpawnOpts::default()).unwrap();
+    // Wait for the child to actually start producing output.
+    let _ = read_until(&sup, pid, "tick").await;
+    sup.kill(pid);
+    // Give the kill a moment to land and the readers to drain, then snapshot the
+    // buffer length and confirm it is stable (the process is genuinely gone).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let len_a = sup.read_since(pid, 0, usize::MAX).unwrap().next_offset;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let len_b = sup.read_since(pid, 0, usize::MAX).unwrap().next_offset;
+    assert_eq!(
+        len_a, len_b,
+        "kill must terminate the OS process so output stops; buffer grew {len_a} -> {len_b}"
+    );
+    assert!(
+        sup.read_since(pid, 0, 4096).unwrap().status.is_terminal(),
+        "kill must flip the slot status terminal"
+    );
+}
+
 #[tokio::test]
 async fn parallel_processes_have_isolated_buffers() {
     let sup = Supervisor::new();

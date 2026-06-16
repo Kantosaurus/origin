@@ -6127,6 +6127,7 @@ mod ask_user_interactive_tests {
 
     use crate::ipc_prompter::ChoiceRegistry;
     use crate::protocol::StreamEvent;
+    use origin_runtime::{spawn_in, TaskClass};
 
     use super::run_ask_user_interactive;
 
@@ -6165,7 +6166,9 @@ mod ask_user_interactive_tests {
             "multi_select": true
         });
         let reg = Arc::clone(&registry);
-        let handle = tokio::spawn(async move { run_ask_user_interactive(&args, &tx, &reg).await });
+        let handle = spawn_in(TaskClass::Realtime, async move {
+            run_ask_user_interactive(&args, &tx, &reg).await
+        });
         // Assert the ChoiceAsk surfaced, then feed a multi-select decision.
         let id = expect_choice_ask(rx.recv().await.expect("ask emitted"), "Which target?", 3);
         registry.resolve(&id, vec![0, 2], None);
@@ -6186,7 +6189,9 @@ mod ask_user_interactive_tests {
             "options": [{"label": "a"}, {"label": "b"}]
         });
         let reg = Arc::clone(&registry);
-        let handle = tokio::spawn(async move { run_ask_user_interactive(&args, &tx, &reg).await });
+        let handle = spawn_in(TaskClass::Realtime, async move {
+            run_ask_user_interactive(&args, &tx, &reg).await
+        });
         let id = expect_choice_ask(rx.recv().await.expect("ask emitted"), "Pick one", 2);
         registry.resolve(&id, vec![1], Some("my own answer".to_string()));
         let bytes = handle.await.expect("task joins").expect("ok result");
@@ -6205,7 +6210,9 @@ mod ask_user_interactive_tests {
             "options": [{"label": "x"}]
         });
         let reg = Arc::clone(&registry);
-        let handle = tokio::spawn(async move { run_ask_user_interactive(&args, &tx, &reg).await });
+        let handle = spawn_in(TaskClass::Realtime, async move {
+            run_ask_user_interactive(&args, &tx, &reg).await
+        });
         let id = expect_choice_ask(rx.recv().await.expect("ask emitted"), "Pick", 1);
         registry.resolve(&id, Vec::new(), None); // cancelled
         let bytes = handle.await.expect("task joins").expect("ok result");
@@ -6223,7 +6230,9 @@ mod ask_user_interactive_tests {
             "options": [{"label": "only"}]
         });
         let reg = Arc::clone(&registry);
-        let handle = tokio::spawn(async move { run_ask_user_interactive(&args, &tx, &reg).await });
+        let handle = spawn_in(TaskClass::Realtime, async move {
+            run_ask_user_interactive(&args, &tx, &reg).await
+        });
         let id = expect_choice_ask(rx.recv().await.expect("ask emitted"), "Pick", 1);
         registry.resolve(&id, vec![0, 99], None); // 99 is out of range
         let bytes = handle.await.expect("task joins").expect("ok result");
@@ -6267,7 +6276,7 @@ async fn run_bash_streaming(
     // ⇒ a fresh per-call supervisor, byte-identical to before.
     proc_supervisor: Option<&origin_tools::proc_supervisor::Supervisor>,
 ) -> Result<Vec<u8>, String> {
-    use origin_tools::proc_supervisor::{ProcStatus, SpawnOpts};
+    use origin_tools::proc_supervisor::{KillOnDrop, ProcStatus, SpawnOpts};
     use std::time::Duration;
 
     let command = args
@@ -6329,6 +6338,13 @@ async fn run_bash_streaming(
             .into_bytes());
     }
 
+    // Foreground. A kill-on-drop guard hard-kills the child if THIS future is
+    // dropped mid-poll — the daemon's Ctrl+C interrupt drops the whole turn
+    // future, and without it the detached supervisor task would keep the child
+    // alive to natural completion. Disarmed on normal/timeout termination;
+    // background spawns above never build it.
+    let mut kill_guard = KillOnDrop::new(&sup, pid);
+
     // Foreground: poll the supervisor's ring buffer and stream every complete
     // line to the user as soon as it appears. We hold back a trailing partial
     // line (no terminating newline yet) so chunks align to line boundaries;
@@ -6379,6 +6395,8 @@ async fn run_bash_streaming(
         }
 
         if chunk.status.is_terminal() {
+            // Normal termination — cancel the pending kill before we return.
+            kill_guard.disarm();
             // Drain any remaining buffered bytes the per-read cap left behind.
             loop {
                 let more = sup.read_since(pid, next, 64 * 1024).map_err(|e| e.message)?;
@@ -6410,6 +6428,11 @@ async fn run_bash_streaming(
         }
 
         if std::time::Instant::now() > deadline {
+            // Our poll loop hit its ceiling (the supervisor enforces the real
+            // child timeout). Kill the child so a wedged process never outlives
+            // the tool call, then return.
+            kill_guard.disarm();
+            sup.kill(pid);
             break ("timed_out", -1);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
