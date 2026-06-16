@@ -143,11 +143,12 @@ const BYTES_PER_TOKEN: usize = 4;
 /// The transcript-byte soft cap above which the live in-loop compactor folds the
 /// oldest summarized turns into their summaries (firing `PreCompress`).
 ///
-/// Sized to the running model's real context window when known: a large-context
-/// model (e.g. Claude's 200 K) no longer compacts needlessly at the old fixed
-/// 200 KiB (~50 K tokens, only a quarter of its window). `ORIGIN_COMPACT_SOFT_CAP`
-/// still overrides everything (tuning/tests); an unknown model falls back to
-/// [`crate::compactor::DEFAULT_SOFT_CAP_BYTES`] (byte-identical to before).
+/// Sized to the running model's real context window via the shared
+/// [`crate::model_window::model_context_window`] resolver: a large-context model
+/// (e.g. Claude's 200 K, Opus 4.8's 1 M) no longer compacts needlessly at the old
+/// fixed 200 KiB (~50 K tokens, only a quarter of its window).
+/// `ORIGIN_COMPACT_SOFT_CAP` still overrides everything (tuning/tests); an
+/// unrecognized model resolves to the resolver's conservative 200 K fallback.
 fn compaction_soft_cap(model: &str) -> usize {
     if let Some(bytes) = std::env::var("ORIGIN_COMPACT_SOFT_CAP")
         .ok()
@@ -155,61 +156,43 @@ fn compaction_soft_cap(model: &str) -> usize {
     {
         return bytes;
     }
-    model_context_window(model).map_or(crate::compactor::DEFAULT_SOFT_CAP_BYTES, |window| {
-        let w = usize::try_from(window).unwrap_or(usize::MAX);
-        w.saturating_mul(BYTES_PER_TOKEN)
-            .saturating_mul(COMPACT_WINDOW_NUM)
-            / COMPACT_WINDOW_DEN
-    })
-}
-
-/// Best-effort context window (in tokens) for well-known model families, used
-/// only to size the compaction trigger. Matched by lowercased substring so
-/// version suffixes (`claude-opus-4-7-20250115`) still resolve. Returns `None`
-/// for unrecognized models, so the caller keeps the conservative fixed default.
-/// Full per-model accuracy would come from wiring the live model-discovery
-/// `context_window` through to the loop; this static table covers the common
-/// families without that plumbing.
-fn model_context_window(model: &str) -> Option<u32> {
-    let m = model.to_ascii_lowercase();
-    if m.contains("claude")
-        || m.contains("fable")
-        || m.contains("opus")
-        || m.contains("sonnet")
-        || m.contains("haiku")
-    {
-        Some(200_000)
-    } else if m.contains("gemini") {
-        Some(1_000_000)
-    } else if m.contains("gpt-4") || m.contains("gpt-5") {
-        Some(128_000)
-    } else {
-        None
-    }
+    let window = crate::model_window::model_context_window(model);
+    let w = usize::try_from(window).unwrap_or(usize::MAX);
+    w.saturating_mul(BYTES_PER_TOKEN)
+        .saturating_mul(COMPACT_WINDOW_NUM)
+        / COMPACT_WINDOW_DEN
 }
 
 #[cfg(test)]
 mod compaction_cap_tests {
-    use super::{model_context_window, BYTES_PER_TOKEN, COMPACT_WINDOW_DEN, COMPACT_WINDOW_NUM};
-
-    #[test]
-    fn context_window_resolves_known_families() {
-        assert_eq!(model_context_window("claude-opus-4-7-20250115"), Some(200_000));
-        assert_eq!(model_context_window("claude-fable-5"), Some(200_000));
-        assert_eq!(model_context_window("gemini-2.5-pro"), Some(1_000_000));
-        assert_eq!(model_context_window("gpt-4o-mini"), Some(128_000));
-        assert_eq!(model_context_window("some-unknown-local-model"), None);
-    }
+    use super::{BYTES_PER_TOKEN, COMPACT_WINDOW_DEN, COMPACT_WINDOW_NUM};
+    use crate::model_window::model_context_window;
 
     #[test]
     fn large_window_models_get_a_larger_cap_than_the_fixed_default() {
         // 200k tokens × 4 bytes × 3/5 = 480 KB, well above the 200 KiB default —
-        // so a Claude session no longer compacts at ~25 % of its real window.
-        let window = model_context_window("claude-opus-4-7").expect("known");
+        // so a Claude session no longer compacts at ~25 % of its real window. The
+        // per-family resolution itself is tested in `crate::model_window`.
+        let window = model_context_window("claude-sonnet-4-6");
+        assert_eq!(window, 200_000);
         let cap = usize::try_from(window).expect("fits") * BYTES_PER_TOKEN * COMPACT_WINDOW_NUM
             / COMPACT_WINDOW_DEN;
         assert_eq!(cap, 480_000);
         assert!(cap > crate::compactor::DEFAULT_SOFT_CAP_BYTES);
+    }
+
+    #[test]
+    fn unknown_model_uses_the_resolver_fallback_not_the_old_fixed_default() {
+        // Unifying onto the shared resolver deliberately changed the UNKNOWN-model
+        // cap: it now resolves to the 200 K-token fallback (480 KB) instead of the
+        // old `None` → DEFAULT_SOFT_CAP_BYTES (204,800). Pin that shift so a future
+        // edit can't silently revert it (or quietly change the fallback window).
+        let window = model_context_window("totally-unknown-local-model-xyz");
+        assert_eq!(window, 200_000);
+        let cap = usize::try_from(window).expect("fits") * BYTES_PER_TOKEN * COMPACT_WINDOW_NUM
+            / COMPACT_WINDOW_DEN;
+        assert_eq!(cap, 480_000);
+        assert_ne!(cap, crate::compactor::DEFAULT_SOFT_CAP_BYTES);
     }
 }
 
@@ -1976,6 +1959,15 @@ pub struct LoopOptions {
     /// [`origin_stream::TokenKind`] — it's a turn-end side product, not a
     /// streaming token.
     pub event_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
+    /// Daemon-wide registry the `ask_user` tool parks on for its interactive
+    /// pause-await. When BOTH this and `event_tx` are `Some`, an `ask_user`
+    /// dispatch emits a [`StreamEvent::ChoiceAsk`](crate::protocol::StreamEvent)
+    /// and blocks until a matching
+    /// [`ClientMessage::ChoiceDecision`](crate::protocol::ClientMessage)
+    /// resolves it (mirroring the permission pause-await). `None` (the default
+    /// everywhere, including swarm sub-agents and tests) ⇒ `ask_user` degrades
+    /// to a prose instruction, byte-identical to having no interactive channel.
+    pub choice_registry: Option<Arc<crate::ipc_prompter::ChoiceRegistry>>,
     /// If `Some`, the loop embeds the user prompt and prepends any retrieved
     /// `<context source="origin-mem">` block to the system prompt of every
     /// turn's `ChatRequest`. `None` disables prompt-recall injection.
@@ -2181,6 +2173,7 @@ impl Default for LoopOptions {
             session_store: None,
             proposer: None,
             event_tx: None,
+            choice_registry: None,
             injector: None,
             proposal_registry: None,
             skills: None,
@@ -2426,6 +2419,11 @@ impl SpeculativeRegistry {
         "graph_query",
         "graph_path",
         "graph_summarize",
+        // `ask_user` must reach the main loop's interactive pause-await (it needs
+        // the live `event_tx` + `choice_registry`); a speculative dispatch has
+        // neither and would precompute the prose-fallback, shadowing the real
+        // interactive path.
+        "ask_user",
     ];
 
     fn spawn(
@@ -4109,7 +4107,15 @@ async fn run_loop_inner(
             if name == "Task" {
                 if let Some(coord) = opts.coordinator.as_deref() {
                     match serde_json::from_value::<origin_tools::builtins::task::TaskInput>(args.clone()) {
-                        Ok(input) => {
+                        Ok(mut input) => {
+                            // Honor a mid-session `/model` switch: when the Task
+                            // call didn't name a model, inherit the parent
+                            // session's exact model so the worker runs on a model
+                            // the account can serve (the worker-side fallback in
+                            // `swarm_worker` covers the secondary dispatch paths).
+                            if input.model.is_none() {
+                                input.model = Some(session.model.clone());
+                            }
                             let goal = input.goal.clone();
                             match origin_tools::builtins::task::task_spawn(coord, input).await {
                                 Ok(handle) => {
@@ -4207,6 +4213,31 @@ async fn run_loop_inner(
                             continue;
                         }
                         Err(e) => return Err(e),
+                    }
+                } else if let Some((choice_tx, choice_reg)) = ask_user_interactive_channel(meta, opts)
+                {
+                    // Interactive pause-await path: emit a `ChoiceAsk` and block
+                    // on the matching `ChoiceDecision` (mirrors the permission
+                    // prompter). Reached only when this is `ask_user` AND BOTH an
+                    // event channel and the choice registry are wired; otherwise
+                    // the call falls through to the generic `dispatch_tool` arm,
+                    // which returns the prose instruction (backward-compat). Bad
+                    // args surface as an error to the model rather than aborting.
+                    match run_ask_user_interactive(&args, choice_tx, choice_reg).await {
+                        Ok(bytes) => bytes,
+                        Err(msg) => {
+                            tracing::warn!(tool = %name, %msg, "ask_user failed; returning error to model");
+                            if let Some(m) = opts.metrics.as_deref() {
+                                m.tool_call_total(provider.name(), &name, "err").inc();
+                            }
+                            tool_results.push(Block::ToolResult {
+                                tool_use_id: id,
+                                handle: None,
+                                inline: Some(format!("Error: {msg}").into_bytes()),
+                                cache_marker: None,
+                            });
+                            continue;
+                        }
                     }
                 } else if meta.name == "Bash" {
                     // Streaming dispatch path: forwards each stdout/stderr
@@ -5744,6 +5775,18 @@ async fn dispatch_tool(
             })?;
             run_workflow_tool(args, coord, skill_catalog).await
         }
+        // ── ask_user (interactive choice) — backward-compat path ──
+        // The INTERACTIVE pause-await (emit `ChoiceAsk` → block on
+        // `ChoiceDecision`) is handled in the main loop body, which has the live
+        // `event_tx` + `choice_registry`. Reaching `dispatch_tool` means no
+        // interactive channel is wired (headless / swarm sub-agent / unit test),
+        // so the tool degrades to a prose instruction telling the model to ask in
+        // its next message. Bad args still surface as `BadArgs`.
+        "ask_user" => {
+            let parsed = origin_tools::builtins::ask_user::AskUserArgs::from_value(args)
+                .map_err(LoopError::BadArgs)?;
+            Ok(origin_tools::builtins::ask_user::backward_compat_instruction(&parsed))
+        }
         other => Err(LoopError::UnknownTool(other.into())),
     }
 }
@@ -6005,6 +6048,196 @@ fn node_row_to_json(row: &origin_codegraph::index::NodeRow) -> serde_json::Value
         "signature_handle": hex::encode(row.signature_handle),
         "body_handle": hex::encode(row.body_handle),
     })
+}
+
+/// Return the interactive choice channel for an `ask_user` dispatch, or `None`.
+///
+/// The interactive pause-await path is available only when the tool is
+/// `ask_user` AND the turn wired BOTH an event channel and the daemon-wide
+/// choice registry. `None` (any other tool, or a headless / swarm / scripted
+/// turn) routes the call through the generic `dispatch_tool` prose fallback.
+fn ask_user_interactive_channel<'a>(
+    meta: &ToolMeta,
+    opts: &'a LoopOptions,
+) -> Option<(
+    &'a tokio::sync::mpsc::Sender<StreamEvent>,
+    &'a Arc<crate::ipc_prompter::ChoiceRegistry>,
+)> {
+    if meta.name != "ask_user" {
+        return None;
+    }
+    match (opts.event_tx.as_ref(), opts.choice_registry.as_ref()) {
+        (Some(tx), Some(reg)) => Some((tx, reg)),
+        _ => None,
+    }
+}
+
+/// Dispatch the `ask_user` tool over the interactive pause-await path: parse the
+/// `{question, options, multi_select?, allow_custom?}` payload, emit a
+/// [`StreamEvent::ChoiceAsk`] over `event_tx`, and block on the matching
+/// [`ClientMessage::ChoiceDecision`](crate::protocol::ClientMessage) resolved
+/// through `registry`. The resolved `(selected indices, custom)` is mapped back
+/// to the chosen option labels (plus any free text) and folded into the tool
+/// result the model sees. An empty/cancelled decision yields the "user skipped"
+/// result. Mirrors `permission_ask`'s mechanism exactly.
+///
+/// # Errors
+/// Returns the `ask_user` validation message (a `BadArgs`-class string) when the
+/// model's input is malformed; the await itself never errors (an unreachable
+/// client resolves to the skip outcome).
+async fn run_ask_user_interactive(
+    args: &Value,
+    event_tx: &tokio::sync::mpsc::Sender<StreamEvent>,
+    registry: &Arc<crate::ipc_prompter::ChoiceRegistry>,
+) -> Result<Vec<u8>, String> {
+    let parsed = origin_tools::builtins::ask_user::AskUserArgs::from_value(args)?;
+    // Project the tool's options onto the protocol's `ChoiceOption` shape.
+    let options: Vec<crate::protocol::ChoiceOption> = parsed
+        .options
+        .iter()
+        .map(|o| crate::protocol::ChoiceOption {
+            label: o.label.clone(),
+            description: o.description.clone(),
+        })
+        .collect();
+    let prompter =
+        crate::ipc_prompter::IpcChoicePrompter::new(event_tx.clone(), Arc::clone(registry));
+    let (selected, custom) = prompter
+        .ask(
+            parsed.question.clone(),
+            options,
+            parsed.multi_select,
+            parsed.allow_custom,
+        )
+        .await;
+    // Map the chosen indices back to labels (ignoring any out-of-range index a
+    // misbehaving client might send), then fold labels + custom into the result.
+    let labels: Vec<String> = selected
+        .iter()
+        .filter_map(|&i| parsed.options.get(i).map(|o| o.label.clone()))
+        .collect();
+    let result = origin_tools::builtins::ask_user::format_decision(&labels, custom.as_deref());
+    Ok(result.into_bytes())
+}
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+mod ask_user_interactive_tests {
+    use std::sync::Arc;
+
+    use crate::ipc_prompter::ChoiceRegistry;
+    use crate::protocol::StreamEvent;
+
+    use super::run_ask_user_interactive;
+
+    /// Pull the next emitted event, assert it is a `ChoiceAsk`, and return its
+    /// correlation id (plus a sanity check on the question + option count).
+    fn expect_choice_ask(ev: StreamEvent, question: &str, option_count: usize) -> String {
+        match ev {
+            StreamEvent::ChoiceAsk { id, question: q, options, .. } => {
+                assert_eq!(q, question);
+                assert_eq!(options.len(), option_count);
+                id
+            }
+            other => panic!("expected ChoiceAsk, got {other:?}"),
+        }
+    }
+
+    /// Full round-trip: dispatch `ask_user` interactively → assert a `ChoiceAsk`
+    /// is emitted → resolve the matching `ChoiceDecision` → the tool result is
+    /// the selected labels.
+    #[tokio::test]
+    async fn dispatch_emits_choice_ask_and_returns_selected_labels() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let registry = Arc::new(ChoiceRegistry::new());
+        let args = serde_json::json!({
+            "question": "Which target?",
+            "options": [
+                {"label": "staging"},
+                {"label": "prod"},
+                {"label": "canary"}
+            ],
+            "multi_select": true
+        });
+        let reg = Arc::clone(&registry);
+        let handle = tokio::spawn(async move { run_ask_user_interactive(&args, &tx, &reg).await });
+        // Assert the ChoiceAsk surfaced, then feed a multi-select decision.
+        let id = expect_choice_ask(rx.recv().await.expect("ask emitted"), "Which target?", 3);
+        registry.resolve(&id, vec![0, 2], None);
+        let bytes = handle.await.expect("task joins").expect("ok result");
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(text.contains("staging"), "first selected label present: {text}");
+        assert!(text.contains("canary"), "third selected label present: {text}");
+        assert!(!text.contains("prod"), "unselected label absent: {text}");
+    }
+
+    /// A custom free-text answer is appended to the result.
+    #[tokio::test]
+    async fn dispatch_appends_custom_text() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let registry = Arc::new(ChoiceRegistry::new());
+        let args = serde_json::json!({
+            "question": "Pick one",
+            "options": [{"label": "a"}, {"label": "b"}]
+        });
+        let reg = Arc::clone(&registry);
+        let handle = tokio::spawn(async move { run_ask_user_interactive(&args, &tx, &reg).await });
+        let id = expect_choice_ask(rx.recv().await.expect("ask emitted"), "Pick one", 2);
+        registry.resolve(&id, vec![1], Some("my own answer".to_string()));
+        let bytes = handle.await.expect("task joins").expect("ok result");
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(text.contains('b'), "selected label present: {text}");
+        assert!(text.contains("my own answer"), "custom text appended: {text}");
+    }
+
+    /// An empty/cancelled decision yields the "user skipped" result.
+    #[tokio::test]
+    async fn empty_decision_is_user_skipped() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let registry = Arc::new(ChoiceRegistry::new());
+        let args = serde_json::json!({
+            "question": "Pick",
+            "options": [{"label": "x"}]
+        });
+        let reg = Arc::clone(&registry);
+        let handle = tokio::spawn(async move { run_ask_user_interactive(&args, &tx, &reg).await });
+        let id = expect_choice_ask(rx.recv().await.expect("ask emitted"), "Pick", 1);
+        registry.resolve(&id, Vec::new(), None); // cancelled
+        let bytes = handle.await.expect("task joins").expect("ok result");
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(text.contains("skipped"), "skip result: {text}");
+    }
+
+    /// An out-of-range index from a misbehaving client is ignored, not panicked.
+    #[tokio::test]
+    async fn out_of_range_index_is_ignored() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let registry = Arc::new(ChoiceRegistry::new());
+        let args = serde_json::json!({
+            "question": "Pick",
+            "options": [{"label": "only"}]
+        });
+        let reg = Arc::clone(&registry);
+        let handle = tokio::spawn(async move { run_ask_user_interactive(&args, &tx, &reg).await });
+        let id = expect_choice_ask(rx.recv().await.expect("ask emitted"), "Pick", 1);
+        registry.resolve(&id, vec![0, 99], None); // 99 is out of range
+        let bytes = handle.await.expect("task joins").expect("ok result");
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(text.contains("only"), "valid label kept: {text}");
+        assert!(!text.contains("99"), "bogus index dropped: {text}");
+    }
+
+    /// Malformed input (blank question) surfaces as an error, not a hang.
+    #[tokio::test]
+    async fn bad_args_returns_error() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let registry = Arc::new(ChoiceRegistry::new());
+        let args = serde_json::json!({ "question": "", "options": [] });
+        let err = run_ask_user_interactive(&args, &tx, &registry)
+            .await
+            .expect_err("blank question is an error");
+        assert!(err.contains("question"), "error mentions question: {err}");
+    }
 }
 
 /// Dispatch the `Bash` tool and forward output to `event_tx` as
@@ -6981,6 +7214,56 @@ mod dispatch_table_tests {
             unrecognized.is_empty(),
             "tools registered in the inventory but not handled by dispatch_tool: {unrecognized:?}"
         );
+    }
+
+    /// Backward-compat: with NO interactive channel (the `dispatch_tool` path is
+    /// reached only when no `event_tx` + `choice_registry` are wired — headless,
+    /// swarm sub-agents, scripted tests), `ask_user` degrades to a prose
+    /// instruction telling the model to ask the question conversationally rather
+    /// than emitting a `ChoiceAsk` no one can answer.
+    #[tokio::test]
+    async fn ask_user_without_interactive_channel_returns_prose_instruction() {
+        let args = serde_json::json!({
+            "question": "Which database backend?",
+            "options": [
+                {"label": "postgres", "description": "battle-tested"},
+                {"label": "sqlite"}
+            ]
+        });
+        let out = dispatch_tool(
+            ask_user_meta(),
+            &args,
+            None, None, None, None, None, None, None, None, None, None,
+        )
+        .await
+        .expect("ask_user backward-compat path is infallible for valid args");
+        assert!(
+            out.contains("Interactive prompting is not available"),
+            "degrades to prose instruction: {out}"
+        );
+        assert!(out.contains("Which database backend?"), "includes the question");
+        assert!(out.contains("postgres"), "lists the options: {out}");
+    }
+
+    /// `ask_user` with a blank question surfaces a `BadArgs`, not `UnknownTool`.
+    #[tokio::test]
+    async fn ask_user_blank_question_is_bad_args() {
+        let args = serde_json::json!({ "question": "  ", "options": [] });
+        let err = dispatch_tool(
+            ask_user_meta(),
+            &args,
+            None, None, None, None, None, None, None, None, None, None,
+        )
+        .await
+        .expect_err("blank question is rejected");
+        assert!(matches!(err, LoopError::BadArgs(_)), "BadArgs, got {err:?}");
+    }
+
+    /// Look up the registered `ask_user` `ToolMeta` from the inventory.
+    fn ask_user_meta() -> &'static ToolMeta {
+        registry_iter()
+            .find(|m| m.name == "ask_user")
+            .expect("ask_user is registered in the inventory")
     }
 
     /// Regression: handle-dependent Pure tools (`mem_search`, `ask`,

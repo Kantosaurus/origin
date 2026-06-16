@@ -99,6 +99,7 @@ async fn memory_proposed_round_trip_via_stub_provider() {
             streaming_disabled: true,
             proposer: Some(Arc::clone(&proposer)),
             event_tx: Some(event_tx.clone()),
+            choice_registry: None,
             injector: None,
             sidecar: None,
             session_store: None,

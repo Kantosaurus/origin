@@ -96,6 +96,7 @@ async fn memory_e2e_proposer_to_store_via_wiremock() {
         streaming_disabled: true,
         proposer: Some(Arc::clone(&proposer)),
         event_tx: Some(event_tx.clone()),
+        choice_registry: None,
         injector: None, // no embedder wired
         sidecar: None,
         session_store: None,

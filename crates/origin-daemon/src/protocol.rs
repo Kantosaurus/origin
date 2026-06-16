@@ -112,7 +112,30 @@ pub enum ClientMessage {
     /// `allow == false` denies the tool. Sent mid-turn over the same connection
     /// serving the prompt (like [`ClientMessage::Interrupt`]). Only produced
     /// when the turn opted into [`PromptRequest::permission_ask`].
-    PermissionDecision { id: u64, allow: bool },
+    ///
+    /// `always` (additive; `#[serde(default)]`) carries a "remember this
+    /// decision" flag for an upgraded Allow-once / Deny / Always-allow picker.
+    /// Old clients that never send the field still deserialize (defaults to
+    /// `false`), so the wire stays backward-compatible.
+    PermissionDecision {
+        id: u64,
+        allow: bool,
+        #[serde(default)]
+        always: bool,
+    },
+    /// Client's answer to a [`StreamEvent::ChoiceAsk`] emitted by the
+    /// `ask_user` tool, correlated by `id`. `selected` holds the zero-based
+    /// indices the user picked from `ChoiceAsk::options` (empty ⇒ the user
+    /// skipped/cancelled); `custom` holds free-text when the user chose the
+    /// "type your own" affordance. Like [`ClientMessage::PermissionDecision`]
+    /// this is delivered cross-connection (the prompt connection is busy
+    /// streaming) and resolved through the daemon-wide choice registry.
+    ChoiceDecision {
+        id: String,
+        selected: Vec<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custom: Option<String>,
+    },
     /// Hot-swap the active provider/account credential without restarting
     /// the daemon.
     SwitchAccount { provider: String, account_id: String },
@@ -398,6 +421,29 @@ pub enum StreamEvent {
         /// or path) so the user sees *what* they are approving.
         args_preview: String,
     },
+    /// Interactive structured choice emitted by the `ask_user` builtin tool.
+    /// The daemon pauses the tool and blocks on the matching
+    /// [`ClientMessage::ChoiceDecision`] (correlated by `id`) — the exact
+    /// pattern [`StreamEvent::PermissionAsk`] uses. Only emitted when the turn
+    /// runs with an interactive event channel + choice registry wired; a
+    /// headless/swarm turn degrades the tool to a prose instruction instead, so
+    /// default streams are byte-identical (this variant is never emitted there).
+    ChoiceAsk {
+        /// Correlation id, unique within the daemon's lifetime. Echoed back in
+        /// the decision. A `String` (not the `u64` of `PermissionAsk`) so it can
+        /// also carry a tool-use id verbatim when convenient.
+        id: String,
+        /// The question to put to the user.
+        question: String,
+        /// The selectable options, in display order.
+        options: Vec<ChoiceOption>,
+        /// `true` ⇒ the user may pick more than one option (checkbox UI).
+        #[serde(default)]
+        multi_select: bool,
+        /// `true` ⇒ the picker offers a "type your own" free-text affordance.
+        #[serde(default)]
+        allow_custom: bool,
+    },
     /// Emitted after a successful `ClientMessage::SwitchAccount` so the CLI
     /// can confirm the new provider/account is in effect for subsequent
     /// prompts.
@@ -678,6 +724,20 @@ pub struct WorkflowRunStep {
     pub status: String,
 }
 
+/// One selectable option inside a [`StreamEvent::ChoiceAsk`].
+///
+/// `label` is what the user picks (and what the daemon feeds back to the model
+/// as the chosen result); `description` is optional secondary help text the
+/// picker renders in a muted style.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChoiceOption {
+    /// The selectable label, returned verbatim to the model when chosen.
+    pub label: String,
+    /// Optional secondary help text rendered beneath/after the label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 /// A single line in a unified diff view.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DiffLine {
@@ -769,13 +829,136 @@ mod permission_wire_tests {
 
     #[test]
     fn permission_decision_message_round_trips() {
-        let msg = ClientMessage::PermissionDecision { id: 7, allow: true };
+        let msg = ClientMessage::PermissionDecision {
+            id: 7,
+            allow: true,
+            always: false,
+        };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: ClientMessage = serde_json::from_str(&json).expect("deserialize");
         assert!(matches!(
             back,
-            ClientMessage::PermissionDecision { id: 7, allow: true }
+            ClientMessage::PermissionDecision {
+                id: 7,
+                allow: true,
+                always: false
+            }
         ));
+    }
+
+    #[test]
+    fn permission_decision_always_round_trips() {
+        let msg = ClientMessage::PermissionDecision {
+            id: 9,
+            allow: true,
+            always: true,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains("\"always\":true"), "always serialized: {json}");
+        let back: ClientMessage = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            back,
+            ClientMessage::PermissionDecision {
+                id: 9,
+                allow: true,
+                always: true
+            }
+        ));
+    }
+
+    #[test]
+    fn old_permission_decision_without_always_still_deserializes() {
+        // An old client / cassette that predates the `always` upgrade sends no
+        // `always` key. `#[serde(default)]` must fill it with `false` so the
+        // daemon never rejects a legacy decision.
+        let legacy = r#"{"kind":"permission_decision","id":3,"allow":false}"#;
+        let back: ClientMessage = serde_json::from_str(legacy).expect("legacy deserialize");
+        match back {
+            ClientMessage::PermissionDecision { id, allow, always } => {
+                assert_eq!(id, 3);
+                assert!(!allow);
+                assert!(!always, "missing `always` defaults to false");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn choice_ask_event_round_trips() {
+        let ev = StreamEvent::ChoiceAsk {
+            id: "tool-42".to_string(),
+            question: "Which deployment target?".to_string(),
+            options: vec![
+                ChoiceOption {
+                    label: "staging".to_string(),
+                    description: Some("safe sandbox".to_string()),
+                },
+                ChoiceOption {
+                    label: "prod".to_string(),
+                    description: None,
+                },
+            ],
+            multi_select: false,
+            allow_custom: true,
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(json.contains("\"kind\":\"choice_ask\""), "tagged on kind: {json}");
+        let back: StreamEvent = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            StreamEvent::ChoiceAsk {
+                id,
+                question,
+                options,
+                multi_select,
+                allow_custom,
+            } => {
+                assert_eq!(id, "tool-42");
+                assert_eq!(question, "Which deployment target?");
+                assert_eq!(options.len(), 2);
+                assert_eq!(options[0].label, "staging");
+                assert_eq!(options[0].description.as_deref(), Some("safe sandbox"));
+                assert_eq!(options[1].label, "prod");
+                assert!(options[1].description.is_none());
+                assert!(!multi_select);
+                assert!(allow_custom);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn choice_decision_message_round_trips() {
+        let msg = ClientMessage::ChoiceDecision {
+            id: "tool-42".to_string(),
+            selected: vec![0, 2],
+            custom: Some("something else".to_string()),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains("\"kind\":\"choice_decision\""), "tagged: {json}");
+        let back: ClientMessage = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            ClientMessage::ChoiceDecision { id, selected, custom } => {
+                assert_eq!(id, "tool-42");
+                assert_eq!(selected, vec![0, 2]);
+                assert_eq!(custom.as_deref(), Some("something else"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn choice_decision_without_custom_deserializes() {
+        // The empty/skip path: no `custom` key, empty `selected`.
+        let json = r#"{"kind":"choice_decision","id":"x","selected":[]}"#;
+        let back: ClientMessage = serde_json::from_str(json).expect("deserialize");
+        match back {
+            ClientMessage::ChoiceDecision { id, selected, custom } => {
+                assert_eq!(id, "x");
+                assert!(selected.is_empty());
+                assert!(custom.is_none());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]

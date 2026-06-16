@@ -99,6 +99,7 @@ async fn two_task_calls_in_one_turn_run_concurrently() {
                 follow_ups: Vec::new(),
                 transcript_handle: [0; 32],
                 usage: SwarmUsage::default(),
+                detail: None,
             })
         })
     });

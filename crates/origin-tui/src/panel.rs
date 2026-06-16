@@ -15,6 +15,35 @@ pub enum PermissionOutcome {
     Edit,
 }
 
+/// The semantic colors [`Panel::render`] paints with, threaded in by the
+/// caller so the side panel follows the active theme.
+///
+/// `origin-tui` is theme-agnostic (it cannot depend on the cli's `Tokens`), so
+/// the cli supplies these from `Tokens`/`theme::Palette` — `muted` for the
+/// auto-allowed ring and decided rows, `warn` for the requires-permission ring,
+/// and `body` for the tool label. [`PanelColors::default`] reproduces the
+/// legacy "Burnished Copper" hexes so a caller that hasn't wired a theme yet
+/// renders byte-identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanelColors {
+    /// Lowest legible text (auto-allowed ring, decided rows).
+    pub muted: u32,
+    /// Warning/attention (requires-permission ring).
+    pub warn: u32,
+    /// Body prose (tool label).
+    pub body: u32,
+}
+
+impl Default for PanelColors {
+    fn default() -> Self {
+        Self {
+            muted: 0x00_5C_57_52,
+            warn: 0x00_E5_C0_7B,
+            body: 0x00_C8_C1_B8,
+        }
+    }
+}
+
 /// Events that flow through the side panel.
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Clone)]
@@ -115,8 +144,10 @@ impl Panel {
     /// `start_row`. Text is truncated to the grid's column width.
     ///
     /// Styled output: permission asks show tool name + tier with
-    /// color-coded tier indicators; decided events render dimmed.
-    pub fn render(&self, side: &mut Grid, start_row: u16) {
+    /// color-coded tier indicators; decided events render dimmed. Colors come
+    /// from the caller-supplied [`PanelColors`] so the side panel re-themes with
+    /// the rest of the UI (`/theme`, `NO_COLOR`, `HighContrast`).
+    pub fn render(&self, side: &mut Grid, start_row: u16, colors: PanelColors) {
         let width = side.cols();
         for (row_idx, ev) in self.items.iter().enumerate() {
             let row = start_row.saturating_add(u16::try_from(row_idx).unwrap_or(u16::MAX));
@@ -126,8 +157,8 @@ impl Panel {
             match ev {
                 PanelEvent::PermissionAsk { tool, tier, .. } => {
                     let (tier_ch, tier_fg) = match tier {
-                        Tier::AutoAllowed => ('\u{25CB}', 0x00_5C_57_52),
-                        Tier::RequiresPermission => ('\u{25CF}', 0x00_E5_C0_7B),
+                        Tier::AutoAllowed => ('\u{25CB}', colors.muted),
+                        Tier::RequiresPermission => ('\u{25CF}', colors.warn),
                     };
                     if width > 2 {
                         side.put(row, 1, Cell::new(tier_ch, tier_fg, 0, crate::grid::Attr::PLAIN));
@@ -141,7 +172,7 @@ impl Panel {
                         side.put(
                             row,
                             col,
-                            Cell::new(ch, 0x00_C8_C1_B8, 0, crate::grid::Attr::PLAIN),
+                            Cell::new(ch, colors.body, 0, crate::grid::Attr::PLAIN),
                         );
                     }
                 }
@@ -160,7 +191,7 @@ impl Panel {
                         side.put(
                             row,
                             col,
-                            Cell::new(ch, 0x00_5C_57_52, 0, crate::grid::Attr::PLAIN),
+                            Cell::new(ch, colors.muted, 0, crate::grid::Attr::PLAIN),
                         );
                     }
                 }

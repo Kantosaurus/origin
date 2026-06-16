@@ -886,6 +886,7 @@ mod tests {
             follow_ups: Vec::new(),
             transcript_handle: [0u8; 32],
             usage: Usage::default(),
+            detail: None,
         };
         let summary = report_summary(&report);
         assert!(summary.contains("Completed"));

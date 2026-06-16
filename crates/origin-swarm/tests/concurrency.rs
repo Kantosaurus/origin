@@ -81,6 +81,7 @@ async fn spawned_workers_run_concurrently_not_serially() {
                 follow_ups: Vec::new(),
                 transcript_handle: [0; 32],
                 usage: Usage::default(),
+                detail: None,
             })
         })
     });

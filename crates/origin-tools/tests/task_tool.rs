@@ -50,6 +50,7 @@ async fn task_tool_dispatches_worker_and_inlines_report() {
                 }],
                 transcript_handle: [0; 32],
                 usage: Usage::default(),
+                detail: None,
             })
         })
     }));
@@ -99,6 +100,7 @@ async fn task_tool_filters_disallowed_tools_into_decision_record() {
                 follow_ups: Vec::new(),
                 transcript_handle: [0; 32],
                 usage: Usage::default(),
+                detail: None,
             })
         })
     }));

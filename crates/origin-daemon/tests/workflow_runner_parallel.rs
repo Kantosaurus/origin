@@ -83,6 +83,7 @@ async fn workflow_fans_out_per_layer_in_dependency_order() {
                 follow_ups: Vec::new(),
                 transcript_handle: [0; 32],
                 usage: SwarmUsage::default(),
+                detail: None,
             })
         })
     });

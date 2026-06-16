@@ -35,6 +35,8 @@ pub mod memory_inbox;
 pub mod mentions;
 pub mod mermaid;
 pub mod oidc;
+pub mod resume;
+pub mod onboarding;
 pub mod plan_panel_wiring;
 pub mod plugin;
 pub mod providers;

@@ -69,9 +69,9 @@ fn push_sgr(out: &mut Vec<u8>, fg: u32, bg: u32, attr: Attr) {
 /// Emit the SGR sequence for a style, with the color decision passed in so the
 /// behavior is unit-testable without touching the process environment.
 ///
-/// Attribute sequences (bold/italic/underline/reverse/dim) are always emitted
-/// so structure survives even with color off; only the 24-bit foreground and
-/// background sequences are gated behind `want_color`.
+/// Attribute sequences (bold/italic/underline/reverse/dim/strike) are always
+/// emitted so structure survives even with color off; only the 24-bit
+/// foreground and background sequences are gated behind `want_color`.
 fn push_sgr_inner(out: &mut Vec<u8>, fg: u32, bg: u32, attr: Attr, want_color: bool) {
     use std::io::Write;
     out.extend_from_slice(b"\x1b[0m");
@@ -89,6 +89,9 @@ fn push_sgr_inner(out: &mut Vec<u8>, fg: u32, bg: u32, attr: Attr, want_color: b
     }
     if attr.bits() & Attr::DIM.bits() != 0 {
         out.extend_from_slice(b"\x1b[2m");
+    }
+    if attr.bits() & Attr::STRIKE.bits() != 0 {
+        out.extend_from_slice(b"\x1b[9m");
     }
     if want_color && fg != 0 {
         let (r, g, b) = unpack(fg);
@@ -134,6 +137,28 @@ mod tests {
         // deliberately does NOT special-case (presence is what matters).
         assert!(!want_color(Some("1")));
         assert!(!want_color(Some("0")));
+    }
+
+    #[test]
+    fn each_attr_flag_emits_its_sgr_code() {
+        // Every style bit must emit its own SGR introducer so the renderer can
+        // express weight/dim/italic/underline/strike independently of color.
+        // (REVERSE = 7m is covered implicitly; the rich-text path uses the five
+        // text attributes below.) If a flag could not be expressed it would have
+        // to fall back here — none do: all five map to a real SGR code.
+        let cases: &[(Attr, &str)] = &[
+            (Attr::BOLD, "\x1b[1m"),
+            (Attr::DIM, "\x1b[2m"),
+            (Attr::ITALIC, "\x1b[3m"),
+            (Attr::UNDERLINE, "\x1b[4m"),
+            (Attr::STRIKE, "\x1b[9m"),
+        ];
+        for &(attr, code) in cases {
+            let mut out: Vec<u8> = Vec::new();
+            push_sgr_inner(&mut out, 0, 0, attr, true);
+            let s = String::from_utf8(out).expect("SGR bytes are valid UTF-8");
+            assert!(s.contains(code), "attr {attr:?} must emit {code:?}, got {s:?}");
+        }
     }
 
     #[test]

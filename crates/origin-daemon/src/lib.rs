@@ -15,6 +15,8 @@ pub mod goal_driver;
 pub mod ipc_prompter;
 pub mod lsp_diagnostics;
 pub mod memory_wiring;
+pub mod model_default;
+pub mod model_window;
 pub mod pairing;
 pub mod plan_bus;
 pub mod proposal_registry;
