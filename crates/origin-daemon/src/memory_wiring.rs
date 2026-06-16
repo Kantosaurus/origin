@@ -73,6 +73,60 @@ impl MemoryWiring {
         }
     }
 
+    /// Rebuild the in-RAM HNSW index from the persisted store rows (#2).
+    ///
+    /// A restarted daemon starts with an empty [`MemIndex`]; without this the
+    /// HNSW search path in [`MemoryDispatchHandle::search`] stays empty until
+    /// new `mem_save` calls land, so prompt-recall over previously-saved
+    /// memories silently degrades to the naïve substring scan. This walks every
+    /// stored row, decodes its quantized vector back to `f32`, and re-inserts it
+    /// keyed by the same `u64` id the search path uses.
+    ///
+    /// Only runs when an embedder is wired: rows persisted without a real
+    /// embedder carry a fallback placeholder vector (see
+    /// [`MemoryDispatchHandle::save`]) that must not enter the index. When no
+    /// embedder is present this is a no-op and returns `0`. Best-effort: a
+    /// missing quantizer (nothing saved yet) is treated as "nothing to
+    /// rehydrate" and returns `0` rather than erroring.
+    ///
+    /// Returns the number of vectors inserted.
+    ///
+    /// # Errors
+    /// Propagates a [`origin_mem::StorageError`] only if iterating the store
+    /// fails; per-row insert failures are surfaced as the same error type.
+    pub fn rehydrate_index(&self) -> Result<usize, origin_mem::StorageError> {
+        if self.embedder.is_none() {
+            return Ok(0);
+        }
+        let Some(quantizer) = self.store.load_quantizer()? else {
+            // No quantizer trained yet ⇒ no rows to rehydrate.
+            return Ok(0);
+        };
+        let records = self.store.iter_all()?;
+        // Decode every row's vector OUTSIDE the index lock, skipping the
+        // fallback placeholder vector ([1,0,0,…]) so a row saved before the
+        // embedder was installed never pollutes recall. We then take the write
+        // lock only for the tight insert batch (keeps lock scope minimal).
+        let to_insert: Vec<(u64, [f32; EMBED_DIM])> = records
+            .iter()
+            .filter_map(|r| {
+                let vec = quantizer.decode(&r.encoded);
+                let is_placeholder =
+                    vec.iter().skip(1).all(|x| *x == 0.0) && (vec[0] - 1.0).abs() < 1e-6;
+                (!is_placeholder).then(|| (origin_mem::memory_id_to_u64(&r.id), vec))
+            })
+            .collect();
+        let inserted = to_insert.len();
+        let mut index = self.index.write();
+        for (uid, vec) in &to_insert {
+            index
+                .insert(*uid, vec)
+                .map_err(|e| origin_mem::StorageError::QuantizerFormat(e.to_string()))?;
+        }
+        drop(index);
+        Ok(inserted)
+    }
+
     /// Wrap the store + index into a `MemoryHandle` the tool dispatch can use.
     #[must_use]
     pub fn handle(&self) -> Arc<MemoryDispatchHandle> {
@@ -227,6 +281,11 @@ impl MemoryHandle for MemoryDispatchHandle {
         // Embed the body — degrade to a zero vector if no embedder. The naïve
         // search path doesn't use the embedding so this is safe.
         let mut vec = [0_f32; EMBED_DIM];
+        // Whether a REAL (non-zero) embedding was produced. Only then is the
+        // vector meaningful enough to insert into the HNSW index — the fallback
+        // unit vector below is a schema placeholder, not a semantic embedding,
+        // so indexing it would pollute recall with `[1,0,0,…]` neighbours.
+        let mut embedded_real = false;
         if let Some(emb) = self.embedder.as_ref() {
             if let Ok(v) = emb.embed(body) {
                 let copy_len = v.len().min(EMBED_DIM);
@@ -237,6 +296,7 @@ impl MemoryHandle for MemoryDispatchHandle {
                     for x in &mut vec {
                         *x /= norm;
                     }
+                    embedded_real = true;
                 }
             }
         }
@@ -251,6 +311,19 @@ impl MemoryHandle for MemoryDispatchHandle {
             .store
             .save(body, &vec, &tag_refs)
             .map_err(|e| MemoryToolError::Storage(e.to_string()))?;
+
+        // #2: populate the in-RAM HNSW index so prompt-recall (`Injector`) and
+        // consolidation can find this row WITHOUT a full rebuild. Before this
+        // fix `save()` only wrote the store row, leaving the index empty, so the
+        // HNSW search path in `search()` always fell through to the naïve scan.
+        // Only insert a real embedding (see `embedded_real`); the fallback unit
+        // vector is a schema placeholder and must not enter the index.
+        if embedded_real {
+            self.index
+                .write()
+                .insert(origin_mem::memory_id_to_u64(&id), &vec)
+                .map_err(|e| MemoryToolError::Storage(e.to_string()))?;
+        }
         Ok(id.to_string())
     }
 
@@ -281,4 +354,100 @@ fn ensure_fallback_quantizer(store: &MemoryStore) -> Result<(), MemoryToolError>
         .install_quantizer(&q)
         .map_err(|e| MemoryToolError::Storage(e.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use origin_mem::{memory_id_to_u64, MetaRow, SearchOpts};
+
+    /// Build a fresh, empty `MemoryWiring` (no embedder) backed by a tempdir
+    /// CAS + on-disk `SQLite` (so migrations run). Returns the wiring and the
+    /// `TempDir` guard (kept alive for the test's duration).
+    fn fresh_wiring() -> (MemoryWiring, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = origin_cas::Store::open(origin_cas::StoreConfig {
+            root: tmp.path().join("cas"),
+            hot_capacity: 64,
+            warm_pack_target_bytes: 1 << 20,
+            cold_zstd_level: 3,
+        })
+        .unwrap();
+        let sql = origin_store::Store::open(tmp.path().join("origin.db").to_str().unwrap()).unwrap();
+        let store = Arc::new(MemoryStore::new(Arc::new(sql), Arc::new(cas)));
+        let index = Arc::new(RwLock::new(MemIndex::new()));
+        (MemoryWiring::new(store, None, index), tmp)
+    }
+
+    /// #2 core: inserting an embedding into the SHARED index keyed by
+    /// `memory_id_to_u64(&id)` makes it searchable. This exercises exactly the
+    /// id-keying + `index.insert` + `index.search` round-trip that the
+    /// `save()` fix now performs (the production embedder path is ONNX-gated, so
+    /// this drives the same shared index Arc directly with a known unit vector).
+    #[test]
+    fn shared_index_insert_makes_row_searchable() {
+        let (wiring, _tmp) = fresh_wiring();
+
+        // A real, L2-normalised vector (not the fallback placeholder).
+        let mut vec = [0_f32; EMBED_DIM];
+        vec[3] = 0.6;
+        vec[7] = 0.8; // 0.6^2 + 0.8^2 = 1.0 ⇒ already unit norm.
+
+        let id = ulid::Ulid::new();
+        let uid = memory_id_to_u64(&id);
+
+        // Before insert: the shared index is empty ⇒ search finds nothing.
+        let opts = SearchOpts { top_n: 5, ..SearchOpts::default() };
+        let pre = wiring
+            .index
+            .read()
+            .search(&vec, &opts, |found| {
+                (found == uid).then_some(MetaRow {
+                    age_days: 0.0,
+                    cluster_priority: 1.0,
+                    edge_boost: 0.0,
+                    superseded_by: None,
+                })
+            })
+            .unwrap();
+        assert!(pre.is_empty(), "empty index must return no candidates");
+
+        // The exact line `save()` now runs on a real embedding.
+        wiring.index.write().insert(uid, &vec).unwrap();
+
+        // After insert: querying the same vector returns this id.
+        let post = wiring
+            .index
+            .read()
+            .search(&vec, &opts, |found| {
+                (found == uid).then_some(MetaRow {
+                    age_days: 0.0,
+                    cluster_priority: 1.0,
+                    edge_boost: 0.0,
+                    superseded_by: None,
+                })
+            })
+            .unwrap();
+        assert!(
+            post.iter().any(|c| c.id == uid),
+            "after the save-path insert the row must be searchable in the shared HNSW index; got {post:?}"
+        );
+    }
+
+    /// #2 rehydrate: with no embedder wired, `rehydrate_index` is a safe no-op
+    /// (rows carry only placeholder vectors, which must never enter the index).
+    #[test]
+    fn rehydrate_index_is_noop_without_embedder() {
+        let (wiring, _tmp) = fresh_wiring();
+        // Save a row via the handle (no embedder ⇒ fallback placeholder vector).
+        let handle = wiring.handle();
+        handle.save("a remembered fact", &["test".to_string()]).unwrap();
+        // Rehydrate must not insert the placeholder row.
+        assert_eq!(
+            wiring.rehydrate_index().unwrap(),
+            0,
+            "rehydrate must be a no-op when no embedder is wired"
+        );
+    }
 }

@@ -72,7 +72,19 @@ async fn real_worker_runs_a_subagent_to_completion() {
     })));
 
     let mut coord = Coordinator::new(plan, format!("origin-worker-e2e-{}", std::process::id()));
-    coord.set_default_worker(origin_daemon::swarm_worker::real_worker(active));
+    let vault = origin_keyvault::KeyVault::in_memory();
+    // The daemon's process-wide cache-band Plan. The worker forks a view sharing
+    // its content-addressed handle bands (sub-agent prefix-cache inheritance);
+    // the fork's share/isolate semantics are unit-tested in
+    // `origin_planner::planner::fork_tests`. Here we just prove the plan threads
+    // through `real_worker` without breaking the worker's run_loop.
+    let wire_plan = origin_planner::Plan::default();
+    coord.set_default_worker(origin_daemon::swarm_worker::real_worker(
+        active,
+        Arc::clone(&cas),
+        vault,
+        wire_plan,
+    ));
 
     let spec = WorkerSpec {
         goal: "investigate the foo module".into(),

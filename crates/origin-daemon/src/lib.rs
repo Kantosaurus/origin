@@ -19,6 +19,7 @@ pub mod pairing;
 pub mod plan_bus;
 pub mod proposal_registry;
 pub mod protocol;
+pub mod remote_quic;
 pub mod provider_factory;
 pub mod ra_impl;
 pub mod runtime_launch;

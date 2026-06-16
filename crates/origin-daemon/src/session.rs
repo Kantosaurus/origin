@@ -4,7 +4,6 @@
 //! Persistence (P1.12) wraps this with `SQLite` writes per turn.
 
 use origin_core::types::{Message, MessageId};
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -13,9 +12,6 @@ pub struct Session {
     pub provider_name: String,
     pub model: String,
     pub messages: Vec<Message>,
-    /// Memory proposals emitted at the end of an assistant turn that the user
-    /// has not yet accepted/rejected/edited. Keyed by `proposal_id`.
-    pub pending_proposals: HashMap<u32, origin_mem::MemoryProposal>,
     /// Monotonic counter handed to [`origin_mem::Proposer::scan`].
     pub next_proposal_id: u32,
     /// Additional workspace roots the agent may read/edit across (cline
@@ -32,7 +28,6 @@ impl Session {
             provider_name: provider_name.into(),
             model: model.into(),
             messages: Vec::new(),
-            pending_proposals: HashMap::new(),
             next_proposal_id: 1,
             roots: Vec::new(),
         }
@@ -43,13 +38,12 @@ impl Session {
     /// from `SessionStore` or in tests). Mirrors [`Session::new`] otherwise,
     /// leaving `provider_name` empty.
     #[must_use]
-    pub fn new_with_id(id: String, model: String) -> Self {
+    pub const fn new_with_id(id: String, model: String) -> Self {
         Self {
             id,
             provider_name: String::new(),
             model,
             messages: Vec::new(),
-            pending_proposals: HashMap::new(),
             next_proposal_id: 1,
             roots: Vec::new(),
         }

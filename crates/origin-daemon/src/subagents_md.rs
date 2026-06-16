@@ -165,15 +165,6 @@ pub fn catalog_block(defs: &[SubagentDef]) -> String {
     out
 }
 
-/// Process-wide cached `<origin-subagents>` block, built once on first use from
-/// `~/.origin/subagents`. Empty (no dir / no files) ⇒ `""` ⇒ byte-identical.
-#[must_use]
-pub fn global_block() -> &'static str {
-    static CELL: OnceLock<String> = OnceLock::new();
-    CELL.get_or_init(|| subagents_dir().map_or_else(String::new, |d| catalog_block(&load(&d))))
-        .as_str()
-}
-
 /// The process-wide `.md`-loaded subagent defs, cached once on first use.
 fn global_defs() -> &'static [SubagentDef] {
     static CELL: OnceLock<Vec<SubagentDef>> = OnceLock::new();
@@ -186,11 +177,12 @@ fn global_defs() -> &'static [SubagentDef] {
 /// (browser-security C).
 ///
 /// **Default-off / byte-identical:** when `allow_domains` is empty AND there are
-/// no `.md` subagents, this returns `""` — identical to [`global_block`]. With an
-/// empty allowlist it is byte-identical to [`global_block`] regardless of `.md`
-/// files (the built-in is simply not injected), so the only behavioral change is
-/// the additive injection of one extra catalog line when a browser allowlist is
-/// configured.
+/// no `.md` subagents, this returns `""`. With an empty allowlist it is
+/// byte-identical regardless of `.md` files (the built-in is simply not
+/// injected), so the only behavioral change is the additive injection of one
+/// extra catalog line when a browser allowlist is configured. This is the sole
+/// production entry point — the former `global_block()` (no-allowlist variant)
+/// had no callers and was removed.
 #[must_use]
 pub fn block_with_builtins(allow_domains: &[String]) -> String {
     let md_defs = global_defs();

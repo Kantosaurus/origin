@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! SchemaCrush ↔ CAS ↔ Recall contract (headroom SmartCrusher port).
+//! `SchemaCrush` ↔ CAS ↔ Recall contract (headroom `SmartCrusher` port).
 //!
 //! Proves the reversibility guarantee the daemon wiring relies on: when a
 //! large homogeneous JSON array tool result is crushed, the lossy offload

@@ -85,18 +85,33 @@ impl SessionStore {
         let id = s.id.clone();
         let provider = s.provider_name.clone();
         let model = s.model.clone();
+        // #15: derive a short, deterministic title from the first user message so
+        // the `sessions.title` column — surfaced by `origin sessions ls` — is
+        // actually populated. `None` until a user turn exists (a brand-new
+        // session persisted before its first prompt keeps `title = NULL`).
+        let title = derive_session_title(s);
         let now = now_ms();
         self.inner.with_conn(|c| {
             // UPSERT rather than INSERT OR REPLACE: REPLACE deletes the existing
             // row before re-inserting, which resets `created_at` to now, wipes
             // any `title`, and (with foreign_keys ON) risks cascading the delete
             // to this session's messages. On conflict, update only the mutable
-            // provider/model and leave created_at, title, and child rows intact.
+            // provider/model; preserve created_at and child rows.
+            //
+            // `title`: set it on first insert, and on conflict fill it in only
+            // when still NULL (`COALESCE(existing, derived)`). This makes the
+            // title stable once derived — a later persist (which may have
+            // compacted/rewound the first turn out of `s.messages`) never
+            // clobbers an already-set title — while still back-filling a session
+            // whose row was created before its first user turn landed.
             c.execute(
                 "INSERT INTO sessions (id, created_at, title, provider, model) \
-                 VALUES (?1, ?2, NULL, ?3, ?4) \
-                 ON CONFLICT(id) DO UPDATE SET provider = excluded.provider, model = excluded.model",
-                rusqlite::params![id, now, provider, model],
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                     provider = excluded.provider, \
+                     model = excluded.model, \
+                     title = COALESCE(sessions.title, excluded.title)",
+                rusqlite::params![id, now, title, provider, model],
             )?;
             Ok(())
         })?;
@@ -413,6 +428,35 @@ fn now_ms() -> i64 {
     })
 }
 
+/// Maximum number of characters retained in a derived session title.
+const SESSION_TITLE_MAX_CHARS: usize = 80;
+
+/// Derive a short, deterministic session title from the first user message
+/// (#15). Returns `None` when the session has no user turn yet (the `title`
+/// column then stays `NULL`). No LLM call: the title is the first non-empty
+/// line of the first user message's leading text block, whitespace-collapsed
+/// and truncated to [`SESSION_TITLE_MAX_CHARS`] on a char boundary.
+fn derive_session_title(s: &Session) -> Option<String> {
+    let first_user = s.messages.iter().find(|m| m.role == Role::User)?;
+    let text = first_user.blocks.iter().find_map(|b| match b {
+        origin_core::types::Block::Text { text, .. } => Some(text.as_str()),
+        _ => None,
+    })?;
+    // First non-blank line, with internal whitespace collapsed to single spaces.
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    let truncated: String = if collapsed.chars().count() > SESSION_TITLE_MAX_CHARS {
+        let head: String = collapsed.chars().take(SESSION_TITLE_MAX_CHARS - 1).collect();
+        format!("{head}\u{2026}") // …
+    } else {
+        collapsed
+    };
+    Some(truncated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Session, SessionStore};
@@ -445,6 +489,63 @@ mod tests {
         // Keeping 0 turns clears the transcript.
         assert_eq!(store.truncate_after(sid, 0).expect("truncate"), 3);
         assert!(store.load_messages(sid).expect("load").is_empty());
+    }
+
+    /// #15 regression: `persist_session` must populate `sessions.title` from
+    /// the first user message (first non-blank line, whitespace-collapsed,
+    /// truncated). Before the fix `persist` hardcoded `title NULL`, so the
+    /// column surfaced by `origin sessions ls` was always empty.
+    #[test]
+    fn persist_session_derives_title_from_first_user_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(dir.path().join("sessions.db")).expect("open");
+
+        // A brand-new session with NO user turn ⇒ title stays NULL.
+        let empty = Session::new_with_id("sess-empty".to_string(), "m".to_string());
+        store.persist_session(&empty).expect("persist empty");
+        let empty_sum = store
+            .list_summaries()
+            .expect("list")
+            .into_iter()
+            .find(|r| r.id == "sess-empty")
+            .expect("row present");
+        assert_eq!(empty_sum.title, None, "no user turn ⇒ NULL title");
+
+        // A session with a user turn ⇒ derived title.
+        let mut s = Session::new_with_id("sess-titled".to_string(), "m".to_string());
+        s.push(
+            Message::new(Role::User)
+                .with_block(Block::text("  Fix the   parser bug\nmore details here  ")),
+        );
+        store.persist_session(&s).expect("persist titled");
+        let sum = store
+            .list_summaries()
+            .expect("list")
+            .into_iter()
+            .find(|r| r.id == "sess-titled")
+            .expect("row present");
+        assert_eq!(
+            sum.title.as_deref(),
+            Some("Fix the parser bug"),
+            "title is the first non-blank line, whitespace-collapsed"
+        );
+
+        // A later persist must NOT clobber the now-set title even if the first
+        // user turn is no longer the leading message (compaction/rewind).
+        let mut s2 = Session::new_with_id("sess-titled".to_string(), "m".to_string());
+        s2.push(Message::new(Role::User).with_block(Block::text("a different leading turn")));
+        store.persist_session(&s2).expect("re-persist");
+        let sum2 = store
+            .list_summaries()
+            .expect("list")
+            .into_iter()
+            .find(|r| r.id == "sess-titled")
+            .expect("row present");
+        assert_eq!(
+            sum2.title.as_deref(),
+            Some("Fix the parser bug"),
+            "an existing title must be preserved across re-persist"
+        );
     }
 
     fn first_text(m: &Message) -> String {
@@ -510,7 +611,7 @@ mod tests {
     /// the boundary lands between an assistant `tool_use` and its `tool_result`
     /// the Anthropic API rejects the request. Mirrors the production seam: a long
     /// run ending in a tool turn, then a short run ending in a terminal text turn
-    /// (a summary) with no tool_use.
+    /// (a summary) with no `tool_use`.
     #[test]
     fn repersisting_a_shorter_transcript_does_not_strand_the_tail() {
         let dir = tempfile::tempdir().expect("tempdir");

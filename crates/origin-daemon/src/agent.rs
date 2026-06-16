@@ -11,7 +11,7 @@ use crate::workflows::WorkflowsFile;
 use origin_cas::{Hash, Store};
 use origin_core::types::{Block, Message, Role};
 use origin_mem::{Injector, Proposer};
-use origin_permission::{check_with_skills, prompt::Prompter, Outcome};
+use origin_permission::{prompt::Prompter, Outcome};
 use origin_provider::{ChatRequest, Provider};
 use origin_runtime::{spawn_in, TaskClass};
 use origin_sidecar::{ExtractDeliverer, Sidecar, SummaryDeliverer};
@@ -314,6 +314,80 @@ async fn maybe_checkpoint_per_tool_with_hooks(tool: &str, args: &Value) {
     let _ = checkpoint_with_commit_hooks(&per_tool_checkpoint_label(tool, &edited)).await;
 }
 
+/// Resolve the base permission decision for one tool call (P10.12 wiring).
+///
+/// This is the single entry point the dispatch loop calls *before* the
+/// deny-only overlays. Resolution order, from highest authority to lowest:
+///
+/// 1. **Skill-narrowing** (a confinement boundary): if any active skill masks
+///    out `meta.name`, the call is denied with `reason = "skill-narrowed"` and
+///    no user rule or prompter can re-allow it. This mirrors the first half of
+///    [`origin_permission::check_with_skills`].
+/// 2. **`AutoAllowed` tier**: byte-identical to the historical path — auto
+///    allow, never prompts, never consults rules.
+/// 3. **User permission rules** (only for `RequiresPermission` tools, and only
+///    when `opts.permission_rules` is `Some`): an explicit `allow` rule
+///    auto-approves *without prompting* and an explicit `deny` rule blocks. The
+///    bloom pre-check + exact-rule walk is [`origin_permission::check_with_rules`]
+///    semantics, run at the single canonical
+///    [`crate::config::PERMISSION_RULE_SCOPE`].
+/// 4. **Interactive prompter**: when no rule matched, fall through to the exact
+///    historical prompter path.
+///
+/// **Default-safe / byte-identical:** when `opts.permission_rules` is `None`
+/// (the default everywhere, including tests) step 3 is skipped entirely and the
+/// whole function is equivalent to `check_with_skills(meta, …, prompter,
+/// skills)`. With rules configured, only an *exact* `meta.name@scope` rule can
+/// short-circuit; a tool with no matching rule still prompts exactly as before.
+async fn decide_permission(
+    meta: &ToolMeta,
+    args_preview: &str,
+    prompter: &dyn Prompter,
+    skills: &SkillRegistry,
+    opts: &LoopOptions,
+) -> origin_permission::Decision {
+    // (1) Skill-narrowing is final and must win over any user allow rule.
+    if let Some(mask) = skills.allowed_tools() {
+        if !mask.contains(meta.name) {
+            return origin_permission::Decision {
+                outcome: Outcome::Deny,
+                reason: "skill-narrowed".into(),
+            };
+        }
+    }
+    // (2) AutoAllowed tools never prompt and never consult rules — unchanged.
+    if matches!(meta.tier, origin_tools::Tier::AutoAllowed) {
+        return origin_permission::Decision {
+            outcome: Outcome::Allow,
+            reason: "tier=AutoAllowed".into(),
+        };
+    }
+    // (3) User permission rules: an exact match pre-answers the prompt. Skipped
+    // entirely (byte-identical) when no rules are configured.
+    if let Some(pr) = opts.permission_rules.as_ref() {
+        let key = format!("{}@{}", meta.name, crate::config::PERMISSION_RULE_SCOPE);
+        if pr.bloom.maybe_contains(&key) {
+            if let Some(rule) = pr.rules.iter().find(|r| r.key() == key) {
+                return origin_permission::Decision {
+                    outcome: if rule.allow { Outcome::Allow } else { Outcome::Deny },
+                    reason: format!(
+                        "rule:{}@{}:{}",
+                        meta.name,
+                        crate::config::PERMISSION_RULE_SCOPE,
+                        if rule.allow { "allow" } else { "deny" }
+                    ),
+                };
+            }
+        }
+    }
+    // (4) No rule matched ⇒ historical interactive prompter path.
+    let allowed = prompter.ask(meta, args_preview).await;
+    origin_permission::Decision {
+        outcome: if allowed { Outcome::Allow } else { Outcome::Deny },
+        reason: if allowed { "user-approved".into() } else { "user-denied".into() },
+    }
+}
+
 /// DENY-ONLY governance overlay (Task 3).
 ///
 /// Given a base `decision` that is already `Allow`, apply the optional
@@ -506,6 +580,103 @@ fn apply_domain_overlay(
     decision
 }
 
+/// Collect the candidate filesystem paths a path-touching tool would access,
+/// from its parsed JSON `args`, for the conseca path overlay.
+///
+/// Recognised tools and the path fields they carry:
+/// - `Read` / `Write` / `Edit` / `MultiEdit`: a single `file_path`.
+/// - `ApplyPatch`: every target path recovered from the unified-diff `patch`
+///   body (reuses [`patch_target_paths`]).
+/// - `Bash`: the optional `cwd`. Only `cwd` is checked — it is the one path
+///   argument with a stable, unambiguous field. Arbitrary path-looking tokens
+///   inside the free-form `command` are intentionally NOT parsed: doing so would
+///   be both fragile (shell quoting/expansion) and a source of false denials, so
+///   tool-level conseca `allow_tools`/`deny_tools` remains the lever for the
+///   command body itself.
+///
+/// Any other (or pathless) tool yields an empty vec, so the overlay never
+/// observes it.
+fn conseca_target_paths(tool: &str, args: &Value) -> Vec<String> {
+    match tool {
+        "Read" | "Write" | "Edit" | "MultiEdit" => args
+            .get("file_path")
+            .and_then(Value::as_str)
+            .filter(|p| !p.is_empty())
+            .map(|p| vec![p.to_owned()])
+            .unwrap_or_default(),
+        "ApplyPatch" => args
+            .get("patch")
+            .and_then(Value::as_str)
+            .map_or_else(Vec::new, patch_target_paths),
+        "Bash" => args
+            .get("cwd")
+            .and_then(Value::as_str)
+            .filter(|p| !p.is_empty())
+            .map(|p| vec![p.to_owned()])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// DENY-ONLY conseca filesystem-path overlay (Task 2 / R13).
+///
+/// Given a base `decision` that is already `Allow`, gate a path-touching tool
+/// (`Read`/`Write`/`Edit`/`MultiEdit`/`ApplyPatch`, and `Bash`'s `cwd`) against
+/// the active [`origin_conseca::SecurityPolicy`]'s `allow_paths`/`deny_paths`.
+/// Every target path the call would access is checked with
+/// [`origin_conseca::check_path`]; a path outside `allow_paths` or inside
+/// `deny_paths` downgrades the Allow to a Deny. Like the other overlays this can
+/// only narrow an Allow, never widen a Deny.
+///
+/// **Default-off / byte-identical:** the overlay is a no-op unless a conseca
+/// policy is present AND it constrains paths (at least one of `allow_paths` /
+/// `deny_paths` is non-empty). With no `[conseca]` section (the default)
+/// `opts.conseca` is `None`; with a `[conseca]` section that omits both path
+/// lists every path is permitted, so `decision` is returned unchanged.
+fn apply_path_overlay(
+    decision: origin_permission::Decision,
+    tool: &str,
+    args: &Value,
+    opts: &LoopOptions,
+) -> origin_permission::Decision {
+    let Some(policy) = opts.conseca.as_ref() else {
+        return decision;
+    };
+    // Opt-in: with neither path list configured, conseca expresses no filesystem
+    // constraint, so every path is allowed (byte-identical to before).
+    if policy.allow_paths.is_empty() && policy.deny_paths.is_empty() {
+        return decision;
+    }
+    for path in conseca_target_paths(tool, args) {
+        if let origin_conseca::Decision::Deny(why) = origin_conseca::check_path(policy, &path) {
+            return origin_permission::Decision {
+                outcome: Outcome::Deny,
+                reason: format!("conseca: filesystem path blocked for `{tool}`: {why}"),
+            };
+        }
+    }
+    decision
+}
+
+/// Estimate the cumulative USD spend of a `run_loop` so far, for the policy
+/// spend-cap enforcement (Task 3b / R14).
+///
+/// `model` selects the price row via [`origin_cost::price_for`]; the three
+/// running token totals are the loop's cumulative counters. `input_total`
+/// already folds cache reads (the provider impls add them in), so we split the
+/// cached portion back out and bill it at the cache-read rate, charging only the
+/// fresh remainder at the full input rate — matching the real billing model.
+///
+/// Returns `None` when the model has no known price (unknown/local model): the
+/// caller then cannot meaningfully enforce a dollar cap and leaves the turn
+/// unconstrained, exactly as a missing cap would.
+fn estimate_spend_usd(model: &str, input_total: u64, output_total: u64, cache_read_total: u64) -> Option<f64> {
+    let price = origin_cost::price_for(model)?;
+    let fresh_input = input_total.saturating_sub(cache_read_total);
+    let usage = origin_cost::TokenUsage::new(fresh_input, output_total, cache_read_total, 0);
+    Some(origin_cost::cost_of(&price, &usage).total())
+}
+
 /// ENFORCED per-session browser-action rate-limit check (browser-security B).
 ///
 /// `cap` is the configured maximum number of browser-class actions allowed in a
@@ -539,16 +710,23 @@ const fn browser_rate_limit_ok(cap: Option<u32>, count_so_far: u32) -> bool {
 ///
 /// With no env flags / features set (the default) this function does nothing
 /// observable, so default behavior and every existing test stay byte-identical.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "flat per-turn measurement carrier (provider/model/4 token+call counts/latency/metrics handle); grouping them into a struct would add indirection without clarifying the single emit site"
+)]
 fn run_turn_end_effects(
     provider: &str,
     model: &str,
     input_tokens: u64,
     output_tokens: u64,
+    cache_read_tokens: u64,
     latency_ms: f64,
     tool_calls: u64,
+    metrics: Option<&origin_metrics::Metrics>,
+    notify: Option<&crate::config::NotifyPolicy>,
 ) {
     maybe_record_turn_telemetry(provider, model, input_tokens, output_tokens);
-    maybe_notify_completion();
+    maybe_notify_completion(notify);
     // Task 3 (gen_ai metrics emit). Unconditional by design: this is a cheap
     // `const` no-op unless the daemon is built `--features otel` AND the OTLP
     // exporter has been installed (which requires `ORIGIN_OTLP_ENDPOINT`). The
@@ -564,6 +742,24 @@ fn run_turn_end_effects(
         latency_ms,
         tool_calls,
     );
+    // R4: feed the parallel Prometheus counters that back `/metrics`,
+    // `origin usage`/`insights`, and the TUI `?metrics` panel. These had never
+    // been incremented in production, so every consumer flatlined at zero even
+    // though the OTel path above already received the same values. We increment
+    // by the cumulative per-loop totals here (this runs once, at loop end), so
+    // each completed run_loop folds its usage in exactly once. `None` ⇒ no-op,
+    // byte-identical to before.
+    if let Some(m) = metrics {
+        if input_tokens > 0 {
+            m.tokens_in_total(provider, model).inc_by(input_tokens);
+        }
+        if output_tokens > 0 {
+            m.tokens_out_total(provider, model).inc_by(output_tokens);
+        }
+        if cache_read_tokens > 0 {
+            m.cache_hit_total(provider).inc_by(cache_read_tokens);
+        }
+    }
 }
 
 /// Measured pain-bucket inputs for one session-stop record (Stage C5).
@@ -883,24 +1079,114 @@ fn maybe_record_turn_telemetry(provider: &str, model: &str, input_tokens: u64, o
     }
 }
 
-/// Best-effort desktop completion notification (Task 5). No-op unless
-/// `ORIGIN_NOTIFY=1`. Spawns the platform desktop-notification command and
-/// ignores every failure. Default-off ⇒ no spawn.
-fn maybe_notify_completion() {
+/// Best-effort completion notification (Task 5 + notify-policy wiring). No-op
+/// unless `ORIGIN_NOTIFY=1`. With no `[notify]` policy (`policy = None`, the
+/// default) this spawns the platform desktop-notification command and ignores
+/// every failure — byte-identical to before. When a policy is wired, the
+/// notification is first gated through [`origin_notify::should_send`] (suppressed
+/// inside quiet hours unless urgent) and then dispatched over the configured
+/// [`origin_notify::Channel`] (desktop toast, webhook POST, or a spawned
+/// command). Default-off ⇒ no spawn.
+fn maybe_notify_completion(policy: Option<&crate::config::NotifyPolicy>) {
     if std::env::var("ORIGIN_NOTIFY").as_deref() != Ok("1") {
         return;
     }
     let n = origin_notify::Notification::new("origin", "Turn complete", false);
-    let (program, cmd_args) = origin_notify::desktop_command(&n);
-    let _ = std::process::Command::new(program).args(cmd_args).spawn();
+    let Some(policy) = policy else {
+        // No policy: the historical unconditional desktop toast.
+        dispatch_notification(&n, &origin_notify::Channel::Desktop);
+        return;
+    };
+    // Quiet-hours suppression for non-urgent notifications.
+    if !origin_notify::should_send(&n, policy.quiet.as_ref(), current_minute_of_day()) {
+        return;
+    }
+    dispatch_notification(&n, &policy.channel);
+}
+
+/// Minutes since local midnight (`0..=1439`) for the quiet-hours check.
+///
+/// Derived from the system clock without pulling in a date/time crate: the
+/// daemon has no chrono dependency, so we compute it from the Unix timestamp
+/// modulo one day. This is UTC-based minutes-of-day; quiet-hours windows are
+/// likewise interpreted as UTC, which keeps the wiring dependency-free. Falls
+/// back to `0` if the clock is before the epoch (impossible in practice).
+fn current_minute_of_day() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    // (secs / 60) % (24*60), guaranteed in range so the cast is lossless.
+    u32::try_from((secs / 60) % (24 * 60)).unwrap_or(0)
+}
+
+/// Dispatch one notification over `channel` (best-effort; failures are dropped).
+///
+/// - [`Channel::Desktop`](origin_notify::Channel::Desktop): spawn the OS-native
+///   toast command (the historical path).
+/// - [`Channel::Command`](origin_notify::Channel::Command): spawn the configured
+///   program with its args.
+/// - [`Channel::Webhook`](origin_notify::Channel::Webhook): POST the JSON
+///   payload. The daemon has no blocking HTTP client on this path, so the POST
+///   is shelled via `curl` when available; a missing `curl` simply drops the
+///   notification (best-effort), never failing the turn.
+fn dispatch_notification(n: &origin_notify::Notification, channel: &origin_notify::Channel) {
+    match channel {
+        origin_notify::Channel::Desktop => {
+            let (program, cmd_args) = origin_notify::desktop_command(n);
+            let _ = std::process::Command::new(program).args(cmd_args).spawn();
+        }
+        origin_notify::Channel::Command { program, args } => {
+            if program.is_empty() {
+                return;
+            }
+            let _ = std::process::Command::new(program).args(args).spawn();
+        }
+        origin_notify::Channel::Webhook { url } => {
+            if url.is_empty() {
+                return;
+            }
+            let payload = origin_notify::webhook_payload(n);
+            // Best-effort POST via curl; --data uses the JSON body. We do not
+            // wait on the child (fire-and-forget) so a slow endpoint never
+            // stalls the turn end.
+            let _ = std::process::Command::new("curl")
+                .arg("-fsS")
+                .arg("-X")
+                .arg("POST")
+                .arg("-H")
+                .arg("Content-Type: application/json")
+                .arg("--data")
+                .arg(payload)
+                .arg("--")
+                .arg(url)
+                .spawn();
+        }
+    }
+}
+
+/// Resolve the post-edit formatter command for `path`.
+///
+/// When a [`PostEditConfig`](origin_postedit::PostEditConfig) is wired
+/// (`[post_edit]` present), its `formatter_for` is consulted so per-extension
+/// `format_overrides` win over the builtin table. With no config (`None`, the
+/// default) this is exactly [`origin_postedit::formatter_for`] — the builtin
+/// table only — so behavior is byte-identical to before the wiring.
+fn resolve_formatter(cfg: Option<&origin_postedit::PostEditConfig>, path: &str) -> Option<String> {
+    cfg.map_or_else(
+        || origin_postedit::formatter_for(path).map(ToString::to_string),
+        |c| c.formatter_for(path),
+    )
 }
 
 /// Best-effort post-edit auto-format (Task 2). No-op unless `ORIGIN_AUTOFORMAT=1`
-/// and [`origin_postedit::formatter_for`] maps `path` to a known formatter.
-/// When both hold, spawns `<formatter-argv...> <path>` and ignores every
-/// failure (a missing formatter binary must never fail the edit tool).
+/// and a formatter resolves for `path`. When both hold, spawns
+/// `<formatter-argv...> <path>` and ignores every failure (a missing formatter
+/// binary must never fail the edit tool). The formatter is resolved via
+/// [`resolve_formatter`], so a wired `[post_edit]` config's `format_overrides`
+/// take precedence; with no config the builtin table is used, byte-identical.
 /// Default-off ⇒ no spawn, behavior unchanged.
-fn maybe_autoformat(path: &str) {
+fn maybe_autoformat(cfg: Option<&origin_postedit::PostEditConfig>, path: &str) {
     if std::env::var("ORIGIN_AUTOFORMAT").as_deref() != Ok("1") {
         return;
     }
@@ -911,7 +1197,7 @@ fn maybe_autoformat(path: &str) {
         tracing::warn!(path, "skipping autoformat: path looks like a flag");
         return;
     }
-    let Some(cmd) = origin_postedit::formatter_for(path) else {
+    let Some(cmd) = resolve_formatter(cfg, path) else {
         return;
     };
     // `cmd` may be a program plus flags, e.g. "ruff format"; split on
@@ -927,6 +1213,62 @@ fn maybe_autoformat(path: &str) {
         .spawn();
 }
 
+/// Run the configured post-edit lint and fold its outcome through
+/// [`origin_postedit::repair_decision`] (Task 2 — `PostEditConfig` consumer).
+///
+/// Returns the [`RepairDecision`](origin_postedit::RepairDecision) the policy
+/// reaches after one lint round, or `None` when no decision was taken (no
+/// config, `auto_lint` disabled, or no `lint_command`). The lint is run
+/// synchronously to completion (unlike the fire-and-forget formatter) so its
+/// exit status can drive the decision; a non-zero exit counts as one failing
+/// check. The bounded model-feedback repair loop is not yet driven here — the
+/// decision is surfaced (logged) so the policy is consulted and acted on, but
+/// re-prompting the model from inside tool dispatch is deferred (see report).
+///
+/// `prev_iters` is `0` here: each successful edit starts a fresh post-edit
+/// round. Best-effort throughout — a missing linter or a spawn failure never
+/// fails the edit tool.
+fn run_post_edit_lint(
+    cfg: &origin_postedit::PostEditConfig,
+    path: &str,
+) -> Option<origin_postedit::RepairDecision> {
+    if !cfg.auto_lint {
+        return None;
+    }
+    let lint_cmd = cfg.lint_command.as_deref()?;
+    // Same flag-smuggling guard as the formatter path.
+    if path.starts_with('-') {
+        return None;
+    }
+    let tokens: Vec<&str> = lint_cmd.split_whitespace().collect();
+    let (program, flags) = tokens.split_first()?;
+    let status = std::process::Command::new(program)
+        .args(flags)
+        .arg("--")
+        .arg(path)
+        .status();
+    // A lint that could not even be launched (missing binary) is treated as
+    // "no failures observed" so a misconfigured linter never blocks edits.
+    let failures = match status {
+        Ok(s) if s.success() => 0,
+        Ok(_) => 1,
+        Err(_) => return None,
+    };
+    let decision = origin_postedit::repair_decision(failures, 0, cfg);
+    match decision {
+        origin_postedit::RepairDecision::Stop => {
+            tracing::debug!(path, "post-edit lint clean");
+        }
+        origin_postedit::RepairDecision::Retry { iter } => {
+            tracing::info!(path, iter, "post-edit lint failed; repair budget remains");
+        }
+        origin_postedit::RepairDecision::GiveUp => {
+            tracing::warn!(path, "post-edit lint failed; repair budget exhausted");
+        }
+    }
+    Some(decision)
+}
+
 /// Pure predicate: does a successful `name` tool call trigger post-edit
 /// auto-formatting? True for the file-mutating builtins whose result is a
 /// concrete on-disk edit (`Edit`/`Write`/`MultiEdit`/`ApplyPatch`); false for
@@ -937,15 +1279,21 @@ fn autoformats(name: &str) -> bool {
     matches!(name, "Edit" | "Write" | "MultiEdit" | "ApplyPatch")
 }
 
-/// Shared post-mutation autoformat hook (Task 2). Invoked from each mutating
+/// Shared post-mutation post-edit hook (Task 2). Invoked from each mutating
 /// dispatch arm after a successful edit; no-ops unless [`autoformats`] accepts
-/// the tool, then delegates to [`maybe_autoformat`] (itself gated on
-/// `ORIGIN_AUTOFORMAT=1`). Centralizing the call removes the per-arm
-/// duplication and guarantees `Edit` is treated exactly like `Write`.
-/// Default-off ⇒ no spawn, behavior unchanged.
-fn post_mutation_autoformat(name: &str, path: &str) {
-    if autoformats(name) {
-        maybe_autoformat(path);
+/// the tool. When accepted it runs [`maybe_autoformat`] (gated on
+/// `ORIGIN_AUTOFORMAT=1`, formatter resolved with `cfg`'s overrides) and then,
+/// when a `[post_edit]` config with `auto_lint` is wired, the configured lint
+/// via [`run_post_edit_lint`] whose [`RepairDecision`](origin_postedit::RepairDecision)
+/// is consulted. `cfg = None` (the default everywhere, including tests) ⇒ the
+/// builtin-table formatter only and no lint — byte-identical to before.
+fn post_mutation_autoformat(cfg: Option<&origin_postedit::PostEditConfig>, name: &str, path: &str) {
+    if !autoformats(name) {
+        return;
+    }
+    maybe_autoformat(cfg, path);
+    if let Some(c) = cfg {
+        let _ = run_post_edit_lint(c, path);
     }
 }
 
@@ -1417,12 +1765,15 @@ mod swarm_collab_wiring_tests {
         std::env::remove_var("ORIGIN_SWARM_COLLAB");
     }
 
-    /// Default-off discipline: with the gate UNSET, the same read+edit sequence
-    /// records nothing and delivers no notice — byte-identical to before.
+    /// Disable discipline: with the gate explicitly DISABLED
+    /// (`ORIGIN_SWARM_COLLAB=0`), the same read+edit sequence records nothing and
+    /// delivers no notice. (Swarm collab is default-ON since `78d2d7f`, so the
+    /// off path is reached via the documented `=0`/`false` disable value rather
+    /// than by simply unsetting the var.)
     #[tokio::test]
-    async fn no_notice_when_gate_unset() {
+    async fn no_notice_when_gate_disabled() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-        std::env::remove_var("ORIGIN_SWARM_COLLAB");
+        std::env::set_var("ORIGIN_SWARM_COLLAB", "0");
 
         let reader = origin_swarm::WorkerId::generate();
         let editor = origin_swarm::WorkerId::generate();
@@ -1451,12 +1802,13 @@ mod swarm_collab_wiring_tests {
         })
         .await;
 
+        std::env::remove_var("ORIGIN_SWARM_COLLAB");
         let map = mailboxes.lock().unwrap_or_else(PoisonError::into_inner);
         assert!(
             map.get(&reader).expect("reader mailbox").is_empty(),
-            "gate unset ⇒ no notice ⇒ byte-identical"
+            "gate disabled ⇒ no notice"
         );
-        assert_eq!(registry.tracked_paths(), 0, "gate unset ⇒ nothing recorded");
+        assert_eq!(registry.tracked_paths(), 0, "gate disabled ⇒ nothing recorded");
     }
 
     /// `render_swarm_notices` (A4): empty slice ⇒ empty string (no block, so the
@@ -1601,10 +1953,11 @@ pub struct LoopOptions {
     pub sidecar: Option<Arc<Sidecar>>,
     /// Optional session store for delivering summaries (P5.2).
     pub session_store: Option<Arc<SessionStore>>,
-    /// If `Some`, the Proposer runs at turn end and pushes proposals into
-    /// `session.pending_proposals` and emits one [`StreamEvent::MemoryProposed`]
-    /// per proposal through `event_tx` (or skips the emit if no sender is
-    /// configured). `None` disables the feature (the existing dogfood path).
+    /// If `Some`, the Proposer runs at turn end, records each proposal in the
+    /// daemon-wide `proposal_registry` (the real persistence path) and emits one
+    /// [`StreamEvent::MemoryProposed`] per proposal through `event_tx` (or skips
+    /// the emit if no sender is configured). `None` disables the feature (the
+    /// existing dogfood path).
     pub proposer: Option<Arc<Proposer>>,
     /// Side-band channel for non-streaming [`StreamEvent`]s (currently only
     /// [`StreamEvent::MemoryProposed`]). The daemon main forwards these as
@@ -1746,6 +2099,64 @@ pub struct LoopOptions {
     /// pre-per-connection wire. Set from the per-connection account slot in
     /// `handle_request`.
     pub session_account: Option<Arc<str>>,
+    /// Shared process supervisor for `Bash`/`Monitor`. When `Some`, the SAME
+    /// `Supervisor` instance is used for both the background-spawn path
+    /// (`run_bash_streaming`) and the later `Monitor`/`Bash` read-since path, so
+    /// a pid spawned by `Bash{run_in_background:true}` is visible to a later
+    /// `Monitor` call within the same session. `None` (the default everywhere,
+    /// including tests) ⇒ each call makes a fresh per-call `Supervisor`,
+    /// byte-identical to the legacy behavior (background+Monitor cannot share a
+    /// pid across tool calls). The `Supervisor` is `Clone` (`Arc`-backed) so a
+    /// single instance is constructed per session in `main.rs`.
+    pub proc_supervisor: Option<origin_tools::proc_supervisor::Supervisor>,
+    /// Shared read-before-overwrite guard for `Write`. When `Some`, the `Read`
+    /// dispatch arm records each read path via `note_read`, and the `Write` arm
+    /// consults `has_read` through THIS shared guard, so `Write{force:false}`
+    /// over a file the model has already Read in this session succeeds. `None`
+    /// (the default everywhere, including tests) ⇒ each `Write` builds a fresh
+    /// `WriteGuard`, byte-identical to the legacy behavior (no read is ever
+    /// recorded, so overwriting any existing file requires `force=true`). The
+    /// guard uses interior mutability (`Arc<RwLock<…>>`) so an `Arc<WriteGuard>`
+    /// can record reads across calls.
+    pub write_guard: Option<Arc<origin_tools::builtins::write::WriteGuard>>,
+    /// Daemon-wide Prometheus [`Metrics`](origin_metrics::Metrics) registry
+    /// (R4). When `Some`, the loop feeds the real per-turn token usage and each
+    /// tool-call result into the counters that back `/metrics`, `origin usage`,
+    /// `origin insights`, and the TUI `?metrics` panel — which otherwise report
+    /// zero because nothing in production ever incremented them. The `OTel`
+    /// `record_gen_ai_usage` path already had these values; the Prometheus
+    /// increments are co-located with it. `None` (the default everywhere,
+    /// including tests) ⇒ the counters stay at zero, byte-identical to before.
+    pub metrics: Option<Arc<origin_metrics::Metrics>>,
+    /// Optional user-configured permission rules + bloom pre-check (P10.12).
+    /// When `Some`, a `RequiresPermission` tool is first matched against the
+    /// rule list via [`origin_permission::check_with_rules`]: an explicit
+    /// `allow` rule auto-approves and an explicit `deny` rule blocks, BEFORE the
+    /// interactive prompter is ever asked. When no rule matches the tool, the
+    /// gate falls through to the existing skill-narrowed prompter path. `None`
+    /// (the default everywhere, including tests) ⇒ the rule path is never
+    /// consulted and the decision is byte-identical to before this wiring.
+    /// Sourced from `[[permission_rules]]` in `governance.toml`.
+    pub permission_rules: Option<Arc<crate::config::PermissionRules>>,
+    /// Optional post-edit policy: formatter overrides, `auto_lint`/`auto_test`,
+    /// and a bounded repair budget. When `Some`, a successful `Edit`, `Write`,
+    /// `MultiEdit`, or `ApplyPatch` consults `PostEditConfig::formatter_for`
+    /// (overrides first) and, under the `ORIGIN_AUTOFORMAT=1` gate, formats with
+    /// the resolved command, then runs the configured lint and folds its outcome
+    /// through [`origin_postedit::repair_decision`]. `None` (the default
+    /// everywhere, including tests) means the post-edit path consults only the
+    /// builtin formatter table exactly as before, byte-identical. Sourced from
+    /// `[post_edit]` in `governance.toml`.
+    pub post_edit: Option<Arc<origin_postedit::PostEditConfig>>,
+    /// Optional notification policy (quiet hours + delivery channel). When
+    /// `Some`, the completion notification is gated through
+    /// [`origin_notify::should_send`] (suppressed inside quiet hours unless
+    /// urgent) and dispatched over the configured channel (desktop toast,
+    /// webhook POST, or a spawned command). `None` (the default everywhere,
+    /// including tests) ⇒ `ORIGIN_NOTIFY=1` spawns the desktop toast
+    /// unconditionally exactly as before, byte-identical. Sourced from
+    /// `[notify]` in `governance.toml`.
+    pub notify: Option<Arc<crate::config::NotifyPolicy>>,
 }
 
 impl Default for LoopOptions {
@@ -1780,6 +2191,12 @@ impl Default for LoopOptions {
             router: None,
             browser_rate_limit: None,
             session_account: None,
+            proc_supervisor: None,
+            write_guard: None,
+            metrics: None,
+            permission_rules: None,
+            post_edit: None,
+            notify: None,
         }
     }
 }
@@ -1954,6 +2371,13 @@ pub enum LoopError {
     ToolFailure(String),
     #[error("malformed tool args: {0}")]
     BadArgs(String),
+    /// Emitted when the governance policy refuses to start (or continue) a turn:
+    /// a denied/omitted model at selection, or cumulative spend over the cap.
+    /// The Display string is user-facing and explains the refusal. Only ever
+    /// produced when an `[[policy_layers]]` governance config is present (the
+    /// default ⇒ no policy ⇒ this variant is never constructed).
+    #[error("governance: {0}")]
+    GovernanceDenied(String),
     /// Emitted by `run_loop` when every retry budgeted by `MAX_PROVIDER_RETRIES`
     /// has returned `ProviderError::RateLimit`. The Display string is the
     /// user-facing message the daemon writes into the `ErrorFrame`, so it
@@ -2016,7 +2440,7 @@ impl SpeculativeRegistry {
             // reach here (Mutating tier or the NEEDS_SUBSYSTEM_HANDLE
             // guard above) and flow through the main dispatch path, which
             // threads the live handles from `LoopOptions`.
-            let text = dispatch_tool(meta, &args, cas.as_deref(), None, None, None, None, None, None).await?;
+            let text = dispatch_tool(meta, &args, cas.as_deref(), None, None, None, None, None, None, None, None, None).await?;
             Ok::<_, LoopError>(text.into_bytes())
         });
         self.in_flight.insert(tool_use_id, handle);
@@ -2682,7 +3106,8 @@ async fn run_loop_inner(
     // Browser-security (C): when a conseca domain-allowlist is configured, also
     // inject a first-class, built-in `browser` named subagent scoped to the
     // browse/read tools and carrying that allowlist. With no allowlist (the
-    // default) `block_with_builtins(&[])` is byte-identical to `global_block()`.
+    // default) `block_with_builtins(&[])` injects only the `.md` subagents (none
+    // ⇒ `""`), byte-identical to the pre-browser-security wire.
     let browser_allow_domains: Vec<String> = opts
         .conseca
         .as_ref()
@@ -2748,6 +3173,11 @@ async fn run_loop_inner(
     // spend against the goal's token budget.
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
+    // R4: cumulative prompt-cache READ tokens this run_loop — fed into the
+    // `origin_cache_hit_total{provider}` Prometheus counter at loop end. Zero
+    // unless the provider reported cache reads (Anthropic prompt-cache); stays
+    // unused when no `metrics` handle is wired.
+    let mut total_cache_read_tokens: u64 = 0;
 
     // Set once any mutating tool dispatches in this run_loop. Consumed only by
     // the optional, default-off end-of-turn checkpoint (Task 1) so a clean
@@ -2872,6 +3302,41 @@ async fn run_loop_inner(
             }
             None => session.model.clone(),
         };
+        // Policy model allow/deny-list enforcement (Task 3a / R14). DENY-ONLY and
+        // default-safe: only consulted when an `[[policy_layers]]` engine is
+        // present, and `is_model_allowed` returns `true` for every model unless a
+        // layer sets `allowed_models`/`denied_models`. When the resolved
+        // `turn_model` is denied, refuse the turn with a clear error rather than
+        // silently picking another model — the operator chose this model and the
+        // policy says no. With no policy (the default everywhere) this block is a
+        // no-op and the turn proceeds byte-identically.
+        if let Some(policy) = opts.policy.as_ref() {
+            if !policy.is_model_allowed(&turn_model) {
+                return Err(LoopError::GovernanceDenied(format!(
+                    "model `{turn_model}` is not permitted by the governance policy \
+                     (allowed_models/denied_models); switch with `/model <allowed-model>`"
+                )));
+            }
+            // Policy spend-cap enforcement (Task 3b / R14). DENY-ONLY and
+            // default-safe: only when a layer sets `max_spend_usd`. Refuse to
+            // START a turn whose cumulative spend already exceeds the cap, so a
+            // long session cannot run past the operator's budget. Turn 1 always
+            // proceeds (cumulative spend is still 0 ⇒ within any non-negative
+            // cap). An unknown-priced model can't be costed ⇒ left unconstrained
+            // (`estimate_spend_usd` returns `None`), exactly as no cap would be.
+            if let Some(cap) = policy.spend_cap_usd() {
+                if let Some(spent) =
+                    estimate_spend_usd(&turn_model, total_input_tokens, total_output_tokens, total_cache_read_tokens)
+                {
+                    if spent > cap {
+                        return Err(LoopError::GovernanceDenied(format!(
+                            "cumulative spend ${spent:.4} exceeds the governance cap ${cap:.4}; \
+                             this turn is refused to stay within budget"
+                        )));
+                    }
+                }
+            }
+        }
         // The provider this turn's chat call uses: the freshly-built owned one
         // for a cross-provider pick, otherwise the borrowed active provider.
         let turn_provider: &dyn Provider = rebuilt.as_deref().unwrap_or(provider);
@@ -3262,6 +3727,10 @@ async fn run_loop_inner(
         // only need the two top-level fields here.
         total_input_tokens = total_input_tokens.saturating_add(u64::from(resp.usage.input_tokens));
         total_output_tokens = total_output_tokens.saturating_add(u64::from(resp.usage.output_tokens));
+        // R4: accumulate prompt-cache reads for the `origin_cache_hit_total`
+        // counter (fed once at loop end alongside the token totals).
+        total_cache_read_tokens =
+            total_cache_read_tokens.saturating_add(u64::from(resp.usage.cache_read_input_tokens));
 
         session.push(resp.assistant.clone());
 
@@ -3329,6 +3798,12 @@ async fn run_loop_inner(
                     p
                 };
                 for p in proposals {
+                    // The daemon-wide `ProposalRegistry` is the real persistence
+                    // path (a later `MemoryDecision::Accept` resolves the body
+                    // /tags from it, possibly on a different connection); the
+                    // per-`Session` `pending_proposals` map was write-only and
+                    // has been removed (#14). The proposal is surfaced to the
+                    // client purely via the `MemoryProposed` event below.
                     if let Some(registry) = &opts.proposal_registry {
                         registry.record(p.proposal_id, p.body.clone(), p.suggested_tags.clone());
                     }
@@ -3336,12 +3811,11 @@ async fn run_loop_inner(
                         let _ = tx
                             .send(StreamEvent::MemoryProposed {
                                 proposal_id: p.proposal_id,
-                                body: p.body.clone(),
-                                suggested_tags: p.suggested_tags.clone(),
+                                body: p.body,
+                                suggested_tags: p.suggested_tags,
                             })
                             .await;
                     }
-                    session.pending_proposals.insert(p.proposal_id, p);
                 }
             }
 
@@ -3376,8 +3850,11 @@ async fn run_loop_inner(
                 &session.model,
                 total_input_tokens,
                 total_output_tokens,
+                total_cache_read_tokens,
                 loop_start.elapsed().as_secs_f64() * 1_000.0,
                 total_tool_calls,
+                opts.metrics.as_deref(),
+                opts.notify.as_deref(),
             );
             // Task 4 / Stage C5: the loop reached a clean assistant turn with
             // no further tool calls — the agent finished the requested work.
@@ -3467,8 +3944,12 @@ async fn run_loop_inner(
             };
 
             // Permission check fires first — denied tools never use cached results.
+            // Resolution: skill-narrowing (final) → AutoAllowed → user permission
+            // rules (P10.12; only when configured) → interactive prompter. With no
+            // `[[permission_rules]]` this is byte-identical to the historical
+            // `check_with_skills` path.
             let skills: &SkillRegistry = opts.skills.as_deref().unwrap_or(&EMPTY_SKILLS);
-            let mut decision = check_with_skills(meta, &preview, prompter, skills).await;
+            let mut decision = decide_permission(meta, &preview, prompter, skills, opts).await;
 
             // Task 3 — DENY-ONLY governance overlay. After the base check yields
             // a decision, the optional policy/conseca layers may only *narrow*
@@ -3501,6 +3982,15 @@ async fn run_loop_inner(
             // default) ⇒ no effect.
             if decision.outcome == Outcome::Allow {
                 decision = apply_domain_overlay(decision, meta.name, &args, opts);
+            }
+
+            // Conseca filesystem-path overlay (Task 2 / R13). Same deny-only
+            // contract: a path-touching tool (`Read`/`Write`/`Edit`/`MultiEdit`/
+            // `ApplyPatch`, and `Bash`'s `cwd`) whose target path is outside
+            // `allow_paths` or inside `deny_paths` is downgraded Allow→Deny. No
+            // conseca policy or no path lists configured (the default) ⇒ no effect.
+            if decision.outcome == Outcome::Allow {
+                decision = apply_path_overlay(decision, meta.name, &args, opts);
             }
 
             // Browser-security (B) — ENFORCED per-session rate limit. Same
@@ -3551,6 +4041,10 @@ async fn run_loop_inner(
                     reason = %decision.reason,
                     "tool denied"
                 );
+                // R4: count the denied tool call before the loop bails out.
+                if let Some(m) = opts.metrics.as_deref() {
+                    m.tool_call_total(provider.name(), &name, "denied").inc();
+                }
                 return Err(LoopError::Denied(name.clone()));
             }
 
@@ -3656,9 +4150,28 @@ async fn run_loop_inner(
                 // synchronous dispatch if the registry has no entry.
                 if let Some(pre) = speculative.take(&id).await {
                     match pre {
-                        Ok(bytes) => bytes,
+                        Ok(bytes) => {
+                            // #5: the speculative dispatch path runs Read with no
+                            // write_guard, so record the read here (on the shared
+                            // guard) when a speculative Read result is consumed,
+                            // so a later `Write{force:false}` over the same path
+                            // is still permitted.
+                            if meta.name == "Read" {
+                                if let (Some(guard), Some(p)) = (
+                                    opts.write_guard.as_ref(),
+                                    args.get("file_path").and_then(Value::as_str),
+                                ) {
+                                    guard.note_read(p);
+                                }
+                            }
+                            bytes
+                        }
                         Err(LoopError::BadArgs(msg) | LoopError::ToolFailure(msg)) => {
                             tracing::warn!(tool = %name, %msg, "speculative tool dispatch failed; returning error to model");
+                            // R4: count the failed (speculative) tool call.
+                            if let Some(m) = opts.metrics.as_deref() {
+                                m.tool_call_total(provider.name(), &name, "err").inc();
+                            }
                             tool_results.push(Block::ToolResult {
                                 tool_use_id: id,
                                 handle: None,
@@ -3675,10 +4188,14 @@ async fn run_loop_inner(
                     // the child writes it, so long-running commands no
                     // longer feel hung. The LLM still receives the fully
                     // accumulated body via `Block::ToolResult` below.
-                    match run_bash_streaming(&args, opts.event_tx.as_ref()).await {
+                    match run_bash_streaming(&args, opts.event_tx.as_ref(), opts.proc_supervisor.as_ref()).await {
                         Ok(bytes) => bytes,
                         Err(msg) => {
                             tracing::warn!(tool = %name, %msg, "Bash dispatch failed; returning error to model");
+                            // R4: count the failed Bash tool call.
+                            if let Some(m) = opts.metrics.as_deref() {
+                                m.tool_call_total(provider.name(), &name, "err").inc();
+                            }
                             if let Some(tx) = &opts.event_tx {
                                 let _ = tx
                                     .send(StreamEvent::ToolResult {
@@ -3720,6 +4237,9 @@ async fn run_loop_inner(
                         opts.coordinator.as_deref(),
                         exposure_arg,
                         opts.skill_catalog.as_deref(),
+                        opts.proc_supervisor.as_ref(),
+                        opts.write_guard.as_ref(),
+                        opts.post_edit.as_ref(),
                     )
                     .await
                     {
@@ -3735,6 +4255,10 @@ async fn run_loop_inner(
                         }
                         Err(LoopError::BadArgs(msg) | LoopError::ToolFailure(msg)) => {
                             tracing::warn!(tool = %name, %msg, "tool dispatch failed; returning error to model");
+                            // R4: count the failed tool call.
+                            if let Some(m) = opts.metrics.as_deref() {
+                                m.tool_call_total(provider.name(), &name, "err").inc();
+                            }
                             // Surface the error to the CLI so the user sees
                             // *why* the tool stopped rather than a silent gap.
                             if let Some(tx) = &opts.event_tx {
@@ -3806,6 +4330,13 @@ async fn run_loop_inner(
                 .saturating_add(u64::try_from(dispatch_start.elapsed().as_millis()).unwrap_or(u64::MAX));
             if first_tool_ms.is_none() {
                 first_tool_ms = Some(u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX));
+            }
+
+            // R4: a tool result was produced (cache hit, speculative, Bash, or
+            // fresh dispatch — every failure path `continue`d above), so count
+            // it as a successful tool call. `None` ⇒ no-op, byte-identical.
+            if let Some(m) = opts.metrics.as_deref() {
+                m.tool_call_total(provider.name(), &name, "ok").inc();
             }
 
             // Real-time swarm collaboration (WS-L, jcode L238). Reaching here
@@ -4416,6 +4947,23 @@ async fn dispatch_tool(
     // "not configured" `ToolFailure`; no other arm consults it, so the result is
     // byte-identical to before for every other tool.
     skill_catalog: Option<&SkillCatalog>,
+    // Shared process supervisor for `Bash`/`Monitor`. `None` (every caller but
+    // the main-loop site) ⇒ each arm builds a fresh per-call `Supervisor`,
+    // byte-identical to before (a backgrounded pid is invisible to a later
+    // `Monitor`). When `Some`, the SAME instance is used so background+Monitor
+    // can share a pid across tool calls (#1).
+    proc_supervisor: Option<&origin_tools::proc_supervisor::Supervisor>,
+    // Shared read-before-overwrite guard for `Write`. `None` (every caller but
+    // the main-loop site) ⇒ `Read` records nothing and `Write` builds a fresh
+    // guard, byte-identical to before. When `Some`, `Read` calls `note_read`
+    // and `Write` consults `has_read` through this shared guard (#5).
+    write_guard: Option<&Arc<origin_tools::builtins::write::WriteGuard>>,
+    // Post-edit policy (Task 2). `None` (every caller but the main-loop site) ⇒
+    // each mutating arm's `post_mutation_autoformat` uses only the builtin
+    // formatter table and runs no lint, byte-identical to before. When `Some`,
+    // `format_overrides` win and the configured `auto_lint` runs with its
+    // `RepairDecision` consulted.
+    post_edit: Option<&Arc<origin_postedit::PostEditConfig>>,
 ) -> Result<String, LoopError> {
     match meta.name {
         "Read" => {
@@ -4435,7 +4983,18 @@ async fn dispatch_tool(
                     .and_then(|n| u32::try_from(n).ok()),
                 as_: args.get("as").and_then(Value::as_str).map(str::to_string),
             };
-            origin_tools::builtins::read::read_v2(args).map_err(|e| LoopError::ToolFailure(e.message))
+            // #5: record this read in the shared Write guard so a later
+            // `Write{force:false}` over this file is permitted (the model has
+            // seen it). Only record on a successful read.
+            let read_path = args.file_path.clone();
+            let out = origin_tools::builtins::read::read_v2(args)
+                .map_err(|e| LoopError::ToolFailure(e.message));
+            if out.is_ok() {
+                if let Some(guard) = write_guard {
+                    guard.note_read(&read_path);
+                }
+            }
+            out
         }
         "Glob" => {
             let gargs = origin_tools::builtins::glob_tool::GlobArgs {
@@ -4521,7 +5080,13 @@ async fn dispatch_tool(
                 .map(|v| serde_json::to_string(&v).expect("BUG: EditResult always serializes"))
                 .map_err(|e| LoopError::ToolFailure(e.message));
             if res.is_ok() {
-                post_mutation_autoformat("Edit", &fmt_path);
+                // #5: a successful Edit means the model has seen this file's
+                // content (Edit reads + rewrites it), so record it so a later
+                // `Write{force:false}` over the same path is permitted.
+                if let Some(guard) = write_guard {
+                    guard.note_read(&fmt_path);
+                }
+                post_mutation_autoformat(post_edit.map(AsRef::as_ref), "Edit", &fmt_path);
             }
             res
         }
@@ -4555,7 +5120,11 @@ async fn dispatch_tool(
                 .map(|v| serde_json::to_string(&v).expect("BUG: MultiEditResult always serializes"))
                 .map_err(|e| LoopError::ToolFailure(e.message));
             if res.is_ok() {
-                post_mutation_autoformat("MultiEdit", &margs.file_path);
+                // #5: a successful MultiEdit means the model has seen this file.
+                if let Some(guard) = write_guard {
+                    guard.note_read(&margs.file_path);
+                }
+                post_mutation_autoformat(post_edit.map(AsRef::as_ref), "MultiEdit", &margs.file_path);
             }
             res
         }
@@ -4573,15 +5142,25 @@ async fn dispatch_tool(
                 .map_err(|e| LoopError::ToolFailure(e.message));
             if res.is_ok() {
                 for p in &fmt_paths {
-                    post_mutation_autoformat("ApplyPatch", p);
+                    // #5: a successful ApplyPatch means the model has seen each
+                    // target file, so a later `Write{force:false}` is permitted.
+                    if let Some(guard) = write_guard {
+                        guard.note_read(p);
+                    }
+                    post_mutation_autoformat(post_edit.map(AsRef::as_ref), "ApplyPatch", p);
                 }
             }
             res
         }
         "Write" => {
-            let guard = origin_tools::builtins::write::WriteGuard::default();
-            // Production callers pass the session's guard via dispatch_with_envelope;
-            // this passthrough path is used only by tests that bypass the envelope.
+            // #5: prefer the session-shared guard so a prior Read/Edit on this
+            // path permits `force=false` overwrite. Falls back to a fresh,
+            // empty guard when no shared guard is wired (tests / legacy path),
+            // byte-identical to before. The empty fallback is unused when a
+            // shared guard is present.
+            let fresh_guard = origin_tools::builtins::write::WriteGuard::default();
+            let guard: &origin_tools::builtins::write::WriteGuard =
+                write_guard.map_or(&fresh_guard, std::convert::AsRef::as_ref);
             let args = origin_tools::builtins::write::WriteArgs {
                 file_path: args
                     .get("file_path")
@@ -4596,11 +5175,16 @@ async fn dispatch_tool(
                 force: args.get("force").and_then(Value::as_bool).unwrap_or(false),
             };
             let fmt_path = args.file_path.clone();
-            let res = origin_tools::builtins::write::write_v2(args, &guard)
+            let res = origin_tools::builtins::write::write_v2(args, guard)
                 .map(|()| "write ok".to_string())
                 .map_err(|e| LoopError::ToolFailure(e.message));
             if res.is_ok() {
-                post_mutation_autoformat("Write", &fmt_path);
+                // A successful Write also marks the path as "seen" so a later
+                // re-Write (force=false) without a fresh Read still succeeds.
+                if let Some(g) = write_guard {
+                    g.note_read(&fmt_path);
+                }
+                post_mutation_autoformat(post_edit.map(AsRef::as_ref), "Write", &fmt_path);
             }
             res
         }
@@ -4636,11 +5220,12 @@ async fn dispatch_tool(
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
             };
-            // Local supervisor for the passthrough path; the envelope path
-            // uses ctx.supervisor (shared across calls within a session).
-            // NOTE: run_in_background + Monitor across separate tool
-            // invocations won't work via this path — see known limitations.
-            let sup = origin_tools::proc_supervisor::Supervisor::new();
+            // #1: prefer the session-shared supervisor so a backgrounded pid is
+            // visible to a later `Monitor`/`Bash` read-since within the same
+            // session. Falls back to a fresh per-call supervisor when none is
+            // wired (tests / legacy path) — byte-identical to before. The
+            // `Supervisor` is `Arc`-backed, so `.cloned()` is cheap.
+            let sup = proc_supervisor.cloned().unwrap_or_default();
             origin_tools::builtins::bash::bash_v2(bargs, &sup)
                 .await
                 .map(|v| serde_json::to_string(&v).expect("BUG: BashResult always serializes"))
@@ -4661,11 +5246,12 @@ async fn dispatch_tool(
                     .unwrap_or(4096),
                 wait: args.get("wait").and_then(Value::as_bool).unwrap_or(false),
             };
-            // Envelope-routed path uses ctx.supervisor; this passthrough
-            // makes a stub supervisor that always returns unknown_pid.
-            // Production should reach this arm only when run_in_background
-            // was used — until Phase 8 wires the shared supervisor.
-            let sup = origin_tools::proc_supervisor::Supervisor::new();
+            // #1: use the session-shared supervisor so a pid spawned by an
+            // earlier `Bash{run_in_background:true}` is known here. Falls back
+            // to a fresh supervisor (which only knows pids it spawned ⇒
+            // unknown_pid) when none is wired — byte-identical to the legacy
+            // passthrough path used by tests. `Supervisor` is `Arc`-backed.
+            let sup = proc_supervisor.cloned().unwrap_or_default();
             origin_tools::builtins::monitor::monitor(margs, &sup)
                 .await
                 .map(|v| serde_json::to_string(&v).expect("BUG: MonitorResult always serializes"))
@@ -5412,8 +5998,13 @@ fn node_row_to_json(row: &origin_codegraph::index::NodeRow) -> serde_json::Value
 async fn run_bash_streaming(
     args: &Value,
     event_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    // #1: shared session supervisor. When `Some`, a backgrounded pid spawned
+    // here is registered on the SAME instance a later `Monitor`/`Bash` call
+    // reads from, so background+Monitor works across tool calls. `None` (tests)
+    // ⇒ a fresh per-call supervisor, byte-identical to before.
+    proc_supervisor: Option<&origin_tools::proc_supervisor::Supervisor>,
 ) -> Result<Vec<u8>, String> {
-    use origin_tools::proc_supervisor::{ProcStatus, SpawnOpts, Supervisor};
+    use origin_tools::proc_supervisor::{ProcStatus, SpawnOpts};
     use std::time::Duration;
 
     let command = args
@@ -5448,15 +6039,21 @@ async fn run_bash_streaming(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    // Per-call supervisor: run_in_background + Monitor across separate tool
-    // invocations won't work via this legacy path (known limitation —
-    // Phase 8 replaces with envelope-level shared supervisor).
-    let sup = Supervisor::new();
+    // #1: prefer the session-shared supervisor so a backgrounded pid here is
+    // visible to a later `Monitor`/`Bash` read-since within the session. Falls
+    // back to a fresh per-call supervisor when none is wired (tests). The
+    // `Supervisor` is `Arc`-backed, so `.cloned()` is cheap.
+    let sup = proc_supervisor.cloned().unwrap_or_default();
     let opts = SpawnOpts {
         timeout: Some(Duration::from_secs(u64::from(timeout_secs))),
         cwd,
         env,
         buffer_cap_bytes: None,
+        // P11.5: the streaming Bash path confines the child under the same
+        // `Shell` sandbox profile as `bash_v2` (the Bash tool's declared
+        // `ToolMeta.sandbox_profile`). No-op on the default feature set; the
+        // Linux/macOS backend enforces it when compiled in.
+        sandbox_profile: Some(origin_tools::SandboxProfile::Shell),
     };
     let pid = sup.spawn(&command, &opts).map_err(|e| e.message)?;
 
@@ -6347,7 +6944,7 @@ mod dispatch_table_tests {
         let empty = serde_json::Value::Object(serde_json::Map::new());
         let mut unrecognized: Vec<String> = Vec::new();
         for meta in registry_iter() {
-            let result = dispatch_tool(meta, &empty, None, None, None, None, None, None, None).await;
+            let result = dispatch_tool(meta, &empty, None, None, None, None, None, None, None, None, None, None).await;
             if let Err(LoopError::UnknownTool(name)) = &result {
                 unrecognized.push(name.clone());
             }
@@ -6409,7 +7006,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_explain")
             .expect("graph_explain registered");
         let args = serde_json::json!({"kind": "communities"});
-        let out = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
+        let out = dispatch_tool(meta, &args, None, None, None, None, None, None, None, None, None, None)
             .await
             .expect("communities dispatch");
         assert_eq!(out, "all detected communities");
@@ -6418,14 +7015,14 @@ mod dispatch_table_tests {
             "kind": "recent_changes",
             "args": {"since_ms": 1_700_000_000_000_i64}
         });
-        let out = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
+        let out = dispatch_tool(meta, &args, None, None, None, None, None, None, None, None, None, None)
             .await
             .expect("recent_changes dispatch");
         assert!(out.contains("1700000000000"), "got: {out}");
 
         // Unknown kind surfaces as BadArgs, not ToolFailure or UnknownTool.
         let args = serde_json::json!({"kind": "bogus"});
-        let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
+        let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None, None, None, None)
             .await
             .expect_err("bogus must fail");
         assert!(matches!(err, LoopError::BadArgs(_)));
@@ -6450,7 +7047,7 @@ mod dispatch_table_tests {
             let meta = registry_iter()
                 .find(|m| m.name == name)
                 .unwrap_or_else(|| panic!("{name} not registered"));
-            let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
+            let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None, None, None, None)
                 .await
                 .expect_err(name);
             match err {
@@ -6479,7 +7076,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_query")
             .expect("graph_query registered");
         let args = serde_json::json!({"kind": "communities"});
-        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None, None, None, None)
+        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None, None, None, None, None, None, None)
             .await
             .expect("graph_query dispatch");
         // Empty edge table yields an empty Partitions list.
@@ -6508,6 +7105,9 @@ mod dispatch_table_tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("ask dispatch");
@@ -6525,7 +7125,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "graph_rebuild")
             .expect("graph_rebuild registered");
         let args = serde_json::json!({"paths": []});
-        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None, None, None, None)
+        let out = dispatch_tool(meta, &args, None, Some(&code_graph), None, None, None, None, None, None, None, None)
             .await
             .expect("graph_rebuild dispatch");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
@@ -6603,7 +7203,7 @@ mod dispatch_table_tests {
             .find(|m| m.name == "mem_search")
             .expect("mem_search registered");
         let args = serde_json::json!({"query": "anything"});
-        let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
+        let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None, None, None, None)
             .await
             .expect_err("must fail without handle");
         match err {
@@ -6640,6 +7240,9 @@ mod dispatch_table_tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("mem_save must succeed");
@@ -6661,6 +7264,9 @@ mod dispatch_table_tests {
             None,
             None,
             Some(&handle),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -6697,7 +7303,7 @@ mod dispatch_table_tests {
             "goal": "do something",
             "allowed_tools": []
         });
-        let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None)
+        let err = dispatch_tool(meta, &args, None, None, None, None, None, None, None, None, None, None)
             .await
             .expect_err("Task without coordinator must fail");
         match err {
@@ -6761,6 +7367,9 @@ mod dispatch_table_tests {
             Some(coordinator.as_ref()),
             None,
             None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("Task with coordinator must succeed");
@@ -6809,6 +7418,58 @@ mod dispatch_table_tests {
         assert_eq!(usage.output_tokens, 2_222);
         assert_eq!(usage.cache_read_input_tokens, 3_333);
         assert_eq!(usage.cache_creation_input_tokens, 4_444);
+    }
+
+    /// #5 regression: a `Read` followed by a `Write{force:false}` over the same
+    /// existing file MUST succeed when both share the session's `WriteGuard`.
+    /// Before the fix, every `Write` dispatch built a fresh guard and nothing
+    /// called `note_read`, so `has_read()` was always false and the overwrite
+    /// was rejected with `edit.read_required`.
+    #[tokio::test]
+    async fn shared_write_guard_permits_overwrite_after_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("seen.txt");
+        std::fs::write(&path, "original\n").expect("seed file");
+        let path_str = path.to_string_lossy().into_owned();
+
+        // The per-session shared guard (as wired in main.rs).
+        let guard = Arc::new(origin_tools::builtins::write::WriteGuard::default());
+
+        let read_meta = registry_iter().find(|m| m.name == "Read").expect("Read registered");
+        let write_meta = registry_iter().find(|m| m.name == "Write").expect("Write registered");
+
+        // Sanity: WITHOUT the shared guard, a force=false overwrite is rejected.
+        let write_args = serde_json::json!({
+            "file_path": path_str,
+            "content": "replacement-no-guard\n",
+            "force": false,
+        });
+        let no_guard = dispatch_tool(
+            write_meta, &write_args, None, None, None, None, None, None, None, None, None, None,
+        )
+        .await;
+        assert!(
+            matches!(no_guard, Err(LoopError::ToolFailure(ref m)) if m.contains("has not been Read")),
+            "without a shared guard, force=false overwrite of an unread file must be refused; got {no_guard:?}"
+        );
+
+        // Read through the SHARED guard: records the read.
+        let read_args = serde_json::json!({ "file_path": path_str });
+        dispatch_tool(
+            read_meta, &read_args, None, None, None, None, None, None, None, None, Some(&guard), None,
+        )
+        .await
+        .expect("Read through shared guard must succeed");
+
+        // Now Write{force:false} through the SAME guard must succeed.
+        let write_ok = dispatch_tool(
+            write_meta, &write_args, None, None, None, None, None, None, None, None, Some(&guard), None,
+        )
+        .await
+        .expect("Write force=false after a Read of the same file must succeed via the shared guard");
+        assert_eq!(write_ok, "write ok");
+        let on_disk = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(on_disk, "replacement-no-guard\n", "the overwrite must have landed");
     }
 }
 
@@ -6873,8 +7534,11 @@ mod wiring_tests {
         assert!(!enabled, "autoformat must be opt-in via ORIGIN_AUTOFORMAT=1");
         assert_eq!(origin_postedit::formatter_for("src/main.rs"), Some("rustfmt"));
         assert_eq!(origin_postedit::formatter_for("README"), None);
-        // No-op with the gate off (no panic, no spawn).
-        maybe_autoformat("src/main.rs");
+        // No-op with the gate off (no panic, no spawn). Both the no-config
+        // (`None`) and config-present spellings must be inert with the gate off.
+        maybe_autoformat(None, "src/main.rs");
+        let cfg = origin_postedit::PostEditConfig::default();
+        maybe_autoformat(Some(&cfg), "src/main.rs");
     }
 
     /// Task 2 (Edit fix): every file-mutating builtin must trigger post-edit
@@ -7228,7 +7892,14 @@ mod wiring_tests {
     fn notify_gate_off_by_default() {
         let enabled = std::env::var("ORIGIN_NOTIFY").as_deref() == Ok("1");
         assert!(!enabled, "notifications must be opt-in via ORIGIN_NOTIFY=1");
-        maybe_notify_completion();
+        // Both the no-policy (`None`) and policy-present spellings must be inert
+        // with the gate off (no spawn, no panic).
+        maybe_notify_completion(None);
+        let policy = crate::config::NotifyPolicy {
+            quiet: Some(origin_notify::QuietHours::new(0, 24 * 60 - 1)),
+            channel: origin_notify::Channel::Desktop,
+        };
+        maybe_notify_completion(Some(&policy));
     }
 
     /// AGENT-LOOP Task 1: the exposure-truncation gate is OFF by default, and
@@ -7356,6 +8027,83 @@ mod wiring_tests {
             3,
         );
         // Reaching here without a panic is the assertion.
+    }
+
+    /// R4: with a `Metrics` handle wired, `run_turn_end_effects` feeds the real
+    /// per-turn token + cache-read totals into the Prometheus counters that back
+    /// `/metrics`, `origin usage`, and the `?metrics` panel — which were never
+    /// incremented in production before this wiring. The snapshot must surface
+    /// the `tokens_in/tokens_out/cache_hit` series with the values we passed.
+    #[test]
+    fn run_turn_end_effects_increments_token_counters() {
+        let metrics = origin_metrics::Metrics::new();
+        // A completed loop with 1234 input / 567 output / 89 cache-read tokens.
+        run_turn_end_effects(
+            "anthropic",
+            "claude-sonnet-4-6",
+            1_234,
+            567,
+            89,
+            42.0,
+            3,
+            Some(&metrics),
+            None,
+        );
+        let snap = metrics.snapshot();
+        let value_of = |family: &str| -> f64 {
+            snap.iter()
+                .find(|r| r.name == family)
+                .map_or(0.0, |r| r.value)
+        };
+        assert!(
+            (value_of("origin_tokens_in_total") - 1_234.0).abs() < f64::EPSILON,
+            "tokens_in counter must advance to 1234; snapshot={:?}",
+            snap.rows
+        );
+        assert!(
+            (value_of("origin_tokens_out_total") - 567.0).abs() < f64::EPSILON,
+            "tokens_out counter must advance to 567"
+        );
+        assert!(
+            (value_of("origin_cache_hit_total") - 89.0).abs() < f64::EPSILON,
+            "cache_hit counter must advance to 89"
+        );
+    }
+
+    /// R4: with no `Metrics` handle (the default everywhere, including tests),
+    /// `run_turn_end_effects` touches no counter — byte-identical to before the
+    /// wiring landed. A fresh registry's snapshot stays empty.
+    #[test]
+    fn run_turn_end_effects_without_metrics_is_noop() {
+        let metrics = origin_metrics::Metrics::new();
+        run_turn_end_effects("anthropic", "m", 100, 50, 0, 1.0, 1, None, None);
+        assert!(
+            metrics.snapshot().rows.is_empty(),
+            "no metrics handle ⇒ counters stay unregistered/zero"
+        );
+    }
+
+    /// R4: the per-tool-call counter the dispatch loop increments
+    /// (`tool_call_total{provider,tool,result}`) advances and is surfaced by the
+    /// snapshot — exercising the exact accessor + `.inc()` the loop uses on the
+    /// ok / err / denied result paths.
+    #[test]
+    fn tool_call_counter_advances_per_result() {
+        let metrics = origin_metrics::Metrics::new();
+        // Mirror the three result-label sites the loop increments.
+        metrics.tool_call_total("anthropic", "Read", "ok").inc();
+        metrics.tool_call_total("anthropic", "Bash", "err").inc();
+        metrics.tool_call_total("anthropic", "Edit", "denied").inc();
+        let snap = metrics.snapshot();
+        let tool_rows: Vec<_> = snap
+            .iter()
+            .filter(|r| r.name == "origin_tool_call_total")
+            .collect();
+        assert_eq!(tool_rows.len(), 3, "three distinct (tool,result) series");
+        assert!(
+            tool_rows.iter().all(|r| (r.value - 1.0).abs() < f64::EPSILON),
+            "each tool-call series advanced by exactly 1"
+        );
     }
 
     /// AGENT-LOOP Task 4: session-stop pain telemetry is disabled by default
@@ -7571,6 +8319,378 @@ mod wiring_tests {
             .expect("console")
             .contains("[warn] slow"));
     }
+
+    // ---- P10.12 / R31: user-configured permission rules (Feature 1) ----
+
+    /// A `RequiresPermission` `ToolMeta` for the named tool, used to exercise the
+    /// `decide_permission` resolution path.
+    fn rp_meta(name: &'static str) -> ToolMeta {
+        ToolMeta {
+            name,
+            description: "test tool",
+            tier: origin_tools::Tier::RequiresPermission,
+            urgency: origin_tools::Urgency::Low,
+            side_effects: SideEffects::Mutating,
+            input_schema: r#"{"type":"object"}"#,
+            sandbox_profile: origin_tools::SandboxProfile::Inherit,
+            token_budget: 1024,
+            hot: false,
+        }
+    }
+
+    /// Build a `PermissionRules` bundle from `(tool, allow)` pairs at the
+    /// canonical scope, mirroring what `config::load_governance` produces.
+    fn rules_bundle(entries: &[(&str, bool)]) -> Arc<crate::config::PermissionRules> {
+        let rules: Vec<origin_permission::rules::Rule> = entries
+            .iter()
+            .map(|(tool, allow)| origin_permission::rules::Rule {
+                tool_name: (*tool).to_string(),
+                scope: crate::config::PERMISSION_RULE_SCOPE.to_string(),
+                allow: *allow,
+            })
+            .collect();
+        let bloom = origin_permission::bloom::BloomPreCheck::build(&rules);
+        Arc::new(crate::config::PermissionRules { rules, bloom })
+    }
+
+    /// DEFAULT-SAFE pass-through: with NO permission rules configured (the
+    /// default), `decide_permission` is byte-identical to the historical
+    /// prompter path — an `AlwaysAllow` prompter allows, an `AlwaysDeny` blocks,
+    /// exactly as before this wiring.
+    #[tokio::test]
+    async fn permission_rules_unconfigured_is_byte_identical() {
+        let opts = LoopOptions::default();
+        assert!(opts.permission_rules.is_none(), "default ⇒ no rules");
+        let no_skills = SkillRegistry::new();
+        let meta = rp_meta("Bash");
+        let allow = origin_permission::prompt::AlwaysAllow;
+        let deny = origin_permission::prompt::AlwaysDeny;
+        // No rules ⇒ the prompter is consulted, just like before.
+        assert_eq!(
+            decide_permission(&meta, "git status", &allow, &no_skills, &opts).await.outcome,
+            Outcome::Allow,
+            "no rules + AlwaysAllow ⇒ allowed (unchanged)"
+        );
+        assert_eq!(
+            decide_permission(&meta, "git status", &deny, &no_skills, &opts).await.outcome,
+            Outcome::Deny,
+            "no rules + AlwaysDeny ⇒ denied (unchanged)"
+        );
+    }
+
+    /// CONFIGURED: an explicit user `deny` rule blocks a `RequiresPermission`
+    /// tool BEFORE the prompter is asked — even an `AlwaysAllow` prompter cannot
+    /// re-allow it.
+    #[tokio::test]
+    async fn permission_rule_deny_blocks_before_prompter() {
+        let opts = LoopOptions {
+            permission_rules: Some(rules_bundle(&[("Bash", false)])),
+            ..LoopOptions::default()
+        };
+        let no_skills = SkillRegistry::new();
+        let meta = rp_meta("Bash");
+        // AlwaysAllow would normally allow; the deny rule pre-empts it.
+        let d = decide_permission(&meta, "rm -rf /", &origin_permission::prompt::AlwaysAllow, &no_skills, &opts).await;
+        assert_eq!(d.outcome, Outcome::Deny, "explicit deny rule blocks");
+        assert!(d.reason.contains("rule:Bash"), "reason names the rule: {}", d.reason);
+    }
+
+    /// CONFIGURED: an explicit user `allow` rule auto-approves a
+    /// `RequiresPermission` tool WITHOUT prompting — even an `AlwaysDeny`
+    /// prompter is never consulted.
+    #[tokio::test]
+    async fn permission_rule_allow_auto_approves_without_prompting() {
+        let opts = LoopOptions {
+            permission_rules: Some(rules_bundle(&[("Read", true)])),
+            ..LoopOptions::default()
+        };
+        let no_skills = SkillRegistry::new();
+        let meta = rp_meta("Read");
+        // AlwaysDeny would normally deny; the allow rule pre-empts it.
+        let d = decide_permission(&meta, "/etc/hosts", &origin_permission::prompt::AlwaysDeny, &no_skills, &opts).await;
+        assert_eq!(d.outcome, Outcome::Allow, "explicit allow rule auto-approves");
+        assert!(d.reason.contains("rule:Read"), "reason names the rule: {}", d.reason);
+    }
+
+    /// CONFIGURED but NO matching rule: a tool with no rule still falls through
+    /// to the prompter exactly as before (here `AlwaysDeny` ⇒ denied), so an
+    /// unrelated rule set never changes a tool it does not name.
+    #[tokio::test]
+    async fn permission_rule_no_match_falls_through_to_prompter() {
+        let opts = LoopOptions {
+            permission_rules: Some(rules_bundle(&[("Read", true)])),
+            ..LoopOptions::default()
+        };
+        let no_skills = SkillRegistry::new();
+        let meta = rp_meta("Bash"); // no rule for Bash
+        let d = decide_permission(&meta, "git status", &origin_permission::prompt::AlwaysDeny, &no_skills, &opts).await;
+        assert_eq!(d.outcome, Outcome::Deny, "unmatched tool falls through to prompter (AlwaysDeny)");
+        let d2 = decide_permission(&meta, "git status", &origin_permission::prompt::AlwaysAllow, &no_skills, &opts).await;
+        assert_eq!(d2.outcome, Outcome::Allow, "unmatched tool falls through to prompter (AlwaysAllow)");
+    }
+
+    /// CONFINEMENT: skill-narrowing is final and outranks a user allow rule. A
+    /// skill that excludes `Bash` from its `allowed-tools` mask denies `Bash`
+    /// even though a user rule says allow — a convenience allow-rule must never
+    /// re-open a tool a confinement boundary closed.
+    #[tokio::test]
+    async fn skill_narrowing_outranks_user_allow_rule() {
+        let opts = LoopOptions {
+            permission_rules: Some(rules_bundle(&[("Bash", true)])),
+            ..LoopOptions::default()
+        };
+        // A skill whose allowed-tools is {Read} ⇒ Bash is narrowed out.
+        let mut skills = SkillRegistry::new();
+        skills.activate_with_body(
+            origin_skills::frontmatter::SkillFrontmatter {
+                name: "read-only".into(),
+                description: "read-only skill".into(),
+                allowed_tools: vec!["Read".into()],
+            },
+            String::new(),
+        );
+        let meta = rp_meta("Bash");
+        let d = decide_permission(&meta, "rm -rf /", &origin_permission::prompt::AlwaysAllow, &skills, &opts).await;
+        assert_eq!(d.outcome, Outcome::Deny, "skill-narrowing wins over the user allow rule");
+        assert_eq!(d.reason, "skill-narrowed");
+    }
+
+    // ---- Task 2 / R13: conseca filesystem-path enforcement (Feature 2) ----
+
+    /// DEFAULT-SAFE pass-through: with no conseca policy (the default) the path
+    /// overlay never gates a path-touching tool — byte-identical.
+    #[test]
+    fn path_overlay_no_policy_is_byte_identical() {
+        let opts = LoopOptions::default();
+        assert!(opts.conseca.is_none());
+        let allow = Decision { outcome: Outcome::Allow, reason: "base".into() };
+        let args = serde_json::json!({ "file_path": "/etc/shadow" });
+        assert_eq!(
+            apply_path_overlay(allow, "Read", &args, &opts).outcome,
+            Outcome::Allow,
+            "no conseca policy ⇒ not gated"
+        );
+    }
+
+    /// DEFAULT-SAFE pass-through: a conseca policy that sets NEITHER `allow_paths`
+    /// NOR `deny_paths` expresses no filesystem constraint, so every path is
+    /// allowed (a tool-only conseca policy must not start denying file access).
+    #[test]
+    fn path_overlay_empty_path_lists_not_gated() {
+        let opts = LoopOptions {
+            conseca: Some(Arc::new(origin_conseca::SecurityPolicy {
+                allow_tools: vec!["Read".into()],
+                ..origin_conseca::SecurityPolicy::default()
+            })),
+            ..LoopOptions::default()
+        };
+        let allow = Decision { outcome: Outcome::Allow, reason: "base".into() };
+        let args = serde_json::json!({ "file_path": "/anywhere/at/all" });
+        assert_eq!(
+            apply_path_overlay(allow, "Read", &args, &opts).outcome,
+            Outcome::Allow,
+            "no path lists configured ⇒ every path allowed"
+        );
+    }
+
+    /// CONFIGURED: with `allow_paths`/`deny_paths` set, a path under the allow
+    /// prefix passes, a path inside a deny prefix is blocked, and a path outside
+    /// every allow prefix is blocked — across Read/Write/Edit and Bash `cwd`.
+    #[test]
+    fn path_overlay_enforces_allow_and_deny() {
+        let opts = LoopOptions {
+            conseca: Some(Arc::new(origin_conseca::SecurityPolicy {
+                allow_paths: vec!["/repo".into()],
+                deny_paths: vec!["/repo/secrets".into()],
+                ..origin_conseca::SecurityPolicy::default()
+            })),
+            ..LoopOptions::default()
+        };
+        let allow = || Decision { outcome: Outcome::Allow, reason: "base".into() };
+
+        // Read inside the allow prefix ⇒ allowed.
+        let ok = serde_json::json!({ "file_path": "/repo/src/main.rs" });
+        assert_eq!(apply_path_overlay(allow(), "Read", &ok, &opts).outcome, Outcome::Allow);
+        // Write inside a deny prefix ⇒ blocked.
+        let bad = serde_json::json!({ "file_path": "/repo/secrets/key.pem" });
+        assert_eq!(apply_path_overlay(allow(), "Write", &bad, &opts).outcome, Outcome::Deny);
+        // Edit outside every allow prefix ⇒ blocked.
+        let outside = serde_json::json!({ "file_path": "/tmp/x" });
+        assert_eq!(apply_path_overlay(allow(), "Edit", &outside, &opts).outcome, Outcome::Deny);
+        // Bash cwd outside the allow prefix ⇒ blocked; cwd inside ⇒ allowed.
+        let bash_bad = serde_json::json!({ "command": "ls", "cwd": "/tmp" });
+        assert_eq!(apply_path_overlay(allow(), "Bash", &bash_bad, &opts).outcome, Outcome::Deny);
+        let bash_ok = serde_json::json!({ "command": "ls", "cwd": "/repo/sub" });
+        assert_eq!(apply_path_overlay(allow(), "Bash", &bash_ok, &opts).outcome, Outcome::Allow);
+        // A non-path tool (and a Bash with no cwd) yields no paths ⇒ never gated.
+        let bash_nocwd = serde_json::json!({ "command": "echo hi" });
+        assert_eq!(apply_path_overlay(allow(), "Bash", &bash_nocwd, &opts).outcome, Outcome::Allow);
+    }
+
+    /// `conseca_target_paths` extracts the right path field per tool and yields
+    /// nothing for pathless tools/args.
+    #[test]
+    fn conseca_target_paths_extraction() {
+        assert_eq!(
+            conseca_target_paths("Read", &serde_json::json!({ "file_path": "/a" })),
+            vec!["/a".to_string()]
+        );
+        assert_eq!(
+            conseca_target_paths("Bash", &serde_json::json!({ "cwd": "/work" })),
+            vec!["/work".to_string()]
+        );
+        let patch = serde_json::json!({ "patch": "*** Update File: src/a.rs\n+++ b/src/b.rs\n" });
+        let got = conseca_target_paths("ApplyPatch", &patch);
+        assert!(got.contains(&"src/a.rs".to_string()) && got.contains(&"src/b.rs".to_string()));
+        // Pathless cases.
+        assert!(conseca_target_paths("WebFetch", &serde_json::json!({ "url": "x" })).is_empty());
+        assert!(conseca_target_paths("Bash", &serde_json::json!({ "command": "ls" })).is_empty());
+        assert!(conseca_target_paths("Read", &serde_json::json!({})).is_empty());
+    }
+
+    // ---- Task 3 / R14: policy model-list + spend-cap (Feature 3) ----
+
+    /// DEFAULT-SAFE: with no policy (the default), every model is allowed
+    /// (`is_model_allowed` short-circuits to `true`).
+    #[test]
+    fn policy_model_unconfigured_allows_everything() {
+        let opts = LoopOptions::default();
+        assert!(opts.policy.is_none());
+        // Mirror the dispatch-site guard: a None policy is never consulted.
+        let allowed = opts.policy.as_ref().is_none_or(|p| p.is_model_allowed("any-model"));
+        assert!(allowed, "no policy ⇒ any model permitted (unchanged)");
+    }
+
+    /// CONFIGURED: a `denied_models` policy reports the named model as not
+    /// allowed (the value the turn-loop guard refuses on), while leaving other
+    /// models allowed.
+    #[test]
+    fn policy_model_denylist_rejects_named_model() {
+        let layer = origin_policy::parse_layer("denied_models = [\"expensive-model\"]", origin_policy::Tier::Admin)
+            .expect("valid layer");
+        let engine = origin_policy::PolicyEngine::new(vec![layer]);
+        assert!(!engine.is_model_allowed("expensive-model"), "denied model rejected");
+        assert!(engine.is_model_allowed("cheap-model"), "other models still allowed");
+    }
+
+    /// CONFIGURED: an `allowed_models` policy rejects a model not on the list.
+    #[test]
+    fn policy_model_allowlist_rejects_unlisted_model() {
+        let layer = origin_policy::parse_layer("allowed_models = [\"only-this\"]", origin_policy::Tier::Admin)
+            .expect("valid layer");
+        let engine = origin_policy::PolicyEngine::new(vec![layer]);
+        assert!(engine.is_model_allowed("only-this"));
+        assert!(!engine.is_model_allowed("something-else"));
+    }
+
+    /// DEFAULT-SAFE: with no spend cap, `estimate_spend_usd` is irrelevant —
+    /// `spend_cap_usd()` is `None` so the turn-loop guard never runs. We also
+    /// assert the estimator is monotonic and prices a known model.
+    #[test]
+    fn spend_estimator_prices_known_model_and_unknown_is_none() {
+        // No cap ⇒ unconstrained (mirrors the guard's `if let Some(cap)`).
+        let engine = origin_policy::PolicyEngine::new(vec![
+            origin_policy::parse_layer("allowed_tools = [\"Read\"]", origin_policy::Tier::User).expect("layer"),
+        ]);
+        assert_eq!(engine.spend_cap_usd(), None, "no max_spend_usd ⇒ no cap");
+
+        // A known model prices a positive cost that grows with tokens.
+        let lo = estimate_spend_usd("claude-sonnet-4-6", 1_000, 1_000, 0).expect("known model prices");
+        let hi = estimate_spend_usd("claude-sonnet-4-6", 10_000_000, 10_000_000, 0).expect("known model prices");
+        assert!(hi > lo && lo >= 0.0, "cost grows with tokens: {lo} < {hi}");
+        // An unknown/local model can't be priced ⇒ None ⇒ left unconstrained.
+        assert!(
+            estimate_spend_usd("some-unknown-local-model-xyz", 1_000_000, 1_000_000, 0).is_none(),
+            "unknown model ⇒ no price ⇒ unconstrained"
+        );
+    }
+
+    /// CONFIGURED: a spend cap is the MIN across layers, and `estimate_spend_usd`
+    /// produces a value the turn-loop guard compares against it — a huge token
+    /// total exceeds a tiny cap (would refuse the turn), a tiny total does not.
+    #[test]
+    fn spend_cap_min_and_estimate_compare() {
+        let admin = origin_policy::parse_layer("max_spend_usd = 50.0", origin_policy::Tier::Admin).expect("layer");
+        let user = origin_policy::parse_layer("max_spend_usd = 0.01", origin_policy::Tier::User).expect("layer");
+        let engine = origin_policy::PolicyEngine::new(vec![admin, user]);
+        let cap = engine.spend_cap_usd().expect("cap set");
+        assert!((cap - 0.01).abs() < f64::EPSILON, "cap is the min (0.01)");
+
+        // A large token total on a priced model exceeds the tiny cap.
+        let big = estimate_spend_usd("claude-sonnet-4-6", 50_000_000, 50_000_000, 0).expect("priced");
+        assert!(big > cap, "big spend ${big} exceeds cap ${cap} ⇒ turn refused");
+        // A tiny total stays within the cap.
+        let small = estimate_spend_usd("claude-sonnet-4-6", 10, 10, 0).expect("priced");
+        assert!(small <= cap, "tiny spend ${small} within cap ${cap} ⇒ turn proceeds");
+    }
+
+    /// Task 2 DEFAULT-SAFE: with no `[post_edit]` config (`None`), the post-edit
+    /// formatter resolution is exactly the builtin table — byte-identical to the
+    /// pre-wiring `origin_postedit::formatter_for` path.
+    #[test]
+    fn resolve_formatter_without_config_uses_builtin_table() {
+        assert_eq!(resolve_formatter(None, "src/main.rs").as_deref(), Some("rustfmt"));
+        assert_eq!(resolve_formatter(None, "app/page.tsx").as_deref(), Some("prettier"));
+        assert_eq!(resolve_formatter(None, "README"), None);
+        // Identical to consulting the crate's builtin table directly.
+        assert_eq!(
+            resolve_formatter(None, "main.go").as_deref(),
+            origin_postedit::formatter_for("main.go")
+        );
+    }
+
+    /// Task 2 CONFIGURED: a `[post_edit]` config's `format_overrides` win over
+    /// the builtin table, while non-overridden extensions still fall through to
+    /// it. This is the wiring the mutating dispatch arms consult.
+    #[test]
+    fn resolve_formatter_with_config_honours_overrides() {
+        let cfg = origin_postedit::PostEditConfig {
+            format_overrides: vec![("rs".to_string(), "leptosfmt".to_string())],
+            ..origin_postedit::PostEditConfig::default()
+        };
+        // Override beats builtin for `.rs`.
+        assert_eq!(resolve_formatter(Some(&cfg), "lib.rs").as_deref(), Some("leptosfmt"));
+        // No override for `.go` ⇒ builtin table.
+        assert_eq!(resolve_formatter(Some(&cfg), "main.go").as_deref(), Some("gofmt"));
+        // Unknown extension ⇒ None.
+        assert_eq!(resolve_formatter(Some(&cfg), "a.unknownext"), None);
+    }
+
+    /// Task 2: `run_post_edit_lint` consults `repair_decision` per the config.
+    /// With `auto_lint` disabled (the default) it returns `None` (no decision,
+    /// no spawn). A flag-like path is also refused. Both are default-safe.
+    #[test]
+    fn run_post_edit_lint_is_noop_without_auto_lint() {
+        let cfg = origin_postedit::PostEditConfig::default();
+        assert!(
+            run_post_edit_lint(&cfg, "src/main.rs").is_none(),
+            "auto_lint disabled ⇒ no decision, no lint spawn"
+        );
+        // auto_lint without a lint_command ⇒ also None (nothing to run).
+        let cfg2 = origin_postedit::PostEditConfig {
+            auto_lint: true,
+            ..origin_postedit::PostEditConfig::default()
+        };
+        assert!(
+            run_post_edit_lint(&cfg2, "src/main.rs").is_none(),
+            "auto_lint with no lint_command ⇒ no decision"
+        );
+    }
+
+    /// Task 2 DEFAULT-SAFE: `post_mutation_autoformat` with `cfg = None` and the
+    /// `ORIGIN_AUTOFORMAT` gate off must be a complete no-op (no panic, no
+    /// spawn) for every mutating tool — byte-identical to before the wiring.
+    #[test]
+    fn post_mutation_autoformat_default_safe_with_no_config() {
+        let enabled = std::env::var("ORIGIN_AUTOFORMAT").as_deref() == Ok("1");
+        assert!(!enabled, "autoformat must be opt-in via ORIGIN_AUTOFORMAT=1");
+        for tool in ["Edit", "Write", "MultiEdit", "ApplyPatch"] {
+            post_mutation_autoformat(None, tool, "src/main.rs");
+        }
+        // A non-mutating tool never autoformats, even with a config present.
+        let cfg = origin_postedit::PostEditConfig::default();
+        post_mutation_autoformat(Some(&cfg), "Read", "src/main.rs");
+    }
 }
 
 #[cfg(test)]
@@ -7598,7 +8718,7 @@ mod bash_streaming_tests {
         // relay): keeps the no-raw-`tokio::spawn` invariant uniform, including
         // in tests, so the spawn-audit stays green.
         let driver = spawn_in(TaskClass::Realtime, async move {
-            run_bash_streaming(&args, Some(&tx)).await
+            run_bash_streaming(&args, Some(&tx), None).await
         });
 
         // Allow generous time for shell cold-start (pwsh on Windows can take
@@ -7658,7 +8778,7 @@ mod bash_streaming_tests {
     async fn silent_command_emits_terminal_result() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(8);
         let args = serde_json::json!({ "command": "true", "timeout": 5 });
-        let bytes = run_bash_streaming(&args, Some(&tx)).await.expect("bash ok");
+        let bytes = run_bash_streaming(&args, Some(&tx), None).await.expect("bash ok");
         drop(tx);
 
         let mut saw_result = false;
@@ -7690,7 +8810,7 @@ mod bash_streaming_tests {
             "run_in_background": true,
         });
         let started = Instant::now();
-        let bytes = run_bash_streaming(&args, Some(&tx)).await.expect("bash ok");
+        let bytes = run_bash_streaming(&args, Some(&tx), None).await.expect("bash ok");
         assert!(
             started.elapsed() < Duration::from_millis(500),
             "background must return fast"
@@ -7713,10 +8833,51 @@ mod bash_streaming_tests {
     #[tokio::test]
     async fn no_sink_still_returns_full_body() {
         let args = serde_json::json!({ "command": "echo a; echo b", "timeout": 5 });
-        let bytes = run_bash_streaming(&args, None).await.expect("bash ok");
+        let bytes = run_bash_streaming(&args, None, None).await.expect("bash ok");
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
         assert_eq!(v["status"], "exited");
         let stdout = v["stdout"].as_str().expect("stdout");
         assert!(stdout.contains('a') && stdout.contains('b'), "stdout: {stdout:?}");
+    }
+
+    /// #1 regression: a background pid spawned through `run_bash_streaming` with
+    /// a SHARED supervisor must be visible to a later read on the SAME
+    /// supervisor (the path a follow-up `Monitor` call takes). Before the fix
+    /// each call made a fresh `Supervisor`, so the pid was unknown.
+    #[tokio::test]
+    async fn shared_supervisor_makes_background_pid_visible_to_monitor() {
+        use origin_tools::proc_supervisor::Supervisor;
+        // One supervisor shared across the spawn path and the read path, exactly
+        // as the per-connection wiring in `main.rs` arranges.
+        let shared = Supervisor::new();
+        let args = serde_json::json!({
+            "command": "echo backgrounded",
+            "run_in_background": true,
+        });
+        let bytes = run_bash_streaming(&args, None, Some(&shared))
+            .await
+            .expect("background spawn ok");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
+        assert_eq!(v["status"], "started");
+        let pid = u32::try_from(v["pid"].as_u64().expect("pid present")).expect("pid fits u32");
+
+        // The follow-up Monitor/Bash read path reads from the SAME supervisor.
+        // With the shared instance this returns Ok; before the fix a fresh
+        // supervisor would error `validation.unknown_pid`.
+        let chunk = shared
+            .read_since(pid, 0, 64 * 1024)
+            .expect("read_since on the shared supervisor must know this pid");
+        // Sanity: the recorded output eventually contains what we echoed (the
+        // process may still be finishing, so allow either now or after a poll).
+        let mut seen = chunk.bytes.contains("backgrounded");
+        for _ in 0..50 {
+            if seen {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let more = shared.read_since(pid, 0, 64 * 1024).expect("pid still known");
+            seen = more.bytes.contains("backgrounded");
+        }
+        assert!(seen, "shared supervisor must surface the background output");
     }
 }

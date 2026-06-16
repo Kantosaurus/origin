@@ -282,7 +282,31 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     );
     info!(cas_root = %cas_root, "cas store ready");
 
-    let vault = KeyVault::detect().map_err(|e| anyhow::anyhow!("keyvault detect: {e}"))?;
+    // R16: attach the secret-access audit ring so every vault get/set/delete/list
+    // records a (provider, account, action, timestamp) tuple (never the secret
+    // bytes) to a 30-day rotating JSONL ring under `~/.origin/keyvault-audit`.
+    // Before this, `detect_with_audit` had zero callers and the daemon vault was
+    // built with `audit: None`, so no secret-access trail was ever produced.
+    // Falls back to the unaudited vault if the audit dir can't be opened so a
+    // read-only/locked home never keeps the daemon from coming up.
+    let vault = {
+        let audit_dir = std::env::var_os("ORIGIN_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".origin")
+            .join("keyvault-audit");
+        match KeyVault::detect_with_audit(&audit_dir).await {
+            Ok(v) => {
+                info!(audit_dir = %audit_dir.display(), "keyvault audit ring attached");
+                v
+            }
+            Err(e) => {
+                warn!(error = %e, "keyvault audit attach failed; running without secret-access audit");
+                KeyVault::detect().map_err(|e| anyhow::anyhow!("keyvault detect: {e}"))?
+            }
+        }
+    };
 
     // P13.2: pairing + bearer-token state lives in-process. Both handles
     // are cloned (Arc) into each per-connection future so concurrent
@@ -501,7 +525,15 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
         // `Task`). Worker bodies run in `TaskClass::Sidecar` (see Coordinator),
         // so a parent awaiting a child never deadlocks the Critical pool.
         let mut coord = Coordinator::new(plan_handle, "origin-daemon");
-        coord.set_default_worker(origin_daemon::swarm_worker::real_worker(Arc::clone(&active)));
+        coord.set_default_worker(origin_daemon::swarm_worker::real_worker(
+            Arc::clone(&active),
+            Arc::clone(&cas),
+            vault.clone(),
+            // The process-wide cache-band Plan (shared with the provider
+            // wire-encoder); each sub-agent forks a session-isolated view that
+            // shares the content-addressed handle bands (prefix-cache inheritance).
+            wire_plan.clone(),
+        ));
         Arc::new(coord)
     };
     info!("swarm coordinator ready");
@@ -597,6 +629,16 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     // behaviour that took down other projects' daemons). Best-effort: a failed
     // write only degrades restart precision, never daemon bring-up.
     write_instance_pid_file();
+
+    // R7: optional remote QUIC transport. Default-OFF — bound ONLY when
+    // `ORIGIN_QUIC_BIND=<addr>` is set, so the daemon's network surface is
+    // byte-identical when unset (no UDP endpoint, no remote access). When set, a
+    // bearer-gated `QuicListener` stands up and authorized remote connections
+    // (those presenting a bearer the pairing flow minted into `bearer_store`) are
+    // bridged to the local socket we just bound, reusing the existing dispatcher.
+    // Deny-by-default: a missing/invalid/revoked bearer closes the connection
+    // before any `ClientMessage` is served.
+    origin_daemon::remote_quic::maybe_spawn(Arc::clone(&bearer_store), path.clone());
 
     // Default-off autonomous background loops (items J + K). Each is gated on
     // its own env var (`ORIGIN_SCHEDULER=1` / `ORIGIN_AMBIENT=1`); when unset
@@ -728,7 +770,16 @@ fn build_memory_wiring(db_path: &str, cas: Arc<Store>) -> Option<MemoryWiring> {
 
     let embedder = try_load_embedder();
     let index = Arc::new(PlRwLock::new(MemIndex::new()));
-    Some(MemoryWiring::new(store, embedder, index))
+    let wiring = MemoryWiring::new(store, embedder, index);
+    // #2: rebuild the HNSW index from persisted rows so prompt-recall +
+    // consolidation work immediately after a restart (no-op without an
+    // embedder, and best-effort: a rehydrate failure is logged, not fatal).
+    match wiring.rehydrate_index() {
+        Ok(0) => {}
+        Ok(n) => info!(count = n, "memory: rehydrated HNSW index from persisted rows"),
+        Err(e) => warn!(error = %e, "memory: HNSW rehydrate failed; recall starts cold"),
+    }
+    Some(wiring)
 }
 
 /// Load the ONNX embedder from `ORIGIN_MEM_MODEL_DIR` (joined with `model.onnx`).
@@ -830,6 +881,18 @@ fn spawn_handler_task(
         // rebuilding the per-connection state.
         let active_account: Arc<tokio::sync::Mutex<Option<Arc<str>>>> =
             Arc::new(tokio::sync::Mutex::new(None));
+        // Per-connection (per-session) shared process supervisor (#1). A single
+        // `Supervisor` instance is reused across every tool call this connection
+        // makes, so a pid spawned by `Bash{run_in_background:true}` is visible to
+        // a later `Monitor`/`Bash` read-since on the same connection. The
+        // `Supervisor` is `Clone` (`Arc`-backed) so each per-turn `LoopOptions`
+        // gets a cheap clone of the same underlying state.
+        let proc_supervisor = origin_tools::proc_supervisor::Supervisor::new();
+        // Per-connection (per-session) shared Write read-before-overwrite guard
+        // (#5). Records which paths have been Read/Edited this session so a later
+        // `Write{force:false}` over a seen file is permitted. Uses interior
+        // mutability, so a single `Arc<WriteGuard>` records reads across calls.
+        let write_guard = Arc::new(origin_tools::builtins::write::WriteGuard::default());
 
         loop {
             // Step 1: drain any pushed-back message left by the goal driver
@@ -910,6 +973,9 @@ fn spawn_handler_task(
                         Arc::clone(&pending_message),
                         Arc::clone(&last_known_session_id),
                         Arc::clone(&active_account),
+                        proc_supervisor.clone(),
+                        Arc::clone(&write_guard),
+                        Arc::clone(&metrics),
                         verifier,
                         req,
                     )
@@ -963,10 +1029,18 @@ fn spawn_handler_task(
                     let ev = match pairing.redeem(&code, &device_id) {
                         Ok(RedeemResult::Issued { bearer, device_id }) => {
                             bearer_store.insert(bearer.clone(), device_id.clone());
-                            // Best-effort vault mirror so bearers survive a
-                            // daemon restart. A failure here is non-fatal —
-                            // the in-memory BearerStore still authorizes
-                            // until the daemon exits.
+                            // The bearer is minted here and recorded in the
+                            // in-memory `BearerStore` (and best-effort mirrored
+                            // to the vault below so it survives a restart).
+                            // NOTE: nothing yet *enforces* this bearer — the
+                            // `BearerStore::validate`/`revoke` calls have no
+                            // production caller because the remote QUIC transport
+                            // (`QuicListener`) is not instantiated in this build.
+                            // So minting + storing it is a no-op for access
+                            // control until that transport is wired; the mint is
+                            // kept so the redeem protocol and the eventual
+                            // enforcement path stay byte-stable. A vault-mirror
+                            // failure is non-fatal.
                             if let Err(e) = vault
                                 .set("origin-remote", &device_id, Secret::new(bearer.clone()))
                                 .await
@@ -1308,7 +1382,14 @@ fn spawn_handler_task(
             let base_token = {
                 use origin_daemon::goal_checkpoint::make_goal_checkpoint_token;
                 let guard = active_goal.lock().await;
-                make_goal_checkpoint_token(&sid, 0, &guard)
+                // #17: never hard-code `last_turn = 0` — that clobbers the real
+                // per-turn checkpoint value. Preserve the highest known turn:
+                // prefer the existing on-disk token's `last_turn` (written by
+                // the per-turn checkpoint), falling back to the persisted
+                // message count when no token exists yet. Detaching must
+                // preserve, not zero, the resume point.
+                let last_turn = detach_last_turn(&session_store, &sid);
+                make_goal_checkpoint_token(&sid, last_turn, &guard)
             };
             if let Some(token) = origin_daemon::supervisor::on_detach(&sid, base_token) {
                 if let Err(e) = session_store.save_resume_token(&token) {
@@ -1561,6 +1642,15 @@ async fn handle_request(
     pending_message: Arc<tokio::sync::Mutex<Option<ClientMessage>>>,
     last_known_session_id: Arc<tokio::sync::Mutex<Option<String>>>,
     active_account: Arc<tokio::sync::Mutex<Option<Arc<str>>>>,
+    // #1: per-connection shared process supervisor reused across tool calls so
+    // background Bash + later Monitor share a pid. `Clone` (Arc-backed).
+    proc_supervisor: origin_tools::proc_supervisor::Supervisor,
+    // #5: per-connection shared Write guard recording reads across tool calls.
+    write_guard: Arc<origin_tools::builtins::write::WriteGuard>,
+    // R4: daemon-wide Prometheus metrics registry. Threaded into `LoopOptions`
+    // so the agent loop feeds per-turn token usage + each tool-call result into
+    // the counters that back `/metrics`, `origin usage`, and the `?metrics` panel.
+    metrics: Arc<Metrics>,
     verifier: Arc<dyn origin_goal::verifier::Verifier>,
     req: PromptRequest,
 ) -> PromptOutcome {
@@ -1771,6 +1861,34 @@ async fn handle_request(
             // switched accounts (`/account`), a cross-provider mid-loop rebuild
             // resolves credentials for THIS account; `None` ⇒ global-slot
             // fallback, byte-identical to the pre-per-connection wire.
+            proc_supervisor: Some(proc_supervisor.clone()),
+            // ^ #1: the SAME supervisor across every turn/tool-call of this
+            // connection, so `Bash{run_in_background:true}` + a later `Monitor`
+            // share a pid (cheap Arc-backed clone).
+            write_guard: Some(Arc::clone(&write_guard)),
+            // ^ #5: shared Write read-before-overwrite guard so a Read/Edit this
+            // session permits a later `Write{force:false}` over the same path.
+            metrics: Some(Arc::clone(&metrics)),
+            // ^ R4: feed per-turn token usage + each tool-call result into the
+            // Prometheus counters so `/metrics`, `origin usage`/`insights`, and
+            // the TUI `?metrics` panel report real numbers instead of zero.
+            permission_rules: governance.permission_rules.clone(),
+            // ^ P10.12: user-configured `[[permission_rules]]` from
+            // `governance.toml`. When present, an explicit allow rule
+            // auto-approves a `RequiresPermission` tool and an explicit deny
+            // blocks it, before the interactive prompter is consulted. Absent
+            // (the default) ⇒ `None` ⇒ byte-identical to before this wiring.
+            post_edit: governance.post_edit.clone(),
+            // ^ Task 2: `[post_edit]` from `governance.toml`. When present, a
+            // successful edit consults the config's formatter overrides and runs
+            // the configured lint with its `RepairDecision`. Absent ⇒ `None` ⇒
+            // builtin formatter table only, byte-identical to before.
+            notify: governance.notify.clone(),
+            // ^ notify: `[notify]` from `governance.toml`. When present, the
+            // completion notification is gated through `should_send` (quiet
+            // hours) and dispatched over the configured channel. Absent ⇒ `None`
+            // ⇒ unconditional desktop toast under `ORIGIN_NOTIFY=1`,
+            // byte-identical to before.
         };
         // Opt-in interactive prompting: when the turn requested it, route
         // RequiresPermission tools through the IPC prompter (asks the client and
@@ -1920,7 +2038,12 @@ async fn handle_goal_activation(
                 use origin_daemon::goal_checkpoint::make_goal_checkpoint_token;
                 let token = {
                     let guard = active_goal.lock().await;
-                    make_goal_checkpoint_token(&sid, 0, &guard)
+                    // #17: preserve the real resume point (existing token's
+                    // `last_turn`, else the persisted message count) rather than
+                    // zeroing it — a goal activation must not clobber a per-turn
+                    // checkpoint that already advanced past turn 0.
+                    let last_turn = detach_last_turn(&session_store, &sid);
+                    make_goal_checkpoint_token(&sid, last_turn, &guard)
                 };
                 if let Err(e) = session_store.save_resume_token(&token) {
                     warn!(error = %e, "goal activation: checkpoint save failed");
@@ -2926,7 +3049,18 @@ fn resume_session_event(session_store: &SessionStore, session_id: &str) -> Strea
             };
         }
     };
-    if messages.is_empty() {
+    // #16: "unknown session" must be gated on the sessions ROW being absent —
+    // NOT on `messages.is_empty()`. A row can legitimately exist with zero
+    // messages (after `RewindSession{keep_turns:0}` or a `ResumeForeign` of an
+    // empty transcript), and resuming such a session must succeed rather than
+    // wrongly report it as unknown. Mirror `export_session_event`, which checks
+    // `list_summaries()` for the id.
+    let row_exists = session_store
+        .list_summaries()
+        .unwrap_or_default()
+        .iter()
+        .any(|s| s.id == session_id);
+    if messages.is_empty() && !row_exists {
         return StreamEvent::AdminError {
             message: format!("unknown session: {session_id}"),
         };
@@ -2936,9 +3070,15 @@ fn resume_session_event(session_store: &SessionStore, session_id: &str) -> Strea
     // Saturate at u32::MAX — a session with >4 G messages is not feasible.
     #[allow(clippy::cast_possible_truncation)]
     let messages_loaded = u32::try_from(messages.len()).unwrap_or(u32::MAX);
-    let restored_to_turn = token
-        .as_ref()
-        .map_or_else(|| messages_loaded.saturating_sub(1), |t| t.last_turn);
+    // For an empty-but-present session there is no "last turn" to restore to ⇒
+    // report turn 0 (rather than `0.saturating_sub(1)` ambiguity).
+    let restored_to_turn = if messages_loaded == 0 {
+        0
+    } else {
+        token
+            .as_ref()
+            .map_or_else(|| messages_loaded.saturating_sub(1), |t| t.last_turn)
+    };
     StreamEvent::SessionResumed {
         session_id: session_id.to_string(),
         messages_loaded,
@@ -3687,6 +3827,30 @@ fn persist(session_store: &SessionStore, session: &Session) {
     }
 }
 
+/// Resolve the `last_turn` to stamp on a detach / goal-activation checkpoint
+/// token (#17).
+///
+/// The detach + goal-activation paths previously hard-coded `last_turn = 0`,
+/// which clobbered the real per-turn checkpoint value (computed from the
+/// session's message count) so a resumed session was capped at turn 0. This
+/// preserves the resume point by preferring, in order:
+///   1. the existing on-disk resume token's `last_turn` (the per-turn
+///      checkpoint writer's value), then
+///   2. the highest persisted turn index (`message_count - 1`),
+///   3. `0` only when neither is available (a session with no token and no
+///      persisted messages — e.g. a goal activated before the first Prompt).
+fn detach_last_turn(session_store: &SessionStore, session_id: &str) -> u32 {
+    if let Ok(Some(token)) = session_store.load_resume_token(session_id) {
+        return token.last_turn;
+    }
+    match session_store.load_messages(session_id) {
+        Ok(msgs) if !msgs.is_empty() => {
+            u32::try_from(msgs.len().saturating_sub(1)).unwrap_or(u32::MAX)
+        }
+        _ => 0,
+    }
+}
+
 /// Submit one `SidecarJob::Summarize` for each assistant turn in the session.
 /// Must be called AFTER `persist` so the message rows exist when the deliverer
 /// fires `update_summary`.
@@ -3934,8 +4098,12 @@ fn spawn_metrics_endpoint(metrics: Metrics, addr: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{resume_foreign_event, turn_window, SessionStore, StreamEvent};
+    use super::{
+        detach_last_turn, resume_foreign_event, resume_session_event, turn_window, Session,
+        SessionStore, StreamEvent,
+    };
     use origin_core::types::{Block, Message, Role};
+    use origin_resume_token::ResumeToken;
 
     fn msg(role: Role, text: &str) -> Message {
         Message {
@@ -4037,5 +4205,89 @@ mod tests {
         let ev = resume_foreign_event(&store, "claude-code", &missing.display().to_string());
         assert!(matches!(ev, StreamEvent::AdminError { .. }), "got {ev:?}");
         assert!(store.list_summaries().expect("list").is_empty());
+    }
+
+    /// #16 regression: a session ROW that exists but has ZERO messages (after a
+    /// `RewindSession{keep_turns:0}`, say) must RESUME — not be reported as an
+    /// "unknown session". Before the fix, resume gated solely on
+    /// `messages.is_empty()`, so an empty-but-present session wrongly errored.
+    #[test]
+    #[allow(clippy::panic)] // asserts the StreamEvent variant via a panicking else-arm
+    fn resume_empty_but_present_session_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(dir.path().join("sessions.db")).expect("open store");
+
+        // A truly unknown id ⇒ AdminError (no row, no messages).
+        match resume_session_event(&store, "ghost") {
+            StreamEvent::AdminError { .. } => {}
+            other => panic!("unknown id must error, got {other:?}"),
+        }
+
+        // Persist a session ROW but no message rows (the rewind-to-0 case).
+        let sid = "sess-empty-resume";
+        store
+            .persist_session(&Session::new_with_id(sid.to_string(), "m".to_string()))
+            .expect("persist empty session row");
+        assert!(store.load_messages(sid).expect("load").is_empty());
+
+        match resume_session_event(&store, sid) {
+            StreamEvent::SessionResumed {
+                session_id,
+                messages_loaded,
+                restored_to_turn,
+                ..
+            } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(messages_loaded, 0, "empty session loads zero messages");
+                assert_eq!(restored_to_turn, 0, "empty session restores to turn 0");
+            }
+            other => panic!("empty-but-present session must resume, got {other:?}"),
+        }
+    }
+
+    /// #17 regression: the detach / goal-activation checkpoint must NOT zero
+    /// `last_turn`. `detach_last_turn` preserves the real resume point —
+    /// preferring the on-disk token's `last_turn`, else the persisted message
+    /// count, else 0.
+    #[test]
+    fn detach_last_turn_preserves_real_resume_point() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(dir.path().join("sessions.db")).expect("open store");
+
+        // No token, no messages ⇒ 0 (the only legitimate zero case).
+        assert_eq!(detach_last_turn(&store, "ghost"), 0);
+
+        // Messages but no token ⇒ derived from message count (len-1).
+        let sid = "sess-msgs";
+        store
+            .persist_session(&Session::new_with_id(sid.to_string(), "m".to_string()))
+            .expect("persist session row");
+        for i in 0..4u32 {
+            let m = Message::new(Role::User).with_block(Block::text(format!("turn {i}")));
+            store.persist_message(sid, i, &m).expect("persist message");
+        }
+        assert_eq!(
+            detach_last_turn(&store, sid),
+            3,
+            "4 messages ⇒ highest turn index 3 (NOT the hard-coded 0 that caused the bug)"
+        );
+
+        // An existing on-disk token wins (the per-turn checkpoint's value).
+        let token = ResumeToken {
+            session_id: sid.to_string(),
+            last_turn: 9,
+            cas_handle_root: [0u8; 32],
+            pending_tool_calls: Vec::new(),
+            plan_seq: 0,
+            goal: None,
+            detached_at_unix: None,
+            memory_estimate_bytes: None,
+        };
+        store.save_resume_token(&token).expect("save token");
+        assert_eq!(
+            detach_last_turn(&store, sid),
+            9,
+            "an existing token's last_turn must be preserved, never zeroed"
+        );
     }
 }

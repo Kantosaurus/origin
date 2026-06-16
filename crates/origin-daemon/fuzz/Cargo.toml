@@ -13,7 +13,7 @@ origin-cas = { path = "../../origin-cas" }
 origin-daemon = { path = ".." }
 origin-ipc = { path = "../../origin-ipc" }
 origin-provider-anthropic = { path = "../../origin-provider-anthropic" }
-origin-provider-openai = { path = "../../origin-provider-openai" }
+origin-provider-openai-compat = { path = "../../origin-provider-openai-compat" }
 origin-stream = { path = "../../origin-stream" }
 
 [[bin]]

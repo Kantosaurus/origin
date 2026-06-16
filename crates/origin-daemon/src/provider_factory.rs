@@ -168,10 +168,15 @@ impl ProviderFactory {
 
     /// Route a phase to a model via an [`origin_router::Router`] (Task 6).
     ///
-    /// This is an *available* helper — it does NOT change the default
-    /// single-model selection performed by [`ProviderFactory::build`]; callers
-    /// opt in explicitly. It wraps `origin_router` so the daemon can pick a
-    /// `ModelRef` for a `phase` from `candidates` under any [`origin_router::Strategy`].
+    /// NOT-YET-WIRED / diagnostic seam: this has no production caller. Live
+    /// per-turn routing in the agent loop is performed by
+    /// [`crate::routing::LiveRouter`] (wired through `LoopOptions::router`), not
+    /// by this method — `ProviderFactory` does not itself perform live routing.
+    /// This is a thin, stateless wrapper kept as an *available* helper (and for
+    /// tests/diagnostics): given a `phase` and `candidates` it picks a
+    /// `ModelRef` under any [`origin_router::Strategy`], without consulting or
+    /// mutating the factory's catalog/account state. It does NOT change the
+    /// default single-model selection performed by [`ProviderFactory::build`].
     /// Returns `None` when the strategy yields no model (e.g. an empty
     /// quota-fallback chain or every candidate exhausted).
     #[must_use]
@@ -359,6 +364,30 @@ impl ProviderFactory {
                 }
                 Ok(Arc::new(p))
             }
+            WireFormat::OpenAIResponses => {
+                // OpenAI Responses API (`/responses`): same catalog fields as the
+                // Chat-Completions path (base URL, chat path, auth, headers) but a
+                // DISTINCT encoder/decoder (`input[]`/`output[]`, not
+                // `messages`/`choices[]`). Used by openai-codex / ChatGPT-OAuth.
+                let cfg = OpenAiCompatConfig {
+                    name,
+                    base_url: render_base_url(
+                        entry.base_url.as_ref(),
+                        &self.vault,
+                        entry.id.as_ref(),
+                        account,
+                    )
+                    .await?,
+                    chat_path: entry.chat_path.to_string(),
+                    auth: token,
+                    extra_headers: openai_extra_headers(entry.id.as_ref()),
+                };
+                let mut p = origin_provider_openai_compat::OpenAiResponses::new(cfg);
+                if let Some(cas) = self.cas.clone() {
+                    p = p.with_cas(cas);
+                }
+                Ok(Arc::new(p))
+            }
             WireFormat::Anthropic => {
                 use origin_provider::catalog::AuthScheme;
                 let base = entry.base_url.as_ref();
@@ -454,8 +483,18 @@ impl ProviderFactory {
             WireFormat::Bedrock => Err(FactoryError::UnknownProvider("bedrock".into())),
             #[cfg(feature = "ollama")]
             WireFormat::Ollama => {
-                let _ = account;
-                Ok(Arc::new(origin_provider_ollama::Ollama::new()))
+                // Honor the catalog's `base_url` (and any `{…}` extras template)
+                // so a user-configured Ollama endpoint / gateway is used instead
+                // of the hardcoded `http://127.0.0.1:11434` default. Ollama is
+                // unauthenticated, so `token` is unused here.
+                let base = render_base_url(
+                    entry.base_url.as_ref(),
+                    &self.vault,
+                    entry.id.as_ref(),
+                    account,
+                )
+                .await?;
+                Ok(Arc::new(origin_provider_ollama::Ollama::with_base_url(&base)))
             }
             #[cfg(not(feature = "ollama"))]
             WireFormat::Ollama => Err(FactoryError::UnknownProvider("ollama".into())),
@@ -743,6 +782,81 @@ mod tests {
             .build_provider_for("anthropic", "m", "no-such-account")
             .await
             .is_none());
+    }
+
+    /// R2 regression: the Ollama factory arm must thread the catalog's
+    /// `base_url` into the provider instead of hardcoding localhost.
+    ///
+    /// We register a custom Ollama entry whose `base_url` is a `{host}` template.
+    /// The fixed arm routes through `render_base_url`, which looks up the
+    /// `<account>/extras` vault entry to expand `{host}`; with no extras seeded
+    /// that lookup fails, so `build` returns `MissingCredential`. The OLD code
+    /// (`Ollama::new()`, base ignored) would have succeeded — so this error
+    /// proves the catalog `base_url` is now consulted.
+    #[cfg(feature = "ollama")]
+    #[tokio::test]
+    async fn ollama_honors_catalog_base_url_template() {
+        use origin_provider::catalog::{
+            AuthScheme, Capabilities, ProviderEntry, WireFormat,
+        };
+        let mut cat = Catalog::builtin();
+        cat.merge_custom(vec![ProviderEntry {
+            id: "ollama-remote".into(),
+            display_name: "Ollama (remote)".into(),
+            wire: WireFormat::Ollama,
+            auth: AuthScheme::None,
+            base_url: "http://{host}:11434".into(),
+            chat_path: "/api/chat".into(),
+            default_model: "llama3.2".into(),
+            capabilities: Capabilities::default(),
+        }])
+        .expect("merge custom ollama entry");
+        let vault = KeyVault::in_memory();
+        let factory = ProviderFactory::new(vault, cat);
+        let id = ProviderId(std::borrow::Cow::Borrowed("ollama-remote"));
+
+        // No `default/extras` vault entry → render_base_url fails. Reaching this
+        // error path is only possible because the arm now consults base_url.
+        // `Arc<dyn Provider>` is not `Debug`, so map the Ok payload to `()` before
+        // `expect_err` (which prints the Ok value on failure).
+        let err = factory
+            .build(&id, "default")
+            .await
+            .map(|_| ())
+            .expect_err("templated base_url with no extras must error via render_base_url");
+        assert!(
+            matches!(err, FactoryError::MissingCredential { .. }),
+            "expected MissingCredential from render_base_url extras lookup, got {err:?}"
+        );
+    }
+
+    /// R2 positive case: a plain (non-templated) custom `base_url` builds an
+    /// Ollama provider offline (Ollama is unauthenticated; `build` never touches
+    /// the network) and is named `ollama`.
+    #[cfg(feature = "ollama")]
+    #[tokio::test]
+    async fn ollama_builds_with_custom_base_url() {
+        use origin_provider::catalog::{
+            AuthScheme, Capabilities, ProviderEntry, WireFormat,
+        };
+        let mut cat = Catalog::builtin();
+        cat.merge_custom(vec![ProviderEntry {
+            id: "ollama-gw".into(),
+            display_name: "Ollama (gateway)".into(),
+            wire: WireFormat::Ollama,
+            auth: AuthScheme::None,
+            base_url: "https://ollama.example.com".into(),
+            chat_path: "/api/chat".into(),
+            default_model: "llama3.2".into(),
+            capabilities: Capabilities::default(),
+        }])
+        .expect("merge custom ollama entry");
+        let vault = KeyVault::in_memory();
+        let factory = ProviderFactory::new(vault, cat);
+        let id = ProviderId(std::borrow::Cow::Borrowed("ollama-gw"));
+
+        let built = factory.build(&id, "default").await.expect("ollama builds");
+        assert_eq!(built.name(), "ollama");
     }
 
     /// The process-wide registry is dormant until [`set_global`] is called: the

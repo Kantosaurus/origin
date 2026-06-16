@@ -109,6 +109,12 @@ async fn accept_persists_via_proposal_registry() {
         router: None,
         browser_rate_limit: None,
         session_account: None,
+        proc_supervisor: None,
+        write_guard: None,
+        metrics: None,
+        permission_rules: None,
+        post_edit: None,
+        notify: None,
     };
     let _summary = run_loop(
         &mut session,

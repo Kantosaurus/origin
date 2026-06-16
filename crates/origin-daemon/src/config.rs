@@ -9,8 +9,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use origin_conseca::SecurityPolicy;
+use origin_permission::bloom::BloomPreCheck;
+use origin_permission::rules::Rule;
 use origin_policy::{PolicyEngine, PolicyLayer, Tier};
 use serde::Deserialize;
+
+/// Canonical session scope for user-configured permission rules.
+///
+/// The daemon passes this single scope to the rule lookup; an author writes
+/// `scope = "*"` (the default) to make a rule apply to every session. Kept as
+/// one constant so the loader-side bloom keys and the dispatch-side check agree
+/// exactly.
+pub const PERMISSION_RULE_SCOPE: &str = "*";
 
 /// Resolve the bearer TTL (seconds) surfaced in
 /// [`StreamEvent::PairIssued`](crate::protocol::StreamEvent::PairIssued).
@@ -82,6 +92,105 @@ struct GovernanceConfig {
     /// `None` ⇒ no browser rate limit (byte-identical default).
     #[serde(default)]
     browser: Option<BrowserConfig>,
+    /// User-configured `[[permission_rules]]` (P10.12). Each entry pre-answers a
+    /// `RequiresPermission` prompt for a named tool: an explicit `allow = true`
+    /// auto-approves and `allow = false` blocks, before the interactive prompter
+    /// is consulted. An empty list (the default) ⇒ no rules ⇒ byte-identical.
+    #[serde(default)]
+    permission_rules: Vec<PermissionRuleConfig>,
+    /// Optional `[post_edit]` section: per-extension formatter overrides plus
+    /// `auto_lint`/`auto_test` policy and a bounded repair budget. Absent ⇒
+    /// `None` ⇒ the daemon's post-edit path consults only the builtin formatter
+    /// table (byte-identical default).
+    #[serde(default)]
+    post_edit: Option<PostEditConfigToml>,
+    /// Optional `[notify]` section: quiet-hours window and the delivery channel
+    /// for completion notifications. Absent ⇒ `None` ⇒ `ORIGIN_NOTIFY=1` spawns
+    /// the desktop toast unconditionally exactly as before (byte-identical).
+    #[serde(default)]
+    notify: Option<NotifyConfigToml>,
+}
+
+/// On-disk `[post_edit]` section.
+///
+/// A config-surface mirror of [`origin_postedit::PostEditConfig`]; the
+/// `format_overrides` are expressed as a TOML table (`ext = "command"`) rather
+/// than the crate's `Vec<(String, String)>` so the file stays readable. Every
+/// field is optional and defaults to the crate's own default, so an empty
+/// `[post_edit]` section is equivalent to `PostEditConfig::default()`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PostEditConfigToml {
+    /// Run a linter after each successful edit.
+    #[serde(default)]
+    auto_lint: bool,
+    /// Lint command (program + flags) run after an edit when `auto_lint`.
+    #[serde(default)]
+    lint_command: Option<String>,
+    /// Run the test suite after each successful edit.
+    #[serde(default)]
+    auto_test: bool,
+    /// Test command (program + flags) run after an edit when `auto_test`.
+    #[serde(default)]
+    test_command: Option<String>,
+    /// Per-extension formatter overrides as `{ ext = "command" }`. Tried before
+    /// the builtin formatter table; extensions match case-insensitively.
+    #[serde(default)]
+    format_overrides: std::collections::BTreeMap<String, String>,
+    /// Maximum automatic repair attempts after a failing check. Omitted ⇒ the
+    /// crate default (2).
+    #[serde(default)]
+    max_repair_iters: Option<u32>,
+}
+
+/// On-disk `[notify]` section.
+///
+/// Maps to the [`origin_notify`] policy layer. `quiet_start`/`quiet_end` are
+/// minutes-of-day (`0..=1439`); when both are present a
+/// [`origin_notify::QuietHours`] window is built and non-urgent completion
+/// notifications inside it are suppressed. `channel` selects delivery; omitted
+/// ⇒ `desktop` (the historical behavior).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NotifyConfigToml {
+    /// Inclusive quiet-window start, minutes since midnight.
+    #[serde(default)]
+    quiet_start: Option<u32>,
+    /// Exclusive quiet-window end, minutes since midnight.
+    #[serde(default)]
+    quiet_end: Option<u32>,
+    /// Delivery channel: `"desktop"` (default), `"webhook"`, or `"command"`.
+    #[serde(default)]
+    channel: Option<String>,
+    /// Absolute URL for the `webhook` channel.
+    #[serde(default)]
+    webhook_url: Option<String>,
+    /// Program for the `command` channel.
+    #[serde(default)]
+    command_program: Option<String>,
+    /// Arguments for the `command` channel.
+    #[serde(default)]
+    command_args: Vec<String>,
+}
+
+/// One `[[permission_rules]]` entry. `tool` is the canonical tool name (e.g.
+/// `"Bash"`, `"Read"`); `scope` defaults to [`PERMISSION_RULE_SCOPE`] (`"*"`,
+/// "every session") and `allow` says whether a match auto-approves (`true`) or
+/// blocks (`false`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PermissionRuleConfig {
+    /// Canonical tool name this rule answers for.
+    tool: String,
+    /// Scope the rule applies at; defaults to `"*"` (all sessions).
+    #[serde(default = "default_rule_scope")]
+    scope: String,
+    /// `true` ⇒ auto-approve, `false` ⇒ block.
+    allow: bool,
+}
+
+fn default_rule_scope() -> String {
+    PERMISSION_RULE_SCOPE.to_owned()
 }
 
 /// On-disk `[browser]` section. Currently a single optional knob: the enforced
@@ -127,7 +236,20 @@ pub enum GovernanceError {
     },
 }
 
-/// The two governance handles threaded into `LoopOptions`. Both are `None` when
+/// User-configured permission rules plus a pre-built bloom pre-check (P10.12).
+///
+/// Threaded into `LoopOptions` together and held behind an `Arc` so it can be
+/// cheaply shared across every per-request loop. The bloom is built once at
+/// load time so dispatch never rebuilds it per turn.
+#[derive(Debug)]
+pub struct PermissionRules {
+    /// The exact rule list, walked on a bloom hit.
+    pub rules: Vec<Rule>,
+    /// Pre-built bloom over every rule's canonical key.
+    pub bloom: BloomPreCheck,
+}
+
+/// The governance handles threaded into `LoopOptions`. All are `None`/empty when
 /// no configuration is present (byte-identical to the historical default).
 #[derive(Debug, Clone, Default)]
 pub struct Governance {
@@ -138,6 +260,29 @@ pub struct Governance {
     /// ENFORCED per-session browser-action cap, or `None` when no
     /// `[browser] max_actions_per_session` is set (byte-identical default).
     pub browser_max_actions: Option<u32>,
+    /// User-configured permission rules + bloom, or `None` when no
+    /// `[[permission_rules]]` are set (byte-identical default).
+    pub permission_rules: Option<Arc<PermissionRules>>,
+    /// Resolved post-edit policy, or `None` when no `[post_edit]` section is set
+    /// (byte-identical default: builtin formatter table only, no lint/test).
+    pub post_edit: Option<Arc<origin_postedit::PostEditConfig>>,
+    /// Resolved notification policy, or `None` when no `[notify]` section is set
+    /// (byte-identical default: unconditional desktop toast under
+    /// `ORIGIN_NOTIFY=1`).
+    pub notify: Option<Arc<NotifyPolicy>>,
+}
+
+/// Resolved notification policy threaded into `LoopOptions` (P-notify).
+///
+/// Built from the on-disk `[notify]` section. Holds an optional quiet-hours
+/// window and the delivery channel; the loop consults
+/// [`origin_notify::should_send`] before dispatching over `channel`.
+#[derive(Debug, Clone)]
+pub struct NotifyPolicy {
+    /// Quiet-hours window; `None` ⇒ no suppression.
+    pub quiet: Option<origin_notify::QuietHours>,
+    /// Delivery channel for completion notifications.
+    pub channel: origin_notify::Channel,
 }
 
 /// Resolve the on-disk governance config path.
@@ -207,10 +352,70 @@ fn governance_from_config(cfg: GovernanceConfig, path: &Path) -> Result<Governan
     };
     let conseca = cfg.conseca.map(Arc::new);
     let browser_max_actions = cfg.browser.and_then(|b| b.max_actions_per_session);
+    // Build the permission-rule bundle once at load time (rules + bloom). An
+    // empty `[[permission_rules]]` ⇒ `None` ⇒ dispatch never consults the rule
+    // path, byte-identical to before this wiring.
+    let permission_rules = if cfg.permission_rules.is_empty() {
+        None
+    } else {
+        let rules: Vec<Rule> = cfg
+            .permission_rules
+            .into_iter()
+            .map(|r| Rule {
+                tool_name: r.tool,
+                scope: r.scope,
+                allow: r.allow,
+            })
+            .collect();
+        let bloom = BloomPreCheck::build(&rules);
+        Some(Arc::new(PermissionRules { rules, bloom }))
+    };
+    // `[post_edit]`: map the config-surface struct onto the crate's
+    // `PostEditConfig`. Absent ⇒ `None` ⇒ the post-edit path uses only the
+    // builtin formatter table, byte-identical to before this wiring.
+    let post_edit = cfg.post_edit.map(|pe| {
+        let mut base = origin_postedit::PostEditConfig {
+            auto_lint: pe.auto_lint,
+            lint_command: pe.lint_command,
+            auto_test: pe.auto_test,
+            test_command: pe.test_command,
+            format_overrides: pe.format_overrides.into_iter().collect(),
+            ..origin_postedit::PostEditConfig::default()
+        };
+        if let Some(iters) = pe.max_repair_iters {
+            base.max_repair_iters = iters;
+        }
+        Arc::new(base)
+    });
+    // `[notify]`: build the quiet-hours window (only when both bounds are set)
+    // and select the delivery channel. Absent ⇒ `None` ⇒ the desktop toast is
+    // spawned unconditionally under `ORIGIN_NOTIFY=1`, byte-identical.
+    let notify = cfg.notify.map(|n| {
+        let quiet = match (n.quiet_start, n.quiet_end) {
+            (Some(s), Some(e)) => Some(origin_notify::QuietHours::new(s, e)),
+            _ => None,
+        };
+        let channel = match n.channel.as_deref() {
+            Some("webhook") => origin_notify::Channel::Webhook {
+                url: n.webhook_url.unwrap_or_default(),
+            },
+            Some("command") => origin_notify::Channel::Command {
+                program: n.command_program.unwrap_or_default(),
+                args: n.command_args,
+            },
+            // "desktop", an unknown value, or an omitted channel all fall back
+            // to the desktop toast (the historical default).
+            _ => origin_notify::Channel::Desktop,
+        };
+        Arc::new(NotifyPolicy { quiet, channel })
+    });
     Ok(Governance {
         policy,
         conseca,
         browser_max_actions,
+        permission_rules,
+        post_edit,
+        notify,
     })
 }
 
@@ -356,6 +561,47 @@ mod tests {
     }
 
     #[test]
+    fn absent_permission_rules_yields_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governance.toml");
+        std::fs::write(&path, "[conseca]\nallow_tools = [\"Read\"]\n").unwrap();
+        let gov = load_governance(&path).unwrap();
+        assert!(
+            gov.permission_rules.is_none(),
+            "no [[permission_rules]] ⇒ None (byte-identical default)"
+        );
+    }
+
+    #[test]
+    fn permission_rules_build_bundle_with_bloom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governance.toml");
+        std::fs::write(
+            &path,
+            "[[permission_rules]]\n\
+             tool = \"Bash\"\n\
+             allow = false\n\
+             [[permission_rules]]\n\
+             tool = \"Read\"\n\
+             scope = \"*\"\n\
+             allow = true\n",
+        )
+        .unwrap();
+        let gov = load_governance(&path).unwrap();
+        let pr = gov.permission_rules.expect("permission rules present");
+        assert_eq!(pr.rules.len(), 2);
+        // Default scope is "*" when omitted.
+        let bash = pr.rules.iter().find(|r| r.tool_name == "Bash").unwrap();
+        assert_eq!(bash.scope, PERMISSION_RULE_SCOPE);
+        assert!(!bash.allow);
+        let read = pr.rules.iter().find(|r| r.tool_name == "Read").unwrap();
+        assert!(read.allow);
+        // The bloom must contain both canonical keys.
+        assert!(pr.bloom.maybe_contains(&format!("Bash@{PERMISSION_RULE_SCOPE}")));
+        assert!(pr.bloom.maybe_contains(&format!("Read@{PERMISSION_RULE_SCOPE}")));
+    }
+
+    #[test]
     fn all_five_tiers_parse() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("governance.toml");
@@ -370,5 +616,103 @@ mod tests {
         .unwrap();
         let gov = load_governance(&path).unwrap();
         assert!(gov.policy.is_some(), "five empty layers still build an engine");
+    }
+
+    #[test]
+    fn absent_post_edit_section_yields_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governance.toml");
+        std::fs::write(&path, "[conseca]\nallow_tools = [\"Read\"]\n").unwrap();
+        let gov = load_governance(&path).unwrap();
+        assert!(
+            gov.post_edit.is_none(),
+            "no [post_edit] section ⇒ None (byte-identical default: builtin formatter table only)"
+        );
+    }
+
+    #[test]
+    fn post_edit_section_maps_overrides_and_lint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governance.toml");
+        std::fs::write(
+            &path,
+            "[post_edit]\n\
+             auto_lint = true\n\
+             lint_command = \"cargo clippy\"\n\
+             max_repair_iters = 3\n\
+             [post_edit.format_overrides]\n\
+             rs = \"leptosfmt\"\n",
+        )
+        .unwrap();
+        let gov = load_governance(&path).unwrap();
+        let pe = gov.post_edit.expect("post_edit present");
+        assert!(pe.auto_lint);
+        assert_eq!(pe.lint_command.as_deref(), Some("cargo clippy"));
+        assert_eq!(pe.max_repair_iters, 3);
+        // The override must win over the builtin table for `.rs`.
+        assert_eq!(pe.formatter_for("lib.rs").as_deref(), Some("leptosfmt"));
+        // A non-overridden extension still resolves via the builtin table.
+        assert_eq!(pe.formatter_for("main.go").as_deref(), Some("gofmt"));
+    }
+
+    #[test]
+    fn empty_post_edit_section_equals_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governance.toml");
+        std::fs::write(&path, "[post_edit]\n").unwrap();
+        let gov = load_governance(&path).unwrap();
+        let pe = gov.post_edit.expect("empty [post_edit] still builds a config");
+        assert_eq!(*pe, origin_postedit::PostEditConfig::default());
+    }
+
+    #[test]
+    fn absent_notify_section_yields_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governance.toml");
+        std::fs::write(&path, "[conseca]\nallow_tools = [\"Read\"]\n").unwrap();
+        let gov = load_governance(&path).unwrap();
+        assert!(
+            gov.notify.is_none(),
+            "no [notify] section ⇒ None (byte-identical default: unconditional desktop toast)"
+        );
+    }
+
+    #[test]
+    fn notify_section_builds_quiet_hours_and_webhook_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governance.toml");
+        std::fs::write(
+            &path,
+            "[notify]\n\
+             quiet_start = 1380\n\
+             quiet_end = 420\n\
+             channel = \"webhook\"\n\
+             webhook_url = \"https://example.test/hook\"\n",
+        )
+        .unwrap();
+        let gov = load_governance(&path).unwrap();
+        let np = gov.notify.expect("notify present");
+        let quiet = np.quiet.expect("quiet hours present");
+        // 23:00–07:00 wrap-around: 02:00 is quiet, 12:00 is not.
+        assert!(quiet.is_quiet(2 * 60));
+        assert!(!quiet.is_quiet(12 * 60));
+        assert_eq!(
+            np.channel,
+            origin_notify::Channel::Webhook {
+                url: "https://example.test/hook".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn notify_section_defaults_to_desktop_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("governance.toml");
+        // No channel key ⇒ desktop; no quiet bounds ⇒ no window.
+        std::fs::write(&path, "[notify]\n").unwrap();
+        let gov = load_governance(&path).unwrap();
+        let np = gov.notify.expect("empty [notify] still builds a policy");
+        assert!(np.quiet.is_none(), "no quiet bounds ⇒ no suppression window");
+        assert_eq!(np.channel, origin_notify::Channel::Desktop);
     }
 }
