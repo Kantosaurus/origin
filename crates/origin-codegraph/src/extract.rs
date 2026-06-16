@@ -290,6 +290,16 @@ fn classify(node: Node, lang: Language, src: &[u8]) -> Result<Option<(String, No
     if lang == Language::Elixir {
         return classify_elixir(node, src);
     }
+    // Go type declarations name themselves on an inner `type_spec`/`type_alias`
+    // node (not a `name` field on the `type_declaration`), and the
+    // struct-vs-interface distinction lives on that spec's `type` child — so
+    // they need a bespoke classifier that inspects the inner node.
+    if lang == Language::Go {
+        if let Some(go_type) = classify_go_type(node, src)? {
+            return Ok(Some(go_type));
+        }
+        // Fall through: funcs/methods still go through the generic path below.
+    }
     let Some(kind) = node_kind_for(lang, node.kind()) else {
         return Ok(None);
     };
@@ -393,6 +403,39 @@ fn classify_elixir(node: Node, src: &[u8]) -> Result<Option<(String, NodeKind)>,
     Ok(Some((name, kind)))
 }
 
+/// Classify a Go `type_spec` / `type_alias` node as a `Struct` or `Interface`.
+///
+/// In tree-sitter-go a `type X struct{}` / `type X interface{}` / `type X = Y`
+/// / `type X int` is a `type_declaration` wrapping one or more inner
+/// `type_spec` (named/struct/interface) or `type_alias` (`= Y`) nodes. The
+/// name lives on the inner node's `name` field — never on the
+/// `type_declaration` — and the struct-vs-interface split is read from the
+/// inner node's `type` field (`interface_type` → [`NodeKind::Interface`],
+/// everything else → [`NodeKind::Struct`], matching how the rest of the table
+/// files record-shaped declarations). Classifying the inner spec (rather than
+/// the outer declaration) also handles grouped `type ( A int; B string )`
+/// blocks for free, since each spec is walked as its own child.
+///
+/// Returns `Ok(None)` for any other Go node so the caller falls through to the
+/// generic function/method path.
+fn classify_go_type(node: Node, src: &[u8]) -> Result<Option<(String, NodeKind)>, ExtractError> {
+    if !matches!(node.kind(), "type_spec" | "type_alias") {
+        return Ok(None);
+    }
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return Ok(None);
+    };
+    let name = std::str::from_utf8(&src[name_node.start_byte()..name_node.end_byte()])?.to_owned();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let kind = match node.child_by_field_name("type").map(|t| t.kind()) {
+        Some("interface_type") => NodeKind::Interface,
+        _ => NodeKind::Struct,
+    };
+    Ok(Some((name, kind)))
+}
+
 /// Map a `(Language, ts_kind)` pair to a `NodeKind`. Grouped by `NodeKind` to
 /// keep clippy's `match_same_arms` happy and to make the language → kind table
 /// easy to scan.
@@ -434,10 +477,13 @@ fn node_kind_for(lang: Language, ts_kind: &str) -> Option<NodeKind> {
     }
     // Structs / record-shaped declarations. Haskell `data` declarations are
     // the closest analogue to a struct/record.
+    // Go types (`type_declaration` → inner `type_spec`/`type_alias`) are handled
+    // by `classify_go_type` in `classify`, not here: the name and the
+    // struct-vs-interface split both live on the inner spec, which the generic
+    // `node_kind_for`/`name_node_for` path cannot see.
     let is_struct = matches!(
         (lang, ts_kind),
         (Language::Rust, "struct_item")
-            | (Language::Go, "type_declaration")
             | (Language::C | Language::Cpp, "struct_specifier")
             | (Language::C, "enum_specifier" | "type_definition")
             | (Language::CSharp, "struct_declaration")

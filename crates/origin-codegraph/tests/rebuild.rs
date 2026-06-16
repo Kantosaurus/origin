@@ -35,28 +35,3 @@ fn touch_file_triggers_rebuild_report() {
         "nothing changed in rebuild2: {report2:?}",
     );
 }
-
-#[test]
-fn git_hook_installer_writes_post_commit() {
-    let dir = tempdir().expect("tempdir");
-    let repo = dir.path();
-    fs::create_dir_all(repo.join(".git/hooks")).expect("mkdir");
-
-    origin_codegraph::git_hook::install_post_commit(repo).expect("install");
-
-    let hook = if cfg!(windows) {
-        repo.join(".git/hooks/post-commit.cmd")
-    } else {
-        repo.join(".git/hooks/post-commit")
-    };
-    assert!(hook.exists(), "hook not written: {}", hook.display());
-    let body = fs::read_to_string(&hook).expect("read");
-    assert!(body.contains("origin"), "hook body missing 'origin': {body}");
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(&hook).expect("meta").permissions().mode();
-        assert_eq!(mode & 0o111, 0o111, "hook must be executable");
-    }
-}

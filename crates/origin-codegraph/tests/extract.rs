@@ -239,6 +239,48 @@ end
 }
 
 #[test]
+fn extracts_go_functions_types_interfaces() {
+    // Go `type_declaration` nodes carry the name on an inner `type_spec`
+    // (struct/alias/named) or `type_spec` with an `interface_type` child, not a
+    // `name` field on the declaration itself — this exercises the Go branch of
+    // `name_node_for` and the struct/interface split in `node_kind_for`.
+    let src = r"
+package p
+
+func Alpha() int { return 1 }
+
+type Gamma struct {
+    X int
+}
+
+type Reader interface {
+    Read() int
+}
+
+type MyInt = int
+
+type Named int
+";
+    let nodes = extract_nodes(Language::Go, src.as_bytes()).expect("extract go");
+    let names = names_in(&nodes);
+    assert!(names.contains(&"Alpha"), "go func: {names:?}");
+    assert!(names.contains(&"Gamma"), "go struct: {names:?}");
+    assert!(names.contains(&"Reader"), "go interface: {names:?}");
+    assert!(names.contains(&"MyInt"), "go type alias: {names:?}");
+    assert!(names.contains(&"Named"), "go named type: {names:?}");
+
+    let alpha = nodes.iter().find(|n| n.name == "Alpha").expect("Alpha");
+    assert_eq!(alpha.kind, NodeKind::Function);
+
+    let gamma = nodes.iter().find(|n| n.name == "Gamma").expect("Gamma");
+    assert_eq!(gamma.kind, NodeKind::Struct, "struct type → Struct");
+
+    // Interfaces must NOT be misfiled as Struct.
+    let reader = nodes.iter().find(|n| n.name == "Reader").expect("Reader");
+    assert_eq!(reader.kind, NodeKind::Interface, "interface type → Interface");
+}
+
+#[test]
 fn extracts_elixir_definitions() {
     let src = r"
 defmodule Gamma do
