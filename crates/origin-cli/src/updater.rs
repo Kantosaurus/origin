@@ -12,27 +12,38 @@
 //!
 //! 1. Calls [`apply_staged_if_present`] at startup. If a `<exe>.new` file is
 //!    sitting next to the running binary (left there by a previous run's
-//!    check), it is renamed over the current executable. On Windows the live
-//!    process keeps using the now-renamed `.old` file, so the swap is safe for
-//!    a running process.
-//! 2. Calls [`check_and_stage_blocking`] synchronously. It first guards on
-//!    install type: auto-update only runs for binaries distributed via npm (the
-//!    running exe lives under a `node_modules` tree). Dev/source builds (cargo
-//!    `target/`), `cargo install` (`~/.cargo/bin`), and direct downloads are
-//!    left untouched so a local build is never clobbered, and the installed
+//!    background check), it is renamed over the current executable. On Windows
+//!    the live process keeps using the now-renamed `.old` file, so the swap is
+//!    safe for a running process. This is a fast, local rename — no network.
+//! 2. Calls [`spawn_background_update_worker`], which spawns a **detached child
+//!    process** that performs the network check + download + stage in the
+//!    background, then returns immediately. Startup is never blocked on the
+//!    network, and the foreground process never re-execs mid-session: a freshly
+//!    downloaded binary is staged as `<exe>.new` and swapped in by the *next*
+//!    launch's apply step (1). The worker (the binary re-invoked with
+//!    [`SELF_UPDATE_WORKER_ENV`] set) runs [`check_and_stage_blocking`], which
+//!    guards on install type: auto-update only runs for binaries distributed via
+//!    npm (the running exe lives under a `node_modules` tree). Dev/source builds
+//!    (cargo `target/`), `cargo install` (`~/.cargo/bin`), and direct downloads
+//!    are left untouched so a local build is never clobbered, and the installed
 //!    version is read from the adjacent npm `package.json`. It then checks the
 //!    npm registry (`registry.npmjs.org/<pkg>/latest`) for the latest published
 //!    version; when newer, it downloads the matching platform asset from the
 //!    GitHub release for that version (where the npm channel also sources its
 //!    binaries), verifies its SHA-256 against the release `SHA256SUMS`, and
-//!    stages the result as `<exe>.new` for the caller to swap in + re-exec.
-//!    Failures are logged via `tracing::warn!` and degraded to `Ok(false)` so
-//!    offline / network-flaky users still run.
+//!    stages the result as `<exe>.new`. Failures are logged via `tracing::warn!`
+//!    and degraded to `Ok(false)` so offline / network-flaky users still run.
 //!
-//! Setting `ORIGIN_NO_UPDATE=1` (any value) short-circuits both the apply and
-//! the network check — the binary then behaves as if the updater were absent. A
-//! 24h on-disk cache at `$ORIGIN_HOME/.origin/update_check.json` (falling back
-//! to `~/.origin/`) prevents hammering the npm registry.
+//! Because the check is fully off the startup hot path (a detached worker, not a
+//! blocking call), the on-disk cache TTL is short ([`UPDATE_CHECK_TTL_SECS`], 1h)
+//! — it only throttles how often a worker is spawned, so a same-day release is
+//! picked up within ~an hour of publish rather than the up-to-24h lag a blocking
+//! check forced. The cache lives at `$ORIGIN_HOME/.origin/update_check.json`
+//! (falling back to `~/.origin/`).
+//!
+//! Setting `ORIGIN_NO_UPDATE=1` (any value) short-circuits the apply, the worker
+//! spawn, and the worker's own network check — the binary then behaves as if the
+//! updater were absent.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,9 +53,29 @@ use thiserror::Error;
 
 /// How long a successful update-check result is reused before re-querying.
 ///
-/// 24 hours — short enough to pick up new releases the day after publish, long
-/// enough to be a courteous registry citizen for typical CLI usage.
-pub const UPDATE_CHECK_TTL_SECS: i64 = 86_400;
+/// 1 hour. The check now runs in a *detached background worker* off the startup
+/// hot path (see [`spawn_background_update_worker`]), so this TTL no longer
+/// trades startup latency for freshness — it only rate-limits how often a worker
+/// is spawned across launches. A short value means a same-day release is picked
+/// up within ~an hour, fixing the up-to-24h lag the old blocking check forced
+/// (a 24h TTL once masked a release that published minutes after the last
+/// check). Because the gate is evaluated once per launch, real-world spawn
+/// frequency stays low even at 1h. Keep this small; a regression test guards it.
+pub const UPDATE_CHECK_TTL_SECS: i64 = 3_600;
+
+// Compile-time guard against re-introducing the up-to-24h lag: the background
+// worker makes a short TTL cheap, so keep it within 1h. Bumping it back toward
+// 24h (which once masked v0.9.5 for ~a day) fails the build right here.
+const _: () = assert!(UPDATE_CHECK_TTL_SECS > 0 && UPDATE_CHECK_TTL_SECS <= 3_600);
+
+/// Environment variable that marks a process as the detached background update
+/// worker.
+///
+/// When set, the CLI performs a single check + download + stage and exits
+/// *without* parsing args or re-exec'ing — the staged binary is applied by the
+/// next foreground launch's [`apply_staged_if_present`]. Set only by
+/// [`build_worker_command`]; never meant to be set by a user.
+pub const SELF_UPDATE_WORKER_ENV: &str = "ORIGIN_SELF_UPDATE_WORKER";
 
 /// GitHub repository slug the binary *assets* are downloaded from. Hardcoded so
 /// a hostile `$ORIGIN_*` env var can never redirect the binary's auto-update to
@@ -552,6 +583,92 @@ pub async fn check_and_stage_blocking() -> Result<bool, UpdateError> {
     Ok(check_and_stage_inner().await)
 }
 
+// ── background (non-blocking) update worker ───────────────────────────────────
+
+/// Pure policy for [`spawn_background_update_worker`]: should a background update
+/// worker be spawned this launch?
+///
+/// Split out from the side-effecting spawn so the decision is unit-testable
+/// without touching the network, the filesystem, or spawning a process.
+///
+/// - `disabled`: `ORIGIN_NO_UPDATE` is set → never update.
+/// - `is_npm_install`: the running binary is an npm-managed install → only these
+///   auto-update (a dev/source build is left untouched).
+/// - `cache_fresh`: a check ran within [`UPDATE_CHECK_TTL_SECS`] → skip, so rapid
+///   relaunches don't each spawn a worker. The TTL is the only throttle now that
+///   the check is off the startup hot path.
+#[must_use]
+const fn should_spawn_background_worker(disabled: bool, is_npm_install: bool, cache_fresh: bool) -> bool {
+    !disabled && is_npm_install && !cache_fresh
+}
+
+// Compile-time guard: the spawn policy is exhaustively pinned, so a future edit
+// that flips the logic fails the build rather than slipping past as a flaky test.
+const _: () = {
+    assert!(should_spawn_background_worker(false, true, false)); // enabled + npm + stale → spawn
+    assert!(!should_spawn_background_worker(true, true, false)); // disabled → no spawn
+    assert!(!should_spawn_background_worker(false, false, false)); // not an npm install → no spawn
+    assert!(!should_spawn_background_worker(false, true, true)); // recent check cached → no spawn
+};
+
+/// Build (but don't spawn) the detached background-worker command: re-invokes the
+/// current binary with [`SELF_UPDATE_WORKER_ENV`] set and all stdio detached to
+/// null so it never writes to the user's terminal. Split out so the command shape
+/// is unit-testable without actually spawning a process.
+///
+/// On Windows the process is created `DETACHED_PROCESS | CREATE_NO_WINDOW` so it
+/// has no console and survives the foreground process exiting. On unix, null
+/// stdio plus reparenting-to-init on parent exit keeps it running in the
+/// background; a spawn that doesn't outlive a fast one-shot command simply
+/// degrades to "no update this run" (the next launch retries).
+fn build_worker_command(exe: &Path) -> std::process::Command {
+    use std::process::Stdio;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.env(SELF_UPDATE_WORKER_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // DETACHED_PROCESS (0x0000_0008) | CREATE_NO_WINDOW (0x0800_0000): no
+        // inherited console, no flashing window, not tied to the parent console.
+        cmd.creation_flags(0x0000_0008 | 0x0800_0000);
+    }
+    cmd
+}
+
+/// Spawn a detached background worker to check + download + stage an update.
+///
+/// Fire-and-forget: returns immediately after spawning, without blocking startup
+/// or re-exec'ing mid-session. The staged binary is applied by the next launch's
+/// [`apply_staged_if_present`].
+///
+/// No-op when updates are disabled (`ORIGIN_NO_UPDATE`), this isn't an npm
+/// install, or a recent check is still cached. A spawn failure is logged at
+/// `debug` and ignored — the next launch retries.
+pub fn spawn_background_update_worker() {
+    let disabled = std::env::var_os("ORIGIN_NO_UPDATE").is_some();
+    let is_npm_install = installed_npm_version().is_some();
+    let cache_fresh = cached_latest(UPDATE_CHECK_TTL_SECS).is_some();
+    if !should_spawn_background_worker(disabled, is_npm_install, cache_fresh) {
+        return;
+    }
+    let exe = match current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!("updater: background worker not spawned (no current_exe): {e}");
+            return;
+        }
+    };
+    match build_worker_command(&exe).spawn() {
+        // Drop the handle without waiting — we intentionally never reap it; it
+        // outlives us (reparented to init on unix / detached on windows).
+        Ok(child) => tracing::debug!("updater: spawned background update worker (pid {})", child.id()),
+        Err(e) => tracing::debug!("updater: background worker spawn failed: {e}"),
+    }
+}
+
 /// Print a user-visible failure message + log via `tracing::warn!`, then return
 /// `false` so the caller can `return` directly.
 fn skip_with_warn(stage: &str, err: impl std::fmt::Display) -> bool {
@@ -919,6 +1036,25 @@ mod tests {
         let pe = Path::new("C:/bin/origin.exe");
         assert_eq!(staged_path(pe), PathBuf::from("C:/bin/origin.exe.new"));
         assert_eq!(old_path(pe), PathBuf::from("C:/bin/origin.exe.old"));
+    }
+
+    // NOTE: the TTL-is-short and the spawn-policy truth-table checks are enforced
+    // as module-level compile-time `const _` assertions (stronger than a test — a
+    // regression fails the build), so they intentionally have no `#[test]` here.
+
+    #[test]
+    fn build_worker_command_sets_worker_env_and_targets_exe() {
+        use std::ffi::OsStr;
+        let exe = Path::new("/some/dir/origin");
+        let cmd = build_worker_command(exe);
+        assert_eq!(cmd.get_program(), OsStr::new("/some/dir/origin"));
+        let has_worker_env = cmd
+            .get_envs()
+            .any(|(k, v)| k == OsStr::new(SELF_UPDATE_WORKER_ENV) && v == Some(OsStr::new("1")));
+        assert!(
+            has_worker_env,
+            "worker command must set {SELF_UPDATE_WORKER_ENV}=1"
+        );
     }
 
     #[test]

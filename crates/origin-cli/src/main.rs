@@ -132,42 +132,28 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("runtime thread panicked"))?
 }
 
-/// Synchronous auto-update step run before any subcommand dispatch. The flow is:
-///   1. Swap in any binary staged from a prior run (rename `.new` over exe).
-///   2. For npm-installed binaries only (dev/source builds are skipped), check
-///      the npm registry for a newer published version. If newer, download the
-///      matching GitHub-release asset, verify it against `SHA256SUMS` (sha256,
-///      no `cosign`), and stage as `<exe>.new` BEFORE proceeding.
-///   3. If we just staged a new binary, swap it in and re-exec with the
-///      same argv so the user's command runs on the new code path.
+/// Non-blocking auto-update step run before any subcommand dispatch. The flow is:
+///   1. Swap in any binary staged by a prior **background worker** (rename `.new`
+///      over the exe). Fast, local rename — no network.
+///   2. Spawn a detached background worker to check the npm registry, download +
+///      `SHA256SUMS`-verify the matching GitHub-release asset, and stage it as
+///      `<exe>.new`. Returns immediately: startup is never blocked on the network
+///      and we never re-exec mid-session. The staged binary is applied by step 1
+///      of the **next** launch.
 ///
-/// Failures along the way fall through to running the current binary. A
-/// successful re-exec calls `std::process::exit` and never returns.
-async fn run_self_update() -> Result<()> {
+/// This replaced a synchronous check that blocked every launch and, being
+/// expensive, was gated behind a 24h TTL — which masked same-day releases (a
+/// release published minutes after the last check stayed invisible for ~a day).
+/// All failures fall through to running the current binary.
+fn run_self_update() {
     match origin_cli::updater::apply_staged_if_present() {
-        Ok(true) => eprintln!("Applied staged update from previous run."),
+        Ok(true) => eprintln!("Applied staged update from a previous run."),
         Ok(false) => {}
         Err(e) => tracing::warn!("updater: apply_staged_if_present failed: {e}"),
     }
 
-    match origin_cli::updater::check_and_stage_blocking().await {
-        Ok(true) => {
-            // We just staged a new binary. Swap it in and re-exec.
-            if matches!(origin_cli::updater::apply_staged_if_present(), Ok(true)) {
-                let exe = std::env::current_exe()?;
-                let args: Vec<String> = std::env::args().skip(1).collect();
-                eprintln!("Update staged; relaunching…");
-                let status = std::process::Command::new(&exe)
-                    .args(&args)
-                    .status()
-                    .map_err(|e| anyhow::anyhow!("relaunch failed: {e}"))?;
-                std::process::exit(status.code().unwrap_or(0));
-            }
-        }
-        Ok(false) => {}
-        Err(e) => tracing::warn!("updater: check_and_stage_blocking failed: {e}"),
-    }
-    Ok(())
+    // Fire-and-forget: the worker checks + downloads + stages in the background.
+    origin_cli::updater::spawn_background_update_worker();
 }
 
 /// Dispatch a top-level subcommand. Returns `Some(result)` for every
@@ -432,7 +418,18 @@ impl Drop for TerminalGuard {
 
 #[allow(clippy::too_many_lines)] // linear startup wiring; splitting hurts readability
 async fn run() -> Result<()> {
-    run_self_update().await?;
+    // Detached background update worker mode: a prior foreground launch spawned
+    // us solely to check + download + stage an update. Do exactly that and exit —
+    // no CLI parse, no UI, no re-exec. The staged binary is swapped in by the next
+    // foreground launch's `apply_staged_if_present`.
+    if std::env::var_os(origin_cli::updater::SELF_UPDATE_WORKER_ENV).is_some() {
+        if let Err(e) = origin_cli::updater::check_and_stage_blocking().await {
+            tracing::warn!("updater: background worker check failed: {e}");
+        }
+        return Ok(());
+    }
+
+    run_self_update();
 
     // Dispatch a subcommand if one was given, otherwise fall through to the
     // TUI entry path (preserves the existing env-driven invocation).
