@@ -151,10 +151,7 @@ pub fn block_style(line: &str, tok: &Tokens) -> BlockStyle {
     let body = &line[off..];
 
     // Code fence (``` or ~~~) — open or close. The info string (lang) follows.
-    if let Some(rest) = body
-        .strip_prefix("```")
-        .or_else(|| body.strip_prefix("~~~"))
-    {
+    if let Some(rest) = body.strip_prefix("```").or_else(|| body.strip_prefix("~~~")) {
         let lang = rest.trim().to_string();
         return BlockStyle {
             kind: BlockKind::CodeFence { lang },
@@ -343,7 +340,18 @@ pub fn render_inline(
         if c == '*' && next == Some('*') {
             let close = find_close(&chars, i + 2, '*', '*');
             let (end, after) = close.map_or((len, len), |e| (e, e + 2));
-            col = put_run(grid, row, &chars, i + 2, end, col, max_cols, tok.bright, bg, Attr::BOLD);
+            col = put_run(
+                grid,
+                row,
+                &chars,
+                i + 2,
+                end,
+                col,
+                max_cols,
+                tok.bright,
+                bg,
+                Attr::BOLD,
+            );
             i = after;
             continue;
         }
@@ -364,9 +372,7 @@ pub fn render_inline(
                 if chars.get(rb + 1) == Some(&'(') {
                     if let Some(rp) = find_close(&chars, rb + 2, ')', '\0') {
                         let attr = Attr(Attr::UNDERLINE.0);
-                        col = put_run(
-                            grid, row, &chars, i + 1, rb, col, max_cols, tok.accent, bg, attr,
-                        );
+                        col = put_run(grid, row, &chars, i + 1, rb, col, max_cols, tok.accent, bg, attr);
                         i = rp + 1; // skip ](url)
                         continue;
                     }
@@ -380,7 +386,16 @@ pub fn render_inline(
             let close = find_close(&chars, i + 1, '`', '\0');
             let (end, after) = close.map_or((len, len), |e| (e, e + 1));
             col = put_run(
-                grid, row, &chars, i + 1, end, col, max_cols, tok.code_fg, tok.code_bg, Attr::PLAIN,
+                grid,
+                row,
+                &chars,
+                i + 1,
+                end,
+                col,
+                max_cols,
+                tok.code_fg,
+                tok.code_bg,
+                Attr::PLAIN,
             );
             i = after;
             continue;
@@ -526,7 +541,11 @@ mod tests {
     // -- render_inline -----------------------------------------------------
 
     fn plain_style(fg: u32) -> Style {
-        Style { fg, bg: 0, bold: false }
+        Style {
+            fg,
+            bg: 0,
+            bold: false,
+        }
     }
 
     /// Read the glyph at a cell as a `char`.

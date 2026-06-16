@@ -247,7 +247,14 @@ pub fn draw_top(grid: &mut Grid, region: Region, ctx: &ChromeCtx, tok: &Tokens) 
     let muted = Cs::plain(tok.muted, 0);
     let body = Cs::plain(tok.body, 0);
 
-    col = put_str(grid, row, col, left_limit, &glyph::ORIGIN.to_string(), accent_bold);
+    col = put_str(
+        grid,
+        row,
+        col,
+        left_limit,
+        &glyph::ORIGIN.to_string(),
+        accent_bold,
+    );
     col = put_str(grid, row, col, left_limit, " origin", accent_bold);
 
     // Build the trailing context (model · cwd · ⎇ branch). The cwd is the
@@ -327,7 +334,10 @@ pub fn draw_status(grid: &mut Grid, region: Region, st: &StatusCtx, tok: &Tokens
     if right <= left {
         return;
     }
-    let rule_row = region.bottom().saturating_sub(1).min(grid.rows().saturating_sub(1));
+    let rule_row = region
+        .bottom()
+        .saturating_sub(1)
+        .min(grid.rows().saturating_sub(1));
 
     // Readout row (only when there is a row above the rule).
     if region.height >= 2 {
@@ -362,7 +372,11 @@ pub fn draw_status(grid: &mut Grid, region: Region, st: &StatusCtx, tok: &Tokens
     // Full-width rule.
     let mut rc = left;
     while rc < right {
-        grid.put(rule_row, rc, Cell::new('\u{2500}', tok.accent_dim, 0, Attr::PLAIN));
+        grid.put(
+            rule_row,
+            rc,
+            Cell::new('\u{2500}', tok.accent_dim, 0, Attr::PLAIN),
+        );
         rc += 1;
     }
 }

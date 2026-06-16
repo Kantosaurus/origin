@@ -193,7 +193,13 @@ fn confirm_selection(state: &PickerState) -> PickerOutcome {
             .checked
             .iter()
             .enumerate()
-            .filter_map(|(i, &on)| if on && i < state.options.len() { Some(i) } else { None })
+            .filter_map(|(i, &on)| {
+                if on && i < state.options.len() {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
             .collect();
         PickerOutcome::Selected {
             indices,
@@ -255,11 +261,7 @@ pub fn layout_picker(state: &PickerState, width: u16, tok: &Tokens) -> Vec<Rende
         }
 
         // 1-based number hint.
-        spans.push(RowSpan::plain(
-            format!("{}. ", i + 1),
-            tok.muted,
-            0,
-        ));
+        spans.push(RowSpan::plain(format!("{}. ", i + 1), tok.muted, 0));
 
         // Label — bright when cursored, body otherwise.
         let label_fg = if cursored { tok.bright } else { tok.body };
@@ -295,11 +297,7 @@ pub fn layout_picker(state: &PickerState, width: u16, tok: &Tokens) -> Vec<Rende
         ];
         if active {
             // Show the prompt glyph + the in-progress custom text.
-            spans.push(RowSpan::plain(
-                format!("{} ", glyph::PROMPT),
-                tok.accent,
-                0,
-            ));
+            spans.push(RowSpan::plain(format!("{} ", glyph::PROMPT), tok.accent, 0));
             let typed = state.custom.as_deref().unwrap_or("");
             spans.push(RowSpan::new(typed.to_string(), tok.bright, 0, Attr::PLAIN));
         } else {
@@ -402,7 +400,10 @@ mod tests {
     fn out_of_range_digit_is_inert() {
         let mut s = single(2);
         assert!(reduce(&mut s, PickerKey::Digit(9)).is_none());
-        assert!(reduce(&mut s, PickerKey::Digit(0)).is_none(), "0 has no 0-based row");
+        assert!(
+            reduce(&mut s, PickerKey::Digit(0)).is_none(),
+            "0 has no 0-based row"
+        );
         assert_eq!(s.cursor, 0);
     }
 
@@ -423,7 +424,7 @@ mod tests {
         reduce(&mut s, PickerKey::Down);
         reduce(&mut s, PickerKey::Down);
         reduce(&mut s, PickerKey::Toggle); // checks index 2
-        // Jump back to 0 and check it.
+                                           // Jump back to 0 and check it.
         reduce(&mut s, PickerKey::Up);
         reduce(&mut s, PickerKey::Up);
         reduce(&mut s, PickerKey::Toggle); // checks index 0
@@ -634,6 +635,9 @@ mod tests {
         let rows = layout_picker(&s, 80, &tok);
         let last = rows.last().expect("layout always yields rows");
         let custom_row: String = last.spans.iter().map(|sp| sp.text.as_str()).collect();
-        assert!(custom_row.contains("hello"), "active custom row echoes the buffer");
+        assert!(
+            custom_row.contains("hello"),
+            "active custom row echoes the buffer"
+        );
     }
 }

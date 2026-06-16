@@ -197,12 +197,10 @@ pub async fn configure_role_interactive(
                 PickerState::new(auth_rows(brand)),
                 tok,
             )? {
-                PickResult::Selected(entry_id) => {
-                    match brand.entries.iter().find(|e| e.id == entry_id) {
-                        Some(e) => e.clone(),
-                        None => continue,
-                    }
-                }
+                PickResult::Selected(entry_id) => match brand.entries.iter().find(|e| e.id == entry_id) {
+                    Some(e) => e.clone(),
+                    None => continue,
+                },
                 // esc ⇒ back to the provider step.
                 PickResult::Back => continue,
             }
@@ -329,16 +327,12 @@ async fn capture_credentials_interactive(
             // lines and would fail with `empty SigV4 credentials`, aborting init.
             let access = match run_text_field("AWS access key id:", false)? {
                 FieldOutcome::Cancelled => return Ok(None),
-                FieldOutcome::Submitted(a) if a.is_empty() => {
-                    return Err(anyhow!("empty SigV4 credentials"))
-                }
+                FieldOutcome::Submitted(a) if a.is_empty() => return Err(anyhow!("empty SigV4 credentials")),
                 FieldOutcome::Submitted(a) => a,
             };
             let secret = match run_text_field("AWS secret access key:", true)? {
                 FieldOutcome::Cancelled => return Ok(None),
-                FieldOutcome::Submitted(s) if s.is_empty() => {
-                    return Err(anyhow!("empty SigV4 credentials"))
-                }
+                FieldOutcome::Submitted(s) if s.is_empty() => return Err(anyhow!("empty SigV4 credentials")),
                 FieldOutcome::Submitted(s) => s,
             };
             persist_sigv4(vault, &entry.id, account, &access, &secret).await?;
@@ -414,7 +408,11 @@ pub async fn run_interactive(
         None
     };
 
-    let subagent = if confirm("Configure a separate provider for subagents and swarm?", false, tok)? {
+    let subagent = if confirm(
+        "Configure a separate provider for subagents and swarm?",
+        false,
+        tok,
+    )? {
         Some(configure_role_interactive(&cat, vault, probe, Role::Subagent, tok).await?)
     } else {
         None
@@ -495,7 +493,12 @@ mod tests {
             "API key"
         );
         assert_eq!(auth_label(&AuthScheme::None), "none");
-        assert_eq!(auth_label(&AuthScheme::SigV4 { service: Cow::Borrowed("bedrock") }), "AWS SigV4");
+        assert_eq!(
+            auth_label(&AuthScheme::SigV4 {
+                service: Cow::Borrowed("bedrock")
+            }),
+            "AWS SigV4"
+        );
     }
 
     #[test]
@@ -513,16 +516,20 @@ mod tests {
 
     #[test]
     fn model_rows_annotate_context_and_default_first() {
-        let models = vec![
-            "claude-sonnet-4-6".to_string(),
-            "claude-opus-4-8".to_string(),
-        ];
+        let models = vec!["claude-sonnet-4-6".to_string(), "claude-opus-4-8".to_string()];
         let rows = model_rows(&models, "claude-opus-4-8");
         // Default sorts to the top.
         assert_eq!(rows[0].value, "claude-opus-4-8");
-        assert_eq!(rows[0].note.as_deref(), Some("1M ctx"), "opus-4-8 annotated 1M ctx");
+        assert_eq!(
+            rows[0].note.as_deref(),
+            Some("1M ctx"),
+            "opus-4-8 annotated 1M ctx"
+        );
         // Sonnet keeps its 200K window.
-        let sonnet = rows.iter().find(|r| r.value == "claude-sonnet-4-6").expect("sonnet row");
+        let sonnet = rows
+            .iter()
+            .find(|r| r.value == "claude-sonnet-4-6")
+            .expect("sonnet row");
         assert_eq!(sonnet.note.as_deref(), Some("200K ctx"));
         // The trailing escape-hatch row is present.
         assert!(
@@ -538,8 +545,12 @@ mod tests {
         let anthropic = brands.iter().find(|b| b.key == "anthropic").expect("brand");
         let rows = auth_rows(anthropic);
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().any(|r| r.value == "anthropic" && r.label == "API key"));
-        assert!(rows.iter().any(|r| r.value == "anthropic-oauth" && r.label == "OAuth"));
+        assert!(rows
+            .iter()
+            .any(|r| r.value == "anthropic" && r.label == "API key"));
+        assert!(rows
+            .iter()
+            .any(|r| r.value == "anthropic-oauth" && r.label == "OAuth"));
     }
 
     #[test]
@@ -663,8 +674,7 @@ mod tests {
 
         // The vault holds the exact JSON blob init.rs uses.
         let stored = vault.get(&bedrock.id, account).await.expect("vault get");
-        let parsed: serde_json::Value =
-            serde_json::from_str(stored.expose()).expect("blob is valid json");
+        let parsed: serde_json::Value = serde_json::from_str(stored.expose()).expect("blob is valid json");
         assert_eq!(parsed["access_key_id"], "AKIAEXAMPLE");
         assert_eq!(parsed["secret_access_key"], "wsecret/EXAMPLE");
 

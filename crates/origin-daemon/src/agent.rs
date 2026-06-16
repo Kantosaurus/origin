@@ -4214,8 +4214,7 @@ async fn run_loop_inner(
                         }
                         Err(e) => return Err(e),
                     }
-                } else if let Some((choice_tx, choice_reg)) = ask_user_interactive_channel(meta, opts)
-                {
+                } else if let Some((choice_tx, choice_reg)) = ask_user_interactive_channel(meta, opts) {
                     // Interactive pause-await path: emit a `ChoiceAsk` and block
                     // on the matching `ChoiceDecision` (mirrors the permission
                     // prompter). Reached only when this is `ask_user` AND BOTH an
@@ -5785,7 +5784,9 @@ async fn dispatch_tool(
         "ask_user" => {
             let parsed = origin_tools::builtins::ask_user::AskUserArgs::from_value(args)
                 .map_err(LoopError::BadArgs)?;
-            Ok(origin_tools::builtins::ask_user::backward_compat_instruction(&parsed))
+            Ok(origin_tools::builtins::ask_user::backward_compat_instruction(
+                &parsed,
+            ))
         }
         other => Err(LoopError::UnknownTool(other.into())),
     }
@@ -6100,8 +6101,7 @@ async fn run_ask_user_interactive(
             description: o.description.clone(),
         })
         .collect();
-    let prompter =
-        crate::ipc_prompter::IpcChoicePrompter::new(event_tx.clone(), Arc::clone(registry));
+    let prompter = crate::ipc_prompter::IpcChoicePrompter::new(event_tx.clone(), Arc::clone(registry));
     let (selected, custom) = prompter
         .ask(
             parsed.question.clone(),
@@ -6134,7 +6134,12 @@ mod ask_user_interactive_tests {
     /// correlation id (plus a sanity check on the question + option count).
     fn expect_choice_ask(ev: StreamEvent, question: &str, option_count: usize) -> String {
         match ev {
-            StreamEvent::ChoiceAsk { id, question: q, options, .. } => {
+            StreamEvent::ChoiceAsk {
+                id,
+                question: q,
+                options,
+                ..
+            } => {
                 assert_eq!(q, question);
                 assert_eq!(options.len(), option_count);
                 id
@@ -7233,7 +7238,16 @@ mod dispatch_table_tests {
         let out = dispatch_tool(
             ask_user_meta(),
             &args,
-            None, None, None, None, None, None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("ask_user backward-compat path is infallible for valid args");
@@ -7252,7 +7266,16 @@ mod dispatch_table_tests {
         let err = dispatch_tool(
             ask_user_meta(),
             &args,
-            None, None, None, None, None, None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect_err("blank question is rejected");

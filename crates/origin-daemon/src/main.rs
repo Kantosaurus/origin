@@ -1818,9 +1818,7 @@ async fn handle_request(
             // scripted) leaves this `None`, so `ask_user` degrades to the prose
             // instruction — byte-identical to having no interactive channel and
             // never emitting a `ChoiceAsk` a non-interactive client can't answer.
-            choice_registry: req
-                .permission_ask
-                .then(|| Arc::clone(&choice_registry)),
+            choice_registry: req.permission_ask.then(|| Arc::clone(&choice_registry)),
             injector: memory.and_then(|m| m.injector.clone()),
             proposal_registry: Some(Arc::clone(&proposal_registry)),
             skills: {

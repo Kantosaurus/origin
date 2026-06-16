@@ -245,7 +245,11 @@ mod tests {
         // not depend on the parallel `syntax` lexer's real output: a Keyword span
         // over bytes 0..3 of "fnX" must paint in the keyword (accent) color.
         let t = tok();
-        let spans = [syntax::Span { start: 0, len: 2, kind: Tok::Keyword }];
+        let spans = [syntax::Span {
+            start: 0,
+            len: 2,
+            kind: Tok::Keyword,
+        }];
         let row = code_row("fn main", &spans, 40, &t);
         // spans[0] is the rule; spans[1] should be the keyword "fn" in accent.
         let kw = &row.spans[1];

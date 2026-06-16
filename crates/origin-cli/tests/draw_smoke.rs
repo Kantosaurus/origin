@@ -95,7 +95,10 @@ fn streaming_caret_rides_live_text_and_vanishes_on_finalize() {
     app.start_assistant_turn();
     app.append_to_current_assistant("hi there");
     let (present, hugs) = render(&mut app);
-    assert!(present, "a streaming caret must render while the turn is in flight");
+    assert!(
+        present,
+        "a streaming caret must render while the turn is in flight"
+    );
     assert!(hugs, "the caret must sit immediately after the live text");
 
     // Finalizing the turn flushes the buffer into scrollback and clears the

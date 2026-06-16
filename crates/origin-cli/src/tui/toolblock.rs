@@ -125,7 +125,7 @@ fn status_token(status: ToolStatus, tok: &Tokens) -> (char, u32) {
 pub fn diff_gutter(kind: DiffKind, tok: &Tokens) -> (char, u32) {
     match kind {
         DiffKind::Add => ('+', tok.ok),
-        DiffKind::Del => ('\u{2212}', tok.err), // −
+        DiffKind::Del => ('\u{2212}', tok.err),   // −
         DiffKind::Ctx => ('\u{00B7}', tok.muted), // ·
     }
 }
@@ -174,10 +174,7 @@ pub fn layout_tool(call: &ToolView, width: u16, tok: &Tokens) -> Vec<RenderRow> 
     // Compute padding so the metric is flush to `width`. If the left text plus
     // the metric don't fit, drop the padding (they butt with a single space).
     let left_width = display_width(&left_text);
-    let pad = cols
-        .saturating_sub(left_width)
-        .saturating_sub(right_width)
-        .max(1);
+    let pad = cols.saturating_sub(left_width).saturating_sub(right_width).max(1);
     header_spans.push(RowSpan::plain(" ".repeat(pad), tok.muted, 0));
     header_spans.push(RowSpan::plain(metric, tok.muted, 0));
     header_spans.push(RowSpan::new(status_glyph.to_string(), status_fg, 0, Attr::BOLD));
@@ -201,10 +198,7 @@ pub fn layout_tool(call: &ToolView, width: u16, tok: &Tokens) -> Vec<RenderRow> 
 /// span placed after it.
 fn body_row(connector_fg: u32, body: RowSpan) -> RenderRow {
     RenderRow {
-        spans: vec![
-            RowSpan::plain(format!("{CONNECTOR} "), connector_fg, 0),
-            body,
-        ],
+        spans: vec![RowSpan::plain(format!("{CONNECTOR} "), connector_fg, 0), body],
         indent: 0,
     }
 }
@@ -315,12 +309,7 @@ mod tests {
 
     /// Total display width of a `RenderRow` (indent + all span widths).
     fn row_width(row: &RenderRow) -> usize {
-        row.indent as usize
-            + row
-                .spans
-                .iter()
-                .map(|s| display_width(&s.text))
-                .sum::<usize>()
+        row.indent as usize + row.spans.iter().map(|s| display_width(&s.text)).sum::<usize>()
     }
 
     /// Concatenated text of a `RenderRow`.
@@ -435,9 +424,18 @@ mod tests {
             removed: 1,
             elapsed_ms: 10,
             body: ToolBody::Diff(vec![
-                DiffLine { kind: DiffKind::Ctx, text: "fn main() {".into() },
-                DiffLine { kind: DiffKind::Del, text: "    old();".into() },
-                DiffLine { kind: DiffKind::Add, text: "    new();".into() },
+                DiffLine {
+                    kind: DiffKind::Ctx,
+                    text: "fn main() {".into(),
+                },
+                DiffLine {
+                    kind: DiffKind::Del,
+                    text: "    old();".into(),
+                },
+                DiffLine {
+                    kind: DiffKind::Add,
+                    text: "    new();".into(),
+                },
             ]),
         };
         let rows = layout_tool(&call, 80, &tok());

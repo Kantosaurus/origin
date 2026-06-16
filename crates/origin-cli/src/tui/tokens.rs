@@ -195,7 +195,7 @@ pub mod glyph {
     pub const ORIGIN: char = '\u{25C6}'; // ◆
     /// Transcript spine gutter.
     pub const SPINE: char = '\u{2503}'; // ┃
-    // Tool icons.
+                                        // Tool icons.
     pub const EDIT: char = '\u{270E}'; // ✎
     pub const BASH: char = '\u{2318}'; // ⌘
     pub const GREP: char = '\u{2315}'; // ⌕
@@ -203,12 +203,12 @@ pub mod glyph {
     pub const WRITE: char = '\u{21F2}'; // ⇲
     pub const WEB: char = '\u{26BF}'; // ⚿
     pub const TASK: char = '\u{2295}'; // ⊕
-    // Status.
+                                       // Status.
     pub const RUN: char = '\u{25B8}'; // ▸
     pub const OK: char = '\u{2714}'; // ✔
     pub const FAIL: char = '\u{2718}'; // ✘
     pub const PERM: char = '\u{26A0}'; // ⚠
-    // Composer / picker.
+                                       // Composer / picker.
     pub const PROMPT: char = '\u{203A}'; // ›
     pub const CURSOR: char = '\u{25B8}'; // ▸
     pub const BOX_UNCHECKED: char = '\u{25A1}'; // □
@@ -428,10 +428,7 @@ mod token_tests {
         ] {
             let on_bg = contrast_ratio(fg, t.bg);
             let on_raised = contrast_ratio(fg, t.raised);
-            assert!(
-                on_bg >= 4.5,
-                "{name} on bg must be >=4.5:1, got {on_bg:.2}"
-            );
+            assert!(on_bg >= 4.5, "{name} on bg must be >=4.5:1, got {on_bg:.2}");
             assert!(
                 on_raised >= 4.5,
                 "{name} on raised must be >=4.5:1, got {on_raised:.2}"
@@ -480,7 +477,11 @@ mod token_tests {
         assert_eq!(hc.body, hp.body);
         // HighContrast keeps the palette's own muted (not the default retune).
         assert_eq!(hc.muted, hp.muted);
-        assert_ne!(hc.accent, Tokens::default_tokens().accent, "distinct from default");
+        assert_ne!(
+            hc.accent,
+            Tokens::default_tokens().accent,
+            "distinct from default"
+        );
     }
 
     #[test]
@@ -532,7 +533,10 @@ mod row_tests {
         let row = RenderRow::one(RowSpan::plain("\u{4f60}", 0x00_C0_C0_C0, 0));
         blit_row(&mut grid, 0, 0, 4, &row);
         assert_eq!(grid.get(0, 0).glyph, '\u{4f60}' as u32, "wide glyph placed");
-        assert!(grid.get(0, 1).is_continuation(), "trailing half is a continuation");
+        assert!(
+            grid.get(0, 1).is_continuation(),
+            "trailing half is a continuation"
+        );
     }
 
     #[test]

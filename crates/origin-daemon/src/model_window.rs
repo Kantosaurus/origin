@@ -40,11 +40,7 @@ pub fn model_context_window(model: &str) -> u32 {
         || m.contains("fable")
     {
         200_000
-    } else if m.contains("gpt-4")
-        || m.contains("gpt-5")
-        || m.contains("o1")
-        || m.contains("o3")
-    {
+    } else if m.contains("gpt-4") || m.contains("gpt-5") || m.contains("o1") || m.contains("o3") {
         128_000
     } else {
         FALLBACK_WINDOW

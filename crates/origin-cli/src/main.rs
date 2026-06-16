@@ -1232,11 +1232,7 @@ async fn handle_picker_key(
                 }
                 picker::PickerOutcome::Cancelled => origin_cli::tui::permission_cancel(),
             };
-            let _ = send_decision(
-                path,
-                &ClientMessage::PermissionDecision { id, allow, always },
-            )
-            .await;
+            let _ = send_decision(path, &ClientMessage::PermissionDecision { id, allow, always }).await;
             // Compact summary: the chosen verb + the tool.
             let verb = match (allow, always) {
                 (true, true) => format!("always allow {tool}"),
@@ -2555,10 +2551,8 @@ async fn call_daemon(
                 } => {
                     // Map the protocol `ChoiceOption`s into `(label, description)`
                     // tuples for the picker, preserving display order.
-                    let opts: Vec<(String, Option<String>)> = options
-                        .into_iter()
-                        .map(|o| (o.label, o.description))
-                        .collect();
+                    let opts: Vec<(String, Option<String>)> =
+                        options.into_iter().map(|o| (o.label, o.description)).collect();
                     on_choice_ask(id, question, opts, multi_select, allow_custom);
                 }
                 _ => {}
@@ -3279,34 +3273,73 @@ mod tests {
     fn picker_key_maps_navigation_and_digits() {
         let s = choice_state(3, false, false);
         assert_eq!(crossterm_to_picker_key(key(KeyCode::Up), &s), Some(PickerKey::Up));
-        assert_eq!(crossterm_to_picker_key(key(KeyCode::Char('k')), &s), Some(PickerKey::Up));
-        assert_eq!(crossterm_to_picker_key(key(KeyCode::Down), &s), Some(PickerKey::Down));
-        assert_eq!(crossterm_to_picker_key(key(KeyCode::Char('j')), &s), Some(PickerKey::Down));
-        assert_eq!(crossterm_to_picker_key(key(KeyCode::Char(' ')), &s), Some(PickerKey::Toggle));
-        assert_eq!(crossterm_to_picker_key(key(KeyCode::Esc), &s), Some(PickerKey::Cancel));
-        assert_eq!(crossterm_to_picker_key(key(KeyCode::Char('2')), &s), Some(PickerKey::Digit(2)));
+        assert_eq!(
+            crossterm_to_picker_key(key(KeyCode::Char('k')), &s),
+            Some(PickerKey::Up)
+        );
+        assert_eq!(
+            crossterm_to_picker_key(key(KeyCode::Down), &s),
+            Some(PickerKey::Down)
+        );
+        assert_eq!(
+            crossterm_to_picker_key(key(KeyCode::Char('j')), &s),
+            Some(PickerKey::Down)
+        );
+        assert_eq!(
+            crossterm_to_picker_key(key(KeyCode::Char(' ')), &s),
+            Some(PickerKey::Toggle)
+        );
+        assert_eq!(
+            crossterm_to_picker_key(key(KeyCode::Esc), &s),
+            Some(PickerKey::Cancel)
+        );
+        assert_eq!(
+            crossterm_to_picker_key(key(KeyCode::Char('2')), &s),
+            Some(PickerKey::Digit(2))
+        );
         // Enter on an option row confirms.
-        assert_eq!(crossterm_to_picker_key(key(KeyCode::Enter), &s), Some(PickerKey::Confirm));
+        assert_eq!(
+            crossterm_to_picker_key(key(KeyCode::Enter), &s),
+            Some(PickerKey::Confirm)
+        );
     }
 
     #[test]
     fn picker_key_enter_on_custom_row_enters_custom_mode() {
         let mut s = choice_state(2, true, false);
         // Cursor on an option ⇒ Enter confirms.
-        assert_eq!(crossterm_to_picker_key(key(KeyCode::Enter), &s), Some(PickerKey::Confirm));
+        assert_eq!(
+            crossterm_to_picker_key(key(KeyCode::Enter), &s),
+            Some(PickerKey::Confirm)
+        );
         // Cursor on the trailing custom row ⇒ Enter becomes Custom.
         s.cursor = s.options.len();
-        assert_eq!(crossterm_to_picker_key(key(KeyCode::Enter), &s), Some(PickerKey::Custom));
+        assert_eq!(
+            crossterm_to_picker_key(key(KeyCode::Enter), &s),
+            Some(PickerKey::Custom)
+        );
     }
 
     #[test]
     fn picker_key_typing_custom_routes_text_keys() {
         let mut s = choice_state(2, true, false);
         s.typing_custom = true;
-        assert_eq!(crossterm_to_picker_key(key(KeyCode::Char('x')), &s), Some(PickerKey::Char('x')));
-        assert_eq!(crossterm_to_picker_key(key(KeyCode::Backspace), &s), Some(PickerKey::Backspace));
-        assert_eq!(crossterm_to_picker_key(key(KeyCode::Enter), &s), Some(PickerKey::Confirm));
-        assert_eq!(crossterm_to_picker_key(key(KeyCode::Esc), &s), Some(PickerKey::Cancel));
+        assert_eq!(
+            crossterm_to_picker_key(key(KeyCode::Char('x')), &s),
+            Some(PickerKey::Char('x'))
+        );
+        assert_eq!(
+            crossterm_to_picker_key(key(KeyCode::Backspace), &s),
+            Some(PickerKey::Backspace)
+        );
+        assert_eq!(
+            crossterm_to_picker_key(key(KeyCode::Enter), &s),
+            Some(PickerKey::Confirm)
+        );
+        assert_eq!(
+            crossterm_to_picker_key(key(KeyCode::Esc), &s),
+            Some(PickerKey::Cancel)
+        );
         // Navigation is dropped while typing free text (does not move the cursor).
         assert_eq!(crossterm_to_picker_key(key(KeyCode::Down), &s), None);
     }
@@ -3360,9 +3393,18 @@ mod tests {
     #[test]
     fn choice_summary_joins_labels_else_custom_else_skipped() {
         let opts = vec![
-            PickerOption { label: "a".into(), description: None },
-            PickerOption { label: "b".into(), description: None },
-            PickerOption { label: "c".into(), description: None },
+            PickerOption {
+                label: "a".into(),
+                description: None,
+            },
+            PickerOption {
+                label: "b".into(),
+                description: None,
+            },
+            PickerOption {
+                label: "c".into(),
+                description: None,
+            },
         ];
         assert_eq!(picker_choice_summary(&opts, &[0, 2], None), "a, c");
         assert_eq!(picker_choice_summary(&opts, &[], Some("freeform")), "freeform");

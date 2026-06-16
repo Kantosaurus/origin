@@ -70,19 +70,15 @@ pub fn verifying_line(iter: u32, max_iter: u32) -> String {
 #[must_use]
 pub fn cleared_line(reason: &ClearReasonWire, t: &Tokens) -> (String, u32) {
     match reason {
-        ClearReasonWire::Met { reason } => (
-            crate::locale::linef("goal.done", &[("reason", reason)]),
-            t.ok,
-        ),
+        ClearReasonWire::Met { reason } => (crate::locale::linef("goal.done", &[("reason", reason)]), t.ok),
         ClearReasonWire::UserSlash => ("goal cancelled".to_string(), t.warn),
         ClearReasonWire::UserClearAll => ("session cleared".to_string(), t.warn),
         ClearReasonWire::MaxIter => ("max iterations reached".to_string(), t.warn),
         ClearReasonWire::BudgetExhausted => ("token budget reached".to_string(), t.warn),
         ClearReasonWire::VerifierRejected { why } => (format!("verifier kept rejecting: {why}"), t.err),
-        ClearReasonWire::VerifierUnavailable => (
-            "verifier unavailable; trusting main model".to_string(),
-            t.warn,
-        ),
+        ClearReasonWire::VerifierUnavailable => {
+            ("verifier unavailable; trusting main model".to_string(), t.warn)
+        }
         ClearReasonWire::Blocked { why } => (format!("blocked: {why}"), t.warn),
     }
 }
@@ -395,19 +391,14 @@ mod tests {
         assert!(handled, "GoalInactive must not fall through to error path");
         assert_eq!(app.lines.len(), 1);
         assert!(app.lines[0].0.contains("no active goal"));
-        assert_ne!(
-            app.lines[0].1,
-            t.err,
-            "GoalInactive must not render in error/red"
-        );
+        assert_ne!(app.lines[0].1, t.err, "GoalInactive must not render in error/red");
     }
 
     #[test]
     fn non_goal_event_returns_false_unhandled() {
         let t = Tokens::default_tokens();
         let mut app = FakeApp::default();
-        let handled =
-            render_goal_event(&mut app, &StreamEvent::TextDelta { text: "hi".into() }, &t);
+        let handled = render_goal_event(&mut app, &StreamEvent::TextDelta { text: "hi".into() }, &t);
         assert!(!handled, "non-Goal events must fall through to existing dispatch");
         assert!(app.lines.is_empty());
         assert_eq!(app.status_updates, 0);
