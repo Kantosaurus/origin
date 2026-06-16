@@ -24,7 +24,7 @@
 use origin_daemon::protocol::StreamEvent;
 use origin_goal::{ClearReasonWire, TagOutcomeWire};
 
-use crate::theme;
+use crate::tui::tokens::Tokens;
 
 /// Sink the goal renderer writes to. Implemented by `tui::App` for the real
 /// UI; tests can implement against a `Vec<RenderedLine>` to assert on
@@ -54,32 +54,36 @@ pub fn verifying_line(iter: u32, max_iter: u32) -> String {
 }
 
 /// One-line terminal notice describing why a goal cleared, plus the color
-/// the CLI should render it in. Reasons render per the bug-#4 spec table:
+/// the CLI should render it in.
 ///
-///   * `Met { reason }`            -> "done: <reason>"                       (green)
-///   * `UserSlash`                 -> "goal cancelled"                       (yellow)
-///   * `UserClearAll`              -> "session cleared"                      (yellow)
-///   * `MaxIter`                   -> "max iterations reached"               (yellow)
-///   * `BudgetExhausted`           -> "token budget reached"                 (yellow)
-///   * `VerifierRejected { why }`  -> "verifier kept rejecting: <why>"      (red)
-///   * `VerifierUnavailable`       -> "verifier unavailable; trusting main model" (yellow)
+/// Colors resolve from the active theme's [`Tokens`] (`ok`/`warn`/`err`) so a
+/// `/theme` switch, `NO_COLOR`, and the `HighContrast` variant all re-theme
+/// these notices. Reasons render per the bug-#4 spec table:
+///
+///   * `Met { reason }`            -> "done: <reason>"                       (ok)
+///   * `UserSlash`                 -> "goal cancelled"                       (warn)
+///   * `UserClearAll`              -> "session cleared"                      (warn)
+///   * `MaxIter`                   -> "max iterations reached"               (warn)
+///   * `BudgetExhausted`           -> "token budget reached"                 (warn)
+///   * `VerifierRejected { why }`  -> "verifier kept rejecting: <why>"      (err)
+///   * `VerifierUnavailable`       -> "verifier unavailable; trusting main model" (warn)
 #[must_use]
-pub fn cleared_line(reason: &ClearReasonWire) -> (String, u32) {
+pub fn cleared_line(reason: &ClearReasonWire, t: &Tokens) -> (String, u32) {
     match reason {
         ClearReasonWire::Met { reason } => (
             crate::locale::linef("goal.done", &[("reason", reason)]),
-            theme::GREEN,
+            t.ok,
         ),
-        ClearReasonWire::UserSlash => ("goal cancelled".to_string(), theme::YELLOW),
-        ClearReasonWire::UserClearAll => ("session cleared".to_string(), theme::YELLOW),
-        ClearReasonWire::MaxIter => ("max iterations reached".to_string(), theme::YELLOW),
-        ClearReasonWire::BudgetExhausted => ("token budget reached".to_string(), theme::YELLOW),
-        ClearReasonWire::VerifierRejected { why } => (format!("verifier kept rejecting: {why}"), theme::RED),
+        ClearReasonWire::UserSlash => ("goal cancelled".to_string(), t.warn),
+        ClearReasonWire::UserClearAll => ("session cleared".to_string(), t.warn),
+        ClearReasonWire::MaxIter => ("max iterations reached".to_string(), t.warn),
+        ClearReasonWire::BudgetExhausted => ("token budget reached".to_string(), t.warn),
+        ClearReasonWire::VerifierRejected { why } => (format!("verifier kept rejecting: {why}"), t.err),
         ClearReasonWire::VerifierUnavailable => (
             "verifier unavailable; trusting main model".to_string(),
-            theme::YELLOW,
+            t.warn,
         ),
-        ClearReasonWire::Blocked { why } => (format!("blocked: {why}"), theme::YELLOW),
+        ClearReasonWire::Blocked { why } => (format!("blocked: {why}"), t.warn),
     }
 }
 
@@ -89,9 +93,14 @@ pub fn cleared_line(reason: &ClearReasonWire) -> (String, u32) {
 /// here), `false` for any other variant — the caller should continue
 /// its existing dispatch in that case.
 ///
+/// Colors resolve from the active theme's [`Tokens`] (`accent`/`warn`/`muted`
+/// plus `ok`/`err` via [`cleared_line`]) so a `/theme` switch, `NO_COLOR`, and
+/// the `HighContrast` variant all re-theme goal rendering consistently with the
+/// rest of the TUI.
+///
 /// This makes the dispatch in `main.rs::call_daemon` a one-liner:
-/// `if render_goal_event(&mut goal_app, &ev) { continue; }`.
-pub fn render_goal_event<R: GoalRender>(app: &mut R, ev: &StreamEvent) -> bool {
+/// `if render_goal_event(&mut goal_app, &ev, &tokens) { continue; }`.
+pub fn render_goal_event<R: GoalRender>(app: &mut R, ev: &StreamEvent, t: &Tokens) -> bool {
     match ev {
         StreamEvent::GoalActive {
             condition,
@@ -103,7 +112,7 @@ pub fn render_goal_event<R: GoalRender>(app: &mut R, ev: &StreamEvent) -> bool {
                     "  \u{25CE} {}",
                     crate::locale::linef("goal.active", &[("condition", condition)])
                 ),
-                theme::ACCENT,
+                t.accent,
                 0,
             );
             app.set_goal_status(Some(status_line(0, *max_iter, 0, *token_budget)));
@@ -125,7 +134,7 @@ pub fn render_goal_event<R: GoalRender>(app: &mut R, ev: &StreamEvent) -> bool {
             )));
             // Blocker notice (one-line).
             if let TagOutcomeWire::Blocked { why } = last_tag {
-                app.push_colored(format!("  \u{26A0} goal blocked: {why}"), theme::YELLOW, 0);
+                app.push_colored(format!("  \u{26A0} goal blocked: {why}"), t.warn, 0);
             }
             true
         }
@@ -138,7 +147,7 @@ pub fn render_goal_event<R: GoalRender>(app: &mut R, ev: &StreamEvent) -> bool {
             iter,
             tokens_spent,
         } => {
-            let (msg, fg) = cleared_line(reason);
+            let (msg, fg) = cleared_line(reason, t);
             // Suffix with the iter / tokens summary so the user can see the
             // run's footprint at a glance without scrolling back.
             app.push_colored(
@@ -150,7 +159,7 @@ pub fn render_goal_event<R: GoalRender>(app: &mut R, ev: &StreamEvent) -> bool {
             true
         }
         StreamEvent::GoalInactive => {
-            app.push_colored("  no active goal".to_string(), theme::MUTED, 0);
+            app.push_colored("  no active goal".to_string(), t.muted, 0);
             true
         }
         _ => false,
@@ -183,6 +192,7 @@ mod tests {
 
     #[test]
     fn goal_active_pushes_condition_and_sets_status() {
+        let t = Tokens::default_tokens();
         let mut app = FakeApp::default();
         let handled = render_goal_event(
             &mut app,
@@ -191,6 +201,7 @@ mod tests {
                 max_iter: 5,
                 token_budget: 10_000,
             },
+            &t,
         );
         assert!(handled, "GoalActive must be handled, not fall through");
         assert_eq!(app.lines.len(), 1, "expected one scrollback push");
@@ -202,6 +213,7 @@ mod tests {
 
     #[test]
     fn goal_iteration_updates_status_and_surfaces_blocker() {
+        let t = Tokens::default_tokens();
         let mut app = FakeApp::default();
         let handled = render_goal_event(
             &mut app,
@@ -212,6 +224,7 @@ mod tests {
                     why: "missing creds".into(),
                 },
             },
+            &t,
         );
         assert!(handled);
         assert_eq!(app.status_updates, 1);
@@ -220,11 +233,12 @@ mod tests {
         assert!(status.contains("4200"));
         assert_eq!(app.lines.len(), 1, "blocked tag must push a notice");
         assert!(app.lines[0].0.contains("missing creds"));
-        assert_eq!(app.lines[0].1, theme::YELLOW);
+        assert_eq!(app.lines[0].1, t.warn);
     }
 
     #[test]
     fn goal_iteration_in_progress_does_not_push_notice() {
+        let t = Tokens::default_tokens();
         let mut app = FakeApp::default();
         render_goal_event(
             &mut app,
@@ -235,6 +249,7 @@ mod tests {
                     what_remains: "writing tests".into(),
                 },
             },
+            &t,
         );
         assert!(
             app.lines.is_empty(),
@@ -246,8 +261,9 @@ mod tests {
 
     #[test]
     fn goal_verifying_updates_status_indicator() {
+        let t = Tokens::default_tokens();
         let mut app = FakeApp::default();
-        render_goal_event(&mut app, &StreamEvent::GoalVerifying);
+        render_goal_event(&mut app, &StreamEvent::GoalVerifying, &t);
         let status = app.status.as_ref().expect("status");
         assert!(status.contains("verifying"), "got: {status}");
         assert!(app.lines.is_empty());
@@ -255,6 +271,7 @@ mod tests {
 
     #[test]
     fn goal_cleared_met_uses_green() {
+        let t = Tokens::default_tokens();
         let mut app = FakeApp::default();
         render_goal_event(
             &mut app,
@@ -265,17 +282,19 @@ mod tests {
                 iter: 2,
                 tokens_spent: 5_000,
             },
+            &t,
         );
         assert_eq!(app.lines.len(), 1);
         assert!(app.lines[0].0.contains("done: tests pass"));
         assert!(app.lines[0].0.contains("iter 2"));
         assert!(app.lines[0].0.contains("5000 tok"));
-        assert_eq!(app.lines[0].1, theme::GREEN);
+        assert_eq!(app.lines[0].1, t.ok);
         assert!(app.status.is_none(), "status must be cleared");
     }
 
     #[test]
     fn goal_cleared_user_slash_is_yellow_with_cancelled_text() {
+        let t = Tokens::default_tokens();
         let mut app = FakeApp::default();
         render_goal_event(
             &mut app,
@@ -284,14 +303,16 @@ mod tests {
                 iter: 1,
                 tokens_spent: 200,
             },
+            &t,
         );
         assert_eq!(app.lines.len(), 1);
         assert!(app.lines[0].0.contains("goal cancelled"));
-        assert_eq!(app.lines[0].1, theme::YELLOW);
+        assert_eq!(app.lines[0].1, t.warn);
     }
 
     #[test]
     fn goal_cleared_user_clear_all_says_session_cleared() {
+        let t = Tokens::default_tokens();
         let mut app = FakeApp::default();
         render_goal_event(
             &mut app,
@@ -300,14 +321,16 @@ mod tests {
                 iter: 4,
                 tokens_spent: 7_777,
             },
+            &t,
         );
         assert_eq!(app.lines.len(), 1);
         assert!(app.lines[0].0.contains("session cleared"));
-        assert_eq!(app.lines[0].1, theme::YELLOW);
+        assert_eq!(app.lines[0].1, t.warn);
     }
 
     #[test]
     fn goal_cleared_max_iter_and_budget_render_yellow() {
+        let t = Tokens::default_tokens();
         for r in [ClearReasonWire::MaxIter, ClearReasonWire::BudgetExhausted] {
             let mut app = FakeApp::default();
             render_goal_event(
@@ -317,13 +340,15 @@ mod tests {
                     iter: 0,
                     tokens_spent: 0,
                 },
+                &t,
             );
-            assert_eq!(app.lines[0].1, theme::YELLOW, "reason {r:?} must be yellow");
+            assert_eq!(app.lines[0].1, t.warn, "reason {r:?} must be yellow");
         }
     }
 
     #[test]
     fn goal_cleared_verifier_rejected_is_red_with_why() {
+        let t = Tokens::default_tokens();
         let mut app = FakeApp::default();
         render_goal_event(
             &mut app,
@@ -334,15 +359,17 @@ mod tests {
                 iter: 5,
                 tokens_spent: 9_999,
             },
+            &t,
         );
         assert_eq!(app.lines.len(), 1);
         assert!(app.lines[0].0.contains("verifier kept rejecting"));
         assert!(app.lines[0].0.contains("tests still fail"));
-        assert_eq!(app.lines[0].1, theme::RED);
+        assert_eq!(app.lines[0].1, t.err);
     }
 
     #[test]
     fn goal_cleared_verifier_unavailable_is_yellow() {
+        let t = Tokens::default_tokens();
         let mut app = FakeApp::default();
         render_goal_event(
             &mut app,
@@ -351,32 +378,36 @@ mod tests {
                 iter: 1,
                 tokens_spent: 0,
             },
+            &t,
         );
         assert!(app.lines[0].0.contains("verifier unavailable"));
-        assert_eq!(app.lines[0].1, theme::YELLOW);
+        assert_eq!(app.lines[0].1, t.warn);
     }
 
     #[test]
     fn goal_inactive_emits_muted_info_not_error() {
         // Bug #20: bare `/goal` with no active goal must render as a benign
-        // info row, not an error. Asserts on the COLOR not being theme::RED
-        // because that's how `error>` rows are styled.
+        // info row, not an error. Asserts on the COLOR not being the error
+        // token because that's how `error>` rows are styled.
+        let t = Tokens::default_tokens();
         let mut app = FakeApp::default();
-        let handled = render_goal_event(&mut app, &StreamEvent::GoalInactive);
+        let handled = render_goal_event(&mut app, &StreamEvent::GoalInactive, &t);
         assert!(handled, "GoalInactive must not fall through to error path");
         assert_eq!(app.lines.len(), 1);
         assert!(app.lines[0].0.contains("no active goal"));
         assert_ne!(
             app.lines[0].1,
-            theme::RED,
+            t.err,
             "GoalInactive must not render in error/red"
         );
     }
 
     #[test]
     fn non_goal_event_returns_false_unhandled() {
+        let t = Tokens::default_tokens();
         let mut app = FakeApp::default();
-        let handled = render_goal_event(&mut app, &StreamEvent::TextDelta { text: "hi".into() });
+        let handled =
+            render_goal_event(&mut app, &StreamEvent::TextDelta { text: "hi".into() }, &t);
         assert!(!handled, "non-Goal events must fall through to existing dispatch");
         assert!(app.lines.is_empty());
         assert_eq!(app.status_updates, 0);

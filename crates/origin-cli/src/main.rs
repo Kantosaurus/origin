@@ -903,15 +903,20 @@ enum KeyOutcome {
 /// Handle one decoded key event. Returns [`KeyOutcome::Break`] only for the
 /// quit path; every other branch returns [`KeyOutcome::Continue`], matching
 /// the `continue`/fall-through behaviour of the original inline `match`.
-/// The input card's text width, derived from the current terminal size — used
-/// by the editor reducer for visual Home/End and Up/Down across wrapped lines.
-/// Mirrors the card geometry in `App::draw` (full-width card: `card_w = cols-2`,
-/// with a 2-column inner indent for the accent rule + padding, so the text
-/// width is `card_w - 2 == cols - 4`).
+/// The composer's text width, derived from the current terminal size — used by
+/// the editor reducer for visual Home/End and Up/Down across wrapped lines.
+///
+/// MUST equal the composer's text column span in `App::draw`. The framed
+/// composer (`composer::draw_field`) spans the full width with its left border at
+/// col 0; the text column is `left + 3` (border + prompt gutter + space) and the
+/// text clips at `right - 1` (before the right border), so the text width is
+/// `(cols - 1) - 3 == cols - 4`. If the composer frame geometry changes, update
+/// this in lock-step or the painted caret desyncs from typing on wrapped lines.
 fn input_text_width() -> usize {
     let cols = crossterm::terminal::size().map_or(80, |(c, _)| c);
-    let card_w = cols.saturating_sub(2);
-    usize::from(card_w.saturating_sub(2))
+    // cols - 4 (see the doc comment): one border + prompt gutter + space on the
+    // left, one border on the right.
+    usize::from(cols.saturating_sub(4))
 }
 
 async fn handle_key_event(
@@ -1974,7 +1979,11 @@ async fn handle_prompt_turn(
             // Bug #4: route Goal* events through the dedicated renderer so
             // they no longer fall into call_daemon's `_ => {}` catch-all.
             let mut a = app_for_goal.lock();
-            render_goal_event(&mut *a, ev);
+            // Resolve goal-render colors from the active theme's tokens so a
+            // `/theme` switch (and NO_COLOR / HighContrast) re-themes goal
+            // rows consistently with the rest of the TUI.
+            let tokens = origin_cli::tui::tokens::Tokens::from_palette(a.palette());
+            render_goal_event(&mut *a, ev, &tokens);
             drop(a);
             handle_for_goal.mark_dirty();
         },
@@ -2497,7 +2506,12 @@ async fn send_skill_command(path: &str, msg: &ClientMessage) -> Result<String> {
                 // looping so the caller sees the new activation summary.
                 // When it's the only event (a bare-`/-goal` or a /clear
                 // with no follow-up), surface it as the final outcome.
-                let (msg, _fg) = origin_cli::goal_render::cleared_line(reason);
+                // Headless skill path: the color is discarded (`_fg`), so the
+                // default token set suffices for the text-only summary.
+                let (msg, _fg) = origin_cli::goal_render::cleared_line(
+                    reason,
+                    &origin_cli::tui::tokens::Tokens::default_tokens(),
+                );
                 last_intermediate = Some(format!("{msg} (iter {iter}, {tokens_spent} tok)"));
                 continue;
             }
