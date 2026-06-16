@@ -886,27 +886,21 @@ mod cassette {
     /// # Errors
     /// Returns [`ProviderError::Api`] if the cassette cannot be read/parsed, no
     /// matching interaction exists, or the recorded status is non-OK.
-    pub fn replay(path: &str, method: &str, url: &str, req_body: &str) -> Result<String, ProviderError> {
-        let text =
-            std::fs::read_to_string(path).map_err(|e| ProviderError::Api(format!("cassette read: {e}")))?;
-        let cassette =
-            Cassette::from_json(&text).map_err(|e| ProviderError::Api(format!("cassette parse: {e}")))?;
-        let probe = ReqShape {
-            method: method.to_string(),
-            url: url.to_string(),
-            headers: Vec::new(),
-            body: req_body.to_string(),
-        };
-        let interaction = cassette
-            .match_next(&probe)
-            .ok_or_else(|| ProviderError::Api(format!("cassette replay miss for {method} {url}")))?;
+    pub fn replay(path: &str, method: &str, url: &str, _req_body: &str) -> Result<String, ProviderError> {
+        // Durable, sequential replay: the position is persisted in a `<path>.pos`
+        // sidecar so each turn of a multi-turn session consumes the NEXT recorded
+        // interaction (turn 1, 2, 3, …) rather than replaying interaction[0] every
+        // time. The cassette is re-read fresh each call, so the cursor must live
+        // out-of-band on disk.
+        let interaction = origin_cassette::replay_next(std::path::Path::new(path), method, url)
+            .map_err(|e| ProviderError::Api(format!("cassette replay: {e}")))?;
         if interaction.response.status != 200 {
             return Err(ProviderError::Api(format!(
                 "cassette replay status {}",
                 interaction.response.status
             )));
         }
-        Ok(interaction.response.body.clone())
+        Ok(interaction.response.body)
     }
 }
 

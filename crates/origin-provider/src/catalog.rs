@@ -5,7 +5,16 @@ use std::borrow::Cow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireFormat {
+    /// `OpenAI` Chat-Completions API (`POST /v1/chat/completions`): request body
+    /// is `{model, messages, tools, …}`, response is `{choices[]}`.
     OpenAIChat,
+    /// `OpenAI` Responses API (`POST /responses`): a DISTINCT wire shape —
+    /// request body is `{model, input[], instructions, tools, …}` (typed `input`
+    /// items, not `messages`), response is `{output[]}` (not `choices[]`).
+    /// Codex/`ChatGPT` OAuth providers speak only this surface; routing them
+    /// through `OpenAIChat` 400s on every turn, so they need their own wire
+    /// format + encoder.
+    OpenAIResponses,
     Anthropic,
     Gemini,
     Bedrock,
