@@ -1,28 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-use origin_metrics::Metrics;
-use origin_tui::widgets::metrics::MetricsWidget;
 use origin_tui::{Panel, PanelEvent, PanelState};
-
-#[test]
-fn snapshot_contains_every_registered_metric() {
-    let m = Metrics::new();
-    m.tool_call_total("anthropic", "Bash", "ok").inc();
-    m.tokens_in_total("anthropic", "claude-opus-4-7").inc_by(10);
-    let widget = MetricsWidget::new(&m);
-    let lines = widget.lines();
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("origin_tool_call_total") && l.contains("Bash")),
-        "missing tool_call_total Bash row in: {lines:#?}"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("origin_tokens_in_total") && l.contains("claude-opus-4-7")),
-        "missing tokens_in_total row in: {lines:#?}"
-    );
-}
 
 #[test]
 fn question_mark_toggles_metrics_state() {

@@ -120,6 +120,12 @@ async fn memory_proposed_round_trip_via_stub_provider() {
             router: None,
             browser_rate_limit: None,
             session_account: None,
+            proc_supervisor: None,
+            write_guard: None,
+            metrics: None,
+            permission_rules: None,
+            post_edit: None,
+            notify: None,
         };
         let summary = run_loop(&mut session, &prompt.user_text, &provider, &AlwaysAllow, &opts)
             .await
@@ -132,11 +138,11 @@ async fn memory_proposed_round_trip_via_stub_provider() {
         drop(opts);
         relay_handle.await.expect("relay join");
 
-        // We expect at least one proposal pending.
-        assert!(
-            !session.pending_proposals.is_empty(),
-            "expected at least one pending proposal"
-        );
+        // (#14) The per-`Session` `pending_proposals` map was write-only dead
+        // state and has been removed; the proposal is verified end-to-end on the
+        // CLIENT side below, where it asserts it received a `MemoryProposed`
+        // event (the real surfacing path). `session` is no longer inspected for
+        // proposals here.
 
         // Write Response so client knows the turn is finished.
         let reply = origin_daemon::protocol::PromptReply {

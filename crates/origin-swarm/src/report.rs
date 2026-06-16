@@ -43,9 +43,9 @@ pub struct CompletionReport {
 impl CompletionReport {
     /// Serialize the report into the CAS and return its handle.
     ///
-    /// The handle is what the swarm SMR ring carries inside
-    /// `SwarmEvent::WorkerComplete` — the body itself never travels through the
-    /// ring (which is sized for hot fanout, not bulk payloads).
+    /// Workers hand the coordinator this compact CAS handle rather than the
+    /// full report body, so completion fanout stays cheap and the bulk payload
+    /// is fetched from the store only on demand.
     ///
     /// # Errors
     /// Returns `origin_cas::StoreError` if the CAS write fails. Bincode

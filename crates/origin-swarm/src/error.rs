@@ -12,9 +12,6 @@ pub enum SwarmError {
     /// Plan persistence error from `origin-plan`.
     #[error("plan: {0}")]
     Plan(origin_plan::PlanStoreError),
-    /// SMR ring error from `origin-smr`.
-    #[error("smr: {0:?}")]
-    Smr(origin_smr::RingError),
     /// Worker exited with an error message.
     #[error("worker: {0}")]
     Worker(String),

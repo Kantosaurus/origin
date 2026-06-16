@@ -175,7 +175,11 @@ pub fn builtin_catalog() -> Vec<ProviderEntry> {
         ProviderEntry {
             id: "openai-codex".into(),
             display_name: "OpenAI Codex (ChatGPT OAuth)".into(),
-            wire: WireFormat::OpenAIChat,
+            // The codex backend at `/responses` speaks the OpenAI *Responses*
+            // API (typed `input[]` items + `output[]`), NOT Chat-Completions.
+            // Routing it through `OpenAIChat` sent a `{messages}` body to
+            // `/responses` and read `choices[]`, so every turn 400'd / mis-parsed.
+            wire: WireFormat::OpenAIResponses,
             auth: AuthScheme::OAuth(OAuthSpec {
                 authorize_url: "https://auth.openai.com/oauth/authorize".into(),
                 token_url: "https://auth.openai.com/oauth/token".into(),
@@ -652,6 +656,37 @@ mod tests {
         ] {
             assert!(ids.contains(id), "missing first-class provider: {id}");
         }
+    }
+
+    #[test]
+    fn openai_codex_resolves_to_responses_api_not_chat() {
+        // Regression: the codex backend speaks the Responses API at `/responses`.
+        // Its catalog entry must carry the dedicated `OpenAIResponses` wire kind
+        // (so the factory builds the Responses encoder), while a plain OpenAI
+        // chat model must STILL resolve to the Chat-Completions wire kind.
+        let cat = builtin_catalog();
+        let codex = cat
+            .iter()
+            .find(|e| e.id == "openai-codex")
+            .expect("openai-codex entry present");
+        assert_eq!(
+            codex.wire,
+            WireFormat::OpenAIResponses,
+            "codex must route to the Responses API, not Chat-Completions"
+        );
+        assert_eq!(
+            codex.chat_path.as_ref(),
+            "/responses",
+            "codex endpoint path is the Responses surface"
+        );
+
+        // A canonical chat provider is unchanged: still Chat-Completions.
+        let openai = cat
+            .iter()
+            .find(|e| e.id == "openai")
+            .expect("openai entry present");
+        assert_eq!(openai.wire, WireFormat::OpenAIChat);
+        assert_eq!(openai.chat_path.as_ref(), "/v1/chat/completions");
     }
 
     #[test]

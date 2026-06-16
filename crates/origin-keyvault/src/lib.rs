@@ -119,12 +119,21 @@ impl KeyVault {
     /// returned by [`KeyVault::detect`].
     #[allow(clippy::future_not_send)]
     pub async fn detect_with_audit<P: AsRef<std::path::Path>>(audit_dir: P) -> Result<Self, Error> {
-        let mut vault = Self::detect()?;
         let ring = AuditRing::open(audit_dir)
             .await
             .map_err(|e| Error::Backend(e.to_string()))?;
-        vault.audit = Some(Arc::new(ring));
-        Ok(vault)
+        Ok(Self::detect()?.with_audit(Arc::new(ring)))
+    }
+
+    /// Attach an already-opened [`AuditRing`] to this vault, so every
+    /// subsequent get/set/delete/list records a (provider, account, action,
+    /// timestamp) tuple. Returns the vault for chaining. This is the shared
+    /// primitive behind [`KeyVault::detect_with_audit`]; it also lets the
+    /// in-memory backend be audited (used in tests and ephemeral runs).
+    #[must_use]
+    pub fn with_audit(mut self, ring: Arc<AuditRing>) -> Self {
+        self.audit = Some(ring);
+        self
     }
 
     async fn audit(&self, action: AuditAction, provider: &str, account: &str) {

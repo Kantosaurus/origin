@@ -3,8 +3,8 @@
 //!
 //! `origin`'s agents edit the user's tree directly; one bad turn can clobber
 //! work. This crate adds a *shadow* git history (cline / kilocode checkpoints,
-//! aider git-as-undo, gemini `/rewind`) plus a lightweight lane / draft-patch
-//! model (jcode) so a turn's output can be reviewed before it lands.
+//! aider git-as-undo, gemini `/rewind`) plus an isolated-worktree helper
+//! (jcode / openclaude lanes) so destructive work can run off the user's tree.
 //!
 //! Every git effect is routed through an injected [`GitRunner`], so the whole
 //! crate is unit-tested offline with a recording mock — no subprocess, no repo,
@@ -86,67 +86,6 @@ pub enum RestoreMode {
     Files(Vec<String>),
     /// Hard-reset HEAD and the working tree to the checkpoint (full rewind).
     Full,
-}
-
-/// A named lane: a base ref plus the ordered draft patches proposed against it.
-///
-/// Lanes let an agent stage several turns' worth of changes (jcode's
-/// lane / draft-patch model) before any of them touches the user's real branch.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct Lane {
-    /// Lane name (an arbitrary identifier).
-    pub name: String,
-    /// The ref this lane is based on (commit id or branch name).
-    pub base: String,
-    /// Draft patches proposed in this lane, oldest first.
-    pub draft_patches: Vec<DraftPatch>,
-}
-
-impl Lane {
-    /// Create an empty lane based on `base`.
-    #[must_use]
-    pub fn new(name: impl Into<String>, base: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            base: base.into(),
-            draft_patches: Vec::new(),
-        }
-    }
-
-    /// Append a draft patch to the lane.
-    pub fn push_draft(&mut self, patch: DraftPatch) {
-        self.draft_patches.push(patch);
-    }
-
-    /// Number of draft patches currently in the lane.
-    #[must_use]
-    pub fn draft_count(&self) -> usize {
-        self.draft_patches.len()
-    }
-}
-
-/// A proposed-but-not-applied change, with the provenance of the agent/turn that
-/// produced it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DraftPatch {
-    /// Stable identifier for the patch.
-    pub id: String,
-    /// One-line summary of what the patch does.
-    pub summary: String,
-    /// Which agent / turn produced the patch (for audit and attribution).
-    pub provenance: String,
-}
-
-impl DraftPatch {
-    /// Construct a draft patch.
-    #[must_use]
-    pub fn new(id: impl Into<String>, summary: impl Into<String>, provenance: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            summary: summary.into(),
-            provenance: provenance.into(),
-        }
-    }
 }
 
 /// A shadow git repository layered over the user's working tree.
@@ -596,22 +535,6 @@ mod tests {
         assert_eq!(cps[0].label, "no-body");
         assert_eq!(cps[0].created_at_unix_ms, 0);
         assert_eq!(cps[0].files_changed, 0);
-    }
-
-    #[test]
-    fn lane_and_draft_patch_model() {
-        let mut lane = Lane::new("agent-lane", "main");
-        assert_eq!(lane.draft_count(), 0);
-        lane.push_draft(DraftPatch::new("p1", "add cache", "agent:planner/turn3"));
-        lane.push_draft(DraftPatch::new("p2", "fix lint", "agent:fixer/turn4"));
-        assert_eq!(lane.draft_count(), 2);
-        assert_eq!(lane.base, "main");
-        assert_eq!(lane.draft_patches[0].provenance, "agent:planner/turn3");
-
-        // Lane round-trips through serde untouched.
-        let json = serde_json::to_string(&lane).unwrap();
-        let back: Lane = serde_json::from_str(&json).unwrap();
-        assert_eq!(lane, back);
     }
 
     #[test]

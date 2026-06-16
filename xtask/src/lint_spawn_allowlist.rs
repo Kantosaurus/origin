@@ -16,11 +16,9 @@ pub const ALLOWLIST: &[&str] = &[
     "crates/origin-supervisor/src/launch_windows.rs",
     // Provider crates carry a few one-off keepalive tasks; tracked for P14.
     "crates/origin-provider-anthropic/src",
-    "crates/origin-provider-openai/src",
     "crates/origin-provider-gemini/src",
     "crates/origin-provider-ollama/src",
     "crates/origin-provider-bedrock/src",
-    "crates/origin-provider-openrouter/src",
     "crates/origin-provider-github/src",
 ];
 

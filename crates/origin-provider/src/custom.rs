@@ -70,6 +70,7 @@ pub fn load(path: &Path) -> Result<Vec<ProviderEntry>, CustomLoadError> {
     for (id, entry) in root.providers {
         let wire = match entry.wire.as_str() {
             "openai-chat" => WireFormat::OpenAIChat,
+            "openai-responses" => WireFormat::OpenAIResponses,
             "anthropic" => WireFormat::Anthropic,
             "gemini" => WireFormat::Gemini,
             "ollama" => WireFormat::Ollama,

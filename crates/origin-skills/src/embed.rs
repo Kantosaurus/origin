@@ -4,8 +4,10 @@
 //! N9.4 — bodies are content-addressed (skill body lives in CAS via `body_hash`);
 //! the index entry's public id is the lower 64 bits of the ULID we mint per skill.
 
+use std::sync::Arc;
+
 use crate::loader::Skill;
-use origin_mem::{IndexError, MemIndex, EMBED_DIM};
+use origin_mem::{Embedder, EmbedderError, IndexError, MemIndex, EMBED_DIM};
 use thiserror::Error;
 
 /// Embedder façade. In production, holds an `origin_mem::Embedder`; in tests,
@@ -16,6 +18,10 @@ pub struct SkillEmbedder {
 
 enum Inner {
     Stub,
+    /// Production arm: a real ONNX `origin_mem::Embedder` shared (`Arc`) with the
+    /// daemon's memory subsystem so skill bodies and memories embed through the
+    /// same model into the same vector space.
+    Real(Arc<Embedder>),
 }
 
 #[allow(clippy::module_name_repetitions)] // unambiguous from outside the crate
@@ -23,15 +29,26 @@ enum Inner {
 pub enum SkillEmbedError {
     #[error("index: {0}")]
     Index(#[from] IndexError),
+    #[error("embed: {0}")]
+    Embed(#[from] EmbedderError),
 }
 
 impl SkillEmbedder {
     /// Deterministic stub for unit tests: maps text bytes onto a normalised
-    /// vector by hashing into `EMBED_DIM` floats. Production callers will use
-    /// `SkillEmbedder::with_embedder` once `origin_mem::Embedder` is wired in.
+    /// vector by hashing into `EMBED_DIM` floats. Production callers use
+    /// [`SkillEmbedder::with_embedder`] with a real `origin_mem::Embedder`.
     #[must_use]
     pub const fn stub_for_tests() -> Self {
         Self { inner: Inner::Stub }
+    }
+
+    /// Production constructor: embed skill bodies through a real ONNX
+    /// `origin_mem::Embedder` (shared with the daemon's memory subsystem).
+    #[must_use]
+    pub const fn with_embedder(embedder: Arc<Embedder>) -> Self {
+        Self {
+            inner: Inner::Real(embedder),
+        }
     }
 
     /// Returns a normalised embedding for `text` (test-only deterministic impl).
@@ -69,8 +86,19 @@ impl SkillEmbedder {
             .try_into()
             .expect("blake3 hash is 32 bytes; first 8 always present");
         let id = u64::from_le_bytes(bytes);
-        let vec = match self.inner {
+        let vec = match &self.inner {
             Inner::Stub => self.embed_for_tests(&skill.body),
+            Inner::Real(embedder) => {
+                // The ONNX embedder L2-normalises its output and returns a
+                // `Vec<f32>` of `EMBED_DIM` length (MiniLM L6 v2 ⇒ 384). Copy it
+                // into the fixed-size array the index expects; a shorter/longer
+                // vector (defensive) is zero-padded / truncated to `EMBED_DIM`.
+                let raw = embedder.embed(&skill.body)?;
+                let mut v = [0_f32; EMBED_DIM];
+                let n = raw.len().min(EMBED_DIM);
+                v[..n].copy_from_slice(&raw[..n]);
+                v
+            }
         };
         index.insert(id, &vec)?;
         Ok(id)

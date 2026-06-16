@@ -38,6 +38,16 @@ pub async fn run(json: bool, privacy: bool) -> Result<()> {
     } else {
         println!("{}", report.to_text());
     }
+    // Signal the verdict to CI / scripts via the process exit code: a FAIL check
+    // must make `origin doctor` exit non-zero so a broken environment is
+    // detectable from the shell. `exit_code` maps OK/WARN -> 0, FAIL -> 2.
+    // We exit directly (mirroring the auto-update re-exec at main.rs) because the
+    // dispatch path collapses every subcommand to `Result<()>` with no typed
+    // error -> exit-code mapping; returning `Ok(())` here would always exit 0.
+    let code = exit_code(report.worst());
+    if code != 0 {
+        std::process::exit(code);
+    }
     Ok(())
 }
 
@@ -119,5 +129,53 @@ pub const fn exit_code(worst: Health) -> i32 {
     match worst {
         Health::Ok | Health::Warn => 0,
         Health::Fail => 2,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{exit_code, Health};
+    use origin_doctor::{diagnose, DoctorInputs};
+
+    #[test]
+    fn exit_code_is_zero_when_all_pass() {
+        assert_eq!(exit_code(Health::Ok), 0);
+        assert_eq!(exit_code(Health::Warn), 0);
+    }
+
+    #[test]
+    fn exit_code_is_nonzero_on_fail() {
+        assert_ne!(exit_code(Health::Fail), 0);
+        assert_eq!(exit_code(Health::Fail), 2);
+    }
+
+    #[test]
+    fn run_path_derives_nonzero_exit_from_a_failing_report() {
+        // Mirror the wiring in `run`: a report whose worst verdict is FAIL must
+        // produce a non-zero `exit_code`, so `origin doctor` will exit non-zero.
+        // (The actual `std::process::exit` call cannot be exercised in-process
+        // without terminating the test, so we assert on the value `run` feeds it.)
+        let failing = DoctorInputs {
+            // An unwritable home is a hard FAIL per the doctor verdict logic.
+            writable_home: false,
+            ..DoctorInputs::default()
+        };
+        let report = diagnose(&failing);
+        assert_eq!(report.worst(), Health::Fail);
+        assert_ne!(exit_code(report.worst()), 0);
+
+        // And a clean, all-pass environment maps back to a zero exit code.
+        let healthy = DoctorInputs {
+            rust_version: Some("rustc 1.96.0".to_string()),
+            config_present: true,
+            daemon_running: true,
+            providers_configured: vec!["anthropic".to_string()],
+            writable_home: true,
+            network_ok: None,
+        };
+        let ok_report = diagnose(&healthy);
+        assert_ne!(ok_report.worst(), Health::Fail);
+        assert_eq!(exit_code(ok_report.worst()), 0);
     }
 }

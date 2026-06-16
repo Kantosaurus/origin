@@ -165,12 +165,9 @@ pub fn refresh(provider: Option<&str>) {
         }
     };
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
     let mut cache = load_cache(&home);
     let count = models.len();
-    cache.put(&name, now, models);
+    cache.put(&name, models);
     match persist_cache(&home, &cache) {
         Ok(()) => println!("refreshed `{name}`: {count} models cached"),
         Err(e) => println!("refreshed `{name}` ({count} models) but failed to persist cache: {e}"),
@@ -267,11 +264,7 @@ mod tests {
         let home = dir.path();
 
         let mut cache = ModelCache::new();
-        cache.put(
-            "acme",
-            1_000,
-            vec![ModelInfo::new("gpt-4o".to_string(), Some(128_000), true)],
-        );
+        cache.put("acme", vec![ModelInfo::new("gpt-4o".to_string())]);
         persist_cache(home, &cache).expect("persist");
         assert!(cache_file(home).exists(), "cache file should be written");
 
@@ -303,12 +296,11 @@ mod tests {
         let mut cache = ModelCache::new();
         cache.put(
             "openai",
-            1_000,
             vec![
-                ModelInfo::new("gpt-4o-mini".to_string(), Some(128_000), true),
+                ModelInfo::new("gpt-4o-mini".to_string()),
                 // Duplicate of the builtin default: must not reappear.
-                ModelInfo::new("gpt-4o".to_string(), None, true),
-                ModelInfo::new("o3".to_string(), None, true),
+                ModelInfo::new("gpt-4o".to_string()),
+                ModelInfo::new("o3".to_string()),
             ],
         );
         let merged = merged_models_for("gpt-4o", &cache, "openai");
@@ -323,8 +315,7 @@ mod tests {
         let mut cache = ModelCache::new();
         cache.put(
             "groq",
-            1_000,
-            vec![ModelInfo::new("llama-3.3-70b-versatile".to_string(), None, true)],
+            vec![ModelInfo::new("llama-3.3-70b-versatile".to_string())],
         );
         let merged = merged_models_for("gpt-4o", &cache, "openai");
         assert_eq!(merged, ["gpt-4o"]);

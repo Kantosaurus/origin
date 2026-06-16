@@ -114,6 +114,45 @@ impl Store {
         })
     }
 
+    /// True iff a migrated memory with this content-key was already inserted.
+    ///
+    /// # Errors
+    /// Propagates rusqlite errors from the query.
+    pub fn contains_migrated_memory(&self, key: &str) -> rusqlite::Result<bool> {
+        self.with_conn(|c| {
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM migrated_memories WHERE key = ?", [key], |r| {
+                r.get(0)
+            })?;
+            Ok(n > 0)
+        })
+    }
+
+    /// Insert a migrated memory keyed by `key` with JSON `body`.
+    ///
+    /// # Errors
+    /// Propagates rusqlite errors (including UNIQUE violations) from the insert.
+    pub fn insert_migrated_memory(&self, key: &str, body_json: &str) -> rusqlite::Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO migrated_memories(key, body) VALUES(?, ?)",
+                rusqlite::params![key, body_json],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Count rows currently in `migrated_memories`. Test/diagnostic helper that
+    /// lets callers confirm the migration sink persisted exactly what it counted.
+    ///
+    /// # Errors
+    /// Propagates rusqlite errors from the query.
+    pub fn count_migrated_memories(&self) -> rusqlite::Result<usize> {
+        self.with_conn(|c| {
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM migrated_memories", [], |r| r.get(0))?;
+            Ok(usize::try_from(n).unwrap_or(0))
+        })
+    }
+
     /// Run `PRAGMA wal_checkpoint(TRUNCATE)` so the WAL is folded back into
     /// the main database file and truncated. Safe to run on a quiesced
     /// store; concurrent writers will be queued by the connection mutex.

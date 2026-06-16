@@ -92,15 +92,50 @@ impl QuicListener {
         bundle: CertBundle,
         allowed_clients: Vec<CertFingerprint>,
     ) -> Result<Self, QuicError> {
-        install_default_crypto_provider();
-
-        let cert = CertificateDer::from(bundle.cert_der);
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bundle.key_der));
-
         let verifier = Arc::new(PinnedClientCertVerifier {
             allowed: allowed_clients,
             provider: provider(),
         });
+        Self::bind_with_verifier(addr, bundle, verifier)
+    }
+
+    /// Bind a listener whose TLS layer accepts **any** client certificate that
+    /// completes the handshake, deferring access control to an application-layer
+    /// bearer token presented on the stream (see
+    /// [`QuicConnection::read_bearer`]).
+    ///
+    /// This is the transport the daemon's pairing flow uses: pairing mints
+    /// *bearer tokens* (bound to a `device_id`), not pinned client-cert
+    /// fingerprints, so the cert-pinned [`Self::bind`] cannot gate it. The TLS
+    /// handshake still authenticates the *server* (the client pins the daemon's
+    /// cert fingerprint out-of-band via the `origin://…#<fp>` URL) and still
+    /// encrypts the channel; the bearer is the per-device authorization anchor.
+    ///
+    /// Deny-by-default is preserved at the application layer: the daemon reads
+    /// the bearer frame and consults `BearerStore::validate` *before* serving
+    /// any `ClientMessage`, closing the connection on a missing/invalid token.
+    ///
+    /// # Errors
+    /// Returns [`QuicError::Tls`] if the rustls server config cannot be
+    /// constructed, or [`QuicError::Io`] if the UDP socket cannot bind.
+    #[allow(clippy::unused_async)]
+    pub async fn bind_bearer_gated(addr: SocketAddr, bundle: CertBundle) -> Result<Self, QuicError> {
+        let verifier = Arc::new(AcceptAnyClientCertVerifier {
+            provider: provider(),
+        });
+        Self::bind_with_verifier(addr, bundle, verifier)
+    }
+
+    /// Shared bind path for both the cert-pinned and bearer-gated listeners.
+    fn bind_with_verifier(
+        addr: SocketAddr,
+        bundle: CertBundle,
+        verifier: Arc<dyn ClientCertVerifier>,
+    ) -> Result<Self, QuicError> {
+        install_default_crypto_provider();
+
+        let cert = CertificateDer::from(bundle.cert_der);
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bundle.key_der));
 
         let mut rustls_config = RustlsServerConfig::builder()
             .with_client_cert_verifier(verifier)
@@ -194,6 +229,35 @@ impl QuicConnector {
         server_fingerprint: CertFingerprint,
         client_bundle: &CertBundle,
     ) -> Result<QuicConnection, QuicError> {
+        Self::connect_with_bearer(addr, server_name, server_fingerprint, client_bundle, None).await
+    }
+
+    /// Like [`Self::connect`], but when `bearer` is `Some`, transmits the token
+    /// as the very first frame on the freshly-opened bidirectional stream so the
+    /// server can authorize the connection before serving any request.
+    ///
+    /// The bearer rides as a single [`FrameKind::Request`] frame whose body is
+    /// the raw token bytes — read on the server with
+    /// [`QuicConnection::read_bearer`]. When `bearer` is `None` **no** auth frame
+    /// is sent, so the unauthenticated path is byte-identical to the original
+    /// [`Self::connect`] (and to a peer that never opted into bearer auth).
+    ///
+    /// # Errors
+    /// Returns [`QuicError::Tls`] on cert/config issues, [`QuicError::Io`] on
+    /// socket bind failure, [`QuicError::Connect`] on handshake failure, or
+    /// [`QuicError::Frame`] if the bearer frame cannot be written.
+    ///
+    /// # Panics
+    /// Does not panic on well-formed input. The internal `.expect` calls operate
+    /// on static string literals (`"0.0.0.0:0"` / `"[::]:0"`) which are
+    /// guaranteed to parse as valid socket addresses.
+    pub async fn connect_with_bearer(
+        addr: SocketAddr,
+        server_name: &str,
+        server_fingerprint: CertFingerprint,
+        client_bundle: &CertBundle,
+        bearer: Option<&str>,
+    ) -> Result<QuicConnection, QuicError> {
         install_default_crypto_provider();
 
         let verifier = Arc::new(PinnedServerCertVerifier {
@@ -234,12 +298,20 @@ impl QuicConnector {
             .open_bi()
             .await
             .map_err(|e| QuicError::Connect(format!("open_bi: {e}")))?;
-        Ok(QuicConnection {
+        let mut conn = QuicConnection {
             send,
             recv,
             endpoint,
             connection: Some(connection),
-        })
+        };
+        // Application-layer authorization: when a bearer was supplied, present
+        // it as the first frame on the stream so the server can authorize this
+        // connection before serving any request. Skipped entirely when `None`
+        // so the unauthenticated path stays byte-identical.
+        if let Some(token) = bearer {
+            conn.write_frame(FrameKind::Request, token.as_bytes()).await?;
+        }
+        Ok(conn)
     }
 }
 
@@ -375,6 +447,67 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
     }
 }
 
+/// Server-side verifier that accepts **any** client certificate completing the
+/// handshake. Used only by [`QuicListener::bind_bearer_gated`], where access
+/// control is enforced at the application layer by an opaque bearer token rather
+/// than by a pinned client-cert fingerprint. The TLS layer still authenticates
+/// the *server* to the client (cert-fingerprint pinning, client side) and
+/// encrypts the channel; this verifier deliberately delegates *client*
+/// authorization to the bearer gate.
+#[derive(Debug)]
+struct AcceptAnyClientCertVerifier {
+    provider: Arc<CryptoProvider>,
+}
+
+impl ClientCertVerifier for AcceptAnyClientCertVerifier {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// One end of a QUIC bidirectional stream. Carries length-prefixed frames
 /// using the same wire format as [`crate::transport::Connection`].
 ///
@@ -464,6 +597,23 @@ impl QuicConnection {
         Ok((kind, body))
     }
 
+    /// Read the application-layer bearer token a client presented as its first
+    /// frame (see [`QuicConnector::connect_with_bearer`]). Returns the token as a
+    /// UTF-8 string.
+    ///
+    /// The daemon calls this immediately after [`QuicListener::accept`] on a
+    /// [`QuicListener::bind_bearer_gated`] listener and hands the result to
+    /// `BearerStore::validate` *before* serving any `ClientMessage`, so a missing
+    /// or invalid token closes the connection (deny-by-default).
+    ///
+    /// # Errors
+    /// Returns [`QuicError::Frame`] if no frame arrives (connection closed before
+    /// presenting a bearer) or the body is not valid UTF-8.
+    pub async fn read_bearer(&mut self) -> Result<String, QuicError> {
+        let (_kind, body) = self.read_frame().await?;
+        String::from_utf8(body).map_err(|e| QuicError::Frame(format!("bearer not utf-8: {e}")))
+    }
+
     /// Write a frame with `kind` and `body`. Uses `request_id = 0` — callers
     /// that need a specific request id should use [`Self::write_raw`].
     ///
@@ -531,5 +681,116 @@ mod tests {
         let (kind, len) = decode_header(&header).expect("at-cap header is valid");
         assert_eq!(kind, FrameKind::Request);
         assert_eq!(len, MAX_FRAME_BYTES);
+    }
+
+    use crate::tls::generate_self_signed;
+
+    /// End-to-end over a real bearer-gated QUIC listener: a client that presents
+    /// a VALID bearer (one the server's validate gate accepts) is served, while a
+    /// client presenting an INVALID bearer is rejected by the gate before any
+    /// request is served. This is the production enforcement contract the daemon
+    /// relies on (its gate is `BearerStore::validate`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bearer_gate_accepts_valid_and_rejects_invalid() {
+        let server_bundle = generate_self_signed("origin-daemon").expect("server cert");
+        let client_bundle = generate_self_signed("origin-client").expect("client cert");
+        let server_fp = sha256_fingerprint(&server_bundle.cert_der);
+
+        let listener = QuicListener::bind_bearer_gated("127.0.0.1:0".parse().expect("addr"), server_bundle)
+            .await
+            .expect("bind bearer-gated");
+        let addr = listener.local_addr();
+
+        // The server's validate gate: only "good-token" authorizes. Mirrors the
+        // daemon's `bearer_store.validate(&presented).is_some()` deny-by-default.
+        let server = tokio::spawn(async move {
+            // First accept: valid bearer ⇒ served.
+            let mut c1 = listener.accept().await.expect("accept 1");
+            let b1 = c1.read_bearer().await.expect("read bearer 1");
+            assert_eq!(b1, "good-token", "server saw the transmitted bearer");
+            if b1 == "good-token" {
+                c1.write_frame(FrameKind::Response, b"served").await.expect("serve 1");
+            }
+            // Second accept: invalid bearer ⇒ gate denies, connection dropped
+            // without serving any request.
+            let mut c2 = listener.accept().await.expect("accept 2");
+            let b2 = c2.read_bearer().await.expect("read bearer 2");
+            assert_ne!(b2, "good-token", "invalid bearer must not match");
+            // Deny-by-default: drop without responding.
+            drop(c2);
+        });
+
+        // Valid bearer round-trips over the wire and is served.
+        let mut ok = QuicConnector::connect_with_bearer(
+            addr,
+            "origin-daemon",
+            server_fp,
+            &client_bundle,
+            Some("good-token"),
+        )
+        .await
+        .expect("connect valid");
+        ok.write_raw(&crate::frame::encode(1, FrameKind::Request, b"hi"))
+            .await
+            .expect("send request");
+        let (kind, body) = ok.read_frame().await.expect("served response");
+        assert_eq!(kind, FrameKind::Response);
+        assert_eq!(&body, b"served");
+        drop(ok);
+
+        // Invalid bearer: the gate denies, so no response is ever served. The
+        // attempt to read one fails (connection closed by the gate).
+        let mut bad = QuicConnector::connect_with_bearer(
+            addr,
+            "origin-daemon",
+            server_fp,
+            &client_bundle,
+            Some("evil-token"),
+        )
+        .await
+        .expect("connect (TLS ok; bearer rejected at app layer)");
+        bad.write_raw(&crate::frame::encode(1, FrameKind::Request, b"intrude"))
+            .await
+            .expect("send request");
+        let denied = bad.read_frame().await;
+        assert!(
+            denied.is_err(),
+            "invalid bearer must be denied: no request served"
+        );
+
+        server.await.expect("server task");
+    }
+
+    /// The bearer travels the wire verbatim: what the client transmits via
+    /// `connect_with_bearer(Some(..))` is exactly what the server reads via
+    /// `read_bearer`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bearer_round_trips_verbatim() {
+        let server_bundle = generate_self_signed("origin-daemon").expect("server cert");
+        let client_bundle = generate_self_signed("origin-client").expect("client cert");
+        let server_fp = sha256_fingerprint(&server_bundle.cert_der);
+        let token = "orb_deadbeefcafef00d";
+
+        let listener = QuicListener::bind_bearer_gated("127.0.0.1:0".parse().expect("addr"), server_bundle)
+            .await
+            .expect("bind");
+        let addr = listener.local_addr();
+        let server = tokio::spawn(async move {
+            let mut c = listener.accept().await.expect("accept");
+            c.read_bearer().await.expect("read bearer")
+        });
+
+        let _client = QuicConnector::connect_with_bearer(
+            addr,
+            "origin-daemon",
+            server_fp,
+            &client_bundle,
+            Some(token),
+        )
+        .await
+        .expect("connect");
+
+        let got = server.await.expect("server task");
+        assert_eq!(got, token, "bearer must round-trip byte-for-byte");
     }
 }

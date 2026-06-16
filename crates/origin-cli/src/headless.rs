@@ -34,7 +34,10 @@ pub struct RunArgs {
     pub json: bool,
     /// Remote daemon URL (`origin://host:port#fingerprint`).
     pub remote: Option<String>,
-    /// Optional bearer token for remote auth (not yet sent on the wire).
+    /// Optional bearer token for remote auth. When set on a `--remote` run it is
+    /// transmitted as the first frame of the QUIC handshake (see
+    /// [`origin_ipc::quic::QuicConnector::connect_with_bearer`]) so the daemon's
+    /// bearer gate can authorize the connection.
     pub bearer: Option<String>,
     /// Model override.
     pub model: Option<String>,
@@ -138,9 +141,6 @@ pub async fn run(args: RunArgs) -> Result<()> {
         json_schema,
         roots,
     } = args;
-    // Future work: send `bearer` as part of the remote handshake.
-    let _ = bearer;
-
     let fmt = OutputFormat::resolve(json, output_format.as_deref())?;
     let raw_model =
         model.unwrap_or_else(|| std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-fable-5".into()));
@@ -159,11 +159,16 @@ pub async fn run(args: RunArgs) -> Result<()> {
             let parsed = crate::admin_url::parse_origin_url(&url)?;
             let server_fp = parsed.server_fingerprint()?;
             let client_bundle = crate::admin_url::resolve_client_bundle()?;
-            let qc = origin_ipc::quic::QuicConnector::connect(
+            // Transmit the bearer (if supplied) as the first frame of the QUIC
+            // handshake so the daemon's bearer gate authorizes this connection.
+            // A `None` bearer sends no auth frame, byte-identical to the
+            // pre-bearer `--remote` path.
+            let qc = origin_ipc::quic::QuicConnector::connect_with_bearer(
                 parsed.addr,
                 "origin-daemon",
                 server_fp,
                 &client_bundle,
+                bearer.as_deref(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;

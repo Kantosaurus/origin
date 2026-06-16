@@ -2,11 +2,11 @@
 //! Trait the envelope passes into the `Diagnostics` tool. Implemented daemon-side
 //! by `origin-daemon::ra_impl::DaemonRa` (wraps `origin-lsp-client::LspClient`).
 //!
-//! # Design note — Phase 6
-//! `DaemonRa` is constructed per-call (not shared via `EnvelopeCtx`) because the
-//! `dispatch_with_envelope` plumbing was deferred in Phase 2. Phase 8 cleanup
-//! will wire the shared handle; until then, per-call construction is suboptimal
-//! but unblocking.
+//! # Design note
+//! `DaemonRa` is constructed per-call rather than shared via `EnvelopeCtx`: the
+//! `tool_envelope`/`EnvelopeCtx` sharing path was never wired into the daemon
+//! (the live dispatch calls each builtin directly — see [`crate::tool_envelope`]),
+//! so there is no shared handle to thread. Per-call construction is the live path.
 
 use std::path::Path;
 

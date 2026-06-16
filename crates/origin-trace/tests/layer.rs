@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::needless_collect, clippy::used_underscore_binding)]
 
-use origin_trace::init;
+use origin_trace::{init, QueryArgs};
 use tempfile::tempdir;
 use tracing::{info_span, instrument};
 
@@ -28,4 +28,25 @@ fn span_close_writes_a_row_to_the_ring() {
         !files.is_empty(),
         "expected at least one parquet file after span close"
     );
+
+    // The leading `ts_ns` column must carry a real wall-clock timestamp, not
+    // the placeholder `0`. Read the written rows back and assert every span row
+    // is stamped. (Same `init`/global-subscriber path as above, so this runs in
+    // the same test to stay deterministic with `set_global_default`.)
+    let rows = origin_trace::query::run(&QueryArgs {
+        dir: dir.path().to_path_buf(),
+        kind: None,
+        error_kind: None,
+        limit: 64,
+    })
+    .expect("query");
+    assert!(!rows.is_empty(), "expected at least one queried span row");
+    for row in &rows {
+        assert!(
+            row.ts_ns > 0,
+            "span row must have a real ts_ns, got 0 (kind={}, tool={})",
+            row.kind,
+            row.tool
+        );
+    }
 }

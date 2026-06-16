@@ -43,6 +43,23 @@ pub struct SpawnOpts {
     pub cwd: Option<String>,
     pub env: Vec<(String, String)>,
     pub buffer_cap_bytes: Option<usize>,
+    /// Per-tool sandbox confinement applied to the spawned child (P11.5).
+    ///
+    /// `None` (the default everywhere) is treated exactly like
+    /// [`SandboxProfile::Inherit`]: the child inherits the daemon's privileges
+    /// and [`origin_sandbox::apply`] is never invoked, so the spawn is
+    /// byte-identical to the pre-wiring path. When `Some(profile)`, the profile
+    /// is handed to [`origin_sandbox::apply`] just before `spawn()` so the
+    /// per-OS backend can confine the child.
+    ///
+    /// Enforcement is Linux/macOS-only and only when the matching
+    /// `origin-sandbox` cargo feature is compiled in; on every other host (and
+    /// in the default feature set used here) `apply` resolves to the
+    /// [`origin_sandbox::backend_noop`] backend, which mutates nothing and only
+    /// logs a warning for a non-`Inherit` profile. The Windows backend needs a
+    /// post-spawn Job-Object handshake that this supervisor does not perform, so
+    /// the `windows` feature is intentionally not engaged here.
+    pub sandbox_profile: Option<origin_sandbox::SandboxProfile>,
 }
 
 #[derive(Debug)]
@@ -83,6 +100,35 @@ impl ProcSlot {
 /// Convenience: unlock a `Mutex`, recovering from poison.
 fn unlock<T>(r: Result<T, PoisonError<T>>) -> T {
     r.unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Apply the requested [`origin_sandbox::SandboxProfile`] to `cmd` before spawn.
+///
+/// `None` (or any caller that never sets `sandbox_profile`) is a complete no-op:
+/// `apply` is never called, so the spawn is byte-identical to the pre-wiring
+/// path. A `Some(profile)` is forwarded to [`origin_sandbox::apply`] via the
+/// std command behind tokio's `Command` (`as_std_mut`); tokio preserves the
+/// `pre_exec`/creation-flag mutations the backend makes when it later spawns.
+///
+/// Enforcement is Linux/macOS-only and only when the matching `origin-sandbox`
+/// OS feature is compiled in. origin-tools enables no such feature, so in this
+/// dependency graph `apply` resolves to [`origin_sandbox::backend_noop`], which
+/// mutates nothing and only warns on a non-`Inherit` profile — Bash keeps
+/// working. The Windows enforcement backend would set `CREATE_SUSPENDED` and
+/// depend on a post-spawn Job-Object attach + `ResumeThread` this supervisor
+/// does not perform; because that backend is never compiled here it cannot be
+/// reached, but the hazard is documented so it is not wired naively later.
+fn apply_sandbox(cmd: &mut Command, profile: Option<origin_sandbox::SandboxProfile>) {
+    let Some(profile) = profile else { return };
+    if profile == origin_sandbox::SandboxProfile::Inherit {
+        return;
+    }
+    // Confinement is best-effort here: a backend that rejects the policy must
+    // not fail the tool. The real enforcement backends (Linux/macOS) succeed at
+    // apply-time and surface kernel denials inside the child; the no-op backend
+    // already logs its own warning. We therefore drop any apply error and spawn
+    // the child unconfined rather than failing the spawn.
+    let _ = origin_sandbox::apply(profile, cmd.as_std_mut());
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +197,19 @@ impl Supervisor {
             .stderr(Stdio::piped())
             .stdin(Stdio::null());
         cmd.kill_on_drop(true);
+
+        // P11.5: confine the child to the requested sandbox profile, if any.
+        // `None`/`Inherit` skip `apply` entirely so the spawn is byte-identical
+        // to the pre-wiring path. `apply` takes a `std::process::Command`;
+        // tokio's `Command` exposes the wrapped std command via `as_std_mut`,
+        // and tokio preserves any `pre_exec`/creation-flags set there when it
+        // spawns. The Windows enforcement backend sets `CREATE_SUSPENDED` and
+        // relies on a post-spawn Job-Object attach this supervisor does not run,
+        // so it would wedge the child — we keep that backend out of the spawn
+        // path. The default build has no OS backend feature enabled, so this
+        // resolves to the no-op backend that only warns on a non-Inherit
+        // profile and mutates nothing.
+        apply_sandbox(&mut cmd, opts.sandbox_profile);
 
         let spawned = cmd.spawn();
         // On Windows, if the direct spawn fails (e.g. the command is a shell

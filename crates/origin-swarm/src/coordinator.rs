@@ -10,14 +10,12 @@
 //! - and a `last_completion` slot test code can poke at without round-tripping
 //!   through `await_completion`.
 //!
-//! P9.7 wires in `PrefixLedger` inheritance; P9.8 substitutes the real
-//! agent-loop `WorkerFn`; P9.9 wires the TUI panel against the same
-//! `PlanHandle`.
+//! P9.8 substitutes the real agent-loop `WorkerFn`; P9.9 wires the TUI panel
+//! against the same `PlanHandle`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use origin_planner::PrefixLedger;
 use origin_runtime::{spawn_in, TaskClass};
 use tokio::sync::{watch, Mutex};
 use ulid::Ulid;
@@ -26,7 +24,6 @@ use crate::admission::AdmissionGate;
 use crate::collab::{FileRegistry, Mailbox};
 use crate::error::SwarmError;
 use crate::lifecycle::Lifecycle;
-use crate::prefix_inherit::PrefixSnapshot;
 use crate::report::CompletionReport;
 use crate::rpc::PlanHandle;
 use crate::spec::WorkerSpec;
@@ -119,15 +116,6 @@ pub struct Coordinator {
     workers: Arc<Mutex<HashMap<WorkerId, WorkerState>>>,
     default_worker: WorkerFn,
     last_completion: Arc<Mutex<Option<CompletionReport>>>,
-    /// Parent ledger retained so observers can re-snapshot post-builder if
-    /// the upstream code mutates a clone before spawn. Currently not exposed
-    /// publicly — the cached `parent_snapshot` is what workers actually see.
-    parent_ledger: Option<PrefixLedger>,
-    /// Eagerly cached `PrefixSnapshot` computed once at
-    /// [`Coordinator::with_parent_ledger`] time. Cloned cheaply into every
-    /// `WorkerContext::inherited_ledger` on spawn (`Vec<(SectionId, Band)>`
-    /// clone — both `Copy` payloads).
-    parent_snapshot: Option<PrefixSnapshot>,
     /// Memory-governed admission gate. Defaults to the process-shared gate so
     /// every room draws on one authoritative RAM budget; spawn admits through
     /// it (parking, holding nothing) before launching the worker, so the swarm
@@ -140,10 +128,9 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
-    /// Construct a new coordinator wrapping `plan` and bound to a logical
-    /// `ring_name` (the SMR shared-memory region the coordinator will create
-    /// when workers actually need it — P9.6 lazily defers ring creation since
-    /// the noop worker never sends).
+    /// Construct a new coordinator wrapping `plan` and tagged with a logical
+    /// `ring_name` (a diagnostic room label; in-process workers communicate
+    /// through the shared `PlanHandle`, so no shared-memory region is opened).
     #[must_use]
     pub fn new(plan: PlanHandle, ring_name: impl Into<String>) -> Self {
         // Real-time collaboration is default-ON: build the room state so workers
@@ -164,14 +151,12 @@ impl Coordinator {
             workers: Arc::new(Mutex::new(HashMap::new())),
             default_worker: default_noop_worker(),
             last_completion: Arc::new(Mutex::new(None)),
-            parent_ledger: None,
-            parent_snapshot: None,
             gate: AdmissionGate::shared(),
             collab,
         }
     }
 
-    /// Logical SMR ring name (diagnostic accessor).
+    /// Logical room label this coordinator was tagged with (diagnostic accessor).
     #[must_use]
     pub fn ring_name(&self) -> &str {
         &self.ring_name
@@ -184,21 +169,6 @@ impl Coordinator {
     #[must_use]
     pub fn with_memory_gate(mut self, gate: Arc<AdmissionGate>) -> Self {
         self.gate = gate;
-        self
-    }
-
-    /// Builder-style setter for the parent's `PrefixLedger`.
-    ///
-    /// The snapshot of stable bands (`Frozen` + `Sticky`) is computed
-    /// **once, eagerly** here and cached for the lifetime of the
-    /// coordinator. Subsequent `spawn`/`spawn_with` calls clone the cached
-    /// snapshot into each `WorkerContext` rather than re-walking the
-    /// ledger — workers should see a stable inheritance set per coordinator
-    /// (N7.1, P9.7).
-    #[must_use]
-    pub fn with_parent_ledger(mut self, l: PrefixLedger) -> Self {
-        self.parent_snapshot = Some(Self::take_prefix_snapshot(&l));
-        self.parent_ledger = Some(l);
         self
     }
 
@@ -246,11 +216,9 @@ impl Coordinator {
 
         let ctx = WorkerContext {
             plan: self.plan.clone(),
-            smr_producer: None,
             budget: spec.budget,
             parent_actor: spec.parent_actor,
             spec: spec.clone(),
-            inherited_ledger: self.parent_snapshot.clone().unwrap_or_default(),
             collab,
         };
 
@@ -396,15 +364,5 @@ impl Coordinator {
     #[must_use]
     pub fn last_completion_for_test(&self) -> Option<CompletionReport> {
         self.last_completion.try_lock().ok().and_then(|g| g.clone())
-    }
-
-    /// Extract a `PrefixSnapshot` from a parent `PrefixLedger`, retaining
-    /// only `Frozen` + `Sticky` band entries (N7.1, P9.7).
-    ///
-    /// Free-function-style: takes a borrow, returns an owned snapshot.
-    /// Idempotent and side-effect free.
-    #[must_use]
-    pub fn take_prefix_snapshot(l: &PrefixLedger) -> PrefixSnapshot {
-        PrefixSnapshot::from_ledger(l)
     }
 }

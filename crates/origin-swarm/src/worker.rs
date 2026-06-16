@@ -13,12 +13,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use origin_plan::ActorId;
-use origin_smr::Ring;
 
 use crate::collab::{FileRegistry, Mailbox};
 use crate::coordinator::WorkerId;
 use crate::error::SwarmError;
-use crate::prefix_inherit::PrefixSnapshot;
 use crate::report::CompletionReport;
 use crate::rpc::PlanHandle;
 use crate::spec::{Budget, ReportStatus, Usage, WorkerSpec};
@@ -60,31 +58,16 @@ pub struct WorkerCollab {
 pub struct WorkerContext {
     /// Shared plan handle (workers see and author plan ops through this).
     pub plan: PlanHandle,
-    /// SMR producer ring. `None` in P9.6 noop tests; P9.8 populates it.
-    pub smr_producer: Option<Arc<Ring>>,
     /// Resource ceiling.
     pub budget: Budget,
     /// Parent's `ActorId` — the worker uses this to thread Lamport ordering.
     pub parent_actor: ActorId,
     /// Verbatim spec the worker was launched with.
     pub spec: WorkerSpec,
-    /// Coordinator's `PrefixLedger` snapshot at spawn time — populated with
-    /// the parent's `Frozen` + `Sticky` band entries (N7.1, P9.7). Workers
-    /// call [`PrefixSnapshot::seed_into`] against a fresh `PrefixLedger` on
-    /// their first turn to reuse the coordinator's stable prefix bytes.
-    pub inherited_ledger: PrefixSnapshot,
     /// Real-time swarm-collaboration handle (WS-L, jcode L238). `Some` only
     /// when the coordinator was built with `ORIGIN_SWARM_COLLAB` set; `None`
     /// (the default) ⇒ the worker scopes no collab context ⇒ byte-identical.
     pub collab: Option<WorkerCollab>,
-}
-
-impl WorkerContext {
-    /// Read-only access to the inherited `PrefixLedger` snapshot.
-    #[must_use]
-    pub const fn inherited_ledger(&self) -> &PrefixSnapshot {
-        &self.inherited_ledger
-    }
 }
 
 /// Worker future: takes a `WorkerContext`, returns a `CompletionReport`.

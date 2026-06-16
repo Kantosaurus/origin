@@ -293,8 +293,18 @@ fn detect_rm_rf_home(cmd: &str, risks: &mut Vec<Risk>) {
     if effective_command(&ws) != Some("rm") {
         return;
     }
-    let has_recursive_force = ws.iter().skip(1).any(|w| is_rf_flag(w));
-    if !has_recursive_force {
+    // Aggregate the recursive and force intents across *all* flag tokens, so
+    // the separated forms (`rm -r -f ~`, `rm -f -r ~`, `rm --recursive --force
+    // ~`) are recognized as well as the combined `-rf` bundle. A single token
+    // may also carry both (e.g. `-rf`).
+    let mut has_recursive = false;
+    let mut has_force = false;
+    for w in ws.iter().skip(1) {
+        let (r, f) = rf_intent(w);
+        has_recursive |= r;
+        has_force |= f;
+    }
+    if !(has_recursive && has_force) {
         return;
     }
     for target in ws.iter().skip(1).filter(|w| !w.starts_with('-')) {
@@ -307,18 +317,29 @@ fn detect_rm_rf_home(cmd: &str, risks: &mut Vec<Risk>) {
     }
 }
 
-/// True for a flag bundle that enables both recursive and force, e.g. `-rf`,
-/// `-fr`, `-Rf`, or the long `--recursive`/`--force` forms.
-fn is_rf_flag(w: &str) -> bool {
-    if let Some(bundle) = w.strip_prefix("--") {
-        return matches!(bundle, "recursive" | "force" | "no-preserve-root");
+/// Classify a single `rm` argument into the `(recursive, force)` intent it
+/// contributes. Returns `(false, false)` for non-flag tokens. Handles both the
+/// combined short bundle (`-rf` → `(true, true)`) and the separated short
+/// (`-r` → `(true, false)`, `-f` → `(false, true)`) and long
+/// (`--recursive`/`--force`) forms, so the caller can OR the intents across all
+/// tokens regardless of flag order or grouping. `--no-preserve-root` is the
+/// safety override only ever paired with a destructive recursive force, so it
+/// implies both.
+fn rf_intent(w: &str) -> (bool, bool) {
+    if let Some(long) = w.strip_prefix("--") {
+        return match long {
+            "recursive" => (true, false),
+            "force" => (false, true),
+            "no-preserve-root" => (true, true),
+            _ => (false, false),
+        };
     }
     if let Some(bundle) = w.strip_prefix('-') {
         let has_r = bundle.contains('r') || bundle.contains('R');
         let has_f = bundle.contains('f');
-        return has_r && has_f;
+        return (has_r, has_f);
     }
-    false
+    (false, false)
 }
 
 /// Targets that mean "the home directory or the filesystem root".
@@ -500,6 +521,48 @@ mod tests {
         // A specific subdirectory is not flagged by this detector.
         let a = analyze("rm -rf ./build");
         assert!(matches!(worst(&a), Risk::Safe), "build dir should be safe");
+    }
+
+    #[test]
+    fn rm_recursive_and_force_as_separate_flags_is_dangerous() {
+        // The recursive + force intent must be recognized even when `-r` and
+        // `-f` are supplied as SEPARATE tokens (in either order), not only as
+        // the combined `-rf` bundle, and likewise for the long forms.
+        for line in [
+            "rm -r -f ~",
+            "rm -f -r ~",
+            "rm -r -f $HOME",
+            "rm --recursive --force ~",
+            "rm -r --force ~",
+            "rm --recursive -f /",
+            "sudo rm -r -f ~",
+        ] {
+            let a = analyze(line);
+            assert!(
+                matches!(worst(&a), Risk::Dangerous(_)),
+                "expected Dangerous for {line:?}, got {:?}",
+                worst(&a)
+            );
+        }
+    }
+
+    #[test]
+    fn rm_recursive_without_force_or_plain_rm_is_not_flagged() {
+        // Recursive alone (no force) targeting a specific home subpath is not
+        // the catastrophic shape this detector exists for; nor is a plain `rm`.
+        for line in [
+            "rm -r ~/somefile",
+            "rm --recursive ~/project",
+            "rm file",
+            "rm -f config.toml",
+        ] {
+            let a = analyze(line);
+            assert!(
+                !matches!(worst(&a), Risk::Dangerous(_)),
+                "expected NOT Dangerous for {line:?}, got {:?}",
+                worst(&a)
+            );
+        }
     }
 
     #[test]

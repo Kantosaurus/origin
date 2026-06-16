@@ -21,9 +21,8 @@
 //! assert_eq!(catalog, ["claude-sonnet-4-6", "gpt-4o", "gpt-4o-mini"]);
 //!
 //! let mut cache = ModelCache::new();
-//! cache.put("openai", 1_000, discovered);
-//! assert!(!cache.is_stale("openai", 1_300, 600));
-//! assert!(cache.is_stale("openai", 5_000, 600));
+//! cache.put("openai", discovered);
+//! assert_eq!(cache.get("openai").map(<[_]>::len), Some(2));
 //! ```
 
 #![forbid(unsafe_code)]
@@ -37,23 +36,13 @@ use serde::{Deserialize, Serialize};
 pub struct ModelInfo {
     /// Provider-scoped model identifier (for example `gpt-4o`).
     pub id: String,
-    /// Maximum context window in tokens, when the provider advertises one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_window: Option<u32>,
-    /// Whether the model is known to support tool / function calling.
-    #[serde(default)]
-    pub supports_tools: bool,
 }
 
 impl ModelInfo {
-    /// Construct a [`ModelInfo`] from its parts.
+    /// Construct a [`ModelInfo`] from its id.
     #[must_use]
-    pub const fn new(id: String, context_window: Option<u32>, supports_tools: bool) -> Self {
-        Self {
-            id,
-            context_window,
-            supports_tools,
-        }
+    pub const fn new(id: String) -> Self {
+        Self { id }
     }
 }
 
@@ -73,10 +62,6 @@ pub enum DiscoveryError {
 #[derive(Debug, Deserialize)]
 struct RawModel {
     id: Option<String>,
-    #[serde(alias = "context_length", alias = "max_context", alias = "context")]
-    context_window: Option<u32>,
-    #[serde(default, alias = "tools", alias = "function_calling")]
-    supports_tools: Option<bool>,
 }
 
 /// Accepted top-level shapes for a model-listing response.
@@ -98,11 +83,7 @@ impl RawModel {
     fn into_info(self) -> Option<ModelInfo> {
         // Drop entries without a usable id; an empty id is meaningless.
         let id = self.id.filter(|s| !s.is_empty())?;
-        Some(ModelInfo {
-            id,
-            context_window: self.context_window,
-            supports_tools: self.supports_tools.unwrap_or(false),
-        })
+        Some(ModelInfo { id })
     }
 }
 
@@ -116,10 +97,8 @@ impl RawModel {
 /// * a bare top-level array of model objects.
 ///
 /// Entries lacking a non-empty `id` are skipped rather than rejected, so a
-/// single malformed row does not discard an otherwise valid listing. Optional
-/// `context_window` (also accepted as `context_length` / `max_context` /
-/// `context`) and `supports_tools` (also `tools` / `function_calling`) fields
-/// are captured when present.
+/// single malformed row does not discard an otherwise valid listing. Any
+/// additional per-model fields are ignored.
 ///
 /// # Errors
 ///
@@ -160,20 +139,17 @@ pub fn merge_catalog(builtin: &[String], discovered: &[ModelInfo]) -> Vec<String
     out
 }
 
-/// A single cached provider listing: when it was fetched and what it contained.
+/// A single cached provider listing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CacheEntry {
-    fetched_at_unix: u64,
     models: Vec<ModelInfo>,
 }
 
-/// A TTL-aware cache mapping a provider name to its last discovered model list.
+/// A cache mapping a provider name to its last discovered model list.
 ///
-/// The cache stores the fetch timestamp alongside the models so callers can ask
-/// [`ModelCache::is_stale`] whether a refetch is due, then fetch and
-/// [`ModelCache::put`] the fresh result. It is plain in-memory state with no
-/// background expiry; staleness is evaluated on demand against a caller-supplied
-/// clock, keeping the type pure and offline-testable.
+/// Plain in-memory state with no background expiry: callers
+/// [`ModelCache::put`] a freshly fetched listing and [`ModelCache::get`] it
+/// back. The type is pure and offline-testable.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCache {
     providers: BTreeMap<String, CacheEntry>,
@@ -186,36 +162,16 @@ impl ModelCache {
         Self::default()
     }
 
-    /// Insert or replace the cached listing for `provider`, recording the
-    /// wall-clock `now_unix` (seconds) at which it was fetched.
-    pub fn put(&mut self, provider: &str, now_unix: u64, models: Vec<ModelInfo>) {
-        self.providers.insert(
-            provider.to_string(),
-            CacheEntry {
-                fetched_at_unix: now_unix,
-                models,
-            },
-        );
+    /// Insert or replace the cached listing for `provider`.
+    pub fn put(&mut self, provider: &str, models: Vec<ModelInfo>) {
+        self.providers
+            .insert(provider.to_string(), CacheEntry { models });
     }
 
     /// Return the cached models for `provider`, or `None` if never fetched.
     #[must_use]
     pub fn get(&self, provider: &str) -> Option<&[ModelInfo]> {
         self.providers.get(provider).map(|e| e.models.as_slice())
-    }
-
-    /// Report whether `provider`'s cached listing is stale at `now_unix` for the
-    /// given `ttl_secs`.
-    ///
-    /// A provider that was never cached is always stale (a refetch is due). A
-    /// cached provider is stale once `now_unix` is more than `ttl_secs` past its
-    /// fetch time. Clock skew that places `now_unix` before the fetch time is
-    /// treated as fresh (the saturating difference is zero).
-    #[must_use]
-    pub fn is_stale(&self, provider: &str, now_unix: u64, ttl_secs: u64) -> bool {
-        self.providers
-            .get(provider)
-            .is_none_or(|entry| now_unix.saturating_sub(entry.fetched_at_unix) > ttl_secs)
     }
 
     /// Serialize the whole cache to a JSON string for on-disk persistence.
@@ -252,11 +208,7 @@ mod tests {
         let models = parse_models_response(body).unwrap();
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "gpt-4o");
-        assert_eq!(models[0].context_window, Some(128_000));
-        assert!(models[0].supports_tools);
         assert_eq!(models[1].id, "gpt-4o-mini");
-        assert_eq!(models[1].context_window, None);
-        assert!(!models[1].supports_tools);
     }
 
     #[test]
@@ -269,15 +221,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_models_array_shape_with_field_aliases() {
+    fn parses_models_array_shape_ignoring_extra_fields() {
+        // Extra per-model fields (here `context_length`, `function_calling`)
+        // are tolerated and ignored; only `id` is captured.
         let body = r#"{"models":[
             {"id":"gemini-2.5-pro","context_length":1000000,"function_calling":true}
         ]}"#;
         let models = parse_models_response(body).unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "gemini-2.5-pro");
-        assert_eq!(models[0].context_window, Some(1_000_000));
-        assert!(models[0].supports_tools);
     }
 
     #[test]
@@ -301,12 +253,12 @@ mod tests {
     fn merge_catalog_dedups_and_is_builtin_first() {
         let builtin = vec!["claude-sonnet-4-6".to_string(), "claude-opus-4-8".to_string()];
         let discovered = vec![
-            ModelInfo::new("gpt-4o".to_string(), None, true),
+            ModelInfo::new("gpt-4o".to_string()),
             // Duplicate of a builtin id: must not reappear.
-            ModelInfo::new("claude-opus-4-8".to_string(), None, true),
-            ModelInfo::new("gpt-4o-mini".to_string(), None, true),
+            ModelInfo::new("claude-opus-4-8".to_string()),
+            ModelInfo::new("gpt-4o-mini".to_string()),
             // Duplicate within discovered: collapsed to first occurrence.
-            ModelInfo::new("gpt-4o".to_string(), None, true),
+            ModelInfo::new("gpt-4o".to_string()),
         ];
         let merged = merge_catalog(&builtin, &discovered);
         assert_eq!(
@@ -319,24 +271,18 @@ mod tests {
     fn cache_put_get_roundtrips_models() {
         let mut cache = ModelCache::new();
         assert!(cache.get("openai").is_none());
-        let models = vec![ModelInfo::new("gpt-4o".to_string(), Some(128_000), true)];
-        cache.put("openai", 1_000, models.clone());
+        let models = vec![ModelInfo::new("gpt-4o".to_string())];
+        cache.put("openai", models.clone());
         assert_eq!(cache.get("openai"), Some(models.as_slice()));
     }
 
     #[test]
-    fn cache_is_stale_fresh_vs_past_ttl() {
+    fn cache_put_replaces_prior_listing() {
         let mut cache = ModelCache::new();
-        // Never fetched -> always stale.
-        assert!(cache.is_stale("openai", 0, 600));
-        cache.put("openai", 1_000, vec![]);
-        // Within TTL -> fresh.
-        assert!(!cache.is_stale("openai", 1_000, 600));
-        assert!(!cache.is_stale("openai", 1_600, 600));
-        // Exactly one second past TTL -> stale.
-        assert!(cache.is_stale("openai", 1_601, 600));
-        // Clock skew (now before fetch) is treated as fresh.
-        assert!(!cache.is_stale("openai", 500, 600));
+        cache.put("openai", vec![ModelInfo::new("old".to_string())]);
+        cache.put("openai", vec![ModelInfo::new("new".to_string())]);
+        assert_eq!(cache.get("openai").map(<[_]>::len), Some(1));
+        assert_eq!(cache.get("openai").unwrap()[0].id, "new");
     }
 
     #[test]
@@ -344,19 +290,14 @@ mod tests {
         let mut cache = ModelCache::new();
         cache.put(
             "anthropic",
-            42,
-            vec![ModelInfo::new("claude-opus-4-8".to_string(), Some(200_000), true)],
+            vec![ModelInfo::new("claude-opus-4-8".to_string())],
         );
-        cache.put(
-            "openai",
-            7,
-            vec![ModelInfo::new("gpt-4o".to_string(), None, true)],
-        );
+        cache.put("openai", vec![ModelInfo::new("gpt-4o".to_string())]);
         let json = cache.to_json().unwrap();
         let restored = ModelCache::from_json(&json).unwrap();
         assert_eq!(restored, cache);
         assert_eq!(restored.get("anthropic").unwrap().len(), 1);
-        assert!(!restored.is_stale("openai", 8, 600));
+        assert_eq!(restored.get("openai").unwrap()[0].id, "gpt-4o");
     }
 
     #[test]

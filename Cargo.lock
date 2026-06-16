@@ -1043,12 +1043,6 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "cfg_aliases"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd16c4719339c4530435d38e511904438d07cce7950afa3718a84ac36c10e89e"
-
-[[package]]
-name = "cfg_aliases"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
@@ -1840,12 +1834,6 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
-
-[[package]]
-name = "fixedbitset"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
 
 [[package]]
 name = "flatbuffers"
@@ -3593,25 +3581,13 @@ dependencies = [
 
 [[package]]
 name = "nix"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab2156c4fce2f8df6c499cc1c763e4394b7482525bf2a9701c9d79d215f519e4"
-dependencies = [
- "bitflags 2.11.1",
- "cfg-if",
- "cfg_aliases 0.1.1",
- "libc",
-]
-
-[[package]]
-name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
 dependencies = [
  "bitflags 2.11.1",
  "cfg-if",
- "cfg_aliases 0.2.1",
+ "cfg_aliases",
  "libc",
  "memoffset 0.9.1",
 ]
@@ -3624,7 +3600,7 @@ checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
 dependencies = [
  "bitflags 2.11.1",
  "cfg-if",
- "cfg_aliases 0.2.1",
+ "cfg_aliases",
  "libc",
 ]
 
@@ -3965,7 +3941,7 @@ dependencies = [
 
 [[package]]
 name = "origin-alloc"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "libc",
  "serial_test",
@@ -3978,7 +3954,7 @@ dependencies = [
 
 [[package]]
 name = "origin-ambient"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -3986,7 +3962,7 @@ dependencies = [
 
 [[package]]
 name = "origin-bench"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -4001,7 +3977,7 @@ dependencies = [
 
 [[package]]
 name = "origin-browser"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "html2md",
  "origin-keyvault",
@@ -4019,7 +3995,7 @@ dependencies = [
 
 [[package]]
 name = "origin-cas"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "blake3",
  "byteorder",
@@ -4040,7 +4016,7 @@ dependencies = [
 
 [[package]]
 name = "origin-cassette"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4049,7 +4025,7 @@ dependencies = [
 
 [[package]]
 name = "origin-cli"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4125,21 +4101,21 @@ dependencies = [
 
 [[package]]
 name = "origin-clipboard"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "origin-cmdparse"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "origin-codegraph"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "blake3",
  "criterion",
@@ -4147,7 +4123,6 @@ dependencies = [
  "lopdf 0.32.0",
  "origin-cas",
  "origin-store",
- "petgraph",
  "regex",
  "rkyv",
  "rusqlite",
@@ -4175,7 +4150,7 @@ dependencies = [
 
 [[package]]
 name = "origin-conseca"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4184,7 +4159,7 @@ dependencies = [
 
 [[package]]
 name = "origin-core"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "proptest",
  "rkyv",
@@ -4194,25 +4169,14 @@ dependencies = [
 
 [[package]]
 name = "origin-cost"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
 ]
 
 [[package]]
-name = "origin-cow"
-version = "0.9.3"
-dependencies = [
- "libc",
- "nix 0.28.0",
- "tempfile",
- "thiserror 1.0.69",
- "windows 0.58.0",
-]
-
-[[package]]
 name = "origin-daemon"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4260,9 +4224,7 @@ dependencies = [
  "origin-provider-gemini",
  "origin-provider-github",
  "origin-provider-ollama",
- "origin-provider-openai",
  "origin-provider-openai-compat",
- "origin-provider-openrouter",
  "origin-repomap",
  "origin-resume-token",
  "origin-review",
@@ -4304,7 +4266,7 @@ dependencies = [
 
 [[package]]
 name = "origin-doctor"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4313,14 +4275,14 @@ dependencies = [
 
 [[package]]
 name = "origin-editfmt"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "origin-export"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4329,7 +4291,7 @@ dependencies = [
 
 [[package]]
 name = "origin-gmail"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "base64 0.22.1",
  "origin-keyvault",
@@ -4343,7 +4305,7 @@ dependencies = [
 
 [[package]]
 name = "origin-goal"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "async-trait",
  "serde",
@@ -4353,7 +4315,7 @@ dependencies = [
 
 [[package]]
 name = "origin-hooks"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "criterion",
  "origin-sandbox",
@@ -4366,11 +4328,11 @@ dependencies = [
 
 [[package]]
 name = "origin-i18n"
-version = "0.9.3"
+version = "0.9.4"
 
 [[package]]
 name = "origin-ipc"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "bytes",
  "hex",
@@ -4394,7 +4356,7 @@ dependencies = [
 
 [[package]]
 name = "origin-keyvault"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "age",
  "async-trait",
@@ -4419,7 +4381,7 @@ dependencies = [
 
 [[package]]
 name = "origin-knowledge"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4428,7 +4390,7 @@ dependencies = [
 
 [[package]]
 name = "origin-lsp-client"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4439,11 +4401,11 @@ dependencies = [
 
 [[package]]
 name = "origin-lspfleet"
-version = "0.9.3"
+version = "0.9.4"
 
 [[package]]
 name = "origin-mcp"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "async-trait",
  "eventsource-stream",
@@ -4465,7 +4427,7 @@ dependencies = [
 
 [[package]]
 name = "origin-mem"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "bitvec",
  "blake3",
@@ -4491,11 +4453,11 @@ dependencies = [
 
 [[package]]
 name = "origin-mermaid"
-version = "0.9.3"
+version = "0.9.4"
 
 [[package]]
 name = "origin-metrics"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
@@ -4508,7 +4470,7 @@ dependencies = [
 
 [[package]]
 name = "origin-migrate"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "blake3",
  "globset",
@@ -4527,7 +4489,7 @@ dependencies = [
 
 [[package]]
 name = "origin-modeldiscovery"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4536,7 +4498,7 @@ dependencies = [
 
 [[package]]
 name = "origin-multimodal"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "image",
  "pdf-extract",
@@ -4547,7 +4509,7 @@ dependencies = [
 
 [[package]]
 name = "origin-notify"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4556,7 +4518,7 @@ dependencies = [
 
 [[package]]
 name = "origin-oidc"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4565,7 +4527,7 @@ dependencies = [
 
 [[package]]
 name = "origin-outputstyle"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4574,7 +4536,7 @@ dependencies = [
 
 [[package]]
 name = "origin-permission"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "async-trait",
  "growable-bloom-filter",
@@ -4586,7 +4548,7 @@ dependencies = [
 
 [[package]]
 name = "origin-plan"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "bincode",
  "origin-cas",
@@ -4600,7 +4562,7 @@ dependencies = [
 
 [[package]]
 name = "origin-planner"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "proptest",
  "thiserror 1.0.69",
@@ -4608,7 +4570,7 @@ dependencies = [
 
 [[package]]
 name = "origin-plugin"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -4617,7 +4579,7 @@ dependencies = [
 
 [[package]]
 name = "origin-policy"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -4626,7 +4588,7 @@ dependencies = [
 
 [[package]]
 name = "origin-postedit"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4635,7 +4597,7 @@ dependencies = [
 
 [[package]]
 name = "origin-provider"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4660,7 +4622,7 @@ dependencies = [
 
 [[package]]
 name = "origin-provider-anthropic"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "async-trait",
  "dirs",
@@ -4688,7 +4650,7 @@ dependencies = [
 
 [[package]]
 name = "origin-provider-bedrock"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "async-trait",
  "aws-credential-types",
@@ -4707,7 +4669,7 @@ dependencies = [
 
 [[package]]
 name = "origin-provider-gemini"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -4726,14 +4688,13 @@ dependencies = [
 
 [[package]]
 name = "origin-provider-github"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "async-trait",
  "origin-core",
  "origin-keyvault",
  "origin-provider",
  "origin-provider-openai-compat",
- "origin-stream",
  "reqwest",
  "serde",
  "serde_json",
@@ -4743,7 +4704,7 @@ dependencies = [
 
 [[package]]
 name = "origin-provider-ollama"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -4760,22 +4721,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "origin-provider-openai"
-version = "0.9.3"
-dependencies = [
- "async-trait",
- "origin-core",
- "origin-provider",
- "origin-provider-openai-compat",
- "origin-stream",
- "serde_json",
- "tokio",
- "wiremock",
-]
-
-[[package]]
 name = "origin-provider-openai-compat"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -4799,22 +4746,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "origin-provider-openrouter"
-version = "0.9.3"
-dependencies = [
- "async-trait",
- "origin-core",
- "origin-provider",
- "origin-provider-openai-compat",
- "origin-stream",
- "serde_json",
- "tokio",
- "wiremock",
-]
-
-[[package]]
 name = "origin-replay"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "blake3",
  "origin-core",
@@ -4830,7 +4763,7 @@ dependencies = [
 
 [[package]]
 name = "origin-repomap"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -4838,7 +4771,7 @@ dependencies = [
 
 [[package]]
 name = "origin-resume-token"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "blake3",
  "getrandom 0.2.17",
@@ -4853,14 +4786,14 @@ dependencies = [
 
 [[package]]
 name = "origin-review"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "origin-router"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4869,7 +4802,7 @@ dependencies = [
 
 [[package]]
 name = "origin-runtime"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "parking_lot",
  "thiserror 1.0.69",
@@ -4879,7 +4812,7 @@ dependencies = [
 
 [[package]]
 name = "origin-sandbox"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "caps",
  "landlock",
@@ -4894,7 +4827,7 @@ dependencies = [
 
 [[package]]
 name = "origin-schedule"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -4902,7 +4835,7 @@ dependencies = [
 
 [[package]]
 name = "origin-scout"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4911,7 +4844,7 @@ dependencies = [
 
 [[package]]
 name = "origin-selfdev"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -4921,7 +4854,7 @@ dependencies = [
 
 [[package]]
 name = "origin-shimquirks"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde_json",
  "thiserror 1.0.69",
@@ -4929,7 +4862,7 @@ dependencies = [
 
 [[package]]
 name = "origin-sidecar"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "async-trait",
  "mockall",
@@ -4945,7 +4878,7 @@ dependencies = [
 
 [[package]]
 name = "origin-skills"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "blake3",
  "include_dir",
@@ -4957,27 +4890,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "origin-smr"
-version = "0.9.3"
-dependencies = [
- "bytecheck",
- "crossbeam-utils",
- "nix 0.29.0",
- "rkyv",
- "thiserror 1.0.69",
- "windows 0.58.0",
-]
-
-[[package]]
 name = "origin-steering"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "origin-store"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "refinery",
  "rusqlite",
@@ -4988,7 +4909,7 @@ dependencies = [
 
 [[package]]
 name = "origin-stream"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "bytes",
  "parking_lot",
@@ -4999,7 +4920,7 @@ dependencies = [
 
 [[package]]
 name = "origin-supervisor"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -5019,7 +4940,7 @@ dependencies = [
 
 [[package]]
 name = "origin-swarm"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "bincode",
  "origin-cas",
@@ -5027,7 +4948,6 @@ dependencies = [
  "origin-plan",
  "origin-planner",
  "origin-runtime",
- "origin-smr",
  "origin-store",
  "serde",
  "tempfile",
@@ -5038,7 +4958,7 @@ dependencies = [
 
 [[package]]
 name = "origin-telemetry"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -5047,7 +4967,7 @@ dependencies = [
 
 [[package]]
 name = "origin-tools"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "async-trait",
  "blake3",
@@ -5085,7 +5005,7 @@ dependencies = [
 
 [[package]]
 name = "origin-trace"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "arrow",
  "chrono",
@@ -5100,7 +5020,7 @@ dependencies = [
 
 [[package]]
 name = "origin-tui"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "async-trait",
  "blake3",
@@ -5126,11 +5046,11 @@ dependencies = [
 
 [[package]]
 name = "origin-ui-preview"
-version = "0.9.3"
+version = "0.9.4"
 
 [[package]]
 name = "origin-vcs"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -5139,7 +5059,7 @@ dependencies = [
 
 [[package]]
 name = "origin-voice"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -5147,7 +5067,7 @@ dependencies = [
 
 [[package]]
 name = "origin-watch"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -5156,7 +5076,7 @@ dependencies = [
 
 [[package]]
 name = "origin-websearch"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -5165,7 +5085,7 @@ dependencies = [
 
 [[package]]
 name = "origin-workflowgen"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -5315,16 +5235,6 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
-
-[[package]]
-name = "petgraph"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4c5cc86750666a3ed20bdaf5ca2a0344f9c67674cae0515bec2da16fbaa47db"
-dependencies = [
- "fixedbitset",
- "indexmap 2.7.1",
-]
 
 [[package]]
 name = "phf"
@@ -5730,7 +5640,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e20a958963c291dc322d98411f541009df2ced7b5a4f2bd52337638cfccf20"
 dependencies = [
  "bytes",
- "cfg_aliases 0.2.1",
+ "cfg_aliases",
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
@@ -5770,7 +5680,7 @@ version = "0.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "addec6a0dcad8a8d96a771f815f0eaf55f9d1805756410b39f5fa81332574cbd"
 dependencies = [
- "cfg_aliases 0.2.1",
+ "cfg_aliases",
  "libc",
  "once_cell",
  "socket2 0.6.3",

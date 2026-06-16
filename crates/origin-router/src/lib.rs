@@ -115,15 +115,13 @@ pub enum Strategy {
 /// Per-model health signals, keyed in the router by [`ModelRef::key`].
 ///
 /// Latency and error rate are exponential moving averages updated by
-/// [`Router::record_result`]; `cost_rank` and `exhausted` are caller-managed.
+/// [`Router::record_result`]; `exhausted` is caller-managed.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Health {
     /// EMA of observed request latency in milliseconds.
     pub ema_latency_ms: f64,
     /// EMA of the error rate in `[0, 1]` (1.0 == always failing).
     pub ema_error_rate: f64,
-    /// Relative cost tier; lower is cheaper. Used as a tiebreak when scoring.
-    pub cost_rank: u32,
     /// `true` when the model has hit a quota / rate limit and should be skipped.
     pub exhausted: bool,
 }
@@ -133,7 +131,6 @@ impl Default for Health {
         Self {
             ema_latency_ms: 0.0,
             ema_error_rate: 0.0,
-            cost_rank: 0,
             exhausted: false,
         }
     }
@@ -248,11 +245,6 @@ impl Router {
         }
     }
 
-    /// Set the cost rank for `m` (lower is cheaper); used as a scoring tiebreak.
-    pub fn set_cost_rank(&mut self, m: &ModelRef, rank: u32) {
-        self.health.entry(m.key()).or_default().cost_rank = rank;
-    }
-
     /// Whether `m` is currently flagged exhausted.
     #[must_use]
     pub fn is_exhausted(&self, m: &ModelRef) -> bool {
@@ -268,9 +260,9 @@ impl Router {
     ///   otherwise (ignores `candidates`).
     /// - [`Strategy::QuotaFallback`] returns the first non-exhausted model in
     ///   its chain (ignores `candidates`).
-    /// - [`Strategy::Scored`] ranks `candidates` by [`Health::score`] with
-    ///   `cost_rank` as a tiebreak, skipping exhausted models; returns `None`
-    ///   when `candidates` is empty or all are exhausted.
+    /// - [`Strategy::Scored`] ranks `candidates` by [`Health::score`], skipping
+    ///   exhausted models; returns `None` when `candidates` is empty or all are
+    ///   exhausted.
     #[must_use]
     pub fn choose(&self, phase: Phase, candidates: &[ModelRef]) -> Option<ModelRef> {
         match &self.strategy {
@@ -300,16 +292,13 @@ impl Router {
     }
 
     /// Compare two candidates the way [`Strategy::Scored`] does: higher
-    /// [`Health::score`] wins, with a lower `cost_rank` as the tiebreak.
+    /// [`Health::score`] wins.
     fn score_cmp(&self, a: &ModelRef, b: &ModelRef) -> std::cmp::Ordering {
         let ha = self.health(a).copied().unwrap_or_default();
         let hb = self.health(b).copied().unwrap_or_default();
         ha.score()
             .partial_cmp(&hb.score())
             .unwrap_or(std::cmp::Ordering::Equal)
-            // Lower cost_rank is better, so reverse the comparison to keep
-            // "greater is better" for `max_by`.
-            .then(hb.cost_rank.cmp(&ha.cost_rank))
     }
 
     /// Rank every non-exhausted candidate best-first by [`Strategy::Scored`].
@@ -317,9 +306,9 @@ impl Router {
     /// Unlike [`Router::choose`], which returns only the single best model,
     /// this returns the full ordering so callers can present a ranked list.
     /// The order is the same one `choose` would pick from: higher
-    /// [`Health::score`] first, `cost_rank` breaking ties. Exhausted models
-    /// are dropped. The comparison is independent of the configured strategy,
-    /// so this works regardless of how the router was constructed.
+    /// [`Health::score`] first. Exhausted models are dropped. The comparison is
+    /// independent of the configured strategy, so this works regardless of how
+    /// the router was constructed.
     #[must_use]
     pub fn scored_order(&self, candidates: &[ModelRef]) -> Vec<ModelRef> {
         let mut ranked: Vec<ModelRef> = candidates
@@ -444,18 +433,6 @@ mod tests {
         assert_eq!(r.choose(Phase::Default, &[slow.clone(), fast]), Some(slow));
     }
 
-    #[test]
-    fn scored_uses_cost_rank_as_tiebreak() {
-        let cheap = m("p", "cheap");
-        let pricey = m("p", "pricey");
-        let mut r = Router::new(Strategy::Scored);
-        // Identical latency/error -> equal score; cheaper cost_rank wins.
-        r.record_result(&cheap, 500, true);
-        r.record_result(&pricey, 500, true);
-        r.set_cost_rank(&cheap, 1);
-        r.set_cost_rank(&pricey, 5);
-        assert_eq!(r.choose(Phase::Default, &[pricey, cheap.clone()]), Some(cheap));
-    }
 
     #[test]
     fn scored_skips_exhausted_candidates() {

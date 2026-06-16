@@ -32,6 +32,9 @@
 
 #![forbid(unsafe_code)]
 
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use serde::{Deserialize, Serialize};
 
 /// Sentinel written in place of any redacted secret value.
@@ -47,6 +50,13 @@ pub enum CassetteError {
     /// The payload describes where the leak was found.
     #[error("refusing to persist cassette: unredacted secret in {0}")]
     UnredactedSecret(String),
+    /// Reading or writing a cassette / its replay-position sidecar failed.
+    #[error("cassette io: {0}")]
+    Io(String),
+    /// Sequential replay reached the end of the tape (or found no remaining
+    /// interaction matching the requested `(method, url)` shape).
+    #[error("cassette replay miss for {0}")]
+    ReplayMiss(String),
 }
 
 /// The shape of an HTTP request as stored in a cassette.
@@ -86,13 +96,46 @@ pub struct Interaction {
 }
 
 /// A named, ordered collection of recorded HTTP interactions.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Replay is *sequential*: an interior cursor advances past each consumed
+/// interaction so successive [`Cassette::take_next`] calls return
+/// interaction `0`, `1`, `2`, … in record order. The cursor is in-memory
+/// only — it is never serialized — so a freshly loaded cassette always starts
+/// at the beginning; durable, cross-call replay position is provided by the
+/// file-backed [`replay_next`] helper.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Cassette {
     /// Human-readable cassette name (typically the test or scenario name).
     pub name: String,
     /// Interactions in record order; replay matching consumes them sequentially.
     pub interactions: Vec<Interaction>,
+    /// Index of the next interaction to consider during sequential replay.
+    /// Interior-mutable so replay can advance through `&self`; skipped by serde
+    /// and excluded from equality so on-disk round-trips stay lossless.
+    #[serde(skip)]
+    cursor: AtomicUsize,
 }
+
+// Manual `Clone`/`PartialEq`/`Eq`: the replay `cursor` is transient state, not
+// part of a cassette's identity, so a clone preserves the current position and
+// equality ignores it (keeping JSON round-trips lossless).
+impl Clone for Cassette {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            interactions: self.interactions.clone(),
+            cursor: AtomicUsize::new(self.cursor.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl PartialEq for Cassette {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.interactions == other.interactions
+    }
+}
+
+impl Eq for Cassette {}
 
 impl Cassette {
     /// Create an empty cassette with the given name.
@@ -101,6 +144,7 @@ impl Cassette {
         Self {
             name: name.into(),
             interactions: Vec::new(),
+            cursor: AtomicUsize::new(0),
         }
     }
 
@@ -109,17 +153,54 @@ impl Cassette {
         self.interactions.push(interaction);
     }
 
-    /// Find the next interaction whose request matches `req` by `(method, url)`
-    /// shape, scanning forward from the start.
+    /// Consume and return the next interaction whose request matches `req` by
+    /// `(method, url)` shape, scanning forward from the current replay cursor and
+    /// advancing past the match so the *following* call resumes after it.
+    ///
+    /// This is the sequential-consumption primitive: recording interactions
+    /// `A, B` to the same `(method, url)` and calling `take_next` twice returns
+    /// `A` then `B` (not `A` twice). The cursor advances to just past the matched
+    /// interaction; an unmatched probe leaves the cursor unchanged.
     ///
     /// Matching is intentionally shape-based (method + url) rather than byte-exact:
     /// headers and bodies vary across runs (timestamps, nonces) but the call
     /// sequence is stable. The match is case-insensitive on the method.
     ///
-    /// Returns `None` when no recorded request shares the shape.
-    #[must_use]
+    /// Returns `None` at end-of-tape (cursor past the last interaction) or when no
+    /// remaining recorded request shares the shape.
+    pub fn take_next(&self, req: &ReqShape) -> Option<&Interaction> {
+        let start = self.cursor.load(Ordering::Relaxed).min(self.interactions.len());
+        let rel = self.interactions[start..]
+            .iter()
+            .position(|i| shapes_match(&i.request, req))?;
+        let idx = start + rel;
+        // Saturating advance: never wrap past the end of the tape.
+        self.cursor.store(idx.saturating_add(1), Ordering::Relaxed);
+        self.interactions.get(idx)
+    }
+
+    /// Backwards-compatible alias for [`Cassette::take_next`]: consumes and
+    /// advances. Retained because external callers (the provider replay taps)
+    /// refer to `match_next`; new code should prefer `take_next`.
     pub fn match_next(&self, req: &ReqShape) -> Option<&Interaction> {
-        self.interactions.iter().find(|i| shapes_match(&i.request, req))
+        self.take_next(req)
+    }
+
+    /// Reset the replay cursor back to the start of the tape.
+    pub fn rewind(&self) {
+        self.cursor.store(0, Ordering::Relaxed);
+    }
+
+    /// The current replay cursor position (index of the next interaction to be
+    /// considered by [`Cassette::take_next`]).
+    #[must_use]
+    pub fn cursor(&self) -> usize {
+        self.cursor.load(Ordering::Relaxed)
+    }
+
+    /// Set the replay cursor to `pos` (clamped to the number of interactions).
+    pub fn set_cursor(&self, pos: usize) {
+        self.cursor.store(pos.min(self.interactions.len()), Ordering::Relaxed);
     }
 
     /// Serialize the cassette to pretty JSON.
@@ -139,6 +220,63 @@ impl Cassette {
     pub fn from_json(s: &str) -> Result<Self, CassetteError> {
         serde_json::from_str(s).map_err(|e| CassetteError::Serde(e.to_string()))
     }
+}
+
+/// The path of the sidecar file that persists a cassette's replay cursor.
+///
+/// Stored next to the cassette as `<cassette>.pos` so it travels with the
+/// recording and is trivially discardable.
+#[must_use]
+pub fn position_path(cassette: &Path) -> PathBuf {
+    let mut s = cassette.as_os_str().to_os_string();
+    s.push(".pos");
+    PathBuf::from(s)
+}
+
+/// Read the persisted replay cursor for the cassette at `path`. A missing or
+/// unparseable sidecar is treated as position `0` (start of tape).
+fn read_position(path: &Path) -> usize {
+    std::fs::read_to_string(position_path(path))
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// Persist the replay cursor `pos` for the cassette at `path`.
+fn write_position(path: &Path, pos: usize) -> Result<(), CassetteError> {
+    std::fs::write(position_path(path), pos.to_string()).map_err(|e| CassetteError::Io(e.to_string()))
+}
+
+/// Durable, sequential replay against the cassette file at `path`.
+///
+/// Each call loads the cassette, restores the persisted cursor from the
+/// `<path>.pos` sidecar, consumes the next interaction matching `(method, url)`
+/// from that position, persists the advanced cursor, and returns the matched
+/// [`Interaction`]. Because the cursor lives on disk, successive calls — even
+/// from separate processes or after the cassette is re-parsed fresh each turn —
+/// return interaction `0`, `1`, `2`, … in record order rather than replaying
+/// interaction `0` every time.
+///
+/// # Errors
+/// Returns [`CassetteError::Io`] if the cassette or sidecar cannot be read or
+/// written, [`CassetteError::Serde`] if the cassette is not valid JSON, and
+/// [`CassetteError::ReplayMiss`] at end-of-tape or when no remaining interaction
+/// matches the requested shape.
+pub fn replay_next(path: &Path, method: &str, url: &str) -> Result<Interaction, CassetteError> {
+    let text = std::fs::read_to_string(path).map_err(|e| CassetteError::Io(e.to_string()))?;
+    let cassette = Cassette::from_json(&text)?;
+    cassette.set_cursor(read_position(path));
+    let probe = ReqShape {
+        method: method.to_string(),
+        url: url.to_string(),
+        headers: Vec::new(),
+        body: String::new(),
+    };
+    let Some(interaction) = cassette.take_next(&probe).cloned() else {
+        return Err(CassetteError::ReplayMiss(format!("{method} {url}")));
+    };
+    write_position(path, cassette.cursor())?;
+    Ok(interaction)
 }
 
 /// Two request shapes match when their methods (case-insensitive) and URLs agree.
@@ -552,6 +690,85 @@ mod tests {
         assert!(c.match_next(&req("GET", "https://h/missing")).is_none());
         // Same url but wrong method does not match.
         assert!(c.match_next(&req("DELETE", "https://h/a")).is_none());
+    }
+
+    #[test]
+    fn take_next_advances_for_identical_method_and_url() {
+        // Regression for the "replay never advances" bug: a multi-turn agent
+        // session POSTs to the SAME url every turn, so the cursor must advance.
+        let mut c = Cassette::new("multi-turn");
+        c.record(Interaction {
+            request: req("POST", "https://h/v1/messages"),
+            response: resp(200, "turn-1"),
+        });
+        c.record(Interaction {
+            request: req("POST", "https://h/v1/messages"),
+            response: resp(200, "turn-2"),
+        });
+        c.record(Interaction {
+            request: req("POST", "https://h/v1/messages"),
+            response: resp(200, "turn-3"),
+        });
+
+        let probe = req("POST", "https://h/v1/messages");
+        // Successive calls return [0], [1], [2] in order — NOT [0] three times.
+        assert_eq!(c.take_next(&probe).unwrap().response.body, "turn-1");
+        assert_eq!(c.take_next(&probe).unwrap().response.body, "turn-2");
+        assert_eq!(c.take_next(&probe).unwrap().response.body, "turn-3");
+        // End-of-tape saturates to `None` (no wrap back to turn-1).
+        assert!(c.take_next(&probe).is_none());
+        assert_eq!(c.cursor(), 3);
+
+        // `rewind` restores sequential replay from the top.
+        c.rewind();
+        assert_eq!(c.take_next(&probe).unwrap().response.body, "turn-1");
+    }
+
+    #[test]
+    fn match_next_alias_also_advances() {
+        // The provider replay taps call `match_next`; it must consume too.
+        let mut c = Cassette::new("alias");
+        c.record(Interaction {
+            request: req("POST", "https://h/v1/messages"),
+            response: resp(200, "first"),
+        });
+        c.record(Interaction {
+            request: req("POST", "https://h/v1/messages"),
+            response: resp(200, "second"),
+        });
+        let probe = req("POST", "https://h/v1/messages");
+        assert_eq!(c.match_next(&probe).unwrap().response.body, "first");
+        assert_eq!(c.match_next(&probe).unwrap().response.body, "second");
+        assert!(c.match_next(&probe).is_none());
+    }
+
+    #[test]
+    fn replay_next_persists_cursor_across_fresh_loads() {
+        // Models production: the cassette is re-read + re-parsed fresh on every
+        // turn, so the position MUST survive on disk (the `.pos` sidecar).
+        let dir = std::env::temp_dir().join(format!("origin-cassette-replay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tape.json");
+
+        let mut c = Cassette::new("disk");
+        for body in ["r1", "r2"] {
+            c.record(Interaction {
+                request: req("POST", "https://h/v1/messages"),
+                response: resp(200, body),
+            });
+        }
+        std::fs::write(&path, c.to_json().unwrap()).unwrap();
+
+        // Two independent `replay_next` calls (each re-reads the file) advance.
+        let first = replay_next(&path, "POST", "https://h/v1/messages").unwrap();
+        assert_eq!(first.response.body, "r1");
+        let second = replay_next(&path, "POST", "https://h/v1/messages").unwrap();
+        assert_eq!(second.response.body, "r2");
+        // End-of-tape is an explicit miss, not a silent re-serve of r1.
+        let third = replay_next(&path, "POST", "https://h/v1/messages");
+        assert!(matches!(third, Err(CassetteError::ReplayMiss(_))));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

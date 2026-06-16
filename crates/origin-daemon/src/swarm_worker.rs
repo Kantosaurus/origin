@@ -23,6 +23,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use origin_cas::Store as CasStore;
+use origin_keyvault::KeyVault;
 use origin_permission::prompt::Prompter;
 use origin_provider::Provider;
 use origin_swarm::{CompletionReport, McpServerSpec, ReportStatus, Usage, WorkerContext, WorkerFn};
@@ -32,12 +34,40 @@ use tokio::sync::RwLock;
 use crate::agent::{run_loop, scope_runtime_tools, scope_swarm_collab, LoopOptions, SwarmCollab};
 use crate::session::Session;
 
+/// Run the MCP `initialize` handshake, then `tools/list`.
+///
+/// The MCP wire protocol requires the `initialize` request/response to precede
+/// every other method, so a spec-compliant server rejects a bare `tools/list`.
+/// Issuing the list without the handshake (the pre-fix behaviour) made the list
+/// error out, so the server was skipped and the sub-agent silently ran with zero
+/// inline-MCP tools — defeating the whole inline-MCP-per-subagent feature.
+///
+/// # Errors
+/// Forwards the [`ClientError`](origin_mcp::client::ClientError) from either the
+/// handshake or the list call.
+async fn handshake_and_list(
+    client: &origin_mcp::client::McpClient,
+) -> Result<origin_mcp::client::ListToolsResult, origin_mcp::client::ClientError> {
+    client.initialize().await?;
+    client.list_tools().await
+}
+
 /// Spin up each declared inline-MCP server and wrap its tools as [`DynTool`]s
 /// namespaced `mcp__<server>__<tool>` (gap 9b: inline-MCP-per-subagent). Returns
 /// the worker-scoped runtime registry plus the namespaced tool names to add to
-/// the worker's allow-list. Best-effort: a server that fails to spawn or list its
-/// tools is logged and skipped (the worker still runs without it).
-async fn build_runtime_tools(specs: &[McpServerSpec]) -> (HashMap<String, Arc<dyn DynTool>>, Vec<String>) {
+/// the worker's allow-list. Best-effort: a server that fails to spawn, handshake,
+/// or list its tools is logged and skipped (the worker still runs without it).
+///
+/// Each proxy is wired with (a) the server's declared JSON Schema, so model args
+/// are validated before each `tools/call`, and (b) the daemon CAS store, so a
+/// large tool result is offloaded to content-addressed storage instead of being
+/// inlined into the transcript. HTTP servers get a best-effort OAuth bearer from
+/// the vault before the handshake so authenticated endpoints are reachable.
+async fn build_runtime_tools(
+    specs: &[McpServerSpec],
+    cas: &Arc<CasStore>,
+    vault: &KeyVault,
+) -> (HashMap<String, Arc<dyn DynTool>>, Vec<String>) {
     let mut map: HashMap<String, Arc<dyn DynTool>> = HashMap::new();
     let mut names: Vec<String> = Vec::new();
     for spec in specs {
@@ -50,20 +80,39 @@ async fn build_runtime_tools(specs: &[McpServerSpec]) -> (HashMap<String, Arc<dy
                 }
             }
         } else if let Some(url) = &spec.url {
-            Arc::new(origin_mcp::transport_http::HttpTransport::new(url.clone(), None))
+            let http = Arc::new(origin_mcp::transport_http::HttpTransport::new(url.clone(), None));
+            // Best-effort OAuth: an authenticated HTTP MCP server needs its bearer
+            // set BEFORE the initialize/list handshake. The token lives in the vault
+            // under (provider = "mcp-<server>", account = "default/oauth"); a missing
+            // secret just means the server is public, so we proceed unauthenticated.
+            if let Err(e) =
+                origin_mcp::oauth::attach_bearer(vault, &format!("mcp-{}", spec.name), "default", &http).await
+            {
+                tracing::debug!(server = %spec.name, error = %e, "inline-MCP: no OAuth bearer attached (proceeding unauthenticated)");
+            }
+            http as Arc<dyn origin_mcp::transport::Transport>
         } else {
             tracing::warn!(server = %spec.name, "inline-MCP: server declares neither command nor url; skipping");
             continue;
         };
         let client = Arc::new(origin_mcp::client::McpClient::new(transport));
-        let listed = match client.list_tools().await {
+        let listed = match handshake_and_list(&client).await {
             Ok(l) => l,
             Err(e) => {
-                tracing::warn!(server = %spec.name, error = %e, "inline-MCP: tools/list failed; skipping");
+                tracing::warn!(server = %spec.name, error = %e, "inline-MCP: initialize/tools-list failed; skipping");
                 continue;
             }
         };
+        // One schema cache per server, shared by all of its tool proxies.
+        let schemas = Arc::new(origin_mcp::schema::SchemaCache::new());
         for tool in listed.tools {
+            // Register the server's declared schema under the REMOTE tool name (the
+            // proxy validates against `remote_name`). Best-effort: a schema that
+            // doesn't compile is left unregistered, and `validate` treats an unknown
+            // tool as pass-through, so a non-conforming server still works.
+            if let Err(e) = schemas.register(&tool.name, &tool.input_schema) {
+                tracing::debug!(server = %spec.name, tool = %tool.name, error = %e, "inline-MCP: schema register skipped (pass-through)");
+            }
             let full = format!("mcp__{}__{}", spec.name, tool.name);
             // ToolMeta requires `&'static` strings; leak the per-tool metadata
             // (small, process-lifetime, mirroring the static inventory registry).
@@ -83,7 +132,12 @@ async fn build_runtime_tools(specs: &[McpServerSpec]) -> (HashMap<String, Arc<dy
                 token_budget: DEFAULT_TOKEN_BUDGET,
                 hot: false,
             };
-            let proxy = origin_mcp::proxy::McpToolProxy::new(Arc::clone(&client), meta, tool.name.clone());
+            // Wire schema validation (validate model args pre-call) and CAS hand-off
+            // (offload large results) — both previously left at their `None` defaults,
+            // so neither protection was active for any shipped inline-MCP tool.
+            let proxy = origin_mcp::proxy::McpToolProxy::new(Arc::clone(&client), meta, tool.name.clone())
+                .with_schemas(Arc::clone(&schemas))
+                .with_cas(Arc::clone(cas), 16 * 1024);
             map.insert(full.clone(), Arc::new(proxy) as Arc<dyn DynTool>);
             names.push(full);
         }
@@ -150,11 +204,22 @@ impl Prompter for AllowList {
 /// worker snapshots the provider, runs a bounded agent loop for its goal, and
 /// returns a structured report.
 #[must_use]
-pub fn real_worker(active: ActiveProvider) -> WorkerFn {
+pub fn real_worker(
+    active: ActiveProvider,
+    cas: Arc<CasStore>,
+    vault: KeyVault,
+    plan: origin_planner::Plan,
+) -> WorkerFn {
     Arc::new(move |ctx: WorkerContext| {
         let active = Arc::clone(&active);
+        let cas = Arc::clone(&cas);
+        let vault = vault.clone();
+        // The daemon's process-wide cache-band `Plan` (shared with the provider
+        // wire-encoder). Each worker forks a session-isolated view sharing the
+        // content-addressed handle bands (sub-agent prefix-cache inheritance).
+        let plan = plan.clone();
         // Heap-box the (large) worker future to keep the closure's stack small.
-        Box::pin(async move { Box::pin(run_worker(active, ctx)).await })
+        Box::pin(async move { Box::pin(run_worker(active, cas, vault, plan, ctx)).await })
     })
 }
 
@@ -163,6 +228,9 @@ pub fn real_worker(active: ActiveProvider) -> WorkerFn {
 /// sub-agent failure surfaces to the parent as data, not a torn-down turn.
 async fn run_worker(
     active: ActiveProvider,
+    cas: Arc<CasStore>,
+    vault: KeyVault,
+    plan: origin_planner::Plan,
     ctx: WorkerContext,
 ) -> Result<CompletionReport, origin_swarm::SwarmError> {
     let provider = active.read().await.clone();
@@ -177,7 +245,7 @@ async fn run_worker(
     // gap 9b: spin up this sub-agent's declared inline-MCP servers and expose
     // their tools to the worker for the run. Empty specs ⇒ empty map ⇒ no MCP
     // (byte-identical default).
-    let (mcp_tools, mcp_tool_names) = build_runtime_tools(&ctx.spec.mcp_servers).await;
+    let (mcp_tools, mcp_tool_names) = build_runtime_tools(&ctx.spec.mcp_servers, &cas, &vault).await;
 
     // Narrow the child's tools to its allow-list (glob patterns supported) plus
     // its inline-MCP tool names, and never `Task` (a child that could spawn its
@@ -197,6 +265,18 @@ async fn run_worker(
         // Sub-agents have no client to stream to; the non-streaming path returns
         // the same assistant text and is simpler to account for.
         streaming_disabled: true,
+        // #13 / N7.1+P9.7 sub-agent prefix-cache inheritance — WIRED via the live
+        // handle-band `Plan`. `fork_shared_handle_bands` hands the worker a `Plan`
+        // that SHARES the daemon's process-wide, content-addressed `handle_bands`
+        // map (the same one the Anthropic wire-encoder reads), so the child
+        // (a) inherits every CAS-handle band the parent already assigned —
+        // identical content the parent marked `Sticky` is reused as a cacheable
+        // `Reference` instead of re-inlined — and (b) its own registrations stay
+        // visible to that encoder. Per-session marker state is isolated, so
+        // concurrent siblings never clobber one another. (This supersedes the
+        // old `SectionId`→band `PrefixLedger` inheritance seam, which the live
+        // wire path never consumed and which has now been removed.)
+        plan: Some(plan.fork_shared_handle_bands()),
         ..Default::default()
     };
 
@@ -306,5 +386,71 @@ mod tests {
         let al = AllowList::from_patterns(&["Task".to_string(), "Read".to_string()]);
         assert!(!al.ask(meta("Task"), "").await);
         assert!(al.ask(meta("Read"), "").await);
+    }
+
+    /// Regression: inline-MCP must run the `initialize` handshake before
+    /// `tools/list`, or a spec-compliant server rejects the list and the
+    /// sub-agent silently gets zero MCP tools (gap 9b non-functional).
+    mod mcp_lifecycle {
+        use async_trait::async_trait;
+        use origin_mcp::client::McpClient;
+        use origin_mcp::transport::{Transport, TransportError};
+        use serde_json::{json, Value};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        /// A spec-compliant MCP server that rejects every request issued before
+        /// the `initialize` handshake completes.
+        struct StrictServer {
+            initialized: AtomicBool,
+        }
+
+        #[async_trait]
+        impl Transport for StrictServer {
+            async fn round_trip(&self, request_json: &str) -> Result<Value, TransportError> {
+                let req: Value = serde_json::from_str(request_json).map_err(TransportError::Serde)?;
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                match req.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "initialize" => {
+                        self.initialized.store(true, Ordering::SeqCst);
+                        Ok(json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2024-11-05"}}))
+                    }
+                    "tools/list" if self.initialized.load(Ordering::SeqCst) => Ok(json!({
+                        "jsonrpc":"2.0","id":id,
+                        "result":{"tools":[{"name":"echo","description":"echo","inputSchema":{"type":"object"}}]}
+                    })),
+                    // Pre-init request → JSON-RPC error, mirroring a real server.
+                    _ => Ok(json!({
+                        "jsonrpc":"2.0","id":id,
+                        "error":{"code":-32002,"message":"Received request before initialization was complete"}
+                    })),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn handshake_precedes_tools_list() {
+            let transport: Arc<dyn Transport> = Arc::new(StrictServer {
+                initialized: AtomicBool::new(false),
+            });
+            let client = McpClient::new(transport);
+            // With the handshake, the strict server answers the list.
+            let listed = super::super::handshake_and_list(&client)
+                .await
+                .expect("initialize+list must succeed against a spec-compliant server");
+            assert_eq!(listed.tools.len(), 1);
+            assert_eq!(listed.tools[0].name, "echo");
+        }
+
+        #[tokio::test]
+        async fn bare_list_without_handshake_is_rejected() {
+            // Control: the pre-fix behaviour (bare `tools/list`) errors out, which
+            // is exactly why sub-agents silently ran with zero inline-MCP tools.
+            let transport: Arc<dyn Transport> = Arc::new(StrictServer {
+                initialized: AtomicBool::new(false),
+            });
+            let client = McpClient::new(transport);
+            assert!(client.list_tools().await.is_err());
+        }
     }
 }

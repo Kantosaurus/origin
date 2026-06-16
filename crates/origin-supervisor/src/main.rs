@@ -3,13 +3,23 @@
 //! resume tokens across the restart.
 
 use clap::Parser;
+use origin_supervisor::ipc_resume;
 use origin_supervisor::relaunch::{
     decide_relaunch, default_relaunch_manifest_path, load_manifest, perform_swap, watch_outcome,
     RelaunchDecision, RelaunchManifest, WatchOutcome, SELFDEV_RELAUNCH_EXIT_CODE,
 };
+use origin_supervisor::resume_token::ResumeToken;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
+
+/// Number of connect attempts the resume replay makes while the freshly
+/// (re)spawned daemon is still binding its IPC endpoint. Each failed attempt
+/// sleeps [`RESUME_CONNECT_BACKOFF`] before retrying; the product bounds how
+/// long the detached replay thread lingers when no daemon ever comes up.
+const RESUME_CONNECT_ATTEMPTS: u32 = 40;
+/// Delay between resume-replay connect attempts (≈ `40 × 250ms = 10s` total).
+const RESUME_CONNECT_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Crash streak (non-sentinel exits) within [`ROLLBACK_WINDOW`] of a swap that
 /// triggers an automatic rollback to the previous binary.
@@ -54,6 +64,118 @@ fn rollback_scratch_path(daemon_path: &Path) -> PathBuf {
 /// non-empty file. Guards against swapping in a truncated/half-written artifact.
 fn new_binary_valid(manifest: &RelaunchManifest) -> bool {
     std::fs::metadata(&manifest.new_binary_path).is_ok_and(|m| m.is_file() && m.len() > 0)
+}
+
+/// Resolve the `resume/` directory the daemon persists its [`ResumeToken`]s
+/// into, deriving it exactly as the daemon does so the supervisor reads the
+/// same files the daemon writes.
+///
+/// The daemon's session DB path is `ORIGIN_DB` (when set by the CLI/tests) or
+/// the per-instance default `InstanceId::for_cwd().db_path()`. The supervisor
+/// inherits the CLI's cwd and env, so `for_cwd()` yields the same instance id.
+/// `SessionStore` stores resume tokens under `<dir-of-db>/resume`
+/// (`SessionStore::resume_dir`), so we mirror that derivation here.
+fn resolve_resume_dir() -> PathBuf {
+    let db_path = std::env::var("ORIGIN_DB")
+        .unwrap_or_else(|_| origin_ipc::instance::InstanceId::for_cwd().db_path());
+    let db = PathBuf::from(db_path);
+    let dir = db.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    dir.join("resume")
+}
+
+/// Resolve the daemon's IPC endpoint the same way the CLI and daemon do:
+/// `ORIGIN_SOCK` when set (the CLI pins it on the supervisor's env), else the
+/// per-instance path for the current working directory.
+fn resolve_ipc_endpoint() -> String {
+    origin_ipc::instance::resolve_ipc_path()
+}
+
+/// Best-effort replay of any persisted resume tokens to a freshly (re)spawned
+/// daemon, run on a detached thread so it can wait for the daemon's IPC
+/// endpoint to come up while the supervisor's main thread blocks on the child.
+///
+/// DEFAULT-SAFE: when no tokens are present (the common case) this is a no-op —
+/// it never even opens a connection, so a daemon with no detached sessions
+/// behaves byte-identically to before this wiring existed. Every failure
+/// (unreadable dir, tampered token, daemon never reachable) is logged and
+/// swallowed: one bad token must never wedge the restart loop.
+fn spawn_resume_replay(resume_dir: PathBuf, endpoint: String) {
+    std::thread::spawn(move || {
+        // Enumerate first; a clean no-op short-circuits before any IPC work.
+        let tokens = match ResumeToken::load_all(&resume_dir) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, dir = %resume_dir.display(),
+                    "supervisor: could not load resume tokens; skipping replay");
+                return;
+            }
+        };
+        if tokens.is_empty() {
+            return;
+        }
+        let count = tokens.len();
+        info!(count, dir = %resume_dir.display(),
+            "supervisor: replaying persisted resume tokens to daemon");
+        match drive_resume_replay(tokens, &endpoint) {
+            Ok(()) => info!(count, "supervisor: resume tokens replayed"),
+            Err(e) => warn!(error = %e, "supervisor: resume replay failed (sessions not re-attached)"),
+        }
+    });
+}
+
+/// Connect to the (possibly still-binding) daemon with bounded retry, then
+/// replay every token over IPC. Delegates to [`drive_resume_replay_with`] with
+/// the production retry budget.
+///
+/// # Errors
+/// Returns the last connect error if the daemon never becomes reachable within
+/// [`RESUME_CONNECT_ATTEMPTS`], or any serialization/write error from the replay.
+fn drive_resume_replay(tokens: Vec<ResumeToken>, endpoint: &str) -> anyhow::Result<()> {
+    drive_resume_replay_with(tokens, endpoint, RESUME_CONNECT_ATTEMPTS, RESUME_CONNECT_BACKOFF)
+}
+
+/// Retry-parameterized core of [`drive_resume_replay`] (the `attempts`/`backoff`
+/// are arguments so tests can use a tiny budget). Runs the async
+/// [`ipc_resume::replay_all`] on a throwaway current-thread runtime so the sync
+/// supervisor needs no global one.
+///
+/// # Errors
+/// Returns the last connect error if the daemon never becomes reachable within
+/// `attempts`, or any serialization/write error from the replay.
+fn drive_resume_replay_with(
+    tokens: Vec<ResumeToken>,
+    endpoint: &str,
+    attempts: u32,
+    backoff: Duration,
+) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        // The daemon may still be binding its endpoint after spawn; retry the
+        // first connect a bounded number of times before giving up.
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..attempts.max(1) {
+            match origin_ipc::transport::Connector::connect(endpoint).await {
+                Ok(_) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e.into());
+                    if attempt + 1 < attempts.max(1) {
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(anyhow::anyhow!(
+                "daemon IPC endpoint {endpoint} not reachable for resume replay: {e}"
+            ));
+        }
+        ipc_resume::replay_all(tokens, endpoint).await
+    })
 }
 
 #[cfg(unix)]
@@ -126,6 +248,14 @@ fn run_supervisor_loop(
             );
             return Err(anyhow::anyhow!("restart storm"));
         }
+
+        // Before we (re)spawn and block on the daemon, kick off a detached,
+        // best-effort replay of any persisted resume tokens. It waits for the
+        // about-to-be-spawned daemon's IPC endpoint to come up, then sends one
+        // `ResumeRequest` per token so detached/in-flight sessions are
+        // re-attached across the restart — the supervisor's stated purpose.
+        // No tokens present → the thread no-ops without opening a connection.
+        spawn_resume_replay(resolve_resume_dir(), resolve_ipc_endpoint());
 
         let exit = launch::run_child(daemon_path, forward)?;
         let code = exit.status.code().unwrap_or(-1);
@@ -254,5 +384,102 @@ fn apply_relaunch_decision(
             // Don't leave a manifest that would retry a doomed swap.
             let _ = std::fs::remove_file(manifest_path);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use origin_supervisor::resume_token::ResumeToken;
+    use std::sync::Mutex;
+
+    /// `set_var`/`remove_var` are process-global; serialize the env-mutating
+    /// tests so they cannot interleave.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn token(id: &str) -> ResumeToken {
+        ResumeToken {
+            session_id: id.to_string(),
+            last_turn: 1,
+            cas_handle_root: [0u8; 32],
+            pending_tool_calls: Vec::new(),
+            plan_seq: 0,
+            goal: None,
+            detached_at_unix: None,
+            memory_estimate_bytes: None,
+        }
+    }
+
+    #[test]
+    fn resolve_resume_dir_derives_from_origin_db() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("sessions.db");
+        std::env::set_var("ORIGIN_DB", &db);
+        let dir = resolve_resume_dir();
+        std::env::remove_var("ORIGIN_DB");
+        // Mirrors SessionStore::resume_dir(): <dir-of-db>/resume.
+        assert_eq!(dir, tmp.path().join("resume"));
+    }
+
+    #[test]
+    fn enumeration_finds_persisted_tokens() {
+        // Two persisted tokens in a temp resume dir are both enumerated. This
+        // is the decision the detached replay thread makes before any IPC: a
+        // non-empty result means "replay", empty means "no-op".
+        let tmp = tempfile::tempdir().unwrap();
+        token("alpha").save(tmp.path()).unwrap();
+        token("beta").save(tmp.path()).unwrap();
+
+        let mut loaded = ResumeToken::load_all(tmp.path()).unwrap();
+        loaded.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].session_id, "alpha");
+        assert_eq!(loaded[1].session_id, "beta");
+        assert!(!loaded.is_empty(), "non-empty => replay path is taken");
+    }
+
+    #[test]
+    fn empty_dir_is_noop() {
+        // An empty (no-token) resume dir enumerates to nothing, so the replay
+        // thread short-circuits without opening an IPC connection — the
+        // default-safe path that is byte-identical to pre-wiring behaviour.
+        let tmp = tempfile::tempdir().unwrap();
+        let loaded = ResumeToken::load_all(tmp.path()).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn missing_dir_is_noop() {
+        // A resume dir that never existed (no detached session ever) is also a
+        // clean no-op rather than an error.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let loaded = ResumeToken::load_all(&missing).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn replay_to_dead_endpoint_is_bounded_error_not_panic() {
+        // drive_resume_replay against an endpoint nothing is listening on must
+        // return an Err (so the caller logs+swallows it) rather than hang
+        // forever or panic. Use a low attempt budget via a bogus path.
+        let tokens = vec![token("x")];
+        // A path no daemon binds. On Windows this is a non-existent pipe; on
+        // unix a socket path that was never created.
+        #[cfg(windows)]
+        let endpoint = r"\\.\pipe\origin-supervisor-test-nonexistent".to_string();
+        #[cfg(unix)]
+        let endpoint = {
+            let tmp = tempfile::tempdir().unwrap();
+            tmp.path().join("nonexistent.sock").to_string_lossy().into_owned()
+        };
+        // Use a tiny retry budget so the test terminates fast; assert only
+        // that an unreachable endpoint yields an error (so the caller
+        // logs+swallows it) rather than a hang or panic.
+        let res =
+            drive_resume_replay_with(tokens, &endpoint, 2, std::time::Duration::from_millis(5));
+        assert!(res.is_err(), "unreachable endpoint must yield an error, not success");
     }
 }

@@ -36,6 +36,11 @@ pub async fn bash_v2(args: BashArgs, sup: &Supervisor) -> Result<Value, ToolErro
         cwd: args.cwd,
         env: args.env,
         buffer_cap_bytes: None,
+        // P11.5: Bash runs under the `Shell` sandbox profile (its declared
+        // `ToolMeta.sandbox_profile`). On the default feature set the supervisor
+        // forwards this to the no-op backend, so execution is unchanged; on a
+        // build with the Linux/macOS backend it confines the child.
+        sandbox_profile: Some(crate::SandboxProfile::Shell),
     };
     let pid = sup.spawn(&args.command, &opts)?;
     if args.run_in_background {

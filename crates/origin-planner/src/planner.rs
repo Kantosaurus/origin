@@ -176,6 +176,31 @@ impl Plan {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = indices;
     }
+
+    /// Fork a `Plan` for a child agent that SHARES this plan's content-addressed
+    /// `handle_bands` map but gets ISOLATED per-session marker state.
+    ///
+    /// `handle_bands` is keyed by a CAS body hash, so a band assignment is a
+    /// property of the *content*, not the session — sharing it means a sub-agent
+    /// (a) inherits every band the parent has already assigned (so identical CAS
+    /// content the parent marked `Sticky` is reused as a cacheable `Reference`
+    /// instead of re-inlined), and (b) its own registrations stay visible to the
+    /// shared wire-encoder that reads the same map. This is the N7.1/P9.7
+    /// sub-agent prefix-cache inheritance — realised in the live handle-band
+    /// model rather than the superseded `SectionId`→band `PrefixLedger` one.
+    ///
+    /// The `ordered`/`markers` section layout and `dynamic_message_markers` are
+    /// per-session, so the fork starts them empty/fresh: concurrent siblings
+    /// never clobber one another's per-message breakpoints.
+    #[must_use]
+    pub fn fork_shared_handle_bands(&self) -> Self {
+        Self {
+            ordered: Vec::new(),
+            markers: Vec::new(),
+            handle_bands: Arc::clone(&self.handle_bands),
+            dynamic_message_markers: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
 }
 
 /// Plans the cache-prefix layout for a single request.
@@ -219,5 +244,41 @@ impl<'a> CachePlanner<'a> {
             handle_bands: Arc::new(RwLock::new(HashMap::new())),
             dynamic_message_markers: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+}
+
+#[cfg(test)]
+mod fork_tests {
+    use super::Plan;
+    use crate::Band;
+
+    #[test]
+    fn fork_inherits_parent_bands_and_shares_registrations() {
+        let parent = Plan::default();
+        let h_inherited = [1u8; 32];
+        parent.register_handle(h_inherited, Band::Sticky);
+
+        // A sub-agent's plan inherits the parent's already-assigned bands.
+        let child = parent.fork_shared_handle_bands();
+        assert_eq!(child.band_for_handle(&h_inherited), Some(Band::Sticky));
+
+        // The child's own registrations are visible to the shared encoder
+        // (reading the parent/global plan) because handle_bands is one map.
+        let h_child = [2u8; 32];
+        child.register_handle(h_child, Band::Sticky);
+        assert_eq!(parent.band_for_handle(&h_child), Some(Band::Sticky));
+    }
+
+    #[test]
+    fn fork_isolates_per_session_markers() {
+        let parent = Plan::default();
+        parent.set_dynamic_message_markers(vec![3, 7]);
+        let child = parent.fork_shared_handle_bands();
+        // The child starts with no per-message markers (its own session).
+        assert!(child.dynamic_message_markers().is_empty());
+        // Writing the child's markers never clobbers the parent's (no sibling race).
+        child.set_dynamic_message_markers(vec![1]);
+        assert_eq!(parent.dynamic_message_markers(), vec![3, 7]);
+        assert_eq!(child.dynamic_message_markers(), vec![1]);
     }
 }

@@ -546,6 +546,7 @@ const fn wire_section_label(w: WireFormat) -> &'static str {
         WireFormat::Ollama => "Ollama (local)",
         WireFormat::GitHubCopilot => "GitHub Copilot",
         WireFormat::OpenAIChat => "OpenAI-compatible (chat/completions)",
+        WireFormat::OpenAIResponses => "OpenAI-compatible (responses)",
     }
 }
 

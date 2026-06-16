@@ -12,11 +12,15 @@ workspace = true
 
 [features]
 default = ["openai", "gemini", "ollama", "openrouter", "openai-compat", "oauth-providers", "custom-providers"]
-openai = ["dep:origin-provider-openai", "openai-compat"]
+# `openai` / `openrouter` are served by the generic OpenAIChat path
+# (origin-provider-openai-compat) via the catalog; the dedicated thin-wrapper
+# crates were redundant and removed. The feature flags are retained (now just
+# aliases for `openai-compat`) so downstream feature selections stay valid.
+openai = ["openai-compat"]
 openai-compat = []
 gemini = ["dep:origin-provider-gemini"]
 ollama = ["dep:origin-provider-ollama"]
-openrouter = ["dep:origin-provider-openrouter", "openai-compat"]
+openrouter = ["openai-compat"]
 bedrock = ["dep:origin-provider-bedrock"]
 github-models = ["dep:origin-provider-github"]
 oauth-providers = []
@@ -32,10 +36,8 @@ origin-core             = { path = "../origin-core" }
 origin-provider         = { path = "../origin-provider" }
 origin-provider-anthropic = { path = "../origin-provider-anthropic" }
 origin-provider-openai-compat = { path = "../origin-provider-openai-compat" }
-origin-provider-openai     = { path = "../origin-provider-openai",     optional = true }
 origin-provider-gemini     = { path = "../origin-provider-gemini",     optional = true }
 origin-provider-ollama     = { path = "../origin-provider-ollama",     optional = true }
-origin-provider-openrouter = { path = "../origin-provider-openrouter", optional = true }
 origin-provider-bedrock    = { path = "../origin-provider-bedrock",    optional = true }
 origin-provider-github     = { path = "../origin-provider-github",     optional = true }
 origin-tools            = { path = "../origin-tools" }

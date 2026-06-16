@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::{span, Subscriber};
 use tracing_subscriber::layer::Context;
@@ -205,7 +205,10 @@ where
         };
         let dur_us = u64::try_from(stash.start.elapsed().as_micros()).unwrap_or(u64::MAX);
         let row = SpanRow {
-            ts_ns: 0, // optional; the daemon's wall clock is captured per-record on the writer side if needed
+            // Wall-clock timestamp of the span close, in nanoseconds since the
+            // UNIX epoch. This is the leading column of every trace row, so a
+            // placeholder `0` made every row unsortable/unjoinable by time.
+            ts_ns: now_ns(),
             span_id: id.into_u64(),
             parent_id: stash.parent,
             kind: stash.kind,
@@ -219,6 +222,15 @@ where
         // trace row than block the agent loop.
         let _ = self.tx.try_send(row);
     }
+}
+
+/// Wall-clock nanoseconds since the UNIX epoch, saturating on the (practically
+/// impossible) pre-1970 clock so the trace path never panics. Used to stamp
+/// every [`SpanRow`] on close.
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
 #[derive(Clone)]
@@ -354,6 +366,24 @@ mod intern_tests {
         let a = leak_str(String::from("origin-trace-bug2-test-0"));
         let b = leak_str(String::from("origin-trace-bug2-test-0"));
         assert!(std::ptr::eq(a, b), "intern must dedup repeated strings");
+    }
+}
+
+#[cfg(test)]
+mod now_ns_tests {
+    use super::now_ns;
+
+    #[test]
+    fn now_ns_is_a_real_wall_clock_and_non_decreasing() {
+        let a = now_ns();
+        // Far past the dawn of the epoch: any plausible wall clock is well
+        // above this. Guards against the previous hard-coded `0`.
+        assert!(a > 0, "now_ns must return a real timestamp, got 0");
+        let b = now_ns();
+        assert!(
+            b >= a,
+            "wall clock must be non-decreasing across calls: {a} then {b}"
+        );
     }
 }
 

@@ -1,6 +1,42 @@
 // SPDX-License-Identifier: Apache-2.0
+use std::sync::Arc;
+
 use origin_keyvault::audit::{AuditAction, AuditRing};
+use origin_keyvault::{KeyVault, Secret};
 use tempfile::tempdir;
+
+/// R16: a vault with an attached audit ring must record every secret access
+/// (set/get/delete/list) into the ring. Before the daemon wiring (and this
+/// `with_audit` primitive) the audit ring was never attached in production, so
+/// no secret-access trail was ever produced.
+#[tokio::test]
+async fn attached_vault_records_each_access() {
+    let dir = tempdir().expect("tempdir");
+    let ring = Arc::new(AuditRing::open(dir.path()).await.expect("open"));
+    // Audit the in-memory backend so the test is platform-independent.
+    let vault = KeyVault::in_memory().with_audit(Arc::clone(&ring));
+
+    vault
+        .set("anthropic", "default", Secret::new("sk-ant-xxx".to_string()))
+        .await
+        .expect("set");
+    let _ = vault.get("anthropic", "default").await.expect("get");
+    let _ = vault.list("anthropic").await.expect("list");
+    vault.delete("anthropic", "default").await.expect("delete");
+
+    let events = ring.replay().await.expect("replay");
+    let actions: Vec<AuditAction> = events.iter().map(|e| e.action).collect();
+    assert!(
+        actions.contains(&AuditAction::Set)
+            && actions.contains(&AuditAction::Get)
+            && actions.contains(&AuditAction::List)
+            && actions.contains(&AuditAction::Delete),
+        "attached vault must record set/get/list/delete; got {actions:?}"
+    );
+    // The recorded events carry the (provider, account) namespace, never the
+    // secret bytes (covered by `ring_never_records_secret_bytes`).
+    assert!(events.iter().all(|e| e.provider == "anthropic"));
+}
 
 #[tokio::test]
 async fn ring_appends_and_replays() {

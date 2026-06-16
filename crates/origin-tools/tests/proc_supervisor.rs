@@ -2,6 +2,7 @@
 #![allow(clippy::unwrap_used)]
 
 use origin_tools::proc_supervisor::{SpawnOpts, Supervisor};
+use origin_tools::SandboxProfile;
 use std::time::Duration;
 
 #[tokio::test]
@@ -56,6 +57,56 @@ async fn timeout_terminates_long_process() {
         chunk = sup.read_since(pid, 0, 4096).unwrap();
     }
     assert!(chunk.status.is_terminal(), "status was {:?}", chunk.status);
+}
+
+/// P11.5 plumbing: `SpawnOpts` carries the tool's `SandboxProfile`, and a
+/// non-`Inherit` profile reaches `origin_sandbox::apply` at spawn. On the
+/// default feature set `apply` resolves to the no-op backend (it warns but
+/// mutates nothing), so the child still spawns and its output still flows —
+/// proving the wiring engages without breaking process execution.
+#[tokio::test]
+async fn non_inherit_sandbox_profile_still_spawns_and_runs() {
+    let sup = Supervisor::new();
+    #[cfg(unix)]
+    let cmd = "echo sandboxed";
+    #[cfg(windows)]
+    let cmd = "Write-Output sandboxed";
+    let opts = SpawnOpts {
+        sandbox_profile: Some(SandboxProfile::Shell),
+        ..SpawnOpts::default()
+    };
+    let pid = sup.spawn(cmd, &opts).unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let chunk = sup.read_since(pid, 0, 4096).unwrap();
+    assert!(chunk.bytes.contains("sandboxed"), "got: {:?}", chunk.bytes);
+}
+
+/// The default (`Inherit` / `None`) sandbox profile must be byte-identical to
+/// the pre-wiring path: `apply` is never called and the child runs exactly as
+/// before. We assert both the unset (`None`) and explicit `Inherit` spellings
+/// behave the same as an ordinary spawn.
+#[tokio::test]
+async fn inherit_sandbox_profile_is_unchanged() {
+    let sup = Supervisor::new();
+    #[cfg(unix)]
+    let cmd = "echo inherit";
+    #[cfg(windows)]
+    let cmd = "Write-Output inherit";
+
+    // Unset profile (None) — the documented default.
+    let pid_none = sup.spawn(cmd, &SpawnOpts::default()).unwrap();
+    // Explicit Inherit — must also skip `apply`.
+    let opts_inherit = SpawnOpts {
+        sandbox_profile: Some(SandboxProfile::Inherit),
+        ..SpawnOpts::default()
+    };
+    let pid_inherit = sup.spawn(cmd, &opts_inherit).unwrap();
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let none = sup.read_since(pid_none, 0, 4096).unwrap();
+    let inherit = sup.read_since(pid_inherit, 0, 4096).unwrap();
+    assert!(none.bytes.contains("inherit"), "none: {:?}", none.bytes);
+    assert!(inherit.bytes.contains("inherit"), "inherit: {:?}", inherit.bytes);
 }
 
 #[tokio::test]

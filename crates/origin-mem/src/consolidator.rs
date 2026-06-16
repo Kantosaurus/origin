@@ -71,17 +71,24 @@ impl Consolidator {
         let memories: Vec<MemoryRecord> = self.store.iter_all()?;
 
         // ── Build ULID ↔ u64 pass-local maps ────────────────────────────────
-        // Position in the sorted Vec is the u64 index the HNSW uses.
+        // The HNSW index is keyed by the STABLE id `memory_id_to_u64(&id)` (the
+        // high 64 bits of the ULID) — the same scheme the daemon's injector and
+        // memory_wiring use to populate it. The previous positional `iter_all`
+        // index disagreed with that scheme, so every candidate `.get(id)` missed
+        // and supersede/contradiction/priority-bump silently targeted nothing
+        // (or, if an index were keyed positionally elsewhere, the WRONG rows).
+        // Keep one canonical id scheme across injector, search handle, and here.
         let id_to_u64: HashMap<MemoryId, u64> = memories
             .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                #[allow(clippy::cast_possible_truncation)]
-                (r.id, i as u64)
-            })
+            .map(|r| (r.id, crate::memory_id_to_u64(&r.id)))
             .collect();
 
-        let u64_to_record: Vec<&MemoryRecord> = memories.iter().collect();
+        // Resolve a candidate's stable u64 back to its record. Keyed by
+        // `memory_id_to_u64`, NOT positional order.
+        let u64_to_record: HashMap<u64, &MemoryRecord> = memories
+            .iter()
+            .map(|r| (crate::memory_id_to_u64(&r.id), r))
+            .collect();
 
         // ── Current time for age calculation ────────────────────────────────
         let now_ms = SystemTime::now()
@@ -109,12 +116,11 @@ impl Consolidator {
             // Decode quantized vector back to f32.
             let vec_m = quantizer.decode(&record_m.encoded);
 
-            // Build lookup closure: u64 index → MetaRow.
+            // Build lookup closure: stable u64 id → MetaRow.
             let lookup = |uid: u64| -> Option<MetaRow> {
-                // On 64-bit targets usize == u64 so this is lossless; on 32-bit
-                // targets the index would have been checked at insert time.
-                #[allow(clippy::cast_possible_truncation)]
-                let r = u64_to_record.get(uid as usize)?;
+                // `uid` is `memory_id_to_u64(&id)`, the same key the HNSW index
+                // is populated with; resolve it through the stable-id map.
+                let r = u64_to_record.get(&uid)?;
                 let age_ms = now_ms.saturating_sub(r.created_at_ms);
                 // Precision loss acceptable: age in days is bounded and the
                 // f32 range is sufficient for the decay formula.
@@ -151,9 +157,8 @@ impl Consolidator {
                     continue;
                 }
 
-                // u64 → usize: lossless on 64-bit; 32-bit insert guard ensures fits.
-                #[allow(clippy::cast_possible_truncation)]
-                let Some(record_c) = u64_to_record.get(candidate.id as usize) else {
+                // Resolve the candidate's stable u64 id back to its record.
+                let Some(&record_c) = u64_to_record.get(&candidate.id) else {
                     continue;
                 };
 

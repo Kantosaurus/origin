@@ -187,3 +187,79 @@ async fn remote_url_routes_through_quic() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("remote-ok"), "stdout: {stdout}");
 }
+
+/// End-to-end CLI bearer transmission: `origin run --remote … --bearer <token>`
+/// must transmit the token as the first frame on the QUIC stream so a
+/// bearer-gated server reads exactly the supplied bearer before serving the
+/// request. This is the wire-level proof that `--bearer` is no longer dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_bearer_is_transmitted_on_the_wire() {
+    use origin_ipc::quic::QuicListener;
+    use origin_ipc::tls::{generate_self_signed, sha256_fingerprint_hex};
+
+    const TOKEN: &str = "orb_wire_token_abc123";
+
+    let server_bundle = generate_self_signed("origin-daemon").expect("server cert");
+    let client_bundle = generate_self_signed("origin-client").expect("client cert");
+    let server_fp_hex = sha256_fingerprint_hex(&server_bundle.cert_der);
+
+    // A bearer-gated listener (the daemon's production remote transport): the
+    // client cert is accepted at TLS, and authorization rides on the bearer.
+    let listener =
+        QuicListener::bind_bearer_gated("127.0.0.1:0".parse().expect("addr"), server_bundle)
+            .await
+            .expect("bind bearer-gated");
+    let addr = listener.local_addr();
+    let dir = TempDir::new().expect("tempdir");
+    let client_cert_path = dir.path().join("client_cert.der");
+    let client_key_path = dir.path().join("client_key.der");
+    std::fs::write(&client_cert_path, &client_bundle.cert_der).expect("write client cert");
+    std::fs::write(&client_key_path, &client_bundle.key_der).expect("write client key");
+
+    let server = tokio::spawn(async move {
+        let mut conn = listener.accept().await.expect("accept");
+        // The FIRST frame is the bearer the CLI transmitted.
+        let presented = conn.read_bearer().await.expect("read bearer");
+        // Then the actual request frame.
+        let _req = conn.read_frame().await.expect("read req");
+        // Stream a text delta (so --json output carries it) then the reply.
+        let ev = origin_daemon::protocol::StreamEvent::TextDelta {
+            text: "remote-ok".into(),
+        };
+        let ev_body = serde_json::to_vec(&ev).expect("ser ev");
+        conn.write_frame(origin_ipc::frame::FrameKind::Event, &ev_body)
+            .await
+            .expect("write ev");
+        let reply = origin_daemon::protocol::PromptReply {
+            assistant_text: "remote-ok".into(),
+            turns: 1,
+        };
+        let body = serde_json::to_vec(&reply).expect("ser reply");
+        conn.write_frame(origin_ipc::frame::FrameKind::Response, &body)
+            .await
+            .expect("write reply");
+        presented
+    });
+
+    let cmd = env!("CARGO_BIN_EXE_origin");
+    let url = format!("origin://{addr}#{server_fp_hex}");
+    let output = tokio::process::Command::new(cmd)
+        .env("ORIGIN_REMOTE_CLIENT_CERT_FILE", &client_cert_path)
+        .env("ORIGIN_REMOTE_CLIENT_KEY_FILE", &client_key_path)
+        .args(["run", "--remote", &url, "--bearer", TOKEN, "--json", "hi"])
+        .output()
+        .await
+        .expect("run binary");
+    let presented = server.await.expect("server task");
+
+    assert_eq!(
+        presented, TOKEN,
+        "the CLI must transmit the --bearer token verbatim as the first frame"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("remote-ok"),
+        "authorized request must be served; stdout: {stdout}, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

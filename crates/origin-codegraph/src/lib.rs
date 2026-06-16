@@ -5,9 +5,7 @@
 
 pub mod ask;
 pub mod chunker;
-pub mod community;
 pub mod extract;
-pub mod git_hook;
 pub mod index;
 pub mod lang;
 pub mod query;
