@@ -1641,6 +1641,14 @@ enum PromptOutcome {
     ConnectionDead,
 }
 
+/// How a turn's `select!` resolved in [`handle_request`]: either the turn
+/// future finished on its own (`Normal`) or the mid-turn interrupt poller fired
+/// first and the turn future was dropped (`Interrupted`).
+enum TurnEnd {
+    Normal(Result<origin_daemon::agent::LoopSummary, origin_daemon::agent::LoopError>),
+    Interrupted(InterruptOutcome),
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_request(
     conn: &SharedConnection,
@@ -1933,21 +1941,45 @@ async fn handle_request(
         } else {
             &always_allow
         };
-        drive_goal_loop(
-            conn,
+        // Mid-turn interrupt: race the turn future against `poll_for_interrupt`,
+        // the SOLE interrupt reader during the turn (`drive_goal_loop`'s own
+        // between-iteration peek has been removed so they cannot double-consume
+        // a frame). When the poller wins, `select!` DROPS the turn future —
+        // cancelling the in-flight model stream + async tool futures at their
+        // await points, and (via the foreground-Bash kill-on-drop guard)
+        // SIGKILLing a running foreground process. The borrowed-future form of
+        // `select!` needs no `'static`/Arc refactor. This is what finally makes
+        // Ctrl+C abort a REGULAR (non-goal) turn, not just a `/goal` loop.
+        let turn_fut = drive_goal_loop(
             &mut session,
             req.user_text.clone(),
             provider,
             &opts,
             Arc::clone(&active_goal),
-            Arc::clone(&pending_message),
             Arc::clone(&session_store),
             verifier.as_ref(),
             event_tx.clone(),
             prompter,
-        )
-        .await
+        );
+        tokio::select! {
+            res = turn_fut => TurnEnd::Normal(res),
+            outcome = poll_for_interrupt(conn, &pending_message) => TurnEnd::Interrupted(outcome),
+        }
     };
+    // Mid-turn interrupt teardown. Done BEFORE the channels close so the
+    // `GoalCleared` event `interrupt_cleanup` may emit still reaches the client
+    // through the live event relay. The turn future was already dropped by the
+    // `select!` above (model stream + tool futures cancelled, foreground process
+    // SIGKILLed).
+    if let TurnEnd::Interrupted(outcome) = &loop_result {
+        // The drop can land between the assistant `tool_use` push and its
+        // `tool_result`. Strip that orphaned tail BEFORE the checkpoint + persist
+        // so neither the resume token nor the saved session opens the next
+        // request with an unmatched tool_use (Anthropic 400).
+        drop_orphan_tool_use_tail(&mut session.messages);
+        interrupt_cleanup(outcome, &session, &active_goal, &session_store, &event_tx).await;
+    }
+
     // Close per-request channels so both relay tasks exit cleanly.
     drop(tx_sub);
     drop(event_tx);
@@ -1961,7 +1993,7 @@ async fn handle_request(
     let _turn_elapsed = turn_started.elapsed();
 
     match loop_result {
-        Ok(summary) => {
+        TurnEnd::Normal(Ok(summary)) => {
             let reply = PromptReply {
                 assistant_text: summary.assistant_text,
                 turns: summary.turns,
@@ -1983,7 +2015,7 @@ async fn handle_request(
             submit_summarize_jobs(&sidecar, &session_store, &session);
             PromptOutcome::Succeeded
         }
-        Err(e) => {
+        TurnEnd::Normal(Err(e)) => {
             let message = format!("loop error: {e}");
             let _ = conn
                 .lock()
@@ -1991,6 +2023,28 @@ async fn handle_request(
                 .write_frame(FrameKind::ErrorFrame, message.as_bytes())
                 .await;
             PromptOutcome::Failed { message }
+        }
+        // Ctrl+C / mid-turn follow-up: the turn was aborted. Write a TERMINAL
+        // `Response` so the client's `call_daemon` loop ends (it blocks until a
+        // Response/ErrorFrame). Persist whatever the partial turn left so the
+        // session stays coherent and resumable.
+        TurnEnd::Interrupted(_) => {
+            let reply = PromptReply {
+                assistant_text: last_assistant_text(&session),
+                turns: u32::try_from(session.messages.len()).unwrap_or(u32::MAX),
+            };
+            #[allow(clippy::expect_used)]
+            let bytes = serde_json::to_vec(&reply).expect("PromptReply is always serializable");
+            {
+                let mut g = conn.lock().await;
+                if let Err(e) = g.write_frame(FrameKind::Response, &bytes).await {
+                    error!(error = %e, "write interrupted reply");
+                    return PromptOutcome::ConnectionDead;
+                }
+            }
+            persist(session_store.as_ref(), &session);
+            submit_summarize_jobs(&sidecar, &session_store, &session);
+            PromptOutcome::Succeeded
         }
     }
 }
@@ -2135,6 +2189,24 @@ async fn handle_clear_all(
         }
     }
     let _ = write_event(conn, &StreamEvent::AdminOk).await;
+}
+
+/// Strip a trailing assistant `tool_use` with no matching `tool_result`.
+///
+/// A mid-tool interrupt drops the turn future between the assistant `tool_use`
+/// push and its `tool_result`, leaving `session.messages` ending in an assistant
+/// message whose `tool_use` blocks are unmatched. Persisting that verbatim makes
+/// the NEXT request open with an unmatched `tool_use`, which Anthropic rejects
+/// with a 400. Pop the orphan so the saved session + resume token stay valid. A
+/// normal turn ends with assistant text, never a trailing `tool_use`, so this
+/// only fires after a mid-tool interrupt.
+fn drop_orphan_tool_use_tail(messages: &mut Vec<origin_core::types::Message>) {
+    use origin_core::types::{Block, Role};
+    while messages.last().is_some_and(|m| {
+        matches!(m.role, Role::Assistant) && m.blocks.iter().any(|b| matches!(b, Block::ToolUse { .. }))
+    }) {
+        messages.pop();
+    }
 }
 
 /// Pull the last assistant text out of `session` for tag parsing + verifier
@@ -2289,79 +2361,110 @@ async fn goal_cap_clear(
     }
 }
 
-/// Between-iteration peek for a pending client message (the `Iterate` arm of
-/// [`drive_goal_loop`]). Returns `true` when a frame was waiting — in which
-/// case the goal has been cleared, a terminal checkpoint persisted, the
-/// `GoalCleared` event emitted, and (for non-`Interrupt` messages) the parsed
-/// `ClientMessage` pushed into `pending_message` — and the caller should
-/// return. Returns `false` when nothing was waiting and the loop should
-/// continue. Reads `session` only (id + message count).
-async fn handle_iterate_pending(
+/// Why [`poll_for_interrupt`] returned — i.e. how the in-flight turn should be
+/// torn down by the interrupted branch of the `select!` in [`handle_request`].
+enum InterruptOutcome {
+    /// A plain `ClientMessage::Interrupt` landed mid-turn: the client is
+    /// explicitly cancelling the in-flight run (Ctrl+C). The frame is consumed.
+    UserInterrupt,
+    /// A non-`Interrupt` follow-up landed mid-turn (a queued Prompt, an admin
+    /// call, …). It has already been pushed into `pending_message`; the outer
+    /// message loop will dispatch it after this turn unwinds.
+    PushedBack,
+}
+
+/// Mid-turn interrupt poller. This is the SOLE interrupt reader while a turn is
+/// in flight: [`handle_request`] races a turn future against this poller via
+/// `tokio::select!`, so when this future resolves the turn future is dropped —
+/// which cancels the in-flight model stream + any async tool futures at their
+/// await points, and (via the foreground-Bash kill-on-drop guard) `SIGKILLs` a
+/// running foreground process.
+///
+/// It mirrors the connection-read path the outer message loop and the
+/// (now-removed) `handle_iterate_pending` between-iteration peek used: a
+/// ZERO-timeout peek of the connection (cancellation-safe thanks to the
+/// `Connection::rx_buf`), then a short sleep, repeating until a frame is
+/// waiting. A waiting frame is decoded exactly like the outer loop:
+///
+/// - `Interrupt`: return [`InterruptOutcome::UserInterrupt`] (frame consumed).
+/// - any other variant: push the parsed `ClientMessage` into `pending_message`
+///   so the outer loop dispatches it, then return [`InterruptOutcome::PushedBack`].
+/// - decode failure: write an `ErrorFrame` so the user sees the malformed frame
+///   was dropped, then return `PushedBack` (nothing to dispatch; turn unwinds).
+///
+/// Because a peeked frame is fully consumed from `rx_buf` here, this MUST be the
+/// only reader during the turn — `drive_goal_loop`'s own between-iteration peek
+/// has been removed so the two cannot double-consume a frame.
+async fn poll_for_interrupt(
     conn: &SharedConnection,
+    pending_message: &tokio::sync::Mutex<Option<ClientMessage>>,
+) -> InterruptOutcome {
+    loop {
+        // Zero-timeout peek: returns immediately whether or not a whole frame is
+        // buffered. A dropped peek leaves partial bytes intact in `rx_buf`.
+        let peek = {
+            let mut g = conn.lock().await;
+            tokio::time::timeout(std::time::Duration::ZERO, g.read_frame_body()).await
+        };
+        let Ok(Ok(body)) = peek else {
+            // Nothing waiting (timed out) or the connection erred — back off
+            // briefly and poll again. A real connection error surfaces on the
+            // outer loop's next read; here we just keep watching for an
+            // interrupt for the life of the turn.
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            continue;
+        };
+        // Mirror the outer loop's decode path: ClientMessage envelope first,
+        // legacy raw PromptRequest fallback.
+        let parsed: Option<ClientMessage> =
+            serde_json::from_slice::<ClientMessage>(&body).ok().or_else(|| {
+                #[allow(deprecated)]
+                from_legacy_prompt_request(&body).ok()
+            });
+        match parsed {
+            Some(ClientMessage::Interrupt) => return InterruptOutcome::UserInterrupt,
+            Some(msg) => {
+                *pending_message.lock().await = Some(msg);
+                return InterruptOutcome::PushedBack;
+            }
+            None => {
+                let _ = conn
+                    .lock()
+                    .await
+                    .write_frame(
+                        FrameKind::ErrorFrame,
+                        b"bad request: malformed mid-turn frame; dropped",
+                    )
+                    .await;
+                return InterruptOutcome::PushedBack;
+            }
+        }
+    }
+}
+
+/// Tear down the in-flight turn after [`poll_for_interrupt`] fired. The turn
+/// future has already been dropped by the `select!` (cancelling the model
+/// stream + tool futures + hard-killing a foreground process). This performs the
+/// goal-clear cleanup the old `handle_iterate_pending` peek did — relocated here
+/// so a Ctrl+C during ANY turn (regular OR mid-goal) reaches it — then records
+/// the `UserInterrupt` pain bucket.
+///
+/// Returns `true` when a goal was active and has been cleared (the caller emits
+/// nothing further; the `GoalCleared` event is sent here). Reads `session` only.
+async fn interrupt_cleanup(
+    outcome: &InterruptOutcome,
     session: &Session,
     active_goal: &tokio::sync::Mutex<Option<origin_goal::GoalState>>,
     session_store: &SessionStore,
-    pending_message: &tokio::sync::Mutex<Option<ClientMessage>>,
     event_tx: &tokio::sync::mpsc::Sender<StreamEvent>,
-) -> bool {
-    // Peek for a pending user message between iterations. If one is waiting,
-    // parse it and decide:
-    //   * `Interrupt`         → clear the goal, drop the frame (Interrupt is
-    //                           itself a no-op after the clear).
-    //   * any other variant   → clear the goal AND push the parsed
-    //                           `ClientMessage` into `pending_message` so the
-    //                           outer message loop dispatches it on its next
-    //                           tick (replaces the previous "drop the frame"
-    //                           behaviour that silently lost the user's
-    //                           follow-up).
-    //   * decode failure      → clear the goal, drop the body (a malformed
-    //                           frame is the same as an Interrupt for our
-    //                           purposes; the outer loop would reject it on
-    //                           the next read).
-    let peek = {
-        let mut g = conn.lock().await;
-        tokio::time::timeout(std::time::Duration::ZERO, g.read_frame_body()).await
+) {
+    // Clear any active goal and persist a terminal checkpoint so a crash before
+    // the next message write does not resurrect a now-stale Active snapshot.
+    // Build the snapshot from the prior goal BEFORE the slot is observed empty.
+    let prior = {
+        let mut slot = active_goal.lock().await;
+        slot.take()
     };
-    let Ok(Ok(pending_body)) = peek else {
-        return false;
-    };
-    // Mirror the outer loop's decode path: ClientMessage envelope first,
-    // legacy raw PromptRequest fallback.
-    let parsed: Option<ClientMessage> = serde_json::from_slice::<ClientMessage>(&pending_body)
-        .ok()
-        .or_else(|| {
-            #[allow(deprecated)]
-            from_legacy_prompt_request(&pending_body).ok()
-        });
-    let is_interrupt = matches!(parsed, Some(ClientMessage::Interrupt));
-    // Bug #12: if the peeked frame couldn't be decoded as any known message,
-    // write an ErrorFrame to the client so the user sees that their malformed
-    // prompt was dropped (mirrors the outer-loop decode path at
-    // main.rs:744-750). Without this the daemon would silently swallow the
-    // body and emit only GoalCleared.
-    if parsed.is_none() {
-        let _ = conn
-            .lock()
-            .await
-            .write_frame(
-                FrameKind::ErrorFrame,
-                b"bad request: malformed mid-goal frame; dropped",
-            )
-            .await;
-    }
-    // Clear the active goal before yielding control. The outer loop sees a
-    // stable `None` slot when it picks up the pushed-back message. Build a
-    // terminal checkpoint from the prior goal first so a crash between here
-    // and the next message write does not resurrect a now-stale Active
-    // snapshot.
-    let mut slot = active_goal.lock().await;
-    let prior = slot.take();
-    drop(slot);
-    let cleared_ev = prior.as_ref().map(|p| StreamEvent::GoalCleared {
-        reason: origin_goal::ClearReasonWire::UserSlash,
-        iter: p.iter,
-        tokens_spent: p.tokens_spent,
-    });
     if let Some(p) = prior {
         let last_turn = u32::try_from(session.messages.len().saturating_sub(1)).unwrap_or(u32::MAX);
         let token = cleared_resume_token(
@@ -2371,30 +2474,25 @@ async fn handle_iterate_pending(
             origin_goal::ClearReasonWire::UserSlash,
         );
         if let Err(e) = session_store.save_resume_token(&token) {
-            warn!(error = %e, "goal checkpoint: user-slash save failed");
+            warn!(error = %e, "goal checkpoint: interrupt save failed");
         }
+        let _ = event_tx
+            .send(StreamEvent::GoalCleared {
+                reason: origin_goal::ClearReasonWire::UserSlash,
+                iter: p.iter,
+                tokens_spent: p.tokens_spent,
+            })
+            .await;
     }
-    if let Some(ev) = cleared_ev {
-        let _ = event_tx.send(ev).await;
-    }
-    // Decide based on the user's intent. A plain `Interrupt` is the client
-    // explicitly cancelling the in-flight autonomous run; anything else is a
-    // follow-up we push back to the outer loop for normal dispatch.
-    if is_interrupt {
-        // Stage C5 Task 4: a plain `Interrupt` landing mid-goal-iteration is
-        // the client explicitly cancelling the in-flight autonomous run — the
-        // `UserInterrupt` pain bucket. Emitted only on the interrupt branch (a
-        // pushed-back follow-up is a continuation, not a cancellation), so the
-        // reason is precise. Default-off ⇒ no event.
+    // A plain `Interrupt` is the client explicitly cancelling the in-flight run
+    // — the `UserInterrupt` pain bucket. A pushed-back follow-up is a
+    // continuation, not a cancellation, so the bucket is emitted only on the
+    // interrupt branch (precise reason). Default-off ⇒ no event.
+    if matches!(outcome, InterruptOutcome::UserInterrupt) {
         origin_daemon::agent::record_session_stop_pain(origin_daemon::agent::SessionStopPain::reason_only(
             origin_telemetry::SessionStopReason::UserInterrupt,
         ));
-    } else if let Some(msg) = parsed {
-        // A follow-up Prompt, an admin call, etc. — consumed here would lose
-        // the user's intent, so push it back for the outer loop to dispatch.
-        *pending_message.lock().await = Some(msg);
     }
-    true
 }
 
 /// Apply a `DriverDecision::Cleared`: persist a terminal-status checkpoint and
@@ -2498,15 +2596,16 @@ async fn run_verifier_dispatch(
 /// message channel via a zero-duration `timeout` poll — if any other
 /// `ClientMessage` is waiting, we break out so the outer message loop
 /// handles it (the spec's "user interrupt mid-iteration" case).
+// `conn` / `pending_message` were dropped: the mid-turn interrupt poller in
+// `handle_request` (`poll_for_interrupt`) is now the sole connection reader
+// during a turn, so this loop no longer peeks the connection itself.
 #[allow(clippy::too_many_arguments)]
 async fn drive_goal_loop(
-    conn: &SharedConnection,
     session: &mut Session,
     initial_user_text: String,
     provider: &dyn Provider,
     opts: &LoopOptions,
     active_goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
-    pending_message: Arc<tokio::sync::Mutex<Option<ClientMessage>>>,
     session_store: Arc<SessionStore>,
     verifier: &dyn origin_goal::verifier::Verifier,
     event_tx: tokio::sync::mpsc::Sender<StreamEvent>,
@@ -2602,21 +2701,15 @@ async fn drive_goal_loop(
             } => {
                 let _ = event_tx.send(iter_event).await;
                 next_text = synthesized_prompt;
-                // Peek for a pending user message between iterations; if one is
-                // waiting, the goal is cleared and we return (see
-                // `handle_iterate_pending`). Otherwise fall through and loop.
-                if handle_iterate_pending(
-                    conn,
-                    session,
-                    &active_goal,
-                    &session_store,
-                    &pending_message,
-                    &event_tx,
-                )
-                .await
-                {
-                    return Ok(last_summary.unwrap_or_else(empty_loop_summary));
-                }
+                // NOTE: the between-iteration connection peek that used to live
+                // here (`handle_iterate_pending`) has been removed. The mid-turn
+                // interrupt poller in `handle_request` (`poll_for_interrupt`) is
+                // now the SOLE connection reader during a turn — it watches for
+                // an Interrupt / follow-up at EVERY await point of this loop, not
+                // just the iteration boundary, and dropping this future via the
+                // `select!` performs the goal-clear cleanup in `interrupt_cleanup`.
+                // Keeping a second peek here would race and double-consume the
+                // same frame from `rx_buf`.
             }
             DriverDecision::Cleared {
                 reason,
@@ -4141,6 +4234,45 @@ mod tests {
         }
     }
 
+    fn tool_use_msg() -> Message {
+        Message {
+            role: Role::Assistant,
+            blocks: vec![Block::ToolUse {
+                id: "tu1".into(),
+                name: "Bash".into(),
+                input_json: b"{}".to_vec(),
+                cache_marker: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn drop_orphan_tool_use_tail_strips_interrupted_mid_tool_tail() {
+        // A turn interrupted mid-tool ends in an orphaned assistant tool_use.
+        let mut orphaned = vec![
+            msg(Role::User, "do it"),
+            msg(Role::Assistant, "ok"),
+            tool_use_msg(),
+        ];
+        super::drop_orphan_tool_use_tail(&mut orphaned);
+        assert_eq!(orphaned.len(), 2, "the orphaned trailing tool_use is popped");
+        assert!(
+            orphaned.last().is_some_and(|m| matches!(m.role, Role::Assistant)
+                && m.blocks.iter().all(|b| !matches!(b, Block::ToolUse { .. }))),
+            "the new tail is the balanced assistant text turn"
+        );
+
+        // A balanced transcript (tool_use followed by its tool_result) is untouched.
+        let mut balanced = vec![
+            msg(Role::User, "do it"),
+            tool_use_msg(),
+            msg(Role::Tool, "result"),
+        ];
+        let before = balanced.len();
+        super::drop_orphan_tool_use_tail(&mut balanced);
+        assert_eq!(balanced.len(), before, "a balanced transcript is left intact");
+    }
+
     #[test]
     fn turn_window_isolates_each_turn() {
         // user0, asst1, tool2, user3, asst4, tool5
@@ -4317,6 +4449,113 @@ mod tests {
             detach_last_turn(&store, sid),
             9,
             "an existing token's last_turn must be preserved, never zeroed"
+        );
+    }
+
+    /// Ctrl+C must abort a REGULAR (non-goal) turn mid-flight — the bug this
+    /// change fixes. Before the fix the turn ran INLINE in `handle_request`
+    /// (`drive_goal_loop(..).await`), so a mid-turn `Interrupt` was only ever
+    /// observed by the goal driver's BETWEEN-iteration peek, which for a regular
+    /// one-iteration prompt fires AFTER the turn already finished. The Interrupt
+    /// was therefore buffered and ignored: the turn ran to completion.
+    ///
+    /// This test reproduces `handle_request`'s new mechanism faithfully against
+    /// a REAL connection: a turn future that would loop to `MAX_TURNS` (standing
+    /// in for a provider that keeps emitting tool-use) is raced via the SAME
+    /// `tokio::select!` against the production `poll_for_interrupt`. A real
+    /// `Interrupt` frame is delivered on the connection mid-turn. The turn future
+    /// must be DROPPED — observable as the shared turn counter stopping far short
+    /// of `MAX_TURNS` — and `poll_for_interrupt` must report `UserInterrupt`.
+    ///
+    /// Pre-fix (turn awaited inline, no poller) the counter would reach
+    /// `MAX_TURNS`; post-fix it aborts promptly.
+    #[tokio::test]
+    #[allow(clippy::panic)]
+    async fn interrupt_aborts_regular_turn_before_max_turns() {
+        use origin_ipc::frame::FrameKind;
+        use origin_ipc::transport::{Connector, Listener};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        // A long-but-bounded ceiling so a buggy (non-aborting) run still
+        // terminates the test instead of hanging.
+        const MAX_TURNS: u32 = 1000;
+
+        // Unique per-process pipe/socket path (mirrors stream_e2e.rs).
+        let pid = std::process::id();
+        let nano = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        #[cfg(windows)]
+        let path = format!(r"\\.\pipe\origin-test-interrupt-{pid}-{nano}");
+        #[cfg(unix)]
+        let path = format!(
+            "{}/origin-test-interrupt-{pid}-{nano}.sock",
+            std::env::temp_dir().display()
+        );
+
+        let listener = Listener::bind(&path).await.expect("bind");
+        let path_client = path.clone();
+
+        let turns_run = Arc::new(AtomicU32::new(0));
+        let turns_run_srv = Arc::clone(&turns_run);
+
+        // Use the daemon's `spawn_in` task wrapper (raw `tokio::spawn` in
+        // daemon src is forbidden by the `spawn_audit` test).
+        let server = super::spawn_in(super::TaskClass::Background, async move {
+            let conn = listener.accept().await.expect("accept");
+            let shared: super::SharedConnection = Arc::new(Mutex::new(conn));
+            let pending: Mutex<Option<super::ClientMessage>> = Mutex::new(None);
+
+            // The "turn" future: stands in for `drive_goal_loop` running an
+            // agentic loop that keeps going (tool-use after tool-use). It bumps
+            // the shared counter each "turn" and yields, so the interrupt poller
+            // gets scheduled. If never dropped it runs to MAX_TURNS.
+            let turn_fut = async {
+                for _ in 0..MAX_TURNS {
+                    turns_run_srv.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            };
+
+            // EXACTLY the production race from `handle_request`.
+            let outcome = tokio::select! {
+                () = turn_fut => None,
+                o = super::poll_for_interrupt(&shared, &pending) => Some(o),
+            };
+            (outcome, turns_run_srv.load(Ordering::SeqCst))
+        });
+
+        // Client: connect, let a few turns elapse, then deliver the Interrupt.
+        let mut client = Connector::connect(&path_client).await.expect("connect");
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let body = serde_json::to_vec(&super::ClientMessage::Interrupt).expect("encode interrupt");
+        client
+            .write_frame(FrameKind::Request, &body)
+            .await
+            .expect("send interrupt");
+
+        let (outcome, final_turns) = server.await.expect("server task");
+
+        // The poller fired (not the turn-completion arm).
+        match outcome {
+            Some(super::InterruptOutcome::UserInterrupt) => {}
+            Some(super::InterruptOutcome::PushedBack) => {
+                panic!("plain Interrupt must yield UserInterrupt, not PushedBack")
+            }
+            None => panic!("turn ran to completion — the Interrupt was ignored (the bug)"),
+        }
+        // The turn was dropped FAR short of MAX_TURNS. A handful of 5ms turns fit
+        // in the ~60ms pre-interrupt window; the ceiling rules out a run-to-end.
+        assert!(
+            final_turns < MAX_TURNS,
+            "turn must abort before max_turns; ran {final_turns}/{MAX_TURNS}"
+        );
+        assert!(
+            final_turns < 100,
+            "turn should abort promptly after the interrupt; ran {final_turns} turns"
         );
     }
 }
