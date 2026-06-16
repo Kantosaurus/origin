@@ -3328,7 +3328,7 @@ async fn drive_selfdev_cycle(
     // Step 3: drive the self-edit by submitting `description` as a prompt onto
     // the live agent path under a `selfdev-` session id (is_self_dispatch_session
     // recognises this prefix, so it never resets the user's idle clock).
-    let model = std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-fable-5".to_string());
+    let model = origin_daemon::model_default::configured_default_model();
     let edit_session = format!("selfdev-{job_id}");
     if let Err(e) =
         origin_daemon::scheduler::dispatch_prompt(sock_path, &model, edit_session, &description).await

@@ -38,6 +38,13 @@ pub struct CompletionReport {
     pub transcript_handle: [u8; 32],
     /// Provider-side token / tool-call accounting.
     pub usage: Usage,
+    /// Optional human-readable detail surfaced to the parent agent — e.g. the
+    /// underlying error string when `status` is `GoalUnreachable`.
+    ///
+    /// Serde-default + skip-if-none keeps the wire/CAS shape backward-compatible
+    /// with reports written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl CompletionReport {

@@ -92,6 +92,7 @@ pub fn default_noop_worker() -> WorkerFn {
                 follow_ups: Vec::new(),
                 transcript_handle: [0; 32],
                 usage: Usage::default(),
+                detail: None,
             })
         })
     })

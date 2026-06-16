@@ -4124,7 +4124,15 @@ async fn run_loop_inner(
             if name == "Task" {
                 if let Some(coord) = opts.coordinator.as_deref() {
                     match serde_json::from_value::<origin_tools::builtins::task::TaskInput>(args.clone()) {
-                        Ok(input) => {
+                        Ok(mut input) => {
+                            // Honor a mid-session `/model` switch: when the Task
+                            // call didn't name a model, inherit the parent
+                            // session's exact model so the worker runs on a model
+                            // the account can serve (the worker-side fallback in
+                            // `swarm_worker` covers the secondary dispatch paths).
+                            if input.model.is_none() {
+                                input.model = Some(session.model.clone());
+                            }
                             let goal = input.goal.clone();
                             match origin_tools::builtins::task::task_spawn(coord, input).await {
                                 Ok(handle) => {

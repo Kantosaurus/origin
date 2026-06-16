@@ -154,9 +154,16 @@ pub async fn task_await(
         ReportStatus::BudgetExhausted => "budget_exhausted",
         ReportStatus::Aborted => "aborted",
     };
+    // Surface the worker's masked failure reason (e.g. an unservable-model
+    // provider rejection) to the parent agent so it sees WHY the sub-agent
+    // failed, not just the `goal_unreachable` status.
+    let summary = match &report.detail {
+        Some(d) => format!("worker for {goal:?} reported {:?}: {d}", report.status),
+        None => format!("worker for {goal:?} reported {:?}", report.status),
+    };
     Ok(TaskOutput {
         status: status.to_owned(),
-        summary: format!("worker for {goal:?} reported {:?}", report.status),
+        summary,
         files_touched: report.files_touched.iter().map(hex::encode).collect(),
         follow_ups: report.follow_ups.into_iter().map(|t| t.goal).collect(),
     })

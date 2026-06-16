@@ -236,10 +236,11 @@ async fn run_worker(
     let provider = active.read().await.clone();
     // Per-agent routing (openclaude): use the worker's explicit model override
     // when set, else the daemon default.
-    let model =
-        ctx.spec.model.clone().unwrap_or_else(|| {
-            std::env::var("ORIGIN_MODEL").unwrap_or_else(|_| "claude-fable-5".to_string())
-        });
+    let model = ctx
+        .spec
+        .model
+        .clone()
+        .unwrap_or_else(crate::model_default::configured_default_model);
     let mut session = Session::new(provider.name(), &model);
 
     // gap 9b: spin up this sub-agent's declared inline-MCP servers and expose
@@ -319,6 +320,7 @@ async fn run_worker(
                 output_tokens: summary.output_tokens,
                 tool_calls: summary.turns,
             },
+            detail: None,
         },
         Err(e) => {
             tracing::warn!(error = %e, goal = %goal, "swarm worker: run_loop failed");
@@ -331,6 +333,7 @@ async fn run_worker(
                 follow_ups: Vec::new(),
                 transcript_handle: [0; 32],
                 usage: Usage::default(),
+                detail: Some(format!("run_loop failed: {e}")),
             }
         }
     };
