@@ -18,7 +18,7 @@ use origin_cli::cli_def::{Cli, Cmd, KeyringSub, PairSub, ProvidersSub, SessionsS
 use origin_cli::goal_render::render_goal_event;
 use origin_cli::input::{
     parse_clear_command, parse_mem_command, parse_model_command, parse_skill_command, parse_workflow_command,
-    permission_answer, reduce_editor, InputAction,
+    reduce_editor, InputAction,
 };
 use origin_cli::plan_panel_wiring::Wiring as PlanPanelWiring;
 use origin_cli::tui::App;
@@ -944,39 +944,19 @@ async fn handle_key_event(
     // (default) map every event maps to itself, so the key path is
     // byte-identical when no override file is present.
     let ev = app.lock().keymap().canonicalize(ev);
+    // Interactive picker (INT-3): when a picker is open — an upgraded permission
+    // ask (Allow once / Deny / Always allow <tool>) or an `ask_user` structured
+    // choice — keys route to `picker::reduce` BEFORE the scrollback/editor
+    // handlers. `Esc` dismisses the picker without quitting the app. The decision
+    // is sent on a FRESH connection (the turn's connection is busy streaming).
+    if app.lock().has_picker() {
+        return handle_picker_key(ev, app, handle, path).await;
+    }
+
     // Scrollback navigation — intercept before the buffer reducer. Returns
     // `Some` when the key was a navigation key we fully handled.
     if let Some(outcome) = handle_scrollback_key(ev, app, handle) {
         return outcome;
-    }
-
-    // Pending permission ask (opt-in `/permissions`): y/n/Esc answers it. The
-    // decision is sent on a FRESH connection so the daemon's registry can
-    // resolve it (the turn's connection is busy streaming). Other keys fall
-    // through to normal handling; a no-op when nothing is pending.
-    if app.lock().pending_permission.is_some() {
-        if let Some(allow) = permission_answer(ev.code) {
-            let pending = app.lock().pending_permission.take();
-            if let Some(p) = pending {
-                let _ = send_decision(
-                    path,
-                    &ClientMessage::PermissionDecision { id: p.id, allow, always: false },
-                )
-                .await;
-                // The deny verb routes through the `permission.denied` catalog key
-                // (En "denied" — byte-identical); the allow verb has no key and
-                // stays in code. The `<tool> <args>` suffix is unchanged.
-                let verb = if allow {
-                    "allowed".to_string()
-                } else {
-                    origin_cli::locale::line("permission.denied").to_string()
-                };
-                app.lock()
-                    .add_line("system> ", &format!("{verb}: {} {}", p.tool, p.args));
-            }
-            handle.mark_dirty();
-            return KeyOutcome::Continue;
-        }
     }
 
     // claude-code L147 keymap `Clear` action: the builtin chord is `Ctrl+U`,
@@ -1115,6 +1095,173 @@ fn handle_scrollback_key(
         }
         _ => None,
     }
+}
+
+/// Map a raw crossterm key to a [`picker::PickerKey`] given the picker's current
+/// mode. Returns `None` for keys the picker ignores (so they're simply dropped
+/// while a picker is open — they never reach the editor).
+///
+/// - **Typing a custom answer** (`typing_custom`): printable `Char(c)` →
+///   `Char(c)`; `Backspace` → `Backspace`; `Enter` → `Confirm`; `Esc` →
+///   `Cancel`. Navigation keys are dropped (text entry has focus).
+/// - **Normal mode**: `Up`/`k` → `Up`; `Down`/`j` → `Down`; `Space` → `Toggle`;
+///   digits `1`..=`9` → `Digit(n)`; `Esc` → `Cancel`. `Enter` → `Confirm`,
+///   except when `allow_custom` and the cursor sits on the trailing "type your
+///   own" row (`cursor == options.len()`), where it becomes `Custom` to enter
+///   free-text mode.
+///
+/// Pure (no I/O) so it is unit-testable without the async loop.
+fn crossterm_to_picker_key(
+    ev: crossterm::event::KeyEvent,
+    state: &origin_cli::tui::picker::PickerState,
+) -> Option<origin_cli::tui::picker::PickerKey> {
+    use crossterm::event::KeyCode;
+    use origin_cli::tui::picker::PickerKey;
+
+    if state.typing_custom {
+        return match ev.code {
+            KeyCode::Char(c) => Some(PickerKey::Char(c)),
+            KeyCode::Backspace => Some(PickerKey::Backspace),
+            KeyCode::Enter => Some(PickerKey::Confirm),
+            KeyCode::Esc => Some(PickerKey::Cancel),
+            _ => None,
+        };
+    }
+
+    match ev.code {
+        KeyCode::Up | KeyCode::Char('k') => Some(PickerKey::Up),
+        KeyCode::Down | KeyCode::Char('j') => Some(PickerKey::Down),
+        KeyCode::Char(' ') => Some(PickerKey::Toggle),
+        KeyCode::Esc => Some(PickerKey::Cancel),
+        KeyCode::Char(c @ '1'..='9') => {
+            // `Digit(n)` is 1-based; ASCII digit → its value.
+            Some(PickerKey::Digit(c as u8 - b'0'))
+        }
+        KeyCode::Enter => {
+            // On the trailing "type your own" row (only present when
+            // `allow_custom`), Enter enters free-text mode instead of confirming.
+            if state.allow_custom && state.cursor == state.options.len() {
+                Some(PickerKey::Custom)
+            } else {
+                Some(PickerKey::Confirm)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Render the compact "you chose: …" summary appended to the transcript when a
+/// picker resolves. Joins the selected labels with `, `, falls back to the
+/// custom text, or "skipped" when nothing was chosen.
+fn picker_choice_summary(
+    options: &[origin_cli::tui::picker::PickerOption],
+    selected: &[usize],
+    custom: Option<&str>,
+) -> String {
+    if let Some(text) = custom.filter(|t| !t.is_empty()) {
+        return text.to_string();
+    }
+    if selected.is_empty() {
+        return "skipped".to_string();
+    }
+    let labels: Vec<&str> = selected
+        .iter()
+        .filter_map(|&i| options.get(i).map(|o| o.label.as_str()))
+        .collect();
+    if labels.is_empty() {
+        "skipped".to_string()
+    } else {
+        labels.join(", ")
+    }
+}
+
+/// Route one key through the active picker. Reduces it via [`picker::reduce`];
+/// on a terminal [`picker::PickerOutcome`] sends the matching decision on a
+/// fresh connection (cross-connection, like permission/memory decisions), clears
+/// the picker, and appends a compact "you chose: …" line. Always returns
+/// [`KeyOutcome::Continue`] — `Esc` dismisses the picker without quitting.
+async fn handle_picker_key(
+    ev: crossterm::event::KeyEvent,
+    app: &SharedApp,
+    handle: &Handle,
+    path: &str,
+) -> KeyOutcome {
+    use origin_cli::tui::{picker, PickerSource};
+
+    // Reduce the key against a snapshot of the picker state, committing the
+    // mutated state back. Returns `(outcome, source, options)` when the picker
+    // terminates, else `None` (and the lock is released between calls).
+    let resolved = {
+        let mut a = app.lock();
+        let Some(session) = a.active_picker.as_mut() else {
+            return KeyOutcome::Continue;
+        };
+        let Some(pkey) = crossterm_to_picker_key(ev, &session.state) else {
+            // A key the picker ignores: consume it (don't fall through to the
+            // editor) and keep the picker open.
+            return KeyOutcome::Continue;
+        };
+        match picker::reduce(&mut session.state, pkey) {
+            None => {
+                // State advanced (cursor move / toggle / custom edit); repaint.
+                drop(a);
+                handle.mark_dirty();
+                return KeyOutcome::Continue;
+            }
+            Some(outcome) => {
+                // Terminal: take ownership of the session so we can send the
+                // decision after releasing the lock.
+                let session = a.take_picker().expect("picker present");
+                drop(a);
+                Some((outcome, session.source, session.state.options))
+            }
+        }
+    };
+
+    let Some((outcome, source, options)) = resolved else {
+        return KeyOutcome::Continue;
+    };
+
+    match source {
+        PickerSource::Permission { id, tool } => {
+            // Map the outcome → (allow, always). A cancel is a plain deny.
+            let (allow, always) = match &outcome {
+                picker::PickerOutcome::Selected { indices, .. } => {
+                    let idx = indices.first().copied().unwrap_or(1); // default: Deny
+                    origin_cli::tui::picker_outcome_to_permission(idx)
+                }
+                picker::PickerOutcome::Cancelled => origin_cli::tui::permission_cancel(),
+            };
+            let _ = send_decision(
+                path,
+                &ClientMessage::PermissionDecision { id, allow, always },
+            )
+            .await;
+            // Compact summary: the chosen verb + the tool.
+            let verb = match (allow, always) {
+                (true, true) => format!("always allow {tool}"),
+                (true, false) => "allowed".to_string(),
+                _ => origin_cli::locale::line("permission.denied").to_string(),
+            };
+            app.lock().add_line("you> ", &format!("you chose: {verb}"));
+        }
+        PickerSource::Choice { id } => {
+            let (selected, custom) = origin_cli::tui::picker_outcome_to_choice(&outcome);
+            let _ = send_decision(
+                path,
+                &ClientMessage::ChoiceDecision {
+                    id,
+                    selected: selected.clone(),
+                    custom: custom.clone(),
+                },
+            )
+            .await;
+            let summary = picker_choice_summary(&options, &selected, custom.as_deref());
+            app.lock().add_line("you> ", &format!("you chose: {summary}"));
+        }
+    }
+    handle.mark_dirty();
+    KeyOutcome::Continue
 }
 
 /// Apply a reduced [`InputAction`] to the TUI. Returns [`KeyOutcome::Break`]
@@ -1934,6 +2081,8 @@ async fn handle_prompt_turn(
     let handle_for_goal = handle.clone();
     let app_for_perm = Arc::clone(app);
     let handle_for_perm = handle.clone();
+    let app_for_choice = Arc::clone(app);
+    let handle_for_choice = handle.clone();
     // Snapshot the session effort level so this turn carries `/effort`/`/fast`.
     let effort = app.lock().effort.clone();
     // Carry the startup `--thinking-tokens` budget on every turn (aider
@@ -1988,14 +2137,26 @@ async fn handle_prompt_turn(
             handle_for_goal.mark_dirty();
         },
         move |id, tool: &str, args: &str| {
-            // Surface the permission ask; the event loop's y/n handler reads
-            // `pending_permission` and sends the decision on a fresh connection.
-            app_for_perm.lock().pending_permission = Some(origin_cli::tui::PendingPermission {
-                id,
-                tool: tool.to_string(),
-                args: args.to_string(),
-            });
+            // INT-3: surface the permission ask through the interactive picker
+            // (Allow once / Deny / Always allow <tool>). The event loop routes
+            // keys through `picker::reduce` and sends the decision on a fresh
+            // connection (the turn's connection is busy streaming).
+            app_for_perm.lock().open_permission_picker(id, tool, args);
             handle_for_perm.mark_dirty();
+        },
+        move |id: String,
+              question: String,
+              options: Vec<(String, Option<String>)>,
+              multi: bool,
+              allow_custom: bool| {
+            // INT-3: an `ask_user` structured choice — open the interactive
+            // picker (single or multi select, optional free-text). On confirm /
+            // cancel the event loop sends a `ChoiceDecision` on a fresh
+            // connection (same cross-connection pattern as permission asks).
+            app_for_choice
+                .lock()
+                .open_choice_picker(id, question, options, multi, allow_custom);
+            handle_for_choice.mark_dirty();
         },
         move |d| {
             app_for_delta.lock().append_to_current_assistant(d);
@@ -2244,6 +2405,10 @@ async fn call_daemon(
     // Opt-in permission ask (id, tool, args_preview): surfaces the approval
     // prompt; the event loop sends the decision back on a fresh connection.
     mut on_permission_ask: impl FnMut(u64, &str, &str) + Send,
+    // `ask_user` structured choice (id, question, options[(label, description?)],
+    // multi_select, allow_custom): surfaces the interactive picker; the event
+    // loop sends the `ChoiceDecision` back on a fresh connection.
+    mut on_choice_ask: impl FnMut(String, String, Vec<(String, Option<String>)>, bool, bool) + Send,
     mut on_delta: impl FnMut(&str) + Send,
     mut on_tool: impl FnMut(&str, &str, Vec<origin_daemon::protocol::DiffLine>) + Send,
     mut on_tool_chunk: impl FnMut(&str, &str) + Send,
@@ -2370,6 +2535,21 @@ async fn call_daemon(
                     ref tool,
                     ref args_preview,
                 } => on_permission_ask(id, tool, args_preview),
+                StreamEvent::ChoiceAsk {
+                    id,
+                    question,
+                    options,
+                    multi_select,
+                    allow_custom,
+                } => {
+                    // Map the protocol `ChoiceOption`s into `(label, description)`
+                    // tuples for the picker, preserving display order.
+                    let opts: Vec<(String, Option<String>)> = options
+                        .into_iter()
+                        .map(|o| (o.label, o.description))
+                        .collect();
+                    on_choice_ask(id, question, opts, multi_select, allow_custom);
+                }
                 _ => {}
             }
             continue;
@@ -3003,6 +3183,7 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)] // panic!/unwrap are idiomatic test assertions
 mod tests {
     use super::*;
 
@@ -3054,5 +3235,128 @@ mod tests {
         enable_autowrap(&mut buf).expect("writing to an in-memory buffer is infallible");
         assert_eq!(buf.as_slice(), ENABLE_AUTOWRAP);
         assert_eq!(buf.as_slice(), b"\x1b[?7h");
+    }
+
+    // ── INT-3: picker key mapping + summary ─────────────────────────────────
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use origin_cli::tui::picker::{PickerKey, PickerOption, PickerState};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn choice_state(n: usize, allow_custom: bool, multi: bool) -> PickerState {
+        PickerState {
+            question: "q".into(),
+            options: (0..n)
+                .map(|i| PickerOption {
+                    label: format!("opt{i}"),
+                    description: None,
+                })
+                .collect(),
+            multi,
+            allow_custom,
+            cursor: 0,
+            checked: vec![false; n],
+            custom: None,
+            typing_custom: false,
+        }
+    }
+
+    #[test]
+    fn picker_key_maps_navigation_and_digits() {
+        let s = choice_state(3, false, false);
+        assert_eq!(crossterm_to_picker_key(key(KeyCode::Up), &s), Some(PickerKey::Up));
+        assert_eq!(crossterm_to_picker_key(key(KeyCode::Char('k')), &s), Some(PickerKey::Up));
+        assert_eq!(crossterm_to_picker_key(key(KeyCode::Down), &s), Some(PickerKey::Down));
+        assert_eq!(crossterm_to_picker_key(key(KeyCode::Char('j')), &s), Some(PickerKey::Down));
+        assert_eq!(crossterm_to_picker_key(key(KeyCode::Char(' ')), &s), Some(PickerKey::Toggle));
+        assert_eq!(crossterm_to_picker_key(key(KeyCode::Esc), &s), Some(PickerKey::Cancel));
+        assert_eq!(crossterm_to_picker_key(key(KeyCode::Char('2')), &s), Some(PickerKey::Digit(2)));
+        // Enter on an option row confirms.
+        assert_eq!(crossterm_to_picker_key(key(KeyCode::Enter), &s), Some(PickerKey::Confirm));
+    }
+
+    #[test]
+    fn picker_key_enter_on_custom_row_enters_custom_mode() {
+        let mut s = choice_state(2, true, false);
+        // Cursor on an option ⇒ Enter confirms.
+        assert_eq!(crossterm_to_picker_key(key(KeyCode::Enter), &s), Some(PickerKey::Confirm));
+        // Cursor on the trailing custom row ⇒ Enter becomes Custom.
+        s.cursor = s.options.len();
+        assert_eq!(crossterm_to_picker_key(key(KeyCode::Enter), &s), Some(PickerKey::Custom));
+    }
+
+    #[test]
+    fn picker_key_typing_custom_routes_text_keys() {
+        let mut s = choice_state(2, true, false);
+        s.typing_custom = true;
+        assert_eq!(crossterm_to_picker_key(key(KeyCode::Char('x')), &s), Some(PickerKey::Char('x')));
+        assert_eq!(crossterm_to_picker_key(key(KeyCode::Backspace), &s), Some(PickerKey::Backspace));
+        assert_eq!(crossterm_to_picker_key(key(KeyCode::Enter), &s), Some(PickerKey::Confirm));
+        assert_eq!(crossterm_to_picker_key(key(KeyCode::Esc), &s), Some(PickerKey::Cancel));
+        // Navigation is dropped while typing free text (does not move the cursor).
+        assert_eq!(crossterm_to_picker_key(key(KeyCode::Down), &s), None);
+    }
+
+    #[test]
+    fn single_select_digit_then_enter_shapes_choice_decision() {
+        // Digit(2) on a single-select picker selects index 1 and emits.
+        let mut s = choice_state(3, false, false);
+        let pk = crossterm_to_picker_key(key(KeyCode::Char('2')), &s).unwrap();
+        let out = origin_cli::tui::picker::reduce(&mut s, pk).expect("digit emits");
+        let (sel, custom) = origin_cli::tui::picker_outcome_to_choice(&out);
+        assert_eq!(sel, vec![1]);
+        assert!(custom.is_none());
+    }
+
+    #[test]
+    fn multi_select_toggle_several_then_enter_sorted_indices() {
+        let mut s = choice_state(4, false, true);
+        // Toggle option 0, move to 2, toggle, then confirm.
+        let pk = crossterm_to_picker_key(key(KeyCode::Char(' ')), &s).unwrap();
+        assert!(origin_cli::tui::picker::reduce(&mut s, pk).is_none());
+        origin_cli::tui::picker::reduce(&mut s, PickerKey::Down);
+        origin_cli::tui::picker::reduce(&mut s, PickerKey::Down);
+        origin_cli::tui::picker::reduce(&mut s, PickerKey::Toggle);
+        let out = origin_cli::tui::picker::reduce(&mut s, PickerKey::Confirm).expect("confirm emits");
+        let (sel, _custom) = origin_cli::tui::picker_outcome_to_choice(&out);
+        assert_eq!(sel, vec![0, 2], "checked indices come back sorted");
+    }
+
+    #[test]
+    fn custom_flow_enter_type_enter_yields_custom_text() {
+        let mut s = choice_state(2, true, false);
+        // Arrow down to the custom row, Enter → Custom mode.
+        origin_cli::tui::picker::reduce(&mut s, PickerKey::Down);
+        origin_cli::tui::picker::reduce(&mut s, PickerKey::Down);
+        let pk = crossterm_to_picker_key(key(KeyCode::Enter), &s).unwrap();
+        assert_eq!(pk, PickerKey::Custom);
+        origin_cli::tui::picker::reduce(&mut s, pk);
+        // Type "hey" then Enter.
+        for c in ['h', 'e', 'y'] {
+            let pk = crossterm_to_picker_key(key(KeyCode::Char(c)), &s).unwrap();
+            origin_cli::tui::picker::reduce(&mut s, pk);
+        }
+        let pk = crossterm_to_picker_key(key(KeyCode::Enter), &s).unwrap();
+        let out = origin_cli::tui::picker::reduce(&mut s, pk).expect("confirm emits");
+        let (sel, custom) = origin_cli::tui::picker_outcome_to_choice(&out);
+        assert!(sel.is_empty());
+        assert_eq!(custom.as_deref(), Some("hey"));
+    }
+
+    #[test]
+    fn choice_summary_joins_labels_else_custom_else_skipped() {
+        let opts = vec![
+            PickerOption { label: "a".into(), description: None },
+            PickerOption { label: "b".into(), description: None },
+            PickerOption { label: "c".into(), description: None },
+        ];
+        assert_eq!(picker_choice_summary(&opts, &[0, 2], None), "a, c");
+        assert_eq!(picker_choice_summary(&opts, &[], Some("freeform")), "freeform");
+        assert_eq!(picker_choice_summary(&opts, &[], None), "skipped");
+        // Empty custom falls through to labels/skipped, not an empty line.
+        assert_eq!(picker_choice_summary(&opts, &[1], Some("")), "b");
     }
 }

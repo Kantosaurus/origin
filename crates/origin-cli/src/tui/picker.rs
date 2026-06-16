@@ -8,8 +8,6 @@
 //! `PickerOutcome::Selected{indices,custom}` maps straight to
 //! `ChoiceDecision{selected,custom}`.
 
-#![allow(dead_code)] // Consumed by mod.rs in Wave 2 (permission + ChoiceAsk wiring).
-
 use origin_tui::grid::Attr;
 
 use super::tokens::{glyph, RenderRow, RowSpan, Tokens};
@@ -126,11 +124,16 @@ pub fn reduce(state: &mut PickerState, key: PickerKey) -> Option<PickerOutcome> 
                 None
             }
             PickerKey::Down => {
-                if !state.options.is_empty() {
-                    let last = state.options.len() - 1;
-                    if state.cursor < last {
-                        state.cursor += 1;
-                    }
+                // The cursor ranges over `[0, options.len())`, plus the trailing
+                // `✎ type your own…` row at index `options.len()` when
+                // `allow_custom` (so Down can reach it and Enter→Custom there).
+                let last = if state.allow_custom {
+                    state.options.len()
+                } else {
+                    state.options.len().saturating_sub(1)
+                };
+                if state.cursor < last {
+                    state.cursor += 1;
                 }
                 None
             }
@@ -281,8 +284,11 @@ pub fn layout_picker(state: &PickerState, width: u16, tok: &Tokens) -> Vec<Rende
     // `✎ type your own…` row.
     if state.allow_custom {
         let active = state.typing_custom;
-        let caret = if active { glyph::CURSOR } else { ' ' };
-        let caret_fg = if active { tok.accent } else { tok.muted };
+        // The caret shows while typing OR when the cursor rests on this row (so a
+        // user who arrowed down to it gets the same `▸` affordance as an option).
+        let cursored = active || state.cursor == state.options.len();
+        let caret = if cursored { glyph::CURSOR } else { ' ' };
+        let caret_fg = if cursored { tok.accent } else { tok.muted };
         let mut spans = vec![
             RowSpan::plain(format!("{caret} "), caret_fg, 0),
             RowSpan::plain(format!("{} ", glyph::EDIT), tok.accent_dim, 0),
@@ -491,6 +497,31 @@ mod tests {
                 custom: Some("hi".into()),
             })
         );
+    }
+
+    #[test]
+    fn down_reaches_custom_row_when_allowed() {
+        // With allow_custom, the cursor extends one past the last option onto the
+        // trailing `✎ type your own…` row so Down can reach it (Enter→Custom
+        // there is decided by the key mapper in main.rs).
+        let mut s = single(2);
+        s.allow_custom = true;
+        reduce(&mut s, PickerKey::Down); // 0 → 1 (last option)
+        reduce(&mut s, PickerKey::Down); // 1 → 2 (custom row)
+        assert_eq!(s.cursor, s.options.len(), "cursor reaches the custom row");
+        // Further Down saturates at the custom row.
+        reduce(&mut s, PickerKey::Down);
+        assert_eq!(s.cursor, s.options.len(), "Down saturates on the custom row");
+    }
+
+    #[test]
+    fn down_stops_at_last_option_without_custom() {
+        // Without allow_custom there is no custom row, so Down still saturates at
+        // the last option (unchanged behavior).
+        let mut s = single(2);
+        reduce(&mut s, PickerKey::Down);
+        reduce(&mut s, PickerKey::Down);
+        assert_eq!(s.cursor, 1, "Down saturates at the last option");
     }
 
     #[test]

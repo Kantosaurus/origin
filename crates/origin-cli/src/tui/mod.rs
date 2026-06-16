@@ -19,7 +19,7 @@ mod codeblock;
 mod composer;
 mod markdown;
 mod palette;
-mod picker;
+pub mod picker;
 mod syntax;
 mod toolblock;
 mod transcript;
@@ -49,6 +49,66 @@ pub struct PendingPermission {
     pub id: u64,
     pub tool: String,
     pub args: String,
+}
+
+/// What an [`active_picker`](App::active_picker) interaction resolves back to.
+///
+/// Either a daemon permission ask (`u64` id) or an `ask_user` structured choice
+/// (`String` id). The variant tells the input router which `ClientMessage` to
+/// send when the picker confirms/cancels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickerSource {
+    /// An upgraded permission ask: Allow once / Deny / Always allow `<tool>`.
+    Permission { id: u64, tool: String },
+    /// An `ask_user` structured choice, correlated by its string id.
+    Choice { id: String },
+}
+
+/// A live interactive picker: the pure [`picker::PickerState`] plus the
+/// [`PickerSource`] that says how its outcome maps back onto the wire.
+#[derive(Debug, Clone)]
+pub struct PickerSession {
+    pub state: picker::PickerState,
+    pub source: PickerSource,
+}
+
+/// Map a permission-picker option index to the `(allow, always)` decision pair.
+///
+/// The pair is carried by `ClientMessage::PermissionDecision`. The option order
+/// is fixed by [`App::open_permission_picker`]: `0 = Allow once`, `1 = Deny`,
+/// `2 = Always allow <tool>`; any other index (defensive) denies. A *cancel*
+/// (Esc) is handled by the caller as a deny — see [`permission_cancel`].
+///
+/// Pure + `const` so the input loop and unit tests share one source of truth.
+#[must_use]
+pub const fn picker_outcome_to_permission(idx: usize) -> (bool, bool) {
+    match idx {
+        0 => (true, false),  // Allow once
+        2 => (true, true),   // Always allow <tool>
+        _ => (false, false), // Deny (index 1) or any unexpected index
+    }
+}
+
+/// The `(allow, always)` pair for a cancelled permission picker (Esc): treated
+/// as a plain deny, never an "always" decision.
+#[must_use]
+pub const fn permission_cancel() -> (bool, bool) {
+    (false, false)
+}
+
+/// Map a `PickerOutcome` into the `(selected, custom)` choice-decision shape.
+///
+/// The pair is carried by `ClientMessage::ChoiceDecision`. A `Cancelled` outcome
+/// yields the daemon's "user skipped" signal: an empty `selected` and no custom
+/// text.
+///
+/// Pure so the input loop and unit tests share one source of truth.
+#[must_use]
+pub fn picker_outcome_to_choice(outcome: &picker::PickerOutcome) -> (Vec<usize>, Option<String>) {
+    match outcome {
+        picker::PickerOutcome::Selected { indices, custom } => (indices.clone(), custom.clone()),
+        picker::PickerOutcome::Cancelled => (Vec::new(), None),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +417,12 @@ pub struct App {
     /// user. `Some` ⇒ the next `y`/`n` (or `Esc`) answers it; rendered above the
     /// input card. `None` in the common case.
     pub pending_permission: Option<PendingPermission>,
+    /// The live interactive picker, if one is open. Drives both the upgraded
+    /// permission ask (Allow once / Deny / Always allow `<tool>`) and `ask_user`
+    /// structured choices through one reusable [`picker`] component. `Some` ⇒
+    /// keys route to [`picker::reduce`] and the picker renders inline above the
+    /// composer; `None` in the common case so input handling is byte-identical.
+    pub active_picker: Option<PickerSession>,
     /// Scrollback row of the tool-activity line currently showing a `▸`
     /// "running" marker, so [`finish_tool_line`](Self::finish_tool_line) can
     /// flip it to `✔`/`✘` when the tool completes. `None` when no tool is in
@@ -499,6 +565,7 @@ impl App {
             notify_desktop: false,
             permission_ask: false,
             pending_permission: None,
+            active_picker: None,
             running_tool_row: None,
             mouse_capture: true,
             last_assistant: None,
@@ -898,6 +965,98 @@ impl App {
         self.scroll_offset = 0;
     }
 
+    /// Open the upgraded permission picker for a daemon `PermissionAsk`. Builds a
+    /// single-select picker with the fixed option order Allow once / Deny /
+    /// Always allow `<tool>` (no custom row) and stores it as the
+    /// [`active_picker`](App::active_picker) with a [`PickerSource::Permission`].
+    /// The option indices map back to `(allow, always)` via
+    /// [`picker_outcome_to_permission`].
+    pub fn open_permission_picker(&mut self, id: u64, tool: &str, args: &str) {
+        let question = crate::locale::linef(
+            "permission.ask",
+            &[("tool", tool), ("args", args)],
+        );
+        let options = vec![
+            picker::PickerOption {
+                label: "Allow once".to_string(),
+                description: None,
+            },
+            picker::PickerOption {
+                label: "Deny".to_string(),
+                description: None,
+            },
+            picker::PickerOption {
+                label: format!("Always allow {tool}"),
+                description: None,
+            },
+        ];
+        let state = picker::PickerState {
+            question,
+            options,
+            multi: false,
+            allow_custom: false,
+            cursor: 0,
+            checked: Vec::new(),
+            custom: None,
+            typing_custom: false,
+        };
+        self.active_picker = Some(PickerSession {
+            state,
+            source: PickerSource::Permission {
+                id,
+                tool: tool.to_string(),
+            },
+        });
+        self.scroll_offset = 0;
+    }
+
+    /// Open the structured-choice picker for an `ask_user` `ChoiceAsk`.
+    ///
+    /// Maps each `ChoiceOption` to a [`picker::PickerOption`], sets `multi` /
+    /// `allow_custom`, and sizes `checked` to all-`false`. Stored as the
+    /// [`active_picker`](App::active_picker) with a [`PickerSource::Choice`].
+    pub fn open_choice_picker(
+        &mut self,
+        id: String,
+        question: String,
+        options: Vec<(String, Option<String>)>,
+        multi: bool,
+        allow_custom: bool,
+    ) {
+        let opts: Vec<picker::PickerOption> = options
+            .into_iter()
+            .map(|(label, description)| picker::PickerOption { label, description })
+            .collect();
+        let checked = vec![false; opts.len()];
+        let state = picker::PickerState {
+            question,
+            options: opts,
+            multi,
+            allow_custom,
+            cursor: 0,
+            checked,
+            custom: None,
+            typing_custom: false,
+        };
+        self.active_picker = Some(PickerSession {
+            state,
+            source: PickerSource::Choice { id },
+        });
+        self.scroll_offset = 0;
+    }
+
+    /// Take the active picker, leaving `None`. Returns `Some` only while a picker
+    /// is open.
+    pub const fn take_picker(&mut self) -> Option<PickerSession> {
+        self.active_picker.take()
+    }
+
+    /// Whether an interactive picker is currently open.
+    #[must_use]
+    pub const fn has_picker(&self) -> bool {
+        self.active_picker.is_some()
+    }
+
     pub fn add_colored_line(&mut self, text: String, fg: u32, bg: u32) {
         // Pre-formatted (tool output, diff rows, streamed command lines): drawn
         // verbatim so embedded `**`/backticks aren't reinterpreted as markdown.
@@ -1264,7 +1423,22 @@ impl App {
             // it would steal the only transcript row, so content always renders.
             let avail = at_bottom.saturating_sub(transcript_top);
             let gap = if avail > INPUT_GAP_ROWS { INPUT_GAP_ROWS } else { 0 };
-            let scrollback_limit = avail.saturating_sub(gap) as usize;
+
+            // ── Interactive picker reservation ───────────────────────────────
+            // When a picker (permission upgrade or `ask_user` choice) is open it
+            // renders in the rows just above the status zone, tied to the copper
+            // spine. Lay it out first so we can shrink the transcript by exactly
+            // its height — the composer geometry / cursor sync are untouched
+            // because the picker only consumes transcript rows.
+            let picker_rows = self.layout_active_picker(cols, &tok);
+            // Cap the picker to the available transcript height (minus the gap)
+            // so a long question never crowds the transcript out entirely; the
+            // picker reducer keeps the cursor row reachable regardless.
+            let transcript_budget = avail.saturating_sub(gap) as usize;
+            let picker_h = picker_rows.len().min(transcript_budget);
+            // Leave a one-row breather above the picker when there's room.
+            let picker_gap = usize::from(picker_h > 0 && transcript_budget > picker_h);
+            let scrollback_limit = transcript_budget.saturating_sub(picker_h + picker_gap);
 
             let cols_usize = cols as usize;
             let mut visual_lines: Vec<VisualLine<'_>> = Vec::new();
@@ -1305,14 +1479,23 @@ impl App {
             let offset = self.scroll_offset.min(max_offset);
             let skip = total.saturating_sub(visible).saturating_sub(offset);
 
+            // The transcript may not paint into the picker's reserved rows at the
+            // bottom of the transcript area (`[picker_top, at_bottom)`).
+            let picker_h_u16 = clamp_u16(picker_h);
+            let transcript_bottom = at_bottom.saturating_sub(picker_h_u16);
             let mut row: u16 = transcript_top;
             for vl in visual_lines.iter().skip(skip).take(visible) {
-                if row >= at_bottom {
+                if row >= transcript_bottom {
                     break;
                 }
                 render_scroll_line(main, row, vl, cols, &tok);
                 row = row.saturating_add(1);
             }
+
+            // ── Interactive picker (Stage 5b) ────────────────────────────────
+            // Render the laid-out picker rows in their reserved region, tied to
+            // the copper spine in col 0 so it reads as part of the transcript.
+            Self::draw_picker_zone(main, transcript_bottom, at_bottom, cols, &picker_rows, &tok);
 
             // ── Top chrome strip + rule (Stage 1) ────────────────────────────
             self.draw_chrome_top(main, cols, chrome_h, &tok, offset);
@@ -1347,6 +1530,60 @@ impl App {
             }
         }
         clear_prompt_grid(composer.prompt_grid(), self.palette());
+    }
+
+    /// Lay out the active picker into [`RenderRow`](crate::tui::tokens::RenderRow)s,
+    /// or an empty `Vec` when none is open.
+    ///
+    /// The spine gutter occupies col 0, so the picker is laid out into the
+    /// remaining width (`cols - 2`) so its descriptions clip correctly against
+    /// the right edge.
+    fn layout_active_picker(
+        &self,
+        cols: u16,
+        tok: &crate::tui::tokens::Tokens,
+    ) -> Vec<crate::tui::tokens::RenderRow> {
+        self.active_picker
+            .as_ref()
+            .map(|sess| {
+                crate::tui::picker::layout_picker(&sess.state, cols.saturating_sub(2), tok)
+            })
+            .unwrap_or_default()
+    }
+
+    /// Stage 5b — paint the interactive picker into its reserved region.
+    ///
+    /// The region is `[top, bottom)` at the foot of the transcript, with the
+    /// copper `┃` spine in col 0 so it reads as part of the live turn. No-op when
+    /// no picker is open or the region is empty. The pre-laid-out `rows` are
+    /// blitted starting at col 2 (after the spine gutter `┃ `); rows beyond the
+    /// region are clipped (the reducer keeps the cursor reachable regardless).
+    fn draw_picker_zone(
+        main: &mut Grid,
+        top: u16,
+        bottom: u16,
+        cols: u16,
+        rows: &[crate::tui::tokens::RenderRow],
+        tok: &crate::tui::tokens::Tokens,
+    ) {
+        if rows.is_empty() || top >= bottom {
+            return;
+        }
+        let mut r = top;
+        for rr in rows {
+            if r >= bottom {
+                break;
+            }
+            // Copper spine gutter in col 0 (matching the transcript spine).
+            main.put(
+                r,
+                0,
+                Cell::new(crate::tui::tokens::glyph::SPINE, tok.spine, 0, Attr::PLAIN),
+            );
+            // Blit the picker row after the spine gutter (col 2).
+            crate::tui::tokens::blit_row(main, r, 2, cols, rr);
+            r = r.saturating_add(1);
+        }
     }
 
     /// Stage 1 — paint the persistent top chrome strip (row 0) + a full-width
@@ -1461,31 +1698,10 @@ impl App {
         if status_top >= rows {
             return;
         }
-        // Permission ask blocks the turn — highest priority, the user answers
-        // y / n (INT-3 will route this through the picker; INT-2 keeps y/n).
-        if let Some(ref ask) = self.pending_permission {
-            let msg = format!(
-                "\u{26A0} {}  y = allow \u{00B7} n = deny",
-                crate::locale::linef("permission.ask", &[("tool", &ask.tool), ("args", &ask.args)])
-            );
-            // Clear the readout row first so stale metrics don't bleed through.
-            for c in 0..cols {
-                main.put(status_top, c, Cell::new(' ', 0, 0, Attr::PLAIN));
-            }
-            write_str_styled(
-                main,
-                status_top,
-                1,
-                &msg,
-                cols,
-                Style {
-                    fg: tok.warn,
-                    bg: 0,
-                    bold: true,
-                },
-            );
-            return;
-        }
+        // INT-3: permission asks now render through the interactive picker (see
+        // `draw_picker_zone`) instead of the cramped y/n readout line, so the
+        // legacy `pending_permission` branch is retired here. The picker is the
+        // higher-priority signal and draws in the transcript foot.
         // Stall watchdog: a gentle "still working…" reassurance overpaints the
         // readout (muted, never an alarm).
         if let Some(StallTier::Soft(secs)) = self.stall {
@@ -3002,7 +3218,84 @@ mod tests {
         assert!(!app.notify_desktop);
         assert!(!app.permission_ask, "permission prompting defaults off");
         assert!(app.pending_permission.is_none());
+        assert!(app.active_picker.is_none(), "no picker open by default");
         assert_eq!(app.palette(), theme::palette(Theme::Default));
+    }
+
+    // ── INT-3: picker wiring (permission + choice) ──────────────────────────
+
+    #[test]
+    fn picker_outcome_to_permission_maps_each_option() {
+        // 0 = Allow once, 1 = Deny, 2 = Always allow.
+        assert_eq!(picker_outcome_to_permission(0), (true, false), "Allow once");
+        assert_eq!(picker_outcome_to_permission(1), (false, false), "Deny");
+        assert_eq!(picker_outcome_to_permission(2), (true, true), "Always allow");
+        // Any unexpected index is a safe deny.
+        assert_eq!(picker_outcome_to_permission(7), (false, false), "out-of-range denies");
+        // Esc-as-deny.
+        assert_eq!(permission_cancel(), (false, false), "cancel is a plain deny");
+    }
+
+    #[test]
+    fn open_permission_picker_builds_three_single_select_options() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.open_permission_picker(42, "Bash", "rm -rf build/");
+        let sess = app.active_picker.as_ref().expect("picker opened");
+        assert!(matches!(sess.source, PickerSource::Permission { id: 42, .. }));
+        assert!(!sess.state.multi, "permission picker is single-select");
+        assert!(!sess.state.allow_custom, "permission picker has no custom row");
+        assert_eq!(sess.state.options.len(), 3);
+        assert_eq!(sess.state.options[0].label, "Allow once");
+        assert_eq!(sess.state.options[1].label, "Deny");
+        assert_eq!(sess.state.options[2].label, "Always allow Bash");
+    }
+
+    #[test]
+    fn picker_outcome_to_choice_maps_selected_and_cancel() {
+        // Multi-select with custom text.
+        let out = picker::PickerOutcome::Selected {
+            indices: vec![0, 2],
+            custom: Some("other".to_string()),
+        };
+        let (sel, custom) = picker_outcome_to_choice(&out);
+        assert_eq!(sel, vec![0, 2]);
+        assert_eq!(custom.as_deref(), Some("other"));
+        // Cancel ⇒ the daemon's "user skipped" signal (empty + no custom).
+        let (sel, custom) = picker_outcome_to_choice(&picker::PickerOutcome::Cancelled);
+        assert!(sel.is_empty());
+        assert!(custom.is_none());
+    }
+
+    #[test]
+    fn open_choice_picker_maps_options_and_sizes_checked() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.open_choice_picker(
+            "tool-7".to_string(),
+            "Which target?".to_string(),
+            vec![
+                ("staging".to_string(), Some("safe".to_string())),
+                ("prod".to_string(), None),
+            ],
+            true,
+            true,
+        );
+        let sess = app.active_picker.as_ref().expect("picker opened");
+        assert!(matches!(&sess.source, PickerSource::Choice { id } if id == "tool-7"));
+        assert!(sess.state.multi);
+        assert!(sess.state.allow_custom);
+        assert_eq!(sess.state.options.len(), 2);
+        assert_eq!(sess.state.options[0].description.as_deref(), Some("safe"));
+        assert_eq!(sess.state.checked, vec![false, false], "checked sized all-false");
+    }
+
+    #[test]
+    fn take_picker_clears_active() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.open_permission_picker(1, "Write", "a.txt");
+        assert!(app.has_picker());
+        let taken = app.take_picker();
+        assert!(taken.is_some());
+        assert!(!app.has_picker(), "take_picker leaves None");
     }
 
     #[test]
