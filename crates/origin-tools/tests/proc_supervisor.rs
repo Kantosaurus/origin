@@ -1,9 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::unwrap_used)]
 
-use origin_tools::proc_supervisor::{SpawnOpts, Supervisor};
+use origin_tools::proc_supervisor::{ProcessId, SpawnOpts, Supervisor};
 use origin_tools::SandboxProfile;
 use std::time::Duration;
+
+/// Poll the supervisor's ring buffer until `needle` appears or the child exits,
+/// with a generous ceiling. A fixed `sleep` raced PowerShell's cold-start on the
+/// Windows CI runner (slow first launch), so the reads now wait for real output
+/// instead of guessing a duration.
+async fn read_until(sup: &Supervisor, pid: ProcessId, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut acc = String::new();
+    let mut off = 0u64;
+    loop {
+        let chunk = sup.read_since(pid, off, 65536).unwrap();
+        acc.push_str(&chunk.bytes);
+        off = chunk.next_offset;
+        if acc.contains(needle) || std::time::Instant::now() > deadline {
+            return acc;
+        }
+        if chunk.status.is_terminal() {
+            let more = sup.read_since(pid, off, 65536).unwrap();
+            acc.push_str(&more.bytes);
+            return acc;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
 
 #[tokio::test]
 async fn spawn_and_read_output() {
@@ -13,10 +37,8 @@ async fn spawn_and_read_output() {
     #[cfg(windows)]
     let cmd = "Write-Output hello";
     let pid = sup.spawn(cmd, &SpawnOpts::default()).unwrap();
-    // Wait for output to land in the buffer (PowerShell startup can be slow on Windows).
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    let chunk = sup.read_since(pid, 0, 4096).unwrap();
-    assert!(chunk.bytes.contains("hello"), "got: {:?}", chunk.bytes);
+    let out = read_until(&sup, pid, "hello").await;
+    assert!(out.contains("hello"), "got: {out:?}");
 }
 
 #[tokio::test]
@@ -102,11 +124,10 @@ async fn inherit_sandbox_profile_is_unchanged() {
     };
     let pid_inherit = sup.spawn(cmd, &opts_inherit).unwrap();
 
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    let none = sup.read_since(pid_none, 0, 4096).unwrap();
-    let inherit = sup.read_since(pid_inherit, 0, 4096).unwrap();
-    assert!(none.bytes.contains("inherit"), "none: {:?}", none.bytes);
-    assert!(inherit.bytes.contains("inherit"), "inherit: {:?}", inherit.bytes);
+    let none = read_until(&sup, pid_none, "inherit").await;
+    let inherit = read_until(&sup, pid_inherit, "inherit").await;
+    assert!(none.contains("inherit"), "none: {none:?}");
+    assert!(inherit.contains("inherit"), "inherit: {inherit:?}");
 }
 
 #[tokio::test]
@@ -118,10 +139,9 @@ async fn parallel_processes_have_isolated_buffers() {
     let (a, b) = ("Write-Output AAA", "Write-Output BBB");
     let pa = sup.spawn(a, &SpawnOpts::default()).unwrap();
     let pb = sup.spawn(b, &SpawnOpts::default()).unwrap();
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    let ca = sup.read_since(pa, 0, 4096).unwrap();
-    let cb = sup.read_since(pb, 0, 4096).unwrap();
-    assert!(ca.bytes.contains("AAA"));
-    assert!(cb.bytes.contains("BBB"));
-    assert!(!ca.bytes.contains("BBB"));
+    let ca = read_until(&sup, pa, "AAA").await;
+    let cb = read_until(&sup, pb, "BBB").await;
+    assert!(ca.contains("AAA"), "a: {ca:?}");
+    assert!(cb.contains("BBB"), "b: {cb:?}");
+    assert!(!ca.contains("BBB"), "isolation: {ca:?}");
 }
