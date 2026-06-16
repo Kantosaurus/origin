@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Protocol-level tests for the swarm coordinator (P9.6, N7.4, N7.5).
+//! Protocol-level tests for the swarm coordinator (P9.6, N7.5).
 //!
-//! Two scenarios are covered:
-//! 1. `three_workers_complete_and_report` — `Coordinator::spawn` + the default
-//!    noop worker drives three workers to `Completed` with structured
-//!    `CompletionReport`s flowing back through `await_completion`.
-//! 2. `credit_channel_blocks_at_zero` — the generic `CreditChannel<T>` enforces
-//!    its budget on send and re-issues capacity on receive.
+//! `three_workers_complete_and_report` — `Coordinator::spawn` + the default
+//! noop worker drives three workers to `Completed` with structured
+//! `CompletionReport`s flowing back through `await_completion`.
 
 use origin_cas::{Store as CasStore, StoreConfig};
 use origin_plan::{Plan, PlanStore};
@@ -70,18 +67,4 @@ async fn three_workers_complete_and_report() {
     // Plan handle remains queryable post-spawn.
     let snap = plan.snapshot().await;
     assert!(snap.is_empty() || !snap.is_empty(), "plan accessible");
-}
-
-#[tokio::test]
-async fn credit_channel_blocks_at_zero() {
-    use origin_swarm::credit::{CreditChannel, TrySendError};
-    let (tx, mut rx) = CreditChannel::<u32>::new(2);
-    tx.try_send(1).expect("send 1");
-    tx.try_send(2).expect("send 2");
-    let err = tx.try_send(3).expect_err("at budget");
-    assert!(matches!(err, TrySendError::WouldBlock));
-    let v = rx.recv().await.expect("recv");
-    assert_eq!(v, 1);
-    // Receiver issuing a credit unblocks the sender.
-    tx.try_send(3).expect("post-issue");
 }

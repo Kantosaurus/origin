@@ -1,6 +1,6 @@
 [package]
 name = "origin-swarm"
-description = "Coordinator/worker protocol with credit-channel backpressure and completion reports"
+description = "Coordinator/worker protocol with completion reports"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,6 @@ workspace = true
 [dependencies]
 origin-core = { path = "../origin-core" }
 origin-plan = { path = "../origin-plan" }
-origin-smr = { path = "../origin-smr" }
 origin-cas = { path = "../origin-cas" }
 origin-store = { path = "../origin-store" }
 origin-planner = { path = "../origin-planner" }
