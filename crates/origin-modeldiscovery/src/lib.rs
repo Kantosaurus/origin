@@ -164,8 +164,7 @@ impl ModelCache {
 
     /// Insert or replace the cached listing for `provider`.
     pub fn put(&mut self, provider: &str, models: Vec<ModelInfo>) {
-        self.providers
-            .insert(provider.to_string(), CacheEntry { models });
+        self.providers.insert(provider.to_string(), CacheEntry { models });
     }
 
     /// Return the cached models for `provider`, or `None` if never fetched.
@@ -288,10 +287,7 @@ mod tests {
     #[test]
     fn cache_to_json_from_json_round_trip() {
         let mut cache = ModelCache::new();
-        cache.put(
-            "anthropic",
-            vec![ModelInfo::new("claude-opus-4-8".to_string())],
-        );
+        cache.put("anthropic", vec![ModelInfo::new("claude-opus-4-8".to_string())]);
         cache.put("openai", vec![ModelInfo::new("gpt-4o".to_string())]);
         let json = cache.to_json().unwrap();
         let restored = ModelCache::from_json(&json).unwrap();

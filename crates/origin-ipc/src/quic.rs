@@ -120,9 +120,7 @@ impl QuicListener {
     /// constructed, or [`QuicError::Io`] if the UDP socket cannot bind.
     #[allow(clippy::unused_async)]
     pub async fn bind_bearer_gated(addr: SocketAddr, bundle: CertBundle) -> Result<Self, QuicError> {
-        let verifier = Arc::new(AcceptAnyClientCertVerifier {
-            provider: provider(),
-        });
+        let verifier = Arc::new(AcceptAnyClientCertVerifier { provider: provider() });
         Self::bind_with_verifier(addr, bundle, verifier)
     }
 
@@ -709,7 +707,9 @@ mod tests {
             let b1 = c1.read_bearer().await.expect("read bearer 1");
             assert_eq!(b1, "good-token", "server saw the transmitted bearer");
             if b1 == "good-token" {
-                c1.write_frame(FrameKind::Response, b"served").await.expect("serve 1");
+                c1.write_frame(FrameKind::Response, b"served")
+                    .await
+                    .expect("serve 1");
             }
             // Second accept: invalid bearer ⇒ gate denies, connection dropped
             // without serving any request.
@@ -780,15 +780,10 @@ mod tests {
             c.read_bearer().await.expect("read bearer")
         });
 
-        let _client = QuicConnector::connect_with_bearer(
-            addr,
-            "origin-daemon",
-            server_fp,
-            &client_bundle,
-            Some(token),
-        )
-        .await
-        .expect("connect");
+        let _client =
+            QuicConnector::connect_with_bearer(addr, "origin-daemon", server_fp, &client_bundle, Some(token))
+                .await
+                .expect("connect");
 
         let got = server.await.expect("server task");
         assert_eq!(got, token, "bearer must round-trip byte-for-byte");

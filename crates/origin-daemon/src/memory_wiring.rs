@@ -111,8 +111,7 @@ impl MemoryWiring {
             .iter()
             .filter_map(|r| {
                 let vec = quantizer.decode(&r.encoded);
-                let is_placeholder =
-                    vec.iter().skip(1).all(|x| *x == 0.0) && (vec[0] - 1.0).abs() < 1e-6;
+                let is_placeholder = vec.iter().skip(1).all(|x| *x == 0.0) && (vec[0] - 1.0).abs() < 1e-6;
                 (!is_placeholder).then(|| (origin_mem::memory_id_to_u64(&r.id), vec))
             })
             .collect();
@@ -398,7 +397,10 @@ mod tests {
         let uid = memory_id_to_u64(&id);
 
         // Before insert: the shared index is empty ⇒ search finds nothing.
-        let opts = SearchOpts { top_n: 5, ..SearchOpts::default() };
+        let opts = SearchOpts {
+            top_n: 5,
+            ..SearchOpts::default()
+        };
         let pre = wiring
             .index
             .read()

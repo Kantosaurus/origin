@@ -2536,10 +2536,9 @@ fn skill_command_outcome(
                 ClientMessage::ClearAll => "context cleared",
                 _ => "skill deactivated",
             };
-            last_intermediate.take().map_or_else(
-                || Ok(base.to_string()),
-                |prior| Ok(format!("{base}; {prior}")),
-            )
+            last_intermediate
+                .take()
+                .map_or_else(|| Ok(base.to_string()), |prior| Ok(format!("{base}; {prior}")))
         }
         StreamEvent::WorkflowActive { name, steps, skipped } => {
             let main = if steps.is_empty() {

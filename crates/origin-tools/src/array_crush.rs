@@ -198,7 +198,9 @@ fn crush_array_in_place(value: &mut Value, cfg: &CrushConfig) -> CrushOutcome {
 
     for (i, row) in rows.iter().enumerate() {
         match row {
-            Value::Object(map) if columns.iter().all(|c| map.contains_key(c)) && map.len() == columns.len() => {
+            Value::Object(map)
+                if columns.iter().all(|c| map.contains_key(c)) && map.len() == columns.len() =>
+            {
                 let cells: Vec<Value> = columns
                     .iter()
                     .map(|c| {
@@ -498,8 +500,7 @@ mod tests {
             budget_tokens: 0,
             ..CrushConfig::default()
         };
-        let (crushed, outcome) =
-            crush_result_bytes(&bytes, "abc123", 0, &cfg).expect("should crush");
+        let (crushed, outcome) = crush_result_bytes(&bytes, "abc123", 0, &cfg).expect("should crush");
         assert_eq!(outcome, CrushOutcome::Lossless);
         assert!(crushed.len() < bytes.len());
         let v: Value = serde_json::from_slice(&crushed).unwrap();
@@ -514,8 +515,7 @@ mod tests {
             head_rows: 8,
             ..CrushConfig::default()
         };
-        let (crushed, outcome) =
-            crush_result_bytes(&bytes, "feedface", 0, &cfg).expect("should crush");
+        let (crushed, outcome) = crush_result_bytes(&bytes, "feedface", 0, &cfg).expect("should crush");
         assert!(matches!(outcome, CrushOutcome::Lossy { .. }));
         let v: Value = serde_json::from_slice(&crushed).unwrap();
         assert_eq!(v["__offloaded"]["recall"], json!("feedface"));

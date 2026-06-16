@@ -487,13 +487,8 @@ impl ProviderFactory {
                 // so a user-configured Ollama endpoint / gateway is used instead
                 // of the hardcoded `http://127.0.0.1:11434` default. Ollama is
                 // unauthenticated, so `token` is unused here.
-                let base = render_base_url(
-                    entry.base_url.as_ref(),
-                    &self.vault,
-                    entry.id.as_ref(),
-                    account,
-                )
-                .await?;
+                let base =
+                    render_base_url(entry.base_url.as_ref(), &self.vault, entry.id.as_ref(), account).await?;
                 Ok(Arc::new(origin_provider_ollama::Ollama::with_base_url(&base)))
             }
             #[cfg(not(feature = "ollama"))]
@@ -796,9 +791,7 @@ mod tests {
     #[cfg(feature = "ollama")]
     #[tokio::test]
     async fn ollama_honors_catalog_base_url_template() {
-        use origin_provider::catalog::{
-            AuthScheme, Capabilities, ProviderEntry, WireFormat,
-        };
+        use origin_provider::catalog::{AuthScheme, Capabilities, ProviderEntry, WireFormat};
         let mut cat = Catalog::builtin();
         cat.merge_custom(vec![ProviderEntry {
             id: "ollama-remote".into(),
@@ -836,9 +829,7 @@ mod tests {
     #[cfg(feature = "ollama")]
     #[tokio::test]
     async fn ollama_builds_with_custom_base_url() {
-        use origin_provider::catalog::{
-            AuthScheme, Capabilities, ProviderEntry, WireFormat,
-        };
+        use origin_provider::catalog::{AuthScheme, Capabilities, ProviderEntry, WireFormat};
         let mut cat = Catalog::builtin();
         cat.merge_custom(vec![ProviderEntry {
             id: "ollama-gw".into(),

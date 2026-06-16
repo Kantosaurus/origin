@@ -514,8 +514,7 @@ mod tests {
         // A session with a user turn ⇒ derived title.
         let mut s = Session::new_with_id("sess-titled".to_string(), "m".to_string());
         s.push(
-            Message::new(Role::User)
-                .with_block(Block::text("  Fix the   parser bug\nmore details here  ")),
+            Message::new(Role::User).with_block(Block::text("  Fix the   parser bug\nmore details here  ")),
         );
         store.persist_session(&s).expect("persist titled");
         let sum = store

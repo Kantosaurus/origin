@@ -58,8 +58,8 @@ async fn lossy_offload_handle_recalls_the_original() {
         head_rows: 10,
         ..CrushConfig::default()
     };
-    let (crushed, outcome) = crush_result_bytes(&original_bytes, &hex, 0, &cfg)
-        .expect("a 400-row homogeneous array should crush");
+    let (crushed, outcome) =
+        crush_result_bytes(&original_bytes, &hex, 0, &cfg).expect("a 400-row homogeneous array should crush");
 
     // It's the lossy tier, and it's strictly smaller.
     assert!(matches!(outcome, CrushOutcome::Lossy { .. }), "got {outcome:?}");
@@ -82,7 +82,10 @@ async fn lossy_offload_handle_recalls_the_original() {
     hex::decode_to_slice(recall_hex, &mut handle).unwrap();
     let recalled = recall_tool(&cas, handle, None).expect("recall resolves");
     let recalled_val: Value = serde_json::from_str(&recalled).unwrap();
-    assert_eq!(recalled_val, original, "Recall must reconstruct the exact original");
+    assert_eq!(
+        recalled_val, original,
+        "Recall must reconstruct the exact original"
+    );
 }
 
 #[tokio::test]

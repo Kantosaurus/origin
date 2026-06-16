@@ -120,9 +120,11 @@ impl Store {
     /// Propagates rusqlite errors from the query.
     pub fn contains_migrated_memory(&self, key: &str) -> rusqlite::Result<bool> {
         self.with_conn(|c| {
-            let n: i64 = c.query_row("SELECT COUNT(*) FROM migrated_memories WHERE key = ?", [key], |r| {
-                r.get(0)
-            })?;
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM migrated_memories WHERE key = ?",
+                [key],
+                |r| r.get(0),
+            )?;
             Ok(n > 0)
         })
     }

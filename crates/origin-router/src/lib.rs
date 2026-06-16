@@ -433,7 +433,6 @@ mod tests {
         assert_eq!(r.choose(Phase::Default, &[slow.clone(), fast]), Some(slow));
     }
 
-
     #[test]
     fn scored_skips_exhausted_candidates() {
         let a = m("p", "a");
