@@ -8,5 +8,5 @@ pub mod spawn;
 
 pub use bulk_gate::BulkGate;
 pub use class::TaskClass;
-pub use registry::init_for_test;
+pub use registry::{critical_tasks_in_flight, init_for_test};
 pub use spawn::spawn_in;

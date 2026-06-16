@@ -12,6 +12,7 @@
 )]
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -152,14 +153,27 @@ impl AuditRing {
     }
 
     async fn open_next_page(dir: &Path) -> Result<(File, PathBuf, usize), AuditError> {
-        let stamp = Utc::now().format("%Y-%m-%d-%H%M%S%f");
-        let path = dir.join(format!("audit-{stamp}.jsonl"));
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-            .await?;
-        Ok((file, path, 0))
+        // Page filenames must be unique independent of clock granularity: two
+        // rotations within the same OS clock tick (fast runner) would otherwise
+        // collide and lose a page. A process-wide monotonic sequence appended to
+        // the timestamp guarantees a fresh, ordered name every time. The
+        // sequence sorts lexicographically (zero-padded), and `replay()` sorts
+        // merged events by `ts_ms` regardless, so chronological order holds.
+        static PAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let stamp = Utc::now().format("%Y-%m-%d-%H%M%S%f");
+            let seq = PAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!("audit-{stamp}-{seq:020}.jsonl"));
+            match OpenOptions::new().create_new(true).write(true).open(&path).await {
+                Ok(file) => return Ok((file, path, 0)),
+                // Defensive: if the (timestamp, seq) name somehow already exists
+                // (e.g. a recycled counter across a re-opened ring in the same
+                // process+tick), bump the sequence and retry rather than fail.
+                // (`AlreadyExists` falls through to the next loop iteration.)
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     async fn gc_old_pages(dir: &Path) -> Result<(), AuditError> {

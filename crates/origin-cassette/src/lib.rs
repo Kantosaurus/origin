@@ -747,9 +747,11 @@ mod tests {
     fn replay_next_persists_cursor_across_fresh_loads() {
         // Models production: the cassette is re-read + re-parsed fresh on every
         // turn, so the position MUST survive on disk (the `.pos` sidecar).
-        let dir = std::env::temp_dir().join(format!("origin-cassette-replay-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("tape.json");
+        // Use a fresh, unique, auto-cleaned temp dir so a stale `.pos` sidecar
+        // from a prior same-PID run can never make the first replay return the
+        // wrong interaction.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tape.json");
 
         let mut c = Cassette::new("disk");
         for body in ["r1", "r2"] {
@@ -769,7 +771,7 @@ mod tests {
         let third = replay_next(&path, "POST", "https://h/v1/messages");
         assert!(matches!(third, Err(CassetteError::ReplayMiss(_))));
 
-        std::fs::remove_dir_all(&dir).ok();
+        // `dir` (tempfile::TempDir) auto-cleans on drop — no manual rm needed.
     }
 
     #[test]

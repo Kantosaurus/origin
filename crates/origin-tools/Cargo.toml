@@ -48,6 +48,9 @@ origin-store = { path = "../origin-store" }
 # build-time deps of the library.
 origin-gmail = { path = "../origin-gmail" }
 origin-workflowgen = { path = "../origin-workflowgen" }
+# Stamps explicit, distinct mtimes in tests/glob_v2.rs so the mtime-DESC sort
+# assertion is deterministic instead of relying on a wall-clock sleep gap.
+filetime = "0.2"
 tempfile = "3"
 proptest = { workspace = true }
 fs4 = "0.12"

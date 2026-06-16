@@ -4,6 +4,8 @@
 use origin_browser::protocol::Verb;
 use origin_browser::router::BrowserRouter;
 
+mod common;
+
 fn fake(name: &str) -> String {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(format!("tests/fakes/{name}"))
@@ -14,6 +16,10 @@ fn fake(name: &str) -> String {
 
 #[tokio::test]
 async fn falls_back_to_cloak_when_primary_signals_bot() {
+    if !common::node_available() {
+        eprintln!("skipping falls_back_to_cloak_when_primary_signals_bot: `node` unavailable");
+        return;
+    }
     let mut router = BrowserRouter::with_commands(
         ("node", vec![fake("agent_browser_bot.mjs")]),
         ("node", vec![fake("cloak_fake.mjs")]),
@@ -37,6 +43,10 @@ async fn falls_back_to_cloak_when_primary_signals_bot() {
 
 #[tokio::test]
 async fn primary_used_when_clean() {
+    if !common::node_available() {
+        eprintln!("skipping primary_used_when_clean: `node` unavailable");
+        return;
+    }
     let mut router = BrowserRouter::with_commands(
         ("node", vec![fake("agent_browser_fake.mjs")]),
         ("node", vec![fake("cloak_fake.mjs")]),
@@ -55,6 +65,10 @@ async fn primary_used_when_clean() {
 
 #[tokio::test]
 async fn sticks_to_cloak_after_two_successful_fallbacks() {
+    if !common::node_available() {
+        eprintln!("skipping sticks_to_cloak_after_two_successful_fallbacks: `node` unavailable");
+        return;
+    }
     let mut router = BrowserRouter::with_commands(
         ("node", vec![fake("agent_browser_bot.mjs")]),
         ("node", vec![fake("cloak_fake.mjs")]),

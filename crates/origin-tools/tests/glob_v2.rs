@@ -1,17 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::unwrap_used)]
 
+use filetime::{set_file_mtime, FileTime};
 use origin_tools::builtins::glob_tool::{glob_v2, GlobArgs};
 use std::fs;
-use std::time::Duration;
 use tempfile::tempdir;
 
 #[test]
 fn returns_matches_sorted_by_mtime_desc() {
     let d = tempdir().unwrap();
-    fs::write(d.path().join("old.rs"), "").unwrap();
-    std::thread::sleep(Duration::from_millis(50));
-    fs::write(d.path().join("new.rs"), "").unwrap();
+    let old = d.path().join("old.rs");
+    let new = d.path().join("new.rs");
+    fs::write(&old, "").unwrap();
+    fs::write(&new, "").unwrap();
+    // Stamp explicit, distinct mtimes instead of relying on a wall-clock sleep
+    // gap between writes (which raced filesystems with coarse mtime resolution
+    // and an unstable tie-break when the two writes landed in the same tick).
+    // The glob sorts mtime-DESC, so `new.rs` (newer) must precede `old.rs`.
+    set_file_mtime(&old, FileTime::from_unix_time(1_000_000, 0)).unwrap();
+    set_file_mtime(&new, FileTime::from_unix_time(2_000_000, 0)).unwrap();
 
     let out = glob_v2(GlobArgs {
         pattern: "**/*.rs".into(),

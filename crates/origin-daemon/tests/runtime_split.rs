@@ -15,8 +15,23 @@ fn control_and_worker_run_on_distinct_threads() {
     let signal = ShutdownSignal::new();
     let signal_clone = signal.clone();
     let handle = thread::spawn(move || start(signal_clone));
-    // Give the runtimes a moment to come up.
-    thread::sleep(Duration::from_millis(150));
+
+    // Bounded readiness poll: `start()` populates both handles (their `raw()`
+    // flips from `None` to `Some`) once the runtimes are up. A fixed 150ms
+    // sleep raced a slow runner where the runtimes had not booted yet; this
+    // waits for the real readiness signal instead, with a generous ceiling.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let ready = signal.control_handle().raw().is_some() && signal.worker_handle().raw().is_some();
+        if ready {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "runtimes did not come up within 10s"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 
     let (ctrl_tx, ctrl_rx) = mpsc::sync_channel::<String>(1);
     let (work_tx, work_rx) = mpsc::sync_channel::<String>(1);
