@@ -14,6 +14,16 @@
 
 pub mod tokens;
 
+mod chrome;
+mod codeblock;
+mod composer;
+mod markdown;
+mod palette;
+mod picker;
+mod syntax;
+mod toolblock;
+mod transcript;
+
 use std::time::{Duration, Instant};
 
 use origin_tui::composer::{Composer, PROMPT_ROWS};
