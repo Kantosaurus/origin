@@ -42,18 +42,21 @@ async fn rebind_reclaims_stale_socket_file() {
 async fn rebind_refuses_when_live_listener_owns_path() {
     let path = unique_socket_path();
 
-    // A *live* listener owns the path: a rebind must NOT clobber it.
+    // A *live* listener owns the path: a rebind must NOT clobber it. `live` is
+    // kept OWNED in this scope for the whole test. (A previous version moved it
+    // into a task that dropped it after one `accept()`; on a differently-
+    // scheduled runner — e.g. macOS — that drop raced ahead of the rebind,
+    // leaving a *stale* socket the rebind happily reclaimed, so `rebind.is_err()`
+    // was false and the test flaked.)
     let live = Listener::bind(&path).await.expect("live bind");
-    // Keep accepting so the socket is genuinely connectable.
-    let accept_path = path.clone();
-    let server = tokio::spawn(async move {
-        let _ = live.accept().await;
-        drop(accept_path);
-    });
 
-    // Confirm the path is live before asserting bind refuses it.
-    let _client = Connector::connect(&path).await.expect("connect to live");
+    // Connect and accept concurrently to confirm the socket is genuinely
+    // connectable; `accept` takes `&self`, so `live` stays bound afterwards.
+    let (client, accepted) = tokio::join!(Connector::connect(&path), live.accept());
+    let _client = client.expect("connect to live");
+    let _accepted = accepted.expect("accept the live connection");
 
+    // While `live` still owns the path, a rebind must refuse it.
     let rebind = Listener::bind(&path).await;
     assert!(rebind.is_err(), "rebind must refuse a live socket");
     assert_eq!(
@@ -62,6 +65,6 @@ async fn rebind_refuses_when_live_listener_owns_path() {
         "live socket should still report AddrInUse",
     );
 
-    server.abort();
+    drop(live);
     let _ = std::fs::remove_file(&path);
 }

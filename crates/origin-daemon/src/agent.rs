@@ -9116,16 +9116,18 @@ mod bash_streaming_tests {
         let chunk = shared
             .read_since(pid, 0, 64 * 1024)
             .expect("read_since on the shared supervisor must know this pid");
-        // Sanity: the recorded output eventually contains what we echoed (the
-        // process may still be finishing, so allow either now or after a poll).
+        // Sanity: the recorded output eventually contains what we echoed. Poll
+        // until it lands or the child exits — PowerShell cold-start on a slow CI
+        // runner can take well over a second, so a fixed short budget races it.
         let mut seen = chunk.bytes.contains("backgrounded");
-        for _ in 0..50 {
-            if seen {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !seen {
             let more = shared.read_since(pid, 0, 64 * 1024).expect("pid still known");
             seen = more.bytes.contains("backgrounded");
+            if seen || more.status.is_terminal() || std::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(seen, "shared supervisor must surface the background output");
     }
