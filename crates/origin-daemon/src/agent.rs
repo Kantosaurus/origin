@@ -143,11 +143,12 @@ const BYTES_PER_TOKEN: usize = 4;
 /// The transcript-byte soft cap above which the live in-loop compactor folds the
 /// oldest summarized turns into their summaries (firing `PreCompress`).
 ///
-/// Sized to the running model's real context window when known: a large-context
-/// model (e.g. Claude's 200 K) no longer compacts needlessly at the old fixed
-/// 200 KiB (~50 K tokens, only a quarter of its window). `ORIGIN_COMPACT_SOFT_CAP`
-/// still overrides everything (tuning/tests); an unknown model falls back to
-/// [`crate::compactor::DEFAULT_SOFT_CAP_BYTES`] (byte-identical to before).
+/// Sized to the running model's real context window via the shared
+/// [`crate::model_window::model_context_window`] resolver: a large-context model
+/// (e.g. Claude's 200 K, Opus 4.8's 1 M) no longer compacts needlessly at the old
+/// fixed 200 KiB (~50 K tokens, only a quarter of its window).
+/// `ORIGIN_COMPACT_SOFT_CAP` still overrides everything (tuning/tests); an
+/// unrecognized model resolves to the resolver's conservative 200 K fallback.
 fn compaction_soft_cap(model: &str) -> usize {
     if let Some(bytes) = std::env::var("ORIGIN_COMPACT_SOFT_CAP")
         .ok()
@@ -155,61 +156,43 @@ fn compaction_soft_cap(model: &str) -> usize {
     {
         return bytes;
     }
-    model_context_window(model).map_or(crate::compactor::DEFAULT_SOFT_CAP_BYTES, |window| {
-        let w = usize::try_from(window).unwrap_or(usize::MAX);
-        w.saturating_mul(BYTES_PER_TOKEN)
-            .saturating_mul(COMPACT_WINDOW_NUM)
-            / COMPACT_WINDOW_DEN
-    })
-}
-
-/// Best-effort context window (in tokens) for well-known model families, used
-/// only to size the compaction trigger. Matched by lowercased substring so
-/// version suffixes (`claude-opus-4-7-20250115`) still resolve. Returns `None`
-/// for unrecognized models, so the caller keeps the conservative fixed default.
-/// Full per-model accuracy would come from wiring the live model-discovery
-/// `context_window` through to the loop; this static table covers the common
-/// families without that plumbing.
-fn model_context_window(model: &str) -> Option<u32> {
-    let m = model.to_ascii_lowercase();
-    if m.contains("claude")
-        || m.contains("fable")
-        || m.contains("opus")
-        || m.contains("sonnet")
-        || m.contains("haiku")
-    {
-        Some(200_000)
-    } else if m.contains("gemini") {
-        Some(1_000_000)
-    } else if m.contains("gpt-4") || m.contains("gpt-5") {
-        Some(128_000)
-    } else {
-        None
-    }
+    let window = crate::model_window::model_context_window(model);
+    let w = usize::try_from(window).unwrap_or(usize::MAX);
+    w.saturating_mul(BYTES_PER_TOKEN)
+        .saturating_mul(COMPACT_WINDOW_NUM)
+        / COMPACT_WINDOW_DEN
 }
 
 #[cfg(test)]
 mod compaction_cap_tests {
-    use super::{model_context_window, BYTES_PER_TOKEN, COMPACT_WINDOW_DEN, COMPACT_WINDOW_NUM};
-
-    #[test]
-    fn context_window_resolves_known_families() {
-        assert_eq!(model_context_window("claude-opus-4-7-20250115"), Some(200_000));
-        assert_eq!(model_context_window("claude-fable-5"), Some(200_000));
-        assert_eq!(model_context_window("gemini-2.5-pro"), Some(1_000_000));
-        assert_eq!(model_context_window("gpt-4o-mini"), Some(128_000));
-        assert_eq!(model_context_window("some-unknown-local-model"), None);
-    }
+    use super::{BYTES_PER_TOKEN, COMPACT_WINDOW_DEN, COMPACT_WINDOW_NUM};
+    use crate::model_window::model_context_window;
 
     #[test]
     fn large_window_models_get_a_larger_cap_than_the_fixed_default() {
         // 200k tokens × 4 bytes × 3/5 = 480 KB, well above the 200 KiB default —
-        // so a Claude session no longer compacts at ~25 % of its real window.
-        let window = model_context_window("claude-opus-4-7").expect("known");
+        // so a Claude session no longer compacts at ~25 % of its real window. The
+        // per-family resolution itself is tested in `crate::model_window`.
+        let window = model_context_window("claude-sonnet-4-6");
+        assert_eq!(window, 200_000);
         let cap = usize::try_from(window).expect("fits") * BYTES_PER_TOKEN * COMPACT_WINDOW_NUM
             / COMPACT_WINDOW_DEN;
         assert_eq!(cap, 480_000);
         assert!(cap > crate::compactor::DEFAULT_SOFT_CAP_BYTES);
+    }
+
+    #[test]
+    fn unknown_model_uses_the_resolver_fallback_not_the_old_fixed_default() {
+        // Unifying onto the shared resolver deliberately changed the UNKNOWN-model
+        // cap: it now resolves to the 200 K-token fallback (480 KB) instead of the
+        // old `None` → DEFAULT_SOFT_CAP_BYTES (204,800). Pin that shift so a future
+        // edit can't silently revert it (or quietly change the fallback window).
+        let window = model_context_window("totally-unknown-local-model-xyz");
+        assert_eq!(window, 200_000);
+        let cap = usize::try_from(window).expect("fits") * BYTES_PER_TOKEN * COMPACT_WINDOW_NUM
+            / COMPACT_WINDOW_DEN;
+        assert_eq!(cap, 480_000);
+        assert_ne!(cap, crate::compactor::DEFAULT_SOFT_CAP_BYTES);
     }
 }
 

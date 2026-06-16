@@ -13,11 +13,13 @@ use origin_tui::grid::{Attr, Cell, Grid};
 
 use super::tokens::{char_cell_width, glyph, Region, Tokens};
 
-// `format_tokens` / `context_window_for` live in `mod.rs` and are not part of
-// this module's owned surface; the chrome zone only needs the token formatter,
-// so a small local copy is kept here (mirrors `mod.rs::format_tokens`) rather
-// than reaching into a sibling module's private items. `ctx_pct` arrives
-// pre-computed in `ChromeCtx`, so `context_window_for` is not needed here.
+// `format_tokens` lives in `mod.rs` and is not part of this module's owned
+// surface; the chrome zone only needs the token formatter, so a small local copy
+// is kept here (mirrors `mod.rs::format_tokens`) rather than reaching into a
+// sibling module's private items. The per-model context window comes from the
+// shared `origin_daemon::model_window::model_context_window` resolver via
+// `App::ctx_pct`, which arrives pre-computed in `ChromeCtx`, so the resolver is
+// not needed here.
 
 /// Clock glyph for the right-aligned session timer (`◷`).
 const CLOCK: char = '\u{25F7}';
@@ -57,7 +59,8 @@ pub struct ChromeCtx {
     /// any in-flight `turn_started`.
     pub elapsed: String,
     /// Context-window fill percentage (0–100), colorized warn/err past
-    /// thresholds. Derived from `last_ctx_tokens` / `context_window_for(model)`.
+    /// thresholds. Derived from `last_ctx_tokens` /
+    /// `origin_daemon::model_window::model_context_window(model)`.
     pub ctx_pct: u8,
 }
 

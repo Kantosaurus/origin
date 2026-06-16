@@ -732,7 +732,7 @@ impl App {
         if self.last_ctx_tokens == 0 {
             return None;
         }
-        let window = context_window_for(&self.usage.model);
+        let window = origin_daemon::model_window::model_context_window(&self.usage.model);
         let pct = u64::from(self.last_ctx_tokens) * 100 / u64::from(window.max(1));
         Some(u8::try_from(pct.min(100)).unwrap_or(100))
     }
@@ -2543,19 +2543,6 @@ fn format_elapsed_clock(d: Duration) -> String {
     }
 }
 
-/// A rough context-window size (tokens) for `model`, for the `ctx N%` meter.
-/// Heuristic by family — exact-enough to show how full the window is.
-fn context_window_for(model: &str) -> u32 {
-    let m = model.to_ascii_lowercase();
-    if m.contains("gemini") {
-        1_000_000
-    } else if m.contains("claude") || m.contains("opus") || m.contains("sonnet") || m.contains("haiku") {
-        200_000
-    } else {
-        128_000
-    }
-}
-
 /// Summary line for a diff truncated to `shown` of `total` rows, or `None` when
 /// nothing was elided (`total <= shown`).
 ///
@@ -3231,6 +3218,20 @@ mod tests {
         app.stop_turn_timer();
         let pct = app.ctx_pct().expect("a turn ran");
         assert!((70..=80).contains(&pct), "≈75% of 200k, got {pct}");
+    }
+
+    #[test]
+    fn ctx_meter_uses_real_one_million_window_for_opus_4_8() {
+        // Opus 4.8 has a 1M window: 150k tokens must read as ~15%, NOT the ~75%
+        // the old crude 200K heuristic produced. This exercises the shared
+        // `origin_daemon::model_window::model_context_window` resolver via
+        // `App::ctx_pct`.
+        let mut app = App::new("anthropic", "claude-opus-4-8", CompletionSources::default());
+        app.start_turn_timer();
+        app.record_usage_tokens(150_000, 10, 0, 0); // ~150k of a 1M window
+        app.stop_turn_timer();
+        let pct = app.ctx_pct().expect("a turn ran");
+        assert!((13..=17).contains(&pct), "≈15% of 1M, got {pct}");
     }
 
     #[test]
