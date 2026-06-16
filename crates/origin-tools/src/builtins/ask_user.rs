@@ -64,8 +64,8 @@ impl AskUserArgs {
     /// Returns a human-readable message when `question` is missing/blank or the
     /// JSON shape is wrong, so the daemon can surface it as a `BadArgs` error.
     pub fn from_value(v: &serde_json::Value) -> Result<Self, String> {
-        let args: Self = serde_json::from_value(v.clone())
-            .map_err(|e| format!("ask_user: invalid input: {e}"))?;
+        let args: Self =
+            serde_json::from_value(v.clone()).map_err(|e| format!("ask_user: invalid input: {e}"))?;
         if args.question.trim().is_empty() {
             return Err("ask_user: `question` must be a non-empty string".to_string());
         }
@@ -219,7 +219,10 @@ mod tests {
         assert!(text.contains("— sandbox"), "renders the description");
         assert!(text.contains("2. prod"), "numbers the second option");
         assert!(text.contains("pick more than one"), "notes multi-select");
-        assert!(text.contains("not listed"), "notes the custom affordance (default on)");
+        assert!(
+            text.contains("not listed"),
+            "notes the custom affordance (default on)"
+        );
     }
 
     #[test]

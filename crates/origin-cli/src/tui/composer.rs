@@ -103,6 +103,9 @@ fn write_clip(
 ///
 /// Everything is read from [`Tokens`] (frame in `accent_dim`, prompt in
 /// `accent`, body text in `body`, placeholder/cues in `muted`).
+// Long but linear frame paint (top/body/bottom + gutter cues); splitting it would
+// just scatter the border math across helpers. Over the line cap only after rustfmt.
+#[allow(clippy::too_many_lines)]
 pub fn draw_field(grid: &mut Grid, region: Region, ed: &EditorView, tok: &Tokens) {
     if region.width < 2 || region.height < 2 {
         return;
@@ -115,15 +118,39 @@ pub fn draw_field(grid: &mut Grid, region: Region, ed: &EditorView, tok: &Tokens
 
     // --- Frame: top + bottom borders -------------------------------------
     cell(grid, top, left, TOP_LEFT, tok.accent_dim, tok.raised, Attr::PLAIN);
-    cell(grid, bottom, left, BOT_LEFT, tok.accent_dim, tok.raised, Attr::PLAIN);
+    cell(
+        grid,
+        bottom,
+        left,
+        BOT_LEFT,
+        tok.accent_dim,
+        tok.raised,
+        Attr::PLAIN,
+    );
     let mut c = left + 1;
     while c < last_col {
         cell(grid, top, c, HORIZ, tok.accent_dim, tok.raised, Attr::PLAIN);
         cell(grid, bottom, c, HORIZ, tok.accent_dim, tok.raised, Attr::PLAIN);
         c += 1;
     }
-    cell(grid, top, last_col, TOP_RIGHT, tok.accent_dim, tok.raised, Attr::PLAIN);
-    cell(grid, bottom, last_col, BOT_RIGHT, tok.accent_dim, tok.raised, Attr::PLAIN);
+    cell(
+        grid,
+        top,
+        last_col,
+        TOP_RIGHT,
+        tok.accent_dim,
+        tok.raised,
+        Attr::PLAIN,
+    );
+    cell(
+        grid,
+        bottom,
+        last_col,
+        BOT_RIGHT,
+        tok.accent_dim,
+        tok.raised,
+        Attr::PLAIN,
+    );
 
     // --- Content rows between the borders --------------------------------
     let first_content = top + 1;
@@ -173,7 +200,15 @@ pub fn draw_field(grid: &mut Grid, region: Region, ed: &EditorView, tok: &Tokens
             // Continuation rows that actually carry wrapped text get the soft-wrap
             // cue; rows beyond the text stay a blank gutter.
             if (i as usize) < visible.len() {
-                cell(grid, row, gutter_col, WRAP_CUE, tok.muted, tok.raised, Attr::PLAIN);
+                cell(
+                    grid,
+                    row,
+                    gutter_col,
+                    WRAP_CUE,
+                    tok.muted,
+                    tok.raised,
+                    Attr::PLAIN,
+                );
             }
         }
 
@@ -243,8 +278,7 @@ pub fn draw_hint(grid: &mut Grid, region: Region, in_flight: bool, tok: &Tokens)
         total = total.saturating_add(seg_w(key, label));
     }
     let separator_w = char_str_width(SEP_STR); // " · "
-    total =
-        total.saturating_add(separator_w.saturating_mul(u16c(segs.len()).saturating_sub(1)));
+    total = total.saturating_add(separator_w.saturating_mul(u16c(segs.len()).saturating_sub(1)));
 
     // Center within the region; left-align if it would overflow.
     let start = if total < region.width {

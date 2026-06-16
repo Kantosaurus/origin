@@ -197,10 +197,7 @@ impl IpcChoicePrompter {
     /// Create a choice prompter that emits asks over `event_tx` and parks on
     /// `registry`.
     #[must_use]
-    pub const fn new(
-        event_tx: mpsc::Sender<StreamEvent>,
-        registry: std::sync::Arc<ChoiceRegistry>,
-    ) -> Self {
+    pub const fn new(event_tx: mpsc::Sender<StreamEvent>, registry: std::sync::Arc<ChoiceRegistry>) -> Self {
         Self { event_tx, registry }
     }
 
@@ -328,11 +325,8 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let registry = Arc::new(ChoiceRegistry::new());
         let prompter = IpcChoicePrompter::new(tx, Arc::clone(&registry));
-        let handle = tokio::spawn(async move {
-            prompter
-                .ask("Pick".to_string(), Vec::new(), true, true)
-                .await
-        });
+        let handle =
+            tokio::spawn(async move { prompter.ask("Pick".to_string(), Vec::new(), true, true).await });
         let id = expect_choice_ask(rx.recv().await.expect("ask emitted"), "Pick");
         registry.resolve(&id, vec![0, 2], Some("extra".to_string()));
         let (sel, custom) = handle.await.expect("task joins");
@@ -345,11 +339,8 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let registry = Arc::new(ChoiceRegistry::new());
         let prompter = IpcChoicePrompter::new(tx, Arc::clone(&registry));
-        let handle = tokio::spawn(async move {
-            prompter
-                .ask("Pick".to_string(), Vec::new(), false, false)
-                .await
-        });
+        let handle =
+            tokio::spawn(async move { prompter.ask("Pick".to_string(), Vec::new(), false, false).await });
         let id = expect_choice_ask(rx.recv().await.expect("ask emitted"), "Pick");
         // A *different* holder of the Arc resolves it (the cross-connection path).
         let other = Arc::clone(&registry);
@@ -365,9 +356,7 @@ mod tests {
         drop(rx); // no client listening
         let registry = Arc::new(ChoiceRegistry::new());
         let prompter = IpcChoicePrompter::new(tx, registry);
-        let (sel, custom) = prompter
-            .ask("Pick".to_string(), Vec::new(), false, false)
-            .await;
+        let (sel, custom) = prompter.ask("Pick".to_string(), Vec::new(), false, false).await;
         assert!(sel.is_empty(), "a vanished client must skip, never auto-select");
         assert!(custom.is_none());
     }

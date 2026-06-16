@@ -1027,10 +1027,7 @@ impl App {
     /// The option indices map back to `(allow, always)` via
     /// [`picker_outcome_to_permission`].
     pub fn open_permission_picker(&mut self, id: u64, tool: &str, args: &str) {
-        let question = crate::locale::linef(
-            "permission.ask",
-            &[("tool", tool), ("args", args)],
-        );
+        let question = crate::locale::linef("permission.ask", &[("tool", tool), ("args", args)]);
         let options = vec![
             picker::PickerOption {
                 label: "Allow once".to_string(),
@@ -1411,6 +1408,9 @@ impl App {
         self.usage.elapsed += elapsed;
     }
 
+    // The frame orchestration (clear → chrome → transcript → status → composer →
+    // popups → selection); linear by design. Over the line cap only after rustfmt.
+    #[allow(clippy::too_many_lines)]
     pub fn draw(&self, composer: &mut Composer, widget: &mut StreamWidget) {
         let _ = widget;
         {
@@ -1501,10 +1501,20 @@ impl App {
             for entry in &self.scrollback {
                 // User prompts wrap into the right band; everything else full-width.
                 let right = entry.align == LineAlign::Right;
-                let wrap_cols = if right { right_band(cols) as usize } else { cols_usize };
+                let wrap_cols = if right {
+                    right_band(cols) as usize
+                } else {
+                    cols_usize
+                };
                 wrap_into(
-                    &entry.text, entry.fg, entry.bg, entry.bold, entry.literal, right,
-                    wrap_cols, &mut visual_lines,
+                    &entry.text,
+                    entry.fg,
+                    entry.bg,
+                    entry.bold,
+                    entry.literal,
+                    right,
+                    wrap_cols,
+                    &mut visual_lines,
                 );
             }
             // Live assistant turn gets an explicit `◆ origin` role header (the one
@@ -1517,7 +1527,16 @@ impl App {
                 .as_ref()
                 .map(|buf| format!("\u{25C6} origin\n  {buf}"));
             if let Some(text) = live_buf.as_deref() {
-                wrap_into(text, tok.origin, 0, false, false, false, cols_usize, &mut visual_lines);
+                wrap_into(
+                    text,
+                    tok.origin,
+                    0,
+                    false,
+                    false,
+                    false,
+                    cols_usize,
+                    &mut visual_lines,
+                );
             }
             // Index of the live turn's *last* visual row, used to ride a streaming
             // caret on it. The live buffer is appended last, so when one is in
@@ -1539,7 +1558,14 @@ impl App {
             let transcript_bottom = at_bottom.saturating_sub(picker_h_u16);
             let mut row: u16 = transcript_top;
             let last_painted_row = paint_transcript_rows(
-                main, &visual_lines, skip, visible, &mut row, transcript_bottom, cols, &tok,
+                main,
+                &visual_lines,
+                skip,
+                visible,
+                &mut row,
+                transcript_bottom,
+                cols,
+                &tok,
             );
 
             // ── Streaming caret (Stage 9, Motion) ────────────────────────────
@@ -1578,8 +1604,7 @@ impl App {
             self.draw_composer(main, field_region, &wrapped, &input_layout, &tok);
 
             // ── Hint line (Stage 4) ──────────────────────────────────────────
-            let hint_region =
-                crate::tui::tokens::Region::new(rows.saturating_sub(hint_h), 0, cols, hint_h);
+            let hint_region = crate::tui::tokens::Region::new(rows.saturating_sub(hint_h), 0, cols, hint_h);
             crate::tui::composer::draw_hint(
                 main,
                 hint_region,
@@ -1612,9 +1637,7 @@ impl App {
     ) -> Vec<crate::tui::tokens::RenderRow> {
         self.active_picker
             .as_ref()
-            .map(|sess| {
-                crate::tui::picker::layout_picker(&sess.state, cols.saturating_sub(2), tok)
-            })
+            .map(|sess| crate::tui::picker::layout_picker(&sess.state, cols.saturating_sub(2), tok))
             .unwrap_or_default()
     }
 
@@ -1678,12 +1701,7 @@ impl App {
             elapsed: format_elapsed_clock(live_elapsed),
             ctx_pct: self.ctx_pct().unwrap_or(0),
         };
-        crate::tui::chrome::draw_top(
-            main,
-            crate::tui::tokens::Region::new(0, 0, cols, 1),
-            &ctx,
-            tok,
-        );
+        crate::tui::chrome::draw_top(main, crate::tui::tokens::Region::new(0, 0, cols, 1), &ctx, tok);
         // Full-width rule on row 1, in accent_dim, seating the transcript.
         for c in 0..cols {
             main.put(1, c, Cell::new('\u{2500}', tok.accent_dim, 0, Attr::PLAIN));
@@ -1730,15 +1748,9 @@ impl App {
             .clone()
             .or_else(|| localize_phase(phase).map(|p| format!("{}s {p}", live_elapsed.as_secs())));
         let st = crate::tui::chrome::StatusCtx {
-            spinner: self
-                .spinner
-                .active
-                .then(|| self.spinner.frame_char().to_string()),
+            spinner: self.spinner.active.then(|| self.spinner.frame_char().to_string()),
             phase: phase_owned,
-            tokens: self
-                .usage
-                .input_tokens
-                .saturating_add(self.usage.output_tokens),
+            tokens: self.usage.input_tokens.saturating_add(self.usage.output_tokens),
             cost: Some(crate::status::cost_usd(&self.usage)),
             in_flight: self.spinner.active || self.goal_status.is_some(),
         };
@@ -1907,7 +1919,6 @@ impl App {
             tok,
         );
     }
-
 }
 
 /// Clear the (unused) prompt grid to the base surface color. The composer keeps
@@ -2313,12 +2324,7 @@ fn paint_transcript_rows(
 /// when it scrolled out of the painted window. The painted window covers visual
 /// indices `[skip, ..)` mapped to rows `[transcript_top, last_painted_row)`, so
 /// `idx` is on screen iff `idx >= skip` and its row is below `last_painted_row`.
-fn caret_row_for(
-    idx: usize,
-    skip: usize,
-    transcript_top: u16,
-    last_painted_row: u16,
-) -> Option<u16> {
+fn caret_row_for(idx: usize, skip: usize, transcript_top: u16, last_painted_row: u16) -> Option<u16> {
     let offset_in_window = idx.checked_sub(skip)?;
     let crow = transcript_top.saturating_add(clamp_u16(offset_in_window));
     (crow < last_painted_row).then_some(crow)
@@ -2470,7 +2476,11 @@ fn render_scroll_line(
         let g0 = grid.get(row, 0).glyph;
         let blank = g0 == 0 || g0 == u32::from(' ');
         if blank {
-            grid.put(row, 0, Cell::new(crate::tui::tokens::glyph::SPINE, tok.spine, 0, Attr::PLAIN));
+            grid.put(
+                row,
+                0,
+                Cell::new(crate::tui::tokens::glyph::SPINE, tok.spine, 0, Attr::PLAIN),
+            );
         }
     }
 }
@@ -3106,7 +3116,11 @@ mod tests {
         let content_right = cols - 2; // exclusive content edge
         let start = content_right - w; // first glyph column
         assert!(start > cols / 2, "text starts in the right half (start={start})");
-        assert_eq!(g.get(0, start).glyph, u32::from('h'), "first glyph at computed start");
+        assert_eq!(
+            g.get(0, start).glyph,
+            u32::from('h'),
+            "first glyph at computed start"
+        );
         assert_eq!(
             rightmost_glyph(&g, 0, cols - 1),
             Some(content_right - 1),
@@ -3161,10 +3175,7 @@ mod tests {
                 "row {i} has the right rule"
             );
             let g0 = g.get(0, 0).glyph;
-            assert!(
-                g0 == 0 || g0 == u32::from(' '),
-                "row {i} has no left spine"
-            );
+            assert!(g0 == 0 || g0 == u32::from(' '), "row {i} has no left spine");
         }
     }
 
@@ -3588,7 +3599,11 @@ mod tests {
         assert_eq!(picker_outcome_to_permission(1), (false, false), "Deny");
         assert_eq!(picker_outcome_to_permission(2), (true, true), "Always allow");
         // Any unexpected index is a safe deny.
-        assert_eq!(picker_outcome_to_permission(7), (false, false), "out-of-range denies");
+        assert_eq!(
+            picker_outcome_to_permission(7),
+            (false, false),
+            "out-of-range denies"
+        );
         // Esc-as-deny.
         assert_eq!(permission_cancel(), (false, false), "cancel is a plain deny");
     }

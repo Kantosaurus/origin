@@ -61,7 +61,7 @@ const SID: &str = "sess-compact";
 
 /// Seed a store + an over-cap in-memory session: the oldest four turns are
 /// small and summarized (foldable), and one large recent turn pushes the
-/// transcript past the 200 KiB soft cap. Returns the live store so callers can
+/// transcript past the soft cap. Returns the live store so callers can
 /// assert on snapshots after the loop.
 fn seed(dir: &TempDir) -> (Arc<SessionStore>, Session) {
     let store = Arc::new(SessionStore::open(dir.path().join("sessions.db")).expect("open store"));
@@ -80,8 +80,10 @@ fn seed(dir: &TempDir) -> (Arc<SessionStore>, Session) {
             .expect("summary");
     }
     // A large recent turn pushes the accumulated transcript over the soft cap so
-    // the post-turn compaction call actually fires.
-    let big = "y".repeat(210_000);
+    // the post-turn compaction call actually fires. Sized comfortably above the
+    // shared `model_window` resolver's unknown-model fallback (200K tokens ⇒
+    // 480 KB), which the unknown model "test-model" resolves to.
+    let big = "y".repeat(600_000);
     session
         .messages
         .push(Message::new(Role::User).with_block(Block::text(big)));

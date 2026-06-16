@@ -255,7 +255,10 @@ mod tests {
         reduce(&mut s, PickKey::Down);
         assert_eq!(s.cursor, 1);
         reduce(&mut s, PickKey::Down);
-        assert_eq!(s.cursor, 1, "clamps to the filtered length (2), not items length (3)");
+        assert_eq!(
+            s.cursor, 1,
+            "clamps to the filtered length (2), not items length (3)"
+        );
     }
 
     #[test]

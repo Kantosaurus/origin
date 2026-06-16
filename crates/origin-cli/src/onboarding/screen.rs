@@ -148,7 +148,10 @@ pub fn run_text_field(prompt: &str, masked: bool) -> io::Result<FieldOutcome> {
 /// so the caller simply repaints and reads again.
 fn read_pick_key() -> io::Result<Option<PickKey>> {
     let Event::Key(KeyEvent {
-        code, modifiers, kind, ..
+        code,
+        modifiers,
+        kind,
+        ..
     }) = event::read()?
     else {
         return Ok(None);
@@ -217,7 +220,14 @@ pub fn paint_picker(
     let mut col = put_str(&mut grid, 0, 1, &format!("{} ", glyph::ORIGIN), tok.accent, max);
     col = put_str(&mut grid, 0, col, banner, tok.bright, max);
     if !breadcrumb.is_empty() {
-        let _ = put_str(&mut grid, 0, col, &format!(" \u{00b7} {breadcrumb}"), tok.muted, max);
+        let _ = put_str(
+            &mut grid,
+            0,
+            col,
+            &format!(" \u{00b7} {breadcrumb}"),
+            tok.muted,
+            max,
+        );
     }
 
     // Row 1: a horizontal rule.
@@ -395,7 +405,11 @@ mod tests {
         let grid = paint_picker("origin", "", "Pick", &state, &tok, 50, 14);
         // Row 6 = first item (no marker), row 7 = second item (cursor).
         assert_eq!(grid_char(&grid, 6, 1), ' ', "non-cursor row has no marker");
-        assert_eq!(grid_char(&grid, 7, 1), glyph::CURSOR, "cursor moved to second row");
+        assert_eq!(
+            grid_char(&grid, 7, 1),
+            glyph::CURSOR,
+            "cursor moved to second row"
+        );
     }
 
     #[test]
@@ -487,8 +501,17 @@ mod tests {
         assert_eq!(map_key(KeyCode::Down, KeyModifiers::NONE), Some(PickKey::Down));
         assert_eq!(map_key(KeyCode::Enter, KeyModifiers::NONE), Some(PickKey::Enter));
         assert_eq!(map_key(KeyCode::Esc, KeyModifiers::NONE), Some(PickKey::Esc));
-        assert_eq!(map_key(KeyCode::Backspace, KeyModifiers::NONE), Some(PickKey::Backspace));
-        assert_eq!(map_key(KeyCode::Char('x'), KeyModifiers::NONE), Some(PickKey::Char('x')));
-        assert_eq!(map_key(KeyCode::Char('c'), KeyModifiers::CONTROL), Some(PickKey::Esc));
+        assert_eq!(
+            map_key(KeyCode::Backspace, KeyModifiers::NONE),
+            Some(PickKey::Backspace)
+        );
+        assert_eq!(
+            map_key(KeyCode::Char('x'), KeyModifiers::NONE),
+            Some(PickKey::Char('x'))
+        );
+        assert_eq!(
+            map_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Some(PickKey::Esc)
+        );
     }
 }

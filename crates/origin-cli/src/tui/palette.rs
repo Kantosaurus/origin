@@ -169,7 +169,16 @@ pub fn draw_slash(grid: &mut Grid, region: Region, items: &[SlashItem], sel: usi
             if selected { Attr::BOLD } else { Attr::PLAIN },
         );
         if !item.desc.is_empty() {
-            write_clip(grid, row, desc_col, &item.desc, clip, tok.muted, row_bg, Attr::PLAIN);
+            write_clip(
+                grid,
+                row,
+                desc_col,
+                &item.desc,
+                clip,
+                tok.muted,
+                row_bg,
+                Attr::PLAIN,
+            );
         }
     }
 }
@@ -179,13 +188,7 @@ pub fn draw_slash(grid: &mut Grid, region: Region, items: &[SlashItem], sel: usi
 /// Each row leads with a per-kind glyph (File `◇` / Dir `▸` / Agent `⊕`) then
 /// the display path/name in `tok.body`. The selected row is filled with
 /// `tok.sel_bg`.
-pub fn draw_mentions(
-    grid: &mut Grid,
-    region: Region,
-    items: &[MentionItem],
-    sel: usize,
-    tok: &Tokens,
-) {
+pub fn draw_mentions(grid: &mut Grid, region: Region, items: &[MentionItem], sel: usize, tok: &Tokens) {
     if region.width < 2 || region.height == 0 || items.is_empty() {
         return;
     }
@@ -209,7 +212,11 @@ pub fn draw_mentions(
         // text after a one-cell gap.
         let glyph_col = left + 1;
         if glyph_col < clip {
-            grid.put(row, glyph_col, Cell::new(kind_glyph, glyph_fg, row_bg, Attr::PLAIN));
+            grid.put(
+                row,
+                glyph_col,
+                Cell::new(kind_glyph, glyph_fg, row_bg, Attr::PLAIN),
+            );
         }
         write_clip(
             grid,
@@ -349,7 +356,11 @@ mod tests {
         ];
         draw_mentions(&mut grid, region, &items, 1, &tok);
         assert_eq!(grid.get(1, 0).bg, tok.sel_bg, "selected mention row uses sel_bg");
-        assert_eq!(grid.get(0, 0).bg, tok.raised, "unselected mention row uses raised");
+        assert_eq!(
+            grid.get(0, 0).bg,
+            tok.raised,
+            "unselected mention row uses raised"
+        );
     }
 
     #[test]

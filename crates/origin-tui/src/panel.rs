@@ -169,11 +169,7 @@ impl Panel {
                         if col >= width {
                             break;
                         }
-                        side.put(
-                            row,
-                            col,
-                            Cell::new(ch, colors.body, 0, crate::grid::Attr::PLAIN),
-                        );
+                        side.put(row, col, Cell::new(ch, colors.body, 0, crate::grid::Attr::PLAIN));
                     }
                 }
                 PanelEvent::PermissionDecided { id, outcome } => {
@@ -188,11 +184,7 @@ impl Panel {
                         if col >= width {
                             break;
                         }
-                        side.put(
-                            row,
-                            col,
-                            Cell::new(ch, colors.muted, 0, crate::grid::Attr::PLAIN),
-                        );
+                        side.put(row, col, Cell::new(ch, colors.muted, 0, crate::grid::Attr::PLAIN));
                     }
                 }
                 PanelEvent::ShowMetrics => {}
