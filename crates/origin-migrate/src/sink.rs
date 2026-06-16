@@ -31,8 +31,12 @@ pub fn apply(b: &MigrateBundle) -> Result<ApplyReport, SourceError> {
     Ok(summarize(b))
 }
 
-/// Idempotent apply through a [`Store`]. Content-hash dedupe ensures
-/// re-running `origin import` does not duplicate sessions or skills.
+/// Idempotent apply through a [`Store`].
+///
+/// Content-hash dedupe ensures re-running `origin import` does not duplicate
+/// sessions, skills, or memories. Every artifact the dry-run [`summarize`]
+/// counts is actually persisted, so the reported counts match what is queryable
+/// in the store.
 ///
 /// # Errors
 /// Returns a [`SourceError`] when storage refuses a write.
@@ -77,6 +81,28 @@ pub fn apply_with_store(store: &Store, b: &MigrateBundle) -> Result<ApplyReport,
         let body = serde_json::to_string(k).map_err(io_err)?;
         store.insert_migrated_skill(&key, &body).map_err(io_err)?;
         r.skills_inserted += 1;
+    }
+
+    for mem in &b.memories {
+        // Key on (kind, body, tags): hashing the body alone would let two
+        // distinct memories with the same body but different kinds/tags collide
+        // and silently drop one as a duplicate. Length-frame every field — and
+        // the tag count — so the encoding is injective.
+        let mut hasher = blake3::Hasher::new();
+        update_framed(&mut hasher, mem.kind.as_bytes());
+        update_framed(&mut hasher, mem.body.as_bytes());
+        hasher.update(&(mem.tags.len() as u64).to_le_bytes());
+        for tag in &mem.tags {
+            update_framed(&mut hasher, tag.as_bytes());
+        }
+        let key = hasher.finalize().to_hex().to_string();
+        if store.contains_migrated_memory(&key).map_err(io_err)? {
+            r.memories_skipped_duplicate += 1;
+            continue;
+        }
+        let body = serde_json::to_string(mem).map_err(io_err)?;
+        store.insert_migrated_memory(&key, &body).map_err(io_err)?;
+        r.memories_inserted += 1;
     }
 
     Ok(r)
