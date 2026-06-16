@@ -1970,9 +1970,13 @@ async fn handle_request(
     // `GoalCleared` event `interrupt_cleanup` may emit still reaches the client
     // through the live event relay. The turn future was already dropped by the
     // `select!` above (model stream + tool futures cancelled, foreground process
-    // SIGKILLed). The leftover half-streamed assistant turn in `session` is
-    // acceptable — `persist` below leaves the session in a coherent state.
+    // SIGKILLed).
     if let TurnEnd::Interrupted(outcome) = &loop_result {
+        // The drop can land between the assistant `tool_use` push and its
+        // `tool_result`. Strip that orphaned tail BEFORE the checkpoint + persist
+        // so neither the resume token nor the saved session opens the next
+        // request with an unmatched tool_use (Anthropic 400).
+        drop_orphan_tool_use_tail(&mut session.messages);
         interrupt_cleanup(outcome, &session, &active_goal, &session_store, &event_tx).await;
     }
 
@@ -2185,6 +2189,24 @@ async fn handle_clear_all(
         }
     }
     let _ = write_event(conn, &StreamEvent::AdminOk).await;
+}
+
+/// Strip a trailing assistant `tool_use` with no matching `tool_result`.
+///
+/// A mid-tool interrupt drops the turn future between the assistant `tool_use`
+/// push and its `tool_result`, leaving `session.messages` ending in an assistant
+/// message whose `tool_use` blocks are unmatched. Persisting that verbatim makes
+/// the NEXT request open with an unmatched `tool_use`, which Anthropic rejects
+/// with a 400. Pop the orphan so the saved session + resume token stay valid. A
+/// normal turn ends with assistant text, never a trailing `tool_use`, so this
+/// only fires after a mid-tool interrupt.
+fn drop_orphan_tool_use_tail(messages: &mut Vec<origin_core::types::Message>) {
+    use origin_core::types::{Block, Role};
+    while messages.last().is_some_and(|m| {
+        matches!(m.role, Role::Assistant) && m.blocks.iter().any(|b| matches!(b, Block::ToolUse { .. }))
+    }) {
+        messages.pop();
+    }
 }
 
 /// Pull the last assistant text out of `session` for tag parsing + verifier
@@ -4210,6 +4232,45 @@ mod tests {
             role,
             blocks: vec![Block::text(text.to_string())],
         }
+    }
+
+    fn tool_use_msg() -> Message {
+        Message {
+            role: Role::Assistant,
+            blocks: vec![Block::ToolUse {
+                id: "tu1".into(),
+                name: "Bash".into(),
+                input_json: b"{}".to_vec(),
+                cache_marker: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn drop_orphan_tool_use_tail_strips_interrupted_mid_tool_tail() {
+        // A turn interrupted mid-tool ends in an orphaned assistant tool_use.
+        let mut orphaned = vec![
+            msg(Role::User, "do it"),
+            msg(Role::Assistant, "ok"),
+            tool_use_msg(),
+        ];
+        super::drop_orphan_tool_use_tail(&mut orphaned);
+        assert_eq!(orphaned.len(), 2, "the orphaned trailing tool_use is popped");
+        assert!(
+            orphaned.last().is_some_and(|m| matches!(m.role, Role::Assistant)
+                && m.blocks.iter().all(|b| !matches!(b, Block::ToolUse { .. }))),
+            "the new tail is the balanced assistant text turn"
+        );
+
+        // A balanced transcript (tool_use followed by its tool_result) is untouched.
+        let mut balanced = vec![
+            msg(Role::User, "do it"),
+            tool_use_msg(),
+            msg(Role::Tool, "result"),
+        ];
+        let before = balanced.len();
+        super::drop_orphan_tool_use_tail(&mut balanced);
+        assert_eq!(balanced.len(), before, "a balanced transcript is left intact");
     }
 
     #[test]
