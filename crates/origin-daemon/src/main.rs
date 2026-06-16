@@ -13,7 +13,7 @@ use origin_core::types::Role;
 use origin_daemon::agent::{LoopOptions, SessionStoreSummaryDeliverer};
 use origin_daemon::auth::BearerStore;
 use origin_daemon::config::{bearer_ttl_secs, governance_path, load_governance, Governance};
-use origin_daemon::ipc_prompter::{IpcPrompter, PermissionRegistry};
+use origin_daemon::ipc_prompter::{ChoiceRegistry, IpcPrompter, PermissionRegistry};
 use origin_daemon::memory_wiring::MemoryWiring;
 use origin_daemon::pairing::{Pairing, RedeemResult};
 use origin_daemon::plan_bus::PlanBus;
@@ -320,6 +320,11 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     // Shared across connections so a `PermissionDecision` arriving on a fresh
     // connection resolves an ask emitted on the turn's (busy) connection.
     let permission_registry = Arc::new(PermissionRegistry::new());
+    // Daemon-wide pending `ask_user` choice registry (interactive prompts).
+    // Shared across connections so a `ChoiceDecision` arriving on a fresh
+    // connection resolves a `ChoiceAsk` emitted on the turn's (busy) connection
+    // — the `permission_registry` sibling for structured questions.
+    let choice_registry = Arc::new(ChoiceRegistry::new());
     // Daemon-wide plan-op broadcast bus. IPC clients subscribe via
     // `ClientMessage::SubscribePlan`; swarm coordinators publish via
     // `bus.publish(envelope)` when their PlanHandle::apply succeeds.
@@ -708,6 +713,7 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
             Arc::clone(&metrics),
             Arc::clone(&proposal_registry),
             Arc::clone(&permission_registry),
+            Arc::clone(&choice_registry),
             plan_bus.clone(),
             Arc::clone(&skill_catalog),
             Arc::clone(&workflows_catalog),
@@ -819,6 +825,7 @@ fn spawn_handler_task(
     metrics: Arc<Metrics>,
     proposal_registry: Arc<ProposalRegistry>,
     permission_registry: Arc<PermissionRegistry>,
+    choice_registry: Arc<ChoiceRegistry>,
     plan_bus: PlanBus,
     skill_catalog: Arc<SkillCatalog>,
     workflows_catalog: Arc<origin_daemon::workflows::WorkflowsFile>,
@@ -961,6 +968,7 @@ fn spawn_handler_task(
                         memory_handle.clone(),
                         Arc::clone(&proposal_registry),
                         Arc::clone(&permission_registry),
+                        Arc::clone(&choice_registry),
                         Arc::clone(&skill_catalog),
                         Arc::clone(&workflows_catalog),
                         governance.clone(),
@@ -1222,12 +1230,26 @@ fn spawn_handler_task(
                 ClientMessage::SubscribePlan => {
                     spawn_plan_relay(plan_bus.subscribe(), Arc::clone(&conn));
                 }
-                ClientMessage::PermissionDecision { id, allow } => {
+                ClientMessage::PermissionDecision { id, allow, always } => {
                     // Cross-connection resolution: the client sends its decision
                     // on a FRESH connection (the turn's connection is busy
                     // streaming), so it lands here. Resolve the waiting ask in
                     // the daemon-wide registry. Unknown ids are ignored.
+                    //
+                    // `always` ("remember this decision") is the CLI/picker's
+                    // concern (it persists the rule client-side); the daemon's
+                    // immediate job is only to allow/deny the in-flight tool, so
+                    // the registry resolve still keys on `allow`.
+                    let _ = always;
                     permission_registry.resolve(id, allow);
+                }
+                ClientMessage::ChoiceDecision { id, selected, custom } => {
+                    // Cross-connection resolution for an `ask_user` `ChoiceAsk`,
+                    // mirroring `PermissionDecision`: the client answers on a
+                    // fresh connection, so the decision lands here and resolves
+                    // the waiting choice in the daemon-wide registry. Unknown ids
+                    // (stale / cancelled asks) are ignored.
+                    choice_registry.resolve(&id, selected, custom);
                 }
                 ClientMessage::Interrupt => {
                     // When `Interrupt` lands in the OUTER loop it means
@@ -1630,6 +1652,7 @@ async fn handle_request(
     memory_handle: Option<Arc<dyn MemoryHandleTrait>>,
     proposal_registry: Arc<ProposalRegistry>,
     permission_registry: Arc<PermissionRegistry>,
+    choice_registry: Arc<ChoiceRegistry>,
     skill_catalog: Arc<SkillCatalog>,
     workflows_catalog: Arc<origin_daemon::workflows::WorkflowsFile>,
     governance: Governance,
@@ -1789,6 +1812,15 @@ async fn handle_request(
             // cap the compactor is a no-op ⇒ short sessions stay byte-identical.
             proposer: memory.map(|m| Arc::clone(&m.proposer)),
             event_tx: Some(event_tx.clone()),
+            // Wire the interactive `ask_user` pause-await only when the turn
+            // opted into interactive prompting (the same `permission_ask` flag
+            // the interactive CLI sets). A non-opted-in turn (headless / swarm /
+            // scripted) leaves this `None`, so `ask_user` degrades to the prose
+            // instruction — byte-identical to having no interactive channel and
+            // never emitting a `ChoiceAsk` a non-interactive client can't answer.
+            choice_registry: req
+                .permission_ask
+                .then(|| Arc::clone(&choice_registry)),
             injector: memory.and_then(|m| m.injector.clone()),
             proposal_registry: Some(Arc::clone(&proposal_registry)),
             skills: {
@@ -2860,6 +2892,7 @@ async fn handle_admin(
         | ClientMessage::ActivateSkill { .. }
         | ClientMessage::DeactivateSkill { .. }
         | ClientMessage::PermissionDecision { .. }
+        | ClientMessage::ChoiceDecision { .. }
         | ClientMessage::ActivateWorkflow { .. }
         | ClientMessage::SelfDevStart { .. }
         | ClientMessage::SelfDevStatus

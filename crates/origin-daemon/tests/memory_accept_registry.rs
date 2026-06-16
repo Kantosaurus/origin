@@ -88,6 +88,7 @@ async fn accept_persists_via_proposal_registry() {
         streaming_disabled: true,
         proposer: Some(Arc::clone(&proposer)),
         event_tx: Some(event_tx.clone()),
+        choice_registry: None,
         injector: None,
         sidecar: None,
         session_store: None,

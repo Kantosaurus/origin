@@ -953,7 +953,11 @@ async fn handle_key_event(
         if let Some(allow) = permission_answer(ev.code) {
             let pending = app.lock().pending_permission.take();
             if let Some(p) = pending {
-                let _ = send_decision(path, &ClientMessage::PermissionDecision { id: p.id, allow }).await;
+                let _ = send_decision(
+                    path,
+                    &ClientMessage::PermissionDecision { id: p.id, allow, always: false },
+                )
+                .await;
                 // The deny verb routes through the `permission.denied` catalog key
                 // (En "denied" — byte-identical); the allow verb has no key and
                 // stays in code. The `<tool> <args>` suffix is unchanged.
