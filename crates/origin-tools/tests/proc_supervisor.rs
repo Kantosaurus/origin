@@ -49,7 +49,10 @@ async fn read_since_returns_only_new_bytes() {
     #[cfg(windows)]
     let cmd = "'aaa','bbb','ccc' | ForEach-Object { $_ }";
     let pid = sup.spawn(cmd, &SpawnOpts::default()).unwrap();
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // Wait for all output to land before slicing (PowerShell cold-start on CI
+    // lags past a fixed sleep). `read_since` is a pure read from an offset, so
+    // the incremental offset reads below are unaffected by this poll.
+    let _ = read_until(&sup, pid, "ccc").await;
     let first = sup.read_since(pid, 0, 4).unwrap();
     let next = sup.read_since(pid, first.next_offset, 4096).unwrap();
     assert!(!next.bytes.is_empty());
@@ -98,9 +101,8 @@ async fn non_inherit_sandbox_profile_still_spawns_and_runs() {
         ..SpawnOpts::default()
     };
     let pid = sup.spawn(cmd, &opts).unwrap();
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    let chunk = sup.read_since(pid, 0, 4096).unwrap();
-    assert!(chunk.bytes.contains("sandboxed"), "got: {:?}", chunk.bytes);
+    let out = read_until(&sup, pid, "sandboxed").await;
+    assert!(out.contains("sandboxed"), "got: {out:?}");
 }
 
 /// The default (`Inherit` / `None`) sandbox profile must be byte-identical to
