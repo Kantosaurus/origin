@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Token-aware result builder. Every tool produces its serialised result
-//! through `ResultWriter`, which enforces a per-call token budget and emits
-//! a structured continuation handle on overflow.
+//! Token-aware result builder. `ResultWriter` enforces a per-call token budget
+//! and emits a structured continuation handle on overflow.
+//!
+//! NOT on the live dispatch path: it was meant to be driven by [`crate::tool_envelope`],
+//! which was never wired into the daemon (see that module). The shipped dispatch
+//! bounds results via each builtin's own `head_limit` + `SchemaCrush`
+//! ([`crate::array_crush`]) and the `dispatch` result cache instead. Kept as an
+//! opt-in builder for callers that want budgeted, resumable output.
 
 use serde_json::{json, Value};
 

@@ -20,8 +20,12 @@ pub struct ToolMeta {
     /// that exec untrusted binaries override this to `Shell`, `WriteCwd`,
     /// etc. via the optional `sandbox: …` arm of [`crate::origin_tool!`].
     pub sandbox_profile: SandboxProfile,
-    /// Approximate token budget for this tool's serialised result. The
-    /// envelope's `ResultWriter` truncates / elides at this cap. Default 25k.
+    /// Approximate token budget for this tool's serialised result (default 25k).
+    /// Advisory metadata: the [`crate::budget_writer::ResultWriter`] that would
+    /// truncate/elide at this cap is NOT on the live dispatch path (the
+    /// `tool_envelope` it rode was never wired — see that module). Live results
+    /// are bounded instead by each builtin's own `head_limit` plus `SchemaCrush`
+    /// ([`crate::array_crush`]) and the `dispatch` result cache.
     pub token_budget: u32,
     /// "Hot" tools have their full schema embedded in the system prompt.
     /// "Deferred" tools advertise only {name, description}; their schemas

@@ -46,25 +46,38 @@ pub struct Detected {
 #[must_use]
 pub fn detect(bytes: &[u8]) -> Detected {
     let (bom, body_start, encoding) = detect_bom(bytes);
-
-    if encoding != Encoding::Utf8 {
-        return Detected {
-            eol: Eol::Lf,
-            bom,
-            encoding,
-            trailing_newline: false,
-            per_line_eol: Vec::new(),
-        };
-    }
-
     let body = &bytes[body_start..];
-    let (eol, per_line_eol, trailing_newline) = classify_eols(body);
+
+    // Classify EOLs against the DECODED text so UTF-16 files keep their real
+    // line-ending convention. `\r` and `\n` are ASCII, so classifying the UTF-8
+    // bytes of the decoded String is equivalent to classifying the UTF-16 code
+    // units, and it reuses the byte-level classifier. Previously this short-
+    // circuited to `Eol::Lf` for any non-UTF-8 encoding, which silently folded a
+    // UTF-16 file's CRLF/CR endings to LF on the next edit write-back. A decode
+    // error falls back to LF with no per-line data (the file is rejected later
+    // by `normalise_to_lf`, so denormalise is never reached for it).
+    let (eol, per_line_eol, trailing_newline) = match encoding {
+        Encoding::Utf8 => classify_eols(body),
+        Encoding::Utf16Le => classify_utf16(body, encoding_rs::UTF_16LE),
+        Encoding::Utf16Be => classify_utf16(body, encoding_rs::UTF_16BE),
+    };
     Detected {
         eol,
         bom,
         encoding,
         trailing_newline,
         per_line_eol,
+    }
+}
+
+/// Decode a UTF-16 body and classify its EOLs. On a decode error, fall back to
+/// LF with no per-line data (the file will be rejected by `normalise_to_lf`).
+fn classify_utf16(body: &[u8], enc: &'static encoding_rs::Encoding) -> (Eol, Vec<Eol>, bool) {
+    let (cow, _, had_errors) = enc.decode(body);
+    if had_errors {
+        (Eol::Lf, Vec::new(), false)
+    } else {
+        classify_eols(cow.as_bytes())
     }
 }
 
@@ -252,5 +265,43 @@ const fn dominant_eol_str(det: &Detected) -> &'static str {
         Eol::Crlf => "\r\n",
         Eol::Cr => "\r",
         Eol::Lf | Eol::Mixed | Eol::None => "\n",
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{denormalise, detect, normalise_to_lf, Eol};
+
+    fn utf16le_bytes(s: &str) -> Vec<u8> {
+        let mut out = vec![0xff, 0xfe]; // UTF-16-LE BOM
+        for u in s.encode_utf16() {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn utf16le_crlf_is_classified_and_roundtrips() {
+        // A Windows-authored UTF-16-LE file using CRLF line endings.
+        let original = utf16le_bytes("line one\r\nline two\r\n");
+        let det = detect(&original);
+        // Regression: detect() must classify the real EOL, not blindly report LF.
+        assert_eq!(det.eol, Eol::Crlf, "UTF-16 CRLF must be detected as CRLF");
+        let text = normalise_to_lf(&original, &det).unwrap();
+        assert_eq!(text, "line one\nline two\n");
+        // Round-trip with no edit must reproduce the original CRLF bytes exactly.
+        let out = denormalise(&text, &det);
+        assert_eq!(out, original, "UTF-16 CRLF must survive the edit round-trip");
+    }
+
+    #[test]
+    fn utf16le_lf_stays_lf() {
+        let original = utf16le_bytes("a\nb\n");
+        let det = detect(&original);
+        assert_eq!(det.eol, Eol::Lf);
+        let text = normalise_to_lf(&original, &det).unwrap();
+        let out = denormalise(&text, &det);
+        assert_eq!(out, original);
     }
 }
