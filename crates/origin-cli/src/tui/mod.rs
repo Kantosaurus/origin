@@ -4,6 +4,15 @@
 //! Features: unicode-width-aware wrapping, keyboard scrollback,
 //! inline markdown (bold, headers, code), heading hierarchy,
 //! code block backgrounds, side panel rendering.
+//!
+//! The render layer is decomposed into focused painter submodules (see the TUI
+//! rework plan, `docs/superpowers/plans/2026-06-16-tui-rework.md`). [`tokens`]
+//! is the single source of colors + glyphs; the painter modules emit
+//! [`tokens::RenderRow`]s the draw orchestrator blits into the grid. The
+//! painter modules are stubbed in Wave 0 and filled in Wave 1; the live
+//! `App::draw` still uses the in-module helpers until Wave 2 wires them in.
+
+pub mod tokens;
 
 use std::time::{Duration, Instant};
 

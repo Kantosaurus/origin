@@ -20,6 +20,7 @@ impl Attr {
     pub const UNDERLINE: Self = Self(1 << 2);
     pub const REVERSE: Self = Self(1 << 3);
     pub const DIM: Self = Self(1 << 4);
+    pub const STRIKE: Self = Self(1 << 5);
 
     #[must_use]
     pub const fn bits(self) -> u32 {
