@@ -602,6 +602,12 @@ pub struct Layout {
 /// Rules:
 /// - Explicit `\n` always ends a visual line.
 /// - When `width == 0`, soft-wrap is disabled; only `\n` splits lines.
+/// - Soft-wrap prefers **word boundaries**: when a line would overflow, it
+///   breaks at the last space within the line so whole words stay intact
+///   (no more `wh`/`en` splits mid-word). The run of spaces at the break is
+///   swallowed — the next line begins at the following word. A single word
+///   wider than `width` still hard-breaks mid-word (there is no boundary to
+///   prefer), so an over-long token can never stall the layout.
 /// - Lines record byte ranges into `buffer`. The newline char itself is
 ///   **excluded** from the line slice; the next line begins after it.
 /// - The cursor maps to the visual line that *contains* its byte index.
@@ -616,59 +622,88 @@ pub struct Layout {
 /// on char boundaries).
 #[must_use]
 pub fn wrap_with_cursor(buffer: &str, width: usize, cursor: usize) -> Layout {
-    let mut lines: Vec<VisualLine> = Vec::new();
-    let mut cursor_row = 0usize;
-    let mut cursor_col = 0usize;
-    let mut cursor_placed = false;
+    let lines = wrap_lines(buffer, width);
+    let (cursor_row, cursor_col) = locate_cursor(buffer, &lines, cursor);
+    Layout {
+        lines,
+        cursor_row,
+        cursor_col,
+    }
+}
 
-    let mut line_start = 0usize; // byte offset where current visual line starts
-    let mut col_w = 0usize; // display width accumulated on current visual line
+/// Word-aware soft-wrap of `buffer` into visual-line byte ranges.
+///
+/// Splits on every `\n` (excluded from the slice) and soft-wraps at the last
+/// space boundary before `width` is exceeded; an over-long single word
+/// hard-breaks at the column so layout always makes progress. Always returns at
+/// least one line (the empty buffer yields a single empty line).
+fn wrap_lines(buffer: &str, width: usize) -> Vec<VisualLine> {
+    let mut lines: Vec<VisualLine> = Vec::new();
+    let mut line_start = 0usize; // byte offset where the current visual line starts
+    let mut col_w = 0usize; // display width accumulated on the current visual line
+                            // The last space-run boundary seen on the current line, recorded as
+                            // `(break_at, resume_at)`: end the line at `break_at` (before the spaces)
+                            // and resume the next line at `resume_at` (after them). `None` until we see
+                            // a space following at least one non-space char.
+    let mut last_break: Option<(usize, usize)> = None;
+    // Whether the previous char on this line was a space, so a run of spaces
+    // extends the same boundary instead of opening a new one each space.
+    let mut prev_was_space = false;
 
     let bytes = buffer.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
-        // Decode the next char.
         let ch = buffer[i..].chars().next().expect("char boundary");
         let ch_len = ch.len_utf8();
 
-        // Place the cursor if it falls before this char.
-        if !cursor_placed && cursor == i {
-            cursor_row = lines.len();
-            cursor_col = col_w;
-            cursor_placed = true;
-        }
-
         if ch == '\n' {
-            // Hard break: emit current line up to `i`, advance past `\n`.
             lines.push(VisualLine {
                 byte_start: line_start,
                 byte_end: i,
             });
             line_start = i + ch_len;
             col_w = 0;
+            last_break = None;
+            prev_was_space = false;
             i += ch_len;
             continue;
         }
 
         let w = UnicodeWidthChar::width(ch).unwrap_or(1);
+
         if width > 0 && col_w + w > width && line_start < i {
-            // Soft wrap before this char.
+            // Overflow: prefer the last word boundary on this line. If we have
+            // one, end the line before the spaces and resume after them so the
+            // word that would have been split moves intact to the next line.
+            // Otherwise (an over-long single word) hard-break at the column.
+            let (break_at, resume_at) = last_break.unwrap_or((i, i));
             lines.push(VisualLine {
                 byte_start: line_start,
-                byte_end: i,
+                byte_end: break_at,
             });
-            line_start = i;
-            col_w = 0;
-            // If the cursor sits exactly at this wrap byte, the top-of-loop
-            // block placed it at the end of the line we just pushed. It really
-            // belongs at column 0 of the new line — re-place it. (`cursor == i`
-            // is false when cursor_placed came from an earlier position, so this
-            // only fires for a cursor at the boundary.)
-            if cursor_placed && cursor == i {
-                cursor_row = lines.len();
-                cursor_col = 0;
-            }
+            line_start = resume_at;
+            last_break = None;
+            // Recompute the carried width: chars from `resume_at..i` already
+            // scanned now sit at the head of the fresh line.
+            col_w = display_width(&buffer[resume_at..i]);
         }
+
+        // Record a break opportunity at the start of a space-run that follows
+        // at least one non-space char on this line. `break_at` is the first
+        // space (where the line ends, trimming the run); `resume_at` advances to
+        // just past the run so the next line starts on the following word. A
+        // contiguous run of spaces extends the same boundary; the first space of
+        // a fresh run (after a word) opens a new one.
+        if ch == ' ' && i > line_start {
+            let break_at = if prev_was_space {
+                last_break.map_or(i, |(b, _)| b)
+            } else {
+                i
+            };
+            last_break = Some((break_at, i + ch_len));
+        }
+        prev_was_space = ch == ' ';
+
         col_w += w;
         i += ch_len;
     }
@@ -679,13 +714,6 @@ pub fn wrap_with_cursor(buffer: &str, width: usize, cursor: usize) -> Layout {
         byte_end: bytes.len(),
     });
 
-    // Handle the cursor when it lies at end-of-buffer.
-    if !cursor_placed {
-        cursor_row = lines.len() - 1;
-        cursor_col = display_width(&buffer[line_start..]);
-    }
-
-    // Always at least one line — even for empty buffer.
     if lines.is_empty() {
         lines.push(VisualLine {
             byte_start: 0,
@@ -693,11 +721,36 @@ pub fn wrap_with_cursor(buffer: &str, width: usize, cursor: usize) -> Layout {
         });
     }
 
-    Layout {
-        lines,
-        cursor_row,
-        cursor_col,
+    lines
+}
+
+/// Map a byte `cursor` into `(row, col)` over the wrapped `lines`.
+///
+/// The cursor sits on the visual line that *contains* its byte index; at an
+/// exact wrap/newline boundary it prefers the *next* line (column 0) so typing
+/// after `End` extends the freshly-wrapped row. End-of-buffer lands at the end
+/// of the final line.
+fn locate_cursor(buffer: &str, lines: &[VisualLine], cursor: usize) -> (usize, usize) {
+    for (row, line) in lines.iter().enumerate() {
+        // Prefer the next line when the cursor lands exactly on a soft-wrap
+        // boundary: it belongs at column 0 of the following line. A boundary is
+        // "soft" when the next line resumes at this same byte (no newline gap).
+        let next_resumes_here = lines
+            .get(row + 1)
+            .is_some_and(|n| n.byte_start == line.byte_end && cursor == line.byte_end);
+        if cursor < line.byte_end || (cursor == line.byte_end && !next_resumes_here) {
+            // Clamp into the slice in case the cursor sits in a swallowed space
+            // run between this line's end and the next line's start.
+            let end = cursor.min(line.byte_end);
+            let start = line.byte_start.min(end);
+            return (row, display_width(&buffer[start..end]));
+        }
     }
+    // End-of-buffer (or trailing position): last line, at its end.
+    let last = lines.len().saturating_sub(1);
+    let line = &lines[last];
+    let end = cursor.clamp(line.byte_start, line.byte_end);
+    (last, display_width(&buffer[line.byte_start..end]))
 }
 
 /// Display width (in cells) of `s`, summing unicode-width per char.
@@ -1035,6 +1088,87 @@ mod tests {
         assert_eq!(l.lines.len(), 2);
         assert_eq!(l.cursor_row, 1);
         assert_eq!(l.cursor_col, 0);
+    }
+
+    /// Resolve each visual line back into its &str so word-wrap assertions read
+    /// against the actual text on each row.
+    fn rows<'a>(buffer: &'a str, layout: &Layout) -> Vec<&'a str> {
+        layout
+            .lines
+            .iter()
+            .map(|vl| &buffer[vl.byte_start..vl.byte_end])
+            .collect()
+    }
+
+    #[test]
+    fn wrap_breaks_at_word_boundary_not_mid_word() {
+        // The reported bug: "when" must never split into "wh" / "en". With a
+        // width of 8, "click when ready" should wrap whole-word:
+        //   "click"  |  "when"  |  "ready"  — every row a complete word.
+        let buf = "click when ready";
+        let l = wrap_with_cursor(buf, 8, 0);
+        let r = rows(buf, &l);
+        assert_eq!(r, vec!["click", "when", "ready"], "whole words per row: {r:?}");
+        // No row exceeds the width.
+        for row in &r {
+            assert!(display_width(row) <= 8, "row within width: {row:?}");
+        }
+    }
+
+    #[test]
+    fn wrap_swallows_the_space_run_at_the_break() {
+        // The space(s) at the wrap point are trimmed: the next line starts on
+        // the word, not a leading space.
+        let buf = "alpha beta";
+        let l = wrap_with_cursor(buf, 6, 0);
+        let r = rows(buf, &l);
+        assert_eq!(r, vec!["alpha", "beta"], "leading space trimmed: {r:?}");
+    }
+
+    #[test]
+    fn wrap_hard_breaks_a_single_overlong_word() {
+        // A single word wider than the field has no boundary to prefer, so it
+        // still hard-breaks at the column (no stall, no infinite loop).
+        let buf = "supercalifragilistic";
+        let l = wrap_with_cursor(buf, 5, 0);
+        let r = rows(buf, &l);
+        assert_eq!(r[0], "super", "first 5 cells");
+        assert!(r.len() >= 4, "the long word spans multiple rows: {r:?}");
+        assert_eq!(r.concat(), buf, "no characters lost across the break");
+    }
+
+    #[test]
+    fn wrap_word_boundary_cursor_maps_to_the_word_on_the_next_row() {
+        // Cursor just inside "when" (byte index of the 'h') must land on the row
+        // that carries "when", at the right column — not on the previous row.
+        let buf = "click when ready";
+        let when_at = buf.find("when").expect("has 'when'");
+        let cursor = when_at + 1; // between 'w' and 'h'
+        let l = wrap_with_cursor(buf, 8, cursor);
+        assert_eq!(l.cursor_row, 1, "cursor on the 'when' row");
+        assert_eq!(l.cursor_col, 1, "cursor between 'w' and 'h'");
+    }
+
+    #[test]
+    fn wrap_word_boundary_preserves_round_trip_text() {
+        // Stitching rows back together with single spaces recovers the words in
+        // order (spaces collapse at breaks, which is the intended display).
+        let buf = "the quick brown fox jumps";
+        let l = wrap_with_cursor(buf, 10, 0);
+        let r = rows(buf, &l);
+        let stitched = r.join(" ");
+        assert_eq!(stitched, buf, "words preserved in order: {r:?}");
+    }
+
+    #[test]
+    fn wrap_cursor_in_swallowed_space_maps_to_next_word_start() {
+        // Cursor parked on the space that gets swallowed at the wrap point must
+        // resolve onto the next word's row (column 0), never into the gap.
+        let buf = "click when ready";
+        let space_at = buf.find(' ').expect("has a space"); // the space after "click"
+        let l = wrap_with_cursor(buf, 8, space_at + 1); // just past that space
+        assert_eq!(l.cursor_row, 1, "cursor on the 'when' row");
+        assert_eq!(l.cursor_col, 0, "cursor at the start of 'when'");
     }
 
     #[test]

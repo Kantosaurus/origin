@@ -566,10 +566,13 @@ fn git_branch_short() -> Option<String> {
 /// scroll-away banner is redundant.
 const WORDMARK: &str = "\u{25C6} origin";
 
-/// The one-line first-run tip seeded under the wordmark. Tells a new user how to
-/// reach the two most useful affordances (`/` skills, `@` file mentions) without
-/// the old banner's bulk.
-const FIRST_RUN_TIP: &str =
+/// The composer placeholder shown while the input buffer is empty (on startup,
+/// after `/clear`, and any time the field is empty). It clears the instant the
+/// user types. Tells a new user how to reach the two most useful affordances
+/// (`/` skills, `@` file mentions) without the old banner's bulk — this text
+/// used to sit under the wordmark banner, but lives in the prompt bar now so the
+/// banner stays a clean identity strip.
+const COMPOSER_PLACEHOLDER: &str =
     "Ask anything — type your task and press \u{23CE}.  / browses skills · @ mentions files";
 
 impl App {
@@ -874,14 +877,17 @@ impl App {
     }
 
     /// Seed the first-run greeting: a single compact `◆ origin` wordmark line
-    /// plus one short tip. Replaces the retired multi-line ASCII block-art banner
-    /// (spec §"Identity / wordmark") — the persistent top chrome strip now owns
-    /// identity, so the greeting stays minimal and tasteful.
+    /// Seed the first-run greeting: a single compact `◆ origin` wordmark line.
+    /// Replaces the retired multi-line ASCII block-art banner (spec §"Identity /
+    /// wordmark") — the persistent top chrome strip now owns identity, so the
+    /// greeting stays minimal and tasteful. The "how to use it" tip that used to
+    /// sit under the wordmark moved into the composer placeholder (see
+    /// [`COMPOSER_PLACEHOLDER`]) so it clears the moment the user starts typing.
     ///
     /// `cols`/`rows` are kept in the signature (call sites + the `reset_to_login`
     /// parity test pass them) but the greeting no longer centers itself in the
-    /// viewport: it's a two-row header pinned to the top of the transcript, the
-    /// way a real prompt-first terminal reads.
+    /// viewport: it's a header pinned to the top of the transcript, the way a
+    /// real prompt-first terminal reads.
     pub fn push_banner(&mut self, _cols: u16, _rows: u16) {
         let tok = crate::tui::tokens::Tokens::from_palette(self.palette());
         // One leading blank for breathing room above the wordmark.
@@ -895,13 +901,8 @@ impl App {
         // applies; this is the intended identity color.)
         self.scrollback
             .push(ScrollLine::styled(WORDMARK.to_string(), tok.origin, 0, true));
-        // The tip, hang-indented under the wordmark in muted text.
-        self.scrollback.push(ScrollLine::styled(
-            format!("  {FIRST_RUN_TIP}"),
-            tok.muted,
-            0,
-            false,
-        ));
+        // Trailing blank for breathing room below the wordmark. The usage tip
+        // that used to live here now rides the composer placeholder.
         self.scrollback
             .push(ScrollLine::styled(String::new(), 0, 0, false));
     }
@@ -1695,7 +1696,6 @@ impl App {
             .turn_started
             .map_or(self.usage.elapsed, |t| self.usage.elapsed + t.elapsed());
         let ctx = crate::tui::chrome::ChromeCtx {
-            model: self.usage.model.clone(),
             cwd: self.cwd.clone(),
             branch: self.branch.clone(),
             elapsed: format_elapsed_clock(live_elapsed),
@@ -1750,7 +1750,9 @@ impl App {
         let st = crate::tui::chrome::StatusCtx {
             spinner: self.spinner.active.then(|| self.spinner.frame_char().to_string()),
             phase: phase_owned,
-            tokens: self.usage.input_tokens.saturating_add(self.usage.output_tokens),
+            model: self.usage.model.clone(),
+            input_tokens: self.usage.input_tokens,
+            output_tokens: self.usage.output_tokens,
             cost: Some(crate::status::cost_usd(&self.usage)),
             in_flight: self.spinner.active || self.goal_status.is_some(),
         };
@@ -1824,7 +1826,7 @@ impl App {
             lines,
             cursor_row: layout.cursor_row,
             cursor_col: layout.cursor_col,
-            placeholder: "Ask anything\u{2026}".to_string(),
+            placeholder: COMPOSER_PLACEHOLDER.to_string(),
             scroll_top,
             max_rows: MAX_INPUT_ROWS,
         };

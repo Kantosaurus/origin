@@ -2,12 +2,15 @@
 //! Persistent chrome: the top context strip + the bottom status zone.
 //!
 //! Two painters draw the always-visible frame around the transcript:
-//! [`draw_top`] paints the context strip (`◆ origin   <model> · <cwd> · ⎇
+//! [`draw_top`] paints the context strip (`◆ origin v0.9.6   <cwd> · ⎇
 //! <branch>` left, `◷ <elapsed> · ⛁ <ctx%>` right-aligned), and [`draw_status`]
-//! paints the quiet spinner/phase/tokens/cost zone above a full-width rule that
-//! seats the composer. Both clip strictly to their `Region` so a narrow terminal
-//! never overflows `region.width` — the cwd is middle-truncated to make room for
-//! the (fixed-width, right-aligned) clock + context meter.
+//! paints the quiet spinner/phase zone above a full-width rule that seats the
+//! composer — its right-aligned readout carries `<model> · ↑<in> ↓<out> ·
+//! $<cost>` (the model moved down here from the top strip, and the token count
+//! is split into outgoing `↑` / incoming `↓`). Both clip strictly to their
+//! `Region` so a narrow terminal never overflows `region.width` — the cwd is
+//! middle-truncated to make room for the (fixed-width, right-aligned) clock +
+//! context meter.
 
 use origin_tui::grid::{Attr, Cell, Grid};
 
@@ -29,9 +32,17 @@ const CTX: char = '\u{26C1}';
 const BRANCH: char = '\u{2387}';
 /// Inline separator between context fields (` · `).
 const SEP: &str = " \u{00B7} ";
+/// Crate version string (e.g. `v0.9.6`), rendered after the `◆ origin`
+/// wordmark in the top strip so users can always see which build they're on.
+/// Sourced from the workspace `version` via Cargo's `CARGO_PKG_VERSION`.
+const VERSION_TAG: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 /// Context-fill thresholds (percent) where the meter turns warn / err.
 const CTX_WARN_PCT: u8 = 75;
 const CTX_ERR_PCT: u8 = 90;
+/// Outgoing-tokens glyph for the status metrics (`↑`, input/prompt tokens).
+const TOK_UP: char = '\u{2191}';
+/// Incoming-tokens glyph for the status metrics (`↓`, output/completion tokens).
+const TOK_DOWN: char = '\u{2193}';
 
 /// Format a token count compactly (`1.2k`, `3.4M`). Local copy of
 /// `mod.rs::format_tokens` so this module is self-contained and testable.
@@ -45,12 +56,12 @@ fn format_tokens(n: u32) -> String {
     }
 }
 
-/// The data the top context strip renders: wordmark context (model · cwd ·
-/// branch) on the left, session clock + context-fill on the right.
+/// The data the top context strip renders: wordmark context (cwd · branch) on
+/// the left, session clock + context-fill on the right. The model name moved
+/// down to the bottom status zone (next to the token metrics) so the top strip
+/// stays a quiet identity + location strip.
 #[derive(Debug, Clone, Default)]
 pub struct ChromeCtx {
-    /// Active model name (from `UsageSnapshot::model`).
-    pub model: String,
     /// Current working directory, truncated middle on narrow widths.
     pub cwd: String,
     /// Git branch, if resolvable (`⎇ branch`); `None` outside a repo.
@@ -72,8 +83,13 @@ pub struct StatusCtx {
     pub spinner: Option<String>,
     /// A short phase label (e.g. `thinking`, goal status), if any.
     pub phase: Option<String>,
-    /// Total tokens this session (input + output), for the metrics readout.
-    pub tokens: u32,
+    /// Active model name (from `UsageSnapshot::model`). Rendered just before the
+    /// token metrics so the build's model reads alongside its token spend.
+    pub model: String,
+    /// Outgoing tokens this session (input / prompt), for the `↑` metric.
+    pub input_tokens: u32,
+    /// Incoming tokens this session (output / completion), for the `↓` metric.
+    pub output_tokens: u32,
     /// Session cost in USD, if cost tracking is on.
     pub cost: Option<f64>,
     /// Whether a turn is currently in flight (dims/animates the zone).
@@ -195,9 +211,11 @@ const fn ctx_color(pct: u8, tok: &Tokens) -> u32 {
 
 /// Paint the persistent top context strip into `region`.
 ///
-/// Left, starting at `region.left`: `◆ origin` (accent) then `model · cwd · ⎇
-/// branch` in muted text with the cwd middle-truncated to whatever width is left
-/// after reserving the right segment. Right, ending at `region.right()`: `◷
+/// Left, starting at `region.left`: `◆ origin v<ver>` (accent wordmark + dim
+/// version tag) then `cwd · ⎇ branch` in muted text with the cwd
+/// middle-truncated to whatever width is left after reserving the right segment.
+/// (The model name moved to the bottom status zone, beside the token metrics.)
+/// Right, ending at `region.right()`: `◷
 /// elapsed · ⛁ ctx%` with the percentage colorized warn/err past the
 /// thresholds. The whole row is clipped to `region.width`, so it never
 /// overflows `grid.cols()`.
@@ -233,7 +251,7 @@ pub fn draw_top(grid: &mut Grid, region: Region, ctx: &ChromeCtx, tok: &Tokens) 
         right
     };
 
-    // --- Left segment: ◆ origin   <model> · <cwd> · ⎇ <branch>.
+    // --- Left segment: ◆ origin   <cwd> · ⎇ <branch>.
     // Wordmark first (always shown when any width exists).
     let mut col = left;
     let left_limit = if right_fits {
@@ -257,9 +275,23 @@ pub fn draw_top(grid: &mut Grid, region: Region, ctx: &ChromeCtx, tok: &Tokens) 
     );
     col = put_str(grid, row, col, left_limit, " origin", accent_bold);
 
-    // Build the trailing context (model · cwd · ⎇ branch). The cwd is the
-    // flexible field; everything else is fixed, so reserve the fixed parts and
-    // give the remainder to a middle-truncated cwd.
+    // Version tag (` v0.9.6`) immediately after the wordmark, in dim text so it
+    // reads as a quiet annotation rather than part of the identity. Only painted
+    // when it fits within the left limit, so a narrow terminal keeps `◆ origin`.
+    if col < left_limit {
+        col = put_str(
+            grid,
+            row,
+            col,
+            left_limit,
+            &format!(" {VERSION_TAG}"),
+            Cs::fga(tok.muted, Attr::DIM),
+        );
+    }
+
+    // Build the trailing context (cwd · ⎇ branch). The cwd is the flexible
+    // field; the branch segment is fixed, so reserve it and give the remainder
+    // to a middle-truncated cwd.
     if col < left_limit {
         // Two spaces between wordmark and context for breathing room.
         col = put_str(grid, row, col, left_limit, "  ", Cs::plain(0, 0));
@@ -268,21 +300,14 @@ pub fn draw_top(grid: &mut Grid, region: Region, ctx: &ChromeCtx, tok: &Tokens) 
     let branch_seg_width = ctx.branch.as_ref().map_or(0u16, |b| {
         str_width(SEP) + char_cell_width(BRANCH) + 1 + str_width(b)
     });
-    let model_width = str_width(&ctx.model);
-    let sep_before_cwd = str_width(SEP);
 
-    // Remaining cells for the whole "model · cwd · ⎇ branch" run.
+    // Remaining cells for the whole "cwd · ⎇ branch" run.
     let remaining = left_limit.saturating_sub(col);
-    // Budget for the cwd after the fixed model + separators + branch segment.
-    let cwd_budget = remaining
-        .saturating_sub(model_width)
-        .saturating_sub(sep_before_cwd)
-        .saturating_sub(branch_seg_width);
+    // Budget for the cwd after the fixed branch segment.
+    let cwd_budget = remaining.saturating_sub(branch_seg_width);
     let cwd_shown = middle_truncate(&ctx.cwd, cwd_budget);
 
-    col = put_str(grid, row, col, left_limit, &ctx.model, muted);
     if !cwd_shown.is_empty() {
-        col = put_str(grid, row, col, left_limit, SEP, muted);
         col = put_str(grid, row, col, left_limit, &cwd_shown, body);
     }
     if let Some(branch) = &ctx.branch {
@@ -320,11 +345,12 @@ pub fn draw_top(grid: &mut Grid, region: Region, ctx: &ChromeCtx, tok: &Tokens) 
 /// Paint the bottom status zone into `region` (above the composer rule).
 ///
 /// The first row of `region` carries the quiet readout — spinner, phase, and a
-/// right-aligned `tokens · $cost` metrics group, all in muted/dim text so the
-/// zone never competes with the transcript. The last row of `region` is a
-/// full-width `─` rule in `accent_dim` that seats the composer beneath it. When
-/// the region is a single row, the rule wins (the composer frame still needs
-/// its seat); the readout is dropped.
+/// right-aligned `<model> · ↑<in> ↓<out> · $<cost>` metrics group, all in
+/// muted/dim text so the zone never competes with the transcript. `↑` is
+/// outgoing (input/prompt) tokens, `↓` is incoming (output/completion) tokens.
+/// The last row of `region` is a full-width `─` rule in `accent_dim` that seats
+/// the composer beneath it. When the region is a single row, the rule wins (the
+/// composer frame still needs its seat); the readout is dropped.
 pub fn draw_status(grid: &mut Grid, region: Region, st: &StatusCtx, tok: &Tokens) {
     if region.width == 0 || region.height == 0 {
         return;
@@ -356,8 +382,20 @@ pub fn draw_status(grid: &mut Grid, region: Region, st: &StatusCtx, tok: &Tokens
             col = put_str(grid, row, col, right, phase, Cs::plain(fg, 0));
         }
 
-        // Right-aligned metrics: <tokens> tok · $<cost>.
-        let mut metrics = format!("{} tok", format_tokens(st.tokens));
+        // Right-aligned metrics: <model> · ↑<in> ↓<out> · $<cost>.
+        // The model sits here now (moved off the top strip) so the build's model
+        // reads alongside its token spend. `↑` = outgoing (input) tokens, `↓` =
+        // incoming (output) tokens.
+        let mut metrics = String::new();
+        if !st.model.is_empty() {
+            let _ = write!(metrics, "{}{SEP}", st.model);
+        }
+        let _ = write!(
+            metrics,
+            "{TOK_UP}{} {TOK_DOWN}{}",
+            format_tokens(st.input_tokens),
+            format_tokens(st.output_tokens),
+        );
         if let Some(cost) = st.cost {
             let _ = write!(metrics, "{SEP}${cost:.4}");
         }
@@ -396,7 +434,6 @@ mod tests {
 
     fn sample_ctx() -> ChromeCtx {
         ChromeCtx {
-            model: "opus-4.8".to_string(),
             cwd: "/home/u/projects/origin".to_string(),
             branch: Some("feat/tui-rework".to_string()),
             elapsed: "1m 04s".to_string(),
@@ -474,6 +511,31 @@ mod tests {
     }
 
     #[test]
+    fn draw_top_renders_version_tag_after_wordmark() {
+        let mut grid = Grid::new(120, 3);
+        let tok = Tokens::default_tokens();
+        draw_top(&mut grid, Region::new(0, 0, 120, 1), &sample_ctx(), &tok);
+        // Collect the rendered top row as a string and confirm the version tag
+        // (`v<CARGO_PKG_VERSION>`) appears right after the `◆ origin` wordmark.
+        let row: String = (0..grid.cols())
+            .map(|c| char::from_u32(grid.get(0, c).glyph).unwrap_or(' '))
+            .collect();
+        let expected = format!("v{}", env!("CARGO_PKG_VERSION"));
+        assert!(
+            row.contains(&expected),
+            "version tag `{expected}` missing from top strip:\n{row}"
+        );
+        // It sits between the wordmark and the cwd context field.
+        let v_at = row.find(&expected).expect("version present");
+        let origin_at = row.find("origin").expect("wordmark present");
+        // The cwd's leaf ("origin" dir) would collide with the wordmark text, so
+        // anchor on the cwd head ("/home") instead.
+        let cwd_at = row.find("/home").expect("cwd present");
+        assert!(origin_at < v_at, "version tag follows the wordmark");
+        assert!(v_at < cwd_at, "version tag precedes the cwd");
+    }
+
+    #[test]
     fn draw_top_offset_region_keeps_wordmark_at_region_left() {
         let mut grid = Grid::new(120, 3);
         let tok = Tokens::default_tokens();
@@ -528,7 +590,9 @@ mod tests {
         let st = StatusCtx {
             spinner: Some("\u{280B}".to_string()),
             phase: Some("thinking".to_string()),
-            tokens: 12_345,
+            model: "opus-4.8".to_string(),
+            input_tokens: 12_345,
+            output_tokens: 6_789,
             cost: Some(0.0421),
             in_flight: true,
         };
@@ -548,7 +612,9 @@ mod tests {
         let st = StatusCtx {
             spinner: Some("\u{280B}".to_string()),
             phase: Some("thinking".to_string()),
-            tokens: 1_500,
+            model: "opus-4.8".to_string(),
+            input_tokens: 1_500,
+            output_tokens: 800,
             cost: None,
             in_flight: true,
         };
@@ -557,8 +623,21 @@ mod tests {
         assert_eq!(glyph_at(&grid, 0, 0), '\u{280B}', "spinner frame at left");
         // Phase text appears somewhere on the readout row.
         assert!(find_col(&grid, 0, 't').is_some(), "phase 'thinking' present");
-        // Token metrics ("1.5k tok") right-aligned ⇒ a 'k' appears on the row.
-        assert!(find_col(&grid, 0, 'k').is_some(), "token metric present");
+        // The whole readout row, as text, for substring assertions.
+        let row: String = (0..grid.cols()).map(|c| glyph_at(&grid, 0, c)).collect();
+        // Model name moved down here, beside the metrics.
+        assert!(row.contains("opus-4.8"), "model present in status zone:\n{row}");
+        // Outgoing (↑) and incoming (↓) token glyphs + counts both render.
+        assert!(
+            find_col(&grid, 0, TOK_UP).is_some(),
+            "↑ outgoing-token glyph present"
+        );
+        assert!(
+            find_col(&grid, 0, TOK_DOWN).is_some(),
+            "↓ incoming-token glyph present"
+        );
+        assert!(row.contains("1.5k"), "outgoing token count present:\n{row}");
+        assert!(row.contains("800"), "incoming token count present:\n{row}");
     }
 
     #[test]
@@ -577,7 +656,9 @@ mod tests {
         StatusCtx {
             spinner: None,
             phase: None,
-            tokens: 0,
+            model: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
             cost: None,
             in_flight: false,
         }
