@@ -76,6 +76,53 @@ async fn flush_text(pending: &mut String, conn: &SharedConnection) -> Result<(),
     Ok(())
 }
 
+/// Drain a `Subscriber`, forwarding the worker's assistant prose to its progress
+/// channel.
+///
+/// Coalesces assistant `TextDelta` tokens and sends each run as
+/// [`origin_swarm::WorkerProgress::AssistantText`] — the focused-agent
+/// transcript's live prose. Mirrors [`relay_to_connection`]'s text coalescing
+/// but targets the worker's progress channel instead of an IPC connection.
+/// Non-text tokens are ignored here (a worker's tool activity reaches the panel
+/// via its `event_tx` relay). Returns when the ring closes.
+///
+/// # Errors
+/// Propagates ring decode errors.
+pub async fn relay_to_progress(
+    mut sub: Subscriber,
+    progress: &origin_swarm::WorkerProgressTx,
+) -> Result<(), RelayError> {
+    let mut pending = String::new();
+    loop {
+        let Some(first) = sub.next().await? else {
+            flush_text_to_progress(&mut pending, progress);
+            break;
+        };
+        let mut current = Some(first);
+        while let Some(tev) = current {
+            if matches!(tev.kind(), TokenKind::TextDelta) {
+                pending.push_str(&String::from_utf8_lossy(tev.payload()));
+            } else {
+                // A non-text token ends the current prose run; flush it so the
+                // transcript ordering (text then tool) matches arrival order.
+                flush_text_to_progress(&mut pending, progress);
+            }
+            current = sub.try_next()?;
+        }
+        flush_text_to_progress(&mut pending, progress);
+    }
+    Ok(())
+}
+
+/// Forward the accumulated text (if any) as one `AssistantText`, clearing the
+/// buffer. A closed progress channel is ignored (the consumer simply stops).
+fn flush_text_to_progress(pending: &mut String, progress: &origin_swarm::WorkerProgressTx) {
+    if pending.is_empty() {
+        return;
+    }
+    let _ = progress.send(origin_swarm::WorkerProgress::AssistantText(std::mem::take(pending)));
+}
+
 /// Translate a non-text `TokenEvent` into its `StreamEvent`. Returns `None` for
 /// events the CLI relay does not surface (`ToolUseStart`, consumed by the agent
 /// loop's speculative dispatch) or malformed `Usage` payloads. `TextDelta` is
@@ -105,5 +152,37 @@ fn translate(tev: &TokenEvent) -> Option<StreamEvent> {
         }
         TokenKind::TurnEnd => Some(StreamEvent::TurnEnd),
         TokenKind::ToolUseStart => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relay_to_progress;
+    use origin_stream::{Ring, TokenEvent, TokenKind};
+
+    #[tokio::test]
+    async fn relay_to_progress_coalesces_text_into_assistant_runs() {
+        // Subscribe BEFORE publishing so no records are missed.
+        let ring = Ring::with_capacity(64 * 1024);
+        let sub = ring.subscribe();
+        let pub_ok = |ev| ring.publish(&ev).expect("publish token");
+        pub_ok(TokenEvent::new(TokenKind::TextDelta, b"Hello ".to_vec()));
+        pub_ok(TokenEvent::new(TokenKind::TextDelta, b"world".to_vec()));
+        // A non-text token flushes the current prose run...
+        pub_ok(TokenEvent::new(TokenKind::TurnEnd, Vec::new()));
+        // ...and later text starts a fresh run.
+        pub_ok(TokenEvent::new(TokenKind::TextDelta, b"more".to_vec()));
+        ring.close();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        relay_to_progress(sub, &tx).await.expect("relay drains the ring");
+        drop(tx);
+
+        let mut texts = Vec::new();
+        while let Ok(origin_swarm::WorkerProgress::AssistantText(t)) = rx.try_recv() {
+            texts.push(t);
+        }
+        // Streamed deltas coalesce: "Hello world" as one run, "more" as a second.
+        assert_eq!(texts, vec!["Hello world".to_string(), "more".to_string()]);
     }
 }

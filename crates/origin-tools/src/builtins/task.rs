@@ -83,6 +83,19 @@ pub struct TaskInput {
     /// sub-agent that declares `mcp:` servers. Empty ⇒ no MCP (default).
     #[serde(default)]
     pub mcp_servers: Vec<origin_swarm::McpServerSpec>,
+    /// Run this sub-agent in the BACKGROUND (non-blocking): the dispatching turn
+    /// registers the worker and returns immediately instead of awaiting it, so
+    /// the main agent stays responsive while sub-agents run. The result is
+    /// delivered at the start of a later turn (a `<background-results>` block) or
+    /// on demand via the `CollectTasks` tool. Defaults to `true`; set `false` to
+    /// await the worker in-turn (the legacy blocking behaviour).
+    #[serde(default = "default_background")]
+    pub background: bool,
+}
+
+/// Background dispatch is the default (see [`TaskInput::background`]).
+const fn default_background() -> bool {
+    true
 }
 
 /// Actionable inlined view of the worker's [`CompletionReport`].
@@ -174,6 +187,34 @@ pub async fn task_await(
     goal: &str,
 ) -> Result<TaskOutput, TaskError> {
     let report = coord.await_completion(handle).await?;
+    Ok(report_to_output(report, goal))
+}
+
+/// Non-blocking sibling of [`task_await`]: poll a detached (background) worker
+/// without parking.
+///
+/// Returns `None` while it is still running, and `Some(Ok(view))` /
+/// `Some(Err(..))` once it reaches a terminal state — the reap primitive the
+/// background-job registry drains with.
+///
+/// # Errors
+/// `Some(Err(TaskError::Swarm))` when the worker reported `Failed` or its handle
+/// is unknown (vanished / already evicted).
+pub async fn task_try_collect(
+    coord: &Coordinator,
+    handle: &WorkerHandle,
+    goal: &str,
+) -> Option<Result<TaskOutput, TaskError>> {
+    match coord.try_completion(handle).await? {
+        Ok(report) => Some(Ok(report_to_output(report, goal))),
+        Err(e) => Some(Err(TaskError::Swarm(e))),
+    }
+}
+
+/// Build the actionable [`TaskOutput`] view from a worker's terminal report.
+/// Shared by [`task_await`] (blocking) and [`task_try_collect`] (non-blocking)
+/// so both produce byte-identical output. `goal` only labels the summary.
+fn report_to_output(report: origin_swarm::CompletionReport, goal: &str) -> TaskOutput {
     let status = match report.status {
         ReportStatus::Completed => "completed",
         ReportStatus::GoalUnreachable => "goal_unreachable",
@@ -187,12 +228,12 @@ pub async fn task_await(
         Some(d) => format!("worker for {goal:?} reported {:?}: {d}", report.status),
         None => format!("worker for {goal:?} reported {:?}", report.status),
     };
-    Ok(TaskOutput {
+    TaskOutput {
         status: status.to_owned(),
         summary,
         files_touched: report.files_touched.iter().map(hex::encode).collect(),
         follow_ups: report.follow_ups.into_iter().map(|t| t.goal).collect(),
-    })
+    }
 }
 
 /// Spawn a worker for `input.goal`, await completion, return the actionable view.
@@ -234,7 +275,7 @@ mod budget_tests {
 
 crate::origin_tool! {
     name: "Task",
-    description: "Dispatch a sub-agent (swarm worker) with a goal, allowed tools, and budget; it runs concurrently and returns a structured CompletionReport summary. Prefer this to parallelize independent units of work — spawn several at once. No permission prompt is required; the sub-agent is confined to the `allowed_tools` you grant it.",
+    description: "Dispatch a sub-agent (swarm worker) with a goal, allowed tools, and budget; it runs CONCURRENTLY in the background and returns a structured CompletionReport summary. By default (`background:true`) the dispatch returns immediately so you stay responsive — the sub-agent's result is delivered automatically at the start of your next turn (a `<background-results>` block), or gather it on demand with `CollectTasks`. Set `background:false` only when you must have the result WITHIN this turn. Prefer this to parallelize independent units of work — spawn several at once. No permission prompt is required; the sub-agent is confined to the `allowed_tools` you grant it.",
     // AutoAllowed: spawning a swarm worker never prompts. The child is confined
     // to the `allowed_tools` allow-list the parent grants, and any governance /
     // conseca deny overlay still applies — so removing the parent-side prompt is
@@ -242,10 +283,23 @@ crate::origin_tool! {
     tier: crate::Tier::AutoAllowed,
     urgency: crate::Urgency::Medium,
     side_effects: crate::SideEffects::Mutating,
-    input_schema: r#"{"type":"object","required":["goal","allowed_tools"],"properties":{"goal":{"type":"string"},"allowed_tools":{"type":"array","items":{"type":"string"}},"budget":{"type":"object"},"model":{"type":"string"},"mcp_servers":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"url":{"type":"string"}},"required":["name"]}}}}"#,
+    input_schema: r#"{"type":"object","required":["goal","allowed_tools"],"properties":{"goal":{"type":"string"},"allowed_tools":{"type":"array","items":{"type":"string"}},"budget":{"type":"object"},"model":{"type":"string"},"background":{"type":"boolean","description":"Run non-blocking in the background (default true). Set false to await the result in this turn."},"mcp_servers":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"url":{"type":"string"}},"required":["name"]}}}}"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
     token_budget: crate::DEFAULT_TOKEN_BUDGET,
     // hot: the full schema is always advertised to the model (no ToolSearch
     // round-trip first). Task being deferred was why swarm was never invoked.
+    hot: true,
+}
+
+crate::origin_tool! {
+    name: "CollectTasks",
+    description: "Gather the results of background sub-agents you dispatched (Task with background:true, the default). Returns each FINISHED sub-agent's report and lists any STILL RUNNING. Call this when you need their findings within the current turn; otherwise finished results are delivered automatically at the start of your next turn. Pure/read-only over the background-job registry; safe to poll.",
+    tier: crate::Tier::AutoAllowed,
+    urgency: crate::Urgency::Low,
+    side_effects: crate::SideEffects::Pure,
+    input_schema: r#"{"type":"object","properties":{"ids":{"type":"array","items":{"type":"string"},"description":"Optional worker ids to gather; omit to gather all background jobs for this session."}}}"#,
+    sandbox: ::origin_sandbox::SandboxProfile::Inherit,
+    token_budget: crate::DEFAULT_TOKEN_BUDGET,
+    // hot so the model can gather background results in-turn without a ToolSearch.
     hot: true,
 }

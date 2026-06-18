@@ -69,6 +69,18 @@ per unit and let them run in parallel rather than doing the work serially \
 yourself. Scope each sub-agent by granting it only the `allowed_tools` it \
 needs. Prefer parallel `Task` delegation wherever it is possible and safe.
 
+TASKS RUN IN THE BACKGROUND BY DEFAULT. A `Task` dispatch returns immediately \
+(background:true) so you and the user stay responsive while sub-agents work — \
+you do NOT block waiting for them. Each finished sub-agent's result is delivered \
+automatically at the start of your next turn as a `<background-results>` block; \
+incorporate it then. When you need a sub-agent's findings WITHIN the current \
+turn (e.g. to synthesize a final answer now), call `CollectTasks` to gather the \
+finished ones and see which are still running — poll it until you have what you \
+need. Only set `background:false` on a `Task` when you truly cannot proceed \
+without that result in this same turn. After dispatching background work, it is \
+correct to tell the user what you started and stay available for their next \
+question; their results will arrive and you will fold them in.
+
 This is the default. Skip it only when the work is genuinely trivial.\
 ";
 

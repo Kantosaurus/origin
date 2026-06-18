@@ -226,6 +226,61 @@ pub fn real_worker(
 /// Drive one worker to completion. Always returns `Ok` with a report — a failed
 /// `run_loop` becomes a `GoalUnreachable` report rather than a swarm error, so a
 /// sub-agent failure surfaces to the parent as data, not a torn-down turn.
+/// Wire a worker's two live-progress relays onto `opts` so a focused agent's
+/// transcript streams to the TUI.
+///
+/// Relay (a) maps the loop's `event_tx` UI events — tool starts (`ToolStarted`,
+/// which also drives the panel's current-tool line) and tool results
+/// (`ToolResult`) — onto the progress channel. Relay (b) maps the streamed
+/// assistant text: token deltas flow ONLY through the streaming ring's relay
+/// subscriber (`relay_tx`), never `event_tx`, so a relay subscriber is required
+/// to surface the sub-agent's prose as `AssistantText` (this is why a worker
+/// with a progress consumer streams). Both feed the same `progress` channel; the
+/// relays are detached Realtime tasks that end when the loop drops `opts`.
+fn wire_worker_progress(opts: &mut LoopOptions, progress: origin_swarm::WorkerProgressTx) {
+    // (a) tool activity + results, off the loop's UI event channel.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::protocol::StreamEvent>(256);
+    opts.event_tx = Some(tx);
+    let progress_tools = progress.clone();
+    drop(origin_runtime::spawn_in(
+        origin_runtime::TaskClass::Realtime,
+        async move {
+            use crate::protocol::StreamEvent as Ev;
+            use origin_swarm::WorkerProgress as P;
+            while let Some(ev) = rx.recv().await {
+                let mapped = match ev {
+                    Ev::ToolActivity { tool, .. } => Some(P::ToolStarted(tool)),
+                    Ev::ToolResult {
+                        tool, ok, preview, ..
+                    } => Some(P::ToolResult { tool, ok, preview }),
+                    _ => None,
+                };
+                if let Some(p) = mapped {
+                    // Parent gone ⇒ send fails ⇒ stop forwarding.
+                    if progress_tools.send(p).is_err() {
+                        break;
+                    }
+                }
+            }
+        },
+    ));
+    // (b) assistant prose, off the streaming token ring: `run_streaming_turn`
+    // hands one subscriber per turn through `relay_tx`, which `relay_to_progress`
+    // drains into coalesced `AssistantText`.
+    let (tx_sub, mut rx_sub) = tokio::sync::mpsc::channel::<origin_stream::Subscriber>(1);
+    opts.relay_tx = Some(tx_sub);
+    drop(origin_runtime::spawn_in(
+        origin_runtime::TaskClass::Realtime,
+        async move {
+            while let Some(sub) = rx_sub.recv().await {
+                if crate::stream_relay::relay_to_progress(sub, &progress).await.is_err() {
+                    break;
+                }
+            }
+        },
+    ));
+}
+
 async fn run_worker(
     active: ActiveProvider,
     cas: Arc<CasStore>,
@@ -261,11 +316,15 @@ async fn run_worker(
     } else {
         ctx.budget.max_tool_calls
     };
+    // A transcript consumer (the interactive TUI watching this agent) wants the
+    // sub-agent's assistant text live, so it must STREAM (token deltas only flow
+    // on the streaming path). Without a consumer the worker stays non-streaming
+    // (simpler accounting, byte-identical to before).
+    let want_transcript = ctx.progress.is_some();
     let mut opts = LoopOptions {
         max_turns,
-        // Sub-agents have no client to stream to; the non-streaming path returns
-        // the same assistant text and is simpler to account for.
-        streaming_disabled: true,
+        // Stream only when a transcript consumer is attached (see above).
+        streaming_disabled: !want_transcript,
         // #13 / N7.1+P9.7 sub-agent prefix-cache inheritance — WIRED via the live
         // handle-band `Plan`. `fork_shared_handle_bands` hands the worker a `Plan`
         // that SHARES the daemon's process-wide, content-addressed `handle_bands`
@@ -281,31 +340,11 @@ async fn run_worker(
         ..Default::default()
     };
 
-    // Live current-tool feed (TUI swarm panel): when the spawner asked for
-    // progress, route this worker's per-tool `ToolActivity` events (which the
-    // loop emits whenever `event_tx` is set) onto the progress channel as
-    // `ToolStarted`, so the parent can show what this sub-agent is doing right
-    // now. Streaming stays disabled — `event_tx` here carries UI events only,
-    // not token deltas. The relay ends when the loop drops `opts` (→ `tx`), so
-    // there is nothing to clean up. `None` (the default) ⇒ byte-identical.
+    // When the spawner asked for progress, wire this worker's live output onto
+    // the progress channel (tools + streamed assistant prose) so the TUI can
+    // focus the agent and watch its full conversation. `None` ⇒ byte-identical.
     if let Some(progress) = ctx.progress.take() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::protocol::StreamEvent>(64);
-        opts.event_tx = Some(tx);
-        // Realtime relay, like all daemon background tasks (no raw `tokio::spawn`).
-        // Detached: drop the handle (the task runs to completion on its own).
-        drop(origin_runtime::spawn_in(
-            origin_runtime::TaskClass::Realtime,
-            async move {
-                while let Some(ev) = rx.recv().await {
-                    if let crate::protocol::StreamEvent::ToolActivity { tool, .. } = ev {
-                        // Parent gone ⇒ send fails ⇒ stop forwarding.
-                        if progress.send(origin_swarm::WorkerProgress::ToolStarted(tool)).is_err() {
-                            break;
-                        }
-                    }
-                }
-            },
-        ));
+        wire_worker_progress(&mut opts, progress);
     }
 
     let goal = ctx.spec.goal.clone();

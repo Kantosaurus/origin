@@ -106,6 +106,7 @@ async fn memory_e2e_proposer_to_store_via_wiremock() {
         workflows: None,
         memory_handle: None,
         coordinator: None,
+        background_jobs: None,
         plan: None,
         goal: Arc::new(tokio::sync::Mutex::new(None)),
         policy: None,

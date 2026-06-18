@@ -387,6 +387,19 @@ impl SwarmAgentStatus {
 ///
 /// Rows are keyed by `id` (the daemon's stable hex worker id) so a worker's
 /// completion event updates its existing row in place rather than duplicating.
+/// One streamed line of a swarm sub-agent's live transcript (assistant prose, a
+/// tool it started, or a tool's result) — buffered per agent so the user can
+/// focus the agent (Tab → select, Enter → view) and watch its full conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwarmAgentLine {
+    /// A run of the agent's assistant text (streamed deltas are coalesced).
+    Text(String),
+    /// A tool the agent started (the tool name).
+    Tool(String),
+    /// A tool's result preview; `bool` is whether the tool succeeded.
+    ToolResult(String, bool),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwarmAgentRow {
     /// Stable hex worker id (correlates the spawn and completion events).
@@ -404,6 +417,9 @@ pub struct SwarmAgentRow {
     pub started: std::time::Instant,
     /// When it reached a terminal state, to freeze the clock. `None` while running.
     pub finished: Option<std::time::Instant>,
+    /// The agent's live transcript, streamed line-by-line. Rendered in the main
+    /// pane when this agent is focused (`App::swarm_view`).
+    pub transcript: Vec<SwarmAgentLine>,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -444,6 +460,13 @@ pub struct App {
     /// settled) clears the list, so the panel always reflects the current fan-out.
     /// Drives the compact "swarm" readout above the composer.
     pub swarm_agents: Vec<SwarmAgentRow>,
+    /// Tab-highlight cursor into [`Self::swarm_agents`] (the panel selection).
+    /// `None` ⇒ nothing highlighted. Advanced by Tab during a live wave.
+    pub swarm_selected: Option<usize>,
+    /// The focused sub-agent's id: when `Some`, the main pane shows that agent's
+    /// full transcript instead of the origin conversation. Set by Enter on the
+    /// highlighted agent; Enter again toggles back to `None` (main view).
+    pub swarm_view: Option<String>,
     /// Session reasoning-effort level (`fast`/`low`/`medium`/`high`/`max`) as a
     /// canonical wire token, or `None` to leave the provider wire unchanged.
     /// Seeded from the startup `--effort` flag and mutated mid-session by the
@@ -624,17 +647,30 @@ fn git_branch_short() -> Option<String> {
 /// scroll-away banner is redundant.
 const WORDMARK: &str = "\u{25C6} origin";
 
-/// Startup hero logo: the full block-letter "origin" wordmark, painted in copper
-/// and shown before the user's first prompt. Once the first turn begins,
-/// [`App::dismiss_startup_banner`] clears it and the session runs under the
-/// small `◆ origin` top-chrome header. (`/clear` re-pushes it.)
-const BANNER_ART: [&str; 3] = [
-    "\u{2588}\u{2580}\u{2588} \u{2588}\u{2580}\u{2588} \u{2588} \u{2588}\u{2580}\u{2580} \u{2588} \u{2588}\u{2584} \u{2588}",
-    "\u{2588} \u{2588} \u{2588}\u{2580}\u{2584} \u{2588} \u{2588} \u{2588} \u{2588} \u{2588} \u{2580}\u{2588}",
-    "\u{2580}\u{2580}\u{2580} \u{2580} \u{2580} \u{2580} \u{2580}\u{2580}\u{2580} \u{2580} \u{2580}  \u{2580}",
+/// Startup hero logo: the big block-letter "ORIGIN" wordmark, painted in copper
+/// and shown before the user's first prompt. One entry per letter, each
+/// [`BANNER_ROWS`] rows tall and 6 columns wide; [`App::push_banner`] joins them
+/// with a 2-column gutter and centers the result in the viewport. Once the first
+/// turn begins [`App::dismiss_startup_banner`] clears it and the session runs
+/// under the small `◆ origin` top-chrome header. (`/clear` re-pushes it.)
+const BANNER_LETTERS: [[&str; BANNER_ROWS]; 6] = [
+    ["██████", "██  ██", "██  ██", "██  ██", "██████"], // O
+    ["█████ ", "██  ██", "█████ ", "██ ██ ", "██  ██"], // R
+    ["██████", "  ██  ", "  ██  ", "  ██  ", "██████"], // I
+    ["██████", "██    ", "██ ███", "██  ██", "██████"], // G
+    ["██████", "  ██  ", "  ██  ", "  ██  ", "██████"], // I
+    ["██  ██", "███ ██", "██████", "██ ███", "██  ██"], // N
 ];
-/// Tagline rendered under the startup logo.
+/// Rows per block letter (the hero's height in text rows).
+const BANNER_ROWS: usize = 5;
+/// Tagline rendered, centered, under the startup logo.
 const BANNER_TAGLINE: &str = "the agentic coding terminal";
+
+/// Left padding to horizontally center `content_w` columns within `cols`.
+/// Saturates to 0 when the content is wider than the viewport.
+fn banner_center_pad(cols: u16, content_w: usize) -> String {
+    " ".repeat((cols as usize).saturating_sub(content_w) / 2)
+}
 
 /// The composer placeholder shown while the input buffer is empty (on startup,
 /// after `/clear`, and any time the field is empty). It clears the instant the
@@ -664,6 +700,8 @@ impl App {
             stall: None,
             startup_banner: false,
             swarm_agents: Vec::new(),
+            swarm_selected: None,
+            swarm_view: None,
             effort: None,
             output_style: None,
             steering: origin_steering::SteeringQueue::new(),
@@ -960,23 +998,41 @@ impl App {
     /// parity test pass them) but the greeting no longer centers itself in the
     /// viewport: it's a header pinned to the top of the transcript, the way a
     /// real prompt-first terminal reads.
-    pub fn push_banner(&mut self, _cols: u16, _rows: u16) {
+    pub fn push_banner(&mut self, cols: u16, rows: u16) {
         let tok = crate::tui::tokens::Tokens::from_palette(self.palette());
-        // Startup hero: the full block-letter logo, copper, drawn verbatim so the
-        // block glyphs render as-is (no markdown reinterpretation). It stays only
-        // until the first prompt — `dismiss_startup_banner` then clears it and the
-        // session falls back to the small `◆ origin` top-chrome header.
-        self.scrollback
-            .push(ScrollLine::styled(String::new(), 0, 0, false));
-        for art in BANNER_ART {
+        // Assemble the big wordmark: each row joins the six letters' row-segments
+        // with a 2-column gutter, drawn verbatim so the block glyphs render as-is.
+        let art: Vec<String> = (0..BANNER_ROWS)
+            .map(|r| {
+                BANNER_LETTERS
+                    .iter()
+                    .map(|l| l[r])
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            })
+            .collect();
+        let art_w = art.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+        // Vertical breathing room so the hero sits in the upper-middle rather than
+        // flush against the top edge — scaled to the viewport, clamped to a band.
+        let total_h = BANNER_ROWS + 3; // art rows + blank + tagline + blank
+        let top_pad = (rows as usize).saturating_sub(total_h) / 3;
+        for _ in 0..top_pad.clamp(1, 6) {
+            self.scrollback.push(ScrollLine::verbatim(String::new(), 0, 0));
+        }
+        // Center each art row by the SAME pad (block left-edges stay aligned).
+        let art_pad = banner_center_pad(cols, art_w);
+        for line in &art {
             self.scrollback
-                .push(ScrollLine::verbatim((*art).to_string(), tok.origin, 0));
+                .push(ScrollLine::verbatim(format!("{art_pad}{line}"), tok.origin, 0));
         }
         self.scrollback.push(ScrollLine::verbatim(String::new(), 0, 0));
-        self.scrollback
-            .push(ScrollLine::verbatim(BANNER_TAGLINE.to_string(), tok.muted, 0));
-        self.scrollback
-            .push(ScrollLine::styled(String::new(), 0, 0, false));
+        let tag_pad = banner_center_pad(cols, BANNER_TAGLINE.chars().count());
+        self.scrollback.push(ScrollLine::verbatim(
+            format!("{tag_pad}{BANNER_TAGLINE}"),
+            tok.muted,
+            0,
+        ));
+        self.scrollback.push(ScrollLine::verbatim(String::new(), 0, 0));
         self.startup_banner = true;
     }
 
@@ -1263,6 +1319,9 @@ impl App {
                 .all(|r| r.status != SwarmAgentStatus::Running)
         {
             self.swarm_agents.clear();
+            // A fresh wave invalidates any selection/focus into the old one.
+            self.swarm_selected = None;
+            self.swarm_view = None;
         }
         let terminal = matches!(
             new_status,
@@ -1286,8 +1345,124 @@ impl App {
                 current_tool: None,
                 started: now,
                 finished: terminal.then_some(now),
+                transcript: Vec::new(),
             });
         }
+    }
+
+    /// Append one streamed transcript line to a sub-agent's buffer. Consecutive
+    /// `"text"` parts are coalesced into the trailing assistant run so streamed
+    /// deltas read as flowing prose, not one line per token. Unknown id ⇒ no-op
+    /// (the `spawned` event creates the row before output streams).
+    pub fn apply_swarm_output(&mut self, id: &str, part: &str, body: &str, ok: bool) {
+        let Some(row) = self.swarm_agents.iter_mut().find(|r| r.id == id) else {
+            return;
+        };
+        match part {
+            "text" => {
+                if let Some(SwarmAgentLine::Text(t)) = row.transcript.last_mut() {
+                    t.push_str(body);
+                } else {
+                    row.transcript.push(SwarmAgentLine::Text(body.to_string()));
+                }
+            }
+            "tool" => row.transcript.push(SwarmAgentLine::Tool(body.to_string())),
+            "tool_result" => row
+                .transcript
+                .push(SwarmAgentLine::ToolResult(body.to_string(), ok)),
+            _ => {}
+        }
+    }
+
+    /// Tab through the swarm agents: advance the panel highlight cursor, wrapping.
+    /// No-op (clears the cursor) when there are no agents. Returns `true` when the
+    /// selection changed so the caller can repaint.
+    pub fn swarm_cycle_selection(&mut self) -> bool {
+        let n = self.swarm_agents.len();
+        if n == 0 {
+            let had = self.swarm_selected.is_some();
+            self.swarm_selected = None;
+            return had;
+        }
+        self.swarm_selected = Some(self.swarm_selected.map_or(0, |i| (i + 1) % n));
+        true
+    }
+
+    /// Enter on the highlighted agent: focus it (the main pane shows its
+    /// transcript) — or, if it is already focused, toggle back to the main origin
+    /// view. No-op when nothing is selected. Returns `true` when the view changed.
+    pub fn swarm_toggle_focus(&mut self) -> bool {
+        let Some(i) = self.swarm_selected else {
+            return false;
+        };
+        let Some(row) = self.swarm_agents.get(i) else {
+            self.swarm_selected = None;
+            return false;
+        };
+        if self.swarm_view.as_deref() == Some(row.id.as_str()) {
+            self.swarm_view = None; // toggle back to the main origin agent
+        } else {
+            self.swarm_view = Some(row.id.clone());
+        }
+        true
+    }
+
+    /// The focused sub-agent's row, if the user has drilled into one (Enter).
+    /// `None` ⇒ the main pane shows the normal origin transcript.
+    #[must_use]
+    pub fn focused_swarm_agent(&self) -> Option<&SwarmAgentRow> {
+        let id = self.swarm_view.as_deref()?;
+        self.swarm_agents.iter().find(|r| r.id == id)
+    }
+
+    /// Render a focused sub-agent's buffered transcript as main-pane scrollback
+    /// lines: a `⎇ viewing` header, then its assistant prose (markdown), the tools
+    /// it ran, and their result previews — themed via `tok`. Empty transcript ⇒ a
+    /// "waiting for output" placeholder so the focused pane is never blank.
+    fn render_agent_transcript_lines(
+        agent: &SwarmAgentRow,
+        tok: &crate::tui::tokens::Tokens,
+    ) -> Vec<ScrollLine> {
+        let short = agent
+            .id
+            .get(agent.id.len().saturating_sub(6)..)
+            .unwrap_or(&agent.id);
+        let mut out: Vec<ScrollLine> = Vec::new();
+        out.push(ScrollLine {
+            text: format!(
+                "\u{23C7} viewing  {short} \u{00B7} {}    [Tab/Enter \u{21A9} back]",
+                agent.goal
+            ),
+            fg: tok.accent,
+            bg: 0,
+            bold: true,
+            literal: true,
+            align: LineAlign::Left,
+        });
+        out.push(ScrollLine::verbatim(String::new(), tok.muted, 0));
+        out.push(ScrollLine::verbatim("\u{25C6} sub-agent".to_string(), tok.origin, 0));
+        for line in &agent.transcript {
+            match line {
+                SwarmAgentLine::Text(t) => {
+                    out.push(ScrollLine::styled(format!("  {t}"), tok.origin, 0, false));
+                }
+                SwarmAgentLine::Tool(name) => {
+                    out.push(ScrollLine::verbatim(format!("  [{name}]"), tok.tool, 0));
+                }
+                SwarmAgentLine::ToolResult(preview, ok) => {
+                    let fg = if *ok { tok.muted } else { tok.err };
+                    out.push(ScrollLine::verbatim(format!("    {preview}"), fg, 0));
+                }
+            }
+        }
+        if agent.transcript.is_empty() {
+            out.push(ScrollLine::verbatim(
+                "  (waiting for output\u{2026})".to_string(),
+                tok.muted,
+                0,
+            ));
+        }
+        out
     }
 
 
@@ -1675,7 +1850,23 @@ impl App {
             let cols_usize = cols as usize;
             let mut visual_lines: Vec<VisualLine<'_>> = Vec::new();
 
-            for entry in &self.scrollback {
+            // When the user has drilled into a swarm sub-agent (Tab → select,
+            // Enter → view), the main pane shows THAT agent's full transcript
+            // instead of the origin conversation. `focus_lines` is empty unless an
+            // existing agent is focused, so the normal scrollback path is the
+            // byte-identical default. (A focused-but-missing id falls back to
+            // scrollback too — `swarm_view` is cleared on every fresh wave.)
+            let focus_lines: Vec<ScrollLine> = self
+                .focused_swarm_agent()
+                .map(|a| Self::render_agent_transcript_lines(a, &tok))
+                .unwrap_or_default();
+            let source: &[ScrollLine] = if focus_lines.is_empty() {
+                &self.scrollback
+            } else {
+                &focus_lines
+            };
+
+            for entry in source {
                 // User prompts wrap into the right band; everything else full-width.
                 let right = entry.align == LineAlign::Right;
                 let wrap_cols = if right {
@@ -1699,10 +1890,15 @@ impl App {
             // markdown-parsed live (literal=false) so headings/code style as they
             // stream rather than snapping at finalize. Owned outside the wrap so
             // the `&str` slices in `visual_lines` outlive it.
-            let live_buf = self
-                .current_assistant
-                .as_ref()
-                .map(|buf| format!("\u{25C6} origin\n  {buf}"));
+            // The origin agent's live streaming turn is hidden while focused on a
+            // sub-agent (that pane shows the sub-agent's own stream instead).
+            let live_buf = if focus_lines.is_empty() {
+                self.current_assistant
+                    .as_ref()
+                    .map(|buf| format!("\u{25C6} origin\n  {buf}"))
+            } else {
+                None
+            };
             if let Some(text) = live_buf.as_deref() {
                 wrap_into(
                     text,
@@ -2255,7 +2451,12 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine], pal: theme::Palette) 
 /// (status glyph + short id + elapsed clock), the goal, and a third line that is
 /// either the tool the agent is using right now or its terminal state. There is
 /// no budget bar — swarm budgets are unlimited.
-pub fn draw_side_swarm(side: &mut Grid, agents: &[SwarmAgentRow], pal: theme::Palette) {
+pub fn draw_side_swarm(
+    side: &mut Grid,
+    agents: &[SwarmAgentRow],
+    selected: Option<usize>,
+    pal: theme::Palette,
+) {
     let cols = side.cols();
     let rows = side.rows();
     let muted = Style {
@@ -2308,11 +2509,11 @@ pub fn draw_side_swarm(side: &mut Grid, agents: &[SwarmAgentRow], pal: theme::Pa
     side.put(1, 0, Cell::new('\u{251C}', pal.border, pal.panel_bg, Attr::PLAIN));
 
     let mut row: u16 = 2;
-    for a in agents {
+    for (i, a) in agents.iter().enumerate() {
         if row >= rows {
             break;
         }
-        row = draw_swarm_agent_block(side, row, a, cols, rows, pal);
+        row = draw_swarm_agent_block(side, row, a, selected == Some(i), cols, rows, pal);
     }
 }
 
@@ -2323,6 +2524,7 @@ fn draw_swarm_agent_block(
     side: &mut Grid,
     mut row: u16,
     a: &SwarmAgentRow,
+    selected: bool,
     cols: u16,
     rows: u16,
     pal: theme::Palette,
@@ -2337,6 +2539,12 @@ fn draw_swarm_agent_block(
         SwarmAgentStatus::Completed => ('\u{2714}', pal.green, pal.accent_dim),
         SwarmAgentStatus::Failed => ('\u{2718}', pal.red, pal.accent_dim),
     };
+    // Selection cursor (Tab highlight): a `❯` in col 1 marks the agent Enter
+    // would drill into. The id then renders bright instead of dim/accent.
+    if selected {
+        side.put(row, 1, Cell::new('\u{276F}', pal.accent, pal.panel_bg, Attr::BOLD));
+    }
+    let id_fg = if selected { pal.panel_header } else { id_fg };
     // Line 1: glyph (col 2) + short id (col 4) + elapsed clock (right).
     side.put(row, 2, Cell::new(glyph, glyph_fg, pal.panel_bg, Attr::PLAIN));
     let short: String = a.id.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect();
@@ -3106,6 +3314,66 @@ mod tests {
     }
 
     #[test]
+    fn swarm_output_coalesces_text_and_records_tools() {
+        let mut app = App::new("anthropic", "claude-opus-4-8", CompletionSources::default());
+        app.apply_swarm_event("a1", "goal", "spawned");
+        // Streamed text deltas coalesce into one assistant run.
+        app.apply_swarm_output("a1", "text", "Hello ", false);
+        app.apply_swarm_output("a1", "text", "world", false);
+        app.apply_swarm_output("a1", "tool", "Read", false);
+        app.apply_swarm_output("a1", "tool_result", "Read: ok", true);
+        // Unknown id is ignored, never panics.
+        app.apply_swarm_output("nope", "text", "x", false);
+        let t = &app.swarm_agents[0].transcript;
+        assert_eq!(
+            t,
+            &vec![
+                SwarmAgentLine::Text("Hello world".to_string()),
+                SwarmAgentLine::Tool("Read".to_string()),
+                SwarmAgentLine::ToolResult("Read: ok".to_string(), true),
+            ],
+        );
+    }
+
+    #[test]
+    fn tab_cycles_selection_and_enter_toggles_focus() {
+        let mut app = App::new("anthropic", "claude-opus-4-8", CompletionSources::default());
+        // No agents: cycling is a no-op, focusing does nothing.
+        assert!(!app.swarm_cycle_selection());
+        assert!(!app.swarm_toggle_focus());
+        app.apply_swarm_event("a1", "g1", "spawned");
+        app.apply_swarm_event("b2", "g2", "spawned");
+        // Tab highlights agent 0, then 1, then wraps to 0.
+        assert!(app.swarm_cycle_selection());
+        assert_eq!(app.swarm_selected, Some(0));
+        app.swarm_cycle_selection();
+        assert_eq!(app.swarm_selected, Some(1));
+        app.swarm_cycle_selection();
+        assert_eq!(app.swarm_selected, Some(0));
+        // Enter focuses the highlighted agent ⇒ main pane shows it.
+        assert!(app.swarm_toggle_focus());
+        assert_eq!(app.focused_swarm_agent().map(|r| r.id.as_str()), Some("a1"));
+        // Enter again on the same agent toggles back to the main origin view.
+        assert!(app.swarm_toggle_focus());
+        assert!(app.focused_swarm_agent().is_none());
+    }
+
+    #[test]
+    fn a_fresh_wave_clears_selection_and_focus() {
+        let mut app = App::new("anthropic", "claude-opus-4-8", CompletionSources::default());
+        app.apply_swarm_event("a1", "first", "spawned");
+        app.swarm_cycle_selection();
+        app.swarm_toggle_focus();
+        assert!(app.swarm_view.is_some());
+        app.apply_swarm_event("a1", "first", "completed");
+        // New wave clears the stale selection + focus into the old wave.
+        app.apply_swarm_event("c3", "second", "spawned");
+        assert_eq!(app.swarm_selected, None);
+        assert_eq!(app.swarm_view, None);
+        assert!(app.focused_swarm_agent().is_none());
+    }
+
+    #[test]
     fn startup_banner_shows_block_logo_then_dismisses_on_first_turn() {
         let mut app = App::new("anthropic", "m", CompletionSources::default());
         app.push_banner(80, 24);
@@ -3120,6 +3388,21 @@ mod tests {
         assert!(
             app.scrollback.iter().any(|l| l.text.contains('\u{2588}')),
             "block-letter glyph present"
+        );
+        // Big + centered: ≥5 block-letter rows (a tall hero, not the old 3-line
+        // wordmark), each left-padded so it is centered in the 80-col viewport
+        // rather than flush against column 0.
+        let art_rows: Vec<&str> = app
+            .scrollback
+            .iter()
+            .map(|l| l.text.as_str())
+            .filter(|t| t.contains('\u{2588}'))
+            .collect();
+        assert!(art_rows.len() >= 5, "tall hero, got {} rows", art_rows.len());
+        assert!(
+            art_rows.iter().all(|l| l.starts_with(&" ".repeat(10))),
+            "art rows are centered (substantial left pad), got:\n{}",
+            art_rows.join("\n")
         );
         // The first real turn clears the hero logo.
         app.dismiss_startup_banner();
@@ -3151,6 +3434,7 @@ mod tests {
                 current_tool: Some("Edit".into()),
                 started: now,
                 finished: None,
+                transcript: Vec::new(),
             },
             SwarmAgentRow {
                 id: "bbbbbb02".into(),
@@ -3159,10 +3443,11 @@ mod tests {
                 current_tool: None,
                 started: now,
                 finished: Some(now),
+                transcript: Vec::new(),
             },
         ];
         let mut g = Grid::new(36, 16);
-        draw_side_swarm(&mut g, &agents, theme::palette(theme::Theme::Default));
+        draw_side_swarm(&mut g, &agents, Some(0), theme::palette(theme::Theme::Default));
         let text = grid_glyphs(&g);
         assert!(text.contains("Swarm"), "header missing:\n{text}");
         assert!(text.contains("write failing tests"), "goal missing:\n{text}");

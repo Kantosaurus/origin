@@ -30,9 +30,13 @@ use tokio::sync::Notify;
 
 const MIB: u64 = 1024 * 1024;
 
-/// Effective cap when no memory information and no hard cap are available
-/// (non-Linux, probe failure). Reproduces origin's prior small fixed default.
-pub const DEFAULT_FALLBACK_MAX: u32 = 3;
+/// Effective cap when no memory information and no hard cap are available.
+///
+/// **Unlimited by default** — swarm sub-agents are not artificially capped. On a
+/// platform with no memory probe (e.g. Windows) the only bound is the OS, the
+/// runtime lane backstop, and the `>=1` forward floor. Set `ORIGIN_SWARM_MAX=<n>`
+/// to re-impose a hard cap. (Was a fixed `3`.)
+pub const DEFAULT_FALLBACK_MAX: u32 = u32::MAX;
 
 /// A best-effort snapshot of OS memory, in bytes.
 ///
@@ -204,18 +208,19 @@ impl GateCfg {
     /// Resolve the policy from `ORIGIN_SWARM_*` env vars given a `total` reading.
     #[must_use]
     pub fn from_env(total: MemReading) -> Self {
-        let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-
         let reserve_bytes = env_u64("ORIGIN_SWARM_RESERVE_MB")
             .filter(|m| *m > 0)
             .unwrap_or(512)
             .saturating_mul(MIB)
             .max(MIB);
 
+        // Unlimited by default: the admission lane no longer caps concurrency at a
+        // small multiple of cores — the memory governor (where a probe exists) is
+        // the real limiter, and `ORIGIN_SWARM_LANE_MAX=<n>` re-imposes a cap.
         let lane_ceiling = env_u64("ORIGIN_SWARM_LANE_MAX")
             .filter(|n| *n > 0)
             .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or_else(|| u32::try_from((cores * 8).max(64)).unwrap_or(64));
+            .unwrap_or(u32::MAX);
 
         // Clamped `.max(1)` so a `=0` misconfig can never wedge the >=1 floor.
         let hard_max = env_u64("ORIGIN_SWARM_MAX").map(|n| u32::try_from(n).unwrap_or(u32::MAX).max(1));

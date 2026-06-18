@@ -78,6 +78,9 @@ fn hot_set_contains_exactly_the_expected_tools() {
         // `Task` is hot so swarm delegation is always one call away (no
         // ToolSearch round-trip) — the fix for swarm never being invoked.
         "Task",
+        // `CollectTasks` is hot so the model can gather background sub-agent
+        // results in-turn (background Task dispatch is the default).
+        "CollectTasks",
     ];
     let mut got: Vec<&str> = hot.clone();
     got.sort_unstable();

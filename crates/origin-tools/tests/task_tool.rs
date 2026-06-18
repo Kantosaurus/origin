@@ -63,6 +63,7 @@ async fn task_tool_dispatches_worker_and_inlines_report() {
             budget: TaskBudget::default(),
             model: None,
             mcp_servers: vec![],
+            background: false,
         },
     )
     .await
@@ -113,6 +114,7 @@ async fn task_tool_filters_disallowed_tools_into_decision_record() {
             budget: TaskBudget::default(),
             model: None,
             mcp_servers: vec![],
+            background: false,
         },
     )
     .await

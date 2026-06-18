@@ -145,15 +145,27 @@ fn main() -> Result<()> {
 /// expensive, was gated behind a 24h TTL — which masked same-day releases (a
 /// release published minutes after the last check stayed invisible for ~a day).
 /// All failures fall through to running the current binary.
-fn run_self_update() {
-    match origin_cli::updater::apply_staged_if_present() {
-        Ok(true) => eprintln!("Applied staged update from a previous run."),
-        Ok(false) => {}
-        Err(e) => tracing::warn!("updater: apply_staged_if_present failed: {e}"),
-    }
+/// Apply any staged self-update + kick off the background check. Returns `true`
+/// when a staged binary set was swapped in **this** launch — the signal the
+/// caller uses to force a daemon/supervisor restart so the freshly-applied
+/// binaries take effect now (see [`should_restart_running_daemon`]) rather than
+/// waiting for the next launch's mtime heuristic to maybe fire.
+fn run_self_update() -> bool {
+    let applied = match origin_cli::updater::apply_staged_if_present() {
+        Ok(true) => {
+            eprintln!("Applied staged update from a previous run.");
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            tracing::warn!("updater: apply_staged_if_present failed: {e}");
+            false
+        }
+    };
 
     // Fire-and-forget: the worker checks + downloads + stages in the background.
     origin_cli::updater::spawn_background_update_worker();
+    applied
 }
 
 /// Dispatch a top-level subcommand. Returns `Some(result)` for every
@@ -429,7 +441,9 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
-    run_self_update();
+    // `true` when a staged update was swapped in this launch ⇒ force a daemon
+    // restart below so the new daemon/supervisor binaries take effect now.
+    let update_applied = run_self_update();
 
     // Dispatch a subcommand if one was given, otherwise fall through to the
     // TUI entry path (preserves the existing env-driven invocation).
@@ -533,7 +547,7 @@ async fn run() -> Result<()> {
     // detached child if nothing is listening on the IPC path yet, and wait
     // for it to bind the pipe before we drop into the TUI's alt-screen.
     // (Doing this before `enable_raw_mode` keeps spawn errors readable.)
-    ensure_daemon_running(&path, &default_provider, &default_account).await?;
+    ensure_daemon_running(&path, &default_provider, &default_account, update_applied).await?;
 
     // Restore the terminal before the default panic handler prints, so a
     // backtrace lands on the normal screen instead of a corrupted raw-mode one.
@@ -705,6 +719,7 @@ fn spawn_render_task(
                     // fan-out wave is in flight (any running sub-agent); once the
                     // wave settles the slot reverts to the plan panel.
                     let agents = app.lock().swarm_agents.clone();
+                    let swarm_selected = app.lock().swarm_selected;
                     let swarm_active = agents
                         .iter()
                         .any(|a| a.status == origin_cli::tui::SwarmAgentStatus::Running);
@@ -716,7 +731,7 @@ fn spawn_render_task(
                     app.lock().draw(&mut c, &mut w);
                     if c.side_visible() {
                         if swarm_active {
-                            origin_cli::tui::draw_side_swarm(c.side_grid(), &agents, pal);
+                            origin_cli::tui::draw_side_swarm(c.side_grid(), &agents, swarm_selected, pal);
                         } else {
                             origin_cli::tui::draw_side(c.side_grid(), &lines, pal);
                         }
@@ -998,10 +1013,30 @@ async fn handle_key_event(
             origin_cli::suggestions::accept_selected(&suggestions, &mut buf);
             a.input.set_buffer(buf);
             a.recompute_suggestions();
+        } else if !a.swarm_agents.is_empty() && a.input.is_empty() {
+            // No suggestion popup + idle composer during a live swarm wave: Tab
+            // cycles the panel's agent highlight (Enter then drills into it).
+            a.swarm_cycle_selection();
         }
         drop(a);
         handle.mark_dirty();
         return KeyOutcome::Continue;
+    }
+
+    // Enter on a highlighted swarm agent (composer empty) drills into that agent's
+    // full transcript in the main pane — or, if already viewing it, toggles back
+    // to the main origin view. Normal Enter (submit) is untouched while typing or
+    // when no agent is selected. Shift+Enter (newline) is excluded.
+    if matches!(ev.code, crossterm::event::KeyCode::Enter)
+        && !ev.modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
+    {
+        let mut a = app.lock();
+        if a.swarm_selected.is_some() && a.input.is_empty() {
+            a.swarm_toggle_focus();
+            drop(a);
+            handle.mark_dirty();
+            return KeyOutcome::Continue;
+        }
     }
 
     // aider L107 opt-in vim layer: when active, route the key through the pure
@@ -2092,6 +2127,8 @@ async fn handle_prompt_turn(
     let handle_for_choice = handle.clone();
     let app_for_swarm = Arc::clone(app);
     let handle_for_swarm = handle.clone();
+    let app_for_swarm_out = Arc::clone(app);
+    let handle_for_swarm_out = handle.clone();
     // Snapshot the session effort level so this turn carries `/effort`/`/fast`.
     let effort = app.lock().effort.clone();
     // Carry the startup `--thinking-tokens` budget on every turn (aider
@@ -2339,6 +2376,18 @@ async fn handle_prompt_turn(
             drop(a);
             handle_for_swarm.mark_dirty();
         },
+        move |id: &str, part: &str, body: &str, ok: bool| {
+            // Buffer one streamed transcript line for this sub-agent. Repaint only
+            // when the user is currently viewing this agent (else it's off-screen
+            // and the buffer will be there when they focus it).
+            let mut a = app_for_swarm_out.lock();
+            a.apply_swarm_output(id, part, body, ok);
+            let viewing = a.swarm_view.as_deref() == Some(id);
+            drop(a);
+            if viewing {
+                handle_for_swarm_out.mark_dirty();
+            }
+        },
     )
     .await;
 
@@ -2478,6 +2527,10 @@ async fn call_daemon(
     // completes. A `running` status carries the live `tool` and only updates the
     // panel's current-tool line (no transcript row). `id` correlates the events.
     mut on_swarm: impl FnMut(&str, &str, &str, Option<&str>, Option<&str>) + Send,
+    // One streamed line of a sub-agent's transcript (id, part, body, ok): buffered
+    // per agent so the user can Tab→select / Enter→view that agent's conversation.
+    // `part` is "text" | "tool" | "tool_result".
+    mut on_swarm_output: impl FnMut(&str, &str, &str, bool) + Send,
 ) -> Result<(PromptReply, Duration)> {
     let start = std::time::Instant::now();
     let mut client = Connector::connect(path).await?;
@@ -2492,6 +2545,10 @@ async fn call_daemon(
         read_only,
         roots,
         permission_ask,
+        // The interactive TUI always wires the choice picker (this `call_daemon`
+        // path sets up `on_choice_ask`), so the model's `ask_user` questions
+        // surface a picker regardless of whether `/permissions` is on.
+        interactive: true,
         account: session_account(),
     });
     let body = serde_json::to_vec(&msg)?;
@@ -2578,6 +2635,12 @@ async fn call_daemon(
                     detail,
                     tool,
                 } => on_swarm(&id, &goal, &status, detail.as_deref(), tool.as_deref()),
+                StreamEvent::SwarmAgentOutput {
+                    id,
+                    part,
+                    body,
+                    ok,
+                } => on_swarm_output(&id, &part, &body, ok),
                 StreamEvent::Usage {
                     input_tokens,
                     output_tokens,
@@ -3021,6 +3084,23 @@ fn daemon_pid_path() -> Option<std::path::PathBuf> {
 
 /// Returns `true` when the daemon binary on disk is newer than the last spawn
 /// recorded in this workspace's stamp file.
+/// Whether an already-running (reachable) daemon should be torn down and
+/// respawned this launch.
+///
+/// `force_restart` is set when this launch just applied a staged self-update —
+/// [`apply_staged_if_present`](origin_cli::updater::apply_staged_if_present)
+/// swapped the on-disk `origin-daemon`/`origin-supervisor` binaries, so the
+/// *running* processes are now stale (the live process keeps executing the
+/// renamed `.old` file). We cycle them immediately rather than relying on the
+/// `binary_is_newer` mtime heuristic, which is timing-dependent and can miss —
+/// leaving the daemon frozen at the old version after an update (the
+/// "update didn't land" symptom on Windows, where a live `.exe` can't be
+/// overwritten and the swap is a rename whose mtime may predate the daemon's
+/// last spawn). Otherwise fall back to the mtime comparison.
+const fn should_restart_running_daemon(force_restart: bool, binary_is_newer: bool) -> bool {
+    force_restart || binary_is_newer
+}
+
 fn daemon_binary_is_newer(binary: &std::ffi::OsStr) -> bool {
     let Some(stamp) = daemon_stamp_path() else {
         return false;
@@ -3161,9 +3241,17 @@ const STARTUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 /// `~/.origin/config.toml` — without these, it defaults to `anthropic` and
 /// fails the initial credential lookup for any other configured provider.
 ///
-/// If a daemon is already running but the binary on disk is newer, the stale
-/// daemon is killed and a fresh one is spawned.
-async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Result<()> {
+/// If a daemon is already running but the binary on disk is newer — or
+/// `force_restart` is set because this launch just applied a staged self-update
+/// — the stale daemon (and its supervisor) are killed and a fresh one is spawned
+/// on the new binary, so the update lands immediately instead of leaving the
+/// running daemon frozen at the old version.
+async fn ensure_daemon_running(
+    path: &str,
+    provider: &str,
+    account: &str,
+    force_restart: bool,
+) -> Result<()> {
     let (cmd_path, sibling) = resolve_daemon_binary()?;
     // Supervised launch is the default: route the daemon through
     // origin-supervisor so the self-dev relaunch sentinel (exit 86) has a
@@ -3178,8 +3266,16 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
     let supervised = launcher == origin_cli::daemon_launch::Launcher::Supervisor;
 
     if daemon_reachable(path).await {
-        if daemon_binary_is_newer(&cmd_path) {
-            tracing::info!("daemon binary is newer than running daemon — restarting");
+        if should_restart_running_daemon(force_restart, daemon_binary_is_newer(&cmd_path)) {
+            if force_restart {
+                // The staged self-update we just applied swapped the daemon +
+                // supervisor binaries; cycle the running pair so the new version
+                // takes effect this session (the self-update-completion handoff).
+                eprintln!("Update applied \u{2014} restarting the origin daemon on the new version\u{2026}");
+                tracing::info!("self-update applied this launch — restarting daemon+supervisor on the new binaries");
+            } else {
+                tracing::info!("daemon binary is newer than running daemon — restarting");
+            }
             // Kill only THIS workspace's supervisor+daemon (recorded pids).
             // The pid file lists the supervisor first, so it dies before it
             // can respawn the daemon child killed right after. Other
@@ -3304,6 +3400,19 @@ async fn ensure_daemon_running(path: &str, provider: &str, account: &str) -> Res
 #[allow(clippy::panic, clippy::unwrap_used)] // panic!/unwrap are idiomatic test assertions
 mod tests {
     use super::*;
+
+    #[test]
+    fn just_applied_update_forces_a_daemon_restart_regardless_of_mtime() {
+        // A self-update applied this launch cycles the running daemon+supervisor
+        // even when the mtime heuristic says "not newer" — the case that left the
+        // daemon frozen at the old version on Windows ("update didn't land").
+        assert!(should_restart_running_daemon(true, false));
+        assert!(should_restart_running_daemon(true, true));
+        // With no fresh apply, fall back to the newer-binary mtime heuristic.
+        assert!(should_restart_running_daemon(false, true));
+        // Steady state: running daemon current, nothing applied ⇒ no restart.
+        assert!(!should_restart_running_daemon(false, false));
+    }
 
     // Regression: `is_slash_command` is the gate that decides whether a Submit
     // routes to `handle_submit` (inline) or to the model. Reserved slash verbs

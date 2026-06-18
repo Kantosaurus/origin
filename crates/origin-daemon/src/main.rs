@@ -546,6 +546,15 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     };
     info!("swarm coordinator ready");
 
+    // Daemon-wide registry of DETACHED background sub-agents (non-blocking Task):
+    // a `Task` with `background:true` (default) registers its worker here and the
+    // turn returns immediately; finished results are drained at the next turn's
+    // start or via `CollectTasks`. Lives beside the Coordinator (both outlive
+    // every turn). In-memory: a daemon restart empties it (drain reconciles any
+    // surviving-but-vanished references to `aborted`).
+    let background_jobs: Arc<origin_daemon::bg_jobs::BackgroundJobs> =
+        Arc::new(origin_daemon::bg_jobs::BackgroundJobs::new());
+
     let skill_catalog: Arc<SkillCatalog> = {
         let home = std::env::var_os("ORIGIN_HOME")
             .map(std::path::PathBuf::from)
@@ -724,6 +733,7 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
             Arc::clone(&code_graph),
             Arc::clone(&mem_router),
             Arc::clone(&coordinator),
+            Arc::clone(&background_jobs),
             wire_plan.clone(),
             path.clone(),
         );
@@ -836,6 +846,7 @@ fn spawn_handler_task(
     code_graph: Arc<tokio::sync::Mutex<CodeGraphIndex>>,
     mem_router: Arc<dyn origin_codegraph::ask::MemRouter>,
     coordinator: Arc<Coordinator>,
+    background_jobs: Arc<origin_daemon::bg_jobs::BackgroundJobs>,
     wire_plan: origin_planner::Plan,
     sock_path: String,
 ) {
@@ -979,6 +990,7 @@ fn spawn_handler_task(
                         Arc::clone(&code_graph),
                         Arc::clone(&mem_router),
                         Arc::clone(&coordinator),
+                        Arc::clone(&background_jobs),
                         wire_plan.clone(),
                         Arc::clone(&active_goal),
                         Arc::clone(&pending_message),
@@ -1652,6 +1664,24 @@ enum TurnEnd {
     Interrupted(InterruptOutcome),
 }
 
+/// Whether to wire the interactive choice registry for this turn — i.e. whether
+/// the model's `ask_user` / `AskUserQuestion` tool should pause and surface an
+/// interactive picker (vs. degrade to the prose "ask in your next message"
+/// fallback).
+///
+/// This must be ON for any session with a human who can answer — the
+/// interactive TUI — and OFF for headless / scheduled / swarm-worker turns where
+/// a `ChoiceAsk` would hang forever with no one to answer it. It was previously
+/// gated only on `permission_ask` (the `/permissions on` opt-in), which wrongly
+/// coupled the agent's *questions* to *tool-permission prompting*: a normal TUI
+/// session that never enabled `/permissions` got the prose fallback. The
+/// interactive CLI now sends `interactive: true` on every prompt, so the picker
+/// works there regardless of permission mode; `permission_ask` is still honored
+/// for back-compat (an old client that only set that flag still gets the picker).
+const fn choice_registry_enabled(interactive: bool, permission_ask: bool) -> bool {
+    interactive || permission_ask
+}
+
 /// Resolve the effective reasoning effort for a turn.
 ///
 /// An explicit per-request effort (the CLI's `/effort` / `/fast`) always wins.
@@ -1687,6 +1717,7 @@ async fn handle_request(
     code_graph: Arc<tokio::sync::Mutex<CodeGraphIndex>>,
     mem_router: Arc<dyn origin_codegraph::ask::MemRouter>,
     coordinator: Arc<Coordinator>,
+    background_jobs: Arc<origin_daemon::bg_jobs::BackgroundJobs>,
     plan: origin_planner::Plan,
     active_goal: Arc<tokio::sync::Mutex<Option<origin_goal::GoalState>>>,
     pending_message: Arc<tokio::sync::Mutex<Option<ClientMessage>>>,
@@ -1845,13 +1876,14 @@ async fn handle_request(
             // cap the compactor is a no-op ⇒ short sessions stay byte-identical.
             proposer: memory.map(|m| Arc::clone(&m.proposer)),
             event_tx: Some(event_tx.clone()),
-            // Wire the interactive `ask_user` pause-await only when the turn
-            // opted into interactive prompting (the same `permission_ask` flag
-            // the interactive CLI sets). A non-opted-in turn (headless / swarm /
-            // scripted) leaves this `None`, so `ask_user` degrades to the prose
-            // instruction — byte-identical to having no interactive channel and
-            // never emitting a `ChoiceAsk` a non-interactive client can't answer.
-            choice_registry: req.permission_ask.then(|| Arc::clone(&choice_registry)),
+            // Wire the interactive `ask_user` pause-await for any turn from a
+            // human-answerable session — the interactive TUI sets `interactive`,
+            // and an old client that only set `permission_ask` still qualifies
+            // (see `choice_registry_enabled`). A headless / scheduled / swarm
+            // turn sets neither ⇒ `None` ⇒ `ask_user` degrades to the prose
+            // instruction, so a `ChoiceAsk` no one can answer is never emitted.
+            choice_registry: choice_registry_enabled(req.interactive, req.permission_ask)
+                .then(|| Arc::clone(&choice_registry)),
             injector: memory.and_then(|m| m.injector.clone()),
             proposal_registry: Some(Arc::clone(&proposal_registry)),
             skills: {
@@ -1877,6 +1909,7 @@ async fn handle_request(
             workflows: Some(Arc::clone(&workflows_catalog)),
             memory_handle: memory_handle.clone(),
             coordinator: Some(Arc::clone(&coordinator)),
+            background_jobs: Some(Arc::clone(&background_jobs)),
             plan: Some(plan.clone()),
             // ^ shared with the Anthropic provider's wire-encoder via the
             // `Arc<RwLock<…>>` inside `Plan`. The dispatch loop registers
@@ -4264,8 +4297,8 @@ fn spawn_metrics_endpoint(metrics: Metrics, addr: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        detach_last_turn, resolve_turn_effort, resume_foreign_event, resume_session_event, turn_window,
-        Session, SessionStore, StreamEvent,
+        choice_registry_enabled, detach_last_turn, resolve_turn_effort, resume_foreign_event,
+        resume_session_event, turn_window, Session, SessionStore, StreamEvent,
     };
     use origin_core::types::{Block, Message, Role};
     use origin_provider::ReasoningEffort;
@@ -4293,6 +4326,20 @@ mod tests {
     fn non_anthropic_providers_stay_unset_for_a_byte_identical_wire() {
         assert_eq!(resolve_turn_effort(None, "openai"), None);
         assert_eq!(resolve_turn_effort(None, "gemini"), None);
+    }
+
+    #[test]
+    fn interactive_session_enables_ask_user_picker_without_permission_prompting() {
+        // The bug: a normal interactive TUI turn (interactive=true) that never
+        // ran `/permissions on` (permission_ask=false) must STILL get the
+        // `ask_user` choice picker — not the "interactive prompting is not
+        // available" prose fallback.
+        assert!(choice_registry_enabled(true, false), "interactive TUI ⇒ picker");
+        // Back-compat: an old client that only set permission_ask still works.
+        assert!(choice_registry_enabled(false, true));
+        assert!(choice_registry_enabled(true, true));
+        // Headless / scheduled / swarm (neither flag) ⇒ no picker (would hang).
+        assert!(!choice_registry_enabled(false, false));
     }
 
     fn msg(role: Role, text: &str) -> Message {

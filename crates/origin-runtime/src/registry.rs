@@ -31,16 +31,24 @@ fn permits_for(class: TaskClass) -> usize {
 
 /// Execution-lane ceiling for [`TaskClass::Swarm`] — a deliberately HIGH,
 /// coarse runaway backstop, not the real limiter. Swarm worker concurrency is
-/// bound by the memory-governed `AdmissionGate` in `origin-swarm`; this
-/// semaphore exists only to keep the `spawn_in` contract intact (every task
-/// acquires a permit) and to cap a pathological runaway. Overridable via
-/// `ORIGIN_SWARM_LANE_MAX`; defaults to `(cores * 8).max(64)`.
+/// bound by the memory-governed `AdmissionGate` in `origin-swarm` (now
+/// unlimited by default); this semaphore exists only to keep the `spawn_in`
+/// contract intact (every task acquires a permit) and to cap a pathological
+/// runaway. **Effectively unlimited by default** (`SWARM_LANE_UNLIMITED`,
+/// 1,048,576 permits — never binds for any real fan-out); override with
+/// `ORIGIN_SWARM_LANE_MAX=<n>` to re-impose a smaller lane.
 fn swarm_lane_ceiling(cores: usize) -> usize {
+    /// Flat high backstop: large enough to never bind a realistic swarm, small
+    /// enough to stay well under tokio's `Semaphore::MAX_PERMITS`.
+    const SWARM_LANE_UNLIMITED: usize = 1 << 20;
+    // `cores` is retained for signature symmetry with `permits_for` but no longer
+    // scales the default — the lane is a flat high backstop, not a per-core cap.
+    let _ = cores;
     std::env::var("ORIGIN_SWARM_LANE_MAX")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or_else(|| (cores * 8).max(64))
+        .unwrap_or(SWARM_LANE_UNLIMITED)
 }
 
 pub(crate) fn registry() -> &'static Registry {

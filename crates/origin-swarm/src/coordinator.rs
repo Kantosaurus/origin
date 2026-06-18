@@ -93,6 +93,15 @@ impl WorkerHandle {
     pub const fn id(&self) -> WorkerId {
         self.id
     }
+
+    /// Construct a handle from a raw id. TEST ONLY — exercises the background-job
+    /// registry / orphan-reconcile paths without spawning a real worker. In
+    /// production handles come only from [`Coordinator::spawn`].
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn from_raw_for_test(id: u128) -> Self {
+        Self { id: WorkerId(id) }
+    }
 }
 
 /// Per-worker bookkeeping kept inside the coordinator's map.
@@ -377,6 +386,49 @@ impl Coordinator {
             .clone()
             .ok_or_else(|| SwarmError::Lifecycle("done published but report slot empty".into()))?;
         Ok(report)
+    }
+
+    /// Non-blocking reap: peek a worker's lifecycle WITHOUT awaiting a change, so
+    /// a background reaper can poll detached workers without parking.
+    ///
+    /// Returns `None` while the worker is still running (not yet terminal). On a
+    /// terminal state it returns the same result [`Self::await_completion`]
+    /// would: `Some(Ok(report))` on `Done`, `Some(Err(..))` on `Failed`. An
+    /// unknown handle (never registered, or already evicted / lost to a restart)
+    /// reads as a vanished worker — `Some(Err(Lifecycle))` — so a caller can
+    /// reconcile it to a terminal result instead of waiting forever.
+    pub async fn try_completion(
+        &self,
+        handle: &WorkerHandle,
+    ) -> Option<Result<CompletionReport, SwarmError>> {
+        let map = self.workers.lock().await;
+        let Some(state) = map.get(&handle.id) else {
+            return Some(Err(SwarmError::Lifecycle(format!(
+                "unknown worker {:032x}",
+                handle.id.value()
+            ))));
+        };
+        let snapshot = state.lifecycle_rx.borrow().clone();
+        let slot = Arc::clone(&state.report_slot);
+        drop(map);
+        match snapshot {
+            Lifecycle::Done => Some(
+                slot.lock()
+                    .await
+                    .clone()
+                    .ok_or_else(|| SwarmError::Lifecycle("done published but report slot empty".into())),
+            ),
+            Lifecycle::Failed { reason } => Some(Err(SwarmError::Worker(reason))),
+            _ => None,
+        }
+    }
+
+    /// Remove a reaped worker's state from the registry — the `workers` map is
+    /// otherwise never pruned, so a long session that fans out many sub-agents
+    /// would accumulate dead entries. Call after reaping a terminal worker
+    /// (`try_completion`/`await_completion`). Idempotent for an unknown id.
+    pub async fn evict(&self, handle: &WorkerHandle) {
+        self.workers.lock().await.remove(&handle.id);
     }
 
     /// Test-only helper: returns a clone of the most recently completed

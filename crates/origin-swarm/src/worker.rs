@@ -59,6 +59,13 @@ pub enum WorkerProgress {
     /// The worker began using the named tool (its display name), so the panel
     /// can show what this sub-agent is doing right now.
     ToolStarted(String),
+    /// A streamed chunk of the sub-agent's assistant text — for the focused
+    /// full-transcript view of this worker. Empty when the worker runs without a
+    /// transcript consumer (non-streaming).
+    AssistantText(String),
+    /// A tool's result preview (tool name, success, truncated output) — the
+    /// transcript view renders it under the tool-start line.
+    ToolResult { tool: String, ok: bool, preview: String },
 }
 
 /// Unbounded sender for [`WorkerProgress`]. Unbounded so the worker's hot path

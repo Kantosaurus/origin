@@ -1505,6 +1505,37 @@ fn render_swarm_notices(msgs: &[origin_swarm::Message]) -> String {
     block
 }
 
+/// Render finished BACKGROUND sub-agent results into a `<background-results>`
+/// block for the next turn's trailing context (non-blocking swarm delivery).
+///
+/// Mirrors [`render_swarm_notices`]: one bullet per reaped job (status, goal,
+/// summary; follow-ups if any). An EMPTY slice yields an EMPTY string so a turn
+/// with no finished background jobs stays byte-identical (no block, no
+/// prompt-cache churn). Delivered as PROSE, never a detached `Block::ToolResult`
+/// — the originating `Task` `tool_use` was already closed with the dispatched
+/// placeholder in a prior turn, so a late `ToolResult` would orphan (400).
+fn render_background_results(results: &[crate::bg_jobs::BgResult]) -> String {
+    use std::fmt::Write as _;
+    if results.is_empty() {
+        return String::new();
+    }
+    let mut block = String::from(
+        "<background-results>\nBackground sub-agents you dispatched have finished. \
+         Incorporate their findings into your reply.\n",
+    );
+    for r in results {
+        let o = &r.output;
+        let _ = writeln!(block, "- [{}] {}: {}", o.status, r.goal, o.summary.trim());
+        if !o.follow_ups.is_empty() {
+            block.push_str("    follow-ups: ");
+            block.push_str(&o.follow_ups.join("; "));
+            block.push('\n');
+        }
+    }
+    block.push_str("</background-results>");
+    block
+}
+
 /// Drain THIS worker's own mailbox and render the pending notices into a
 /// `<swarm-notices>` block for the next turn (A4).
 ///
@@ -1911,6 +1942,46 @@ mod swarm_collab_wiring_tests {
         );
     }
 
+    /// `render_background_results`: empty ⇒ empty string (byte-identical turn);
+    /// non-empty ⇒ ONE `<background-results>` block listing each finished job's
+    /// status / goal / summary (+ follow-ups), delivered as PROSE so a detached
+    /// result never needs a (would-be-orphan) `tool_result`.
+    #[test]
+    fn render_background_results_block_shapes() {
+        use crate::bg_jobs::BgResult;
+        use origin_tools::builtins::task::TaskOutput;
+        assert!(render_background_results(&[]).is_empty(), "none finished ⇒ no block");
+        let results = [
+            BgResult {
+                id_hex: "00aa".into(),
+                goal: "audit ipc".into(),
+                output: TaskOutput {
+                    status: "completed".into(),
+                    summary: "found 2 issues".into(),
+                    files_touched: vec![],
+                    follow_ups: vec!["fix the handshake".into()],
+                },
+            },
+            BgResult {
+                id_hex: "00bb".into(),
+                goal: "audit swarm".into(),
+                output: TaskOutput {
+                    status: "aborted".into(),
+                    summary: "worker vanished".into(),
+                    files_touched: vec![],
+                    follow_ups: vec![],
+                },
+            },
+        ];
+        let r = render_background_results(&results);
+        assert!(r.starts_with("<background-results>"), "opens block: {r}");
+        assert!(r.trim_end().ends_with("</background-results>"), "closes block: {r}");
+        assert_eq!(r.matches("<background-results>").count(), 1, "one shared block: {r}");
+        assert!(r.contains("audit ipc") && r.contains("found 2 issues"), "lists completed: {r}");
+        assert!(r.contains("audit swarm") && r.contains("aborted"), "lists aborted: {r}");
+        assert!(r.contains("fix the handshake"), "lists follow-ups: {r}");
+    }
+
     /// `drain_own_swarm_notices` (A4): the drain→render step a worker runs at the
     /// turn boundary. With no `mailboxes` map ⇒ empty (nothing to drain). With a
     /// map whose entry holds a pending notice ⇒ a `<swarm-notices>` block AND the
@@ -2047,6 +2118,14 @@ pub struct LoopOptions {
     /// Task spawns a noop (P9.6) or real (P9.8+) worker and returns the
     /// structured `TaskOutput` JSON.
     pub coordinator: Option<Arc<origin_swarm::Coordinator>>,
+    /// Daemon-wide background-job registry for non-blocking `Task` dispatch. When
+    /// `Some` (the interactive/normal daemon path), a `Task` with `background:true`
+    /// (the default) registers its detached worker here and the turn returns
+    /// WITHOUT awaiting it — the main agent stays responsive while sub-agents run.
+    /// Finished results are drained at the next turn's start (a `<background-results>`
+    /// block) or via `CollectTasks`. `None` (tests / non-daemon) ⇒ every Task awaits
+    /// in-turn, byte-identical to the pre-background behaviour.
+    pub background_jobs: Option<Arc<crate::bg_jobs::BackgroundJobs>>,
     /// Optional N4.3 handle→band index, shared with the active provider's
     /// wire-encoder (the Anthropic provider's `expand_messages_for_wire`
     /// reads `band_for_handle` to decide `Inline` vs `Reference`). When
@@ -2229,6 +2308,7 @@ impl Default for LoopOptions {
             workflows: None,
             memory_handle: None,
             coordinator: None,
+            background_jobs: None,
             plan: None,
             goal: Arc::new(tokio::sync::Mutex::new(None)),
             policy: None,
@@ -3419,6 +3499,17 @@ async fn run_loop_inner(
         // empty string ⇒ nothing appended ⇒ byte-identical turn. Draining
         // consumes the notices so each is shown exactly once.
         let swarm_notices_block = SWARM_COLLAB.try_with(drain_own_swarm_notices).unwrap_or_default();
+        // Non-blocking swarm delivery: drain any background sub-agents that have
+        // FINISHED and fold their results into this turn's trailing context as a
+        // `<background-results>` block. Draining removes them (delivered once).
+        // Empty (none finished, or no registry) ⇒ empty string ⇒ byte-identical.
+        // Skipped for self-dispatch sessions (their ids never hold user jobs).
+        let bg_results_block = match (opts.background_jobs.as_deref(), opts.coordinator.as_deref()) {
+            (Some(bg), Some(coord)) if !is_self_dispatch_session(&session.id) => {
+                render_background_results(&bg.drain_terminal(&session.id, coord).await)
+            }
+            _ => String::new(),
+        };
         // Per-turn system prompt. When the optional post-edit LSP-diagnostics
         // feature produced a block on the previous turn, append it here so the
         // model sees the feedback its edit generated. The swarm-notices block (if
@@ -3435,7 +3526,7 @@ async fn run_loop_inner(
         // invalidating that whole prefix on every request.
         let volatile_context = {
             let mut blocks: Vec<&str> = Vec::new();
-            for b in [&goal_block, &lsp_diag_block, &swarm_notices_block] {
+            for b in [&goal_block, &lsp_diag_block, &swarm_notices_block, &bg_results_block] {
                 if !b.is_empty() {
                     blocks.push(b);
                 }
@@ -4165,6 +4256,15 @@ async fn run_loop_inner(
                                 input.model = Some(session.model.clone());
                             }
                             let goal = input.goal.clone();
+                            // Non-blocking dispatch: background:true (the default)
+                            // registers the worker and returns the turn immediately;
+                            // background:false (or no registry / cap reached / the
+                            // ORIGIN_SWARM_BG=0 global off-switch) awaits it in-turn.
+                            // Captured before `input` is moved below.
+                            let bg_env_on =
+                                std::env::var("ORIGIN_SWARM_BG").map_or(true, |v| v != "0");
+                            let background =
+                                input.background && opts.background_jobs.is_some() && bg_env_on;
                             // Live current-tool feed: hand the worker a progress
                             // sink (only when this connection has an event stream
                             // to relay onto). Each tool the sub-agent starts comes
@@ -4183,10 +4283,21 @@ async fn run_loop_inner(
                             {
                                 Ok(handle) => {
                                     let idx = tool_results.len();
+                                    // Pair the tool_use NOW with a placeholder. For a
+                                    // background dispatch this body is FINAL (the real
+                                    // report arrives in a later turn as prose, never as
+                                    // a detached ToolResult — that would orphan/400);
+                                    // for an in-turn await it is overwritten post-await.
+                                    let placeholder: &[u8] = if background {
+                                        b"(sub-agent dispatched; running in background \
+                                          \xe2\x80\x94 result delivered when ready, or via CollectTasks)"
+                                    } else {
+                                        b"(sub-agent dispatched)"
+                                    };
                                     tool_results.push(Block::ToolResult {
                                         tool_use_id: id.clone(),
                                         handle: None,
-                                        inline: Some(b"(sub-agent dispatched)".to_vec()),
+                                        inline: Some(placeholder.to_vec()),
                                         cache_marker: None,
                                     });
                                     // Surface the new swarm agent to the TUI live, keyed by
@@ -4204,32 +4315,85 @@ async fn run_loop_inner(
                                                 tool: None,
                                             })
                                             .await;
-                                        // Forward each tool the worker starts as a
-                                        // `running` event until the worker finishes
-                                        // (its progress channel closes). Realtime relay,
-                                        // like every other daemon background task.
+                                        // Relay the worker's live progress until it
+                                        // finishes (its channel closes): a tool-start
+                                        // updates the panel's current-tool line AND
+                                        // appends to the agent's transcript; assistant
+                                        // text + tool results append to the transcript
+                                        // (for the focused full-conversation view).
+                                        // Realtime relay, like every daemon bg task.
                                         if let Some(mut rx) = progress_rx {
                                             let ev_tx = tx.clone();
                                             // Detached relay: drop the handle (runs on its own).
                                             drop(spawn_in(TaskClass::Realtime, async move {
-                                                while let Some(
-                                                    origin_swarm::WorkerProgress::ToolStarted(tool),
-                                                ) = rx.recv().await
-                                                {
+                                                use origin_swarm::WorkerProgress as P;
+                                                while let Some(p) = rx.recv().await {
+                                                    let out = match p {
+                                                        P::ToolStarted(tool) => {
+                                                            // Panel current-tool line.
+                                                            let _ = ev_tx
+                                                                .send(StreamEvent::SwarmWorker {
+                                                                    id: worker_id.clone(),
+                                                                    goal: goal_preview.clone(),
+                                                                    status: "running".to_string(),
+                                                                    detail: None,
+                                                                    tool: Some(tool.clone()),
+                                                                })
+                                                                .await;
+                                                            ("tool".to_string(), tool, false)
+                                                        }
+                                                        P::AssistantText(text) => {
+                                                            ("text".to_string(), text, false)
+                                                        }
+                                                        P::ToolResult { tool, ok, preview } => (
+                                                            "tool_result".to_string(),
+                                                            format!("{tool}: {preview}"),
+                                                            ok,
+                                                        ),
+                                                    };
                                                     let _ = ev_tx
-                                                        .send(StreamEvent::SwarmWorker {
+                                                        .send(StreamEvent::SwarmAgentOutput {
                                                             id: worker_id.clone(),
-                                                            goal: goal_preview.clone(),
-                                                            status: "running".to_string(),
-                                                            detail: None,
-                                                            tool: Some(tool),
+                                                            part: out.0,
+                                                            body: out.1,
+                                                            ok: out.2,
                                                         })
                                                         .await;
                                                 }
                                             }));
                                         }
                                     }
-                                    pending_tasks.push((idx, id, goal, handle));
+                                    // Route the spawned worker: background ⇒ register
+                                    // it and let the turn return without awaiting (the
+                                    // placeholder above is its final in-turn result);
+                                    // else (or if the per-session cap is reached) push
+                                    // to pending_tasks for the end-of-loop await.
+                                    // `handle` is Copy, so it serves both paths.
+                                    let registered = if background {
+                                        if let Some(bg) = opts.background_jobs.as_deref() {
+                                            bg.register(
+                                                &session.id,
+                                                crate::bg_jobs::BgJob {
+                                                    id_hex: swarm_worker_id_hex(handle.id()),
+                                                    goal: goal.clone(),
+                                                    handle,
+                                                    dispatched_at: std::time::Instant::now(),
+                                                },
+                                            )
+                                            .await
+                                            .is_ok()
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    };
+                                    if !registered {
+                                        // Cap reached or background:false ⇒ await in-turn
+                                        // (the placeholder is overwritten with the real
+                                        // report after the loop). Never drops work.
+                                        pending_tasks.push((idx, id, goal, handle));
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!(error = %e, "Task spawn failed; returning error to model");
@@ -4253,6 +4417,42 @@ async fn run_loop_inner(
                     }
                     continue;
                 }
+            }
+
+            // CollectTasks: gather background sub-agents on demand. Drains this
+            // session's FINISHED jobs (delivered in-turn as this tool's result —
+            // the tool_use pairs in-turn, so no orphan/400) and lists the ones
+            // still running. Intercepted here like Task (it needs the registry +
+            // coordinator + session id). Drained jobs are removed, so they are
+            // not ALSO injected as `<background-results>` next turn.
+            if name == "CollectTasks" {
+                let body = match (opts.background_jobs.as_deref(), opts.coordinator.as_deref()) {
+                    (Some(bg), Some(coord)) => {
+                        let finished = bg.drain_terminal(&session.id, coord).await;
+                        let still = bg.pending(&session.id).await;
+                        serde_json::json!({
+                            "finished": finished.iter().map(|r| serde_json::json!({
+                                "id": r.id_hex,
+                                "goal": r.goal,
+                                "status": r.output.status,
+                                "summary": r.output.summary,
+                                "files_touched": r.output.files_touched,
+                                "follow_ups": r.output.follow_ups,
+                            })).collect::<Vec<_>>(),
+                            "still_running": still.iter().map(|(id, goal)| serde_json::json!({
+                                "id": id, "goal": goal,
+                            })).collect::<Vec<_>>(),
+                        })
+                    }
+                    _ => serde_json::json!({ "finished": [], "still_running": [] }),
+                };
+                tool_results.push(Block::ToolResult {
+                    tool_use_id: id,
+                    handle: None,
+                    inline: Some(serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec())),
+                    cache_marker: None,
+                });
+                continue;
             }
 
             // Stage C5 Task 1/2: time the tool-execution wall-clock. The clock
@@ -5882,6 +6082,13 @@ async fn dispatch_tool(
                 .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
             serde_json::to_string(&output).map_err(|e| LoopError::ToolFailure(format!("Task: json: {e}")))
         }
+        // ── CollectTasks (gather background sub-agents) ──
+        // The real handling lives in `run_loop` (it needs the live background-job
+        // registry + coordinator + session id). Reaching `dispatch_tool` means no
+        // background registry is wired (headless / swarm sub-agent / test) — so
+        // there are no background jobs to gather. Return an empty result rather
+        // than `UnknownTool` (the tool is advertised, so it must be recognized).
+        "CollectTasks" => Ok("{\"finished\":[],\"still_running\":[]}".to_string()),
         // ── Gmail (read-only; permission-gated) ──
         // Loads Google creds from the keyvault, mints a token, and runs the
         // requested op (search | get | list_threads). Mirrors WebFetch's error

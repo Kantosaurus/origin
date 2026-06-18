@@ -54,6 +54,17 @@ pub struct PromptRequest {
     /// tool execution are byte-identical. Headless/swarm never set this.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub permission_ask: bool,
+    /// Whether this turn comes from an **interactive** session with a human who
+    /// can answer prompts (the TUI). When `true`, the daemon wires the choice
+    /// registry so the model's `ask_user` / `AskUserQuestion` tool surfaces an
+    /// interactive picker; when `false` (the default — headless `origin run`,
+    /// scheduled/webhook self-dispatch, swarm workers) it degrades to the prose
+    /// "ask in your next message" fallback so a `ChoiceAsk` never hangs with no
+    /// one to answer it. Kept distinct from `permission_ask` on purpose: the
+    /// agent's questions must work in a normal TUI session regardless of whether
+    /// interactive *permission prompting* was enabled. `false` ⇒ wire byte-identical.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interactive: bool,
     /// Per-request account override for credential resolution. The interactive
     /// CLI stamps the session's active account (set via `/account`) onto EVERY
     /// prompt, because it opens a fresh daemon connection per prompt — so a
@@ -431,6 +442,23 @@ pub enum StreamEvent {
         /// `None` otherwise. Drives the panel's live current-tool line.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool: Option<String>,
+    },
+    /// One line of a swarm sub-agent's live transcript, streamed so the TUI can
+    /// buffer it per agent and render the agent's full conversation when the user
+    /// focuses it (Tab to select, Enter to view). Emitted only for an interactive
+    /// session watching the swarm; headless/scheduled turns never stream these.
+    SwarmAgentOutput {
+        /// Stable hex worker id (matches the `id` on this agent's `SwarmWorker`).
+        id: String,
+        /// `"text"` (a chunk of assistant prose), `"tool"` (a tool-start line),
+        /// or `"tool_result"` (a tool's output preview). (Named `part`, not
+        /// `kind`, because the enum is internally tagged on a `kind` field.)
+        part: String,
+        /// The assistant-text chunk, the tool name, or the result preview.
+        body: String,
+        /// For `kind == "tool_result"`: whether the tool succeeded. Ignored otherwise.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        ok: bool,
     },
     TurnEnd,
     /// Opt-in interactive permission ask (gated by
@@ -1069,6 +1097,32 @@ mod permission_wire_tests {
             !json.contains("permission_ask"),
             "default request omits the flag: {json}"
         );
+    }
+
+    #[test]
+    fn interactive_defaults_off_omitted_when_false_and_round_trips_when_set() {
+        // Default off ⇒ omitted (wire byte-identical for an old client).
+        let req = PromptRequest {
+            user_text: "hi".to_string(),
+            ..Default::default()
+        };
+        assert!(!req.interactive);
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(!json.contains("interactive"), "default omits the flag: {json}");
+        // An old client's frame (no `interactive` key) deserializes to false.
+        let back: PromptRequest =
+            serde_json::from_str(r#"{"system":"","model":"m","user_text":"hi"}"#).expect("de");
+        assert!(!back.interactive, "missing key ⇒ false (back-compat)");
+        // The interactive TUI sets it; it serializes + round-trips.
+        let req = PromptRequest {
+            user_text: "hi".to_string(),
+            interactive: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains("\"interactive\":true"), "json was: {json}");
+        let back: PromptRequest = serde_json::from_str(&json).expect("deserialize");
+        assert!(back.interactive);
     }
 
     #[test]

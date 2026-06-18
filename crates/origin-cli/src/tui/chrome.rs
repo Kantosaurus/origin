@@ -370,19 +370,8 @@ pub fn draw_status(grid: &mut Grid, region: Region, st: &StatusCtx, tok: &Tokens
         use std::fmt::Write as _;
 
         let row = region.top;
-        let mut col = left;
 
-        // Spinner + phase on the left.
-        if let Some(spin) = &st.spinner {
-            col = put_str(grid, row, col, right, spin, Cs::plain(tok.accent, 0));
-            col = put_str(grid, row, col, right, " ", Cs::plain(0, 0));
-        }
-        if let Some(phase) = &st.phase {
-            let fg = if st.in_flight { tok.body } else { tok.muted };
-            col = put_str(grid, row, col, right, phase, Cs::plain(fg, 0));
-        }
-
-        // Right-aligned metrics: <model> · ↑<in> ↓<out> · $<cost>.
+        // Build the right-aligned metrics: <model> · ↑<in> ↓<out> · $<cost>.
         // The model sits here now (moved off the top strip) so the build's model
         // reads alongside its token spend. `↑` = outgoing (input) tokens, `↓` =
         // incoming (output) tokens.
@@ -400,11 +389,27 @@ pub fn draw_status(grid: &mut Grid, region: Region, st: &StatusCtx, tok: &Tokens
             let _ = write!(metrics, "{SEP}${cost:.4}");
         }
         let mw = str_width(&metrics);
-        if mw < region.width {
-            // Right-align, but never overwrite the left run (spinner/phase).
-            let mstart = right.saturating_sub(mw).max(col);
-            let _ = put_str(grid, row, mstart, right, &metrics, Cs::fga(tok.muted, Attr::DIM));
+
+        // The metrics are the PRIORITY readout: reserve their right-aligned slot
+        // FIRST, then clip the spinner/phase to the space left of them. A long
+        // phase (e.g. the `⎇ N/M agents` swarm readout) — or a narrowed status
+        // zone when the swarm side panel steals width — can no longer push the
+        // model/token/cost line off the row (it used to vanish entirely).
+        let mstart = right.saturating_sub(mw).max(left);
+        let phase_right = mstart; // hard stop so the phase never overwrites metrics
+
+        let mut col = left;
+        if let Some(spin) = &st.spinner {
+            col = put_str(grid, row, col, phase_right, spin, Cs::plain(tok.accent, 0));
+            col = put_str(grid, row, col, phase_right, " ", Cs::plain(0, 0));
         }
+        if let Some(phase) = &st.phase {
+            let fg = if st.in_flight { tok.body } else { tok.muted };
+            let _ = put_str(grid, row, col, phase_right, phase, Cs::plain(fg, 0));
+        }
+        // Always render the metrics (right-aligned; clipped to the zone only when
+        // the whole zone is narrower than the metrics themselves).
+        let _ = put_str(grid, row, mstart, right, &metrics, Cs::fga(tok.muted, Attr::DIM));
     }
 
     // Full-width rule.
@@ -469,6 +474,31 @@ mod tests {
         ctx.branch = None;
         draw_top(&mut grid, Region::new(0, 0, 100, 1), &ctx, &tok);
         assert!(find_col(&grid, 0, BRANCH).is_none(), "no ⎇ when branch None");
+    }
+
+    #[test]
+    fn status_metrics_survive_a_long_phase_in_a_narrow_zone() {
+        // Regression: with the swarm side panel active the status zone is narrow
+        // AND the phase carried the `⎇ N/M agents` readout — the model/token/cost
+        // metrics used to vanish entirely (the `mw < region.width` guard dropped
+        // them). They are the priority readout and must always render.
+        let mut grid = Grid::new(40, 2);
+        let tok = Tokens::default_tokens();
+        let st = StatusCtx {
+            spinner: None,
+            phase: Some("\u{2387} 3/3 agents running".to_string()),
+            model: "claude-opus-4-8".to_string(),
+            input_tokens: 14_000,
+            output_tokens: 75_300,
+            cost: Some(72.027),
+            in_flight: true,
+        };
+        draw_status(&mut grid, Region::new(0, 0, 40, 2), &st, &tok);
+        let row0: String = (0..grid.cols()).map(|c| glyph_at(&grid, 0, c)).collect();
+        assert!(
+            row0.contains("claude-opus-4-8"),
+            "model/metrics must stay visible in a narrow zone, got: {row0:?}"
+        );
     }
 
     #[test]

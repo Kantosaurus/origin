@@ -207,6 +207,8 @@ pub async fn run(args: RunArgs) -> Result<()> {
         read_only: false,
         roots,
         permission_ask: false,
+        // Headless is non-interactive: no human to answer an `ask_user` picker.
+        interactive: false,
         // Headless is one-shot and never switches accounts mid-session, so the
         // daemon resolves the startup/global account ⇒ wire byte-identical.
         account: None,
@@ -262,6 +264,7 @@ async fn run_structured(
             read_only: false,
             roots: roots.clone(),
             permission_ask: false,
+            interactive: false,
             account: None,
         };
         let reply = drive_turn(conn, prompt, Emit::Silent).await?;
@@ -352,6 +355,7 @@ pub async fn one_shot_text(model: &str, user_text: String) -> Result<String> {
         read_only: true,
         roots: Vec::new(),
         permission_ask: false,
+        interactive: false,
         account: None,
     };
     drive_turn(&mut conn, prompt, Emit::Silent).await

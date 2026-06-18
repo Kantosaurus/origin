@@ -109,6 +109,7 @@ async fn memory_proposed_round_trip_via_stub_provider() {
             workflows: None,
             memory_handle: None,
             coordinator: None,
+            background_jobs: None,
             plan: None,
             goal: Arc::new(tokio::sync::Mutex::new(None)),
             policy: None,
