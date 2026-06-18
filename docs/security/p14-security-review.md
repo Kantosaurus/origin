@@ -1,6 +1,6 @@
-# P14 Security Review Signoff
+﻿# P14 Security Review Signoff
 
-Spec criterion 4 — "Security review pass on sandbox profiles + KeyVault" —
+Spec criterion 4 ΓÇö "Security review pass on sandbox profiles + KeyVault" ΓÇö
 is satisfied by completing each item below with the date + reviewer.
 
 ## Sandbox profiles
@@ -8,7 +8,7 @@ is satisfied by completing each item below with the date + reviewer.
 - [ ] **Linux**: namespace + seccomp + landlock applied for every AutoAllowed tool. Verified by `crates/origin-sandbox/tests/linux_*.rs`. Reviewer / date: ____
 - [ ] **macOS**: `sandbox-exec` profiles deny network for AutoAllowed; allow only for explicitly-widened tools. Verified by `crates/origin-sandbox/tests/macos_*.rs`. Reviewer / date: ____
 - [ ] **Windows**: AppContainer + JobObject CPU/RAM caps. Verified by `crates/origin-sandbox/tests/windows_*.rs`. Reviewer / date: ____
-- [ ] **Hook scripts inherit triggering tool's profile** (no escalation). Spec §10D N10.12. Reviewer / date: ____
+- [ ] **Hook scripts inherit triggering tool's profile** (no escalation). Spec ┬º10D N10.12. Reviewer / date: ____
 
 ## KeyVault
 
@@ -20,16 +20,16 @@ is satisfied by completing each item below with the date + reviewer.
 
 ## MCP
 
-- [ ] **Message validation** at the buffer layer with 16 MiB cap per response (spec §10D N10.13). Audit `crates/origin-mcp/src/`. Reviewer / date: ____
+- [ ] **Message validation** at the buffer layer with 16 MiB cap per response (spec ┬º10D N10.13). Audit `crates/origin-mcp/src/`. Reviewer / date: ____
 - [ ] **Schema mismatches** are rejected before agent exposure. Reviewer / date: ____
 
 ## `Secret<T>` lint
 
-- [ ] CI lint asserts no struct field named `*key*`, `*token*`, `*password*`, `*auth*` emits raw bytes through `tracing`. Spec §10D N10.14. Reviewer / date: ____
+- [ ] CI lint asserts no struct field named `*key*`, `*token*`, `*password*`, `*auth*` emits raw bytes through `tracing`. Spec ┬º10D N10.14. Reviewer / date: ____
 
 ## Worker isolation
 
-- [ ] Swarm workers run as child processes with CPU/RAM caps via cgroup (Linux), Job Objects (Windows), `taskpolicy` (macOS). Spec §10D N10.15. Reviewer / date: ____
+- [ ] Swarm workers run as child processes with CPU/RAM caps via cgroup (Linux), Job Objects (Windows), `taskpolicy` (macOS). Spec ┬º10D N10.15. Reviewer / date: ____
 
 ## Sign-off
 
