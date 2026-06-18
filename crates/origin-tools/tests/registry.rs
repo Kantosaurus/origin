@@ -42,6 +42,19 @@ fn every_tool_has_nonzero_token_budget() {
 }
 
 #[test]
+fn task_is_autoallowed_and_hot_for_always_on_swarm() {
+    let meta = registry_iter()
+        .find(|m| m.name == "Task")
+        .expect("Task must be registered");
+    assert_eq!(
+        meta.tier,
+        Tier::AutoAllowed,
+        "swarm delegation must not require a permission prompt",
+    );
+    assert!(meta.hot, "Task must be hot so the model can call it without ToolSearch");
+}
+
+#[test]
 fn hot_set_contains_exactly_the_expected_tools() {
     let hot: Vec<&str> = origin_tools::registry_iter()
         .filter(|m| m.hot)
@@ -62,6 +75,9 @@ fn hot_set_contains_exactly_the_expected_tools() {
         // `Recall` is hot so the model can inflate a SchemaCrush offload handle
         // in one step (no ToolSearch round-trip first).
         "Recall",
+        // `Task` is hot so swarm delegation is always one call away (no
+        // ToolSearch round-trip) — the fix for swarm never being invoked.
+        "Task",
     ];
     let mut got: Vec<&str> = hot.clone();
     got.sort_unstable();

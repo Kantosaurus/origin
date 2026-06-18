@@ -18,17 +18,21 @@ use origin_swarm::{Budget, Coordinator, ReportStatus, SwarmError, WorkerHandle, 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+// Swarm sub-agents run with UNLIMITED budgets by default: a sub-agent runs to
+// completion exactly like the main loop (which itself has no turn cap — see the
+// `max_turns: u32::MAX` change). `u*::MAX` is the "no cap" sentinel; the caller
+// may still pass an explicit, smaller `budget` per `Task` to bound a worker.
 const fn default_wall_ms() -> u64 {
-    60_000
+    u64::MAX
 }
 const fn default_input_tokens() -> u64 {
-    32_000
+    u64::MAX
 }
 const fn default_output_tokens() -> u64 {
-    8_000
+    u64::MAX
 }
 const fn default_tool_calls() -> u32 {
-    32
+    u32::MAX
 }
 
 /// Per-task resource budget. Mirrors [`origin_swarm::Budget`] but with serde
@@ -119,7 +123,30 @@ pub enum TaskError {
 /// # Errors
 /// Returns [`TaskError::Swarm`] if the spawn fails.
 pub async fn task_spawn(coord: &Coordinator, input: TaskInput) -> Result<WorkerHandle, TaskError> {
-    let spec = WorkerSpec {
+    Ok(coord.spawn(worker_spec_from(input)).await?)
+}
+
+/// Like [`task_spawn`] but attaches a live progress sink.
+///
+/// The spawner is notified (via an [`origin_swarm::WorkerProgressTx`]) each time
+/// the sub-agent starts a tool — the daemon uses this to drive the TUI's
+/// per-agent swarm panel (current-tool line).
+///
+/// # Errors
+/// Returns [`TaskError::Swarm`] if the spawn fails.
+pub async fn task_spawn_with_progress(
+    coord: &Coordinator,
+    input: TaskInput,
+    progress: Option<origin_swarm::WorkerProgressTx>,
+) -> Result<WorkerHandle, TaskError> {
+    Ok(coord
+        .spawn_with_progress(worker_spec_from(input), progress)
+        .await?)
+}
+
+/// Build the [`WorkerSpec`] a `Task` launches from its JSON input.
+fn worker_spec_from(input: TaskInput) -> WorkerSpec {
+    WorkerSpec {
         goal: input.goal,
         allowed_tools: input.allowed_tools,
         budget: Budget {
@@ -132,8 +159,7 @@ pub async fn task_spawn(coord: &Coordinator, input: TaskInput) -> Result<WorkerH
         parent_actor: origin_plan::ActorId::new(0),
         model: input.model,
         mcp_servers: input.mcp_servers,
-    };
-    Ok(coord.spawn(spec).await?)
+    }
 }
 
 /// Await a worker previously spawned by [`task_spawn`] and build its actionable
@@ -183,14 +209,43 @@ pub async fn task_tool(coord: &Coordinator, input: TaskInput) -> Result<TaskOutp
     task_await(coord, &handle, &goal).await
 }
 
+#[cfg(test)]
+mod budget_tests {
+    use super::TaskBudget;
+
+    #[test]
+    fn default_budget_is_unlimited() {
+        let b = TaskBudget::default();
+        assert_eq!(b.max_wall_ms, u64::MAX);
+        assert_eq!(b.max_input_tokens, u64::MAX);
+        assert_eq!(b.max_output_tokens, u64::MAX);
+        assert_eq!(b.max_tool_calls, u32::MAX, "no tool-call cap on a default swarm worker");
+    }
+
+    #[test]
+    fn omitted_budget_fields_deserialize_to_unlimited() {
+        // The model may send `"budget": {}` (or omit fields); each missing field
+        // must fall back to the unlimited sentinel, not a small cap.
+        let b: TaskBudget = serde_json::from_str("{}").expect("empty budget");
+        assert_eq!(b.max_tool_calls, u32::MAX);
+        assert_eq!(b.max_input_tokens, u64::MAX);
+    }
+}
+
 crate::origin_tool! {
     name: "Task",
-    description: "Dispatch a sub-agent with a goal, allowed tools, and budget. Returns a structured CompletionReport summary.",
-    tier: crate::Tier::RequiresPermission,
+    description: "Dispatch a sub-agent (swarm worker) with a goal, allowed tools, and budget; it runs concurrently and returns a structured CompletionReport summary. Prefer this to parallelize independent units of work — spawn several at once. No permission prompt is required; the sub-agent is confined to the `allowed_tools` you grant it.",
+    // AutoAllowed: spawning a swarm worker never prompts. The child is confined
+    // to the `allowed_tools` allow-list the parent grants, and any governance /
+    // conseca deny overlay still applies — so removing the parent-side prompt is
+    // safe while making swarm delegation friction-free (always-on swarm).
+    tier: crate::Tier::AutoAllowed,
     urgency: crate::Urgency::Medium,
     side_effects: crate::SideEffects::Mutating,
     input_schema: r#"{"type":"object","required":["goal","allowed_tools"],"properties":{"goal":{"type":"string"},"allowed_tools":{"type":"array","items":{"type":"string"}},"budget":{"type":"object"},"model":{"type":"string"},"mcp_servers":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"url":{"type":"string"}},"required":["name"]}}}}"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
     token_budget: crate::DEFAULT_TOKEN_BUDGET,
-    hot: false,
+    // hot: the full schema is always advertised to the model (no ToolSearch
+    // round-trip first). Task being deferred was why swarm was never invoked.
+    hot: true,
 }

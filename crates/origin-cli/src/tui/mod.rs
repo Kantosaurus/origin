@@ -358,6 +358,54 @@ impl Selection {
 // App-state aggregate: each bool is an independent, unrelated session toggle
 // (plan mode, vim, desktop notify, permission prompting). Grouping them into a
 // sub-struct would obscure rather than clarify.
+/// Lifecycle state of one live swarm sub-agent, as shown in the swarm panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwarmAgentStatus {
+    /// Spawned and still working.
+    Running,
+    /// Finished successfully.
+    Completed,
+    /// Finished unsuccessfully (goal unreachable / budget exhausted / aborted /
+    /// errored).
+    Failed,
+}
+
+impl SwarmAgentStatus {
+    /// The status glyph rendered at the head of the agent's row, mirroring the
+    /// tool-line markers (▸ running, ✔ done, ✘ failed).
+    #[must_use]
+    pub const fn glyph(self) -> &'static str {
+        match self {
+            Self::Running => "\u{25B8}",   // ▸
+            Self::Completed => "\u{2714}", // ✔
+            Self::Failed => "\u{2718}",    // ✘
+        }
+    }
+}
+
+/// One row in the live swarm panel: a single sub-agent and its current state.
+///
+/// Rows are keyed by `id` (the daemon's stable hex worker id) so a worker's
+/// completion event updates its existing row in place rather than duplicating.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwarmAgentRow {
+    /// Stable hex worker id (correlates the spawn and completion events).
+    pub id: String,
+    /// The sub-agent's goal (already truncated by the daemon for display).
+    pub goal: String,
+    /// Current lifecycle state.
+    pub status: SwarmAgentStatus,
+    /// The tool this agent is using right now, if known. Populated by live
+    /// per-worker progress (the daemon forwards each sub-agent's `ToolActivity`);
+    /// `None` until that feed reports one. Rendered in place of a budget bar —
+    /// swarm budgets are unlimited.
+    pub current_tool: Option<String>,
+    /// When this agent was first seen (its `spawned` event), for the elapsed clock.
+    pub started: std::time::Instant,
+    /// When it reached a terminal state, to freeze the clock. `None` while running.
+    pub finished: Option<std::time::Instant>,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct App {
@@ -386,6 +434,16 @@ pub struct App {
     /// a gentle "still working…" notice so a quiet daemon stops looking like an
     /// indefinitely-spinning spinner.
     pub stall: Option<StallTier>,
+    /// `true` while the startup hero logo occupies the scrollback (before the
+    /// first prompt). The first turn calls [`Self::dismiss_startup_banner`],
+    /// which clears the logo and flips this off.
+    pub startup_banner: bool,
+    /// Live swarm sub-agents for the current wave, in spawn order. Updated in
+    /// place by [`StreamEvent::SwarmWorker`](origin_daemon::protocol::StreamEvent)
+    /// events (keyed by id). A fresh wave of spawns (after the previous wave all
+    /// settled) clears the list, so the panel always reflects the current fan-out.
+    /// Drives the compact "swarm" readout above the composer.
+    pub swarm_agents: Vec<SwarmAgentRow>,
     /// Session reasoning-effort level (`fast`/`low`/`medium`/`high`/`max`) as a
     /// canonical wire token, or `None` to leave the provider wire unchanged.
     /// Seeded from the startup `--effort` flag and mutated mid-session by the
@@ -566,6 +624,18 @@ fn git_branch_short() -> Option<String> {
 /// scroll-away banner is redundant.
 const WORDMARK: &str = "\u{25C6} origin";
 
+/// Startup hero logo: the full block-letter "origin" wordmark, painted in copper
+/// and shown before the user's first prompt. Once the first turn begins,
+/// [`App::dismiss_startup_banner`] clears it and the session runs under the
+/// small `◆ origin` top-chrome header. (`/clear` re-pushes it.)
+const BANNER_ART: [&str; 3] = [
+    "\u{2588}\u{2580}\u{2588} \u{2588}\u{2580}\u{2588} \u{2588} \u{2588}\u{2580}\u{2580} \u{2588} \u{2588}\u{2584} \u{2588}",
+    "\u{2588} \u{2588} \u{2588}\u{2580}\u{2584} \u{2588} \u{2588} \u{2588} \u{2588} \u{2588} \u{2580}\u{2588}",
+    "\u{2580}\u{2580}\u{2580} \u{2580} \u{2580} \u{2580} \u{2580}\u{2580}\u{2580} \u{2580} \u{2580}  \u{2580}",
+];
+/// Tagline rendered under the startup logo.
+const BANNER_TAGLINE: &str = "the agentic coding terminal";
+
 /// The composer placeholder shown while the input buffer is empty (on startup,
 /// after `/clear`, and any time the field is empty). It clears the instant the
 /// user types. Tells a new user how to reach the two most useful affordances
@@ -592,6 +662,8 @@ impl App {
             turn_started: None,
             goal_status: None,
             stall: None,
+            startup_banner: false,
+            swarm_agents: Vec::new(),
             effort: None,
             output_style: None,
             steering: origin_steering::SteeringQueue::new(),
@@ -890,21 +962,34 @@ impl App {
     /// real prompt-first terminal reads.
     pub fn push_banner(&mut self, _cols: u16, _rows: u16) {
         let tok = crate::tui::tokens::Tokens::from_palette(self.palette());
-        // One leading blank for breathing room above the wordmark.
+        // Startup hero: the full block-letter logo, copper, drawn verbatim so the
+        // block glyphs render as-is (no markdown reinterpretation). It stays only
+        // until the first prompt — `dismiss_startup_banner` then clears it and the
+        // session falls back to the small `◆ origin` top-chrome header.
         self.scrollback
             .push(ScrollLine::styled(String::new(), 0, 0, false));
-        // The wordmark: seeded verbatim as `◆ origin` (indent 0) so the
-        // `is_origin_header` render path paints `◆` in `tok.accent` + bold and
-        // "origin" alongside it — consistent with the live turn header.
-        // (The flat single-fg scrollline can't split the glyph/word into two
-        // tones, so both ride the one copper header style the renderer already
-        // applies; this is the intended identity color.)
+        for art in BANNER_ART {
+            self.scrollback
+                .push(ScrollLine::verbatim((*art).to_string(), tok.origin, 0));
+        }
+        self.scrollback.push(ScrollLine::verbatim(String::new(), 0, 0));
         self.scrollback
-            .push(ScrollLine::styled(WORDMARK.to_string(), tok.origin, 0, true));
-        // Trailing blank for breathing room below the wordmark. The usage tip
-        // that used to live here now rides the composer placeholder.
+            .push(ScrollLine::verbatim(BANNER_TAGLINE.to_string(), tok.muted, 0));
         self.scrollback
             .push(ScrollLine::styled(String::new(), 0, 0, false));
+        self.startup_banner = true;
+    }
+
+    /// Clear the startup hero logo the moment the first real turn begins, so the
+    /// view switches to the normal transcript under the small top-chrome header.
+    /// A no-op once dismissed; `/clear` (via [`Self::reset_to_login`]) re-pushes
+    /// the logo, which is then dismissed again on the next turn.
+    pub fn dismiss_startup_banner(&mut self) {
+        if self.startup_banner {
+            self.scrollback.clear();
+            self.scroll_offset = 0;
+            self.startup_banner = false;
+        }
     }
 
     /// The last `n` finalized scrollback line texts, most-recent-first. Used by
@@ -1150,6 +1235,97 @@ impl App {
     /// (rendered as no goal row above the input card).
     pub fn set_goal_status_line(&mut self, status: Option<String>) {
         self.goal_status = status;
+    }
+
+    /// Fold a [`StreamEvent::SwarmWorker`](origin_daemon::protocol::StreamEvent)
+    /// update into the live swarm panel.
+    ///
+    /// `status` is the wire token (`"spawned"` / `"completed"` / `"failed"`).
+    /// A worker is matched by `id`: a `"spawned"` event inserts a new row (or,
+    /// if it is the first spawn of a fresh wave — i.e. every existing row has
+    /// already settled — it first clears the previous wave); a terminal event
+    /// flips the matching row's status in place. An unknown id on a terminal
+    /// event is inserted so a late subscriber still sees the agent.
+    pub fn apply_swarm_event(&mut self, id: &str, goal: &str, status: &str) {
+        let new_status = match status {
+            "completed" => SwarmAgentStatus::Completed,
+            "failed" => SwarmAgentStatus::Failed,
+            // "spawned" and any unknown token read as still-running.
+            _ => SwarmAgentStatus::Running,
+        };
+        // A fresh wave: the first spawn after the previous fan-out fully settled
+        // replaces the now-stale completed rows rather than piling up.
+        if new_status == SwarmAgentStatus::Running
+            && !self.swarm_agents.is_empty()
+            && self
+                .swarm_agents
+                .iter()
+                .all(|r| r.status != SwarmAgentStatus::Running)
+        {
+            self.swarm_agents.clear();
+        }
+        let terminal = matches!(
+            new_status,
+            SwarmAgentStatus::Completed | SwarmAgentStatus::Failed
+        );
+        if let Some(row) = self.swarm_agents.iter_mut().find(|r| r.id == id) {
+            row.status = new_status;
+            if !goal.is_empty() {
+                row.goal = goal.to_string();
+            }
+            if terminal && row.finished.is_none() {
+                row.finished = Some(std::time::Instant::now());
+                row.current_tool = None; // no tool once settled
+            }
+        } else {
+            let now = std::time::Instant::now();
+            self.swarm_agents.push(SwarmAgentRow {
+                id: id.to_string(),
+                goal: goal.to_string(),
+                status: new_status,
+                current_tool: None,
+                started: now,
+                finished: terminal.then_some(now),
+            });
+        }
+    }
+
+
+    /// Set the tool a running sub-agent is using right now (live per-worker
+    /// progress). A no-op for an unknown id or an already-settled agent, so a
+    /// late `running` event can never revive a finished row.
+    pub fn set_swarm_agent_tool(&mut self, id: &str, tool: &str) {
+        if let Some(row) = self.swarm_agents.iter_mut().find(|r| r.id == id) {
+            if row.finished.is_none() {
+                row.current_tool = Some(tool.to_string());
+            }
+        }
+    }
+
+    /// Compact live summary of the current swarm wave for the status readout,
+    /// e.g. `⎇ 2/3 agents`. `None` when no agents have been spawned this turn.
+    #[must_use]
+    pub fn swarm_summary(&self) -> Option<String> {
+        if self.swarm_agents.is_empty() {
+            return None;
+        }
+        let total = self.swarm_agents.len();
+        let running = self
+            .swarm_agents
+            .iter()
+            .filter(|r| r.status == SwarmAgentStatus::Running)
+            .count();
+        if running == 0 {
+            // Whole wave settled: show how many succeeded.
+            let done = self
+                .swarm_agents
+                .iter()
+                .filter(|r| r.status == SwarmAgentStatus::Completed)
+                .count();
+            Some(format!("\u{2387} {done}/{total} agents done"))
+        } else {
+            Some(format!("\u{2387} {running}/{total} agents running"))
+        }
     }
 
     /// Handle a `/theme <name>` composer command (aider L107 theme preset).
@@ -1742,11 +1918,18 @@ impl App {
             .map_or(self.usage.elapsed, |t| self.usage.elapsed + t.elapsed());
         let phase = turn_phase(self.spinner.active, self.current_assistant.as_deref());
         // Phase prefers the live goal status when one is set (so the zone shows
-        // the active operation), else the localized Thinking/Responding label.
+        // the active operation); otherwise, while swarm sub-agents are in flight
+        // it shows the compact swarm readout (`⎇ 2/3 agents running`); failing
+        // both it falls back to the localized Thinking/Responding label.
         let phase_owned = self
             .goal_status
             .clone()
+            .or_else(|| self.swarm_summary())
             .or_else(|| localize_phase(phase).map(|p| format!("{}s {p}", live_elapsed.as_secs())));
+        let swarm_running = self
+            .swarm_agents
+            .iter()
+            .any(|r| r.status == SwarmAgentStatus::Running);
         let st = crate::tui::chrome::StatusCtx {
             spinner: self.spinner.active.then(|| self.spinner.frame_char().to_string()),
             phase: phase_owned,
@@ -1754,7 +1937,7 @@ impl App {
             input_tokens: self.usage.input_tokens,
             output_tokens: self.usage.output_tokens,
             cost: Some(crate::status::cost_usd(&self.usage)),
-            in_flight: self.spinner.active || self.goal_status.is_some(),
+            in_flight: self.spinner.active || self.goal_status.is_some() || swarm_running,
         };
         crate::tui::chrome::draw_status(
             main,
@@ -2063,6 +2246,167 @@ pub fn draw_side(side: &mut Grid, plan_lines: &[PlanLine], pal: theme::Palette) 
         );
         row += 1;
     }
+}
+
+/// Render the live swarm panel into the side grid.
+///
+/// Mirrors [`draw_side`]'s chrome (left divider + header rule) so the two side
+/// panels read consistently, then paints one block per sub-agent: a header line
+/// (status glyph + short id + elapsed clock), the goal, and a third line that is
+/// either the tool the agent is using right now or its terminal state. There is
+/// no budget bar — swarm budgets are unlimited.
+pub fn draw_side_swarm(side: &mut Grid, agents: &[SwarmAgentRow], pal: theme::Palette) {
+    let cols = side.cols();
+    let rows = side.rows();
+    let muted = Style {
+        fg: pal.muted,
+        bg: pal.panel_bg,
+        bold: false,
+    };
+
+    // Background + left divider (same as the plan panel).
+    for r in 0..rows {
+        for c in 0..cols {
+            side.put(r, c, Cell::new(' ', 0, pal.panel_bg, Attr::PLAIN));
+        }
+    }
+    for r in 0..rows {
+        side.put(r, 0, Cell::new('\u{2502}', pal.border, pal.panel_bg, Attr::PLAIN));
+    }
+
+    // Header: " ⎇ Swarm" on the left, "N run · M done" right-aligned.
+    write_str_styled(
+        side,
+        0,
+        1,
+        " \u{2387} Swarm",
+        cols.saturating_sub(1),
+        Style {
+            fg: pal.panel_header,
+            bg: pal.panel_bg,
+            bold: true,
+        },
+    );
+    let running = agents
+        .iter()
+        .filter(|a| a.status == SwarmAgentStatus::Running)
+        .count();
+    let done = agents.len().saturating_sub(running);
+    let tally = if done > 0 {
+        format!("{running} run \u{00B7} {done} done ")
+    } else {
+        format!("{running} running ")
+    };
+    let tally_w = clamp_u16(tally.chars().count());
+    let tally_col = cols.saturating_sub(tally_w).max(1);
+    write_str_styled(side, 0, tally_col, &tally, cols.saturating_sub(tally_col), muted);
+
+    // Header rule.
+    for c in 1..cols {
+        side.put(1, c, Cell::new('\u{2500}', pal.border, pal.panel_bg, Attr::PLAIN));
+    }
+    side.put(1, 0, Cell::new('\u{251C}', pal.border, pal.panel_bg, Attr::PLAIN));
+
+    let mut row: u16 = 2;
+    for a in agents {
+        if row >= rows {
+            break;
+        }
+        row = draw_swarm_agent_block(side, row, a, cols, rows, pal);
+    }
+}
+
+/// Paint one sub-agent's 3-line block (+ a blank separator) starting at `row`,
+/// returning the next free row. Split out of [`draw_side_swarm`] to keep each
+/// painter focused.
+fn draw_swarm_agent_block(
+    side: &mut Grid,
+    mut row: u16,
+    a: &SwarmAgentRow,
+    cols: u16,
+    rows: u16,
+    pal: theme::Palette,
+) -> u16 {
+    let muted = Style {
+        fg: pal.muted,
+        bg: pal.panel_bg,
+        bold: false,
+    };
+    let (glyph, glyph_fg, id_fg) = match a.status {
+        SwarmAgentStatus::Running => ('\u{25B8}', pal.accent, pal.accent),
+        SwarmAgentStatus::Completed => ('\u{2714}', pal.green, pal.accent_dim),
+        SwarmAgentStatus::Failed => ('\u{2718}', pal.red, pal.accent_dim),
+    };
+    // Line 1: glyph (col 2) + short id (col 4) + elapsed clock (right).
+    side.put(row, 2, Cell::new(glyph, glyph_fg, pal.panel_bg, Attr::PLAIN));
+    let short: String = a.id.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect();
+    write_str_styled(
+        side,
+        row,
+        4,
+        &short,
+        cols.saturating_sub(4),
+        Style {
+            fg: id_fg,
+            bg: pal.panel_bg,
+            bold: true,
+        },
+    );
+    let secs = a
+        .finished
+        .unwrap_or_else(std::time::Instant::now)
+        .saturating_duration_since(a.started)
+        .as_secs();
+    let clock = format!("{}:{:02} ", secs / 60, secs % 60);
+    let clock_col = cols.saturating_sub(clamp_u16(clock.chars().count())).max(5);
+    write_str_styled(side, row, clock_col, &clock, cols.saturating_sub(clock_col), muted);
+    row += 1;
+    if row >= rows {
+        return row;
+    }
+    // Line 2: the goal.
+    write_str_styled(
+        side,
+        row,
+        4,
+        &a.goal,
+        cols.saturating_sub(5),
+        Style {
+            fg: pal.body,
+            bg: pal.panel_bg,
+            bold: false,
+        },
+    );
+    row += 1;
+    if row >= rows {
+        return row;
+    }
+    // Line 3: current tool (running) or terminal state.
+    let (col, glyph_opt, label, fg) = match a.status {
+        SwarmAgentStatus::Running => a.current_tool.as_ref().map_or(
+            (4, None, "working\u{2026}", pal.muted),
+            |tool| (6, Some('\u{25B8}'), tool.as_str(), pal.tool),
+        ),
+        SwarmAgentStatus::Completed => (4, None, "completed", pal.green),
+        SwarmAgentStatus::Failed => (4, None, "failed", pal.red),
+    };
+    if let Some(g) = glyph_opt {
+        side.put(row, 4, Cell::new(g, pal.accent, pal.panel_bg, Attr::PLAIN));
+    }
+    write_str_styled(
+        side,
+        row,
+        col,
+        label,
+        cols.saturating_sub(col + 1),
+        Style {
+            fg,
+            bg: pal.panel_bg,
+            bold: false,
+        },
+    );
+    // Advance past line 3 + a blank separator between agents.
+    row + 2
 }
 
 /// Checkbox state for one focus-chain row, derived from a plan step's status.
@@ -2441,7 +2785,7 @@ fn render_scroll_line(
 
     let trimmed = vl.text.trim_start();
     // Detect role markers (only on the first wrapped piece, indent == 0).
-    let is_origin_header = vl.indent == 0 && trimmed == "\u{25C6} origin"; // ◆ origin
+    let is_origin_header = vl.indent == 0 && trimmed == WORDMARK; // ◆ origin
 
     if is_origin_header {
         // Assistant turn affordance: ◆ origin in copper, bold, at col 2.
@@ -2449,7 +2793,7 @@ fn render_scroll_line(
             grid,
             row,
             2,
-            "\u{25C6} origin",
+            WORDMARK,
             cols,
             Style {
                 fg: tok.origin,
@@ -2724,6 +3068,108 @@ mod tests {
         assert_eq!(app.usage.model, "claude-opus-4-7");
         app.set_model("claude-sonnet-4-6");
         assert_eq!(app.usage.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn swarm_events_track_each_agent_and_update_in_place() {
+        let mut app = App::new("anthropic", "claude-opus-4-8", CompletionSources::default());
+        assert_eq!(app.swarm_summary(), None, "no agents before any spawn");
+
+        // Two agents spawn in one wave.
+        app.apply_swarm_event("a1", "write tests", "spawned");
+        app.apply_swarm_event("b2", "impl module", "spawned");
+        assert_eq!(app.swarm_agents.len(), 2);
+        assert_eq!(app.swarm_summary().as_deref(), Some("\u{2387} 2/2 agents running"));
+
+        // One completes: the existing row flips in place (no duplicate row).
+        app.apply_swarm_event("a1", "write tests", "completed");
+        assert_eq!(app.swarm_agents.len(), 2, "completion updates in place");
+        assert_eq!(app.swarm_agents[0].status, SwarmAgentStatus::Completed);
+        assert_eq!(app.swarm_summary().as_deref(), Some("\u{2387} 1/2 agents running"));
+
+        // The other fails: whole wave settled → summary shows the done count.
+        app.apply_swarm_event("b2", "impl module", "failed");
+        assert_eq!(app.swarm_agents[1].status, SwarmAgentStatus::Failed);
+        assert_eq!(app.swarm_summary().as_deref(), Some("\u{2387} 1/2 agents done"));
+    }
+
+    #[test]
+    fn a_fresh_spawn_wave_replaces_the_settled_previous_wave() {
+        let mut app = App::new("anthropic", "claude-opus-4-8", CompletionSources::default());
+        app.apply_swarm_event("a1", "first", "spawned");
+        app.apply_swarm_event("a1", "first", "completed");
+        // New wave: the first spawn after the prior wave settled clears it.
+        app.apply_swarm_event("c3", "second", "spawned");
+        assert_eq!(app.swarm_agents.len(), 1, "stale settled wave is cleared");
+        assert_eq!(app.swarm_agents[0].id, "c3");
+        assert_eq!(app.swarm_agents[0].status, SwarmAgentStatus::Running);
+    }
+
+    #[test]
+    fn startup_banner_shows_block_logo_then_dismisses_on_first_turn() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.push_banner(80, 24);
+        assert!(app.startup_banner, "banner active after push");
+        let text: String = app
+            .scrollback
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("the agentic coding terminal"), "tagline:\n{text}");
+        assert!(
+            app.scrollback.iter().any(|l| l.text.contains('\u{2588}')),
+            "block-letter glyph present"
+        );
+        // The first real turn clears the hero logo.
+        app.dismiss_startup_banner();
+        assert!(!app.startup_banner);
+        assert!(app.scrollback.is_empty(), "logo cleared on first turn");
+        // Idempotent: later content is never wiped.
+        app.add_line("you> ", "hello");
+        app.dismiss_startup_banner();
+        assert!(
+            app.scrollback.iter().any(|l| l.text.contains("hello")),
+            "later content preserved by a no-op dismiss"
+        );
+    }
+
+    fn grid_glyphs(g: &Grid) -> String {
+        (0..g.rows())
+            .flat_map(|r| (0..g.cols()).filter_map(move |c| char::from_u32(g.get(r, c).glyph)))
+            .collect()
+    }
+
+    #[test]
+    fn draw_side_swarm_paints_header_goals_and_status_glyphs() {
+        let now = std::time::Instant::now();
+        let agents = vec![
+            SwarmAgentRow {
+                id: "aaaaaa01".into(),
+                goal: "write failing tests".into(),
+                status: SwarmAgentStatus::Running,
+                current_tool: Some("Edit".into()),
+                started: now,
+                finished: None,
+            },
+            SwarmAgentRow {
+                id: "bbbbbb02".into(),
+                goal: "audit gate".into(),
+                status: SwarmAgentStatus::Completed,
+                current_tool: None,
+                started: now,
+                finished: Some(now),
+            },
+        ];
+        let mut g = Grid::new(36, 16);
+        draw_side_swarm(&mut g, &agents, theme::palette(theme::Theme::Default));
+        let text = grid_glyphs(&g);
+        assert!(text.contains("Swarm"), "header missing:\n{text}");
+        assert!(text.contains("write failing tests"), "goal missing:\n{text}");
+        assert!(text.contains("Edit"), "current tool missing:\n{text}");
+        assert!(text.contains('\u{25B8}'), "running glyph ▸ missing");
+        assert!(text.contains('\u{2714}'), "completed glyph ✔ missing");
+        assert!(text.contains("completed"), "terminal label missing");
     }
 
     #[test]

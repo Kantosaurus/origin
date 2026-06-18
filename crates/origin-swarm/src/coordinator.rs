@@ -193,6 +193,30 @@ impl Coordinator {
     /// # Errors
     /// Currently infallible; reserved for future spawn-time validation.
     pub async fn spawn_with(&self, spec: WorkerSpec, worker: WorkerFn) -> Result<WorkerHandle, SwarmError> {
+        self.spawn_inner(spec, worker, None).await
+    }
+
+    /// Spawn a worker (default `WorkerFn`) with a live [`WorkerProgress`] sink so
+    /// the spawner receives a signal each time the worker starts a tool. Used by
+    /// the daemon to drive the TUI's per-agent swarm panel.
+    ///
+    /// # Errors
+    /// Currently infallible; reserved for future spawn-time validation.
+    pub async fn spawn_with_progress(
+        &self,
+        spec: WorkerSpec,
+        progress: Option<crate::WorkerProgressTx>,
+    ) -> Result<WorkerHandle, SwarmError> {
+        let worker = Arc::clone(&self.default_worker);
+        self.spawn_inner(spec, worker, progress).await
+    }
+
+    async fn spawn_inner(
+        &self,
+        spec: WorkerSpec,
+        worker: WorkerFn,
+        progress: Option<crate::WorkerProgressTx>,
+    ) -> Result<WorkerHandle, SwarmError> {
         let id = WorkerId::generate();
         let (lc_tx, lc_rx) = watch::channel(Lifecycle::Spawning);
 
@@ -220,6 +244,7 @@ impl Coordinator {
             parent_actor: spec.parent_actor,
             spec: spec.clone(),
             collab,
+            progress,
         };
 
         let report_slot: Arc<Mutex<Option<CompletionReport>>> = Arc::new(Mutex::new(None));

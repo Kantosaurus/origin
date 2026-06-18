@@ -406,6 +406,32 @@ pub enum StreamEvent {
         #[serde(default)]
         elided_bytes: u32,
     },
+    /// Per-swarm-agent lifecycle update. Emitted by the agent loop when it
+    /// dispatches a `Task` sub-agent (`status: "spawned"`) and again when that
+    /// sub-agent finishes (`status: "completed"` or `"failed"`). Lets the TUI
+    /// show each individual swarm worker live — its `goal` and current state —
+    /// instead of one opaque "Task" tool line shared by every parallel agent.
+    /// `id` is the worker's stable hex id (the same value across its spawn and
+    /// completion events, so the CLI can update the row in place).
+    SwarmWorker {
+        /// Stable hex worker id; identical across this worker's spawn + finish
+        /// events so the CLI updates the existing row rather than appending.
+        id: String,
+        /// The sub-agent's goal (truncated for display).
+        goal: String,
+        /// `"spawned"`, `"running"`, `"completed"`, or `"failed"`. A `"running"`
+        /// event carries the live `tool` the sub-agent just started and does not
+        /// change its lifecycle (it stays running) — it only updates the panel's
+        /// current-tool line.
+        status: String,
+        /// Terminal summary / failure reason; `None` on the spawn event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        /// The tool the sub-agent is using right now, on a `"running"` event;
+        /// `None` otherwise. Drives the panel's live current-tool line.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
+    },
     TurnEnd,
     /// Opt-in interactive permission ask (gated by
     /// [`PromptRequest::permission_ask`]). Emitted before a `RequiresPermission`
@@ -799,6 +825,74 @@ pub enum ServerMessage {
 #[allow(clippy::panic)]
 mod permission_wire_tests {
     use super::*;
+
+    #[test]
+    fn swarm_worker_event_round_trips() {
+        // Spawn event: detail omitted from the wire.
+        let spawn = StreamEvent::SwarmWorker {
+            id: "0000000000000000000000000000abcd".to_string(),
+            goal: "write the failing test".to_string(),
+            status: "spawned".to_string(),
+            detail: None,
+            tool: None,
+        };
+        let json = serde_json::to_string(&spawn).expect("serialize");
+        assert!(json.contains("\"kind\":\"swarm_worker\""), "tagged on kind: {json}");
+        assert!(!json.contains("detail"), "None detail is omitted: {json}");
+        assert!(!json.contains("tool"), "None tool is omitted: {json}");
+        match serde_json::from_str::<StreamEvent>(&json).expect("deserialize") {
+            StreamEvent::SwarmWorker {
+                id,
+                goal,
+                status,
+                detail,
+                tool,
+            } => {
+                assert_eq!(id, "0000000000000000000000000000abcd");
+                assert_eq!(goal, "write the failing test");
+                assert_eq!(status, "spawned");
+                assert_eq!(detail, None);
+                assert_eq!(tool, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // Running event carries the live tool, no detail.
+        let running = StreamEvent::SwarmWorker {
+            id: "id3".to_string(),
+            goal: "g".to_string(),
+            status: "running".to_string(),
+            detail: None,
+            tool: Some("Edit".to_string()),
+        };
+        let back: StreamEvent =
+            serde_json::from_str(&serde_json::to_string(&running).expect("ser")).expect("de");
+        match back {
+            StreamEvent::SwarmWorker { status, tool, .. } => {
+                assert_eq!(status, "running");
+                assert_eq!(tool.as_deref(), Some("Edit"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // Terminal failure event carries a detail.
+        let failed = StreamEvent::SwarmWorker {
+            id: "id2".to_string(),
+            goal: "g".to_string(),
+            status: "failed".to_string(),
+            detail: Some("budget exhausted".to_string()),
+            tool: None,
+        };
+        let back: StreamEvent =
+            serde_json::from_str(&serde_json::to_string(&failed).expect("ser")).expect("de");
+        match back {
+            StreamEvent::SwarmWorker { status, detail, .. } => {
+                assert_eq!(status, "failed");
+                assert_eq!(detail.as_deref(), Some("budget exhausted"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
 
     #[test]
     fn permission_ask_event_round_trips() {

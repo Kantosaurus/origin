@@ -1652,6 +1652,22 @@ enum TurnEnd {
     Interrupted(InterruptOutcome),
 }
 
+/// Resolve the effective reasoning effort for a turn.
+///
+/// An explicit per-request effort (the CLI's `/effort` / `/fast`) always wins.
+/// When the client sent no effort, Anthropic models default to
+/// [`ReasoningEffort::Ultracode`] — maximum reasoning plus the always-on swarm
+/// surface — so Claude models run at full depth out of the box. Every other
+/// provider stays unset (`None`), which leaves its wire byte-identical.
+fn resolve_turn_effort(
+    requested: Option<origin_provider::ReasoningEffort>,
+    provider_name: &str,
+) -> Option<origin_provider::ReasoningEffort> {
+    requested.or_else(|| {
+        (provider_name == "anthropic").then_some(origin_provider::ReasoningEffort::Ultracode)
+    })
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_request(
     conn: &SharedConnection,
@@ -1806,7 +1822,11 @@ async fn handle_request(
             origin_daemon::agent::resolve_session_account(req.account.as_deref(), &slot)
         };
         let opts = LoopOptions {
-            max_turns: 200,
+            // No fixed turn cap on the live request loop: run until the model
+            // produces a tool-free final answer. `u32::MAX` is the "infinite"
+            // sentinel — the effective bounds are the token/compaction budget, the
+            // spend cap, and the user interrupt (Ctrl+C force-stop).
+            max_turns: u32::MAX,
             // Clone (not move) so the outer `cas` stays live for the per-turn
             // `persist(..)` flush below, which makes tool-result handles durable.
             cas: Some(Arc::clone(&cas)),
@@ -1874,12 +1894,16 @@ async fn handle_request(
             // that file is absent both are `None` ⇒ default daemon behavior is
             // byte-identical; when present they narrow (never widen) tool access
             // via the deny-only `apply_governance_overlay` in `agent.rs`.
-            effort: req
-                .effort
-                .as_deref()
-                .and_then(origin_provider::ReasoningEffort::from_wire_str),
+            effort: resolve_turn_effort(
+                req.effort
+                    .as_deref()
+                    .and_then(origin_provider::ReasoningEffort::from_wire_str),
+                provider.name(),
+            ),
             // ^ claude-code `/effort`+`/fast`: the CLI sends a canonical token;
-            // an unknown token maps to `None` ⇒ wire byte-identical.
+            // an unknown token maps to `None`. With no explicit effort, Anthropic
+            // models default to `Ultracode` (max reasoning); other providers stay
+            // `None` ⇒ wire byte-identical. See `resolve_turn_effort`.
             thinking_tokens: req.thinking_tokens,
             // ^ aider `--thinking-tokens`: only the Anthropic encoder honours it
             // (extended thinking with `budget_tokens`); `None` ⇒ wire unchanged.
@@ -4240,11 +4264,36 @@ fn spawn_metrics_endpoint(metrics: Metrics, addr: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        detach_last_turn, resume_foreign_event, resume_session_event, turn_window, Session, SessionStore,
-        StreamEvent,
+        detach_last_turn, resolve_turn_effort, resume_foreign_event, resume_session_event, turn_window,
+        Session, SessionStore, StreamEvent,
     };
     use origin_core::types::{Block, Message, Role};
+    use origin_provider::ReasoningEffort;
     use origin_resume_token::ResumeToken;
+
+    #[test]
+    fn anthropic_defaults_to_ultracode_when_no_effort_requested() {
+        assert_eq!(
+            resolve_turn_effort(None, "anthropic"),
+            Some(ReasoningEffort::Ultracode),
+            "Anthropic models default to ultracode (max reasoning + always-on swarm)",
+        );
+    }
+
+    #[test]
+    fn explicit_effort_always_wins_over_the_anthropic_default() {
+        assert_eq!(
+            resolve_turn_effort(Some(ReasoningEffort::Low), "anthropic"),
+            Some(ReasoningEffort::Low),
+            "a user-set /effort must never be overridden by the default",
+        );
+    }
+
+    #[test]
+    fn non_anthropic_providers_stay_unset_for_a_byte_identical_wire() {
+        assert_eq!(resolve_turn_effort(None, "openai"), None);
+        assert_eq!(resolve_turn_effort(None, "gemini"), None);
+    }
 
     fn msg(role: Role, text: &str) -> Message {
         Message {

@@ -231,7 +231,7 @@ async fn run_worker(
     cas: Arc<CasStore>,
     vault: KeyVault,
     plan: origin_planner::Plan,
-    ctx: WorkerContext,
+    mut ctx: WorkerContext,
 ) -> Result<CompletionReport, origin_swarm::SwarmError> {
     let provider = active.read().await.clone();
     // Per-agent routing (openclaude): use the worker's explicit model override
@@ -261,7 +261,7 @@ async fn run_worker(
     } else {
         ctx.budget.max_tool_calls
     };
-    let opts = LoopOptions {
+    let mut opts = LoopOptions {
         max_turns,
         // Sub-agents have no client to stream to; the non-streaming path returns
         // the same assistant text and is simpler to account for.
@@ -280,6 +280,33 @@ async fn run_worker(
         plan: Some(plan.fork_shared_handle_bands()),
         ..Default::default()
     };
+
+    // Live current-tool feed (TUI swarm panel): when the spawner asked for
+    // progress, route this worker's per-tool `ToolActivity` events (which the
+    // loop emits whenever `event_tx` is set) onto the progress channel as
+    // `ToolStarted`, so the parent can show what this sub-agent is doing right
+    // now. Streaming stays disabled — `event_tx` here carries UI events only,
+    // not token deltas. The relay ends when the loop drops `opts` (→ `tx`), so
+    // there is nothing to clean up. `None` (the default) ⇒ byte-identical.
+    if let Some(progress) = ctx.progress.take() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::protocol::StreamEvent>(64);
+        opts.event_tx = Some(tx);
+        // Realtime relay, like all daemon background tasks (no raw `tokio::spawn`).
+        // Detached: drop the handle (the task runs to completion on its own).
+        drop(origin_runtime::spawn_in(
+            origin_runtime::TaskClass::Realtime,
+            async move {
+                while let Some(ev) = rx.recv().await {
+                    if let crate::protocol::StreamEvent::ToolActivity { tool, .. } = ev {
+                        // Parent gone ⇒ send fails ⇒ stop forwarding.
+                        if progress.send(origin_swarm::WorkerProgress::ToolStarted(tool)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            },
+        ));
+    }
 
     let goal = ctx.spec.goal.clone();
     // Real-time swarm collaboration (WS-L, jcode L238). When the coordinator

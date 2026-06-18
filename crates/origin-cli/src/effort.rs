@@ -30,6 +30,9 @@ pub enum ReasoningEffort {
     High,
     /// Maximum effort; deepest deliberation.
     Max,
+    /// `Ultracode`: the deepest tier — maximum reasoning plus always-on
+    /// multi-agent swarm orchestration. The default effort for Anthropic models.
+    Ultracode,
 }
 
 impl ReasoningEffort {
@@ -43,6 +46,7 @@ impl ReasoningEffort {
             Self::Medium => "medium",
             Self::High => "high",
             Self::Max => "max",
+            Self::Ultracode => "ultracode",
         }
     }
 
@@ -57,6 +61,7 @@ impl ReasoningEffort {
             "medium" | "mid" => Some(Self::Medium),
             "high" => Some(Self::High),
             "max" | "maximum" | "ultra" => Some(Self::Max),
+            "ultracode" | "ultra-code" => Some(Self::Ultracode),
             _ => None,
         }
     }
@@ -106,6 +111,15 @@ mod tests {
             parse_effort_command("/effort min"),
             Some(Some(ReasoningEffort::Low))
         );
+        assert_eq!(
+            parse_effort_command("/effort ultracode"),
+            Some(Some(ReasoningEffort::Ultracode))
+        );
+        // `ultra` stays the historical alias for `max` (unchanged).
+        assert_eq!(
+            parse_effort_command("/effort ultra"),
+            Some(Some(ReasoningEffort::Max))
+        );
     }
 
     #[test]
@@ -129,6 +143,7 @@ mod tests {
             ReasoningEffort::Medium,
             ReasoningEffort::High,
             ReasoningEffort::Max,
+            ReasoningEffort::Ultracode,
         ] {
             assert_eq!(ReasoningEffort::parse_level(lvl.as_str()), Some(lvl));
         }

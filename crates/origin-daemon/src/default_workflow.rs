@@ -49,6 +49,26 @@ Within any sequence of work, do not advance to the next task until the \
 current task's verification command has been run and its output confirms \
 success.
 
+ADVERSARIAL VERIFICATION IS MANDATORY. Everything you plan AND everything you \
+execute must be adversarially verified before you call it done — for the main \
+agent and for EVERY swarm sub-agent alike. Verifying means actively trying to \
+REFUTE the work, not confirm it: run /verification-before-completion, run the \
+real verification command (build/test/lint/repro), and paste its fresh output. \
+Never claim success, and a sub-agent must never report `completed`, without \
+that evidence in hand. For any non-trivial change, dispatch a SEPARATE Task \
+sub-agent whose sole job is to adversarially verify the change — read the diff \
+and try to break it, find the failing case, the unhandled edge, the false \
+green — and only accept the work if that independent verifier cannot. If you \
+ARE a swarm sub-agent, you still owe this: verify your own output adversarially \
+before returning, because no one else may re-check it.
+
+SWARM IS ALWAYS ON. The `Task` tool spawns a sub-agent (swarm worker) that \
+runs concurrently; it never requires a permission prompt. Reach for it by \
+default — whenever the work splits into independent units, dispatch one `Task` \
+per unit and let them run in parallel rather than doing the work serially \
+yourself. Scope each sub-agent by granting it only the `allowed_tools` it \
+needs. Prefer parallel `Task` delegation wherever it is possible and safe.
+
 This is the default. Skip it only when the work is genuinely trivial.\
 ";
 
@@ -80,6 +100,12 @@ mod tests {
             "WebFetch",
             "WebSearch",
             "AskUserQuestion",
+            // Always-on swarm: the directive must push parallel Task delegation.
+            "SWARM IS ALWAYS ON",
+            "Task",
+            // Adversarial verification mandate (applies to swarm sub-agents too).
+            "ADVERSARIAL VERIFICATION IS MANDATORY",
+            "adversarially verify",
         ] {
             assert!(d.contains(phase), "DEFAULT_WORKFLOW missing `{phase}`");
         }

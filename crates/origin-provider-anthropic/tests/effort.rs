@@ -54,4 +54,13 @@ fn set_effort_emits_output_config_effort_with_valid_value() {
     // `max` is valid for Anthropic (Opus tier).
     let body = origin_provider_anthropic::encode_request_for_test(&req_with(Some(ReasoningEffort::Max)));
     assert_eq!(body["output_config"]["effort"], "max");
+
+    // `ultracode` is an origin-internal tier with no literal Anthropic value; it
+    // MUST encode as the highest valid level (`max`) or the API 400s.
+    let body =
+        origin_provider_anthropic::encode_request_for_test(&req_with(Some(ReasoningEffort::Ultracode)));
+    assert_eq!(
+        body["output_config"]["effort"], "max",
+        "Ultracode must wire-encode as the valid `max` level",
+    );
 }

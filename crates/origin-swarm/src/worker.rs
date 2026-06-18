@@ -49,6 +49,22 @@ pub struct WorkerCollab {
     pub mailboxes: SharedMailboxes,
 }
 
+/// A live progress signal from a running worker back to whoever spawned it.
+///
+/// Sent on the optional channel in [`WorkerContext::progress`]; the daemon
+/// relays these to the TUI's per-agent swarm panel. Intentionally neutral (no
+/// daemon/protocol types) so `origin-swarm` keeps no upward dependency.
+#[derive(Debug, Clone)]
+pub enum WorkerProgress {
+    /// The worker began using the named tool (its display name), so the panel
+    /// can show what this sub-agent is doing right now.
+    ToolStarted(String),
+}
+
+/// Unbounded sender for [`WorkerProgress`]. Unbounded so the worker's hot path
+/// never blocks on a slow consumer; cheap to clone.
+pub type WorkerProgressTx = tokio::sync::mpsc::UnboundedSender<WorkerProgress>;
+
 /// Coordinator-provided context for a single worker.
 ///
 /// Cloning is intentionally not supported: the worker owns its slot for the
@@ -68,6 +84,12 @@ pub struct WorkerContext {
     /// when the coordinator was built with `ORIGIN_SWARM_COLLAB` set; `None`
     /// (the default) ⇒ the worker scopes no collab context ⇒ byte-identical.
     pub collab: Option<WorkerCollab>,
+    /// Optional live progress sink. When the spawner wants per-tool updates
+    /// (e.g. the daemon driving the TUI swarm panel) it passes a sender here via
+    /// [`crate::Coordinator::spawn_with_progress`]; the worker forwards each tool
+    /// it starts. `None` (the default for `spawn`/`spawn_with`) ⇒ no progress is
+    /// emitted, byte-identical to before.
+    pub progress: Option<WorkerProgressTx>,
 }
 
 /// Worker future: takes a `WorkerContext`, returns a `CompletionReport`.

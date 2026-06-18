@@ -701,14 +701,25 @@ fn spawn_render_task(
                     // when there is a plan to show (the panel was wired but
                     // `side_visible` stayed false forever, so it never appeared).
                     let lines = plan_panel.lock().render();
+                    // Live swarm agents take the side panel over the plan while a
+                    // fan-out wave is in flight (any running sub-agent); once the
+                    // wave settles the slot reverts to the plan panel.
+                    let agents = app.lock().swarm_agents.clone();
+                    let swarm_active = agents
+                        .iter()
+                        .any(|a| a.status == origin_cli::tui::SwarmAgentStatus::Running);
                     let pal = app.lock().palette();
                     let mut c = composer.lock();
                     let mut w = widget.lock();
                     // Reflows only on the hidden↔visible transition.
-                    c.set_side_visible(!lines.is_empty());
+                    c.set_side_visible(swarm_active || !lines.is_empty());
                     app.lock().draw(&mut c, &mut w);
                     if c.side_visible() {
-                        origin_cli::tui::draw_side(c.side_grid(), &lines, pal);
+                        if swarm_active {
+                            origin_cli::tui::draw_side_swarm(c.side_grid(), &agents, pal);
+                        } else {
+                            origin_cli::tui::draw_side(c.side_grid(), &lines, pal);
+                        }
                     }
                     // Capture the rendered main pane for click-drag selection
                     // extraction — only while a selection is active, so there is
@@ -1355,6 +1366,9 @@ async fn handle_input_action(
 /// "did it take my input?" dead window after pressing Enter.
 fn begin_prompt_turn(app: &SharedApp, text: &str) {
     let mut a = app.lock();
+    // First real turn: clear the startup hero logo so the conversation runs
+    // under the small top-chrome header (no-op on every later turn).
+    a.dismiss_startup_banner();
     a.add_line("you> ", text);
     a.start_assistant_turn();
     a.start_turn_timer();
@@ -2076,6 +2090,8 @@ async fn handle_prompt_turn(
     let handle_for_perm = handle.clone();
     let app_for_choice = Arc::clone(app);
     let handle_for_choice = handle.clone();
+    let app_for_swarm = Arc::clone(app);
+    let handle_for_swarm = handle.clone();
     // Snapshot the session effort level so this turn carries `/effort`/`/fast`.
     let effort = app.lock().effort.clone();
     // Carry the startup `--thinking-tokens` budget on every turn (aider
@@ -2286,6 +2302,43 @@ async fn handle_prompt_turn(
             drop(a);
             handle_for_backoff.mark_dirty();
         },
+        move |id: &str, goal: &str, status: &str, detail: Option<&str>, tool: Option<&str>| {
+            use origin_cli::theme;
+            // A `running` event is a live tool update only: refresh the panel's
+            // current-tool line, no transcript row (those would be per-tool spam).
+            if status == "running" {
+                let mut a = app_for_swarm.lock();
+                if let Some(t) = tool {
+                    a.set_swarm_agent_tool(id, t);
+                }
+                drop(a);
+                handle_for_swarm.mark_dirty();
+                return;
+            }
+            // Lifecycle event (spawned/completed/failed): fold into per-agent
+            // state (drives the `⎇ N/M agents` readout + panel) and append a
+            // transcript row so each sub-agent's spawn and outcome are logged.
+            let short = id.get(id.len().saturating_sub(6)..).unwrap_or(id);
+            let mut a = app_for_swarm.lock();
+            a.apply_swarm_event(id, goal, status);
+            let (glyph, fg, label) = match status {
+                "completed" => ("\u{2714}", theme::MUTED, "completed"),
+                "failed" => ("\u{2718}", theme::RED, "failed"),
+                _ => ("\u{25B8}", theme::MUTED, "spawned"),
+            };
+            let mut line = format!("\u{2387} swarm \u{00B7} {short} \u{00B7} {label} {glyph} {goal}");
+            if status == "failed" {
+                if let Some(d) = detail {
+                    if !d.is_empty() {
+                        line.push_str(" \u{2014} ");
+                        line.push_str(d);
+                    }
+                }
+            }
+            a.add_colored_line(line, fg, 0);
+            drop(a);
+            handle_for_swarm.mark_dirty();
+        },
     )
     .await;
 
@@ -2420,6 +2473,11 @@ async fn call_daemon(
     mut on_usage: impl FnMut(u32, u32, u32, u32) + Send,
     mut on_proposal: impl FnMut(u32, String, Vec<String>) + Send,
     mut on_backoff: impl FnMut(u32, u32, u32) + Send,
+    // Per-swarm-agent lifecycle (id, goal, status, detail?, tool?): updates the
+    // live swarm panel and appends a transcript row as each sub-agent spawns and
+    // completes. A `running` status carries the live `tool` and only updates the
+    // panel's current-tool line (no transcript row). `id` correlates the events.
+    mut on_swarm: impl FnMut(&str, &str, &str, Option<&str>, Option<&str>) + Send,
 ) -> Result<(PromptReply, Duration)> {
     let start = std::time::Instant::now();
     let mut client = Connector::connect(path).await?;
@@ -2513,6 +2571,13 @@ async fn call_daemon(
                     preview,
                     elided_bytes,
                 } => on_tool_result(&tool, ok, &preview, elided_bytes),
+                StreamEvent::SwarmWorker {
+                    id,
+                    goal,
+                    status,
+                    detail,
+                    tool,
+                } => on_swarm(&id, &goal, &status, detail.as_deref(), tool.as_deref()),
                 StreamEvent::Usage {
                     input_tokens,
                     output_tokens,

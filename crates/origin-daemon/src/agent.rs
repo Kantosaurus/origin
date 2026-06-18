@@ -688,6 +688,49 @@ const fn browser_rate_limit_ok(cap: Option<u32>, count_so_far: u32) -> bool {
     }
 }
 
+/// Maximum characters of a swarm sub-agent's goal carried on a
+/// [`StreamEvent::SwarmWorker`] event. Keeps the wire frame (and the TUI row)
+/// compact; the full goal still drives the worker itself.
+const SWARM_GOAL_PREVIEW_CHARS: usize = 80;
+
+/// Truncate a sub-agent goal to a single compact line for the live swarm
+/// panel. Collapses inner whitespace/newlines to single spaces and caps the
+/// length with an ellipsis so one long goal can't blow out the TUI row.
+fn swarm_goal_preview(goal: &str) -> String {
+    let flat = goal.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= SWARM_GOAL_PREVIEW_CHARS {
+        flat
+    } else {
+        let head: String = flat.chars().take(SWARM_GOAL_PREVIEW_CHARS).collect();
+        format!("{head}\u{2026}")
+    }
+}
+
+/// Format a [`origin_swarm::WorkerId`] as the stable hex string used to
+/// correlate a worker's spawn and completion [`StreamEvent::SwarmWorker`]
+/// events in the CLI.
+fn swarm_worker_id_hex(id: origin_swarm::WorkerId) -> String {
+    format!("{:032x}", id.value())
+}
+
+#[cfg(test)]
+mod swarm_preview_tests {
+    use super::{swarm_goal_preview, SWARM_GOAL_PREVIEW_CHARS};
+
+    #[test]
+    fn short_goal_is_flattened_but_kept_whole() {
+        assert_eq!(swarm_goal_preview("write   the\n test"), "write the test");
+    }
+
+    #[test]
+    fn long_goal_is_capped_with_an_ellipsis() {
+        let goal = "x ".repeat(200);
+        let out = swarm_goal_preview(&goal);
+        assert_eq!(out.chars().count(), SWARM_GOAL_PREVIEW_CHARS + 1, "cap + ellipsis");
+        assert!(out.ends_with('\u{2026}'));
+    }
+}
+
 /// Best-effort end-of-turn / loop-end side effects.
 ///
 /// Each sub-step is independently env-gated or feature-gated and default-off:
@@ -2163,7 +2206,12 @@ pub struct LoopOptions {
 impl Default for LoopOptions {
     fn default() -> Self {
         Self {
-            max_turns: 200,
+            // No fixed turn cap: the agent loop runs until the model settles on a
+            // tool-free final answer. `u32::MAX` is the "infinite" sentinel — the
+            // real bounds are the token/compaction budget, the spend cap, and the
+            // user interrupt (Ctrl+C force-stop). Tests/benches/swarm workers still
+            // set an explicit small `max_turns` to bound their runs.
+            max_turns: u32::MAX,
             cas: None,
             code_graph: None,
             mem_router: None,
@@ -4117,7 +4165,22 @@ async fn run_loop_inner(
                                 input.model = Some(session.model.clone());
                             }
                             let goal = input.goal.clone();
-                            match origin_tools::builtins::task::task_spawn(coord, input).await {
+                            // Live current-tool feed: hand the worker a progress
+                            // sink (only when this connection has an event stream
+                            // to relay onto). Each tool the sub-agent starts comes
+                            // back here and is forwarded as a `running` event.
+                            let (progress_tx, progress_rx) = if opts.event_tx.is_some() {
+                                let (t, r) =
+                                    tokio::sync::mpsc::unbounded_channel::<origin_swarm::WorkerProgress>();
+                                (Some(t), Some(r))
+                            } else {
+                                (None, None)
+                            };
+                            match origin_tools::builtins::task::task_spawn_with_progress(
+                                coord, input, progress_tx,
+                            )
+                            .await
+                            {
                                 Ok(handle) => {
                                     let idx = tool_results.len();
                                     tool_results.push(Block::ToolResult {
@@ -4126,6 +4189,46 @@ async fn run_loop_inner(
                                         inline: Some(b"(sub-agent dispatched)".to_vec()),
                                         cache_marker: None,
                                     });
+                                    // Surface the new swarm agent to the TUI live, keyed by
+                                    // its stable worker id so later events update the same
+                                    // row in place.
+                                    if let Some(tx) = &opts.event_tx {
+                                        let worker_id = swarm_worker_id_hex(handle.id());
+                                        let goal_preview = swarm_goal_preview(&goal);
+                                        let _ = tx
+                                            .send(StreamEvent::SwarmWorker {
+                                                id: worker_id.clone(),
+                                                goal: goal_preview.clone(),
+                                                status: "spawned".to_string(),
+                                                detail: None,
+                                                tool: None,
+                                            })
+                                            .await;
+                                        // Forward each tool the worker starts as a
+                                        // `running` event until the worker finishes
+                                        // (its progress channel closes). Realtime relay,
+                                        // like every other daemon background task.
+                                        if let Some(mut rx) = progress_rx {
+                                            let ev_tx = tx.clone();
+                                            // Detached relay: drop the handle (runs on its own).
+                                            drop(spawn_in(TaskClass::Realtime, async move {
+                                                while let Some(
+                                                    origin_swarm::WorkerProgress::ToolStarted(tool),
+                                                ) = rx.recv().await
+                                                {
+                                                    let _ = ev_tx
+                                                        .send(StreamEvent::SwarmWorker {
+                                                            id: worker_id.clone(),
+                                                            goal: goal_preview.clone(),
+                                                            status: "running".to_string(),
+                                                            detail: None,
+                                                            tool: Some(tool),
+                                                        })
+                                                        .await;
+                                                }
+                                            }));
+                                        }
+                                    }
                                     pending_tasks.push((idx, id, goal, handle));
                                 }
                                 Err(e) => {
@@ -4526,16 +4629,43 @@ async fn run_loop_inner(
                 |m| m.sandbox_profile.ordinal(),
             );
             for (idx, id, goal, handle) in std::mem::take(&mut pending_tasks) {
-                let result_bytes = match origin_tools::builtins::task::task_await(coord, &handle, &goal).await
-                {
-                    Ok(output) => serde_json::to_string(&output)
-                        .unwrap_or_else(|e| {
-                            format!("{{\"status\":\"error\",\"summary\":\"Task json: {e}\"}}")
-                        })
-                        .into_bytes(),
-                    Err(e) => format!("Error: {e}").into_bytes(),
-                };
+                // Resolve the worker, capturing both the bytes the model sees and
+                // the terminal (status, detail) the TUI shows on the agent's row.
+                let (result_bytes, worker_status, worker_detail) =
+                    match origin_tools::builtins::task::task_await(coord, &handle, &goal).await {
+                        Ok(output) => {
+                            // Any non-`completed` terminal status (goal_unreachable /
+                            // budget_exhausted / aborted) reads as a failed agent.
+                            let status = if output.status == "completed" {
+                                "completed"
+                            } else {
+                                "failed"
+                            };
+                            let detail = Some(output.summary.clone());
+                            let bytes = serde_json::to_string(&output)
+                                .unwrap_or_else(|e| {
+                                    format!("{{\"status\":\"error\",\"summary\":\"Task json: {e}\"}}")
+                                })
+                                .into_bytes();
+                            (bytes, status, detail)
+                        }
+                        Err(e) => {
+                            let msg = format!("{e}");
+                            (format!("Error: {msg}").into_bytes(), "failed", Some(msg))
+                        }
+                    };
                 if let Some(tx) = &opts.event_tx {
+                    // Live per-agent completion: updates the row this worker's
+                    // "spawned" event created.
+                    let _ = tx
+                        .send(StreamEvent::SwarmWorker {
+                            id: swarm_worker_id_hex(handle.id()),
+                            goal: swarm_goal_preview(&goal),
+                            status: worker_status.to_string(),
+                            detail: worker_detail,
+                            tool: None,
+                        })
+                        .await;
                     let (preview, elided) = build_tool_result_preview(&result_bytes);
                     let _ = tx
                         .send(StreamEvent::ToolResult {

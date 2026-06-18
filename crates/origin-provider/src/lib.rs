@@ -72,6 +72,12 @@ pub enum ReasoningEffort {
     High,
     /// Maximum effort; deepest deliberation.
     Max,
+    /// `Ultracode`: the deepest tier — maximum reasoning *plus* always-on
+    /// multi-agent swarm orchestration. On the provider wire it is the highest
+    /// valid reasoning level (Anthropic `max`); the swarm-orchestration half is
+    /// realised by the always-on `Task` surface, not the wire. This is the
+    /// default effort for Anthropic models.
+    Ultracode,
 }
 
 impl ReasoningEffort {
@@ -86,6 +92,7 @@ impl ReasoningEffort {
             Self::Medium => "medium",
             Self::High => "high",
             Self::Max => "max",
+            Self::Ultracode => "ultracode",
         }
     }
 
@@ -93,13 +100,15 @@ impl ReasoningEffort {
     ///
     /// Anthropic accepts only `low|medium|high|xhigh|max` — there is no `fast`,
     /// so [`Self::Fast`] maps to the closest valid low-latency level, `low`.
+    /// `Ultracode` is an origin-internal tier (the wire has no such value); it
+    /// maps to the highest valid Anthropic level, `max`.
     #[must_use]
     pub const fn as_anthropic_effort(self) -> &'static str {
         match self {
             Self::Fast | Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
-            Self::Max => "max",
+            Self::Max | Self::Ultracode => "max",
         }
     }
 
@@ -107,13 +116,14 @@ impl ReasoningEffort {
     ///
     /// `OpenAI` reasoning models accept `low|medium|high` universally (`minimal`
     /// and `xhigh` are model-specific). `fast` and `max` are not valid values,
-    /// so [`Self::Fast`] maps to `low` and [`Self::Max`] to `high`.
+    /// so [`Self::Fast`] maps to `low` and [`Self::Max`]/[`Self::Ultracode`] to
+    /// `high`.
     #[must_use]
     pub const fn as_openai_effort(self) -> &'static str {
         match self {
             Self::Fast | Self::Low => "low",
             Self::Medium => "medium",
-            Self::High | Self::Max => "high",
+            Self::High | Self::Max | Self::Ultracode => "high",
         }
     }
 
@@ -128,6 +138,7 @@ impl ReasoningEffort {
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
             "max" => Some(Self::Max),
+            "ultracode" => Some(Self::Ultracode),
             _ => None,
         }
     }
@@ -296,5 +307,46 @@ pub trait Provider: Send + Sync {
         .map_err(|e| ProviderError::Api(e.to_string()))?;
         ring.close();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::ReasoningEffort;
+
+    #[test]
+    fn ultracode_round_trips_its_wire_token() {
+        assert_eq!(ReasoningEffort::Ultracode.as_wire_str(), "ultracode");
+        assert_eq!(
+            ReasoningEffort::from_wire_str("ultracode"),
+            Some(ReasoningEffort::Ultracode)
+        );
+        assert_eq!(
+            ReasoningEffort::from_wire_str("ULTRACODE"),
+            Some(ReasoningEffort::Ultracode)
+        );
+    }
+
+    #[test]
+    fn ultracode_maps_to_the_highest_valid_provider_levels() {
+        // On the Anthropic wire `ultracode` has no literal value; it must encode
+        // as the highest VALID level (`max`) or the Messages API 400s.
+        assert_eq!(ReasoningEffort::Ultracode.as_anthropic_effort(), "max");
+        // OpenAI tops out at `high`.
+        assert_eq!(ReasoningEffort::Ultracode.as_openai_effort(), "high");
+    }
+
+    #[test]
+    fn every_level_round_trips_its_wire_token() {
+        for lvl in [
+            ReasoningEffort::Fast,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+            ReasoningEffort::Ultracode,
+        ] {
+            assert_eq!(ReasoningEffort::from_wire_str(lvl.as_wire_str()), Some(lvl));
+        }
     }
 }
