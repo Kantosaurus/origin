@@ -1,0 +1,3 @@
+# SWE-bench Verified A/B harness (bench/swe). Python 3.10+.
+swebench>=3.0      # official evaluator: Docker per task, hidden FAIL_TO_PASS/PASS_TO_PASS
+datasets>=2.18     # loads princeton-nlp/SWE-bench_Verified

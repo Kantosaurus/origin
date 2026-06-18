@@ -94,7 +94,7 @@ the full lint table and the audited exceptions.
 ### Performance is a gate
 
 The `perf-gate.yml` workflow builds `origin-cli`/`origin-daemon` in release and
-runs `origin-bench` against `bench/tasks`, asserting read-only tasks stay within
+runs `origin-bench` against `bench/perf/tasks`, asserting read-only tasks stay within
 budget (worst `wall_ms` ≤ 80 ms). If your change touches a hot path (IPC, CAS, the
 render tick, the agent loop), run the benchmarks locally and call out any
 regression in the PR.

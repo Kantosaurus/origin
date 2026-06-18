@@ -138,7 +138,7 @@ fn group_into_samples(results: &[TaskResult]) -> Vec<TaskSamples> {
 ///
 /// The contestant binary is `$ORIGIN_BENCH_BIN` (falling back to `$ORIGIN_BIN`,
 /// then `origin`); the task set is `$ORIGIN_BENCH_TASKS` (falling back to
-/// `bench/tasks` relative to the current directory). `k` is `samples`.
+/// `bench/perf/tasks` relative to the current directory). `k` is `samples`.
 fn report_from_live(samples: u32) -> Result<ReliabilityReport> {
     let tasks_root = tasks_root();
     let tasks = origin_bench::task_set::load(&tasks_root)
@@ -169,9 +169,12 @@ fn contestant_bin() -> PathBuf {
         .map_or_else(|| PathBuf::from("origin"), PathBuf::from)
 }
 
-/// Resolve the task-set root for the live path.
+/// Resolve the task-set root for the live path. Defaults to the perf-probe set
+/// (`bench/perf/tasks`); the cross-harness A/B now lives in `bench/swe`
+/// (SWE-bench Verified). Override with `ORIGIN_BENCH_TASKS`.
 fn tasks_root() -> PathBuf {
-    std::env::var_os("ORIGIN_BENCH_TASKS").map_or_else(|| PathBuf::from("bench/tasks"), PathBuf::from)
+    std::env::var_os("ORIGIN_BENCH_TASKS")
+        .map_or_else(|| PathBuf::from("bench/perf/tasks"), PathBuf::from)
 }
 
 /// Aggregate one or more recorded `TaskResult` files into a ranked

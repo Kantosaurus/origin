@@ -11,6 +11,7 @@ workspace = true
 clap = { version = "4", features = ["derive"] }
 clap_mangen.workspace = true
 origin-cli = { path = "../crates/origin-cli" }
+origin-cost = { path = "../crates/origin-cost" }
 anyhow = "1"
 syn = { version = "2", features = ["full", "visit"] }
 walkdir = "2"

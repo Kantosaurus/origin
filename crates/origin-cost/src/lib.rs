@@ -285,6 +285,17 @@ static PRICES: &[(&str, ModelPrice)] = &[
     ("llama", ModelPrice::flat(0.2, 0.6)),
 ];
 
+/// The builtin price table as `(model-prefix, price)` pairs (USD / 1M tokens).
+///
+/// Exposed so external tooling — notably the `bench/` SWE-bench harness, via
+/// `cargo run -p xtask -- prices` — can cost EVERY contestant with the exact
+/// rates origin itself uses, keeping cross-harness $ comparisons apples-to-apples.
+/// Longest matching prefix wins (see [`price_for`]).
+#[must_use]
+pub fn price_table() -> &'static [(&'static str, ModelPrice)] {
+    PRICES
+}
+
 /// Cost of a single recorded turn, with the model and cache-warmth context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnCost {

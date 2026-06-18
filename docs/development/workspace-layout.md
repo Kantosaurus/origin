@@ -27,7 +27,7 @@ this page is the *physical* map.
 | `xtask/` | Developer-tools binary: `lint-secrets`, `lint-spawn`, `manpages`, `release`. |
 | `docs/` | Documentation: `architecture/`, `crates/`, `development/` (this dir), `security/`, and the published mdBook in `docs/site/`. |
 | `packaging/` | Distribution: `npm/`, `homebrew/`, `winget/`, `aur/` templates + scripts. |
-| `bench/` | Benchmark task fixtures (`bench/tasks`) the perf gate runs against. |
+| `bench/` | Benchmark task fixtures (`bench/perf/tasks`) the perf gate runs against. |
 | `vendor/` | Vendored third-party sidecars, e.g. `vendor/cloak-browser/` (Node CLI). |
 | `.github/` | CI workflows, issue/PR templates, `CODEOWNERS`, `dependabot.yml`. |
 | `Cargo.toml` | Workspace manifest: members, shared package metadata, lints, deps, profiles. |

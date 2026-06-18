@@ -8418,6 +8418,7 @@ dependencies = [
  "clap",
  "clap_mangen",
  "origin-cli",
+ "origin-cost",
  "proc-macro2",
  "quote",
  "regex",

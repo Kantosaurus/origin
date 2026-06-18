@@ -147,7 +147,7 @@ See also: [`../guides/configuration.md`](../guides/configuration.md) ·
 |----------|---------|---------|-----------------|
 | `ORIGIN_BIN` | bench, cli | Path to the `origin` binary under test. | Resolved at runtime. |
 | `ORIGIN_BENCH_BIN` | cli (bench) | Bench binary override (tried before `ORIGIN_BIN`). | — |
-| `ORIGIN_BENCH_TASKS` | cli (bench) | Bench task directory. | `bench/tasks`. |
+| `ORIGIN_BENCH_TASKS` | cli (bench) | Bench task directory. | `bench/perf/tasks`. |
 | `ORIGIN_TEST_OIDC_SUBJECT` | cli (oidc tests) | Test OIDC subject token. | Test-only. |
 | `SELF_UPDATE_WORKER_ENV` | cli (updater) | Internal marker for the self-update worker process. | Set by the updater. |
 

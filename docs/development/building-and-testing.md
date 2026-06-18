@@ -150,12 +150,12 @@ latest `cargo-llvm-cov` installs cleanly.
 ## The performance gate locally
 
 `perf-gate.yml` builds the release binaries, runs `origin-bench` against
-`bench/tasks`, and asserts the worst read-only task `wall_ms` is **≤ 80 ms**.
+`bench/perf/tasks`, and asserts the worst read-only task `wall_ms` is **≤ 80 ms**.
 Reproduce it:
 
 ```sh
 cargo build --release --locked -p origin-cli -p origin-daemon
-cargo run --release --locked -p origin-bench -- run-origin --tasks bench/tasks > result.json
+cargo run --release --locked -p origin-bench -- run-origin --tasks bench/perf/tasks > result.json
 ```
 
 The gate considers tasks whose id starts with `01-`/`02-` (the read-only set) and
@@ -224,7 +224,7 @@ The docs site (`docs/site/`) deploys to GitHub Pages from `dev` via `docs.yml`.
 | Format check | `cargo fmt --all -- --check` |
 | Clippy (CI parity) | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
 | Coverage | `cargo llvm-cov --workspace` |
-| Perf gate | `cargo run --release -p origin-bench -- run-origin --tasks bench/tasks` |
+| Perf gate | `cargo run --release -p origin-bench -- run-origin --tasks bench/perf/tasks` |
 | spawn/secret lints | `cargo run -p xtask -- lint-spawn` / `lint-secrets` |
 | Supply chain | `cargo deny check advisories bans sources` |
 

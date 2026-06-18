@@ -43,6 +43,10 @@ enum Cmd {
         #[arg(long, default_value = "target/release-packaging")]
         out: std::path::PathBuf,
     },
+    /// Dump origin's builtin model price table as JSON (USD / 1M tokens) so the
+    /// `bench/` SWE-bench harness costs every contestant with origin's own rates.
+    /// Regenerate `bench/swe/prices.json` with `cargo run -p xtask -- prices`.
+    Prices,
 }
 
 fn main() {
@@ -68,6 +72,25 @@ fn main() {
                 1
             }
         },
+        Cmd::Prices => {
+            let table: Vec<serde_json::Value> = origin_cost::price_table()
+                .iter()
+                .map(|(prefix, p)| {
+                    serde_json::json!({
+                        "prefix": prefix,
+                        "input_per_mtok": p.input_per_mtok,
+                        "output_per_mtok": p.output_per_mtok,
+                        "cache_read_per_mtok": p.cache_read_per_mtok,
+                        "cache_write_per_mtok": p.cache_write_per_mtok,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&table).expect("serialize price table")
+            );
+            0
+        }
     };
     std::process::exit(code);
 }

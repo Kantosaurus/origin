@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "//": "Read-only cold-start / latency probes for the perf-gate CI workflow (origin's own latency regression gate). NOT a cross-harness A/B benchmark — see bench/swe/ for that.",
+  "tasks": [
+    "01-read-and-summarize.json",
+    "02-grep-and-explain.json"
+  ]
+}

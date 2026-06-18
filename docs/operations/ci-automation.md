@@ -91,7 +91,7 @@ fast." It builds the release binaries, runs `origin-bench`, and asserts:
 
 ```sh
 cargo build --release --locked -p origin-cli -p origin-daemon
-cargo run --release --locked -p origin-bench -- run-origin --tasks bench/tasks > result.json
+cargo run --release --locked -p origin-bench -- run-origin --tasks bench/perf/tasks > result.json
 # Gate (paraphrased): the WORST wall_ms across read-only tasks (ids 01-/02-)
 # must be <= 80 ms, else the job fails.
 ```

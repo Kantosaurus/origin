@@ -1,0 +1,219 @@
+[
+  {
+    "cache_read_per_mtok": 1.5,
+    "cache_write_per_mtok": 18.75,
+    "input_per_mtok": 15.0,
+    "output_per_mtok": 75.0,
+    "prefix": "claude-opus-4"
+  },
+  {
+    "cache_read_per_mtok": 0.3,
+    "cache_write_per_mtok": 3.75,
+    "input_per_mtok": 3.0,
+    "output_per_mtok": 15.0,
+    "prefix": "claude-sonnet-4"
+  },
+  {
+    "cache_read_per_mtok": 0.08,
+    "cache_write_per_mtok": 1.0,
+    "input_per_mtok": 0.8,
+    "output_per_mtok": 4.0,
+    "prefix": "claude-haiku-4"
+  },
+  {
+    "cache_read_per_mtok": 0.3,
+    "cache_write_per_mtok": 3.75,
+    "input_per_mtok": 3.0,
+    "output_per_mtok": 15.0,
+    "prefix": "claude-3-5-sonnet"
+  },
+  {
+    "cache_read_per_mtok": 0.08,
+    "cache_write_per_mtok": 1.0,
+    "input_per_mtok": 0.8,
+    "output_per_mtok": 4.0,
+    "prefix": "claude-3-5-haiku"
+  },
+  {
+    "cache_read_per_mtok": 1.5,
+    "cache_write_per_mtok": 18.75,
+    "input_per_mtok": 15.0,
+    "output_per_mtok": 75.0,
+    "prefix": "claude-3-opus"
+  },
+  {
+    "cache_read_per_mtok": 0.03,
+    "cache_write_per_mtok": 0.3,
+    "input_per_mtok": 0.25,
+    "output_per_mtok": 1.25,
+    "prefix": "claude-3-haiku"
+  },
+  {
+    "cache_read_per_mtok": 0.3,
+    "cache_write_per_mtok": 3.75,
+    "input_per_mtok": 3.0,
+    "output_per_mtok": 15.0,
+    "prefix": "claude-"
+  },
+  {
+    "cache_read_per_mtok": 0.015,
+    "cache_write_per_mtok": 0.1875,
+    "input_per_mtok": 0.15,
+    "output_per_mtok": 0.6,
+    "prefix": "gpt-4o-mini"
+  },
+  {
+    "cache_read_per_mtok": 0.25,
+    "cache_write_per_mtok": 3.125,
+    "input_per_mtok": 2.5,
+    "output_per_mtok": 10.0,
+    "prefix": "gpt-4o"
+  },
+  {
+    "cache_read_per_mtok": 0.04000000000000001,
+    "cache_write_per_mtok": 0.5,
+    "input_per_mtok": 0.4,
+    "output_per_mtok": 1.6,
+    "prefix": "gpt-4.1-mini"
+  },
+  {
+    "cache_read_per_mtok": 0.2,
+    "cache_write_per_mtok": 2.5,
+    "input_per_mtok": 2.0,
+    "output_per_mtok": 8.0,
+    "prefix": "gpt-4.1"
+  },
+  {
+    "cache_read_per_mtok": 0.11000000000000001,
+    "cache_write_per_mtok": 1.375,
+    "input_per_mtok": 1.1,
+    "output_per_mtok": 4.4,
+    "prefix": "o1-mini"
+  },
+  {
+    "cache_read_per_mtok": 1.5,
+    "cache_write_per_mtok": 18.75,
+    "input_per_mtok": 15.0,
+    "output_per_mtok": 60.0,
+    "prefix": "o1"
+  },
+  {
+    "cache_read_per_mtok": 0.11000000000000001,
+    "cache_write_per_mtok": 1.375,
+    "input_per_mtok": 1.1,
+    "output_per_mtok": 4.4,
+    "prefix": "o3-mini"
+  },
+  {
+    "cache_read_per_mtok": 0.2,
+    "cache_write_per_mtok": 2.5,
+    "input_per_mtok": 2.0,
+    "output_per_mtok": 8.0,
+    "prefix": "o3"
+  },
+  {
+    "cache_read_per_mtok": 0.25,
+    "cache_write_per_mtok": 3.125,
+    "input_per_mtok": 2.5,
+    "output_per_mtok": 10.0,
+    "prefix": "gpt-"
+  },
+  {
+    "cache_read_per_mtok": 0.125,
+    "cache_write_per_mtok": 1.5625,
+    "input_per_mtok": 1.25,
+    "output_per_mtok": 5.0,
+    "prefix": "gemini-1.5-pro"
+  },
+  {
+    "cache_read_per_mtok": 0.0075,
+    "cache_write_per_mtok": 0.09375,
+    "input_per_mtok": 0.075,
+    "output_per_mtok": 0.3,
+    "prefix": "gemini-1.5-flash"
+  },
+  {
+    "cache_read_per_mtok": 0.010000000000000002,
+    "cache_write_per_mtok": 0.125,
+    "input_per_mtok": 0.1,
+    "output_per_mtok": 0.4,
+    "prefix": "gemini-2.0-flash"
+  },
+  {
+    "cache_read_per_mtok": 0.125,
+    "cache_write_per_mtok": 1.5625,
+    "input_per_mtok": 1.25,
+    "output_per_mtok": 10.0,
+    "prefix": "gemini-2.5-pro"
+  },
+  {
+    "cache_read_per_mtok": 0.03,
+    "cache_write_per_mtok": 0.375,
+    "input_per_mtok": 0.3,
+    "output_per_mtok": 2.5,
+    "prefix": "gemini-2.5-flash"
+  },
+  {
+    "cache_read_per_mtok": 0.125,
+    "cache_write_per_mtok": 1.5625,
+    "input_per_mtok": 1.25,
+    "output_per_mtok": 5.0,
+    "prefix": "gemini-"
+  },
+  {
+    "cache_read_per_mtok": 0.027000000000000003,
+    "cache_write_per_mtok": 0.3375,
+    "input_per_mtok": 0.27,
+    "output_per_mtok": 1.1,
+    "prefix": "deepseek-chat"
+  },
+  {
+    "cache_read_per_mtok": 0.05500000000000001,
+    "cache_write_per_mtok": 0.6875,
+    "input_per_mtok": 0.55,
+    "output_per_mtok": 2.19,
+    "prefix": "deepseek-reasoner"
+  },
+  {
+    "cache_read_per_mtok": 0.027000000000000003,
+    "cache_write_per_mtok": 0.3375,
+    "input_per_mtok": 0.27,
+    "output_per_mtok": 1.1,
+    "prefix": "deepseek"
+  },
+  {
+    "cache_read_per_mtok": 0.2,
+    "cache_write_per_mtok": 2.5,
+    "input_per_mtok": 2.0,
+    "output_per_mtok": 10.0,
+    "prefix": "grok-"
+  },
+  {
+    "cache_read_per_mtok": 0.04000000000000001,
+    "cache_write_per_mtok": 0.5,
+    "input_per_mtok": 0.4,
+    "output_per_mtok": 1.2,
+    "prefix": "qwen"
+  },
+  {
+    "cache_read_per_mtok": 0.2,
+    "cache_write_per_mtok": 2.5,
+    "input_per_mtok": 2.0,
+    "output_per_mtok": 6.0,
+    "prefix": "mistral-large"
+  },
+  {
+    "cache_read_per_mtok": 0.020000000000000004,
+    "cache_write_per_mtok": 0.25,
+    "input_per_mtok": 0.2,
+    "output_per_mtok": 0.6,
+    "prefix": "mistral"
+  },
+  {
+    "cache_read_per_mtok": 0.020000000000000004,
+    "cache_write_per_mtok": 0.25,
+    "input_per_mtok": 0.2,
+    "output_per_mtok": 0.6,
+    "prefix": "llama"
+  }
+]

@@ -12,8 +12,12 @@ use std::time::Instant;
 /// Returns any I/O error from spawning the subprocess.
 pub fn run_one(bin: &Path, task: &Task) -> anyhow::Result<TaskResult> {
     let start = Instant::now();
+    // `origin run <prompt> --json` streams one JSON `StreamEvent` per line,
+    // internally tagged on `kind` (snake_case). Token usage rides on
+    // `{"kind":"usage",...}`; each tool start is a `{"kind":"tool_activity",...}`.
+    // The prompt is a POSITIONAL arg (there is no `--prompt` flag).
     let out = Command::new(bin)
-        .args(["run", "--json", "--prompt", &task.prompt])
+        .args(["run", "--json", &task.prompt])
         .output()?;
     let wall = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -23,23 +27,17 @@ pub fn run_one(bin: &Path, task: &Task) -> anyhow::Result<TaskResult> {
     let stdout = String::from_utf8_lossy(&out.stdout);
     for line in stdout.lines() {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(t) = v.get("type").and_then(|x| x.as_str()) {
-                match t {
-                    "turn_end" => {
-                        input_tokens = input_tokens.saturating_add(
-                            v.get("input_tokens")
-                                .and_then(serde_json::Value::as_u64)
-                                .unwrap_or(0),
-                        );
-                        output_tokens = output_tokens.saturating_add(
-                            v.get("output_tokens")
-                                .and_then(serde_json::Value::as_u64)
-                                .unwrap_or(0),
-                        );
-                    }
-                    "tool_call" => tool_calls = tool_calls.saturating_add(1),
-                    _ => {}
+            match v.get("kind").and_then(|x| x.as_str()) {
+                Some("usage") => {
+                    input_tokens = input_tokens.saturating_add(
+                        v.get("input_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                    );
+                    output_tokens = output_tokens.saturating_add(
+                        v.get("output_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                    );
                 }
+                Some("tool_activity") => tool_calls = tool_calls.saturating_add(1),
+                _ => {}
             }
         }
     }

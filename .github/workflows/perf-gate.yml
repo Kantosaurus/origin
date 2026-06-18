@@ -24,7 +24,7 @@ jobs:
       - name: Build release
         run: cargo build --release --locked -p origin-cli -p origin-daemon
       - name: Cold-start benchmark
-        run: cargo run --release --locked -p origin-bench -- run-origin --tasks bench/tasks > result.json
+        run: cargo run --release --locked -p origin-bench -- run-origin --tasks bench/perf/tasks > result.json
       - name: Assert perf gates
         run: |
           python - <<'PY'
