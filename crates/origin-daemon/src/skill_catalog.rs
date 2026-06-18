@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 /// Read-only catalog of every `SKILL.md` available to the daemon.
 ///
-/// Always includes the 14 embedded superpowers skills; entries under `root`
+/// Always includes the embedded superpowers skills; entries under `root`
 /// (defaults to `~/.origin/skills/`) override embedded ones with the same name.
 #[derive(Debug, Default)]
 pub struct SkillCatalog {
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn load_includes_embedded_when_user_dir_missing() {
-        // load_all always returns the 14 embedded superpowers skills, even if
+        // load_all always returns the embedded superpowers skills, even if
         // the user override dir does not exist.
         let dir = tempfile::tempdir().expect("tempdir");
         let cat = SkillCatalog::load_from(&dir.path().join("nope")).expect("ok");
@@ -120,7 +120,7 @@ mod tests {
         assert!(cat.find("missing").is_none());
         assert!(
             cat.len() >= 16,
-            "expected >=16 (14 embedded + 2 user), got {}",
+            "expected >=16 (>=14 embedded + 2 user), got {}",
             cat.len()
         );
     }
