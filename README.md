@@ -78,9 +78,11 @@ origin                               # launches the TUI
 Other channels:
 
 ```sh
-cargo binstall origin-cli            # prebuilt binary via cargo-binstall
+cargo binstall --git https://github.com/Kantosaurus/origin origin-cli  # prebuilt release binary (not on crates.io; no checksum verify)
 cargo install --path crates/origin-cli   # build + install from source
-brew install Kantosaurus/tap/origin  # Homebrew tap, see packaging/homebrew
+brew install kantosaurus/origin/origin   # Homebrew tap, see packaging/homebrew
+scoop bucket add origin https://github.com/Kantosaurus/scoop-origin; scoop install origin  # Windows
+nix profile install github:Kantosaurus/origin   # Nix
 ```
 
 For a from-source developer build, see the [Quickstart](#quickstart) below.

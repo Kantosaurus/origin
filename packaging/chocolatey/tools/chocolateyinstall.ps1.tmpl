@@ -1,0 +1,45 @@
+$ErrorActionPreference = 'Stop'
+
+# Stamped by xtask/src/release.rs from the git tag + per-target SHA256 manifest:
+#   {{VERSION}}          -> release version (e.g. 0.9.10)
+#   {{SHA256_WIN_X64}}   -> sha256 of origin-x86_64-pc-windows-msvc.exe
+#   {{SHA256_WIN_ARM}}   -> sha256 of origin-aarch64-pc-windows-msvc.exe
+$version  = '{{VERSION}}'
+$toolsDir = "$(Split-Path -Parent $MyInvocation.MyCommand.Definition)"
+$base     = "https://github.com/Kantosaurus/origin/releases/download/v$version"
+
+# origin ships as raw, standalone binaries (NOT archives), one per target triple.
+# We resolve this machine's CPU architecture, download the matching binary straight
+# into the package `tools` directory, and verify its SHA-256. Chocolatey then
+# auto-creates a command-line shim named `origin` (it shims every .exe under tools).
+$arch = $env:PROCESSOR_ARCHITECTURE
+if (-not [string]::IsNullOrEmpty($env:PROCESSOR_ARCHITEW6432)) {
+  # A 32-bit (WOW64) PowerShell host reports x86 in PROCESSOR_ARCHITECTURE but the
+  # true OS architecture in PROCESSOR_ARCHITEW6432 -- prefer the latter when present.
+  $arch = $env:PROCESSOR_ARCHITEW6432
+}
+
+if ($arch -eq 'ARM64') {
+  $url      = "$base/origin-aarch64-pc-windows-msvc.exe"
+  $checksum = '{{SHA256_WIN_ARM}}'
+} else {
+  # AMD64 (native x64). x64 is the only non-ARM Windows binary we publish; ARM64
+  # hosts use the ARM64 build above, and x64-under-emulation hosts use this one.
+  $url      = "$base/origin-x86_64-pc-windows-msvc.exe"
+  $checksum = '{{SHA256_WIN_X64}}'
+}
+
+# Pass the resolved URL as BOTH -Url and -Url64bit so the file is fetched regardless
+# of how Get-ChocolateyWebFile resolves OS bitness; the checksum is enforced either way.
+$packageArgs = @{
+  packageName    = $env:ChocolateyPackageName
+  fileFullPath   = Join-Path $toolsDir 'origin.exe'
+  url            = $url
+  url64bit       = $url
+  checksum       = $checksum
+  checksum64     = $checksum
+  checksumType   = 'sha256'
+  checksumType64 = 'sha256'
+}
+
+Get-ChocolateyWebFile @packageArgs

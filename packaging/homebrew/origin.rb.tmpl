@@ -5,13 +5,18 @@ class Origin < Formula
   license "Apache-2.0"
 
   on_macos do
-    if Hardware::CPU.arm?
-      url "https://github.com/Kantosaurus/origin/releases/download/v{{VERSION}}/origin-aarch64-apple-darwin"
-      sha256 "{{SHA256_MAC_ARM}}"
-    else
-      url "https://github.com/Kantosaurus/origin/releases/download/v{{VERSION}}/origin-x86_64-apple-darwin"
-      sha256 "{{SHA256_MAC_X64}}"
-    end
+    # Only Apple Silicon (aarch64-apple-darwin) is built. The Intel
+    # (x86_64-apple-darwin) target is intentionally NOT produced — ort
+    # (ONNX Runtime) dropped its x86_64-macOS prebuilt — so {{SHA256_MAC_X64}}
+    # is always empty and must never be shipped. Rather than emit a formula
+    # with an empty/invalid sha256, fail fast on Intel macOS with a clear,
+    # actionable message. (Rosetta 2 cannot help here: it translates x86_64
+    # -> arm64 for Apple Silicon, not the reverse, so a real Intel Mac cannot
+    # run the arm64 binary.)
+    odie "origin does not ship a native Intel (x86_64) macOS build. Apple Silicon (arm64) only." if Hardware::CPU.intel?
+
+    url "https://github.com/Kantosaurus/origin/releases/download/v{{VERSION}}/origin-aarch64-apple-darwin"
+    sha256 "{{SHA256_MAC_ARM}}"
   end
 
   on_linux do

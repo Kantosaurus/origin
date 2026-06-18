@@ -1,0 +1,46 @@
+{
+  "version": "{{VERSION}}",
+  "description": "Performance-first agentic coding harness",
+  "homepage": "https://github.com/Kantosaurus/origin",
+  "license": "Apache-2.0",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/Kantosaurus/origin/releases/download/v{{VERSION}}/origin-x86_64-pc-windows-msvc.exe",
+      "hash": "{{SHA256_WIN_X64}}",
+      "bin": [
+        [
+          "origin-x86_64-pc-windows-msvc.exe",
+          "origin"
+        ]
+      ]
+    },
+    "arm64": {
+      "url": "https://github.com/Kantosaurus/origin/releases/download/v{{VERSION}}/origin-aarch64-pc-windows-msvc.exe",
+      "hash": "{{SHA256_WIN_ARM}}",
+      "bin": [
+        [
+          "origin-aarch64-pc-windows-msvc.exe",
+          "origin"
+        ]
+      ]
+    }
+  },
+  "checkver": {
+    "github": "https://github.com/Kantosaurus/origin",
+    "regex": "releases/tag/v([\\d.]+)"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/Kantosaurus/origin/releases/download/v$version/origin-x86_64-pc-windows-msvc.exe"
+      },
+      "arm64": {
+        "url": "https://github.com/Kantosaurus/origin/releases/download/v$version/origin-aarch64-pc-windows-msvc.exe"
+      }
+    },
+    "hash": {
+      "url": "https://github.com/Kantosaurus/origin/releases/download/v$version/SHA256SUMS",
+      "find": "([a-fA-F0-9]{64})\\s+$basename"
+    }
+  }
+}

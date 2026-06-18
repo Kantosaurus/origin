@@ -48,8 +48,13 @@ installs). Disable that check by exporting `ORIGINX_NO_UPDATE=1`.
 
 ### cargo-binstall (prebuilt via Cargo)
 
+`origin` is not published to crates.io, so point cargo-binstall at the repo
+directly — it clones the repo, reads `[package.metadata.binstall]`, and downloads
+the matching prebuilt binary from the GitHub Release (no compile). Note this
+channel does **not** verify a checksum/signature; for that prefer npm or Homebrew.
+
 ```sh
-cargo binstall origin-cli            # prebuilt binary via cargo-binstall
+cargo binstall --git https://github.com/Kantosaurus/origin origin-cli
 ```
 
 ### Homebrew

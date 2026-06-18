@@ -1,0 +1,10 @@
+$ErrorActionPreference = 'Stop'
+
+# Remove the downloaded binary so Chocolatey can drop its auto-generated `origin`
+# shim and leave no orphaned executable behind. Chocolatey removes the package
+# directory itself; this just clears the file we fetched at install time.
+$toolsDir = "$(Split-Path -Parent $MyInvocation.MyCommand.Definition)"
+$exe = Join-Path $toolsDir 'origin.exe'
+if (Test-Path -LiteralPath $exe) {
+  Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+}

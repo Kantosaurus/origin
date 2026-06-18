@@ -97,12 +97,14 @@ name = "keystroke_to_pixel"
 harness = false
 
 [package.metadata.binstall]
+# `cargo binstall --git https://github.com/Kantosaurus/origin origin-cli` pulls the
+# prebuilt RAW binary from the GitHub Release instead of compiling. The crate name
+# is `origin-cli` but the binary (and the Release asset prefix) is `origin`, so the
+# URL hardcodes the literal `origin-` prefix — `{ name }` would expand to
+# `origin-cli` and 404. `{ binary-ext }` appends `.exe` on Windows automatically.
+# NOTE: this channel does NOT verify a checksum/signature (cargo-binstall only
+# verifies opt-in minisign, which we don't ship); integrity-sensitive users should
+# prefer npm or Homebrew (which pins a per-artifact SHA-256).
 pkg-url    = "{ repo }/releases/download/v{ version }/origin-{ target }{ binary-ext }"
 pkg-fmt    = "bin"
-bin-dir    = "."
-
-[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
-pkg-fmt = "bin"
-
-[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
-pkg-fmt = "bin"
+bin-dir    = "{ bin }{ binary-ext }"

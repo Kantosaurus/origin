@@ -19,9 +19,12 @@ QUIC+mTLS at a glance, and system requirements.
 | Channel | Command | Updates | Notes |
 |---|---|---|---|
 | **npm** (recommended) | `npm install -g @kantosaurus/origin` | Auto (on by default) | Scoped package; postinstall fetches the per-platform binary. Wrapper command is `origin`. |
-| **cargo-binstall** | `cargo binstall origin-cli` | Manual (`cargo binstall` again) | Prebuilt release asset, no compile. |
-| **Homebrew** | `brew install kantosaurus/tap/origin` | `brew upgrade` | Downloads the signed release binary for your arch. |
-| **winget** | `winget install Kantosaurus.origin` | `winget upgrade` | Windows MSIX/installer manifest. |
+| **cargo-binstall** | `cargo binstall --git https://github.com/Kantosaurus/origin origin-cli` | Manual (re-run) | Prebuilt release asset, no compile; not on crates.io so `--git` is required; no checksum verify on this channel. |
+| **Homebrew** | `brew install kantosaurus/origin/origin` | `brew upgrade` | Tap `kantosaurus/origin`; downloads the release binary for your arch (Apple Silicon + Linux; Intel mac unsupported). |
+| **Scoop** | `scoop bucket add origin https://github.com/Kantosaurus/scoop-origin; scoop install origin` | `scoop update` | Windows x64 + arm64. |
+| **winget** | `winget install Kantosaurus.origin` | `winget upgrade` | Portable installer manifest (Windows x64 + arm64). |
+| **Chocolatey** | `choco install origin` | `choco upgrade` | Windows; downloads + sha256-verifies the release `.exe`. |
+| **Nix** | `nix profile install github:Kantosaurus/origin` | `nix profile upgrade` | Flake installs the prebuilt binary (Linux + Apple Silicon). |
 | **AUR** | `yay -S origin-bin` (or `paru`) | Re-build from AUR | `provides=origin`, `conflicts=origin`. |
 | **From source** | `cargo build --release -p origin-cli -p origin-daemon` | `git pull` + rebuild | MSRV-pinned toolchain (see below). |
 

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Chocolatey package manifest for `origin`.
+     Stamped by xtask/src/release.rs: {{VERSION}} is substituted from the git tag.
+     Schema: Chocolatey 2015/06 nuspec (adds packageSourceUrl/docsUrl/projectSourceUrl/bugTrackerUrl). -->
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>origin</id>
+    <version>{{VERSION}}</version>
+    <title>origin (Install)</title>
+    <authors>Ainsley Woo</authors>
+    <owners>Kantosaurus</owners>
+    <projectUrl>https://github.com/Kantosaurus/origin</projectUrl>
+    <projectSourceUrl>https://github.com/Kantosaurus/origin</projectSourceUrl>
+    <packageSourceUrl>https://github.com/Kantosaurus/origin/tree/dev/packaging/chocolatey</packageSourceUrl>
+    <docsUrl>https://github.com/Kantosaurus/origin/tree/dev/docs</docsUrl>
+    <bugTrackerUrl>https://github.com/Kantosaurus/origin/issues</bugTrackerUrl>
+    <!-- The SPDX <license> expression auto-generates a downlevel licenseUrl;
+         declaring BOTH triggers NuGet error NU5035, so we keep only this one. -->
+    <license type="expression">Apache-2.0</license>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <copyright>Copyright (c) Ainsley Woo</copyright>
+    <tags>origin cli ai agent terminal rust coding harness developer-tools admin</tags>
+    <summary>Performance-first agentic coding harness</summary>
+    <description>
+origin is a performance-first agentic coding harness.
+
+This package downloads the standalone `origin` executable for your CPU
+architecture (x64 or arm64) directly from the official GitHub Release,
+verifies its SHA-256 checksum, and places it in the package `tools`
+directory. Chocolatey automatically creates a command-line shim named
+`origin` on your PATH.
+
+Source and documentation: https://github.com/Kantosaurus/origin
+    </description>
+    <releaseNotes>https://github.com/Kantosaurus/origin/releases/tag/v{{VERSION}}</releaseNotes>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

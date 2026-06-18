@@ -230,3 +230,399 @@ jobs:
             --version "${{ steps.ver.outputs.version }}" \
             --binaries binaries \
             --publish --provenance
+
+  # ---------------------------------------------------------------------------
+  # Extra package managers. Each is a SEPARATE job (needs: release) so it never
+  # blocks the core binaries / npm publish, and each GATES on its secret so it
+  # SKIPS cleanly (stays green) until the owner provisions the secret/repo.
+  # See docs/operations/package-managers.md for the one-time setup per manager.
+  # ---------------------------------------------------------------------------
+
+  homebrew-tap-publish:
+    name: homebrew tap publish
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ github.repository == 'Kantosaurus/origin' && startsWith(github.ref, 'refs/tags/v') }}
+    permissions:
+      contents: read # only to read this repo's own Release assets via gh
+    steps:
+      - name: Check tap token
+        id: guard
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -n "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "have_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_token=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::HOMEBREW_TAP_TOKEN not set — skipping Homebrew tap publish."
+          fi
+      - name: Derive version from tag
+        if: steps.guard.outputs.have_token == 'true'
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Download stamped formula + verified binaries from the Release
+        if: steps.guard.outputs.have_token == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p stage verify
+          tag="${GITHUB_REF_NAME}"
+          gh release download "$tag" -R "${{ github.repository }}" -p 'origin.rb' -D stage --clobber
+          gh release download "$tag" -R "${{ github.repository }}" \
+            -p 'origin-aarch64-apple-darwin' \
+            -p 'origin-aarch64-unknown-linux-gnu' \
+            -p 'origin-x86_64-unknown-linux-gnu' \
+            -D verify --clobber
+          test -s stage/origin.rb
+      - name: Verify formula checksums against published binaries
+        if: steps.guard.outputs.have_token == 'true'
+        run: |
+          set -euo pipefail
+          mapfile -t sums < <(grep -oE 'sha256 "[0-9a-f]{64}"' stage/origin.rb | grep -oE '[0-9a-f]{64}')
+          if [ "${#sums[@]}" -ne 3 ]; then
+            echo "::error::expected 3 sha256 entries in origin.rb, found ${#sums[@]}"; cat stage/origin.rb; exit 1
+          fi
+          declare -A want=(
+            [aarch64-apple-darwin]="${sums[0]}"
+            [aarch64-unknown-linux-gnu]="${sums[1]}"
+            [x86_64-unknown-linux-gnu]="${sums[2]}"
+          )
+          for triple in "${!want[@]}"; do
+            got="$(sha256sum "verify/origin-$triple" | cut -d' ' -f1)"
+            if [ "$got" != "${want[$triple]}" ]; then
+              echo "::error::sha256 mismatch for $triple: formula=${want[$triple]} actual=$got"; exit 1
+            fi
+            echo "ok: $triple ${got}"
+          done
+      - name: Publish to Homebrew tap (plain git push)
+        if: steps.guard.outputs.have_token == 'true'
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 \
+            "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/Kantosaurus/homebrew-origin.git" tap
+          mkdir -p tap/Formula
+          cp stage/origin.rb tap/Formula/origin.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/origin.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date for v${VERSION}; nothing to push."; exit 0
+          fi
+          git commit -m "origin ${VERSION}"
+          branch="$(git rev-parse --abbrev-ref HEAD)"
+          git push origin "HEAD:${branch}" || { git pull --rebase origin "$branch"; git push origin "HEAD:${branch}"; }
+
+  scoop-bucket-publish:
+    name: scoop bucket publish
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ github.repository == 'Kantosaurus/origin' && startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - name: Gate on SCOOP_BUCKET_TOKEN
+        id: gate
+        env:
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+        run: |
+          if [ -n "$SCOOP_BUCKET_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::SCOOP_BUCKET_TOKEN not set - skipping Scoop bucket publish."
+          fi
+      - name: Download stamped manifest + Windows binaries from the Release
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p staged
+          gh release download "$VERSION" --repo "${{ github.repository }}" \
+            --pattern 'origin.json' \
+            --pattern 'origin-x86_64-pc-windows-msvc.exe' \
+            --pattern 'origin-aarch64-pc-windows-msvc.exe' \
+            --dir staged
+          ls -la staged
+      - name: Verify downloaded-binary checksums against the manifest
+        if: steps.gate.outputs.enabled == 'true'
+        working-directory: staged
+        run: |
+          x64_hash=$(jq -r '.architecture."64bit".hash' origin.json)
+          arm_hash=$(jq -r '.architecture.arm64.hash' origin.json)
+          echo "$x64_hash  origin-x86_64-pc-windows-msvc.exe"  | sha256sum -c -
+          echo "$arm_hash  origin-aarch64-pc-windows-msvc.exe" | sha256sum -c -
+      - name: Push manifest to Kantosaurus/scoop-origin
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git clone --depth 1 \
+            "https://x-access-token:${SCOOP_BUCKET_TOKEN}@github.com/Kantosaurus/scoop-origin.git" bucket-repo
+          mkdir -p bucket-repo/bucket
+          cp staged/origin.json bucket-repo/bucket/origin.json
+          cd bucket-repo
+          git add bucket/origin.json
+          if [ -z "$(git status --porcelain -- bucket/origin.json)" ]; then
+            echo "Manifest already up to date for ${VERSION}; nothing to push."; exit 0
+          fi
+          git commit -m "origin: update to ${VERSION#v}"
+          git push origin HEAD || { git pull --rebase origin "$(git rev-parse --abbrev-ref HEAD)"; git push origin HEAD; }
+
+  chocolatey-publish:
+    name: chocolatey publish
+    needs: release
+    runs-on: windows-latest
+    timeout-minutes: 30
+    if: ${{ github.repository == 'Kantosaurus/origin' && startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Guard on CHOCO_API_KEY
+        id: guard
+        shell: bash
+        env:
+          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+        run: |
+          if [ -n "$CHOCO_API_KEY" ]; then
+            echo "have=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CHOCO_API_KEY not set - skipping Chocolatey publish."
+          fi
+      - name: Derive version from tag
+        if: steps.guard.outputs.have == 'true'
+        id: ver
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Build SHA256 manifest from the Release
+        if: steps.guard.outputs.have == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "v${{ steps.ver.outputs.version }}" \
+            --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir . --clobber
+          python - <<'PY'
+          import json
+          m = {}
+          with open('SHA256SUMS') as fh:
+              for line in fh:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  sha, _, name = line.partition('  ')
+                  name = name.strip()
+                  if not name.startswith('origin-'):
+                      continue
+                  tgt = name[len('origin-'):]
+                  if tgt.endswith('.exe'):
+                      tgt = tgt[:-4]
+                  m[tgt] = sha.strip()
+          with open('manifest.json', 'w') as fh:
+              json.dump(m, fh, indent=2)
+          print(json.dumps(m, indent=2))
+          PY
+      - name: Stamp Chocolatey templates
+        if: steps.guard.outputs.have == 'true'
+        shell: bash
+        run: |
+          cargo run -p xtask --locked -- release \
+            --version "${{ steps.ver.outputs.version }}" \
+            --manifest manifest.json \
+            --out out/packaging
+      - name: choco pack
+        if: steps.guard.outputs.have == 'true'
+        shell: pwsh
+        run: |
+          choco pack out/packaging/chocolatey/origin.nuspec --out out/packaging/chocolatey
+      - name: choco push
+        if: steps.guard.outputs.have == 'true'
+        shell: pwsh
+        env:
+          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+        run: |
+          $pkg = Get-ChildItem out/packaging/chocolatey/origin.*.nupkg | Select-Object -First 1
+          if (-not $pkg) { throw "no .nupkg produced by choco pack" }
+          choco push $pkg.FullName --source "https://push.chocolatey.org/" --api-key "$env:CHOCO_API_KEY"
+
+  winget-publish:
+    name: winget publish
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: ${{ github.repository == 'Kantosaurus/origin' && startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - name: Check for WINGET_TOKEN
+        id: gate
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if [ -n "$WINGET_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::WINGET_TOKEN not set — skipping winget submission."
+          fi
+      # winget-releaser (Komac) rebuilds the Kantosaurus.origin manifest from the
+      # PUBLISHED Release: it matches the Windows assets via installers-regex,
+      # downloads them, and computes SHA256 itself. The regex is anchored to the
+      # CLI binary ONLY — the Release also ships origin-daemon-* / origin-supervisor-*
+      # .exe assets, so a broad `.*` would over-match and break the PR. `version`
+      # is intentionally OMITTED: winget-releaser strips the leading `v` from
+      # release-tag only when version is empty, giving PackageVersion 0.9.10.
+      # First-ever submission must be bootstrapped manually (see the package-managers doc).
+      - name: Publish to winget-pkgs
+        if: ${{ steps.gate.outputs.present == 'true' }}
+        uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+        with:
+          identifier: Kantosaurus.origin
+          release-tag: ${{ github.ref_name }}
+          installers-regex: '^origin-(x86_64|aarch64)-pc-windows-msvc\.exe$'
+          fork-user: Kantosaurus
+          max-versions-to-keep: 5
+          token: ${{ secrets.WINGET_TOKEN }}
+
+  aur-publish:
+    name: aur publish (origin-bin)
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Stable tags only: AUR pkgver forbids hyphens, so -rc/-beta tags are skipped.
+    if: ${{ github.repository == 'Kantosaurus/origin' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
+    steps:
+      - name: Check AUR secret
+        id: gate
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -n "$AUR_SSH_PRIVATE_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::AUR_SSH_PRIVATE_KEY not set — skipping AUR publish."
+          fi
+      - name: Derive version from tag
+        if: steps.gate.outputs.enabled == 'true'
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Download stamped PKGBUILD from the Release
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p aur
+          gh release download "${GITHUB_REF_NAME}" --repo "${{ github.repository }}" --pattern 'PKGBUILD' --dir aur
+          echo "----- PKGBUILD -----"; cat aur/PKGBUILD
+          if grep -q '{{' aur/PKGBUILD; then
+            echo "::error::PKGBUILD still contains unstamped {{...}} placeholders." >&2; exit 1
+          fi
+          grep -q "^pkgver=${{ steps.ver.outputs.version }}$" aur/PKGBUILD || {
+            echo "::error::pkgver in PKGBUILD does not match tag ${{ steps.ver.outputs.version }}." >&2; exit 1
+          }
+      - name: Publish origin-bin to the AUR
+        if: steps.gate.outputs.enabled == 'true'
+        uses: KSXGitHub/github-actions-deploy-aur@da03e160361ce01bf087e790b6ffd196d7dccff7 # v4.1.3
+        with:
+          pkgname: origin-bin
+          pkgbuild: ./aur/PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "origin-bin ${{ steps.ver.outputs.version }} (automated release)"
+          ssh_keyscan_types: rsa,ecdsa,ed25519
+          test: true
+          test_flags: --clean --cleanbuild --nodeps --nocheck
+
+  nix-sources-update:
+    name: nix flake sources update
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ github.repository == 'Kantosaurus/origin' && startsWith(github.ref, 'refs/tags/v') }}
+    permissions:
+      contents: write # push the stamped flake-sources.json back to dev
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: dev
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+      - name: Stamp flake sources from release binaries
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p out
+          find dist -type f -name 'origin-*' ! -name '*.sig' -exec cp {} out/ \;
+          python3 - <<'PY'
+          import hashlib, glob, json
+          m = {}
+          for f in glob.glob('out/origin-*'):
+              if f.endswith('.sig'):
+                  continue
+              name = f.rsplit('/', 1)[-1][len('origin-'):]
+              if name.endswith('.exe'):
+                  name = name[:-4]
+              with open(f, 'rb') as fh:
+                  m[name] = hashlib.sha256(fh.read()).hexdigest()
+          with open('manifest.json', 'w') as fh:
+              json.dump(m, fh, indent=2)
+          print(json.dumps(m, indent=2))
+          PY
+          cargo run -p xtask --locked -- release \
+            --version "$version" \
+            --manifest manifest.json \
+            --out out/packaging
+      - name: Verify downloaded-binary checksums match the stamped flake
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, hashlib, sys
+          src = json.load(open('out/packaging/flake-sources.json'))
+          triple = {
+              'x86_64-linux':  'origin-x86_64-unknown-linux-gnu',
+              'aarch64-linux': 'origin-aarch64-unknown-linux-gnu',
+              'aarch64-darwin':'origin-aarch64-apple-darwin',
+          }
+          bad = False
+          for sysname, entry in src['systems'].items():
+              path = 'out/' + triple[sysname]
+              got = hashlib.sha256(open(path, 'rb').read()).hexdigest()
+              if got != entry['sha256']:
+                  print(f'MISMATCH {sysname}: flake={entry["sha256"]} file={got}'); bad = True
+              else:
+                  print(f'ok {sysname}: {got}')
+          sys.exit(1 if bad else 0)
+          PY
+      - name: Commit stamped flake-sources.json to dev
+        run: |
+          set -euo pipefail
+          mkdir -p packaging/nix
+          cp out/packaging/flake-sources.json packaging/nix/flake-sources.json
+          if git diff --quiet -- packaging/nix/flake-sources.json; then
+            echo "flake-sources.json already up to date; nothing to commit."; exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add packaging/nix/flake-sources.json
+          git commit -m "release: stamp Nix flake sources for ${GITHUB_REF_NAME}"
+          git push origin HEAD:dev || { git pull --rebase origin dev; git push origin HEAD:dev; }

@@ -209,8 +209,20 @@ them in their respective taps/repos. The canonical repo owner is
 
 ### cargo-binstall
 
-The release ships `cargo-binstall` metadata so `cargo binstall origin` can fetch
-a prebuilt binary from the GitHub Release rather than compiling from source.
+`crates/origin-cli/Cargo.toml` carries a `[package.metadata.binstall]` block
+(`pkg-fmt = "bin"`, `pkg-url = "{ repo }/releases/download/v{ version }/origin-{ target }{ binary-ext }"`)
+mapping cargo-binstall's target to the raw Release asset names. The crate is not
+on crates.io, so users install with the `--git` form:
+
+```sh
+cargo binstall --git https://github.com/Kantosaurus/origin origin-cli
+```
+
+binstall clones the repo, reads the metadata, and downloads the matching
+`origin-<triple>[.exe]` asset (no compile). This channel does **not** verify a
+checksum/signature (cargo-binstall only verifies opt-in minisign, which origin
+does not ship) — integrity-sensitive users should prefer npm or Homebrew. No CI
+job or secret is needed: the metadata lives in the crate.
 
 ### crates.io
 
