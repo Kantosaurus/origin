@@ -22,7 +22,7 @@ panic = "warn"
 undocumented_unsafe_blocks = "deny"
 
 [dependencies]
-thiserror = "1"
+thiserror = "2"
 wide = "0.7"
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
 unicode-segmentation = "1"

@@ -17,7 +17,7 @@ otel = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk"]
 [dependencies]
 prometheus = { workspace = true }
 serde = { version = "1", features = ["derive"] }
-thiserror = "1"
+thiserror = "2"
 # The workspace deps already enable `trace` on `opentelemetry` and the
 # `grpc-tonic`/`metrics` features on `opentelemetry-otlp` + `opentelemetry_sdk`.
 # We additionally request the `trace` feature on the OTLP exporter and the SDK

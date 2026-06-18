@@ -42,7 +42,7 @@ clap = { version = "4", features = ["derive"] }
 dirs = "5"
 hostname = "0.4"
 url = "2"
-thiserror = "1"
+thiserror = "2"
 origin-provider = { path = "../origin-provider" }
 origin-keyvault = { path = "../origin-keyvault" }
 origin-skills   = { path = "../origin-skills" }

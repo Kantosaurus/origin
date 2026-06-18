@@ -24,7 +24,7 @@ memmap2 = "0.9"
 origin-replay = { path = "../origin-replay", optional = true }
 parking_lot = "0.12"
 rusqlite = { version = "0.31", features = ["bundled"] }
-thiserror = "1"
+thiserror = "2"
 zstd = "0.13"
 
 [dev-dependencies]

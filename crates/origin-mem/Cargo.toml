@@ -28,7 +28,7 @@ rand_chacha = "0.3"
 rusqlite    = { version = "0.31", features = ["bundled", "blob"] }
 ulid        = { version = "1", features = ["serde"] }
 blake3      = "1"
-thiserror   = "1"
+thiserror   = "2"
 sha2        = "0.10"
 ureq        = { version = "2", default-features = false, features = ["tls"] }
 bitvec      = "1"

@@ -3945,7 +3945,7 @@ version = "0.9.9"
 dependencies = [
  "libc",
  "serial_test",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tikv-jemalloc-ctl",
  "tikv-jemalloc-sys",
  "tikv-jemallocator",
@@ -3987,7 +3987,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "url",
@@ -4009,7 +4009,7 @@ dependencies = [
  "proptest",
  "rusqlite",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio-uring",
  "zstd",
 ]
@@ -4021,7 +4021,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4088,7 +4088,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",
  "tracing",
@@ -4104,14 +4104,14 @@ dependencies = [
 name = "origin-clipboard"
 version = "0.9.9"
 dependencies = [
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "origin-cmdparse"
 version = "0.9.9"
 dependencies = [
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4128,7 +4128,7 @@ dependencies = [
  "rkyv",
  "rusqlite",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",
@@ -4155,7 +4155,7 @@ version = "0.9.9"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4164,7 +4164,7 @@ version = "0.9.9"
 dependencies = [
  "proptest",
  "rkyv",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "ulid",
 ]
 
@@ -4255,7 +4255,7 @@ dependencies = [
  "serde_yaml",
  "sysinfo",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",
  "tracing",
@@ -4271,14 +4271,14 @@ version = "0.9.9"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "origin-editfmt"
 version = "0.9.9"
 dependencies = [
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4287,7 +4287,7 @@ version = "0.9.9"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4300,7 +4300,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -4310,7 +4310,7 @@ version = "0.9.9"
 dependencies = [
  "async-trait",
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -4323,7 +4323,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -4349,7 +4349,7 @@ dependencies = [
  "rustls-pemfile",
  "sha2",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "ulid",
  "x509-parser",
@@ -4373,7 +4373,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "windows 0.58.0",
  "wiremock",
@@ -4386,7 +4386,7 @@ version = "0.9.9"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4396,7 +4396,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -4422,7 +4422,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -4445,7 +4445,7 @@ dependencies = [
  "rusqlite",
  "sha2",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokenizers",
  "tracing",
  "ulid",
@@ -4465,7 +4465,7 @@ dependencies = [
  "opentelemetry_sdk",
  "prometheus",
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -4483,7 +4483,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tracing",
  "walkdir",
 ]
@@ -4494,7 +4494,7 @@ version = "0.9.9"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4505,7 +4505,7 @@ dependencies = [
  "pdf-extract",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4514,7 +4514,7 @@ version = "0.9.9"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4523,7 +4523,7 @@ version = "0.9.9"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4532,7 +4532,7 @@ version = "0.9.9"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4543,7 +4543,7 @@ dependencies = [
  "growable-bloom-filter",
  "origin-skills",
  "origin-tools",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -4558,7 +4558,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4566,7 +4566,7 @@ name = "origin-planner"
 version = "0.9.9"
 dependencies = [
  "proptest",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4574,7 +4574,7 @@ name = "origin-plugin"
 version = "0.9.9"
 dependencies = [
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "walkdir",
 ]
 
@@ -4583,7 +4583,7 @@ name = "origin-policy"
 version = "0.9.9"
 dependencies = [
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "toml 0.8.23",
 ]
 
@@ -4593,7 +4593,7 @@ version = "0.9.9"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4614,7 +4614,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "toml 0.8.23",
@@ -4642,7 +4642,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tracing",
@@ -4741,7 +4741,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "wiremock",
@@ -4758,7 +4758,7 @@ dependencies = [
  "serde_json",
  "tar",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "zstd",
 ]
@@ -4768,7 +4768,7 @@ name = "origin-repomap"
 version = "0.9.9"
 dependencies = [
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4783,7 +4783,7 @@ dependencies = [
  "serde_json",
  "subtle",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4799,7 +4799,7 @@ version = "0.9.9"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4807,7 +4807,7 @@ name = "origin-runtime"
 version = "0.9.9"
 dependencies = [
  "parking_lot",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -4822,7 +4822,7 @@ dependencies = [
  "seccompiler",
  "serde",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -4832,7 +4832,7 @@ name = "origin-schedule"
 version = "0.9.9"
 dependencies = [
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4841,7 +4841,7 @@ version = "0.9.9"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4851,7 +4851,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4859,7 +4859,7 @@ name = "origin-shimquirks"
 version = "0.9.9"
 dependencies = [
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4874,7 +4874,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -4888,14 +4888,14 @@ dependencies = [
  "serde",
  "serde_yaml",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "origin-steering"
 version = "0.9.9"
 dependencies = [
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4905,7 +4905,7 @@ dependencies = [
  "refinery",
  "rusqlite",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
@@ -4916,7 +4916,7 @@ dependencies = [
  "bytes",
  "parking_lot",
  "rkyv",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -4953,7 +4953,7 @@ dependencies = [
  "origin-store",
  "serde",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "ulid",
 ]
@@ -4964,7 +4964,7 @@ version = "0.9.9"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -5001,7 +5001,7 @@ dependencies = [
  "serde_json",
  "similar",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "walkdir",
 ]
@@ -5016,7 +5016,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
 ]
@@ -5040,7 +5040,7 @@ dependencies = [
  "proptest",
  "rkyv",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "unicode-segmentation",
  "unicode-width 0.1.14",
@@ -5057,7 +5057,7 @@ version = "0.9.9"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -5065,7 +5065,7 @@ name = "origin-voice"
 version = "0.9.9"
 dependencies = [
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -5074,7 +5074,7 @@ version = "0.9.9"
 dependencies = [
  "serde",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "walkdir",
 ]
 
@@ -5084,7 +5084,7 @@ version = "0.9.9"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -5093,7 +5093,7 @@ version = "0.9.9"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "toml 0.8.23",
 ]
 
@@ -8424,7 +8424,7 @@ dependencies = [
  "serde_json",
  "syn 2.0.117",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "walkdir",
 ]
 
