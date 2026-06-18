@@ -4972,13 +4972,21 @@ const MAX_CACHE_MARKERS: usize = 4;
 /// "A maximum of 4 blocks with cache_control may be provided."`. That is the
 /// production bug this helper guards against.
 ///
-/// The fix is a single source of truth: pick the marker positions once, then
-/// drive both the block-level field (path 2) and the plan's
-/// `dynamic_message_markers` (path 3) from the same set. The selection
-/// policy is "latest N turn boundaries", capped at [`MAX_CACHE_MARKERS`]:
-/// latest-N is cache-optimal because Anthropic's prompt cache hits work on
-/// prefix-extension — newer marker positions amortize across more subsequent
-/// turns than older ones.
+/// The fix is a single source of truth that cannot drift: the block-level
+/// `cache_marker` field (path 2). A marker set on a block rides along with that
+/// block through `session.snapshot()`, CAS expansion, and
+/// `strip_orphan_tool_results`, so it lands on the right block no matter how
+/// those transforms shift message *indices*. We therefore set path 2 only and
+/// leave the index-based `dynamic_message_markers` (path 3) empty — mirroring
+/// the positions into it was exactly what produced the drift: path 3 indexes
+/// `session.messages`, but the wire encoder consumes it against the post-strip
+/// list, so a single dropped (orphaned) turn shifts every later index and path
+/// 3 marks blocks path 2 already covered elsewhere → "Found 5". The provider's
+/// wire encoder independently clamps the total to [`MAX_CACHE_MARKERS`] as
+/// defense in depth. The selection policy is "latest N turn boundaries", capped
+/// at [`MAX_CACHE_MARKERS`]: latest-N is cache-optimal because Anthropic's
+/// prompt cache hits work on prefix-extension — newer marker positions amortize
+/// across more subsequent turns than older ones.
 ///
 /// Without these markers every iteration of [`run_loop`] re-bills the full
 /// `session.snapshot()` at the un-cached rate. Anthropic's prompt cache
@@ -5035,13 +5043,14 @@ fn apply_turn_cache_markers(messages: &mut [Message], plan: Option<&origin_plann
         }
     }
 
-    // Path (3): mirror the same positions in the shared Plan's
-    // `dynamic_message_markers`. The wire encoder OR-combines paths (2) and
-    // (3) per block; because they target the same blocks here, the union
-    // equals the intersection and the marker count is exactly `chosen.len()`.
+    // Path (3): keep the shared Plan's index-based `dynamic_message_markers`
+    // empty. The block-level markers set above (path 2) already encode every
+    // boundary and are immune to the index drift that path 3 suffers when
+    // `strip_orphan_tool_results` drops a turn between here and the wire
+    // encoder. Clearing each turn also wipes any stale positions a prior turn
+    // left in the shared (long-lived) plan, so path 3 stays inert.
     if let Some(plan) = plan {
-        let msg_indices: Vec<usize> = chosen.iter().map(|&(mi, _)| mi).collect();
-        plan.set_dynamic_message_markers(msg_indices);
+        plan.set_dynamic_message_markers(Vec::new());
     }
 }
 
@@ -5113,15 +5122,21 @@ mod cache_marker_tests {
     /// Anthropic rejects requests with > 4 `cache_control` markers. The wire
     /// encoder emits one marker per block when *any* of three independent paths
     /// fires for that block (block-level `cache_marker`, plan `marker_indices`,
-    /// or plan `dynamic_message_markers`). If those paths target different
-    /// blocks, their union can exceed 4 even when each path is individually
-    /// capped — which is exactly the 5-marker 400 the daemon hit in production.
+    /// or plan `dynamic_message_markers`).
     ///
-    /// Invariant: after `apply_turn_cache_markers`, the set of message indices
-    /// marked at the block level must equal the set in `dynamic_message_markers`,
-    /// and the cardinality must stay at or below `MAX_CACHE_MARKERS`.
+    /// The block-level `cache_marker` is the single source of truth: it rides
+    /// along with its block through `session.snapshot()`, CAS expansion, and
+    /// `strip_orphan_tool_results`, so it never drifts. The index-based plan
+    /// `dynamic_message_markers` (path 3) DOES drift — it indexes
+    /// `session.messages` while the encoder consumes it against the post-strip
+    /// wire list — so `apply_turn_cache_markers` must leave it empty rather than
+    /// mirror the block positions into it (mirroring was the source of the
+    /// production 5-marker 400 once a turn got stripped).
+    ///
+    /// Invariant: after `apply_turn_cache_markers`, block-level markers number
+    /// at most `MAX_CACHE_MARKERS` and `dynamic_message_markers` is empty.
     #[test]
-    fn block_and_dynamic_markers_converge_under_ceiling_after_20_turns() {
+    fn block_markers_stay_under_ceiling_and_dynamic_is_inert_after_20_turns() {
         let plan = Plan::default();
         let mut msgs: Vec<Message> = Vec::new();
         for turn in 0..20 {
@@ -5132,24 +5147,22 @@ mod cache_marker_tests {
         let block_marked = block_marked_message_indices(&msgs);
         let dyn_marked: HashSet<usize> = plan.dynamic_message_markers().into_iter().collect();
 
-        assert_eq!(
-            block_marked, dyn_marked,
-            "block-level markers and dynamic_message_markers must target the \
-             same messages so the wire encoder's paths converge per block; got \
-             block={block_marked:?}, dyn={dyn_marked:?}"
-        );
         assert!(
-            block_marked.len() <= MAX_CACHE_MARKERS,
-            "marker count must stay at or below {MAX_CACHE_MARKERS} \
-             (Anthropic's per-request ceiling); got {} at {block_marked:?}",
-            block_marked.len()
+            dyn_marked.is_empty(),
+            "dynamic_message_markers (the drift-prone index-based path) must stay \
+             empty; the block-level marker is the sole source of truth. got {dyn_marked:?}"
+        );
+        assert_eq!(
+            block_marked.len(),
+            MAX_CACHE_MARKERS,
+            "after >MAX turns exactly MAX latest boundaries carry block markers; got {block_marked:?}"
         );
     }
 
     /// Same invariant at the smaller scale where bands collapse — exercises the
     /// edge cases of the recency classifier.
     #[test]
-    fn block_and_dynamic_markers_converge_for_small_sessions() {
+    fn block_markers_stay_under_ceiling_for_small_sessions() {
         for n_turns in 1..=6 {
             let plan = Plan::default();
             let mut msgs: Vec<Message> = Vec::new();
@@ -5159,13 +5172,14 @@ mod cache_marker_tests {
             }
             let block_marked = block_marked_message_indices(&msgs);
             let dyn_marked: HashSet<usize> = plan.dynamic_message_markers().into_iter().collect();
-            assert_eq!(
-                block_marked, dyn_marked,
-                "divergence at n_turns={n_turns}: block={block_marked:?}, dyn={dyn_marked:?}"
-            );
             assert!(
-                block_marked.len() <= MAX_CACHE_MARKERS,
-                "over ceiling at n_turns={n_turns}: {block_marked:?}"
+                dyn_marked.is_empty(),
+                "dynamic markers must stay empty at n_turns={n_turns}: {dyn_marked:?}"
+            );
+            assert_eq!(
+                block_marked.len(),
+                n_turns.min(MAX_CACHE_MARKERS),
+                "expected min(n_turns, MAX) block markers at n_turns={n_turns}: {block_marked:?}"
             );
         }
     }

@@ -207,11 +207,7 @@ impl Anthropic {
     fn build_chat_body(&self, req: &ChatRequest) -> Result<serde_json::Value, ProviderError> {
         let expanded = expand_messages_for_wire(&req.messages, self.cas.as_ref(), self.plan.as_ref())?;
         let plan = self.plan.as_ref();
-        let wire_messages = expanded
-            .iter()
-            .enumerate()
-            .map(|(idx, m)| message_to_wire(m, plan, idx))
-            .collect::<Vec<_>>();
+        let wire_messages = build_wire_messages(&expanded, plan);
         let wire_tools = req
             .tools
             .iter()
@@ -343,11 +339,7 @@ impl Provider for Anthropic {
     async fn chat_stream(&self, req: ChatRequest, ring: &origin_stream::Ring) -> Result<(), ProviderError> {
         let expanded = expand_messages_for_wire(&req.messages, self.cas.as_ref(), self.plan.as_ref())?;
         let plan = self.plan.as_ref();
-        let wire_messages = expanded
-            .iter()
-            .enumerate()
-            .map(|(idx, m)| message_to_wire(m, plan, idx))
-            .collect::<Vec<_>>();
+        let wire_messages = build_wire_messages(&expanded, plan);
         let wire_tools = req
             .tools
             .iter()
@@ -494,21 +486,32 @@ impl Provider for Anthropic {
     }
 }
 
-fn message_to_wire<'a>(m: &'a Message, plan: Option<&Plan>, msg_idx: usize) -> wire::WireMessage<'a> {
-    let role = match m.role {
-        Role::User | Role::Tool | Role::System => "user",
-        // Anthropic represents tool results as user messages (Role::Tool).
-        // System content goes in the top-level `system` field, not a message (Role::System).
-        Role::Assistant => "assistant",
-    };
+/// Anthropic's Messages API rejects any request carrying more than this many
+/// blocks with `cache_control` (`invalid_request_error: "A maximum of 4 blocks
+/// with cache_control may be provided."`). The ceiling spans the WHOLE request
+/// (tools + system + messages); in this encoder `system` is a plain string and
+/// `WireTool` carries no marker, so every marker lives on a message block and
+/// this is the only place the budget is spent.
+const WIRE_MAX_CACHE_MARKERS: usize = 4;
+
+/// Block indices within message `m` (at `msg_idx`) that any emission path would
+/// flag with `cache_control`, BEFORE the per-request ceiling is applied. Three
+/// independent paths feed this:
+///
+/// 1. A `Plan` planted a marker at `(msg_idx == 0, block_idx)` via
+///    `Plan::marker_indices` — the legacy P3.2 first-message section boundary.
+/// 2. The block itself carries `cache_marker: Some(_)` — the index-immune,
+///    block-anchored boundary the agent loop plants on turn boundaries. This is
+///    the authoritative source: it rides along with its block through snapshot,
+///    CAS expansion, and orphan-stripping, so it never drifts.
+/// 3. The plan's `dynamic_message_markers` lists `msg_idx`; the marker lands on
+///    the *last emitting* block (a trailing `Block::Thinking` is dropped by
+///    `block_to_wire`, so it would otherwise swallow the marker). This path is
+///    index-based and therefore fragile if the caller's index space diverges
+///    from the wire's — `build_wire_messages` clamps the union regardless.
+fn marker_block_indices(m: &Message, plan: Option<&Plan>, msg_idx: usize) -> Vec<usize> {
     let marker_indices: &[usize] = plan.map_or(&[], Plan::marker_indices);
-    // Dynamic per-message markers (populated each turn by the agent loop).
-    // Empty by default, so the read is cheap when no planner is wired.
     let dyn_msg_marker_here = plan.is_some_and(|p| p.dynamic_message_markers().contains(&msg_idx));
-    // When path 3 fires we need to land the marker on the *last emitting*
-    // block. `Block::Thinking` is filtered out by `block_to_wire`, so we skip
-    // it when picking the boundary block — otherwise a trailing thinking
-    // block would silently swallow the cache marker.
     let last_emit_idx = if dyn_msg_marker_here {
         m.blocks
             .iter()
@@ -516,38 +519,85 @@ fn message_to_wire<'a>(m: &'a Message, plan: Option<&Plan>, msg_idx: usize) -> w
     } else {
         None
     };
-    // Count emitted `cache_control` markers across the message so we can warn
-    // when callers approach Anthropic's per-request 4-marker ceiling. The
-    // warn fires at the message level; aggregating across messages would
-    // require a wider pass, so we settle for per-message visibility here.
-    let mut emitted_markers: usize = 0;
+    m.blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(block_idx, b)| {
+            let plan_marker_here = plan.is_some() && msg_idx == 0 && marker_indices.contains(&block_idx);
+            let block_marker_here = block_has_cache_marker(b);
+            let dynamic_marker_here = Some(block_idx) == last_emit_idx;
+            (plan_marker_here || block_marker_here || dynamic_marker_here).then_some(block_idx)
+        })
+        .collect()
+}
+
+/// Build the full `messages` array for the wire request, placing cache markers
+/// and enforcing Anthropic's per-request ceiling across the WHOLE request.
+///
+/// This is the single choke point both `chat` (non-streaming) and `chat_stream`
+/// funnel through, so the ceiling is enforced in exactly one place regardless of
+/// transport — and regardless of how the upstream marker-selection paths overlap
+/// or whether their index space has drifted from the wire's (e.g. after a turn
+/// was dropped by `strip_orphan_tool_results`). Without this clamp such a drift
+/// is fatal: the API 400s the entire turn with `"A maximum of 4 blocks with
+/// cache_control may be provided. Found 5."`.
+fn build_wire_messages<'a>(messages: &'a [Message], plan: Option<&Plan>) -> Vec<wire::WireMessage<'a>> {
+    // Pass 1: collect every (msg_idx, block_idx) any path would mark, in
+    // document order (ascending msg_idx, then block_idx).
+    let selected: Vec<(usize, usize)> = messages
+        .iter()
+        .enumerate()
+        .flat_map(|(msg_idx, m)| {
+            marker_block_indices(m, plan, msg_idx)
+                .into_iter()
+                .map(move |block_idx| (msg_idx, block_idx))
+        })
+        .collect();
+
+    // Clamp to the ceiling, keeping the LATEST markers: Anthropic's prompt cache
+    // hits on prefix-extension, so a newer marker amortizes across more
+    // subsequent turns than an older one. Since `selected` is in document order,
+    // the last `WIRE_MAX_CACHE_MARKERS` entries are the latest.
+    if selected.len() > WIRE_MAX_CACHE_MARKERS {
+        tracing::warn!(
+            selected = selected.len(),
+            kept = WIRE_MAX_CACHE_MARKERS,
+            "cache_control marker selection exceeded Anthropic's per-request ceiling; \
+             keeping the latest and dropping the earliest to avoid a 400"
+        );
+    }
+    let keep: std::collections::HashSet<(usize, usize)> = selected
+        .iter()
+        .rev()
+        .take(WIRE_MAX_CACHE_MARKERS)
+        .copied()
+        .collect();
+
+    // Pass 2: serialize, emitting `cache_control` only on the kept positions.
+    messages
+        .iter()
+        .enumerate()
+        .map(|(msg_idx, m)| message_to_wire(m, msg_idx, &keep))
+        .collect()
+}
+
+fn message_to_wire<'a>(
+    m: &'a Message,
+    msg_idx: usize,
+    keep: &std::collections::HashSet<(usize, usize)>,
+) -> wire::WireMessage<'a> {
+    let role = match m.role {
+        Role::User | Role::Tool | Role::System => "user",
+        // Anthropic represents tool results as user messages (Role::Tool).
+        // System content goes in the top-level `system` field, not a message (Role::System).
+        Role::Assistant => "assistant",
+    };
     let content = m
         .blocks
         .iter()
         .enumerate()
         .filter_map(|(block_idx, b)| {
-            // Three paths can emit a `cache_control` on a block:
-            //
-            // 1. A `Plan` planted a marker at `(msg_idx == 0, block_idx)`
-            //    via `Plan::marker_indices`. This is the legacy P3.2 path
-            //    for first-message section boundaries.
-            //
-            // 2. The block itself carries `cache_marker: Some(_)`. Phase 11
-            //    handle-substitution makes section markers viable on any
-            //    message (not just msg 0), so we honour the in-band marker
-            //    regardless of `msg_idx`. All `CacheBoundary` variants map
-            //    to `"ephemeral"`: that is the only `cache_control.type`
-            //    the Anthropic Messages API accepts today.
-            //
-            // 3. The agent loop populated `dynamic_message_markers` with
-            //    `msg_idx`. The marker lands on the *last emitting* block
-            //    of this message — i.e., the natural turn boundary. Skipped
-            //    when the planner is absent or the index list is empty.
-            let plan_marker_here = plan.is_some() && msg_idx == 0 && marker_indices.contains(&block_idx);
-            let block_marker_here = block_has_cache_marker(b);
-            let dynamic_marker_here = Some(block_idx) == last_emit_idx;
-            let cache_control = if plan_marker_here || block_marker_here || dynamic_marker_here {
-                emitted_markers = emitted_markers.saturating_add(1);
+            let cache_control = if keep.contains(&(msg_idx, block_idx)) {
                 // Only the single most-stable boundary (tagged `Frozen` by the
                 // agent loop) gets the longer 1h TTL, and only when explicitly
                 // enabled — sending `ttl` requires the extended-cache-ttl beta,
@@ -567,14 +617,6 @@ fn message_to_wire<'a>(m: &'a Message, plan: Option<&Plan>, msg_idx: usize) -> w
             block_to_wire(b, cache_control)
         })
         .collect();
-    if emitted_markers > 4 {
-        tracing::warn!(
-            msg_idx,
-            emitted_markers,
-            "Anthropic accepts at most 4 cache_control markers per request; \
-             the API will reject the overflow. Trim cache markers or split the request."
-        );
-    }
     wire::WireMessage { role, content }
 }
 
@@ -939,12 +981,26 @@ fn short_hex(h: &[u8; 32]) -> String {
 #[doc(hidden)]
 #[must_use]
 pub fn encode_request_for_test(req: &ChatRequest) -> serde_json::Value {
-    let wire_messages = req
-        .messages
-        .iter()
-        .enumerate()
-        .map(|(idx, m)| message_to_wire(m, None, idx))
-        .collect::<Vec<_>>();
+    encode_request_body_for_test(req, None)
+}
+
+/// Test-only sibling of [`encode_request_for_test`] that threads a [`Plan`] into
+/// the wire encoder, so tests can exercise the plan-driven cache-marker paths
+/// (planner `marker_indices` and `dynamic_message_markers`) and the global
+/// per-request `cache_control` ceiling those paths feed into.
+#[doc(hidden)]
+#[must_use]
+pub fn encode_request_with_plan_for_test(req: &ChatRequest, plan: &Plan) -> serde_json::Value {
+    encode_request_body_for_test(req, Some(plan))
+}
+
+fn encode_request_body_for_test(req: &ChatRequest, plan: Option<&Plan>) -> serde_json::Value {
+    // Mirror the production encode pipeline (expand CAS handles + strip orphan
+    // tool_results) so tests observe the exact message list the wire encoder
+    // places cache markers on — including any index shift from a dropped turn.
+    let expanded = expand_messages_for_wire(&req.messages, None, plan)
+        .expect("test requests carry no CAS handles, so expansion cannot fail");
+    let wire_messages = build_wire_messages(&expanded, plan);
     let wire_tools = req
         .tools
         .iter()
