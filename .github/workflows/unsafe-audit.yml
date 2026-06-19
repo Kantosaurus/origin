@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # The workspace sets `unsafe_code = "forbid"` in the root Cargo.toml's
       # [workspace.lints.rust], which the COMPILER enforces as a hard error for
       # every crate that inherits it via `[lints] workspace = true`. The only way
