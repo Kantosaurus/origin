@@ -1388,10 +1388,27 @@ impl App {
         true
     }
 
-    /// Enter on the highlighted agent: focus it (the main pane shows its
-    /// transcript) — or, if it is already focused, toggle back to the main origin
-    /// view. No-op when nothing is selected. Returns `true` when the view changed.
+    /// Enter while a sub-agent is focused: **always returns to the main origin
+    /// view** (clears `swarm_view`), regardless of which agent the panel cursor
+    /// currently highlights. Enter while NOT focused drills into the highlighted
+    /// agent. Returns `true` when the view changed.
+    ///
+    /// Keying the *exit* off "am I viewing anything?" (`swarm_view`) rather than
+    /// "is the highlighted agent the one I'm viewing?" is essential: the footer
+    /// invites the user to press **Tab/Enter** to go back, and Tab moves the
+    /// selection cursor onto a *different* agent. The previous logic compared the
+    /// viewed id against the *selected* row, so after a Tab the two diverged and
+    /// Enter switched to viewing the newly-selected agent instead of exiting —
+    /// trapping the user, who could hop between sub-agents forever but never
+    /// reach the main view. Now any Enter while focused exits.
     pub fn swarm_toggle_focus(&mut self) -> bool {
+        // Already viewing a sub-agent ⇒ Enter/Tab-back always returns to main,
+        // no matter where the highlight cursor sits.
+        if self.swarm_view.is_some() {
+            self.swarm_view = None;
+            return true;
+        }
+        // Not focused yet ⇒ drill into the highlighted agent (if any).
         let Some(i) = self.swarm_selected else {
             return false;
         };
@@ -1399,11 +1416,7 @@ impl App {
             self.swarm_selected = None;
             return false;
         };
-        if self.swarm_view.as_deref() == Some(row.id.as_str()) {
-            self.swarm_view = None; // toggle back to the main origin agent
-        } else {
-            self.swarm_view = Some(row.id.clone());
-        }
+        self.swarm_view = Some(row.id.clone());
         true
     }
 
@@ -3371,6 +3384,106 @@ mod tests {
         assert_eq!(app.swarm_selected, None);
         assert_eq!(app.swarm_view, None);
         assert!(app.focused_swarm_agent().is_none());
+    }
+
+    /// Repro for "after toggling into a subagent I can't go back": the live
+    /// `main.rs` Enter handler only calls `swarm_toggle_focus` when
+    /// `swarm_selected.is_some()`. But a single agent COMPLETING does not clear
+    /// `swarm_selected`/`swarm_view`, so this models the realistic flow: drill
+    /// into a (background) agent, the agent finishes, then press Enter to return.
+    #[test]
+    fn enter_returns_to_main_after_focused_agent_completes() {
+        let mut app = App::new("anthropic", "claude-opus-4-8", CompletionSources::default());
+        app.apply_swarm_event("a1", "g1", "spawned");
+        // Tab → Enter: drill into the agent.
+        app.swarm_cycle_selection();
+        assert_eq!(app.swarm_selected, Some(0));
+        app.swarm_toggle_focus();
+        assert_eq!(app.focused_swarm_agent().map(|r| r.id.as_str()), Some("a1"));
+        // The agent completes while we are viewing it (no fresh wave starts).
+        app.apply_swarm_event("a1", "g1", "completed");
+        // We must still be focused (completion does not auto-exit).
+        assert!(app.swarm_view.is_some(), "still viewing after completion");
+        // Now Enter to go back. The live gate is `swarm_selected.is_some()`.
+        assert!(
+            app.swarm_selected.is_some(),
+            "selection must survive completion so Enter can toggle back"
+        );
+        app.swarm_toggle_focus();
+        assert!(
+            app.focused_swarm_agent().is_none(),
+            "Enter returns to the main origin view"
+        );
+    }
+
+    /// Repro for the same bug via a DIFFERENT lifecycle: drill into agent 0, then
+    /// a second agent spawns in the SAME wave (appended). Tabbing now lands on a
+    /// different index than the one being viewed; pressing Enter must still be
+    /// able to return to main rather than hopping between agents forever.
+    #[test]
+    fn enter_can_return_to_main_when_a_second_agent_joins_the_wave() {
+        let mut app = App::new("anthropic", "claude-opus-4-8", CompletionSources::default());
+        app.apply_swarm_event("a1", "g1", "spawned");
+        app.swarm_cycle_selection(); // select 0 (a1)
+        app.swarm_toggle_focus(); // view a1
+        assert_eq!(app.swarm_view.as_deref(), Some("a1"));
+        // A second agent joins the live wave (a1 still running ⇒ appended, not a
+        // fresh wave).
+        app.apply_swarm_event("b2", "g2", "spawned");
+        assert_eq!(app.swarm_agents.len(), 2, "second agent appended");
+        // The user presses Enter (selection still points at index 0 = a1), which
+        // should toggle a1 off ⇒ back to main.
+        assert_eq!(app.swarm_selected, Some(0));
+        app.swarm_toggle_focus();
+        assert!(
+            app.focused_swarm_agent().is_none(),
+            "Enter returns to main even after the wave grew"
+        );
+    }
+
+    /// THE reported bug: with 2+ agents, the focus-view footer says "Tab/Enter ↩
+    /// back", so the user presses Tab (which cycles the selection cursor to a
+    /// DIFFERENT agent) and then Enter to go back. The old `swarm_toggle_focus`
+    /// keyed off the *selected* agent, so Enter switched to viewing the newly
+    /// selected agent instead of returning to main — trapping the user, who keeps
+    /// hopping between sub-agents and can never reach the main origin view.
+    #[test]
+    fn tab_then_enter_while_focused_returns_to_main_not_another_agent() {
+        let mut app = App::new("anthropic", "claude-opus-4-8", CompletionSources::default());
+        app.apply_swarm_event("a1", "g1", "spawned");
+        app.apply_swarm_event("b2", "g2", "spawned");
+        // Drill into the first agent.
+        app.swarm_cycle_selection(); // select 0 (a1)
+        app.swarm_toggle_focus(); // view a1
+        assert_eq!(app.swarm_view.as_deref(), Some("a1"), "viewing a1");
+        // Follow the footer hint: Tab (cycles selection to b2), then Enter.
+        app.swarm_cycle_selection(); // select 1 (b2) — but still viewing a1
+        assert_eq!(app.swarm_selected, Some(1));
+        // Enter must return to the MAIN view (we were viewing something), not
+        // silently switch to viewing b2.
+        app.swarm_toggle_focus();
+        assert!(
+            app.focused_swarm_agent().is_none(),
+            "Enter while focused returns to main, never hops to the selected agent"
+        );
+    }
+
+    /// `swarm_toggle_focus` returns to main when viewing even if the selection
+    /// cursor has been cleared (`swarm_selected == None`) — so the live `main.rs`
+    /// Enter/Tab gate must key off `swarm_view`, not only `swarm_selected`, or a
+    /// focused user with no highlight would be unable to exit.
+    #[test]
+    fn exit_focus_works_even_when_selection_is_cleared() {
+        let mut app = App::new("anthropic", "claude-opus-4-8", CompletionSources::default());
+        app.apply_swarm_event("a1", "g1", "spawned");
+        app.swarm_cycle_selection();
+        app.swarm_toggle_focus(); // view a1
+        assert!(app.swarm_view.is_some());
+        // Simulate the highlight being dropped while still focused.
+        app.swarm_selected = None;
+        // The toggle still exits to main (the function keys off `swarm_view`).
+        assert!(app.swarm_toggle_focus(), "exit reports a view change");
+        assert!(app.focused_swarm_agent().is_none(), "returned to main view");
     }
 
     #[test]

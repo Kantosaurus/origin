@@ -622,8 +622,26 @@ async fn run() -> Result<()> {
 
     spawn_stall_watchdog(app.clone(), handle.clone());
 
+    // Shared slot holding the current in-flight prompt's interrupt sender
+    // (Bug #5). Created here — not inside `run_event_loop` — so the auto-fired
+    // first-run prompt and the event loop share ONE slot: the first-run turn is
+    // spawned (non-blocking) and the event loop that immediately follows can
+    // forward Ctrl+C into it, and an interactive `ask_user` picker the turn
+    // raises is answerable because the loop is already polling the keyboard.
+    let interrupt_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
     // Auto-fire the pending discovery prompt now that the TUI is wired up.
-    fire_pending_prompt(pending_prompt, &app, &handle, &path, &mut model, &session_id).await;
+    fire_pending_prompt(
+        pending_prompt,
+        &app,
+        &handle,
+        &interrupt_tx,
+        &path,
+        &model,
+        &session_id,
+    )
+    .await;
 
     // Keep a handle to read the cumulative usage for the farewell summary after
     // the event loop consumes its own `app` handle.
@@ -631,6 +649,7 @@ async fn run() -> Result<()> {
     let result = run_event_loop(
         app,
         handle,
+        interrupt_tx,
         &path,
         &mut model,
         &session_id,
@@ -790,37 +809,49 @@ fn spawn_stall_watchdog(app: SharedApp, handle: Handle) {
 
 /// Auto-fire the queued first-run discovery prompt, if any, now that the TUI
 /// is wired up. A `None` prompt is a no-op.
+///
+/// The turn is dispatched through the same **non-blocking** [`spawn_prompt_turn`]
+/// the interactive submit path uses, NOT awaited inline. This is essential: the
+/// first-run discovery prompt can itself surface an interactive `ask_user`
+/// picker (the default workflow's brainstorming phase actively drives
+/// `AskUserQuestion`), and the picker is only answerable while the input loop is
+/// polling the keyboard. Awaiting the turn here (the old behaviour) blocked the
+/// main task *before* `run_event_loop` started, so the picker rendered but every
+/// key was dropped — a hard freeze that deadlocked the turn (no `ChoiceDecision`
+/// could ever be sent). Spawning instead lets the turn stream concurrently with
+/// the event loop, so the picker is live from the first frame.
 async fn fire_pending_prompt(
     pending_prompt: Option<String>,
     app: &SharedApp,
     handle: &Handle,
+    interrupt_tx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>>,
     path: &str,
-    model: &mut String,
+    model: &str,
     session_id: &str,
 ) {
     let Some(text) = pending_prompt else {
         return;
     };
-    {
-        let mut a = app.lock();
-        a.add_line("system> ", "Running queued first-run discovery prompt\u{2026}");
-        // Activate the spinner so the render heartbeat animates and the
-        // stall watchdog arms for this turn too — without this the
-        // first-run prompt ran with a frozen, un-animated status line.
-        a.spinner.start();
-    }
+    app.lock()
+        .add_line("system> ", "Running queued first-run discovery prompt\u{2026}");
     handle.mark_dirty();
-    // No user interrupt channel for the auto-fire path — the user has
-    // not had a chance to press Ctrl+C yet (TUI is not yet driving the
-    // input loop). `None` keeps `call_daemon`'s select arm a no-op.
-    handle_submit(app, handle, path, model, &text, session_id, None).await;
-    app.lock().spinner.stop();
-    handle.mark_dirty();
+    // Spawn (don't await) so the very next step — entering `run_event_loop` —
+    // starts polling the keyboard immediately, keeping any interactive picker
+    // the turn raises fully responsive. `spawn_prompt_turn` starts the spinner,
+    // installs the interrupt slot, and drains the queue on completion, exactly
+    // like a hand-typed first message.
+    spawn_prompt_turn(text, app, handle, interrupt_tx, path, model, session_id).await;
 }
 
+// One extra argument over clippy's default threshold: the shared `interrupt_tx`
+// slot is now created by `run` (so the first-run prompt and the event loop share
+// it) and threaded in, rather than created locally. Splitting these tightly
+// coupled handles into a struct would obscure more than it clarifies.
+#[allow(clippy::too_many_arguments)]
 async fn run_event_loop(
     app: SharedApp,
     handle: Handle,
+    interrupt_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>>,
     path: &str,
     model: &mut String,
     session_id: &str,
@@ -834,8 +865,9 @@ async fn run_event_loop(
     // `call_daemon` `tokio::select!` writes `ClientMessage::Interrupt` to
     // the daemon over the SAME connection serving the current prompt
     // (required — the daemon's drive-goal-loop peek is per-connection).
-    let interrupt_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
+    // The slot is created by the caller (`run`) and shared with the
+    // auto-fired first-run prompt, so a Ctrl+C reaches whichever turn —
+    // first-run or hand-typed — is currently streaming.
     let mut input_stream = crossterm::event::EventStream::new();
     while let Some(maybe_ev) = input_stream.next().await {
         let event = maybe_ev?;
@@ -1013,6 +1045,12 @@ async fn handle_key_event(
             origin_cli::suggestions::accept_selected(&suggestions, &mut buf);
             a.input.set_buffer(buf);
             a.recompute_suggestions();
+        } else if a.swarm_view.is_some() && a.input.is_empty() {
+            // Already viewing a sub-agent: the focus-view footer offers
+            // "Tab/Enter ↩ back", so Tab here returns to the main origin view
+            // (it does NOT cycle to a different agent — that was the trap that
+            // left users hopping between sub-agents, unable to get back).
+            a.swarm_toggle_focus();
         } else if !a.swarm_agents.is_empty() && a.input.is_empty() {
             // No suggestion popup + idle composer during a live swarm wave: Tab
             // cycles the panel's agent highlight (Enter then drills into it).
@@ -1024,14 +1062,21 @@ async fn handle_key_event(
     }
 
     // Enter on a highlighted swarm agent (composer empty) drills into that agent's
-    // full transcript in the main pane — or, if already viewing it, toggles back
-    // to the main origin view. Normal Enter (submit) is untouched while typing or
-    // when no agent is selected. Shift+Enter (newline) is excluded.
+    // full transcript in the main pane — or, if ALREADY viewing a sub-agent,
+    // returns to the main origin view (regardless of which agent the cursor now
+    // highlights). Normal Enter (submit) is untouched while typing or when no
+    // agent is selected and none is focused. Shift+Enter (newline) is excluded.
     if matches!(ev.code, crossterm::event::KeyCode::Enter)
         && !ev.modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
     {
         let mut a = app.lock();
-        if a.swarm_selected.is_some() && a.input.is_empty() {
+        // Fire when there is something to act on: a focused sub-agent to exit
+        // (`swarm_view`) OR a highlighted agent to drill into (`swarm_selected`).
+        // Keying the exit off `swarm_view` (not just `swarm_selected`) is what
+        // lets the user always get back to main — even after a Tab moved the
+        // highlight off the agent they're viewing.
+        let act = (a.swarm_view.is_some() || a.swarm_selected.is_some()) && a.input.is_empty();
+        if act {
             a.swarm_toggle_focus();
             drop(a);
             handle.mark_dirty();
@@ -3633,5 +3678,118 @@ mod tests {
         assert_eq!(picker_choice_summary(&opts, &[], None), "skipped");
         // Empty custom falls through to labels/skipped, not an empty line.
         assert_eq!(picker_choice_summary(&opts, &[1], Some("")), "b");
+    }
+
+    /// End-to-end simulation of the LIVE `handle_picker_key` reduction cycle for a
+    /// MULTI-SELECT `ask_user` picker carried on a real `App.active_picker`,
+    /// including the trailing `allow_custom` row. This drives the exact
+    /// snapshot→`crossterm_to_picker_key`→`picker::reduce`→commit loop the input
+    /// loop performs (minus the async IPC send, which is a non-blocking await),
+    /// asserting every non-terminal key advances state and Enter resolves the
+    /// checked indices. Reproduces the user-reported "up/down/space/enter do
+    /// nothing" multi-select flow against the integration path.
+    fn drive_picker_key(app: &mut origin_cli::tui::App, code: KeyCode) -> Option<Vec<usize>> {
+        // Mirror handle_picker_key: map the key against the live state, reduce,
+        // and on a terminal outcome take the picker + return the selection.
+        let pkey = {
+            let sess = app.active_picker.as_ref().expect("picker open");
+            crossterm_to_picker_key(key(code), &sess.state)
+        }?;
+        let outcome = {
+            let sess = app.active_picker.as_mut().expect("picker open");
+            origin_cli::tui::picker::reduce(&mut sess.state, pkey)
+        };
+        match outcome {
+            None => None, // non-terminal: state advanced, would `mark_dirty()`
+            Some(out) => {
+                let _ = app.take_picker();
+                let (sel, _custom) = origin_cli::tui::picker_outcome_to_choice(&out);
+                Some(sel)
+            }
+        }
+    }
+
+    fn cursor_of(app: &origin_cli::tui::App) -> usize {
+        app.active_picker.as_ref().expect("picker open").state.cursor
+    }
+
+    fn checked_of(app: &origin_cli::tui::App) -> Vec<bool> {
+        app.active_picker.as_ref().expect("picker open").state.checked.clone()
+    }
+
+    #[test]
+    fn live_multi_select_navigation_toggle_and_confirm_resolves() {
+        use origin_cli::autocomplete::CompletionSources;
+        let mut app = origin_cli::tui::App::new("anthropic", "m", CompletionSources::default());
+        // A typical multi-select ask_user: several options + the custom row.
+        app.open_choice_picker(
+            "choice-1".to_string(),
+            "Pick targets".to_string(),
+            vec![
+                ("alpha".to_string(), None),
+                ("beta".to_string(), Some("the second".to_string())),
+                ("gamma".to_string(), None),
+            ],
+            true,  // multi_select
+            true,  // allow_custom
+        );
+
+        // Down moves the cursor (0 -> 1).
+        assert_eq!(drive_picker_key(&mut app, KeyCode::Down), None);
+        assert_eq!(cursor_of(&app), 1, "Down advanced the cursor");
+
+        // Space toggles the checkbox on the cursor row (index 1).
+        assert_eq!(drive_picker_key(&mut app, KeyCode::Char(' ')), None);
+        assert_eq!(checked_of(&app), vec![false, true, false], "Space checked row 1");
+
+        // Down again (1 -> 2), Space checks row 2.
+        assert_eq!(drive_picker_key(&mut app, KeyCode::Down), None);
+        assert_eq!(cursor_of(&app), 2);
+        assert_eq!(drive_picker_key(&mut app, KeyCode::Char(' ')), None);
+        assert_eq!(checked_of(&app), vec![false, true, true]);
+
+        // Up returns toward the top (2 -> 1 -> 0), and Space on row 0 checks it.
+        assert_eq!(drive_picker_key(&mut app, KeyCode::Up), None);
+        assert_eq!(drive_picker_key(&mut app, KeyCode::Up), None);
+        assert_eq!(cursor_of(&app), 0);
+        assert_eq!(drive_picker_key(&mut app, KeyCode::Char(' ')), None);
+        assert_eq!(checked_of(&app), vec![true, true, true]);
+
+        // Enter on an option row confirms with all checked indices, sorted.
+        let sel = drive_picker_key(&mut app, KeyCode::Enter).expect("Enter resolves");
+        assert_eq!(sel, vec![0, 1, 2], "confirm returns sorted checked indices");
+        assert!(!app.has_picker(), "picker cleared on confirm");
+    }
+
+    #[test]
+    fn live_multi_select_can_reach_and_enter_custom_row() {
+        use origin_cli::autocomplete::CompletionSources;
+        let mut app = origin_cli::tui::App::new("anthropic", "m", CompletionSources::default());
+        app.open_choice_picker(
+            "choice-2".to_string(),
+            "Pick or type".to_string(),
+            vec![("one".to_string(), None), ("two".to_string(), None)],
+            true, // multi_select
+            true, // allow_custom
+        );
+        // Arrow down past the last option (index 1) onto the custom row (index 2).
+        assert_eq!(drive_picker_key(&mut app, KeyCode::Down), None); // 0 -> 1
+        assert_eq!(drive_picker_key(&mut app, KeyCode::Down), None); // 1 -> 2 (custom)
+        assert_eq!(cursor_of(&app), 2, "cursor reached the custom row");
+        // Down again saturates on the custom row (no dead-end / no panic).
+        assert_eq!(drive_picker_key(&mut app, KeyCode::Down), None);
+        assert_eq!(cursor_of(&app), 2);
+        // Enter on the custom row enters free-text mode (does NOT resolve yet).
+        assert_eq!(drive_picker_key(&mut app, KeyCode::Enter), None);
+        assert!(
+            app.active_picker.as_ref().expect("still open").state.typing_custom,
+            "Enter on the custom row switches to free-text entry"
+        );
+        // Type a couple chars, then Enter resolves with the custom text.
+        assert_eq!(drive_picker_key(&mut app, KeyCode::Char('h')), None);
+        assert_eq!(drive_picker_key(&mut app, KeyCode::Char('i')), None);
+        let sel = drive_picker_key(&mut app, KeyCode::Enter).expect("custom Enter resolves");
+        assert!(sel.is_empty(), "custom-only confirm carries no option indices");
+        assert!(!app.has_picker(), "picker cleared after custom confirm");
     }
 }

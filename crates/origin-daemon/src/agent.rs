@@ -1536,6 +1536,50 @@ fn render_background_results(results: &[crate::bg_jobs::BgResult]) -> String {
     block
 }
 
+/// Emit a terminal [`StreamEvent::SwarmWorker`] for each reaped BACKGROUND
+/// result so the TUI's swarm panel flips the matching row from "running" to
+/// its settled state.
+///
+/// Background (`Task { background: true }`) workers register in `BackgroundJobs`
+/// and the turn returns WITHOUT awaiting them, so — unlike the foreground
+/// `pending_tasks` path — no completion event was ever streamed for them. Their
+/// panel rows (created by the dispatch-time `"spawned"` event) would otherwise
+/// show `▸ running` forever, even though the work has finished. We close that
+/// loop here, at the moment the jobs are reaped (next-turn delivery or
+/// `CollectTasks`), keyed by the SAME stable `id_hex` the `"spawned"` event
+/// used so [`crate::tui`-side `apply_swarm_event`] updates the row in place.
+///
+/// `TaskOutput::status` is mapped onto the panel's binary terminal vocabulary:
+/// only `"completed"` is a success; every other terminal status
+/// (`goal_unreachable`, `budget_exhausted`, `aborted`, `error`, …) reads as
+/// `"failed"` so it shows the `✘` glyph, with the real reason carried in
+/// `detail`. A `None` event channel (headless / no TUI) makes this a no-op.
+async fn emit_background_completions(
+    event_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    results: &[crate::bg_jobs::BgResult],
+) {
+    let Some(tx) = event_tx else {
+        return;
+    };
+    for r in results {
+        let success = r.output.status == "completed";
+        let status = if success { "completed" } else { "failed" };
+        // Carry the worker's summary as `detail` for a non-success outcome so the
+        // panel transcript row can show WHY it failed (mirrors the foreground
+        // path's `worker_detail`); a clean completion needs no detail.
+        let detail = (!success).then(|| r.output.summary.clone());
+        let _ = tx
+            .send(StreamEvent::SwarmWorker {
+                id: r.id_hex.clone(),
+                goal: r.goal.clone(),
+                status: status.to_string(),
+                detail,
+                tool: None,
+            })
+            .await;
+    }
+}
+
 /// Drain THIS worker's own mailbox and render the pending notices into a
 /// `<swarm-notices>` block for the next turn (A4).
 ///
@@ -1980,6 +2024,75 @@ mod swarm_collab_wiring_tests {
         assert!(r.contains("audit ipc") && r.contains("found 2 issues"), "lists completed: {r}");
         assert!(r.contains("audit swarm") && r.contains("aborted"), "lists aborted: {r}");
         assert!(r.contains("fix the handshake"), "lists follow-ups: {r}");
+    }
+
+    /// `emit_background_completions`: each reaped background result must stream a
+    /// terminal `SwarmWorker` event keyed by the SAME `id_hex` the `"spawned"`
+    /// event used, so the TUI panel flips the row out of "running". A
+    /// `"completed"` status maps to `"completed"` (no detail); every other
+    /// terminal status maps to `"failed"` and carries the summary as `detail`.
+    /// A `None` channel is a no-op (headless).
+    #[tokio::test]
+    async fn emit_background_completions_streams_terminal_swarm_events() {
+        use crate::bg_jobs::BgResult;
+        use origin_tools::builtins::task::TaskOutput;
+
+        // None channel ⇒ nothing emitted, no panic.
+        emit_background_completions(None, &[]).await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(8);
+        let results = [
+            BgResult {
+                id_hex: "00aa".into(),
+                goal: "audit ipc".into(),
+                output: TaskOutput {
+                    status: "completed".into(),
+                    summary: "all good".into(),
+                    files_touched: vec![],
+                    follow_ups: vec![],
+                },
+            },
+            BgResult {
+                id_hex: "00bb".into(),
+                goal: "audit swarm".into(),
+                output: TaskOutput {
+                    status: "goal_unreachable".into(),
+                    summary: "could not reach the goal".into(),
+                    files_touched: vec![],
+                    follow_ups: vec![],
+                },
+            },
+        ];
+        emit_background_completions(Some(&tx), &results).await;
+        drop(tx); // close the channel so the drain below terminates
+
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        assert_eq!(events.len(), 2, "one terminal event per reaped job");
+
+        match &events[0] {
+            StreamEvent::SwarmWorker { id, status, detail, tool, .. } => {
+                assert_eq!(id, "00aa", "keyed by the stable spawn id");
+                assert_eq!(status, "completed", "a completed job stays completed");
+                assert!(detail.is_none(), "a clean completion carries no detail");
+                assert!(tool.is_none());
+            }
+            other => panic!("expected SwarmWorker, got {other:?}"),
+        }
+        match &events[1] {
+            StreamEvent::SwarmWorker { id, status, detail, .. } => {
+                assert_eq!(id, "00bb");
+                assert_eq!(status, "failed", "any non-completed terminal reads as failed");
+                assert_eq!(
+                    detail.as_deref(),
+                    Some("could not reach the goal"),
+                    "the failure reason rides in detail"
+                );
+            }
+            other => panic!("expected SwarmWorker, got {other:?}"),
+        }
     }
 
     /// `drain_own_swarm_notices` (A4): the drain→render step a worker runs at the
@@ -3506,7 +3619,12 @@ async fn run_loop_inner(
         // Skipped for self-dispatch sessions (their ids never hold user jobs).
         let bg_results_block = match (opts.background_jobs.as_deref(), opts.coordinator.as_deref()) {
             (Some(bg), Some(coord)) if !is_self_dispatch_session(&session.id) => {
-                render_background_results(&bg.drain_terminal(&session.id, coord).await)
+                let finished = bg.drain_terminal(&session.id, coord).await;
+                // Flip the TUI panel rows for these now-settled background workers
+                // (their dispatch streamed "spawned" but no completion). Done
+                // before rendering the prose block; the order is immaterial.
+                emit_background_completions(opts.event_tx.as_ref(), &finished).await;
+                render_background_results(&finished)
             }
             _ => String::new(),
         };
@@ -4429,6 +4547,10 @@ async fn run_loop_inner(
                 let body = match (opts.background_jobs.as_deref(), opts.coordinator.as_deref()) {
                     (Some(bg), Some(coord)) => {
                         let finished = bg.drain_terminal(&session.id, coord).await;
+                        // Flip the TUI panel rows for the workers reaped here, the
+                        // same as the next-turn delivery path — `CollectTasks` is
+                        // the other place a background job settles.
+                        emit_background_completions(opts.event_tx.as_ref(), &finished).await;
                         let still = bg.pending(&session.id).await;
                         serde_json::json!({
                             "finished": finished.iter().map(|r| serde_json::json!({
