@@ -128,6 +128,7 @@ async fn memory_proposed_round_trip_via_stub_provider() {
             permission_rules: None,
             post_edit: None,
             notify: None,
+            ponytail: origin_ponytail::PonytailMode::Full,
         };
         let summary = run_loop(&mut session, &prompt.user_text, &provider, &AlwaysAllow, &opts)
             .await

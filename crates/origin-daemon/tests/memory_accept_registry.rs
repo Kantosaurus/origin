@@ -117,6 +117,7 @@ async fn accept_persists_via_proposal_registry() {
         permission_rules: None,
         post_edit: None,
         notify: None,
+        ponytail: origin_ponytail::PonytailMode::Full,
     };
     let _summary = run_loop(
         &mut session,

@@ -189,6 +189,11 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
             bearer,
             model,
             effort,
+            // Headless `run` is non-interactive: the ponytail dep gate has no
+            // human to answer its prompt, so the daemon leaves it at its
+            // resolved default. The flag exists for symmetry with the global
+            // `--ponytail`/`/ponytail`; it does not change the headless turn.
+            ponytail: _,
             thinking_tokens,
             alias,
             attach,
@@ -584,6 +589,12 @@ async fn run() -> Result<()> {
     if effort_seed.is_some() {
         app.lock().effort = effort_seed;
     }
+    // Seed the session ponytail intensity from the startup `--ponytail` flag.
+    // Unknown values resolve to `None`, leaving the daemon to apply its default.
+    app.lock().ponytail_mode = cli
+        .ponytail
+        .as_deref()
+        .and_then(origin_ponytail::PonytailMode::parse_level);
     // Seed extra workspace roots from the startup `--root` flags (cline multi-root).
     if !cli.root.is_empty() {
         app.lock().workspace_roots.clone_from(&cli.root);
@@ -1621,6 +1632,20 @@ fn slash_verb_boundary(text: &str, cmd: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
 }
 
+/// Shell out to the system `git` binary and return stdout on success. Mirrors
+/// the `Command::new("git").args(...).output()` pattern used elsewhere in the
+/// CLI (`vcs.rs`/`review.rs`/`scout.rs`/`plugin.rs`). Returns `None` when git is
+/// absent, the directory is not a repo, or git exits non-zero — callers treat
+/// "no output" as "nothing to do", so a missing repo degrades gracefully.
+fn run_git(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git").args(args).output().ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        None
+    }
+}
+
 // `too_many_lines`: single linear dispatch over many slash commands; splitting
 // hurts readability. The other three are localized, pre-existing idioms inside
 // this long dispatch (a scoped `app.lock()` guard feeding a rendered message; a
@@ -1695,6 +1720,114 @@ async fn handle_submit(
         }
         handle.mark_dirty();
         return;
+    }
+    // `/ponytail [off|lite|full|ultra]` sets the session ponytail intensity that
+    // every subsequent PromptRequest carries (no arg reports the current mode).
+    // Client-side only — like /effort. The hyphenated forms (`/ponytail-review`
+    // etc.) are NOT matched here (`parse_ponytail_command` rejects the `-` after
+    // the prefix) and fall through to their own handlers below.
+    if let Some(cmd) = origin_ponytail::parse_ponytail_command(text) {
+        app.lock().add_line("you> ", text);
+        match cmd {
+            origin_ponytail::PonytailCmd::Set(mode) => {
+                app.lock().ponytail_mode = Some(mode);
+                app.lock()
+                    .add_line("system> ", &format!("ponytail mode: {}", mode.as_str()));
+            }
+            origin_ponytail::PonytailCmd::Report => {
+                let cur = app
+                    .lock()
+                    .ponytail_mode
+                    .map_or_else(|| "full (default)".to_string(), |m| m.as_str().to_string());
+                app.lock()
+                    .add_line("system> ", &format!("ponytail mode: {cur}"));
+            }
+            origin_ponytail::PonytailCmd::Usage => {
+                app.lock()
+                    .add_line("error> ", "usage: /ponytail [off|lite|full|ultra]");
+            }
+        }
+        handle.mark_dirty();
+        return;
+    }
+    // `/ponytail-review` / `/ponytail-audit` AUTO-RUN: gather the working diff
+    // (review) or the tracked-file list (audit) via `git`, prepend the canonical
+    // ponytail prompt, and dispatch it as a normal user turn (same path a typed
+    // message takes). Placed BEFORE the skill catch-all so it never activates a
+    // `ponytail-review` skill on the daemon.
+    if text.trim() == "/ponytail-review" || text.trim() == "/ponytail-audit" {
+        let is_audit = text.trim().ends_with("audit");
+        app.lock().add_line("you> ", text);
+        let context = if is_audit {
+            // whole-repo: list tracked files (cheap) for the model to scan.
+            run_git(&["ls-files"]).unwrap_or_default()
+        } else {
+            run_git(&["diff"]).unwrap_or_default()
+        };
+        if context.trim().is_empty() {
+            let msg = if is_audit {
+                "ponytail: nothing to audit (no tracked files / not a git repo)."
+            } else {
+                "ponytail: nothing to review (clean working tree)."
+            };
+            app.lock().add_line("system> ", msg);
+            handle.mark_dirty();
+            return;
+        }
+        let prompt = format!(
+            "{}\n\n--- {} ---\n{}",
+            if is_audit {
+                origin_ponytail::commands::audit_prompt()
+            } else {
+                origin_ponytail::commands::review_prompt()
+            },
+            if is_audit { "repo file list" } else { "git diff" },
+            context
+        );
+        // Dispatch `prompt` exactly as a normal user turn (same path the
+        // fallthrough below uses for a typed message).
+        begin_prompt_turn(app, &prompt);
+        handle.mark_dirty();
+        handle_prompt_turn(app, handle, path, model.as_str(), &prompt, session_id, interrupt_rx).await;
+        return;
+    }
+    // `/ponytail-help` / `/ponytail-gain` / `/ponytail-debt` text commands.
+    // `-debt` also harvests `ponytail:` code markers via `git grep`. Placed
+    // BEFORE the skill catch-all so they render locally instead of activating a
+    // skill on the daemon.
+    match text.trim() {
+        "/ponytail-help" => {
+            app.lock().add_line("you> ", text);
+            app.lock()
+                .add_line("system> ", origin_ponytail::commands::help_text());
+            handle.mark_dirty();
+            return;
+        }
+        "/ponytail-gain" => {
+            app.lock().add_line("you> ", text);
+            app.lock()
+                .add_line("system> ", origin_ponytail::commands::gain_text());
+            handle.mark_dirty();
+            return;
+        }
+        "/ponytail-debt" => {
+            app.lock().add_line("you> ", text);
+            let mut out = origin_ponytail::commands::debt_report();
+            // Harvest code markers too: `git grep -n "ponytail:"`.
+            if let Some(grep) = run_git(&["grep", "-n", "ponytail:"]).filter(|s| !s.trim().is_empty())
+            {
+                let hits = origin_ponytail::commands::harvest_comments(&grep);
+                if !hits.is_empty() {
+                    let markers =
+                        format!("\n\ncode markers ({}):\n  {}", hits.len(), hits.join("\n  "));
+                    out.push_str(&markers);
+                }
+            }
+            app.lock().add_line("system> ", &out);
+            handle.mark_dirty();
+            return;
+        }
+        _ => {}
     }
     // `/output-style <default|explanatory|learning|concise>` sets the session
     // output style; its system suffix is sent on every subsequent PromptRequest.
@@ -2176,6 +2309,9 @@ async fn handle_prompt_turn(
     let handle_for_swarm_out = handle.clone();
     // Snapshot the session effort level so this turn carries `/effort`/`/fast`.
     let effort = app.lock().effort.clone();
+    // Snapshot the session ponytail intensity so this turn carries `/ponytail`.
+    // `None` ⇒ the daemon resolves the default (config/env/`full`).
+    let ponytail = app.lock().ponytail_mode.map(|m| m.as_str().to_string());
     // Carry the startup `--thinking-tokens` budget on every turn (aider
     // `--thinking-tokens`). `None` ⇒ wire unchanged.
     let thinking_tokens = thinking_tokens_seed();
@@ -2219,6 +2355,7 @@ async fn handle_prompt_turn(
         &user_text,
         session_id,
         effort,
+        ponytail,
         thinking_tokens,
         system_suffix,
         read_only,
@@ -2527,6 +2664,9 @@ async fn call_daemon(
     session_id: &str,
     // Session reasoning-effort token (`/effort`/`/fast`); `None` ⇒ wire unchanged.
     effort: Option<String>,
+    // Session ponytail intensity token (`/ponytail`); `None` ⇒ the daemon
+    // resolves its default (config/env/`full`).
+    ponytail: Option<String>,
     // Extended-thinking budget in tokens (`--thinking-tokens`); `None` ⇒ wire
     // unchanged. Only the Anthropic provider honours it.
     thinking_tokens: Option<u32>,
@@ -2585,6 +2725,7 @@ async fn call_daemon(
         user_text: user_text.to_string(),
         session_id: Some(session_id.to_string()),
         effort,
+        ponytail,
         thinking_tokens,
         attachments,
         read_only,
@@ -2806,14 +2947,26 @@ async fn switch_account(path: &str, provider: &str, account_id: &str) -> Result<
 /// acknowledgement frame. Opens a one-shot connection — the decision is
 /// fire-and-forget for the user, but we still drain the ack so the daemon's
 /// write buffer is unblocked.
+/// How long [`send_decision`] waits to drain the daemon's one-frame decision
+/// ack before giving up. Kept short because the drain runs INLINE on the single,
+/// serial keyboard event loop: a healthy daemon acks in microseconds, so this
+/// only caps the pathological case (a decision variant the daemon doesn't ack,
+/// or version skew where an older daemon survives a self-update restart).
+const DECISION_ACK_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 async fn send_decision(path: &str, decision: &ClientMessage) -> Result<()> {
     let mut client: Connection = Connector::connect(path).await?;
     let body = serde_json::to_vec(decision)?;
     let frame = encode(1, FrameKind::Request, &body);
     client.write_raw(&frame).await?;
-    // Best-effort drain a single frame so the daemon's reply isn't orphaned.
-    // Errors here are non-fatal — the decision has already been sent.
-    let _ = client.read_frame_body().await;
+    // Best-effort drain the daemon's one-frame ack so it isn't orphaned — but
+    // NEVER block on it. This runs inline on the serial keyboard loop, so an
+    // un-acked or slow reply would otherwise freeze ALL further input (the
+    // "stuck on the next picker" regression: the daemon resolves the decision
+    // but its ChoiceDecision/PermissionDecision arms historically wrote no reply
+    // frame, so this read parked forever). The bound caps that worst case.
+    // Errors / timeout here are non-fatal — the decision was already sent.
+    let _ = tokio::time::timeout(DECISION_ACK_DRAIN, client.read_frame_body()).await;
     Ok(())
 }
 
@@ -3482,11 +3635,54 @@ mod tests {
         assert!(is_slash_command("/timeline revert abc1234"));
         // (`/timelinefoo` is matched by the skill catch-all, not the `/timeline`
         // handler — the handler's own word-boundary guard keeps them distinct.)
+        // ponytail commands route inline (recognized via the skill catch-all,
+        // which `is_slash_command` consults) so their dedicated handlers in
+        // `handle_submit` intercept before the skill-activation path.
+        assert!(is_slash_command("/ponytail"));
+        assert!(is_slash_command("/ponytail ultra"));
+        assert!(is_slash_command("/ponytail-review"));
+        assert!(is_slash_command("/ponytail-audit"));
+        assert!(is_slash_command("/ponytail-debt"));
+        assert!(is_slash_command("/ponytail-gain"));
+        assert!(is_slash_command("/ponytail-help"));
         // Genuine non-commands must still reach the model.
         assert!(!is_slash_command("knowledge foo"));
         assert!(!is_slash_command("please run /vim"));
         assert!(!is_slash_command("/"));
         assert!(!is_slash_command("just a normal prompt"));
+    }
+
+    // Task 14: the `/ponytail` toggle grammar the handler dispatches on. The
+    // hyphenated forms must NOT parse as toggles (they fall through to the
+    // `/ponytail-review` etc. handlers).
+    #[test]
+    fn ponytail_command_grammar() {
+        use origin_ponytail::{parse_ponytail_command, PonytailCmd, PonytailMode};
+        assert_eq!(
+            parse_ponytail_command("/ponytail ultra"),
+            Some(PonytailCmd::Set(PonytailMode::Ultra))
+        );
+        assert_eq!(parse_ponytail_command("/ponytail"), Some(PonytailCmd::Report));
+        assert_eq!(parse_ponytail_command("/ponytail bogus"), Some(PonytailCmd::Usage));
+        assert_eq!(parse_ponytail_command("/ponytail-review"), None);
+        assert_eq!(parse_ponytail_command("/ponytail-audit"), None);
+    }
+
+    // Task 16: the auto-run review/audit prompts the handler prepends must be
+    // non-empty (they ride ahead of the gathered git context).
+    #[test]
+    fn review_prompt_is_injected() {
+        assert!(!origin_ponytail::commands::review_prompt().is_empty());
+        assert!(!origin_ponytail::commands::audit_prompt().is_empty());
+    }
+
+    // Task 17: the text commands + the `ponytail:` marker harvest the
+    // `/ponytail-debt` handler runs over `git grep` output.
+    #[test]
+    fn debt_and_help_text() {
+        assert!(origin_ponytail::commands::help_text().contains("/ponytail-debt"));
+        let hits = origin_ponytail::commands::harvest_comments("a.rs:1: // ponytail: naive O(n^2)\n");
+        assert_eq!(hits.len(), 1);
     }
 
     // Regression (stale/"disjointed" TUI text): the absolute-CUP renderer must
@@ -3507,6 +3703,75 @@ mod tests {
         enable_autowrap(&mut buf).expect("writing to an in-memory buffer is infallible");
         assert_eq!(buf.as_slice(), ENABLE_AUTOWRAP);
         assert_eq!(buf.as_slice(), b"\x1b[?7h");
+    }
+
+    // ── Regression: send_decision must never freeze the serial keyboard loop ──
+    // Root cause of the "stuck on the second multiselect" freeze: `send_decision`
+    // blocked on `read_frame_body()` draining a daemon ack that the daemon's
+    // `ChoiceDecision` / `PermissionDecision` arms never wrote. Because the drain
+    // is awaited INLINE on the single, serial keyboard loop (`run_event_loop`),
+    // it parked all further input the instant the user confirmed picker #1 — so
+    // picker #2 rendered but swallowed every keystroke. `send_decision` MUST
+    // return promptly even when the daemon resolves the decision and sends no
+    // reply frame at all (an old daemon across a self-update restart, or any
+    // decision variant the daemon does not ack).
+    #[tokio::test]
+    async fn send_decision_does_not_hang_when_daemon_sends_no_ack() {
+        use origin_ipc::transport::Listener;
+
+        let path = decision_test_path("noack");
+        let listener = Listener::bind(&path).await.expect("bind decision listener");
+
+        // Stub daemon: accept, read the decision frame (mirrors `resolve()`), then
+        // deliberately write NOTHING and hold the connection open — exactly the
+        // pre-fix `ChoiceDecision`/`PermissionDecision` arm behavior.
+        let server = tokio::spawn(async move {
+            let mut conn = listener.accept().await.expect("accept decision conn");
+            let _ = conn.read_frame_body().await; // consume the decision; never reply
+            // Hold the socket open so the client cannot get EOF either.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+
+        let decision = ClientMessage::ChoiceDecision {
+            id: "choice-1".to_string(),
+            selected: vec![0],
+            custom: None,
+        };
+
+        // Outer guard sits well above `send_decision`'s internal drain bound:
+        // before the fix this elapses (the drain parks forever); after the fix
+        // `send_decision` returns inside its bounded drain, so this never fires.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            send_decision(&path, &decision),
+        )
+        .await;
+        server.abort();
+        assert!(
+            res.is_ok(),
+            "send_decision hung waiting for an ack the daemon never sent — \
+             the keyboard-freeze regression"
+        );
+    }
+
+    /// Unique per-process pipe/socket path for the decision round-trip tests.
+    fn decision_test_path(label: &str) -> String {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        #[cfg(windows)]
+        {
+            format!(r"\\.\pipe\origin-test-decision-{label}-{pid}-{nanos}")
+        }
+        #[cfg(unix)]
+        {
+            format!(
+                "{}/origin-test-decision-{label}-{pid}-{nanos}.sock",
+                std::env::temp_dir().display()
+            )
+        }
     }
 
     // ── INT-3: picker key mapping + summary ─────────────────────────────────

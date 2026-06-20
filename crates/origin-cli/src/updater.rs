@@ -142,6 +142,70 @@ fn cache_path() -> Option<PathBuf> {
     Some(home.join(".origin").join("update_check.json"))
 }
 
+/// Resolve the persistent update-log path (`$ORIGIN_HOME/.origin/update.log`,
+/// falling back to `~/.origin/`). Sibling of [`cache_path`].
+fn update_log_path() -> Option<PathBuf> {
+    let home = std::env::var_os("ORIGIN_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)?;
+    Some(home.join(".origin").join("update.log"))
+}
+
+/// Append one timestamped line to the persistent update log.
+///
+/// The background worker is otherwise COMPLETELY silent — it runs detached with
+/// null stdio, and the CLI installs no `tracing` subscriber, so every
+/// `tracing::warn!`/`eprintln!` in the worker is dropped. That blackout is why a
+/// worker that checks-but-never-stages (a transient download failure) leaves no
+/// trace and can't be diagnosed after the fact. This log fixes that: every check
+/// records whether an update was found and whether the download/stage succeeded
+/// or why it failed.
+///
+/// Best-effort: any IO error is swallowed — the log is for diagnosis, never
+/// load-bearing for the update itself.
+pub fn update_log(msg: &str) {
+    use std::io::Write as _;
+    let Some(path) = update_log_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{} {msg}", now_secs());
+    }
+}
+
+/// Retry an async fallible operation up to `attempts` times, sleeping `backoff`
+/// between tries; returns the first `Ok`, else the last `Err`. `attempts` is
+/// clamped to at least 1.
+///
+/// The multi-binary stage is all-or-nothing: if ANY of the three downloads
+/// fails, nothing is staged and (because the worker is silent) the user is left
+/// on the old version with no signal. A single transient blip — a flaky link, or
+/// a scanning proxy resetting a large transfer — is exactly that failure mode. A
+/// bounded retry turns those transient failures into successes.
+async fn retry_async<T, E, F, Fut>(attempts: u32, backoff: std::time::Duration, mut f: F) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let tries = attempts.max(1);
+    let mut last_err: Option<E> = None;
+    for i in 0..tries {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last_err = Some(e);
+                if i + 1 < tries {
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("the loop runs at least once, so an Err was recorded"))
+}
+
 /// Current unix-epoch seconds. Wrapped so tests don't have to read the system
 /// clock and so a clock-skewed system can't underflow the math.
 fn now_secs() -> i64 {
@@ -460,7 +524,23 @@ pub async fn fetch_latest_npm_version() -> Result<String, UpdateError> {
 /// check so slow links can complete the binary fetch without artificially
 /// failing. Returning bytes (rather than writing a file) lets us verify the
 /// SHA-256 of exactly what we'll stage, closing the verify→stage swap window.
+/// How many times each asset download is attempted before giving up, and the
+/// pause between tries. The all-or-nothing stage means one transient failure
+/// aborts the whole update, so a small bounded retry materially raises the odds
+/// all three binaries land in one worker run.
+const DOWNLOAD_ATTEMPTS: u32 = 3;
+const DOWNLOAD_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Download `url` fully into memory, retrying transient failures (see
+/// [`retry_async`] / [`DOWNLOAD_ATTEMPTS`]).
 async fn download_bytes(url: &str) -> Result<Vec<u8>, UpdateError> {
+    retry_async(DOWNLOAD_ATTEMPTS, DOWNLOAD_RETRY_BACKOFF, || download_once(url)).await
+}
+
+/// One download attempt: build a client, GET, and read the body. A non-2xx
+/// status or transport error is returned as an error so [`retry_async`] can
+/// retry it.
+async fn download_once(url: &str) -> Result<Vec<u8>, UpdateError> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
         .user_agent(user_agent())
@@ -601,6 +681,9 @@ pub fn apply_staged_if_present() -> Result<bool, UpdateError> {
     for t in &targets {
         applied |= apply_one_staged(&t.dest)?;
     }
+    if applied {
+        update_log("applied staged update on launch");
+    }
     Ok(applied)
 }
 
@@ -686,6 +769,7 @@ pub async fn check_and_stage_blocking() -> Result<bool, UpdateError> {
     if std::env::var_os("ORIGIN_NO_UPDATE").is_some() {
         return Ok(false);
     }
+    update_log("worker: check started");
     Ok(check_and_stage_inner().await)
 }
 
@@ -780,6 +864,9 @@ pub fn spawn_background_update_worker() {
 fn skip_with_warn(stage: &str, err: impl std::fmt::Display) -> bool {
     eprintln!("Update check failed ({err}); continuing with current version.");
     tracing::warn!("updater: {stage} failed: {err}");
+    // Persist the reason: this is the funnel every failure path flows through,
+    // and the only durable trace the silent background worker leaves.
+    update_log(&format!("FAILED ({stage}): {err}"));
     false
 }
 
@@ -810,6 +897,7 @@ async fn check_and_stage_inner() -> bool {
     write_cache(&latest);
 
     if !is_newer(&current, &latest) {
+        update_log(&format!("up to date (installed={current}, latest={latest})"));
         return false;
     }
 
@@ -823,6 +911,10 @@ async fn check_and_stage_inner() -> bool {
     };
 
     eprintln!("origin {current} → {latest}: downloading…");
+    update_log(&format!(
+        "update available {current} -> {latest}; downloading {} binaries",
+        targets.len()
+    ));
     tracing::info!(
         "updater: update available (current={current} latest={latest}); downloading {} binaries",
         targets.len()
@@ -881,6 +973,11 @@ async fn stage_all_targets(targets: &[UpdateTarget], checksums: Option<&str>, ve
     // target) so the next launch doesn't re-download the same release in a loop.
     record_staged_version(&targets[targets.len() - 1].dest, version);
     eprintln!("Update staged; will apply on next launch.");
+    update_log(&format!(
+        "staged {} binaries for v{}; applies on next launch",
+        staged.len(),
+        strip_v_prefix(version.trim())
+    ));
     tracing::info!(
         "updater: staged {} binaries for swap-in on next launch",
         staged.len()
@@ -1403,5 +1500,86 @@ mod tests {
             verify_sha256_bytes(bytes, Some(&bad), "origin-test-asset"),
             Err(UpdateError::ChecksumFailed(_))
         ));
+    }
+
+    // ── diagnostic log + download retry (observability + resilience) ──────────
+
+    #[tokio::test]
+    async fn update_log_appends_timestamped_lines() {
+        // The background worker is otherwise silent; this persistent log is the
+        // only trace of why an auto-update did or didn't happen.
+        let _g = ENV_LOCK.lock().await;
+        let tmp = tempdir().expect("tempdir");
+        std::env::set_var("ORIGIN_HOME", tmp.path());
+
+        update_log("worker: check started");
+        update_log("FAILED (download/verify origin-x): network: reset");
+
+        let log = tmp.path().join(".origin").join("update.log");
+        let contents = std::fs::read_to_string(&log).expect("log file written");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "two appended lines, got: {contents:?}");
+        assert!(lines[0].contains("worker: check started"));
+        assert!(lines[1].contains("FAILED (download/verify origin-x)"));
+        // Each line is `<epoch> <msg>` — confirm the timestamp prefix parses.
+        assert!(
+            lines[0]
+                .split(' ')
+                .next()
+                .and_then(|t| t.parse::<i64>().ok())
+                .is_some(),
+            "each line is prefixed with an epoch timestamp"
+        );
+
+        std::env::remove_var("ORIGIN_HOME");
+    }
+
+    #[tokio::test]
+    async fn retry_async_succeeds_after_transient_failures() {
+        use std::cell::Cell;
+        // Fails twice (transient), then succeeds — the exact "flaky download that
+        // aborts the all-or-nothing stage" failure mode the retry exists to fix.
+        let calls = Cell::new(0u32);
+        let result: Result<&str, &str> = retry_async(5, std::time::Duration::ZERO, || {
+            let n = calls.get() + 1;
+            calls.set(n);
+            async move {
+                if n < 3 {
+                    Err("transient reset")
+                } else {
+                    Ok("downloaded")
+                }
+            }
+        })
+        .await;
+        assert_eq!(result, Ok("downloaded"));
+        assert_eq!(calls.get(), 3, "retried until the 3rd attempt succeeded");
+    }
+
+    #[tokio::test]
+    async fn retry_async_gives_up_after_attempts_and_returns_last_error() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let result: Result<&str, String> = retry_async(3, std::time::Duration::ZERO, || {
+            let n = calls.get() + 1;
+            calls.set(n);
+            async move { Err(format!("fail {n}")) }
+        })
+        .await;
+        assert_eq!(result, Err("fail 3".to_string()), "returns the LAST error");
+        assert_eq!(calls.get(), 3, "exactly `attempts` tries, no more");
+    }
+
+    #[tokio::test]
+    async fn retry_async_clamps_zero_attempts_to_one() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let result: Result<&str, &str> = retry_async(0, std::time::Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            async move { Ok("once") }
+        })
+        .await;
+        assert_eq!(result, Ok("once"));
+        assert_eq!(calls.get(), 1, "attempts=0 still runs exactly once");
     }
 }

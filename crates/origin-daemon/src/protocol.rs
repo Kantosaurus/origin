@@ -21,6 +21,11 @@ pub struct PromptRequest {
     /// `ChatRequest`. *Closes: claude-code `/effort`+`/fast`.*
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Optional ponytail intensity for this turn (`off`/`lite`/`full`/`ultra`).
+    /// `None` ⇒ the daemon resolves it (config/env/default `full`). Wire stays
+    /// byte-identical when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ponytail: Option<String>,
     /// Optional extended-thinking budget (in tokens) for this turn. `None` (the
     /// default) leaves the provider wire byte-identical. The daemon threads this
     /// onto `LoopOptions.thinking_tokens`, which the Anthropic encoder maps to

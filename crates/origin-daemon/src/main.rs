@@ -1257,6 +1257,10 @@ fn spawn_handler_task(
                     // the registry resolve still keys on `allow`.
                     let _ = always;
                     permission_registry.resolve(id, allow);
+                    // Ack so the client's `send_decision` drain unblocks; without
+                    // it the serial keyboard loop parks and the next picker
+                    // freezes. See `ack_decision`.
+                    ack_decision(&conn).await;
                 }
                 ClientMessage::ChoiceDecision { id, selected, custom } => {
                     // Cross-connection resolution for an `ask_user` `ChoiceAsk`,
@@ -1265,6 +1269,10 @@ fn spawn_handler_task(
                     // the waiting choice in the daemon-wide registry. Unknown ids
                     // (stale / cancelled asks) are ignored.
                     choice_registry.resolve(&id, selected, custom);
+                    // Ack so the client's `send_decision` drain unblocks; without
+                    // it the serial keyboard loop parks and the next picker
+                    // freezes. See `ack_decision`.
+                    ack_decision(&conn).await;
                 }
                 ClientMessage::Interrupt => {
                     // When `Interrupt` lands in the OUTER loop it means
@@ -1937,6 +1945,16 @@ async fn handle_request(
             // an unknown token maps to `None`. With no explicit effort, Anthropic
             // models default to `Ultracode` (max reasoning); other providers stay
             // `None` ⇒ wire byte-identical. See `resolve_turn_effort`.
+            ponytail: origin_ponytail::resolve_mode(
+                req.ponytail
+                    .as_deref()
+                    .and_then(origin_ponytail::PonytailMode::parse_level),
+            ),
+            // ^ ponytail-native: the CLI sends an optional `off`/`lite`/`full`/`ultra`
+            // token; an explicit token wins, else `resolve_mode` falls to the
+            // `~/.origin/ponytail.toml` `defaultMode` → `PONYTAIL_DEFAULT_MODE` /
+            // `ORIGIN_PONYTAIL` env → `Full`. Drives the injected ruleset block +
+            // the pre-dispatch dependency gate.
             thinking_tokens: req.thinking_tokens,
             // ^ aider `--thinking-tokens`: only the Anthropic encoder honours it
             // (extended thinking with `budget_tokens`); `None` ⇒ wire unchanged.
@@ -4001,6 +4019,26 @@ async fn write_event(conn: &SharedConnection, ev: &StreamEvent) -> Result<()> {
     Ok(())
 }
 
+/// Acknowledge a cross-connection decision (`PermissionDecision` /
+/// `ChoiceDecision`) with a one-frame `Response` so the client's `send_decision`
+/// drain unblocks immediately.
+///
+/// These decisions arrive on a FRESH connection (the turn's connection is busy
+/// streaming) and are applied via the daemon-wide registry. The client's
+/// `send_decision` helper writes the decision and then drains a reply frame —
+/// the same contract [`handle_memory_decision`] already honors. Without this ack
+/// the client's *serial* keyboard event loop parks inside that read, freezing
+/// ALL further input — which surfaced as the interactive picker going
+/// unresponsive on the NEXT `ask_user` question. Best-effort: a write failure
+/// just means the client connection is already gone, which is harmless here.
+async fn ack_decision(conn: &SharedConnection) {
+    let _ = conn
+        .lock()
+        .await
+        .write_frame(FrameKind::Response, b"{\"ok\":true}")
+        .await;
+}
+
 fn persist(session_store: &SessionStore, cas: Option<&Arc<Store>>, session: &Session) {
     if let Err(e) = session_store.persist_session(session) {
         error!(error = %e, "persist_session failed");
@@ -4672,5 +4710,50 @@ mod tests {
             final_turns < 100,
             "turn should abort promptly after the interrupt; ran {final_turns} turns"
         );
+    }
+
+    /// Regression: the daemon MUST ack a cross-connection decision with a
+    /// `Response` frame so the client's `send_decision` drain unblocks instead of
+    /// parking the serial keyboard loop (the "stuck on the next picker" freeze).
+    /// Drives the real `ack_decision` helper that both the `ChoiceDecision` and
+    /// `PermissionDecision` arms now call.
+    #[tokio::test]
+    async fn ack_decision_writes_a_drainable_response_frame() {
+        use origin_ipc::frame::FrameKind;
+        use origin_ipc::transport::{Connector, Listener};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        #[cfg(windows)]
+        let path = format!(r"\\.\pipe\origin-test-ackdecision-{pid}-{nanos}");
+        #[cfg(unix)]
+        let path = format!(
+            "{}/origin-test-ackdecision-{pid}-{nanos}.sock",
+            std::env::temp_dir().display()
+        );
+
+        let listener = Listener::bind(&path).await.expect("bind");
+        // Daemon side: accept, then ack exactly as the decision arms do.
+        let server = super::spawn_in(super::TaskClass::Background, async move {
+            let conn = listener.accept().await.expect("accept");
+            let shared: super::SharedConnection = Arc::new(Mutex::new(conn));
+            super::ack_decision(&shared).await;
+        });
+
+        // Client side: the ack must arrive as a single `Response` frame — the
+        // exact frame `send_decision`'s drain reads — promptly, never a hang.
+        let mut client = Connector::connect(&path).await.expect("connect");
+        let (kind, body) = tokio::time::timeout(std::time::Duration::from_secs(5), client.read_frame())
+            .await
+            .expect("ack arrived before timeout")
+            .expect("read frame");
+        assert_eq!(kind, FrameKind::Response, "decision ack must be a Response frame");
+        assert!(!body.is_empty(), "ack carries a small body");
+        server.await.expect("server task joins");
     }
 }

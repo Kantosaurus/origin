@@ -4063,6 +4063,7 @@ dependencies = [
  "origin-outputstyle",
  "origin-plan",
  "origin-plugin",
+ "origin-ponytail",
  "origin-provider",
  "origin-review",
  "origin-router",
@@ -4218,6 +4219,7 @@ dependencies = [
  "origin-plan",
  "origin-planner",
  "origin-policy",
+ "origin-ponytail",
  "origin-postedit",
  "origin-provider",
  "origin-provider-anthropic",
@@ -4584,6 +4586,15 @@ version = "0.9.11"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "origin-ponytail"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
  "toml 0.8.23",
 ]
 

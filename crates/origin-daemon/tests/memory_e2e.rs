@@ -125,6 +125,7 @@ async fn memory_e2e_proposer_to_store_via_wiremock() {
         permission_rules: None,
         post_edit: None,
         notify: None,
+        ponytail: origin_ponytail::PonytailMode::Full,
     };
     let _summary = run_loop(
         &mut session,

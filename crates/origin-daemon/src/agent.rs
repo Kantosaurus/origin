@@ -1382,6 +1382,124 @@ fn edited_paths_from_tool(name: &str, args: &Value) -> Vec<String> {
     }
 }
 
+/// Collect newly-added deps from a code-write or shell tool call (the ponytail
+/// dependency gate's extraction half). Reads disk for `Write`/manifest-diff;
+/// scans only the inserted text for `Edit`/`MultiEdit`/`ApplyPatch`. Fails open:
+/// any uncertainty (missing field, unreadable file, unknown tool) yields an
+/// empty `Vec`, so a missed dep is never flagged and a write is never broken.
+fn ponytail_added_deps(tool: &str, args: &Value) -> Vec<origin_ponytail::Dep> {
+    use origin_ponytail::{bash_installs, manifest_deps_added, manifest_deps_in_added_lines};
+    match tool {
+        "Bash" => args
+            .get("command")
+            .and_then(|c| c.as_str())
+            .map(bash_installs)
+            .unwrap_or_default(),
+        "Write" => {
+            let Some(path) = args.get("file_path").and_then(|p| p.as_str()) else {
+                return Vec::new();
+            };
+            let Some(content) = args.get("content").and_then(|c| c.as_str()) else {
+                return Vec::new();
+            };
+            let before = std::fs::read_to_string(path).ok();
+            manifest_deps_added(path, before.as_deref(), content)
+        }
+        "Edit" => {
+            let Some(path) = args.get("file_path").and_then(|p| p.as_str()) else {
+                return Vec::new();
+            };
+            let added = args.get("new_string").and_then(|s| s.as_str()).unwrap_or("");
+            manifest_deps_in_added_lines(path, added)
+        }
+        "MultiEdit" => {
+            let Some(path) = args.get("file_path").and_then(|p| p.as_str()) else {
+                return Vec::new();
+            };
+            let mut all = Vec::new();
+            if let Some(edits) = args.get("edits").and_then(|e| e.as_array()) {
+                for e in edits {
+                    let added = e.get("new_string").and_then(|s| s.as_str()).unwrap_or("");
+                    all.extend(manifest_deps_in_added_lines(path, added));
+                }
+            }
+            all
+        }
+        "ApplyPatch" => {
+            // Scan only added (`+`) lines of the patch body, per target file.
+            let patch = args
+                .get("patch")
+                .or_else(|| args.get("input"))
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+            let mut all = Vec::new();
+            let mut cur = String::new();
+            for line in patch.lines() {
+                if let Some(p) = line.strip_prefix("*** ").and_then(|l| {
+                    l.strip_prefix("Update File: ")
+                        .or_else(|| l.strip_prefix("Add File: "))
+                }) {
+                    cur = p.trim().to_string();
+                } else if let Some(added) = line.strip_prefix('+') {
+                    if !cur.is_empty() {
+                        all.extend(manifest_deps_in_added_lines(&cur, added));
+                    }
+                }
+            }
+            all
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The three outcomes of an interactive ponytail dependency prompt. A
+/// non-answer (client gone, timeout, cancel) maps to `Deny` — blocking is
+/// interactive-only and safe-by-default.
+enum PonytailChoice {
+    AllowOnce,
+    AllowRemember,
+    Deny,
+}
+
+/// Present the ponytail `[Allow once · Allow & remember · Deny]` choice over the
+/// SAME interactive pause-await path `ask_user` uses (a [`ChoiceAsk`] emitted on
+/// `event_tx`, parked on the daemon-wide [`ChoiceRegistry`]). Maps the resolved
+/// selection index back to a choice; an empty/skipped selection (vanished
+/// client) resolves to `Deny`, the secure default.
+///
+/// [`ChoiceAsk`]: crate::protocol::StreamEvent
+/// [`ChoiceRegistry`]: crate::ipc_prompter::ChoiceRegistry
+async fn prompt_ponytail_choice(
+    event_tx: &tokio::sync::mpsc::Sender<StreamEvent>,
+    registry: &std::sync::Arc<crate::ipc_prompter::ChoiceRegistry>,
+    f: &origin_ponytail::Flagged,
+) -> PonytailChoice {
+    let prompter = crate::ipc_prompter::IpcChoicePrompter::new(event_tx.clone(), Arc::clone(registry));
+    let options = vec![
+        crate::protocol::ChoiceOption {
+            label: "Allow once".to_string(),
+            description: None,
+        },
+        crate::protocol::ChoiceOption {
+            label: "Allow & remember".to_string(),
+            description: None,
+        },
+        crate::protocol::ChoiceOption {
+            label: "Deny".to_string(),
+            description: None,
+        },
+    ];
+    let (selected, _custom) = prompter
+        .ask(format!("ponytail: {}", f.message()), options, false, false)
+        .await;
+    match selected.first() {
+        Some(0) => PonytailChoice::AllowOnce,
+        Some(1) => PonytailChoice::AllowRemember,
+        // index 2 (Deny), out-of-range, or empty (skip / vanished client) ⇒ deny.
+        _ => PonytailChoice::Deny,
+    }
+}
+
 /// Maximum number of times `run_loop` retries a single turn's provider call
 /// after a `ProviderError::RateLimit`. After the cap is hit the error is
 /// propagated as a `LoopError::Provider` and the turn fails normally.
@@ -2276,6 +2394,11 @@ pub struct LoopOptions {
     /// byte-identical. Set from `PromptRequest.effort` in `handle_request`.
     /// *Closes: claude-code `/effort`+`/fast` (the agent-loop wire).*
     pub effort: Option<origin_provider::ReasoningEffort>,
+    /// Resolved ponytail intensity for this run (default `Full`). Drives both the
+    /// injected `<origin-ponytail>` system block and the pre-dispatch dependency
+    /// gate. Set from `PromptRequest.ponytail` (via `origin_ponytail::resolve_mode`)
+    /// in `handle_request`; `Full` everywhere a request doesn't override it.
+    pub ponytail: origin_ponytail::PonytailMode,
     /// Optional extended-thinking budget (in tokens) for every turn of this
     /// loop. `None` (the default) leaves each `ChatRequest.thinking_tokens` as
     /// `None` ⇒ provider wire byte-identical. Set from
@@ -2427,6 +2550,7 @@ impl Default for LoopOptions {
             policy: None,
             conseca: None,
             effort: None,
+            ponytail: origin_ponytail::PonytailMode::Full,
             thinking_tokens: None,
             attachments: Vec::new(),
             system_suffix: None,
@@ -3402,13 +3526,19 @@ async fn run_loop_inner(
     } else {
         String::new()
     };
+    // ponytail-native: the always-on "lazy senior dev" ruleset, filtered to the
+    // active intensity. `Off` ⇒ empty string (the array's non-empty filter drops
+    // it). The mode is fixed for the whole run, so this block sits in the cached
+    // static prefix exactly like the other system blocks — cache byte-stability
+    // is preserved.
+    let ponytail_block = origin_ponytail::system_block(opts.ponytail);
     let recalled_system = {
         // NOTE: `goal_block`, `lsp_diag_block`, and `swarm_notices_block` are
         // deliberately NOT in this array — they are volatile (goal iteration
         // counters change every goal-driver pass; diagnostics/notices change
         // per turn) and are carried as a trailing message block instead, so the
         // cached system+tools prefix stays byte-stable across the whole run.
-        let parts: [&str; 12] = [
+        let parts: [&str; 13] = [
             &repo_map_block,
             identity_block,
             &directive_block,
@@ -3421,6 +3551,7 @@ async fn run_loop_inner(
             &edit_format_block,
             &subagents_block,
             &result_encoding_block,
+            &ponytail_block,
         ];
         parts
             .iter()
@@ -4327,6 +4458,118 @@ async fn run_loop_inner(
                     m.tool_call_total(provider.name(), &name, "denied").inc();
                 }
                 return Err(LoopError::Denied(name.clone()));
+            }
+
+            // --- ponytail dependency gate (ponytail-native) ---
+            // After permission/governance has ALLOWED the tool, intercept the
+            // code-write/shell tools that can ADD a dependency and challenge any
+            // dep with a native/stdlib replacement (`full`) or, in `ultra`, every
+            // new dep. Pure (no I/O, microsecond) extraction + classification;
+            // `Off` or no flags ⇒ no-op (byte-identical to before). `Lite` only
+            // advises (logs, never blocks). `Full`/`Ultra` block only with a human
+            // in the loop (interactive choice channel present) — every headless /
+            // swarm / scheduled path allows + logs, so the gate can never deadlock
+            // the (uncapped) loop. A Deny becomes a recoverable tool-result error
+            // the model sees and rewrites against, exactly like a dispatch failure.
+            if opts.ponytail != origin_ponytail::PonytailMode::Off
+                && matches!(
+                    meta.name,
+                    "Edit" | "Write" | "MultiEdit" | "ApplyPatch" | "Bash"
+                )
+            {
+                let deps = ponytail_added_deps(meta.name, &args);
+                if !deps.is_empty() {
+                    let flags = origin_ponytail::classify(
+                        &deps,
+                        opts.ponytail,
+                        &origin_ponytail::allowlist(),
+                    );
+                    // The interactive choice channel is wired iff this turn came
+                    // from a human-answerable session (the same signal `ask_user`
+                    // uses): BOTH an event channel and the daemon-wide choice
+                    // registry are present. Absent ⇒ headless/swarm ⇒ allow + log.
+                    let interactive_choice =
+                        opts.event_tx.as_ref().zip(opts.choice_registry.as_ref());
+                    let mut denied: Option<String> = None;
+                    for f in &flags {
+                        let native = match f.kind {
+                            origin_ponytail::FlagKind::Replaceable(r) => r.native,
+                            origin_ponytail::FlagKind::Unjustified => "(none)",
+                        };
+                        if opts.ponytail == origin_ponytail::PonytailMode::Lite {
+                            origin_ponytail::debt::log(
+                                origin_ponytail::DebtAction::Advisory,
+                                &f.dep.name,
+                                native,
+                            );
+                            continue;
+                        }
+                        let Some((event_tx, registry)) = interactive_choice else {
+                            // Non-interactive full/ultra: allow + log, never block.
+                            origin_ponytail::debt::log(
+                                origin_ponytail::DebtAction::HeadlessAllow,
+                                &f.dep.name,
+                                native,
+                            );
+                            continue;
+                        };
+                        match prompt_ponytail_choice(event_tx, registry, f).await {
+                            PonytailChoice::Deny => {
+                                origin_ponytail::debt::log(
+                                    origin_ponytail::DebtAction::Advisory,
+                                    &f.dep.name,
+                                    native,
+                                );
+                                denied = Some(format!("ponytail.blocked: {}", f.message()));
+                                break;
+                            }
+                            PonytailChoice::AllowRemember => {
+                                origin_ponytail::remember(&f.dep.name);
+                                origin_ponytail::debt::log(
+                                    origin_ponytail::DebtAction::Remembered,
+                                    &f.dep.name,
+                                    native,
+                                );
+                            }
+                            PonytailChoice::AllowOnce => {
+                                origin_ponytail::debt::log(
+                                    origin_ponytail::DebtAction::OverrideOnce,
+                                    &f.dep.name,
+                                    native,
+                                );
+                            }
+                        }
+                    }
+                    if let Some(msg) = denied {
+                        // Drain any speculative slot so a precomputed result for
+                        // this tool doesn't stay detached, then surface the block
+                        // to the model as a recoverable tool result (the same shape
+                        // a dispatch `ToolFailure` produces) and move on — the model
+                        // rewrites with the native API instead of the dependency.
+                        let _ = speculative.take(&id).await;
+                        tracing::info!(tool = %name, %msg, "ponytail gate blocked dependency");
+                        if let Some(m) = opts.metrics.as_deref() {
+                            m.tool_call_total(provider.name(), &name, "err").inc();
+                        }
+                        if let Some(tx) = &opts.event_tx {
+                            let _ = tx
+                                .send(StreamEvent::ToolResult {
+                                    tool: name.clone(),
+                                    ok: false,
+                                    preview: msg.clone(),
+                                    elided_bytes: 0,
+                                })
+                                .await;
+                        }
+                        tool_results.push(Block::ToolResult {
+                            tool_use_id: id,
+                            handle: None,
+                            inline: Some(format!("Error: {msg}").into_bytes()),
+                            cache_marker: None,
+                        });
+                        continue;
+                    }
+                }
             }
 
             // Track mutations for the optional end-of-turn checkpoint (Task 1).

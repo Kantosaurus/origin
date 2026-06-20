@@ -473,6 +473,9 @@ pub struct App {
     /// `/effort <level>` and `/fast` composer commands. Sent on every
     /// `PromptRequest`. *Closes: claude-code `/effort`+`/fast` (interactive).*
     pub effort: Option<String>,
+    /// Session ponytail intensity, mutated by `/ponytail`; carried on every
+    /// `PromptRequest`. `None` ⇒ daemon resolves (default `full`).
+    pub ponytail_mode: Option<origin_ponytail::PonytailMode>,
     /// Active output style (Explanatory / Learning / Concise), or `None` for the
     /// default voice. Set by the `/output-style <name>` composer command; its
     /// system suffix is sent on every `PromptRequest` (in the `system` field) so
@@ -703,6 +706,7 @@ impl App {
             swarm_selected: None,
             swarm_view: None,
             effort: None,
+            ponytail_mode: None,
             output_style: None,
             steering: origin_steering::SteeringQueue::new(),
             plan_mode: false,
@@ -2139,10 +2143,21 @@ impl App {
             .swarm_agents
             .iter()
             .any(|r| r.status == SwarmAgentStatus::Running);
+        // Append the ponytail badge to the persistent model segment (skipped
+        // when off ⇒ empty). The model is the always-visible right-aligned
+        // readout, so the badge rides alongside it without a dedicated row.
+        let badge = self.ponytail_badge();
+        let model = if badge.is_empty() {
+            self.usage.model.clone()
+        } else if self.usage.model.is_empty() {
+            badge
+        } else {
+            format!("{} {badge}", self.usage.model)
+        };
         let st = crate::tui::chrome::StatusCtx {
             spinner: self.spinner.active.then(|| self.spinner.frame_char().to_string()),
             phase: phase_owned,
-            model: self.usage.model.clone(),
+            model,
             input_tokens: self.usage.input_tokens,
             output_tokens: self.usage.output_tokens,
             cost: Some(crate::status::cost_usd(&self.usage)),
@@ -2154,6 +2169,13 @@ impl App {
             &st,
             tok,
         );
+    }
+
+    /// Status-bar badge for the active ponytail mode. Empty when off; the
+    /// default (`None` ⇒ full) shows `[PONYTAIL]`, ultra shows `[PONYTAIL:ULTRA]`.
+    #[must_use]
+    pub fn ponytail_badge(&self) -> String {
+        ponytail_badge_for(self.ponytail_mode)
     }
 
     /// Render the goal / stall / permission notices on the status readout row.
@@ -2837,6 +2859,18 @@ fn localize_phase(phase: Option<&str>) -> Option<String> {
     }
 }
 
+/// Pure core of [`App::ponytail_badge`]: maps a session ponytail mode to its
+/// status-bar badge. `Off` ⇒ empty (hidden); `None` (daemon-default `full`) and
+/// `Full` ⇒ `[PONYTAIL]`; `Ultra` ⇒ `[PONYTAIL:ULTRA]`.
+#[must_use]
+fn ponytail_badge_for(mode: Option<origin_ponytail::PonytailMode>) -> String {
+    match mode {
+        Some(origin_ponytail::PonytailMode::Off) => String::new(),
+        Some(origin_ponytail::PonytailMode::Ultra) => "[PONYTAIL:ULTRA]".to_string(),
+        _ => "[PONYTAIL]".to_string(),
+    }
+}
+
 /// Write `s` at (`row`, `col`) on the raised-surface background and return the
 /// next free column. Unlike [`write_str_styled`] it does not bg-fill to the row
 /// end, so spans can be chained left-to-right.
@@ -3289,6 +3323,27 @@ mod tests {
         assert_eq!(app.usage.model, "claude-opus-4-7");
         app.set_model("claude-sonnet-4-6");
         assert_eq!(app.usage.model, "claude-sonnet-4-6");
+    }
+
+    // Task 15: the statusline badge reflects the active ponytail mode. The
+    // daemon-default (`None`) and `Full` both read `[PONYTAIL]`; `Ultra` is
+    // distinguished; `Off` hides the badge entirely.
+    #[test]
+    fn badge_reflects_mode() {
+        use origin_ponytail::PonytailMode;
+        assert_eq!(ponytail_badge_for(None), "[PONYTAIL]");
+        assert_eq!(ponytail_badge_for(Some(PonytailMode::Full)), "[PONYTAIL]");
+        assert_eq!(ponytail_badge_for(Some(PonytailMode::Lite)), "[PONYTAIL]");
+        assert_eq!(ponytail_badge_for(Some(PonytailMode::Ultra)), "[PONYTAIL:ULTRA]");
+        assert!(ponytail_badge_for(Some(PonytailMode::Off)).is_empty());
+
+        // The `App` method delegates to the free helper.
+        let mut app = App::new("anthropic", "claude-opus-4-8", CompletionSources::default());
+        assert_eq!(app.ponytail_badge(), "[PONYTAIL]"); // default None
+        app.ponytail_mode = Some(PonytailMode::Ultra);
+        assert_eq!(app.ponytail_badge(), "[PONYTAIL:ULTRA]");
+        app.ponytail_mode = Some(PonytailMode::Off);
+        assert!(app.ponytail_badge().is_empty());
     }
 
     #[test]

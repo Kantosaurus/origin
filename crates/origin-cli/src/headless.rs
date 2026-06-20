@@ -212,6 +212,9 @@ pub async fn run(args: RunArgs) -> Result<()> {
         // Headless is one-shot and never switches accounts mid-session, so the
         // daemon resolves the startup/global account ⇒ wire byte-identical.
         account: None,
+        // ponytail dep-bloat gate is irrelevant to a non-interactive headless
+        // turn (no human to answer its prompt); leave it at the daemon default.
+        ponytail: None,
     };
     let reply = drive_turn(&mut conn, prompt, emit).await?;
     if matches!(fmt, OutputFormat::Json) {
@@ -266,6 +269,7 @@ async fn run_structured(
             permission_ask: false,
             interactive: false,
             account: None,
+            ponytail: None,
         };
         let reply = drive_turn(conn, prompt, Emit::Silent).await?;
         let candidate = extract_json(&reply);
@@ -357,6 +361,7 @@ pub async fn one_shot_text(model: &str, user_text: String) -> Result<String> {
         permission_ask: false,
         interactive: false,
         account: None,
+        ponytail: None,
     };
     drive_turn(&mut conn, prompt, Emit::Silent).await
 }

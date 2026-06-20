@@ -19,6 +19,9 @@ pub struct Cli {
     /// [`crate::effort::ReasoningEffort::parse_level`] at the call site.
     #[arg(long)]
     pub effort: Option<String>,
+    /// Ponytail intensity for the session (`off`/`lite`/`full`/`ultra`).
+    #[arg(long)]
+    pub ponytail: Option<String>,
     /// Extended-thinking budget in tokens for the session (Anthropic). Seeds the
     /// session so every prompt carries it. Defaults to unset, leaving the
     /// provider wire byte-identical. `0` is rejected. Only the Anthropic
@@ -81,6 +84,9 @@ pub enum Cmd {
         /// effort wire; unknown values leave the wire unchanged.
         #[arg(long)]
         effort: Option<String>,
+        /// Ponytail intensity for this turn (`off`/`lite`/`full`/`ultra`).
+        #[arg(long)]
+        ponytail: Option<String>,
         /// Extended-thinking budget in tokens for this turn (Anthropic). When
         /// omitted, falls back to the global `--thinking-tokens`. `0` is
         /// rejected. Only the Anthropic provider honours it. *Closes: aider
