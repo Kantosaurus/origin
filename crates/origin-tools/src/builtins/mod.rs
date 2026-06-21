@@ -7,6 +7,7 @@ pub mod bash;
 pub mod browser;
 pub mod diagnostics;
 pub mod edit;
+pub mod editmatch;
 pub mod glob_tool;
 pub mod gmail;
 pub mod graph_explain;

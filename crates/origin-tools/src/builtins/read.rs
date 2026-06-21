@@ -15,7 +15,8 @@ pub struct ReadArgs {
     pub as_: Option<String>,
 }
 
-/// 1-based offset (0 means start from line 1). Default limit = 1000 lines.
+/// 0-based line offset: the number of leading lines to skip (0 ⇒ start at line
+/// 1, matching the tool schema). Default limit = 1000 lines.
 ///
 /// # Errors
 /// Returns `ToolError` on I/O failure or non-UTF-8 (without BOM) content.

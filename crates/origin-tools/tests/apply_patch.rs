@@ -176,6 +176,24 @@ fn marker_invalid_op_rolls_back_everything() {
 }
 
 #[test]
+fn empty_context_line_is_treated_as_a_blank_context_line() {
+    // LLMs routinely emit a blank context line as a TRULY EMPTY line ("") rather
+    // than the canonical single space. Dropping it desyncs the hunk against a
+    // file that really has a blank line. The patch below keeps the blank line as
+    // "" between the change and the trailing context.
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("blank.rs");
+    fs::write(&p, "fn foo() {}\n\nfn bar() {}\n").unwrap();
+    let patch = format!(
+        "--- a/{path}\n+++ b/{path}\n@@ -1,3 +1,3 @@\n-fn foo() {{}}\n+fn FOO() {{}}\n\n fn bar() {{}}\n",
+        path = fwd(&p)
+    );
+    let out = apply_patch(&ApplyPatchArgs { patch }).unwrap();
+    assert_eq!(out["files_updated"], 1);
+    assert_eq!(fs::read_to_string(&p).unwrap(), "fn FOO() {}\n\nfn bar() {}\n");
+}
+
+#[test]
 fn unified_diff_path_still_returns_legacy_shape() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("legacy.rs");

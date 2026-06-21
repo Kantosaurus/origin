@@ -83,6 +83,7 @@ pub async fn bash_v2(args: BashArgs, sup: &Supervisor) -> Result<Value, ToolErro
             return Ok(json!({
                 "status": status_str,
                 "exit_code": exit_code,
+                "failed": exit_code != 0,
                 "stdout": cap_stdout(acc),
             }));
         }
@@ -92,7 +93,7 @@ pub async fn bash_v2(args: BashArgs, sup: &Supervisor) -> Result<Value, ToolErro
             // does not outlive the tool call, then return.
             kill_guard.disarm();
             sup.kill(pid);
-            return Ok(json!({"status": "timed_out", "exit_code": -1, "stdout": cap_stdout(acc)}));
+            return Ok(json!({"status": "timed_out", "exit_code": -1, "failed": true, "stdout": cap_stdout(acc)}));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

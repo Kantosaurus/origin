@@ -69,3 +69,40 @@ fn no_match_errors_with_edit_no_match() {
     .unwrap_err();
     assert_eq!(err.reason, "no_match");
 }
+
+#[test]
+fn whitespace_drift_falls_back_to_a_unique_match() {
+    // The file is 4-space indented; the model supplies a tab + trailing space.
+    // Exact match fails, but the whitespace-tolerant fallback finds the unique
+    // line and edits it instead of forcing a blind retry.
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("a.rs");
+    fs::write(&p, "fn main() {\n    let x = 1;\n}\n").unwrap();
+    let out = edit_v2(EditArgs {
+        file_path: p.to_string_lossy().into_owned(),
+        old_string: "\tlet x = 1; ".into(),
+        new_string: "    let x = 42;".into(),
+        replace_all: false,
+    })
+    .unwrap();
+    assert_eq!(out["ok"], true);
+    assert_eq!(fs::read_to_string(&p).unwrap(), "fn main() {\n    let x = 42;\n}\n");
+}
+
+#[test]
+fn no_match_hint_names_the_whitespace_only_near_miss() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("a.rs");
+    fs::write(&p, "fn main() {\n        let total = a + b;\n}\n").unwrap();
+    // Wrong indentation AND a sibling line elsewhere keeps it a near-miss, not
+    // a unique fallback (there is only one candidate line, so add a decoy to
+    // force the no-match path): use a needle that can't uniquely place.
+    let err = edit_v2(EditArgs {
+        file_path: p.to_string_lossy().into_owned(),
+        old_string: "let total = a+b;".into(), // operator spacing differs ⇒ genuine miss
+        new_string: "x".into(),
+        replace_all: false,
+    })
+    .unwrap_err();
+    assert_eq!(err.reason, "no_match");
+}

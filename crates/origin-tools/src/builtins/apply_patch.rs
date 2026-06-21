@@ -451,7 +451,12 @@ impl MarkerParser {
                         lines: Vec::new(),
                     });
                 } else if let Some(h) = cur.as_mut() {
-                    if raw.starts_with(' ') || raw.starts_with('-') || raw.starts_with('+') {
+                    if raw.is_empty() {
+                        // LLMs emit a blank context line as a truly empty line;
+                        // normalise to a single-space context line so it is kept
+                        // (and so `apply_one_hunk`'s `l[1..]`/`l[0]` never panics).
+                        h.lines.push(" ".to_string());
+                    } else if raw.starts_with(' ') || raw.starts_with('-') || raw.starts_with('+') {
                         h.lines.push(raw.to_string());
                     }
                 }
@@ -516,7 +521,10 @@ fn parse_patch(patch: &str) -> Result<Vec<Hunk>, ToolError> {
                 lines: Vec::new(),
             });
         } else if let Some(h) = cur.as_mut() {
-            if line.starts_with(' ') || line.starts_with('-') || line.starts_with('+') {
+            if line.is_empty() {
+                // Blank context line emitted as a truly empty line (see feed_body).
+                h.lines.push(" ".to_string());
+            } else if line.starts_with(' ') || line.starts_with('-') || line.starts_with('+') {
                 h.lines.push(line.to_string());
             }
         }

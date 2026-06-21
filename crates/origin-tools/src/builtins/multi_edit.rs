@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `MultiEdit` — apply a list of edit operations to one file, atomically.
 
+use crate::builtins::editmatch;
 use crate::error::{ErrClass, ToolError};
 use crate::text_fmt;
 use crate::{SideEffects, Tier, Urgency};
@@ -28,38 +29,57 @@ pub fn multi_edit(args: &MultiEditArgs) -> Result<Value, ToolError> {
     let det = text_fmt::detect(&bytes);
     let mut text = text_fmt::normalise_to_lf(&bytes, &det)?;
     let mut applied = 0u32;
+    let total = args.edits.len();
     for op in &args.edits {
+        // `applied` is 0-based internally; report it 1-based to the model.
+        let edit_no = applied + 1;
         // An empty needle matches between every character; replacing it would
         // splice `new` at every position and corrupt the file.
         if op.old.is_empty() {
             return Err(ToolError::new(
                 ErrClass::Validation,
                 "empty_old_string",
-                format!("edit {applied} of {}: old must not be empty", args.edits.len()),
+                format!("edit {edit_no} of {total}: old must not be empty"),
             )
             .recoverable(true));
         }
         let count = text.matches(op.old.as_str()).count();
         text = match count {
             0 => {
-                return Err(ToolError::new(
-                    ErrClass::Edit,
-                    "no_match",
-                    format!("edit {applied} of {}: '{}' not found", args.edits.len(), op.old),
-                ))
+                // Whitespace-tolerant fallback (unique run only); else a
+                // recoverable no_match with the closest near-miss line.
+                if let Some(range) = editmatch::ws_tolerant_unique_range(&text, &op.old) {
+                    let mut s = text.clone();
+                    s.replace_range(range, &op.new);
+                    s
+                } else {
+                    let msg = editmatch::closest_ws_line(&text, &op.old).map_or_else(
+                        || format!("edit {edit_no} of {total}: '{}' not found", op.old),
+                        |line| {
+                            format!(
+                                "edit {edit_no} of {total}: '{}' not found (closest match: line {line} differs only in whitespace)",
+                                op.old
+                            )
+                        },
+                    );
+                    return Err(ToolError::new(ErrClass::Edit, "no_match", msg).recoverable(true));
+                }
             }
             1 => text.replacen(op.old.as_str(), op.new.as_str(), 1),
             _n if op.replace_all => text.replace(op.old.as_str(), op.new.as_str()),
             n => {
+                let lines = editmatch::exact_match_lines(&text, &op.old);
+                let at = if lines.is_empty() {
+                    String::new()
+                } else {
+                    format!(" at lines {lines:?}")
+                };
                 return Err(ToolError::new(
                     ErrClass::Edit,
                     "ambiguous",
-                    format!(
-                        "edit {applied} of {}: '{}' appears {n} times; pass replace_all=true",
-                        args.edits.len(),
-                        op.old
-                    ),
-                ))
+                    format!("edit {edit_no} of {total}: '{}' appears {n} times{at}; pass replace_all=true", op.old),
+                )
+                .recoverable(true));
             }
         };
         applied += 1;
@@ -87,7 +107,7 @@ fn atomic_write(path: &str, bytes: &[u8]) -> Result<(), ToolError> {
 
 crate::origin_tool! {
     name: "MultiEdit",
-    description: "Apply a sequence of edit operations to one file atomically. Single read + single write per call.",
+    description: "Apply a sequence of edit operations to one file atomically (single read + single write). Each `old` must match the file's existing text verbatim — do NOT include Read's line-number/tab prefix; indentation/CRLF drift is tolerated.",
     tier: Tier::RequiresPermission,
     urgency: Urgency::Medium,
     side_effects: SideEffects::Mutating,

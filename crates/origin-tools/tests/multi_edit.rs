@@ -53,7 +53,36 @@ fn failure_mid_sequence_does_not_partially_write() {
     })
     .unwrap_err();
     assert_eq!(err.reason, "no_match");
+    // The no_match must be recoverable so the harness retries instead of aborting.
+    assert!(err.recoverable, "MultiEdit no_match must be recoverable");
     assert_eq!(fs::read_to_string(&p).unwrap(), "x\ny\nz\n");
+}
+
+#[test]
+fn whitespace_drift_falls_back_per_edit() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("a.rs");
+    fs::write(&p, "fn main() {\n    let x = 1;\n    let y = 2;\n}\n").unwrap();
+    multi_edit(&MultiEditArgs {
+        file_path: p.to_string_lossy().into_owned(),
+        edits: vec![
+            EditOp {
+                old: "\tlet x = 1;".into(), // tab instead of 4 spaces
+                new: "    let x = 10;".into(),
+                replace_all: false,
+            },
+            EditOp {
+                old: "let y = 2; ".into(), // trailing space
+                new: "    let y = 20;".into(),
+                replace_all: false,
+            },
+        ],
+    })
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(&p).unwrap(),
+        "fn main() {\n    let x = 10;\n    let y = 20;\n}\n"
+    );
 }
 
 #[test]

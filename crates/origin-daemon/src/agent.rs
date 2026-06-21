@@ -7301,6 +7301,10 @@ fn bash_result_bytes(status: &str, exit_code: i32, stdout: String) -> Vec<u8> {
     let result = serde_json::json!({
         "status": status,
         "exit_code": exit_code,
+        // Explicit failure marker: a non-zero exit (or timeout/kill) is easy for
+        // the model to miss when it is only a number buried in the JSON, leading
+        // to false "done" claims. `failed: true` is an unmissable signal.
+        "failed": exit_code != 0,
         "stdout": origin_tools::builtins::bash::cap_stdout(stdout),
     });
     serde_json::to_string(&result)
@@ -7344,7 +7348,8 @@ mod bash_result_tests {
         assert!(stdout.starts_with("HHHH"), "the head must be preserved");
     }
 
-    /// Small output is passed through untouched (no spurious elision note).
+    /// Small output is passed through untouched (no spurious elision note), and
+    /// a zero exit is not flagged as failed.
     #[test]
     fn small_stdout_is_unchanged() {
         let bytes = bash_result_bytes("exited", 0, "hello world".to_string());
@@ -7352,6 +7357,15 @@ mod bash_result_tests {
         assert_eq!(v["stdout"].as_str().expect("string"), "hello world");
         assert_eq!(v["exit_code"].as_i64().expect("int"), 0);
         assert_eq!(v["status"].as_str().expect("string"), "exited");
+        assert!(!v["failed"].as_bool().expect("bool"));
+    }
+
+    /// A non-zero exit carries an explicit `failed: true` marker.
+    #[test]
+    fn non_zero_exit_is_flagged_failed() {
+        let bytes = bash_result_bytes("exited", 1, "boom".to_string());
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
+        assert!(v["failed"].as_bool().expect("bool"));
     }
 }
 

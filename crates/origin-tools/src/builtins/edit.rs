@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `Edit` v2 — find-and-replace with CRLF safety, hunk return, `replace_all`.
 
+use crate::builtins::editmatch;
 use crate::error::{ErrClass, ToolError};
 use crate::text_fmt;
 use crate::{SideEffects, Tier, Urgency};
@@ -44,22 +45,44 @@ pub fn edit_v2(args: EditArgs) -> Result<Value, ToolError> {
     let count = text.matches(&args.old_string).count();
     let updated = match count {
         0 => {
-            return Err(ToolError::new(
-                ErrClass::Edit,
-                "no_match",
-                format!("'{}' not found in {}", args.old_string, args.file_path),
-            )
-            .recoverable(true)
-            .hint("widen the needle or add surrounding context"));
+            // Exact match failed. Try ONE whitespace-tolerant fallback that
+            // absorbs indentation / trailing-whitespace drift — but only when it
+            // resolves to a UNIQUE run (it never guesses). Otherwise return
+            // no_match enriched with the closest whitespace-only near-miss so the
+            // model can correct in one step instead of blind-retrying.
+            if let Some(range) = editmatch::ws_tolerant_unique_range(&text, &args.old_string) {
+                let mut s = text.clone();
+                s.replace_range(range, &args.new_string);
+                s
+            } else {
+                let msg = editmatch::closest_ws_line(&text, &args.old_string).map_or_else(
+                    || format!("'{}' not found in {}", args.old_string, args.file_path),
+                    |line| {
+                        format!(
+                            "'{}' not found in {} (closest match: line {line} differs only in whitespace)",
+                            args.old_string, args.file_path
+                        )
+                    },
+                );
+                return Err(ToolError::new(ErrClass::Edit, "no_match", msg)
+                    .recoverable(true)
+                    .hint("widen the needle or add surrounding context"));
+            }
         }
         1 => text.replacen(&args.old_string, &args.new_string, 1),
         _ if args.replace_all => text.replace(&args.old_string, &args.new_string),
         n => {
+            let lines = editmatch::exact_match_lines(&text, &args.old_string);
+            let at = if lines.is_empty() {
+                String::new()
+            } else {
+                format!(" at lines {lines:?}")
+            };
             return Err(ToolError::new(
                 ErrClass::Edit,
                 "ambiguous",
                 format!(
-                    "'{}' appears {n} times; pass replace_all=true or widen the needle",
+                    "'{}' appears {n} times{at}; pass replace_all=true or add surrounding context",
                     args.old_string
                 ),
             )
@@ -105,7 +128,7 @@ fn atomic_write(path: &str, bytes: &[u8]) -> Result<(), ToolError> {
 
 crate::origin_tool! {
     name: "Edit",
-    description: "Find-and-replace a unique string in a file. CRLF-safe. Pass replace_all=true for multi-match.",
+    description: "Find-and-replace a unique string in a file. `old_string` must match the file's existing text verbatim — do NOT include Read's line-number/tab prefix. Indentation/CRLF drift is tolerated; on no match the error names the closest near-miss line. Pass replace_all=true for multi-match.",
     tier: Tier::RequiresPermission,
     urgency: Urgency::Medium,
     side_effects: SideEffects::Mutating,
