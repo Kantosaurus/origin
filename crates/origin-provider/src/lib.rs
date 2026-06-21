@@ -256,7 +256,13 @@ pub fn inflate_tool_result_handles(
         }
         out.push(nm);
     }
-    Ok(out)
+    // Tool-pairing repair at the non-anthropic wire choke (parity with the
+    // anthropic encoder): drop an orphaned tool_result and a trailing orphan
+    // tool_use so a resumed/corrupted/interrupted transcript can't 400 the
+    // OpenAI-compatible (or other) provider. Idempotent on a well-formed
+    // transcript.
+    let out = origin_core::types::strip_orphan_tool_results(out);
+    Ok(origin_core::types::strip_trailing_orphan_tool_use(out))
 }
 
 #[async_trait::async_trait]

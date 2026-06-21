@@ -24,6 +24,20 @@ fn store(dir: &std::path::Path) -> Arc<Store> {
     )
 }
 
+/// The assistant `tool_use` that must precede a `tool_result` for the pairing to
+/// be valid (the inflate choke now strips orphaned results).
+fn assistant_tool_use(id: &str) -> Message {
+    Message {
+        role: Role::Assistant,
+        blocks: vec![Block::ToolUse {
+            id: id.into(),
+            name: "Read".into(),
+            input_json: b"{}".to_vec(),
+            cache_marker: None,
+        }],
+    }
+}
+
 fn tool_result(handle: [u8; 32]) -> Message {
     Message {
         role: Role::Tool,
@@ -32,6 +46,7 @@ fn tool_result(handle: [u8; 32]) -> Message {
             handle: Some(handle),
             inline: None,
             cache_marker: None,
+            is_error: false,
         }],
     }
 }
@@ -43,10 +58,10 @@ fn cas_miss_inflates_to_placeholder_instead_of_error() {
 
     // A handle whose payload was never stored (lost when the daemon restarted).
     let dangling: [u8; 32] = [9; 32];
-    let out = inflate_tool_result_handles(&[tool_result(dangling)], Some(&cas))
+    let out = inflate_tool_result_handles(&[assistant_tool_use("t1"), tool_result(dangling)], Some(&cas))
         .expect("a cas miss must degrade, not error");
 
-    let block = &out[0].blocks[0];
+    let block = &out[1].blocks[0];
     // The handle is consumed (take()) and replaced with the inline placeholder.
     assert!(
         matches!(
@@ -74,9 +89,10 @@ fn cas_hit_inflates_the_stored_payload() {
     let payload = b"the real tool output";
     let h = cas.put(payload).expect("put");
 
-    let out = inflate_tool_result_handles(&[tool_result(*h.as_bytes())], Some(&cas)).expect("ok");
+    let out =
+        inflate_tool_result_handles(&[assistant_tool_use("t1"), tool_result(*h.as_bytes())], Some(&cas)).expect("ok");
 
-    let block = &out[0].blocks[0];
+    let block = &out[1].blocks[0];
     assert!(
         matches!(block, Block::ToolResult { inline: Some(_), .. }),
         "hit must inflate to the stored payload: {block:?}"

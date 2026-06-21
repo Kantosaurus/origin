@@ -450,6 +450,7 @@ mod tests {
                 handle: None,
                 inline: Some(b"42 results".to_vec()),
                 cache_marker: None,
+                is_error: false,
             }],
         };
         let req = ChatRequest {
