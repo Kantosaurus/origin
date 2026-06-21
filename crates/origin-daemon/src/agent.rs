@@ -422,17 +422,18 @@ fn apply_governance_overlay(
 /// [`origin_cmdparse::Risk::Dangerous`]. Like [`apply_governance_overlay`],
 /// this can only ever turn an `Allow` into a `Deny`, never widen.
 ///
-/// The whole overlay is gated behind the `ORIGIN_CMD_GUARD=1` environment
-/// variable and only applies to the `Bash` tool, so with the flag unset (the
-/// default) it returns `decision` unchanged and default behavior is
-/// byte-identical. `args` is the tool's parsed JSON arguments; the command is
-/// read from the `command` field (matching the `Bash` builtin's schema).
+/// Applies only to the `Bash` tool, and only acts on the curated, high-confidence
+/// `Risk::Dangerous` set (`rm -rf ~//`, pipe-to-shell `curl|sh`, fork bomb) —
+/// catastrophic, unambiguous patterns that cmdparse is tuned NOT to false-positive
+/// on. This is DEFAULT-ON; set `ORIGIN_CMD_GUARD=0` to opt out entirely. The
+/// broader `Suspicious` heuristics are never acted on here. `args` is the parsed
+/// JSON arguments; the command is read from the `command` field.
 fn apply_cmd_guard(
     decision: origin_permission::Decision,
     tool: &str,
     args: &Value,
 ) -> origin_permission::Decision {
-    if tool != "Bash" || std::env::var("ORIGIN_CMD_GUARD").as_deref() != Ok("1") {
+    if tool != "Bash" || std::env::var("ORIGIN_CMD_GUARD").as_deref() == Ok("0") {
         return decision;
     }
     let Some(cmd) = args.get("command").and_then(Value::as_str) else {
@@ -9607,29 +9608,30 @@ mod wiring_tests {
         ));
     }
 
-    /// cmdparse cmd-guard: with `ORIGIN_CMD_GUARD` unset (the default) even a
-    /// catastrophic command is left as Allow — the overlay is fully off.
+    /// cmdparse cmd-guard: a non-dangerous command is always left as Allow,
+    /// regardless of the (now default-on) gate.
     #[test]
-    fn cmd_guard_off_leaves_allow_unchanged() {
+    fn cmd_guard_leaves_safe_commands_unchanged() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("ORIGIN_CMD_GUARD");
         let allow = Decision {
             outcome: Outcome::Allow,
             reason: "base".into(),
         };
-        let args = serde_json::json!({ "command": "rm -rf ~" });
+        let args = serde_json::json!({ "command": "cargo test" });
         let out = apply_cmd_guard(allow, "Bash", &args);
         assert_eq!(
             out.outcome,
             Outcome::Allow,
-            "cmd-guard must be a no-op when ORIGIN_CMD_GUARD is unset"
+            "a safe command is never downgraded by the guard"
         );
     }
 
-    /// cmdparse cmd-guard: with the gate ON, `rm -rf ~` on `Bash` is downgraded
-    /// to Deny, a safe command stays Allow, and a non-Bash tool is untouched.
+    /// cmdparse cmd-guard is now DEFAULT-ON: with no env var, `rm -rf ~` on
+    /// `Bash` is downgraded to Deny, a safe command stays Allow, a non-Bash tool
+    /// is untouched, and `ORIGIN_CMD_GUARD=0` opts out entirely.
     #[test]
-    fn cmd_guard_on_denies_dangerous_bash() {
+    fn cmd_guard_denies_dangerous_bash_by_default() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mk = || Decision {
             outcome: Outcome::Allow,
@@ -9638,22 +9640,23 @@ mod wiring_tests {
         let dangerous = serde_json::json!({ "command": "rm -rf ~" });
         let safe = serde_json::json!({ "command": "ls -la" });
 
-        std::env::set_var("ORIGIN_CMD_GUARD", "1");
+        // Default (no env var): dangerous denied, safe allowed, non-Bash untouched.
+        std::env::remove_var("ORIGIN_CMD_GUARD");
         let denied = apply_cmd_guard(mk(), "Bash", &dangerous);
         let allowed = apply_cmd_guard(mk(), "Bash", &safe);
         let non_bash = apply_cmd_guard(mk(), "Read", &dangerous);
-        std::env::remove_var("ORIGIN_CMD_GUARD");
-
-        assert_eq!(
-            denied.outcome,
-            Outcome::Deny,
-            "dangerous bash must be denied when ORIGIN_CMD_GUARD=1"
-        );
+        assert_eq!(denied.outcome, Outcome::Deny, "dangerous bash denied by default");
         assert_eq!(allowed.outcome, Outcome::Allow, "safe bash stays Allow");
+        assert_eq!(non_bash.outcome, Outcome::Allow, "cmd-guard only inspects Bash");
+
+        // Explicit opt-out: dangerous passes through.
+        std::env::set_var("ORIGIN_CMD_GUARD", "0");
+        let opted_out = apply_cmd_guard(mk(), "Bash", &dangerous);
+        std::env::remove_var("ORIGIN_CMD_GUARD");
         assert_eq!(
-            non_bash.outcome,
+            opted_out.outcome,
             Outcome::Allow,
-            "cmd-guard only inspects the Bash tool"
+            "ORIGIN_CMD_GUARD=0 opts out of the guard entirely"
         );
     }
 
