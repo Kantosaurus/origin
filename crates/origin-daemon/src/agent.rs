@@ -449,6 +449,38 @@ fn apply_cmd_guard(
     decision
 }
 
+/// Run the configured `auto_test` command at turn end through the platform shell.
+///
+/// Returns a `<test-results>` feedback block ONLY when the command fails (None on
+/// success, spawn failure, or timeout — fail-open). Bounded to 600s. The output
+/// is tail-truncated since test failures surface at the end. Only ever called
+/// when the user opted into `[post_edit] auto_test=true`, so it adds no default
+/// latency.
+async fn run_post_edit_test(cmd: &str) -> Option<String> {
+    let run = if cfg!(windows) {
+        tokio::process::Command::new("pwsh")
+            .args(["-NoProfile", "-Command", cmd])
+            .output()
+    } else {
+        tokio::process::Command::new("sh").args(["-c", cmd]).output()
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(600), run).await {
+        Ok(Ok(out)) if !out.status.success() => {
+            let mut msg = String::from_utf8_lossy(&out.stdout).into_owned();
+            msg.push_str(&String::from_utf8_lossy(&out.stderr));
+            let chars: Vec<char> = msg.chars().collect();
+            let start = chars.len().saturating_sub(4_000);
+            let tail: String = chars[start..].iter().collect();
+            Some(format!(
+                "<test-results>\nThe configured test command `{cmd}` FAILED — fix the failures before \
+                 continuing or claiming done:\n\n{tail}\n</test-results>"
+            ))
+        }
+        // Success / spawn error / timeout ⇒ fail open (no block).
+        _ => None,
+    }
+}
+
 /// Render a `<workspace-roots>` system-prompt block listing the additional
 /// workspace roots the agent may operate across (cline multi-root workspaces).
 /// Empty `roots` ⇒ empty string, leaving the assembled prompt byte-identical.
@@ -3696,6 +3728,9 @@ async fn run_loop_inner(
     // each turn. Intra-prompt only (resets per user prompt) — `/goal` covers the
     // cross-prompt objective.
     let mut todos_block = String::new();
+    // Opt-in post-edit test results (config `[post_edit] auto_test=true` +
+    // `test_command`). Empty unless the user opted in AND the suite failed.
+    let mut test_block = String::new();
 
     // Task 1 (agentgrep exposure-truncation). Already-seen `(file, line)`
     // regions accumulated across this `run_loop` from prior `content`-mode
@@ -3900,6 +3935,7 @@ async fn run_loop_inner(
                 &todos_block,
                 &lsp_diag_block,
                 &compile_check_block,
+                &test_block,
                 &swarm_notices_block,
                 &bg_results_block,
             ] {
@@ -5552,6 +5588,18 @@ async fn run_loop_inner(
             compile_check_block = crate::postcheck::check_block(&lsp_edited_paths)
                 .await
                 .unwrap_or_default();
+        }
+        // Opt-in post-edit test run. Default-off (auto_test defaults false), so it
+        // adds NO latency unless the user explicitly configured it — they then
+        // accept their suite's cost. Failures are fed back like the other gates.
+        if !lsp_edited_paths.is_empty() {
+            if let Some(cfg) = opts.post_edit.as_deref() {
+                if cfg.auto_test {
+                    if let Some(cmd) = cfg.test_command.as_deref() {
+                        test_block = run_post_edit_test(cmd).await.unwrap_or_default();
+                    }
+                }
+            }
         }
     }
     // Task 4 / Stage C5: the loop exhausted its `max_turns` budget without the
