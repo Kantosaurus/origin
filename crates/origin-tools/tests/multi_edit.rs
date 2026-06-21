@@ -24,7 +24,7 @@ fn applies_edits_in_order_atomically() {
                 replace_all: false,
             },
         ],
-    })
+    }, None)
     .unwrap();
     assert_eq!(out["ok"], true);
     assert_eq!(out["applied"], 2);
@@ -50,7 +50,7 @@ fn failure_mid_sequence_does_not_partially_write() {
                 replace_all: false,
             },
         ],
-    })
+    }, None)
     .unwrap_err();
     assert_eq!(err.reason, "no_match");
     // The no_match must be recoverable so the harness retries instead of aborting.
@@ -77,7 +77,7 @@ fn whitespace_drift_falls_back_per_edit() {
                 replace_all: false,
             },
         ],
-    })
+    }, None)
     .unwrap();
     assert_eq!(
         fs::read_to_string(&p).unwrap(),
@@ -104,7 +104,7 @@ fn crlf_preserved_across_multiple_edits() {
                 replace_all: false,
             },
         ],
-    })
+    }, None)
     .unwrap();
     assert_eq!(fs::read(&p).unwrap(), b"A\r\nB\r\nc\r\n");
 }

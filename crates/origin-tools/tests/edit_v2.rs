@@ -15,7 +15,7 @@ fn single_replacement_returns_hunk() {
         old_string: "foo".into(),
         new_string: "bar".into(),
         replace_all: false,
-    })
+    }, None)
     .unwrap();
     assert_eq!(out["ok"], true);
     assert_eq!(out["hunks"][0]["before"].as_str().unwrap().contains("foo"), true);
@@ -34,7 +34,7 @@ fn ambiguous_match_without_replace_all_errors() {
         old_string: "foo".into(),
         new_string: "bar".into(),
         replace_all: false,
-    })
+    }, None)
     .unwrap_err();
     assert_eq!(err.class, origin_tools::ErrClass::Edit);
     assert_eq!(err.reason, "ambiguous");
@@ -50,7 +50,7 @@ fn replace_all_replaces_every_occurrence() {
         old_string: "foo".into(),
         new_string: "bar".into(),
         replace_all: true,
-    })
+    }, None)
     .unwrap();
     assert_eq!(fs::read_to_string(&p).unwrap(), "bar bar bar\n");
 }
@@ -65,9 +65,44 @@ fn no_match_errors_with_edit_no_match() {
         old_string: "missing".into(),
         new_string: "x".into(),
         replace_all: false,
-    })
+    }, None)
     .unwrap_err();
     assert_eq!(err.reason, "no_match");
+}
+
+#[test]
+fn edit_refuses_a_file_not_read_this_session() {
+    use origin_tools::builtins::write::WriteGuard;
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("a.rs");
+    fs::write(&p, "fn foo() {}\n").unwrap();
+    let guard = WriteGuard::default();
+    // Never Read ⇒ refuse (recoverable), so old_string can't be hallucinated.
+    let err = edit_v2(
+        EditArgs {
+            file_path: p.to_string_lossy().into_owned(),
+            old_string: "foo".into(),
+            new_string: "bar".into(),
+            replace_all: false,
+        },
+        Some(&guard),
+    )
+    .unwrap_err();
+    assert_eq!(err.reason, "read_required");
+    assert!(err.recoverable);
+    // After a Read it is permitted.
+    guard.note_read(p.to_string_lossy().as_ref());
+    edit_v2(
+        EditArgs {
+            file_path: p.to_string_lossy().into_owned(),
+            old_string: "foo".into(),
+            new_string: "bar".into(),
+            replace_all: false,
+        },
+        Some(&guard),
+    )
+    .unwrap();
+    assert_eq!(fs::read_to_string(&p).unwrap(), "fn bar() {}\n");
 }
 
 #[test]
@@ -83,7 +118,7 @@ fn whitespace_drift_falls_back_to_a_unique_match() {
         old_string: "\tlet x = 1; ".into(),
         new_string: "    let x = 42;".into(),
         replace_all: false,
-    })
+    }, None)
     .unwrap();
     assert_eq!(out["ok"], true);
     assert_eq!(fs::read_to_string(&p).unwrap(), "fn main() {\n    let x = 42;\n}\n");
@@ -102,7 +137,7 @@ fn no_match_hint_names_the_whitespace_only_near_miss() {
         old_string: "let total = a+b;".into(), // operator spacing differs ⇒ genuine miss
         new_string: "x".into(),
         replace_all: false,
-    })
+    }, None)
     .unwrap_err();
     assert_eq!(err.reason, "no_match");
 }

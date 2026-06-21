@@ -2,6 +2,7 @@
 //! `Edit` v2 — find-and-replace with CRLF safety, hunk return, `replace_all`.
 
 use crate::builtins::editmatch;
+use crate::builtins::write::WriteGuard;
 use crate::error::{ErrClass, ToolError};
 use crate::text_fmt;
 use crate::{SideEffects, Tier, Urgency};
@@ -25,7 +26,7 @@ pub struct EditArgs {
 /// Returns `ToolError(edit.no_match | edit.ambiguous | io.*)`.
 #[allow(clippy::module_name_repetitions)]
 #[allow(clippy::needless_pass_by_value)]
-pub fn edit_v2(args: EditArgs) -> Result<Value, ToolError> {
+pub fn edit_v2(args: EditArgs, guard: Option<&WriteGuard>) -> Result<Value, ToolError> {
     // An empty needle matches between every character; `str::replace("", ..)`
     // would splice `new_string` at every position, corrupting the file.
     if args.old_string.is_empty() {
@@ -36,6 +37,20 @@ pub fn edit_v2(args: EditArgs) -> Result<Value, ToolError> {
         )
         .recoverable(true)
         .hint("provide the exact text to replace"));
+    }
+    // Read-before-edit guard (mirrors Write): refuse to edit a file the model has
+    // not Read this session, so `old_string` reflects observed content rather than
+    // a hallucinated mental model. `None` (tests/headless) ⇒ no guard.
+    if let Some(g) = guard {
+        if !g.has_read(&args.file_path) {
+            return Err(ToolError::new(
+                ErrClass::Edit,
+                "read_required",
+                format!("refusing to Edit '{}' that has not been Read this session", args.file_path),
+            )
+            .recoverable(true)
+            .hint("call Read on this file first, then re-Edit"));
+        }
     }
     let bytes = std::fs::read(&args.file_path)
         .map_err(|e| ToolError::new(ErrClass::Io, "not_found", format!("{}: {e}", args.file_path)))?;

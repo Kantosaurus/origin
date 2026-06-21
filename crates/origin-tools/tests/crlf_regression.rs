@@ -21,7 +21,7 @@ fn edit_lf_needle_against_crlf_file_succeeds() {
         old_string: "foo".into(),
         new_string: "bar".into(),
         replace_all: false,
-    })
+    }, None)
     .unwrap();
     assert_eq!(out["ok"], true);
     let bytes = fs::read(&p).unwrap();
@@ -38,7 +38,7 @@ fn edit_lf_needle_against_cr_only_file_succeeds() {
         old_string: "foo".into(),
         new_string: "bar".into(),
         replace_all: false,
-    })
+    }, None)
     .unwrap();
     assert_eq!(fs::read(&p).unwrap(), b"line1\rbar\rline3\r");
 }
@@ -53,7 +53,7 @@ fn edit_preserves_mixed_eol_byte_for_byte() {
         old_string: "foo".into(),
         new_string: "bar".into(),
         replace_all: false,
-    })
+    }, None)
     .unwrap();
     assert_eq!(fs::read(&p).unwrap(), b"a\r\nb\nbar\r\nc\r");
 }
@@ -68,7 +68,7 @@ fn write_preserves_eol_when_appending_via_edit() {
         old_string: "b".into(),
         new_string: "b\nINSERTED".into(),
         replace_all: false,
-    })
+    }, None)
     .unwrap();
     // Inserted line inherits CRLF from preceding line.
     assert_eq!(fs::read(&p).unwrap(), b"a\r\nb\r\nINSERTED\r\n");

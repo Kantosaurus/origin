@@ -2,6 +2,7 @@
 //! `MultiEdit` — apply a list of edit operations to one file, atomically.
 
 use crate::builtins::editmatch;
+use crate::builtins::write::WriteGuard;
 use crate::error::{ErrClass, ToolError};
 use crate::text_fmt;
 use crate::{SideEffects, Tier, Urgency};
@@ -23,7 +24,20 @@ pub struct MultiEditArgs {
 
 /// # Errors
 /// `edit.no_match | edit.ambiguous | io.*`
-pub fn multi_edit(args: &MultiEditArgs) -> Result<Value, ToolError> {
+pub fn multi_edit(args: &MultiEditArgs, guard: Option<&WriteGuard>) -> Result<Value, ToolError> {
+    // Read-before-edit guard (mirrors Write/Edit): refuse to edit a file not Read
+    // this session. `None` ⇒ no guard (tests/headless).
+    if let Some(g) = guard {
+        if !g.has_read(&args.file_path) {
+            return Err(ToolError::new(
+                ErrClass::Edit,
+                "read_required",
+                format!("refusing to MultiEdit '{}' that has not been Read this session", args.file_path),
+            )
+            .recoverable(true)
+            .hint("call Read on this file first, then re-MultiEdit"));
+        }
+    }
     let bytes = std::fs::read(&args.file_path)
         .map_err(|e| ToolError::new(ErrClass::Io, "not_found", format!("{}: {e}", args.file_path)))?;
     let det = text_fmt::detect(&bytes);

@@ -6059,7 +6059,7 @@ async fn dispatch_tool(
                 replace_all: args.get("replace_all").and_then(Value::as_bool).unwrap_or(false),
             };
             let fmt_path = args.file_path.clone();
-            let res = origin_tools::builtins::edit::edit_v2(args)
+            let res = origin_tools::builtins::edit::edit_v2(args, write_guard.map(AsRef::as_ref))
                 .map(|v| serde_json::to_string(&v).expect("BUG: EditResult always serializes"))
                 .map_err(|e| LoopError::ToolFailure(e.display_message()));
             if res.is_ok() {
@@ -6099,7 +6099,7 @@ async fn dispatch_tool(
                     .to_string(),
                 edits,
             };
-            let res = origin_tools::builtins::multi_edit::multi_edit(&margs)
+            let res = origin_tools::builtins::multi_edit::multi_edit(&margs, write_guard.map(AsRef::as_ref))
                 .map(|v| serde_json::to_string(&v).expect("BUG: MultiEditResult always serializes"))
                 .map_err(|e| LoopError::ToolFailure(e.display_message()));
             if res.is_ok() {
