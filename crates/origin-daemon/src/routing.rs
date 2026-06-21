@@ -60,7 +60,16 @@ pub struct LiveRouter {
     /// Candidate models for the `Scored` strategy. The other strategies ignore
     /// candidates (they encode their own model set), so this is empty for them.
     candidates: Vec<ModelRef>,
+    /// When each model was marked exhausted. The pure `Router` has no clock, so a
+    /// `QuotaFallback` chain whose model is exhausted but never explicitly
+    /// succeeds again would skip it forever; this lets the live layer auto-clear
+    /// the flag after [`EXHAUSTION_COOLDOWN`].
+    exhausted_at: Mutex<std::collections::HashMap<String, (ModelRef, std::time::Instant)>>,
 }
+
+/// How long an exhausted model stays skipped before the live router gives it
+/// another chance (even without an explicit success to clear the flag).
+const EXHAUSTION_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl LiveRouter {
     /// Build a live router for an explicit [`Strategy`] (used by tests and the
@@ -70,6 +79,30 @@ impl LiveRouter {
         Self {
             inner: Mutex::new(Router::new(strategy)),
             candidates,
+            exhausted_at: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Auto-clear any model whose exhaustion is older than [`EXHAUSTION_COOLDOWN`].
+    /// Called before each pick so a `QuotaFallback` chain self-heals over time.
+    fn sweep_cooldowns(&self) {
+        let expired: Vec<ModelRef> = {
+            let Ok(e) = self.exhausted_at.lock() else { return };
+            e.values()
+                .filter(|(_, at)| at.elapsed() >= EXHAUSTION_COOLDOWN)
+                .map(|(m, _)| m.clone())
+                .collect()
+        };
+        if expired.is_empty() {
+            return;
+        }
+        if let Ok(mut r) = self.inner.lock() {
+            for m in &expired {
+                r.clear_exhausted(m);
+            }
+        }
+        if let Ok(mut e) = self.exhausted_at.lock() {
+            e.retain(|_, (_, at)| at.elapsed() < EXHAUSTION_COOLDOWN);
         }
     }
 
@@ -86,6 +119,7 @@ impl LiveRouter {
     /// Turn 1 is classified [`Phase::Plan`]; every later turn [`Phase::Edit`].
     #[must_use]
     pub fn choose_model_ref(&self, turn: u32) -> Option<ModelRef> {
+        self.sweep_cooldowns();
         let phase = if turn == 1 { Phase::Plan } else { Phase::Edit };
         self.inner.lock().ok()?.choose(phase, &self.candidates)
     }
@@ -110,11 +144,16 @@ impl LiveRouter {
     /// recovers from a rate-limit becomes eligible again (self-healing
     /// quota-fallback).
     pub fn record(&self, provider: &str, model: &str, latency_ms: u64, ok: bool) {
+        let m = ModelRef::new(provider, model);
         if let Ok(mut r) = self.inner.lock() {
-            let m = ModelRef::new(provider, model);
             r.record_result(&m, latency_ms, ok);
             if ok {
                 r.clear_exhausted(&m);
+            }
+        }
+        if ok {
+            if let Ok(mut e) = self.exhausted_at.lock() {
+                e.remove(&m.key());
             }
         }
     }
@@ -123,8 +162,12 @@ impl LiveRouter {
     /// skips it on the next turn / prompt. Cleared automatically by the next
     /// successful [`record`](Self::record) for that model.
     pub fn mark_exhausted(&self, provider: &str, model: &str) {
+        let m = ModelRef::new(provider, model);
         if let Ok(mut r) = self.inner.lock() {
-            r.mark_exhausted(&ModelRef::new(provider, model));
+            r.mark_exhausted(&m);
+        }
+        if let Ok(mut e) = self.exhausted_at.lock() {
+            e.insert(m.key(), (m, std::time::Instant::now()));
         }
     }
 

@@ -104,11 +104,18 @@ pub fn compact(input: &CompactionInput<'_>) -> CompactionOutput {
     }
     let transcript = input.transcript;
 
-    // Pick the oldest summarizable turns, as before.
+    // Pick the oldest summarizable turns — but NEVER turn 0. Turn 0 carries the
+    // user's original task statement / pinned goal; folding it into a summary
+    // makes the model drift from the objective over a long session. (Turn 0 is
+    // the first user prompt, never a tool_use, so the pairing closure below can't
+    // pull it back in.)
     let mut selected: Vec<usize> = Vec::with_capacity(COMPACT_OLDEST_N_TURNS);
     for (i, sum) in input.summaries.iter().enumerate().take(transcript.len()) {
         if selected.len() >= COMPACT_OLDEST_N_TURNS {
             break;
+        }
+        if i == 0 {
+            continue;
         }
         if sum.is_some() {
             selected.push(i);
@@ -441,15 +448,17 @@ mod tests {
             .await
             .expect("over-cap must compact");
         assert_eq!(out.len(), transcript.len());
-        // The oldest COMPACT_OLDEST_N_TURNS turns are folded into summaries.
-        for msg in out.iter().take(COMPACT_OLDEST_N_TURNS) {
+        // Turn 0 (the task statement) is NEVER compacted.
+        assert_eq!(out[0], transcript[0], "turn 0 must be preserved verbatim");
+        // The next COMPACT_OLDEST_N_TURNS turns (1..=N) are folded into summaries.
+        for msg in out.iter().skip(1).take(COMPACT_OLDEST_N_TURNS) {
             let Block::Text { text, .. } = &msg.blocks[0] else {
                 panic!("compacted block must be text");
             };
             assert!(text.starts_with("[compacted turn"));
         }
-        // Later turns are untouched.
-        for (i, original) in transcript.iter().enumerate().skip(COMPACT_OLDEST_N_TURNS) {
+        // Turns after the compacted window are untouched.
+        for (i, original) in transcript.iter().enumerate().skip(COMPACT_OLDEST_N_TURNS + 1) {
             assert_eq!(out[i], *original);
         }
     }
