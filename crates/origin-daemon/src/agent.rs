@@ -4041,7 +4041,17 @@ async fn run_loop_inner(
                                 })
                                 .await;
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs.into())).await;
+                        // Add bounded sub-second jitter so concurrent swarm
+                        // workers that all hit the same rate-limit don't retry in
+                        // lockstep (a synchronized thundering-herd second wave).
+                        let jitter_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| u64::from(d.subsec_nanos() % 1000));
+                        tokio::time::sleep(
+                            std::time::Duration::from_secs(sleep_secs.into())
+                                + std::time::Duration::from_millis(jitter_ms),
+                        )
+                        .await;
                         attempt += 1;
                     }
                     Err(LoopError::Provider(origin_provider::ProviderError::RateLimit {
@@ -4090,6 +4100,40 @@ async fn run_loop_inner(
                             last_retry_after_secs: retry_after_secs,
                             api_hint,
                         });
+                    }
+                    Err(LoopError::Provider(origin_provider::ProviderError::Transport(msg)))
+                        if attempt < MAX_PROVIDER_RETRIES =>
+                    {
+                        // Transient transport blip — connection reset/drop, DNS,
+                        // TLS handshake stall (common behind a MITM proxy). Back
+                        // off + retry instead of killing the turn, reusing the
+                        // rate-limit exponential floor + jitter.
+                        let exp_floor = 1u32 << (attempt + 1);
+                        let sleep_secs = exp_floor.clamp(1, MAX_RATE_LIMIT_SLEEP_SECS);
+                        tracing::warn!(attempt, sleep_secs, %msg, "provider transport error; backing off and retrying");
+                        if let Some(lr) = &opts.router {
+                            let failed_ms =
+                                u64::try_from(provider_call_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                            lr.record(turn_provider.name(), &turn_model, failed_ms, false);
+                        }
+                        if let Some(tx) = &opts.event_tx {
+                            let _ = tx
+                                .send(StreamEvent::ProviderBackoff {
+                                    retry_in_secs: sleep_secs,
+                                    attempt: attempt + 1,
+                                    max_attempts: MAX_PROVIDER_RETRIES + 1,
+                                })
+                                .await;
+                        }
+                        let jitter_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| u64::from(d.subsec_nanos() % 1000));
+                        tokio::time::sleep(
+                            std::time::Duration::from_secs(sleep_secs.into())
+                                + std::time::Duration::from_millis(jitter_ms),
+                        )
+                        .await;
+                        attempt += 1;
                     }
                     other => break other?,
                 }

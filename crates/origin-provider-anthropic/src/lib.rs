@@ -99,7 +99,7 @@ impl Anthropic {
         Self {
             auth: AuthKind::ApiKey(api_key.into()),
             base: base.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+            client: build_client(),
             cas: None,
             plan: None,
             oauth_session_id: String::new(),
@@ -127,7 +127,7 @@ impl Anthropic {
         Self {
             auth: AuthKind::OAuthBearer(token.into()),
             base: DEFAULT_BASE.to_string(),
-            client: reqwest::Client::new(),
+            client: build_client(),
             cas: None,
             plan: None,
             oauth_session_id: session_id,
@@ -468,6 +468,19 @@ fn status_is_transient(status: StatusCode) -> bool {
 /// Anthropic `error` event (overloaded/rate-limit/api) as retryable `RateLimit`
 /// so the daemon's backoff loop retries instead of killing the turn on a
 /// transient blip mid-stream.
+/// Shared HTTP client with bounded timeouts. A `connect_timeout` stops a hung
+/// TCP/TLS handshake (common behind a MITM proxy) from stalling a turn forever;
+/// a per-read INACTIVITY timeout (`read_timeout`, not a total deadline) lets a
+/// wedged stream eventually err — and be retried — without killing a long but
+/// live stream. Falls back to the default client if the builder ever fails.
+fn build_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 #[allow(clippy::needless_pass_by_value)] // consumed by `map_err`
 fn streaming_err_to_provider(e: crate::streaming::StreamingError) -> ProviderError {
     if let crate::streaming::StreamingError::MidStream { kind, message } = &e {
