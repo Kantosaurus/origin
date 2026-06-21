@@ -2486,13 +2486,32 @@ async fn poll_for_interrupt(
             let mut g = conn.lock().await;
             tokio::time::timeout(std::time::Duration::ZERO, g.read_frame_body()).await
         };
-        let Ok(Ok(body)) = peek else {
-            // Nothing waiting (timed out) or the connection erred — back off
-            // briefly and poll again. A real connection error surfaces on the
-            // outer loop's next read; here we just keep watching for an
-            // interrupt for the life of the turn.
-            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-            continue;
+        let body = match peek {
+            Ok(Ok(body)) => body,
+            // Timeout: nothing buffered yet — keep watching for the life of the turn.
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                continue;
+            }
+            Ok(Err(e)) => {
+                use std::io::ErrorKind;
+                if matches!(
+                    e.kind(),
+                    ErrorKind::UnexpectedEof
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                ) {
+                    // The client is GONE. Spinning here forever would orphan the
+                    // in-flight turn (no teardown, no cleanup), so treat a dead
+                    // client as an interrupt and let the turn tear down.
+                    tracing::warn!(error = %e, "poll_for_interrupt: client disconnected; treating as interrupt");
+                    return InterruptOutcome::UserInterrupt;
+                }
+                // WouldBlock / transient: nothing actionable buffered — back off.
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                continue;
+            }
         };
         // Mirror the outer loop's decode path: ClientMessage envelope first,
         // legacy raw PromptRequest fallback.

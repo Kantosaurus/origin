@@ -3509,11 +3509,24 @@ async fn run_loop_inner(
                 )
             })
             .map(|g| {
+                // Carry the PRIOR iteration's self-reported remaining work / blocker
+                // forward so the model has continuity across the goal loop instead
+                // of re-deriving where it left off each turn.
+                let carry = match &g.last_status_tag {
+                    Some(origin_goal::TagOutcome::InProgress { what_remains }) => {
+                        format!("Still remaining from the last iteration: {what_remains}\n\n")
+                    }
+                    Some(origin_goal::TagOutcome::Blocked { why }) => {
+                        format!("You reported BLOCKED last iteration: {why}\n\n")
+                    }
+                    _ => String::new(),
+                };
                 format!(
                     "<origin-goal>\nACTIVE GOAL — iteration {iter}/{max}, tokens spent {tok}/{budget}.\n\
                      \n\
                      Condition: {cond}\n\
                      \n\
+                     {carry}\
                      You MUST end every response with exactly one <goal-status> tag:\n  \
                      <goal-status state=\"met|in_progress|blocked\"><reason>...</reason></goal-status>\n\
                      \n\
@@ -3771,12 +3784,21 @@ async fn run_loop_inner(
                     }
                     None => crate::provider_factory::build_provider_for(&pick.provider, &pick.model).await,
                 };
-                match built {
-                    Some(p) => {
-                        rebuilt = Some(p);
-                        pick.model
-                    }
-                    None => session.model.clone(),
+                if let Some(p) = built {
+                    rebuilt = Some(p);
+                    pick.model
+                } else {
+                    // The router wanted a different provider but it couldn't be
+                    // built (missing creds / unknown id / no factory). Falling
+                    // back to the active provider+model silently would run the
+                    // turn on a model the router did NOT choose — surface it.
+                    tracing::warn!(
+                        wanted_provider = %pick.provider,
+                        wanted_model = %pick.model,
+                        fallback_model = %session.model,
+                        "router cross-provider pick could not be built; falling back to the active provider"
+                    );
+                    session.model.clone()
                 }
             }
             None => session.model.clone(),
@@ -4417,17 +4439,25 @@ async fn run_loop_inner(
                 });
                 continue;
             };
-            let args: Value = match serde_json::from_slice(&input_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(tool = %name, error = %e, "malformed tool args; returning error to model");
-                    tool_results.push(Block::ToolResult {
-                        tool_use_id: id,
-                        handle: None,
-                        inline: Some(format!("Error: malformed args: {e}").into_bytes()),
-                        cache_marker: None,
-                    });
-                    continue;
+            let args: Value = if input_bytes.is_empty() {
+                // A no-argument tool call (OpenAI sends arguments:"") or a stream
+                // cut after ToolUseStart but before any input delta arrives as
+                // empty bytes. Treat that as `{}` rather than reporting a spurious
+                // "malformed args: EOF" — a zero-arg tool is legitimate.
+                Value::Object(serde_json::Map::new())
+            } else {
+                match serde_json::from_slice(&input_bytes) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(tool = %name, error = %e, "malformed tool args; returning error to model");
+                        tool_results.push(Block::ToolResult {
+                            tool_use_id: id,
+                            handle: None,
+                            inline: Some(format!("Error: malformed args: {e}").into_bytes()),
+                            cache_marker: None,
+                        });
+                        continue;
+                    }
                 }
             };
             let preview = args.to_string();

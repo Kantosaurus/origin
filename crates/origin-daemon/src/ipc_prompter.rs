@@ -64,6 +64,12 @@ impl PermissionRegistry {
         self.pending.lock().remove(&id);
     }
 
+    /// Number of in-flight reservations (test-only leak check).
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.pending.lock().len()
+    }
+
     /// Deliver a client decision, correlated by `id`. Unknown ids (a stray or
     /// late decision, or one whose `ask` already gave up) are ignored, so a
     /// misbehaving client can never panic the daemon.
@@ -134,6 +140,31 @@ impl ChoiceRegistry {
     }
 }
 
+/// Removes a [`PermissionRegistry`] reservation on drop — so a turn cancelled
+/// mid-ask (the `ask` future dropped while parked on `rx`) cannot leak its
+/// `pending` entry for the daemon's lifetime. On the happy path `resolve`
+/// already removed it, so the drop-time `cancel` is a no-op.
+struct PermissionCancelGuard<'a> {
+    reg: &'a PermissionRegistry,
+    id: u64,
+}
+impl Drop for PermissionCancelGuard<'_> {
+    fn drop(&mut self) {
+        self.reg.cancel(self.id);
+    }
+}
+
+/// [`ChoiceRegistry`] analogue of [`PermissionCancelGuard`].
+struct ChoiceCancelGuard<'a> {
+    reg: &'a ChoiceRegistry,
+    id: &'a str,
+}
+impl Drop for ChoiceCancelGuard<'_> {
+    fn drop(&mut self) {
+        self.reg.cancel(self.id);
+    }
+}
+
 /// Per-turn prompter: emits asks over `event_tx` and parks on the shared
 /// [`PermissionRegistry`] until the decision is resolved from any connection.
 pub struct IpcPrompter {
@@ -157,14 +188,17 @@ impl IpcPrompter {
     /// the round-trip is unit-testable without constructing a full `ToolMeta`).
     async fn ask_named(&self, tool: &str, args_preview: &str) -> bool {
         let (id, rx) = self.registry.register();
+        let _guard = PermissionCancelGuard {
+            reg: &self.registry,
+            id,
+        };
         let ask = StreamEvent::PermissionAsk {
             id,
             tool: tool.to_string(),
             args_preview: args_preview.to_string(),
         };
         if self.event_tx.send(ask).await.is_err() {
-            // Client/relay gone ⇒ cannot ask ⇒ secure default deny. Clean up.
-            self.registry.cancel(id);
+            // Client/relay gone ⇒ cannot ask ⇒ secure default deny (guard cleans up).
             return false;
         }
         // Block until the client answers; a dropped sender resolves to deny.
@@ -212,6 +246,10 @@ impl IpcChoicePrompter {
         allow_custom: bool,
     ) -> ChoiceOutcome {
         let (id, rx) = self.registry.register();
+        let _guard = ChoiceCancelGuard {
+            reg: &self.registry,
+            id: &id,
+        };
         let ask = StreamEvent::ChoiceAsk {
             id: id.clone(),
             question,
@@ -220,8 +258,7 @@ impl IpcChoicePrompter {
             allow_custom,
         };
         if self.event_tx.send(ask).await.is_err() {
-            // Client/relay gone ⇒ cannot ask ⇒ secure default skip. Clean up.
-            self.registry.cancel(&id);
+            // Client/relay gone ⇒ cannot ask ⇒ secure default skip (guard cleans up).
             return (Vec::new(), None);
         }
         // Block until the client answers; a dropped sender resolves to skip.
@@ -306,6 +343,30 @@ mod tests {
     fn resolve_unknown_id_is_noop() {
         let registry = PermissionRegistry::new();
         registry.resolve(999, true); // must not panic
+    }
+
+    #[tokio::test]
+    async fn dropped_ask_does_not_leak_its_reservation() {
+        // A turn cancelled mid-ask (Ctrl+C drops the `ask` future while it parks
+        // on `rx`) must not leak the registry reservation for the daemon's life.
+        let (tx, mut rx) = mpsc::channel(4);
+        let registry = Arc::new(PermissionRegistry::new());
+        let prompter = IpcPrompter::new(tx, Arc::clone(&registry));
+        {
+            let fut = prompter.ask_named("Bash", "x");
+            tokio::pin!(fut);
+            // Poll the ask far enough to register + emit, then DROP it (the rx
+            // branch wins, the never-resolved `fut` is dropped at scope end).
+            tokio::select! {
+                _ = &mut fut => panic!("ask must not resolve without a decision"),
+                ev = rx.recv() => { let _ = ev.expect("ask emitted"); }
+            }
+        }
+        assert_eq!(
+            registry.pending_len(),
+            0,
+            "a dropped (cancelled) ask must clean up its reservation"
+        );
     }
 
     // ── ChoiceRegistry / IpcChoicePrompter (ask_user pause-await) ────────────
