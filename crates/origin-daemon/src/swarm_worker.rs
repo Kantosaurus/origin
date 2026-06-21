@@ -376,21 +376,30 @@ async fn run_worker(
         None => run.await,
     };
     let report = match loop_result {
-        Ok(summary) => CompletionReport {
-            goal,
-            status: ReportStatus::Completed,
-            plan_updates: Vec::new(),
-            files_touched: Vec::new(),
-            decisions: Vec::new(),
-            follow_ups: Vec::new(),
-            transcript_handle: [0; 32],
-            usage: Usage {
-                input_tokens: summary.input_tokens,
-                output_tokens: summary.output_tokens,
-                tool_calls: summary.turns,
-            },
-            detail: None,
-        },
+        Ok(summary) => {
+            // Surface the worker's actual final message so the orchestrator gets
+            // real content instead of a context-free "Completed". Truncated so a
+            // chatty worker can't blow the orchestrator's context.
+            let detail = {
+                let t = summary.assistant_text.trim();
+                (!t.is_empty()).then(|| t.chars().take(4000).collect::<String>())
+            };
+            CompletionReport {
+                goal,
+                status: ReportStatus::Completed,
+                plan_updates: Vec::new(),
+                files_touched: Vec::new(),
+                decisions: Vec::new(),
+                follow_ups: Vec::new(),
+                transcript_handle: [0; 32],
+                usage: Usage {
+                    input_tokens: summary.input_tokens,
+                    output_tokens: summary.output_tokens,
+                    tool_calls: summary.turns,
+                },
+                detail,
+            }
+        }
         Err(e) => {
             tracing::warn!(error = %e, goal = %goal, "swarm worker: run_loop failed");
             CompletionReport {
