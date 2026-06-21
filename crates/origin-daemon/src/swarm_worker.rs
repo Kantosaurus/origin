@@ -337,6 +337,9 @@ async fn run_worker(
         // old `SectionId`→band `PrefixLedger` inheritance seam, which the live
         // wire path never consumed and which has now been removed.)
         plan: Some(plan.fork_shared_handle_bands()),
+        // Match the orchestrator's reasoning effort so the workers that do the
+        // actual editing are not silently downgraded (anthropic ⇒ Ultracode).
+        effort: worker_effort(provider.name()),
         ..Default::default()
     };
 
@@ -406,12 +409,32 @@ async fn run_worker(
     Ok(report)
 }
 
+/// Reasoning effort for a sub-agent turn. Workers do the actual editing, so a
+/// silent downgrade tanks their accuracy: match the orchestrator's default
+/// (anthropic ⇒ Ultracode = max reasoning + always-on swarm). Mirrors the main
+/// loop's `resolve_turn_effort` for the no-explicit-effort case; non-anthropic
+/// providers stay `None` (wire byte-identical).
+fn worker_effort(provider_name: &str) -> Option<origin_provider::ReasoningEffort> {
+    (provider_name == "anthropic").then_some(origin_provider::ReasoningEffort::Ultracode)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::AllowList;
+    use super::{worker_effort, AllowList};
     use origin_permission::prompt::Prompter;
+    use origin_provider::ReasoningEffort;
     use origin_tools::{registry_iter, ToolMeta};
+
+    #[test]
+    fn sub_agents_inherit_ultracode_effort_on_anthropic() {
+        assert_eq!(
+            worker_effort("anthropic"),
+            Some(ReasoningEffort::Ultracode),
+            "workers must not be silently downgraded below the orchestrator's effort"
+        );
+        assert_eq!(worker_effort("openai"), None, "non-anthropic stays wire byte-identical");
+    }
 
     fn meta(name: &str) -> &'static ToolMeta {
         registry_iter()

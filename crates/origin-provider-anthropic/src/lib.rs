@@ -311,23 +311,7 @@ impl Provider for Anthropic {
                 Ok(decode_response(wire))
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(ProviderError::Auth),
-            StatusCode::TOO_MANY_REQUESTS => {
-                let retry = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .unwrap_or(1);
-                let body = resp.text().await.unwrap_or_default();
-                let message = serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|v| v.get("error")?.get("message")?.as_str().map(String::from))
-                    .unwrap_or_default();
-                Err(ProviderError::RateLimit {
-                    retry_after_secs: retry,
-                    message,
-                })
-            }
+            s if status_is_transient(s) => Err(transient_rate_limit(resp).await),
             s => {
                 let body = resp.text().await.unwrap_or_default();
                 Err(ProviderError::Api(format!("status {s}: {body}")))
@@ -435,23 +419,7 @@ impl Provider for Anthropic {
         match resp.status() {
             StatusCode::OK => {}
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => return Err(ProviderError::Auth),
-            StatusCode::TOO_MANY_REQUESTS => {
-                let retry = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .unwrap_or(1);
-                let body = resp.text().await.unwrap_or_default();
-                let message = serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|v| v.get("error")?.get("message")?.as_str().map(String::from))
-                    .unwrap_or_default();
-                return Err(ProviderError::RateLimit {
-                    retry_after_secs: retry,
-                    message,
-                });
-            }
+            s if status_is_transient(s) => return Err(transient_rate_limit(resp).await),
             s => {
                 let text = resp.text().await.unwrap_or_default();
                 return Err(ProviderError::Api(format!("status {s}: {text}")));
@@ -483,6 +451,57 @@ impl Provider for Anthropic {
             .map_err(|e| ProviderError::Api(e.to_string()))?;
         ring.close();
         Ok(())
+    }
+}
+
+/// True for HTTP statuses worth retrying with backoff rather than killing the
+/// turn. Mapped to [`ProviderError::RateLimit`] so the daemon's existing
+/// retry/backoff loop handles them; everything else stays fatal
+/// [`ProviderError::Api`].
+fn status_is_transient(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS
+        || status.as_u16() == 529 // Anthropic `overloaded_error`
+        || status.is_server_error() // any 5xx
+}
+
+/// Build a [`ProviderError::RateLimit`] from a transient response: honor
+/// `retry-after` (else 1s) and surface the API's error message.
+async fn transient_rate_limit(resp: reqwest::Response) -> ProviderError {
+    let retry = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1);
+    let body = resp.text().await.unwrap_or_default();
+    let message = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("error")?.get("message")?.as_str().map(String::from))
+        .unwrap_or_default();
+    ProviderError::RateLimit {
+        retry_after_secs: retry,
+        message,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod transient_tests {
+    use super::status_is_transient;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn retries_429_529_and_5xx_but_not_4xx() {
+        assert!(status_is_transient(StatusCode::TOO_MANY_REQUESTS), "429 is retryable");
+        assert!(
+            status_is_transient(StatusCode::from_u16(529).unwrap()),
+            "529 overloaded_error is retryable (the common turn-killer)"
+        );
+        assert!(status_is_transient(StatusCode::INTERNAL_SERVER_ERROR), "500 retryable");
+        assert!(status_is_transient(StatusCode::BAD_GATEWAY), "502 retryable");
+        assert!(status_is_transient(StatusCode::SERVICE_UNAVAILABLE), "503 retryable");
+        assert!(!status_is_transient(StatusCode::BAD_REQUEST), "400 stays fatal");
+        assert!(!status_is_transient(StatusCode::NOT_FOUND), "404 stays fatal");
     }
 }
 

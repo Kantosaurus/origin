@@ -316,9 +316,12 @@ topological-sort source of truth), then maps each layer's ids back to
 
 ### 2. Per-layer concurrent dispatch
 
-`run_workflow(workflow, coordinator, catalog) -> Result<RunReport, RunError>`
-(`workflow_runner.rs:190`) is the spawn-all-then-await turn shape — exactly what
-the `Task` tool uses (`task_spawn` + `task_await`):
+`run_workflow(workflow, coordinator, catalog, event_tx) -> Result<RunReport,
+RunError>` (`workflow_runner.rs`) is the spawn-all-then-await turn shape — exactly
+what the `Task` tool uses (`task_spawn` + `task_await`). The optional `event_tx`
+emits a `"spawned"` + terminal `SwarmWorker` event per worker (same hex id) so
+the live swarm side panel lights up for workflow fan-outs the same as for `Task`;
+`None` (headless) emits nothing:
 
 ```text
 for each dependency layer (in order):

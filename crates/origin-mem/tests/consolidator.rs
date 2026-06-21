@@ -160,3 +160,57 @@ fn consolidator_uses_stable_memory_id_not_positional_index() {
     assert_eq!(loser, id_a, "older row (by real MemoryId) is the loser");
     assert_eq!(winner, id_b, "newer row (by real MemoryId) is the winner");
 }
+
+/// Regression: a detected supersede must be WRITTEN BACK to the store, not just
+/// reported. Before the fix `run_pass` only collected proposals, so
+/// `superseded_by` stayed NULL forever and the default `drop_superseded` search
+/// path kept recalling the stale duplicate alongside (or instead of) the newer
+/// memory.
+#[test]
+fn supersede_is_persisted_so_stale_dupes_are_dropped() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let sql = Arc::new(origin_store::Store::open(tmp.path().join("o.db")).expect("sql"));
+    let cas = Arc::new(
+        origin_cas::Store::open(origin_cas::StoreConfig {
+            root: tmp.path().join("cas"),
+            hot_capacity: 16,
+            warm_pack_target_bytes: 64 * 1024,
+            cold_zstd_level: 1,
+        })
+        .expect("cas"),
+    );
+    let store = Arc::new(MemoryStore::new(Arc::clone(&sql), Arc::clone(&cas)));
+    store.install_quantizer(&degenerate_quantizer()).expect("install");
+
+    let t0: i64 = 1_700_000_000_000;
+    let id_a = store
+        .save_at("user is a rust engineer", &unit_vec(0.0), &[], t0)
+        .expect("save");
+    let id_b = store
+        .save_at(
+            "user is a senior rust engineer",
+            &unit_vec(0.001),
+            &[],
+            t0 + 1_000,
+        )
+        .expect("save");
+
+    let mut idx = MemIndex::new();
+    idx.insert(memory_id_to_u64(&id_a), &unit_vec(0.0)).expect("ins");
+    idx.insert(memory_id_to_u64(&id_b), &unit_vec(0.001))
+        .expect("ins");
+    let index = Arc::new(RwLock::new(idx));
+    let cons = Consolidator::new(Arc::clone(&store), index);
+
+    cons.run_pass(32).expect("pass");
+
+    // The proposal must be persisted: the older near-duplicate is now marked
+    // superseded by the newer one, so a `drop_superseded` search elides it.
+    let after = store.iter_all().expect("iter_all");
+    let older = after.iter().find(|r| r.id == id_a).expect("id_a present");
+    assert_eq!(
+        older.superseded_by,
+        Some(id_b),
+        "the older near-duplicate must be marked superseded in the store"
+    );
+}

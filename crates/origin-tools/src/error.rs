@@ -67,6 +67,18 @@ impl ToolError {
         self
     }
 
+    /// Human-facing message for the model: the message plus the actionable
+    /// `hint` when present. The dispatch layer feeds this back as the
+    /// `tool_result` so the model can self-correct (e.g. "widen the needle")
+    /// instead of blindly retrying the same wrong input.
+    #[must_use]
+    pub fn display_message(&self) -> String {
+        self.hint.as_ref().map_or_else(
+            || self.message.clone(),
+            |h| format!("{} (hint: {h})", self.message),
+        )
+    }
+
     #[must_use]
     pub fn to_json(&self) -> Value {
         let mut obj = json!({
@@ -95,6 +107,23 @@ mod tests {
         assert_eq!(json["message"], "string not found");
         assert_eq!(json["recoverable"], true);
         assert_eq!(json["hint"], "widen the context");
+    }
+
+    #[test]
+    fn display_message_appends_hint_so_the_model_can_self_correct() {
+        let with_hint = ToolError::new(ErrClass::Edit, "no_match", "string not found")
+            .hint("widen the needle or add surrounding context");
+        assert_eq!(
+            with_hint.display_message(),
+            "string not found (hint: widen the needle or add surrounding context)",
+            "the actionable hint must reach the model, not be dropped"
+        );
+        let without = ToolError::new(ErrClass::Edit, "no_match", "string not found");
+        assert_eq!(
+            without.display_message(),
+            "string not found",
+            "no hint ⇒ message is unchanged"
+        );
     }
 
     #[test]

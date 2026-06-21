@@ -165,8 +165,12 @@ impl Consolidator {
                 peers_touched += 1;
 
                 // ── Supersede proposal ───────────────────────────────────────
-                // If C is older than M, C is the loser (M supersedes C).
+                // If C is older than M, C is the loser (M supersedes C). Persist
+                // it so the default `drop_superseded` search path actually elides
+                // the stale duplicate — proposing without writing left
+                // `superseded_by` NULL forever and the dupe kept being recalled.
                 if record_c.created_at_ms < record_m.created_at_ms {
+                    self.store.mark_superseded(record_c.id, record_m.id)?;
                     supersedes_proposed.push((record_c.id, record_m.id));
                 }
 

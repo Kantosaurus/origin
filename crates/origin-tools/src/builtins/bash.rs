@@ -104,10 +104,16 @@ pub async fn bash_v2(args: BashArgs, sup: &Supervisor) -> Result<Value, ToolErro
 /// entire output every turn it stays in history.
 const STDOUT_BYTE_BUDGET: usize = 96_000;
 
-/// Cap `out` to [`STDOUT_BYTE_BUDGET`], preserving the head and the tail
-/// (command errors and exit summaries usually surface at the *end*) and noting
-/// the elided middle. Truncates on UTF-8 char boundaries so the JSON stays valid.
-fn cap_stdout(out: String) -> String {
+/// Cap `out` to [`STDOUT_BYTE_BUDGET`].
+///
+/// Preserves the head and the tail (command errors and exit summaries usually
+/// surface at the *end*) and notes the elided middle, truncating on UTF-8 char
+/// boundaries so the JSON stays valid. Public so the daemon's streaming Bash
+/// path (`run_bash_streaming`) shares the exact same budget — otherwise a chatty
+/// command floods the model's context with its full output every turn it stays
+/// in history.
+#[must_use]
+pub fn cap_stdout(out: String) -> String {
     if out.len() <= STDOUT_BYTE_BUDGET {
         return out;
     }

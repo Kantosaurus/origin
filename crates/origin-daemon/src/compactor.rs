@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Summary-backed compaction (P5.4).
 
+use origin_cas::{Hash, Store};
 use origin_core::types::{Block, Message};
 
 pub const DEFAULT_SOFT_CAP_BYTES: usize = 200 * 1024;
 pub const COMPACT_OLDEST_N_TURNS: usize = 4;
+
+/// Fallback charge for a handle-backed tool result when the CAS is unavailable
+/// or the handle missed: better to over-estimate than to charge the ~16-byte
+/// structural floor and let compaction never fire while the real request grows.
+const CAS_RESULT_FLOOR: usize = 8 * 1024;
 
 /// Estimate the byte footprint of an in-flight transcript.
 ///
@@ -16,7 +22,7 @@ pub const COMPACT_OLDEST_N_TURNS: usize = 4;
 /// ignores wire framing and prompt-cache markers — it only needs to be
 /// monotonic in transcript growth, not an exact token count.
 #[must_use]
-pub fn estimate_transcript_bytes(transcript: &[Message]) -> usize {
+pub fn estimate_transcript_bytes(transcript: &[Message], cas: Option<&Store>) -> usize {
     /// Fixed overhead charged per block so structural growth is never free.
     const PER_BLOCK_OVERHEAD: usize = 16;
     let mut total: usize = 0;
@@ -32,10 +38,15 @@ pub fn estimate_transcript_bytes(transcript: &[Message]) -> usize {
                     .saturating_add(name.len())
                     .saturating_add(input_json.len()),
                 Block::ToolResult {
-                    tool_use_id, inline, ..
-                } => tool_use_id
-                    .len()
-                    .saturating_add(inline.as_ref().map_or(0, Vec::len)),
+                    tool_use_id,
+                    handle,
+                    inline,
+                    ..
+                } => tool_use_id.len().saturating_add(tool_result_payload_bytes(
+                    handle.as_ref(),
+                    inline.as_ref(),
+                    cas,
+                )),
                 Block::Thinking { tokens, signature } => tokens
                     .len()
                     .saturating_add(signature.as_ref().map_or(0, String::len)),
@@ -44,6 +55,25 @@ pub fn estimate_transcript_bytes(transcript: &[Message]) -> usize {
         }
     }
     total
+}
+
+/// Bytes a tool result contributes to the in-flight request. Inline bytes are
+/// charged directly; a handle-backed result (`inline: None`) is charged its
+/// REAL CAS payload size because `expand_messages_for_wire` inlines that full
+/// payload at send time — charging the ~16-byte structural floor instead let a
+/// session of large reads/greps/build logs stay under the soft cap while the
+/// real request grew until it blew the model window (a hard 400).
+fn tool_result_payload_bytes(
+    handle: Option<&[u8; 32]>,
+    inline: Option<&Vec<u8>>,
+    cas: Option<&Store>,
+) -> usize {
+    if let Some(bytes) = inline {
+        return bytes.len();
+    }
+    let Some(h) = handle else { return 0 };
+    cas.and_then(|c| c.get(Hash::from_bytes(*h)).ok().flatten())
+        .map_or(CAS_RESULT_FLOOR, |b| b.len())
 }
 
 pub struct CompactionInput<'a> {
@@ -187,8 +217,9 @@ pub async fn maybe_compact_transcript(
     transcript: &[Message],
     summaries: &[Option<String>],
     soft_cap_bytes: usize,
+    cas: Option<&Store>,
 ) -> Option<Vec<Message>> {
-    maybe_compact_transcript_indexed(transcript, summaries, soft_cap_bytes)
+    maybe_compact_transcript_indexed(transcript, summaries, soft_cap_bytes, cas)
         .await
         .map(|o| o.transcript)
 }
@@ -204,8 +235,9 @@ pub async fn maybe_compact_transcript_indexed(
     transcript: &[Message],
     summaries: &[Option<String>],
     soft_cap_bytes: usize,
+    cas: Option<&Store>,
 ) -> Option<CompactionOutput> {
-    let current_bytes = estimate_transcript_bytes(transcript);
+    let current_bytes = estimate_transcript_bytes(transcript, cas);
     if current_bytes <= soft_cap_bytes {
         return None;
     }
@@ -305,7 +337,7 @@ mod tests {
         let mut summaries: Vec<Option<String>> = vec![None; transcript.len()];
         summaries[1] = Some("read a file".into()); // assistant turn only — tool turn (2) has none
 
-        let out = maybe_compact_transcript(&transcript, &summaries, 1)
+        let out = maybe_compact_transcript(&transcript, &summaries, 1, None)
             .await
             .expect("over-cap must compact");
         assert_eq!(
@@ -328,7 +360,7 @@ mod tests {
         }
         let summaries: Vec<Option<String>> = (0..transcript.len()).map(|i| Some(format!("s{i}"))).collect();
 
-        let out = maybe_compact_transcript(&transcript, &summaries, 1)
+        let out = maybe_compact_transcript(&transcript, &summaries, 1, None)
             .await
             .expect("over-cap must compact");
         assert_eq!(
@@ -339,12 +371,47 @@ mod tests {
     }
 
     #[test]
+    fn handle_backed_tool_results_are_charged_their_real_cas_size() {
+        // Regression: a handle-backed tool result (inline: None) carries its
+        // payload in CAS; `expand_messages_for_wire` inlines that full payload at
+        // send time. Charging the ~16-byte structural floor let big reads/greps
+        // stay under the soft cap while the real request blew the window. The
+        // estimate must reflect the real CAS size.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cas = Store::open(origin_cas::StoreConfig {
+            root: tmp.path().join("cas"),
+            hot_capacity: 16,
+            warm_pack_target_bytes: 64 * 1024,
+            cold_zstd_level: 1,
+        })
+        .expect("open cas");
+        let big = vec![b'x'; 50_000];
+        let h = cas.put(&big).expect("put");
+
+        let transcript = vec![Message {
+            role: Role::Tool,
+            blocks: vec![Block::ToolResult {
+                tool_use_id: "A".into(),
+                handle: Some(*h.as_bytes()),
+                inline: None,
+                cache_marker: None,
+            }],
+        }];
+
+        let est = estimate_transcript_bytes(&transcript, Some(&cas));
+        assert!(
+            est >= 50_000,
+            "handle-backed result must be charged its real CAS size (~50k), got {est}"
+        );
+    }
+
+    #[test]
     fn estimate_grows_monotonically_with_transcript() {
         let small = vec![user("hi")];
         let big = vec![user(&"x".repeat(10_000)), user("more")];
-        assert!(estimate_transcript_bytes(&big) > estimate_transcript_bytes(&small));
+        assert!(estimate_transcript_bytes(&big, None) > estimate_transcript_bytes(&small, None));
         // Every block carries at least the fixed overhead.
-        assert!(estimate_transcript_bytes(&small) >= "hi".len());
+        assert!(estimate_transcript_bytes(&small, None) >= "hi".len());
     }
 
     #[tokio::test]
@@ -352,7 +419,7 @@ mod tests {
         let transcript: Vec<Message> = (0..3).map(|i| user(&format!("turn {i}"))).collect();
         let summaries: Vec<Option<String>> = transcript.iter().map(|_| Some("s".into())).collect();
         // Soft cap far above the tiny transcript ⇒ no compaction.
-        let out = maybe_compact_transcript(&transcript, &summaries, 1_000_000).await;
+        let out = maybe_compact_transcript(&transcript, &summaries, 1_000_000, None).await;
         assert!(
             out.is_none(),
             "short session must be byte-identical (no compaction)"
@@ -368,7 +435,7 @@ mod tests {
             .map(|(i, _)| Some(format!("sum{i}")))
             .collect();
         // Force the over-cap branch with a tiny cap.
-        let out = maybe_compact_transcript(&transcript, &summaries, 1)
+        let out = maybe_compact_transcript(&transcript, &summaries, 1, None)
             .await
             .expect("over-cap must compact");
         assert_eq!(out.len(), transcript.len());

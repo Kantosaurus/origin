@@ -2743,7 +2743,7 @@ async fn drive_goal_loop(
         }
 
         let summary =
-            origin_daemon::agent::run_loop(session, &next_text, provider, &AlwaysAllow, opts).await?;
+            origin_daemon::agent::run_loop(session, &next_text, provider, prompter, opts).await?;
         is_first_iter = false;
 
         // If no goal is active, we're done after one turn.
@@ -3942,7 +3942,12 @@ async fn handle_run_workflow(
         .await
         .is_ok();
     };
-    let ev = match origin_daemon::workflow_runner::run_workflow(wf, coordinator, skill_catalog).await {
+    // ponytail: `None` event_tx — the standalone `origin workflow run` verb
+    // streams a single summary back over the connection, not the interactive
+    // swarm panel. Live per-worker panel events are wired on the agent-loop
+    // `RunWorkflow` tool path; add a connection bridge here only if a future
+    // `workflow run` UI needs the live readout.
+    let ev = match origin_daemon::workflow_runner::run_workflow(wf, coordinator, skill_catalog, None).await {
         Ok(report) => StreamEvent::WorkflowRunComplete {
             name: report.name,
             layers: u32::try_from(report.layers).unwrap_or(u32::MAX),
@@ -4755,5 +4760,139 @@ mod tests {
         assert_eq!(kind, FrameKind::Response, "decision ack must be a Response frame");
         assert!(!body.is_empty(), "ack carries a small body");
         server.await.expect("server task joins");
+    }
+
+    // --- /permissions on no-op regression ---------------------------------
+    // `drive_goal_loop`'s MAIN per-turn call hardcoded `&AlwaysAllow`, so the
+    // resolved interactive `prompter` was ignored on the common (regular,
+    // non-goal) turn path: every RequiresPermission tool auto-ran even when the
+    // user denied it via `/permissions on`. A regular turn flows through here
+    // with `active_goal == None` (one turn, then return; verifier untouched).
+
+    /// Emits one `Write` `tool_use`, then "done". The Write is the permission
+    /// probe — it is `RequiresPermission`, so it must reach the prompter.
+    struct ScriptedWriteProvider {
+        calls: std::sync::Mutex<usize>,
+        target: std::path::PathBuf,
+    }
+    #[async_trait::async_trait]
+    impl origin_provider::Provider for ScriptedWriteProvider {
+        fn name(&self) -> &'static str {
+            "scripted-write"
+        }
+        async fn chat(
+            &self,
+            _req: origin_provider::ChatRequest,
+        ) -> Result<origin_provider::ChatResponse, origin_provider::ProviderError> {
+            let n = {
+                let mut g = self.calls.lock().expect("calls lock");
+                let n = *g;
+                *g += 1;
+                n
+            };
+            let assistant = if n == 0 {
+                let input = serde_json::json!({
+                    "file_path": self.target.to_string_lossy(),
+                    "content": "SHOULD-NOT-BE-WRITTEN",
+                });
+                Message::new(Role::Assistant).with_block(Block::ToolUse {
+                    id: "tu-write-1".into(),
+                    name: "Write".into(),
+                    input_json: serde_json::to_vec(&input).expect("encode write args"),
+                    cache_marker: None,
+                })
+            } else {
+                Message::new(Role::Assistant).with_block(Block::text("done"))
+            };
+            Ok(origin_provider::ChatResponse {
+                assistant,
+                usage: origin_provider::Usage::default(),
+            })
+        }
+    }
+
+    /// Records that it was consulted, then DENIES. Under the bug it is never
+    /// consulted (the loop uses `AlwaysAllow`), so `asked` stays false.
+    struct RecordingDenier {
+        asked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl origin_permission::prompt::Prompter for RecordingDenier {
+        async fn ask(&self, _meta: &origin_tools::ToolMeta, _preview: &str) -> bool {
+            self.asked
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
+    }
+
+    struct UnreachableVerifier;
+    #[async_trait::async_trait]
+    impl origin_goal::verifier::Verifier for UnreachableVerifier {
+        #[allow(clippy::panic)]
+        async fn verify(
+            &self,
+            _condition: &str,
+            _last_turn: &str,
+        ) -> Result<(origin_goal::verifier::Verdict, u64, u64), origin_goal::verifier::VerifierError>
+        {
+            panic!("verifier must never run on a regular (no-goal) turn")
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::panic)]
+    async fn drive_goal_loop_honors_prompter_on_regular_turn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("probe.txt");
+        let store = Arc::new(SessionStore::open(dir.path().join("sessions.db")).expect("open store"));
+        let mut session = Session::new("perm-test", "test-model");
+        let provider = ScriptedWriteProvider {
+            calls: std::sync::Mutex::new(0),
+            target: target.clone(),
+        };
+        let asked = Arc::new(AtomicBool::new(false));
+        let prompter = RecordingDenier {
+            asked: Arc::clone(&asked),
+        };
+        let verifier = UnreachableVerifier;
+        let active_goal = Arc::new(tokio::sync::Mutex::new(None));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
+        let opts = origin_daemon::agent::LoopOptions {
+            max_turns: 6,
+            ..origin_daemon::agent::LoopOptions::default().without_streaming()
+        };
+
+        let result = super::drive_goal_loop(
+            &mut session,
+            "please write the file".to_string(),
+            &provider,
+            &opts,
+            active_goal,
+            store,
+            &verifier,
+            event_tx,
+            &prompter,
+        )
+        .await;
+
+        // The rock-solid discriminator: under the bug the loop used
+        // `AlwaysAllow`, so our denier is never consulted.
+        assert!(
+            asked.load(Ordering::SeqCst),
+            "the prompter passed to drive_goal_loop must govern the regular turn"
+        );
+        // A denied Write must never touch disk, and must surface as an error.
+        assert!(
+            !target.exists(),
+            "a denied Write must NOT execute (file was created ⇒ tool auto-ran)"
+        );
+        let err = result.expect_err("a denied tool must surface as a loop error, not Ok");
+        assert!(
+            format!("{err}").to_lowercase().contains("deni"),
+            "expected a denial error, got: {err}"
+        );
     }
 }

@@ -218,7 +218,7 @@ async fn maybe_compact_session(session: &mut Session, opts: &LoopOptions) {
     let cap = compaction_soft_cap(&session.model);
     // Cheap pre-check before building the summaries vector: if we are under the
     // cap there is nothing to do and we must not allocate or fire a hook.
-    if crate::compactor::estimate_transcript_bytes(&session.messages) <= cap {
+    if crate::compactor::estimate_transcript_bytes(&session.messages, opts.cas.as_deref()) <= cap {
         return;
     }
     // Build the per-message summary vector aligned to `session.messages` by
@@ -239,7 +239,13 @@ async fn maybe_compact_session(session: &mut Session, opts: &LoopOptions) {
         }
     }
     if let Some(output) =
-        crate::compactor::maybe_compact_transcript_indexed(&session.messages, &summaries, cap).await
+        crate::compactor::maybe_compact_transcript_indexed(
+            &session.messages,
+            &summaries,
+            cap,
+            opts.cas.as_deref(),
+        )
+        .await
     {
         // Before collapsing the oldest turns into their summaries, snapshot each
         // one's pre-compaction body so a later `rewind` can reconstruct it
@@ -460,6 +466,53 @@ fn workspace_roots_block(roots: &[std::path::PathBuf]) -> String {
     }
     s.push_str("</workspace-roots>");
     s
+}
+
+/// Render the static `<origin-env>` block: the OS, the shell `Bash` runs
+/// commands through, and the working directory. Without it the model assumes
+/// POSIX `sh` and a relative cwd, emitting `rm -rf`, `2>/dev/null`, `&&` chains
+/// and relative paths that fail on a Windows/PowerShell host. Static per host
+/// ⇒ sits in the cached system prefix at zero per-turn token cost.
+fn render_env_block(os: &str, windows: bool, cwd: &str) -> String {
+    let shell = if windows {
+        "PowerShell — commands run via `pwsh -Command`. Use PowerShell syntax, NOT POSIX sh: \
+         `Remove-Item` not `rm -rf`, `2>$null` not `2>/dev/null`, `;` (or `-and`) not `&&` to \
+         sequence, `$env:VAR` not `$VAR`, `New-Item` not `touch`. No heredocs."
+    } else {
+        "POSIX sh — commands run via `sh -c`. Standard Unix shell syntax."
+    };
+    format!(
+        "<origin-env>\n\
+         Operating system: {os}\n\
+         Shell: {shell}\n\
+         Working directory: {cwd}\n\
+         Prefer absolute paths for file tools; relative paths resolve against the working \
+         directory above.\n\
+         </origin-env>"
+    )
+}
+
+#[cfg(test)]
+mod env_block_tests {
+    use super::render_env_block;
+
+    #[test]
+    fn windows_block_steers_to_powershell_and_names_cwd() {
+        let b = render_env_block("windows", true, "C:\\work\\proj");
+        assert!(b.contains("<origin-env>"), "wrapped: {b}");
+        assert!(b.contains("Operating system: windows"), "names OS: {b}");
+        assert!(b.contains("PowerShell"), "names the shell: {b}");
+        assert!(b.contains("not `rm -rf`"), "steers away from POSIX-isms: {b}");
+        assert!(b.contains("C:\\work\\proj"), "names the working directory: {b}");
+    }
+
+    #[test]
+    fn unix_block_describes_posix_sh() {
+        let b = render_env_block("linux", false, "/home/u/proj");
+        assert!(b.contains("Operating system: linux"));
+        assert!(b.contains("POSIX sh"), "names POSIX sh on unix: {b}");
+        assert!(b.contains("/home/u/proj"));
+    }
 }
 
 /// DENY-ONLY read-only "plan mode" overlay (gemini Plan Mode).
@@ -696,7 +749,7 @@ const SWARM_GOAL_PREVIEW_CHARS: usize = 80;
 /// Truncate a sub-agent goal to a single compact line for the live swarm
 /// panel. Collapses inner whitespace/newlines to single spaces and caps the
 /// length with an ellipsis so one long goal can't blow out the TUI row.
-fn swarm_goal_preview(goal: &str) -> String {
+pub(crate) fn swarm_goal_preview(goal: &str) -> String {
     let flat = goal.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= SWARM_GOAL_PREVIEW_CHARS {
         flat
@@ -709,7 +762,7 @@ fn swarm_goal_preview(goal: &str) -> String {
 /// Format a [`origin_swarm::WorkerId`] as the stable hex string used to
 /// correlate a worker's spawn and completion [`StreamEvent::SwarmWorker`]
 /// events in the CLI.
-fn swarm_worker_id_hex(id: origin_swarm::WorkerId) -> String {
+pub(crate) fn swarm_worker_id_hex(id: origin_swarm::WorkerId) -> String {
     format!("{:032x}", id.value())
 }
 
@@ -3532,15 +3585,24 @@ async fn run_loop_inner(
     // static prefix exactly like the other system blocks — cache byte-stability
     // is preserved.
     let ponytail_block = origin_ponytail::system_block(opts.ponytail);
+    // Static per-host environment (OS / shell / cwd). Fixed for the whole run,
+    // so it sits in the cached system prefix at zero per-turn token cost. Stops
+    // the model emitting POSIX-isms + relative paths that fail on this host.
+    let env_block = render_env_block(
+        std::env::consts::OS,
+        cfg!(windows),
+        &std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string()),
+    );
     let recalled_system = {
         // NOTE: `goal_block`, `lsp_diag_block`, and `swarm_notices_block` are
         // deliberately NOT in this array — they are volatile (goal iteration
         // counters change every goal-driver pass; diagnostics/notices change
         // per turn) and are carried as a trailing message block instead, so the
         // cached system+tools prefix stays byte-stable across the whole run.
-        let parts: [&str; 13] = [
+        let parts: [&str; 14] = [
             &repo_map_block,
             identity_block,
+            &env_block,
             &directive_block,
             &catalog_block,
             &active_skills_block,
@@ -4820,6 +4882,36 @@ async fn run_loop_inner(
                 continue;
             }
 
+            // RunWorkflow: fan out a phase-layered swarm DAG. Intercepted here
+            // (like Task/CollectTasks) so the live `event_tx` reaches the runner
+            // and each worker's spawn + finish lights the swarm side panel. The
+            // `dispatch_tool` arm has no event channel, so running a workflow
+            // there leaves the panel dark — the original "sometimes the panel
+            // can't be seen" bug. No coordinator ⇒ fall through to that arm's
+            // clear "not configured" error.
+            if name == "RunWorkflow" {
+                if let Some(coord) = opts.coordinator.as_deref() {
+                    let body = match run_workflow_tool(
+                        &args,
+                        coord,
+                        opts.skill_catalog.as_deref(),
+                        opts.event_tx.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(s) => s.into_bytes(),
+                        Err(e) => format!("Error: {e}").into_bytes(),
+                    };
+                    tool_results.push(Block::ToolResult {
+                        tool_use_id: id,
+                        handle: None,
+                        inline: Some(body),
+                        cache_marker: None,
+                    });
+                    continue;
+                }
+            }
+
             // Stage C5 Task 1/2: time the tool-execution wall-clock. The clock
             // starts here, before the cache/speculative/Bash/dispatch fan-out,
             // and is folded into `tool_time_ms` only on the SUCCESS path below
@@ -5761,7 +5853,7 @@ async fn dispatch_tool(
             // seen it). Only record on a successful read.
             let read_path = args.file_path.clone();
             let out =
-                origin_tools::builtins::read::read_v2(args).map_err(|e| LoopError::ToolFailure(e.message));
+                origin_tools::builtins::read::read_v2(args).map_err(|e| LoopError::ToolFailure(e.display_message()));
             if out.is_ok() {
                 if let Some(guard) = write_guard {
                     guard.note_read(&read_path);
@@ -5784,7 +5876,7 @@ async fn dispatch_tool(
             };
             origin_tools::builtins::glob_tool::glob_v2(gargs)
                 .map(|v| serde_json::to_string(&v).expect("BUG: GlobResult always serializes"))
-                .map_err(|e| LoopError::ToolFailure(e.message))
+                .map_err(|e| LoopError::ToolFailure(e.display_message()))
         }
         "Grep" => {
             let mode = args.get("output_mode").and_then(Value::as_str).map(|s| match s {
@@ -5827,7 +5919,7 @@ async fn dispatch_tool(
             };
             origin_tools::builtins::grep_tool::grep_v2(gargs)
                 .map(|v| serde_json::to_string(&v).expect("BUG: GrepResult always serializes"))
-                .map_err(|e| LoopError::ToolFailure(e.message))
+                .map_err(|e| LoopError::ToolFailure(e.display_message()))
         }
         "Edit" => {
             let args = origin_tools::builtins::edit::EditArgs {
@@ -5851,7 +5943,7 @@ async fn dispatch_tool(
             let fmt_path = args.file_path.clone();
             let res = origin_tools::builtins::edit::edit_v2(args)
                 .map(|v| serde_json::to_string(&v).expect("BUG: EditResult always serializes"))
-                .map_err(|e| LoopError::ToolFailure(e.message));
+                .map_err(|e| LoopError::ToolFailure(e.display_message()));
             if res.is_ok() {
                 // #5: a successful Edit means the model has seen this file's
                 // content (Edit reads + rewrites it), so record it so a later
@@ -5891,7 +5983,7 @@ async fn dispatch_tool(
             };
             let res = origin_tools::builtins::multi_edit::multi_edit(&margs)
                 .map(|v| serde_json::to_string(&v).expect("BUG: MultiEditResult always serializes"))
-                .map_err(|e| LoopError::ToolFailure(e.message));
+                .map_err(|e| LoopError::ToolFailure(e.display_message()));
             if res.is_ok() {
                 // #5: a successful MultiEdit means the model has seen this file.
                 if let Some(guard) = write_guard {
@@ -5912,7 +6004,7 @@ async fn dispatch_tool(
             let fmt_paths = patch_target_paths(&pargs.patch);
             let res = origin_tools::builtins::apply_patch::apply_patch(&pargs)
                 .map(|v| serde_json::to_string(&v).expect("BUG: ApplyPatchResult always serializes"))
-                .map_err(|e| LoopError::ToolFailure(e.message));
+                .map_err(|e| LoopError::ToolFailure(e.display_message()));
             if res.is_ok() {
                 for p in &fmt_paths {
                     // #5: a successful ApplyPatch means the model has seen each
@@ -5950,7 +6042,7 @@ async fn dispatch_tool(
             let fmt_path = args.file_path.clone();
             let res = origin_tools::builtins::write::write_v2(args, guard)
                 .map(|()| "write ok".to_string())
-                .map_err(|e| LoopError::ToolFailure(e.message));
+                .map_err(|e| LoopError::ToolFailure(e.display_message()));
             if res.is_ok() {
                 // A successful Write also marks the path as "seen" so a later
                 // re-Write (force=false) without a fresh Read still succeeds.
@@ -6002,7 +6094,7 @@ async fn dispatch_tool(
             origin_tools::builtins::bash::bash_v2(bargs, &sup)
                 .await
                 .map(|v| serde_json::to_string(&v).expect("BUG: BashResult always serializes"))
-                .map_err(|e| LoopError::ToolFailure(e.message))
+                .map_err(|e| LoopError::ToolFailure(e.display_message()))
         }
         "Monitor" => {
             let margs = origin_tools::builtins::monitor::MonitorArgs {
@@ -6028,7 +6120,7 @@ async fn dispatch_tool(
             origin_tools::builtins::monitor::monitor(margs, &sup)
                 .await
                 .map(|v| serde_json::to_string(&v).expect("BUG: MonitorResult always serializes"))
-                .map_err(|e| LoopError::ToolFailure(e.message))
+                .map_err(|e| LoopError::ToolFailure(e.display_message()))
         }
         "Diagnostics" => {
             // Envelope-routed path uses ctx.ra (shared handle); this passthrough
@@ -6051,7 +6143,7 @@ async fn dispatch_tool(
             origin_tools::builtins::diagnostics::diagnostics(dargs, &ra)
                 .await
                 .map(|v| serde_json::to_string(&v).expect("BUG: DiagnosticsResult always serializes"))
-                .map_err(|e| LoopError::ToolFailure(e.message))
+                .map_err(|e| LoopError::ToolFailure(e.display_message()))
         }
         "LspNavigate" => {
             // Per-call `DaemonRa` (same Phase-6 posture as `Diagnostics`); it
@@ -6093,7 +6185,7 @@ async fn dispatch_tool(
             origin_tools::builtins::lsp_nav::lsp_navigate(nav_args, &ra)
                 .await
                 .map(|v| serde_json::to_string(&v).expect("BUG: LspNavigate result always serializes"))
-                .map_err(|e| LoopError::ToolFailure(e.message))
+                .map_err(|e| LoopError::ToolFailure(e.display_message()))
         }
         "ToolSearch" => {
             let sargs = origin_tools::builtins::tool_search::ToolSearchArgs {
@@ -6109,7 +6201,7 @@ async fn dispatch_tool(
             };
             origin_tools::builtins::tool_search::tool_search(&sargs)
                 .map(|v| serde_json::to_string(&v).expect("BUG: ToolSearchResult always serializes"))
-                .map_err(|e| LoopError::ToolFailure(e.message))
+                .map_err(|e| LoopError::ToolFailure(e.display_message()))
         }
         "Recall" => {
             let store =
@@ -6494,10 +6586,15 @@ async fn dispatch_tool(
         // to the linear `{workflow:<name>}` skill-mask activation path, which this
         // arm does not touch.
         "RunWorkflow" => {
+            // `dispatch_tool` has no live `event_tx`, so this arm runs the
+            // workflow without lighting the swarm panel. The interactive main
+            // loop intercepts `RunWorkflow` BEFORE reaching here (see
+            // `name == "RunWorkflow"` there) and passes the real channel; this
+            // arm is the headless / fallback path.
             let coord = coordinator.ok_or_else(|| {
                 LoopError::ToolFailure("RunWorkflow: swarm coordinator not configured".into())
             })?;
-            run_workflow_tool(args, coord, skill_catalog).await
+            run_workflow_tool(args, coord, skill_catalog, None).await
         }
         // ── ask_user (interactive choice) — backward-compat path ──
         // The INTERACTIVE pause-await (emit `ChoiceAsk` → block on
@@ -6532,6 +6629,7 @@ async fn run_workflow_tool(
     args: &Value,
     coordinator: &origin_swarm::Coordinator,
     skill_catalog: Option<&SkillCatalog>,
+    event_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
 ) -> Result<String, LoopError> {
     let name = args
         .get("name")
@@ -6555,7 +6653,7 @@ async fn run_workflow_tool(
     let empty_catalog = SkillCatalog::default();
     let catalog = skill_catalog.unwrap_or(&empty_catalog);
 
-    let report = crate::workflow_runner::run_workflow(workflow, coordinator, catalog)
+    let report = crate::workflow_runner::run_workflow(workflow, coordinator, catalog, event_tx)
         .await
         .map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: {e}")))?;
     serde_json::to_string(&report).map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: json: {e}")))
@@ -7192,14 +7290,69 @@ async fn run_bash_streaming(
         }
     }
 
+    Ok(bash_result_bytes(status_str, exit_code, acc))
+}
+
+/// Serialize the structured Bash tool result. `stdout` is capped to the shared
+/// [`origin_tools::builtins::bash::cap_stdout`] budget so a chatty command
+/// (build log, `find /`, a stack dump) does not flood the model's context every
+/// turn it stays in history. Pure ⇒ unit-testable without spawning a shell.
+fn bash_result_bytes(status: &str, exit_code: i32, stdout: String) -> Vec<u8> {
     let result = serde_json::json!({
-        "status": status_str,
+        "status": status,
         "exit_code": exit_code,
-        "stdout": acc,
+        "stdout": origin_tools::builtins::bash::cap_stdout(stdout),
     });
-    Ok(serde_json::to_string(&result)
+    serde_json::to_string(&result)
         .expect("BUG: bash result Value always serializes")
-        .into_bytes())
+        .into_bytes()
+}
+
+#[cfg(test)]
+mod bash_result_tests {
+    use super::bash_result_bytes;
+
+    /// Regression: the production streaming Bash path must cap its stdout to the
+    /// shared budget. Before the fix `run_bash_streaming` returned the raw
+    /// accumulator, so a chatty command flooded the model's context (and the
+    /// `cap_stdout` helper only ran on a dead test-only path).
+    #[test]
+    fn large_stdout_is_capped_in_the_production_bash_result() {
+        let tail = "TAIL_MARKER_AT_END";
+        let big = format!("{}{}{tail}", "H".repeat(80_000), "M".repeat(80_000));
+        let original_len = big.len();
+
+        let bytes = bash_result_bytes("exited", 0, big);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
+        let stdout = v["stdout"].as_str().expect("stdout is a string");
+
+        assert!(
+            stdout.len() < original_len,
+            "stdout must be capped (got {} of {original_len} bytes)",
+            stdout.len()
+        );
+        assert!(
+            stdout.len() < 100_000,
+            "stdout must fit the ~96k budget, got {}",
+            stdout.len()
+        );
+        assert!(stdout.contains("bytes elided"), "elision must be noted");
+        assert!(
+            stdout.ends_with(tail),
+            "the tail (where errors/exit summaries surface) must be preserved"
+        );
+        assert!(stdout.starts_with("HHHH"), "the head must be preserved");
+    }
+
+    /// Small output is passed through untouched (no spurious elision note).
+    #[test]
+    fn small_stdout_is_unchanged() {
+        let bytes = bash_result_bytes("exited", 0, "hello world".to_string());
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
+        assert_eq!(v["stdout"].as_str().expect("string"), "hello world");
+        assert_eq!(v["exit_code"].as_i64().expect("int"), 0);
+        assert_eq!(v["status"].as_str().expect("string"), "exited");
+    }
 }
 
 /// Build a bounded preview of a tool's result bytes for live display in the

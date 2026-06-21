@@ -25,7 +25,10 @@ use origin_plan::ActorId;
 use origin_swarm::{Budget, Coordinator, ReportStatus, SwarmError, WorkerSpec};
 use serde::Serialize;
 use thiserror::Error;
+use tokio::sync::mpsc::Sender;
 
+use crate::agent::{swarm_goal_preview, swarm_worker_id_hex};
+use crate::protocol::StreamEvent;
 use crate::skill_catalog::SkillCatalog;
 use crate::workflows::{Workflow, WorkflowStep};
 
@@ -184,6 +187,15 @@ pub fn step_worker_spec(step: &WorkflowStep, catalog: &SkillCatalog) -> WorkerSp
 /// starts, so a downstream step never begins before its dependencies finish.
 /// Aggregates every worker's terminal status into a [`RunReport`].
 ///
+/// When `event_tx` is `Some`, each worker emits a `"spawned"`
+/// [`StreamEvent::SwarmWorker`] when it launches and a terminal
+/// (`"completed"`/`"failed"`) one when it settles — keyed by the SAME hex id —
+/// so the live swarm side panel lights up for workflow fan-outs exactly as it
+/// does for the `Task` tool. `None` (headless / `dispatch_tool`'s arm) emits
+/// nothing, byte-identical to before. Non-`Completed` terminal states map to
+/// `"failed"` because the TUI only treats `"completed"`/`"failed"` as terminal —
+/// any other token reads as still-running and would wedge the panel's row open.
+///
 /// # Errors
 /// - [`RunError::Layering`] if the workflow's dependency graph is invalid.
 /// - [`RunError::Swarm`] if a worker spawn or await fails at the swarm layer.
@@ -191,6 +203,7 @@ pub async fn run_workflow(
     workflow: &Workflow,
     coordinator: &Coordinator,
     catalog: &SkillCatalog,
+    event_tx: Option<&Sender<StreamEvent>>,
 ) -> Result<RunReport, RunError> {
     let layers = compute_layers(workflow)?;
     let mut steps_out: Vec<StepReport> = Vec::with_capacity(workflow.steps.len());
@@ -203,19 +216,68 @@ pub async fn run_workflow(
         for &pos in layer {
             let step = &workflow.steps[pos];
             let spec = step_worker_spec(step, catalog);
+            let goal_preview = swarm_goal_preview(&spec.goal);
             let handle = coordinator.spawn(spec).await?;
-            handles.push((pos, handle));
+            if let Some(tx) = event_tx {
+                let _ = tx
+                    .send(StreamEvent::SwarmWorker {
+                        id: swarm_worker_id_hex(handle.id()),
+                        goal: goal_preview.clone(),
+                        status: "spawned".to_string(),
+                        detail: None,
+                        tool: None,
+                    })
+                    .await;
+            }
+            handles.push((pos, handle, goal_preview));
         }
         // Await the whole layer before starting the next.
-        for (pos, handle) in handles {
-            let report = coordinator.await_completion(&handle).await?;
-            let step = &workflow.steps[pos];
-            steps_out.push(StepReport {
-                index: pos,
-                skill: step.skill.clone(),
-                layer: layer_idx,
-                status: status_label(report.status).to_string(),
-            });
+        for (pos, handle, goal_preview) in handles {
+            match coordinator.await_completion(&handle).await {
+                Ok(report) => {
+                    if let Some(tx) = event_tx {
+                        // Only `Completed` is a panel "success"; every other
+                        // terminal state shows as a failed row.
+                        let tui_status = if report.status == ReportStatus::Completed {
+                            "completed"
+                        } else {
+                            "failed"
+                        };
+                        let _ = tx
+                            .send(StreamEvent::SwarmWorker {
+                                id: swarm_worker_id_hex(handle.id()),
+                                goal: goal_preview,
+                                status: tui_status.to_string(),
+                                detail: report.detail.clone(),
+                                tool: None,
+                            })
+                            .await;
+                    }
+                    let step = &workflow.steps[pos];
+                    steps_out.push(StepReport {
+                        index: pos,
+                        skill: step.skill.clone(),
+                        layer: layer_idx,
+                        status: status_label(report.status).to_string(),
+                    });
+                }
+                Err(e) => {
+                    // Settle the panel row before propagating so a swarm-layer
+                    // failure doesn't leave the worker stuck "running".
+                    if let Some(tx) = event_tx {
+                        let _ = tx
+                            .send(StreamEvent::SwarmWorker {
+                                id: swarm_worker_id_hex(handle.id()),
+                                goal: goal_preview,
+                                status: "failed".to_string(),
+                                detail: Some(e.to_string()),
+                                tool: None,
+                            })
+                            .await;
+                    }
+                    return Err(e.into());
+                }
+            }
         }
     }
 

@@ -624,12 +624,15 @@ for the `RunWorkflow` tool / `origin workflow run`:
   Write]`. `Task` is always stripped by the worker substrate, so a step can never
   recurse into another workflow's swarm. The per-step `STEP_BUDGET` is
   300 s wall / 1M input / 256K output tokens / 32 tool calls.
-- `run_workflow(workflow, coordinator, catalog)` executes layer by layer: it
-  **spawns every step in a layer up front** (so same-layer steps run concurrently
-  on the coordinator's swarm pool), then `await_completion`s the whole layer
-  before starting the next — exactly the spawn-all-then-await shape the `Task`
-  tool uses. The `RunReport` aggregates each step's terminal status
-  (`completed` / `goal_unreachable` / `budget_exhausted` / `aborted`).
+- `run_workflow(workflow, coordinator, catalog, event_tx)` executes layer by
+  layer: it **spawns every step in a layer up front** (so same-layer steps run
+  concurrently on the coordinator's swarm pool), then `await_completion`s the
+  whole layer before starting the next — exactly the spawn-all-then-await shape
+  the `Task` tool uses. The `RunReport` aggregates each step's terminal status
+  (`completed` / `goal_unreachable` / `budget_exhausted` / `aborted`). When
+  `event_tx` is `Some` (the agent-loop `RunWorkflow` tool, intercepted in the main
+  loop), each worker emits a `"spawned"` + terminal `SwarmWorker` event so the
+  live swarm side panel renders — `dispatch_tool`'s arm passes `None`.
 
 ### The baked-in default workflow
 

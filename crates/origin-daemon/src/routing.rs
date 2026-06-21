@@ -197,9 +197,12 @@ fn default_plan_model() -> ModelRef {
 }
 
 /// Default `ORIGIN_ROUTER=auto` "fast/editor" model (overridable via
-/// `ORIGIN_ROUTER_FAST`): a cheap, quick Anthropic model.
+/// `ORIGIN_ROUTER_FAST`): the capable model, NOT a weak one. Edit turns do the
+/// actual work, so silently downgrading them to haiku tanked accuracy (and this
+/// account may not even serve haiku). Cost-conscious users opt into a cheap
+/// editor with `ORIGIN_ROUTER_FAST=provider/model`.
 fn default_fast_model() -> ModelRef {
-    ModelRef::new("anthropic", "claude-haiku-4-5")
+    ModelRef::new("anthropic", "claude-opus-4-8")
 }
 
 /// Parse a single `provider/model` reference. Splits on the first `/`; both
@@ -304,8 +307,11 @@ mod tests {
 
     #[test]
     fn auto_router_uses_catalog_defaults_with_no_companions() {
-        // The zero-config sentinel must build even with no companion env vars,
-        // defaulting to phase-aware routing on the latest Anthropic pair.
+        // The zero-config sentinel must build even with no companion env vars.
+        // Accuracy-first default: BOTH legs default to the capable model so
+        // `auto` never silently downgrades edit turns to a weak (or unserved)
+        // fast model. Cost-conscious users restore a cheap editor via
+        // ORIGIN_ROUTER_FAST.
         let lr = LiveRouter::from_env_with("auto", |_| None).expect("auto always builds");
         assert_eq!(
             lr.choose_model(1, "anthropic").as_deref(),
@@ -313,7 +319,8 @@ mod tests {
         );
         assert_eq!(
             lr.choose_model(2, "anthropic").as_deref(),
-            Some("claude-haiku-4-5")
+            Some("claude-opus-4-8"),
+            "edit turns must NOT auto-downgrade to a weak/unserved fast model"
         );
     }
 
