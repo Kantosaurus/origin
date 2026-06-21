@@ -623,10 +623,14 @@ fn build_wire_messages<'a>(messages: &'a [Message], plan: Option<&Plan>) -> Vec<
         .collect();
 
     // Pass 2: serialize, emitting `cache_control` only on the kept positions.
+    // Drop any message whose content serialized to empty — e.g. a thinking-only
+    // assistant turn (thinking blocks are not re-sent), which would otherwise be
+    // a `{"role":..,"content":[]}` that Anthropic rejects with a 400.
     messages
         .iter()
         .enumerate()
         .map(|(msg_idx, m)| message_to_wire(m, msg_idx, &keep))
+        .filter(|wm| !wm.content.is_empty())
         .collect()
 }
 
@@ -827,7 +831,11 @@ fn expand_messages_for_wire(
     // deep in the history (e.g. a stranded tail spliced on after a reused session
     // id, or a compaction hole). Stripping it here keeps a corrupted transcript
     // recoverable instead of fatal; a well-formed transcript is unchanged.
-    Ok(origin_core::types::strip_orphan_tool_results(out))
+    // Two-sided pairing repair at the wire choke: drop orphaned tool_results
+    // AND a trailing orphan tool_use (the latter previously fixed only on the
+    // daemon's interrupt path, leaving resume/corruption/migration to 400).
+    let out = origin_core::types::strip_orphan_tool_results(out);
+    Ok(origin_core::types::strip_trailing_orphan_tool_use(out))
 }
 
 fn load_oauth_metadata(session_id: &str) -> wire::WireMetadata {

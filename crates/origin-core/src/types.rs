@@ -178,9 +178,28 @@ pub fn strip_orphan_tool_results(messages: Vec<Message>) -> Vec<Message> {
     out
 }
 
+/// Drop a trailing `Assistant` message that ends the transcript with a `ToolUse`
+/// carrying no following `tool_result`.
+///
+/// Anthropic rejects a request whose FINAL message is an assistant `tool_use`
+/// with no answer (`400 ... tool_use ... ids were found without tool_result`).
+/// The daemon appends results before its next call, so this only arises from an
+/// interrupt, a resumed/corrupted transcript, or a migration — running it at the
+/// wire choke makes those self-healing. A well-formed transcript (last message a
+/// user prompt or tool result) returns unchanged.
+#[must_use]
+pub fn strip_trailing_orphan_tool_use(mut messages: Vec<Message>) -> Vec<Message> {
+    while messages.last().is_some_and(|m| {
+        matches!(m.role, Role::Assistant) && m.blocks.iter().any(|b| matches!(b, Block::ToolUse { .. }))
+    }) {
+        messages.pop();
+    }
+    messages
+}
+
 #[cfg(test)]
 mod tool_pairing_tests {
-    use super::{strip_orphan_tool_results, Block, Message, Role};
+    use super::{strip_orphan_tool_results, strip_trailing_orphan_tool_use, Block, Message, Role};
 
     fn assistant_tool_use(id: &str) -> Message {
         Message {
@@ -217,6 +236,26 @@ mod tool_pairing_tests {
             Message::new(Role::Assistant).with_block(Block::text("done")),
         ];
         assert_eq!(strip_orphan_tool_results(t.clone()), t);
+    }
+
+    #[test]
+    fn trailing_orphan_tool_use_is_stripped() {
+        // A transcript ending in an assistant tool_use with no following result
+        // (interrupt / resumed-corrupt) would 400 — strip the trailing turn.
+        let t = vec![
+            Message::new(Role::User).with_block(Block::text("hi")),
+            assistant_tool_use("a"),
+        ];
+        let out = strip_trailing_orphan_tool_use(t);
+        assert_eq!(out.len(), 1, "the orphan trailing tool_use turn is dropped");
+        assert!(matches!(out[0].role, Role::User));
+        // A well-formed transcript (ends in a tool result) is untouched.
+        let ok = vec![
+            Message::new(Role::User).with_block(Block::text("hi")),
+            assistant_tool_use("a"),
+            tool_result("a"),
+        ];
+        assert_eq!(strip_trailing_orphan_tool_use(ok.clone()), ok);
     }
 
     #[test]
