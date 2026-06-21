@@ -66,6 +66,55 @@ fn insert_two_files_with_identical_signature_dedup() {
 }
 
 #[test]
+fn nodes_by_name_resolves_declarations() {
+    let (mut idx, _tmp) = open_index();
+    // Two `foo` declarations in different files plus an unrelated `bar`.
+    let foo_a = CodeNodeRecord {
+        kind: NodeKind::Function,
+        name: "foo".to_owned(),
+        language: Language::Rust,
+        file_path: "a.rs".to_owned(),
+        range: Range { start: 0, end: 10 },
+        signature: b"fn foo()".to_vec(),
+        body: b"fn foo() {}".to_vec(),
+    };
+    let foo_b = CodeNodeRecord {
+        kind: NodeKind::Function,
+        name: "foo".to_owned(),
+        language: Language::Rust,
+        file_path: "b.rs".to_owned(),
+        range: Range { start: 0, end: 10 },
+        signature: b"fn foo(x: u8)".to_vec(),
+        body: b"fn foo(x: u8) {}".to_vec(),
+    };
+    let bar = CodeNodeRecord {
+        kind: NodeKind::Function,
+        name: "bar".to_owned(),
+        language: Language::Rust,
+        file_path: "a.rs".to_owned(),
+        range: Range { start: 11, end: 20 },
+        signature: b"fn bar()".to_vec(),
+        body: b"fn bar() {}".to_vec(),
+    };
+    idx.insert_node(&foo_a).expect("insert foo_a");
+    idx.insert_node(&foo_b).expect("insert foo_b");
+    idx.insert_node(&bar).expect("insert bar");
+
+    let rows = idx.nodes_by_name("foo").expect("query by name");
+    assert_eq!(rows.len(), 2, "both foo declarations should resolve");
+    assert!(
+        rows.iter().all(|r| r.name == "foo"),
+        "only foo nodes should be returned"
+    );
+    // Deterministic order: by file_path, so a.rs precedes b.rs.
+    assert_eq!(rows[0].file_path, "a.rs");
+    assert_eq!(rows[1].file_path, "b.rs");
+
+    let none = idx.nodes_by_name("nonexistent").expect("query missing name");
+    assert!(none.is_empty(), "unknown symbol must resolve to nothing");
+}
+
+#[test]
 fn insert_edge_round_trip() {
     let (mut idx, _tmp) = open_index();
     let rec_a = CodeNodeRecord {

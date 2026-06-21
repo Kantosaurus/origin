@@ -157,6 +157,12 @@ pub struct PostEditConfig {
     pub auto_test: bool,
     /// Test command override; `None` falls back to the caller's default.
     pub test_command: Option<String>,
+    /// C8: reproduction gate. When set, the model is instructed (via a
+    /// `<repro-gate>` contract) to write ONE focused test that fails on current
+    /// code BEFORE fixing a reported bug, and `test_command` is run at turn-end
+    /// so the fail→pass transition is execution-checked. Opt-in, default-off.
+    #[serde(default)]
+    pub repro_gate: bool,
     /// Per-extension formatter overrides (extension, command), tried before the
     /// builtin table. Extensions are matched case-insensitively.
     pub format_overrides: Vec<(String, String)>,
@@ -171,6 +177,7 @@ impl Default for PostEditConfig {
             lint_command: None,
             auto_test: false,
             test_command: None,
+            repro_gate: false,
             format_overrides: Vec::new(),
             max_repair_iters: 2,
         }

@@ -42,6 +42,7 @@ pub fn graph_explain_tool(q: &Query) -> String {
         Query::RecentChanges { since_ms } => {
             format!("nodes changed since unix-ms {since_ms}")
         }
+        Query::ByName { ref name } => format!("declarations named `{name}`"),
     }
 }
 

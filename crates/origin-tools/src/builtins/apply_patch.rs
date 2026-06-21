@@ -559,44 +559,27 @@ fn apply_one_hunk(text: &str, h: &Hunk, offset: isize) -> Result<(String, isize)
             _ => {}
         }
     }
-    // start index in CURRENT (working) coordinates; isize so a negative result
-    // from an out-of-range hunk start is rejected rather than wrapping.
+    // start index in CURRENT (working) coordinates; the model's `old_start`
+    // shifted by earlier hunks. A negative result clamps to 0 — `locate_hunk`
+    // then searches outward from there, so a small line-drift no longer aborts
+    // the whole (possibly multi-file) patch.
     let base = isize::try_from(h.old_start.saturating_sub(1))
         .unwrap_or(isize::MAX)
         .saturating_add(offset);
-    let start_idx = usize::try_from(base).map_err(|_| {
+    let hint = usize::try_from(base).unwrap_or(0);
+    let start_idx = locate_hunk(&lines, &old_block, hint).ok_or_else(|| {
         ToolError::new(
             ErrClass::Edit,
             "no_match",
-            format!("hunk @{} resolves before start of {}", h.old_start, h.file),
+            format!(
+                "hunk @{} no longer matches {} (context drifted beyond tolerance); re-read the file and re-emit the hunk",
+                h.old_start, h.file
+            ),
         )
+        .recoverable(true)
     })?;
-    // Checked add so an attacker-controlled huge `old_start` cannot overflow
-    // and slip past the bounds check into an out-of-bounds index panic.
-    let past_eof = start_idx
-        .checked_add(old_block.len())
-        .is_none_or(|end| end > lines.len());
-    if past_eof {
-        return Err(ToolError::new(
-            ErrClass::Edit,
-            "no_match",
-            format!("hunk @{} extends past EOF in {}", h.old_start, h.file),
-        ));
-    }
-    for (off, exp) in old_block.iter().enumerate() {
-        let got = lines[start_idx + off];
-        if got != *exp {
-            return Err(ToolError::new(
-                ErrClass::Edit,
-                "no_match",
-                format!(
-                    "context mismatch at {}:{}: expected `{exp}`, got `{got}`",
-                    h.file,
-                    h.old_start + off
-                ),
-            ));
-        }
-    }
+    // `locate_hunk` only returns an index where the block fits, so the splice
+    // below is in-bounds.
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     out.extend(lines[..start_idx].iter().map(|s| (*s).to_string()));
     out.extend(new_block.iter().cloned());
@@ -614,6 +597,36 @@ fn apply_one_hunk(text: &str, h: &Hunk, offset: isize) -> Result<(String, isize)
     Ok((joined, delta))
 }
 
+/// Locate where `old_block` sits in `lines`, searching outward from the model's
+/// `hint` index. Exact matches win first; failing that, whitespace-trimmed
+/// matches (one drifted-indent context line no longer aborts the patch). On
+/// several candidates the one nearest the hint wins; `None` if nothing matches
+/// within the bounded window (caller → recoverable `no_match`).
+fn locate_hunk(lines: &[&str], old_block: &[&str], hint: usize) -> Option<usize> {
+    // ponytail: bounded ±200-line scan; widen only if real drift exceeds it.
+    const W: usize = 200;
+    if old_block.len() > lines.len() {
+        return None;
+    }
+    if old_block.is_empty() {
+        return Some(hint.min(lines.len())); // pure insertion: nothing to match
+    }
+    let last_start = lines.len() - old_block.len();
+    let lo = hint.saturating_sub(W);
+    let hi = (hint + W).min(last_start);
+    let nearest = |cands: Vec<usize>| cands.into_iter().min_by_key(|&i| i.abs_diff(hint));
+    let exact: Vec<usize> = (lo..=hi)
+        .filter(|&i| lines[i..i + old_block.len()] == *old_block)
+        .collect();
+    if let Some(i) = nearest(exact) {
+        return Some(i);
+    }
+    let trimmed: Vec<usize> = (lo..=hi)
+        .filter(|&i| (0..old_block.len()).all(|k| lines[i + k].trim() == old_block[k].trim()))
+        .collect();
+    nearest(trimmed)
+}
+
 fn atomic_write(path: &str, bytes: &[u8]) -> Result<(), ToolError> {
     use std::io::Write;
     let p = std::path::Path::new(path);
@@ -628,6 +641,29 @@ fn atomic_write(path: &str, bytes: &[u8]) -> Result<(), ToolError> {
             .map_err(|e| ToolError::new(ErrClass::Io, "permission", e.to_string()))?;
     }
     std::fs::rename(&tmp, p).map_err(|e| ToolError::new(ErrClass::Io, "permission", e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locate_relocates_on_line_drift_and_tolerates_whitespace() {
+        let lines = vec!["a", "b", "  ctx", "d", "e"];
+        // Exact block present but the model's hint is off by 2 lines → relocate.
+        assert_eq!(locate_hunk(&lines, &["d", "e"], 0), Some(3));
+        // One context line differs only in indentation → ws-trimmed match.
+        assert_eq!(locate_hunk(&lines, &["ctx"], 2), Some(2));
+        // Genuine content difference → no match.
+        assert_eq!(locate_hunk(&lines, &["nope"], 2), None);
+    }
+
+    #[test]
+    fn locate_picks_candidate_nearest_the_hint() {
+        let lines = vec!["x", "dup", "y", "dup", "z"];
+        assert_eq!(locate_hunk(&lines, &["dup"], 3), Some(3));
+        assert_eq!(locate_hunk(&lines, &["dup"], 0), Some(1));
+    }
 }
 
 crate::origin_tool! {

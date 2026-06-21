@@ -15,7 +15,7 @@ pub fn graph_query_tool(idx: &CodeGraphIndex, q: Query) -> Result<QueryResult, Q
 
 crate::origin_tool! {
     name: "graph_query",
-    description: "Run a typed code-graph query: { kind: \"neighbors\" | \"path\" | \"communities\" | \"god_nodes\" | \"recent_changes\", ... }. Returns a CAS handle to the result set.",
+    description: "Run a typed code-graph query: { kind: \"by_name\" (args.name: resolve a symbol name → its declarations, to check a function/type exists before referencing it) | \"neighbors\" | \"path\" | \"communities\" | \"god_nodes\" | \"recent_changes\", ... }. Returns a CAS handle to the result set.",
     tier: crate::Tier::AutoAllowed,
     urgency: crate::Urgency::Low,
     side_effects: crate::SideEffects::Pure,

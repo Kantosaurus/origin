@@ -26,6 +26,7 @@ pub mod protocol;
 pub mod provider_factory;
 pub mod ra_impl;
 pub mod remote_quic;
+pub mod stuck;
 pub mod runtime_launch;
 pub mod session;
 pub mod session_store;

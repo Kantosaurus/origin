@@ -25,8 +25,16 @@ pub struct AnthropicHaikuVerifier {
     pub model: String,
 }
 
-const VERIFIER_SYSTEM: &str = "You verify whether a stated goal has been met based ONLY on \
-                               the assistant's final response. Answer with exactly one of:\n\
+const VERIFIER_SYSTEM: &str = "You verify whether a stated goal has been met based on the \
+                               assistant's final response. If the response includes a \
+                               <harness-signals> section containing a non-empty <edit-check> or \
+                               <test-results> block, the goal is automatically NOT met — those are \
+                               machine-verified failures (a syntax/test gate the assistant was \
+                               shown) that override any textual claim of completion. If a \
+                               <turn-evidence> block is present, judge the completion claim \
+                               AGAINST that actual tool output — if the evidence contradicts or \
+                               does not support the claim, answer not_met. Otherwise judge from \
+                               the response text. Answer with exactly one of:\n\
                                VERDICT: met\n\
                                VERDICT: not_met — <one-sentence reason>";
 

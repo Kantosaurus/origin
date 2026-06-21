@@ -119,8 +119,17 @@ impl LiveRouter {
     /// Turn 1 is classified [`Phase::Plan`]; every later turn [`Phase::Edit`].
     #[must_use]
     pub fn choose_model_ref(&self, turn: u32) -> Option<ModelRef> {
+        self.choose_model_ref_struggling(turn, false)
+    }
+
+    /// R3: like [`choose_model_ref`](Self::choose_model_ref), but re-enters
+    /// [`Phase::Plan`] (the stronger leg) for a mid-session turn that is
+    /// `struggling` — e.g. the prior turn's syntax/test validation keeps failing.
+    /// A difficulty signal the turn-index-only phase classifier otherwise misses.
+    #[must_use]
+    pub fn choose_model_ref_struggling(&self, turn: u32, struggling: bool) -> Option<ModelRef> {
         self.sweep_cooldowns();
-        let phase = if turn == 1 { Phase::Plan } else { Phase::Edit };
+        let phase = if turn == 1 || struggling { Phase::Plan } else { Phase::Edit };
         self.inner.lock().ok()?.choose(phase, &self.candidates)
     }
 

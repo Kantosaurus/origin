@@ -149,24 +149,53 @@ const BYTES_PER_TOKEN: usize = 4;
 /// fixed 200 KiB (~50 K tokens, only a quarter of its window).
 /// `ORIGIN_COMPACT_SOFT_CAP` still overrides everything (tuning/tests); an
 /// unrecognized model resolves to the resolver's conservative 200 K fallback.
-fn compaction_soft_cap(model: &str) -> usize {
+/// Byte soft-cap for a concrete context `window`, honouring the env override.
+fn soft_cap_for_window(window: u32) -> usize {
     if let Some(bytes) = std::env::var("ORIGIN_COMPACT_SOFT_CAP")
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
     {
         return bytes;
     }
-    let window = crate::model_window::model_context_window(model);
     let w = usize::try_from(window).unwrap_or(usize::MAX);
     w.saturating_mul(BYTES_PER_TOKEN)
         .saturating_mul(COMPACT_WINDOW_NUM)
         / COMPACT_WINDOW_DEN
 }
 
+/// The number of prefix tokens at which the window fraction is crossed.
+const fn token_soft_cap(window: u32) -> usize {
+    (window as usize).saturating_mul(COMPACT_WINDOW_NUM) / COMPACT_WINDOW_DEN
+}
+
+/// R1+R2: compact when EITHER the byte estimate crosses the cap OR the LAST
+/// turn's measured prefix tokens cross the window fraction. The measured gate
+/// catches token-dense transcripts (minified JS, base64, CJK ≈ 2 bytes/token)
+/// that the 4-bytes/token byte heuristic under-counts into an overflow 400.
+const fn should_compact(bytes: usize, byte_cap: usize, last_input_tokens: u32, token_cap: usize) -> bool {
+    bytes > byte_cap || (last_input_tokens > 0 && last_input_tokens as usize >= token_cap)
+}
+
 #[cfg(test)]
 mod compaction_cap_tests {
-    use super::{BYTES_PER_TOKEN, COMPACT_WINDOW_DEN, COMPACT_WINDOW_NUM};
+    use super::{should_compact, token_soft_cap, BYTES_PER_TOKEN, COMPACT_WINDOW_DEN, COMPACT_WINDOW_NUM};
     use crate::model_window::model_context_window;
+
+    #[test]
+    fn measured_token_gate_fires_even_when_bytes_are_under_cap() {
+        // A token-dense transcript: well under the byte cap, but the measured
+        // prefix tokens already cross the window fraction → must still compact.
+        let window = 200_000u32;
+        let token_cap = token_soft_cap(window); // 120_000
+        assert!(
+            should_compact(10_000, 480_000, token_cap as u32, token_cap),
+            "measured tokens over the window fraction must force compaction"
+        );
+        // Under both caps ⇒ no compaction.
+        assert!(!should_compact(10_000, 480_000, 1_000, token_cap));
+        // Byte cap alone still triggers (turn-1 / no measurement).
+        assert!(should_compact(500_000, 480_000, 0, token_cap));
+    }
 
     #[test]
     fn large_window_models_get_a_larger_cap_than_the_fixed_default() {
@@ -214,11 +243,23 @@ mod compaction_cap_tests {
 /// immediately without firing the hook or touching `session.messages`, so a
 /// short session is unaffected. Compaction never errors — a missing summary just
 /// leaves that turn intact.
-async fn maybe_compact_session(session: &mut Session, opts: &LoopOptions) {
-    let cap = compaction_soft_cap(&session.model);
-    // Cheap pre-check before building the summaries vector: if we are under the
-    // cap there is nothing to do and we must not allocate or fire a hook.
-    if crate::compactor::estimate_transcript_bytes(&session.messages, opts.cas.as_deref()) <= cap {
+async fn maybe_compact_session(
+    session: &mut Session,
+    opts: &LoopOptions,
+    last_input_tokens: u32,
+    turn_model: &str,
+) {
+    // R2: size the cap to the SMALLER of the session model and the routed turn
+    // model window, so a transcript compacted for a 1M-window model isn't then
+    // sent to a 128K routed model and 400. With no routing turn_model ==
+    // session.model, so this is a no-op on the default path.
+    let window = crate::model_window::model_context_window(&session.model)
+        .min(crate::model_window::model_context_window(turn_model));
+    let cap = soft_cap_for_window(window);
+    // Cheap pre-check before building the summaries vector: under BOTH the byte
+    // cap and the measured-token cap there is nothing to do (no alloc, no hook).
+    let bytes = crate::compactor::estimate_transcript_bytes(&session.messages, opts.cas.as_deref());
+    if !should_compact(bytes, cap, last_input_tokens, token_soft_cap(window)) {
         return;
     }
     // Build the per-message summary vector aligned to `session.messages` by
@@ -457,6 +498,41 @@ fn apply_cmd_guard(
 /// when the user opted into `[post_edit] auto_test=true`, so it adds no default
 /// latency.
 async fn run_post_edit_test(cmd: &str) -> Option<String> {
+    run_turn_end_command(cmd, "test-results", "test command").await
+}
+
+/// C9: run the test command and report whether it PASSED, for the pre-edit
+/// regression baseline. Fail-open: a spawn error or timeout returns `true`
+/// (assume green) so we never cry "regression" over a failure we couldn't run.
+async fn run_test_passed(cmd: &str) -> bool {
+    let run = if cfg!(windows) {
+        tokio::process::Command::new("pwsh")
+            .args(["-NoProfile", "-Command", cmd])
+            .output()
+    } else {
+        tokio::process::Command::new("sh").args(["-c", cmd]).output()
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(600), run).await {
+        Ok(Ok(out)) => out.status.success(),
+        _ => true,
+    }
+}
+
+/// Turn-end `auto_lint` twin of [`run_post_edit_test`]. Without this the
+/// configured linter ran per edit but its result was only logged-and-dropped
+/// (`let _ =` in [`post_mutation_autoformat`]) — the model never saw the failure
+/// and proceeded as if clean. Emits a `<lint-results>` feedback block only on a
+/// non-zero exit; fail-open otherwise. Only called when the user opted into
+/// `[post_edit] auto_lint`, so it adds no default latency.
+async fn run_post_edit_lint_block(cmd: &str) -> Option<String> {
+    run_turn_end_command(cmd, "lint-results", "lint command").await
+}
+
+/// Run a turn-end check command through the platform shell and, ONLY when it
+/// exits non-zero, return a tail-truncated `<{tag}>` feedback block the model
+/// sees next turn. None on success / spawn failure / timeout — fail-open, so a
+/// misconfigured command never blocks the turn. Bounded to 600s.
+async fn run_turn_end_command(cmd: &str, tag: &str, label: &str) -> Option<String> {
     let run = if cfg!(windows) {
         tokio::process::Command::new("pwsh")
             .args(["-NoProfile", "-Command", cmd])
@@ -472,8 +548,8 @@ async fn run_post_edit_test(cmd: &str) -> Option<String> {
             let start = chars.len().saturating_sub(4_000);
             let tail: String = chars[start..].iter().collect();
             Some(format!(
-                "<test-results>\nThe configured test command `{cmd}` FAILED — fix the failures before \
-                 continuing or claiming done:\n\n{tail}\n</test-results>"
+                "<{tag}>\nThe configured {label} `{cmd}` FAILED — fix the failures before \
+                 continuing or claiming done:\n\n{tail}\n</{tag}>"
             ))
         }
         // Success / spawn error / timeout ⇒ fail open (no block).
@@ -2808,6 +2884,11 @@ pub struct LoopSummary {
     /// `run_loop` invocation. Paired with `input_tokens` for the same reason —
     /// the goal driver's budget cap counts both directions.
     pub output_tokens: u64,
+    /// C15: the failure-only harness gate blocks (`<edit-check>`/`<test-results>`)
+    /// from the final turn, if any. The goal verifier folds these into its input
+    /// so a model can't claim a goal "Met" while the syntax/test gate it was just
+    /// shown is still failing. `None` when every gate was clean.
+    pub gate_signals: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -2824,6 +2905,11 @@ pub enum LoopError {
     ToolFailure(String),
     #[error("malformed tool args: {0}")]
     BadArgs(String),
+    /// Emitted by `run_loop` when the [`stuck`](crate::stuck) detector confirms a
+    /// degenerate loop (the same action repeated with no change). Terminates the
+    /// turn — it ends a confirmed loop, it cannot create one.
+    #[error("stuck loop: {0}")]
+    StuckLoop(String),
     /// Emitted when the governance policy refuses to start (or continue) a turn:
     /// a denied/omitted model at selection, or cumulative spend over the cap.
     /// The Display string is user-facing and explains the refusal. Only ever
@@ -3578,12 +3664,15 @@ async fn run_loop_inner(
             })
             .unwrap_or_default()
     };
-    // Item E (env `ORIGIN_REPOMAP=1`): when set, prepend a compact, token-budgeted
-    // `<repo-map>` block (aider-style personalized PageRank over a def/ref file
-    // graph) so the model gets repository structure up front. Default-off: with
-    // the flag unset this stays `String::new()` and the assembled prompt — and
-    // thus the prompt cache breakpoints — are byte-identical to before.
-    let repo_map_block = if std::env::var("ORIGIN_REPOMAP").as_deref() == Ok("1") {
+    // Item E / C19: prepend a compact, token-budgeted `<repo-map>` block
+    // (aider-style personalized PageRank over a def/ref file graph) so the model
+    // gets repository structure up front instead of hallucinating paths/symbols.
+    // DEFAULT-ON (the grounding is the accuracy win); set `ORIGIN_REPOMAP=0` to
+    // opt out. It lands in the byte-stable cached prefix, so the token cost is
+    // one-time-into-cache, not per turn.
+    let repo_map_block = if matches!(std::env::var("ORIGIN_REPOMAP").as_deref(), Ok("0")) {
+        String::new() // explicit opt-out
+    } else {
         // Map spans every session root (multi-root cross-references are honoured
         // by the ranker); default to the current dir when the session opened
         // with no explicit roots.
@@ -3592,9 +3681,11 @@ async fn run_loop_inner(
         } else {
             session.roots.clone()
         };
-        crate::subsystems::repo_map_block(&roots).unwrap_or_default()
-    } else {
-        String::new()
+        // C1: bias the map's PageRank toward any files the user named in their
+        // prompt (the highest-precision localization signal). Non-matching
+        // entries are ignored by the ranker, so this is fail-open.
+        let focus = prompt_focus_paths(user_text);
+        crate::subsystems::repo_map_block(&roots, &focus).unwrap_or_default()
     };
     // aider model-tuned edit formats: when `ORIGIN_EDITFMT=1`, append a compact
     // `<origin-edit-format>` block selected by `origin_editfmt::best_format_for`
@@ -3698,6 +3789,10 @@ async fn run_loop_inner(
     // spend against the goal's token budget.
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
+    // R1: the LAST turn's API-counted input (prefix) tokens, for the compaction
+    // measured-token gate. Set on every provider response before the end-of-turn
+    // compaction reads it; the byte path covers turn 1.
+    let mut last_input_tokens: u32;
     // R4: cumulative prompt-cache READ tokens this run_loop — fed into the
     // `origin_cache_hit_total{provider}` Prometheus counter at loop end. Zero
     // unless the provider reported cache reads (Anthropic prompt-cache); stays
@@ -3725,12 +3820,54 @@ async fn run_loop_inner(
     let compile_check_enabled = crate::postcheck::enabled();
     // In-conversation task checklist (TodoWrite). Replaced wholesale when the
     // model calls the tool; carried as a volatile block so the plan stays visible
-    // each turn. Intra-prompt only (resets per user prompt) — `/goal` covers the
-    // cross-prompt objective.
-    let mut todos_block = String::new();
+    // each turn. P2: seed from the session's last todos so the foregrounded
+    // checklist survives across `/goal` iterations and follow-up prompts instead
+    // of resetting to empty every run_loop.
+    let mut todos_block = session
+        .last_todos
+        .as_ref()
+        .and_then(origin_tools::builtins::todo_write::render_block)
+        .unwrap_or_default();
     // Opt-in post-edit test results (config `[post_edit] auto_test=true` +
     // `test_command`). Empty unless the user opted in AND the suite failed.
     let mut test_block = String::new();
+    // Opt-in post-edit lint results (config `[post_edit] auto_lint=true` +
+    // `lint_command`). Twin of `test_block`: empty unless opted in AND the lint
+    // failed — finishes the otherwise dropped lint-repair loop.
+    let mut lint_block = String::new();
+    // C2: degenerate-loop detector. The ring spans the whole turn loop, so it is
+    // declared out here; `stuck_block` carries its Tier-1 nudge into the next
+    // turn's volatile context (Tier-2 returns `LoopError::StuckLoop`).
+    let mut stuck = crate::stuck::StuckDetector::new();
+    let mut stuck_block = String::new();
+    // C10: consecutive turns whose post-edit validation (syntax gate / tests)
+    // still failed. After a couple of failures `relocalize_block` steers the
+    // model to re-read and reconsider the region instead of re-editing the same
+    // spot — complements C2 (which keys on identical repeated actions).
+    let mut edit_check_fail_streak: u32 = 0;
+    let mut relocalize_block = String::new();
+    // C9: regression baseline. With auto_test on, run the suite ONCE before any
+    // edit, so a post-edit failure can be classified as a true regression
+    // (green→red) vs a pre-existing failure. Opt-in ⇒ no default cost.
+    let baseline_tests_passed: Option<bool> = match opts.post_edit.as_deref() {
+        Some(cfg) if cfg.auto_test => match cfg.test_command.as_deref() {
+            Some(cmd) => Some(run_test_passed(cmd).await),
+            None => None,
+        },
+        _ => None,
+    };
+    // C8: reproduction-gate contract (opt-in). A standing instruction to write a
+    // failing test FIRST for a reported bug, so a fix is verified against a real
+    // fail→pass transition (execution-checked by the turn-end test run below).
+    let repro_gate_block = if opts.post_edit.as_deref().is_some_and(|c| c.repro_gate) {
+        "<repro-gate>\nFor a reported BUG: before editing any source, write ONE focused test that \
+         reproduces the bug and FAILS on the current code. Only then fix it, and keep editing until \
+         that test passes. Do not claim the bug is fixed until the reproducing test goes from failing \
+         to passing.\n</repro-gate>"
+            .to_string()
+    } else {
+        String::new()
+    };
 
     // Task 1 (agentgrep exposure-truncation). Already-seen `(file, line)`
     // regions accumulated across this `run_loop` from prior `content`-mode
@@ -3814,7 +3951,14 @@ async fn run_loop_inner(
         // the borrowed `provider`, and `turn_model` is `session.model` — exactly
         // the pre-existing wire.
         let mut rebuilt: Option<Arc<dyn Provider>> = None;
-        let turn_model = match opts.router.as_ref().and_then(|lr| lr.choose_model_ref(turn)) {
+        // R3: if the prior turn's validation kept failing (C10 streak), treat
+        // this turn as "struggling" so the router re-enters the stronger Plan leg.
+        let struggling = edit_check_fail_streak >= 2;
+        let turn_model = match opts
+            .router
+            .as_ref()
+            .and_then(|lr| lr.choose_model_ref_struggling(turn, struggling))
+        {
             Some(pick) if pick.provider.as_str() == provider.name() => pick.model,
             Some(pick) => {
                 // Cross-provider pick: try to rebuild. When this session carries
@@ -3936,6 +4080,10 @@ async fn run_loop_inner(
                 &lsp_diag_block,
                 &compile_check_block,
                 &test_block,
+                &lint_block,
+                &stuck_block,
+                &repro_gate_block,
+                &relocalize_block,
                 &swarm_notices_block,
                 &bg_results_block,
             ] {
@@ -3950,7 +4098,14 @@ async fn run_loop_inner(
             messages: session.snapshot(),
             model: turn_model.clone(),
             tools: tools_schema.clone(),
-            effort: opts.effort,
+            // R6: re-resolve effort against the ROUTED provider. When the session
+            // resolved to None but this turn runs on Anthropic (e.g. a cross-
+            // provider router rebuild), mint Ultracode so the capable model isn't
+            // left at the API default. An explicit `/effort` (already in
+            // opts.effort) still wins.
+            effort: opts.effort.or_else(|| {
+                (turn_provider.name() == "anthropic").then_some(origin_provider::ReasoningEffort::Ultracode)
+            }),
             thinking_tokens: opts.thinking_tokens,
             // Attach images/PDF only to the first turn's user message. On later
             // turns the trailing message is a tool-result, so re-attaching would
@@ -4190,6 +4345,37 @@ async fn run_loop_inner(
                         .await;
                         attempt += 1;
                     }
+                    // C18(b): an empty response (zero blocks AND zero output
+                    // tokens) is a silent provider hiccup. Don't push the empty
+                    // turn (it pollutes the transcript and looks like a clean
+                    // stop); back off and retry on the same bounded budget. Fires
+                    // BEFORE the `session.push` below.
+                    Ok((resp, _spec, _ftm))
+                        if attempt < MAX_PROVIDER_RETRIES
+                            && resp.assistant.blocks.is_empty()
+                            && resp.usage.output_tokens == 0 =>
+                    {
+                        let sleep_secs = (1u32 << (attempt + 1)).clamp(1, MAX_RATE_LIMIT_SLEEP_SECS);
+                        tracing::warn!(attempt, sleep_secs, "provider returned an empty response; backing off and retrying");
+                        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs.into())).await;
+                        attempt += 1;
+                    }
+                    // R7: a persistent Api/Auth failure must fold into the router
+                    // health EMA — otherwise a model that keeps failing keeps a
+                    // perfect score and keeps winning the Scored ranking (and a
+                    // multi-candidate router never routes around it). Restricted to
+                    // the provider Api/Auth arms so non-provider failures (Ctrl+C,
+                    // goal_unreachable) are never mis-attributed to model health.
+                    Err(LoopError::Provider(
+                        e @ (origin_provider::ProviderError::Api(_) | origin_provider::ProviderError::Auth),
+                    )) => {
+                        if let Some(lr) = &opts.router {
+                            let failed_ms =
+                                u64::try_from(provider_call_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                            lr.record(turn_provider.name(), &turn_model, failed_ms, false);
+                        }
+                        return Err(LoopError::Provider(e));
+                    }
                     other => break other?,
                 }
             }
@@ -4345,6 +4531,7 @@ async fn run_loop_inner(
         // already folded into `input_tokens` by the provider impls, so we
         // only need the two top-level fields here.
         total_input_tokens = total_input_tokens.saturating_add(u64::from(resp.usage.input_tokens));
+        last_input_tokens = resp.usage.input_tokens;
         total_output_tokens = total_output_tokens.saturating_add(u64::from(resp.usage.output_tokens));
         // R4: accumulate prompt-cache reads for the `origin_cache_hit_total`
         // counter (fed once at loop end alongside the token totals).
@@ -4488,11 +4675,28 @@ async fn run_loop_inner(
                 turn,
             ));
 
+            // C15: bundle the final turn's FAILURE-only gate blocks (syntax
+            // gate + test results) so the goal verifier sees them. Advisory
+            // blocks (LSP diagnostics, which may be warnings) are deliberately
+            // excluded — only hard failures should auto-block a "Met" claim.
+            let gate_signals = {
+                let mut s = String::new();
+                for b in [&compile_check_block, &test_block] {
+                    if !b.is_empty() {
+                        if !s.is_empty() {
+                            s.push_str("\n\n");
+                        }
+                        s.push_str(b);
+                    }
+                }
+                (!s.is_empty()).then_some(s)
+            };
             return Ok(LoopSummary {
                 assistant_text: text,
                 turns: turn,
                 input_tokens: total_input_tokens,
                 output_tokens: total_output_tokens,
+                gate_signals,
             });
         }
 
@@ -4534,10 +4738,12 @@ async fn run_loop_inner(
                     continue;
                 }
                 tracing::warn!(tool = %name, "unknown tool; returning error to model");
+                let suggestion = suggest_tool_name(&name)
+                    .map_or_else(String::new, |s| format!("; did you mean `{s}`?"));
                 tool_results.push(Block::ToolResult {
                     tool_use_id: id,
                     handle: None,
-                    inline: Some(format!("Error: unknown tool `{name}`").into_bytes()),
+                    inline: Some(format!("Error: unknown tool `{name}`{suggestion}").into_bytes()),
                     cache_marker: None,
                     is_error: true,
                 });
@@ -4554,10 +4760,13 @@ async fn run_loop_inner(
                     Ok(v) => v,
                     Err(e) => {
                         tracing::warn!(tool = %name, error = %e, "malformed tool args; returning error to model");
+                        let shape = schema_shape_hint(meta.input_schema);
                         tool_results.push(Block::ToolResult {
                             tool_use_id: id,
                             handle: None,
-                            inline: Some(format!("Error: malformed args: {e}").into_bytes()),
+                            inline: Some(
+                                format!("Error: malformed args for `{name}`: {e}{shape}").into_bytes(),
+                            ),
                             cache_marker: None,
                             is_error: true,
                         });
@@ -4565,6 +4774,11 @@ async fn run_loop_inner(
                     }
                 }
             };
+            // C7: coerce common LLM shape mismatches (scalar→array, "3"→3, a
+            // fenced ```json blob, a near-miss enum) toward the tool's declared
+            // schema before dispatch. Fail-open + idempotent: returns `args`
+            // unchanged when nothing matches, so correct calls are untouched.
+            let args = origin_tools::coerce::coerce(meta.input_schema, &args);
             let preview = args.to_string();
 
             // Compute the memoization key using the RAW input bytes (not
@@ -4826,10 +5040,10 @@ async fn run_loop_inner(
             // NEXT turn's volatile block, and ack. Empty/malformed clears it.
             if name == "TodoWrite" {
                 let n = args.get("todos").and_then(Value::as_array).map_or(0, Vec::len);
-                todos_block = origin_tools::builtins::todo_write::render_block(
-                    args.get("todos").unwrap_or(&Value::Null),
-                )
-                .unwrap_or_default();
+                let todos = args.get("todos").cloned().unwrap_or(Value::Null);
+                todos_block = origin_tools::builtins::todo_write::render_block(&todos).unwrap_or_default();
+                // P2: persist so the checklist survives the next run_loop.
+                session.last_todos = Some(todos);
                 tool_results.push(Block::ToolResult {
                     tool_use_id: id,
                     handle: None,
@@ -5103,6 +5317,10 @@ async fn run_loop_inner(
             // the model-time remainder rather than miscredited as useful tool
             // work). Pure measurement; default path is byte-identical.
             let dispatch_start = std::time::Instant::now();
+            // C4: set true when the Bash arm below ran a command that exited
+            // non-zero / timed out / was killed, so the result block carries a
+            // structural is_error (not just a `failed` field buried in the body).
+            let mut bash_failed = false;
             let result_bytes: Vec<u8> = if let Some(hit) = cache_hit {
                 // Serve the cached body annotated with the originating turn.
                 let store = opts.cas.as_ref().ok_or_else(|| {
@@ -5202,9 +5420,13 @@ async fn run_loop_inner(
                     match run_bash_streaming(&args, opts.event_tx.as_ref(), opts.proc_supervisor.as_ref())
                         .await
                     {
-                        Ok(bytes) => bytes,
+                        Ok((bytes, failed)) => {
+                            bash_failed = failed;
+                            bytes
+                        }
                         Err(msg) => {
                             tracing::warn!(tool = %name, %msg, "Bash dispatch failed; returning error to model");
+                            stuck.record(&name, &preview, true, msg.as_bytes());
                             // R4: count the failed Bash tool call.
                             if let Some(m) = opts.metrics.as_deref() {
                                 m.tool_call_total(provider.name(), &name, "err").inc();
@@ -5269,6 +5491,7 @@ async fn run_loop_inner(
                         }
                         Err(LoopError::BadArgs(msg) | LoopError::ToolFailure(msg)) => {
                             tracing::warn!(tool = %name, %msg, "tool dispatch failed; returning error to model");
+                            stuck.record(&name, &preview, true, msg.as_bytes());
                             // R4: count the failed tool call.
                             if let Some(m) = opts.metrics.as_deref() {
                                 m.tool_call_total(provider.name(), &name, "err").inc();
@@ -5298,6 +5521,11 @@ async fn run_loop_inner(
                     }
                 }
             };
+
+            // C2: fingerprint this successful tool outcome for the stuck-loop
+            // detector. A Bash command that exited non-zero counts as an error
+            // (`bash_failed`); all other success-path results are not errors.
+            stuck.record(&name, &preview, bash_failed, &result_bytes);
 
             // SchemaCrush (headroom SmartCrusher port): compress a large,
             // homogeneous JSON array tool result into a columnar table on its
@@ -5441,7 +5669,7 @@ async fn run_loop_inner(
                     handle: Some(*h.as_bytes()),
                     inline: None,
                     cache_marker: None,
-                    is_error: false,
+                    is_error: bash_failed,
                 }
             } else {
                 Block::ToolResult {
@@ -5449,7 +5677,7 @@ async fn run_loop_inner(
                     handle: None,
                     inline: Some(result_bytes),
                     cache_marker: None,
-                    is_error: false,
+                    is_error: bash_failed,
                 }
             };
             // gemini PostTool lifecycle hook (informational): fires after a tool
@@ -5544,6 +5772,18 @@ async fn run_loop_inner(
             }
         }
 
+        // C2: assess the loop once per turn after all tool outcomes are
+        // recorded. A confirmed degenerate loop halts the turn (ends a loop, it
+        // cannot create one); a softer signal becomes a next-turn nudge.
+        match stuck.assess() {
+            crate::stuck::StuckLevel::Halt(why) => {
+                tracing::warn!(%why, "stuck-loop detector halting the turn");
+                return Err(LoopError::StuckLoop(why));
+            }
+            crate::stuck::StuckLevel::Nudge(n) => stuck_block = n,
+            crate::stuck::StuckLevel::Ok => stuck_block.clear(),
+        }
+
         // Append tool results as a single Role::Tool message (provider crates
         // will translate this to the right wire shape per provider).
         let mut tool_msg = Message::new(Role::Tool);
@@ -5558,7 +5798,7 @@ async fn run_loop_inner(
         // BEFORE the cache-marker pass below so the breakpoints land on the
         // post-compaction transcript. Below the cap (the default for short
         // sessions) this is a no-op ⇒ byte-identical.
-        maybe_compact_session(session, opts).await;
+        maybe_compact_session(session, opts, last_input_tokens, &turn_model).await;
 
         // Place a prompt-cache breakpoint at the freshly closed turn boundary
         // so the next iteration's `ChatRequest` (which re-sends the full
@@ -5594,11 +5834,58 @@ async fn run_loop_inner(
         // accept their suite's cost. Failures are fed back like the other gates.
         if !lsp_edited_paths.is_empty() {
             if let Some(cfg) = opts.post_edit.as_deref() {
-                if cfg.auto_test {
+                // C8: the repro gate also runs the test command at turn-end, so
+                // the model's failing→passing reproduction test is execution-checked.
+                if cfg.auto_test || cfg.repro_gate {
                     if let Some(cmd) = cfg.test_command.as_deref() {
                         test_block = run_post_edit_test(cmd).await.unwrap_or_default();
+                        // C9: classify a post-edit failure against the pre-edit
+                        // baseline — a true regression (was green) vs failures
+                        // that were already red before this change.
+                        if !test_block.is_empty() {
+                            match baseline_tests_passed {
+                                Some(true) => test_block.insert_str(
+                                    0,
+                                    "<regression>\nThese tests PASSED before your change — your edit \
+                                     introduced a regression. Fix it before continuing or claiming done.\n\
+                                     </regression>\n",
+                                ),
+                                Some(false) => test_block.push_str(
+                                    "\n\n(note: the suite was already failing before your change — \
+                                     not all of these failures are necessarily caused by your edit.)",
+                                ),
+                                None => {}
+                            }
+                        }
                     }
                 }
+                // C16: opt-in lint feedback — the twin of auto_test. The
+                // per-edit lint only logged its result; surface it to the model.
+                if cfg.auto_lint {
+                    if let Some(cmd) = cfg.lint_command.as_deref() {
+                        lint_block = run_post_edit_lint_block(cmd).await.unwrap_or_default();
+                    }
+                }
+            }
+        }
+        // C10: track consecutive turns where post-edit validation still failed.
+        // Two in a row ⇒ steer the model to re-localize rather than re-edit the
+        // same spot. Only meaningful on turns that actually edited something.
+        if !lsp_edited_paths.is_empty() {
+            if compile_check_block.is_empty() && test_block.is_empty() {
+                edit_check_fail_streak = 0;
+                relocalize_block.clear();
+            } else {
+                edit_check_fail_streak += 1;
+                relocalize_block = if edit_check_fail_streak >= 2 {
+                    "<re-localize>\nYour last edits to these files have failed validation more than once. \
+                     Stop re-editing the same spot: re-read the file around the failure, reconsider whether \
+                     the change belongs in a DIFFERENT function/file, and verify your assumption about the \
+                     cause before editing again.\n</re-localize>"
+                        .to_string()
+                } else {
+                    String::new()
+                };
             }
         }
     }
@@ -6472,6 +6759,14 @@ async fn dispatch_tool(
                 "recent_changes" => Query::RecentChanges {
                     since_ms: q_args["since_ms"].as_i64().unwrap_or(0),
                 },
+                // C19: resolve a bare symbol NAME → its declarations, so the
+                // model can verify a function/type exists before referencing it.
+                "by_name" => Query::ByName {
+                    name: q_args["name"]
+                        .as_str()
+                        .ok_or_else(|| LoopError::BadArgs("graph_query.args.name: not a string".into()))?
+                        .to_string(),
+                },
                 other => return Err(LoopError::BadArgs(format!("graph_query: unknown kind `{other}`"))),
             };
             let result = {
@@ -6604,6 +6899,12 @@ async fn dispatch_tool(
                 },
                 "recent_changes" => Query::RecentChanges {
                     since_ms: q_args["since_ms"].as_i64().unwrap_or(0),
+                },
+                "by_name" => Query::ByName {
+                    name: q_args["name"]
+                        .as_str()
+                        .ok_or_else(|| LoopError::BadArgs("graph_explain.args.name: not a string".into()))?
+                        .to_string(),
                 },
                 other => {
                     return Err(LoopError::BadArgs(format!(
@@ -7060,10 +7361,23 @@ fn rebuild_groups(
 fn serialize_query_result(r: &origin_codegraph::query::QueryResult) -> String {
     use origin_codegraph::query::QueryResult;
     match r {
-        QueryResult::Empty => "{}".to_string(),
+        // C19: a bare `{}` reads as "nothing here" and hides the far more common
+        // cause — the graph was never built this session. Point the model at the
+        // fix instead of letting an empty result look like a confirmed absence.
+        QueryResult::Empty => serde_json::json!({
+            "nodes": [],
+            "note": "no results — if the code graph has not been built this session, run graph_rebuild first"
+        })
+        .to_string(),
         QueryResult::Nodes(nodes) => {
             let arr: Vec<serde_json::Value> = nodes.iter().map(node_row_to_json).collect();
-            serde_json::json!({ "nodes": arr }).to_string()
+            let mut obj = serde_json::json!({ "nodes": arr });
+            if nodes.is_empty() {
+                obj["note"] = serde_json::Value::String(
+                    "no matching symbol — check the name, or run graph_rebuild if the graph is not built this session".into(),
+                );
+            }
+            obj.to_string()
         }
         QueryResult::Path(nodes) => {
             let arr: Vec<serde_json::Value> = nodes.iter().map(node_row_to_json).collect();
@@ -7296,15 +7610,133 @@ mod ask_user_interactive_tests {
     }
 }
 
+/// Extract file-path-like tokens from the user's prompt, to bias the repo map's
+/// `PageRank` toward files the user actually named. Keeps tokens that contain a
+/// path separator or end in a known source extension; the ranker ignores any
+/// that don't name a real file, so over-inclusion is harmless.
+fn prompt_focus_paths(prompt: &str) -> Vec<String> {
+    const EXTS: &[&str] = &[
+        "rs", "py", "js", "ts", "tsx", "jsx", "go", "java", "c", "cpp", "cc", "h", "hpp", "rb",
+        "php", "cs", "swift", "kt", "scala", "lua", "sh", "toml", "yaml", "yml", "json", "md",
+        "html", "css", "sql",
+    ];
+    prompt
+        .split(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | '(' | ')' | ',' | '<' | '>' | '[' | ']'))
+        .map(|t| t.trim_matches(|c: char| matches!(c, '.' | ':' | ';' | '!' | '?')))
+        .filter(|t| {
+            !t.is_empty()
+                && (t.contains('/')
+                    || t.contains('\\')
+                    || std::path::Path::new(t)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| EXTS.contains(&e)))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Levenshtein distance — a small two-row DP, no dependency.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// The closest registered (or runtime) tool name to `name` — a prefix/case match
+/// or a small edit distance — or `None` when nothing is plausibly close, so a
+/// genuinely novel name doesn't get a garbage suggestion. Targets cross-harness
+/// vocabulary drift (`read_file`/`edit_file`/`search`/`run`).
+fn suggest_tool_name(name: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let names: Vec<String> = registry_iter()
+        .map(|m| m.name.to_string())
+        .chain(runtime_tool_schemas().into_iter().map(|s| s.name))
+        .collect();
+    if let Some(m) = names.iter().find(|n| {
+        let nl = n.to_ascii_lowercase();
+        n.eq_ignore_ascii_case(name) || nl.starts_with(&lower) || lower.starts_with(&nl)
+    }) {
+        return Some(m.clone());
+    }
+    let thresh = (name.len() / 3).max(2);
+    names
+        .into_iter()
+        .map(|n| (edit_distance(&lower, &n.to_ascii_lowercase()), n))
+        .filter(|(d, _)| *d <= thresh)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, n)| n)
+}
+
+/// A one-line shape hint parsed live from a tool's `input_schema`: its required
+/// fields, plus a truncation nudge so a `max_tokens`-cut large-payload call
+/// (Write/Edit/MultiEdit) retries smaller instead of re-guessing the same bad
+/// JSON. Empty when the schema has no required fields or won't parse.
+fn schema_shape_hint(schema: &str) -> String {
+    let Ok(v) = serde_json::from_str::<Value>(schema) else {
+        return String::new();
+    };
+    let req: Vec<&str> = v
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if req.is_empty() {
+        return String::new();
+    }
+    format!(
+        " (expected an object with required fields {req:?}; if the args were truncated, retry with a smaller payload)"
+    )
+}
+
+#[cfg(test)]
+mod dispatch_hint_tests {
+    use super::{prompt_focus_paths, schema_shape_hint, suggest_tool_name};
+
+    #[test]
+    fn focus_paths_picks_files_the_user_named() {
+        let f = prompt_focus_paths("please fix the bug in crates/foo/bar.rs and update main.py, thanks");
+        assert!(f.contains(&"crates/foo/bar.rs".to_string()), "{f:?}");
+        assert!(f.contains(&"main.py".to_string()), "{f:?}");
+        // Ordinary prose words are not treated as paths.
+        assert!(prompt_focus_paths("make the code faster please").is_empty());
+    }
+
+    #[test]
+    fn suggests_closest_tool_for_cross_harness_names() {
+        // Vocabulary drift from other harnesses resolves to our names.
+        assert_eq!(suggest_tool_name("read_file").as_deref(), Some("Read"));
+        assert_eq!(suggest_tool_name("Edt").as_deref(), Some("Edit"));
+        // A genuinely novel name gets no (garbage) suggestion.
+        assert_eq!(suggest_tool_name("frobnicate_quux_9000"), None);
+    }
+
+    #[test]
+    fn shape_hint_lists_required_fields() {
+        let hint = schema_shape_hint(
+            r#"{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}"#,
+        );
+        assert!(hint.contains("file_path"), "hint: {hint}");
+        // No required fields ⇒ no hint.
+        assert!(schema_shape_hint(r#"{"type":"object"}"#).is_empty());
+    }
+}
+
 /// Dispatch the `Bash` tool and forward output to `event_tx` as
 /// [`StreamEvent::ToolChunk`] events **in real time** — each line is streamed
 /// to the user the instant the child writes it, not after the process exits.
-///
-/// This is the key difference from a buffered dispatch: a long-running (or
-/// stuck) command surfaces its output progressively, so the user can tell
-/// whether work is happening rather than staring at a silent gap and
-/// wondering if the command hung. The LLM still receives the fully
-/// accumulated structured body via the returned JSON bytes.
+/// The LLM still receives the fully accumulated structured body (and the
+/// `is_error` bool) via the returned tuple.
 ///
 /// `event_tx` being `None` (unit tests, headless runs) is supported — chunks
 /// are skipped but execution still completes and the full body is returned.
@@ -7317,7 +7749,7 @@ async fn run_bash_streaming(
     // reads from, so background+Monitor works across tool calls. `None` (tests)
     // ⇒ a fresh per-call supervisor, byte-identical to before.
     proc_supervisor: Option<&origin_tools::proc_supervisor::Supervisor>,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, bool), String> {
     use origin_tools::proc_supervisor::{KillOnDrop, ProcStatus, SpawnOpts};
     use std::time::Duration;
 
@@ -7375,9 +7807,11 @@ async fn run_bash_streaming(
     // background split in `bash_v2`. No streaming — the user tails via Monitor.
     if run_in_background {
         let result = serde_json::json!({"status": "started", "pid": pid});
-        return Ok(serde_json::to_string(&result)
+        let bytes = serde_json::to_string(&result)
             .expect("BUG: bash result Value always serializes")
-            .into_bytes());
+            .into_bytes();
+        // A successfully-started background command is not a failure.
+        return Ok((bytes, false));
     }
 
     // Foreground. A kill-on-drop guard hard-kills the child if THIS future is
@@ -7509,7 +7943,11 @@ async fn run_bash_streaming(
         }
     }
 
-    Ok(bash_result_bytes(status_str, exit_code, acc))
+    // The second tuple element is the structural is_error flag: a non-zero exit
+    // (or timeout/kill, which report -1) is the single most common real failure
+    // (a failing `cargo test`/`pytest`/lint run via Bash) and otherwise reaches
+    // the model as a structurally-clean result, driving false "done" claims.
+    Ok((bash_result_bytes(status_str, exit_code, acc), exit_code != 0))
 }
 
 /// Serialize the structured Bash tool result. `stdout` is capped to the shared
@@ -10445,7 +10883,7 @@ mod bash_streaming_tests {
             "early at {first_at:?}, late at {late_at:?}; gap too small — output looks buffered, not real-time"
         );
 
-        let bytes = driver.await.expect("task joined").expect("bash ok");
+        let (bytes, _) = driver.await.expect("task joined").expect("bash ok");
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
         assert_eq!(v["status"], "exited");
         assert_eq!(v["exit_code"], 0);
@@ -10469,7 +10907,7 @@ mod bash_streaming_tests {
         #[cfg(windows)]
         let cmd = "$null";
         let args = serde_json::json!({ "command": cmd, "timeout": 5 });
-        let bytes = run_bash_streaming(&args, Some(&tx), None).await.expect("bash ok");
+        let (bytes, _) = run_bash_streaming(&args, Some(&tx), None).await.expect("bash ok");
         drop(tx);
 
         let mut saw_result = false;
@@ -10491,6 +10929,23 @@ mod bash_streaming_tests {
         assert_eq!(v["exit_code"], 0);
     }
 
+    /// C4: a non-zero exit must surface as the structural is_error flag (the
+    /// returned bool), not merely a `failed` field buried in the body — so a
+    /// failing `cargo test`/`pytest`/lint run via Bash can't read as a clean
+    /// result and drive a false "done" claim.
+    #[tokio::test]
+    async fn nonzero_exit_sets_the_is_error_flag() {
+        let fail = serde_json::json!({ "command": "exit 7", "timeout": 5 });
+        let (bytes, failed) = run_bash_streaming(&fail, None, None).await.expect("ran");
+        assert!(failed, "non-zero exit must set the is_error bool");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(v["failed"], true, "body failed-marker stays in sync");
+
+        let ok = serde_json::json!({ "command": "exit 0", "timeout": 5 });
+        let (_b, failed0) = run_bash_streaming(&ok, None, None).await.expect("ran");
+        assert!(!failed0, "a zero exit is not an error");
+    }
+
     /// `run_in_background` returns the pid immediately without streaming, just
     /// like the foreground/background split in `bash_v2`.
     #[tokio::test]
@@ -10510,7 +10965,7 @@ mod bash_streaming_tests {
             "run_in_background": true,
         });
         let started = Instant::now();
-        let bytes = run_bash_streaming(&args, Some(&tx), None).await.expect("bash ok");
+        let (bytes, _) = run_bash_streaming(&args, Some(&tx), None).await.expect("bash ok");
         // Returned far sooner than the child's 30s sleep ⇒ we did not block on
         // it. The generous 10s ceiling absorbs even a pathologically slow shell
         // cold-start while still proving the non-blocking guarantee.
@@ -10541,7 +10996,7 @@ mod bash_streaming_tests {
         #[cfg(windows)]
         let cmd = "Write-Output a; Write-Output b";
         let args = serde_json::json!({ "command": cmd, "timeout": 5 });
-        let bytes = run_bash_streaming(&args, None, None).await.expect("bash ok");
+        let (bytes, _) = run_bash_streaming(&args, None, None).await.expect("bash ok");
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
         assert_eq!(v["status"], "exited");
         let stdout = v["stdout"].as_str().expect("stdout");
@@ -10566,7 +11021,7 @@ mod bash_streaming_tests {
             "command": cmd,
             "run_in_background": true,
         });
-        let bytes = run_bash_streaming(&args, None, Some(&shared))
+        let (bytes, _) = run_bash_streaming(&args, None, Some(&shared))
             .await
             .expect("background spawn ok");
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");

@@ -41,42 +41,101 @@ pub fn multi_edit(args: &MultiEditArgs, guard: Option<&WriteGuard>) -> Result<Va
     let bytes = std::fs::read(&args.file_path)
         .map_err(|e| ToolError::new(ErrClass::Io, "not_found", format!("{}: {e}", args.file_path)))?;
     let det = text_fmt::detect(&bytes);
-    let mut text = text_fmt::normalise_to_lf(&bytes, &det)?;
-    let mut applied = 0u32;
+    let original = text_fmt::normalise_to_lf(&bytes, &det)?;
     let total = args.edits.len();
-    for op in &args.edits {
-        // `applied` is 0-based internally; report it 1-based to the model.
-        let edit_no = applied + 1;
-        // An empty needle matches between every character; replacing it would
-        // splice `new` at every position and corrupt the file.
+
+    // Validate every op up front (cheap, fail-fast, no partial file writes).
+    for (i, op) in args.edits.iter().enumerate() {
         if op.old.is_empty() {
             return Err(ToolError::new(
                 ErrClass::Validation,
                 "empty_old_string",
-                format!("edit {edit_no} of {total}: old must not be empty"),
+                format!("edit {} of {total}: old must not be empty", i + 1),
             )
             .recoverable(true));
         }
+        if op.old == op.new {
+            return Err(ToolError::new(
+                ErrClass::Edit,
+                "noop",
+                format!("edit {} of {total}: new equals old; this edit changes nothing", i + 1),
+            )
+            .recoverable(true)
+            .hint("remove the no-op edit or target a different region"));
+        }
+    }
+
+    // C14: when every op resolves to a UNIQUE, DISJOINT range against the
+    // original snapshot, apply them in one right-to-left pass — so no edit's
+    // result can shift another's match (the order-dependent corruption class).
+    // Anything that can't (replace_all, chained edits whose `old` only exists
+    // after a prior edit, overlaps) falls back to the sequential apply below,
+    // preserving today's chained-edit semantics.
+    let text = if let Some(updated) = try_disjoint_apply(&original, &args.edits) {
+        updated
+    } else {
+        sequential_apply(original, &args.edits, total)?
+    };
+
+    let new_bytes = text_fmt::denormalise(&text, &det);
+    atomic_write(&args.file_path, &new_bytes)?;
+    Ok(json!({"ok": true, "applied": total}))
+}
+
+type Resolved = (std::ops::Range<usize>, String);
+
+/// Resolve every op to a unique byte range in the ORIGINAL `text` and, if all
+/// ranges are disjoint, splice the replacements right-to-left. `None` (→ caller
+/// falls back to [`sequential_apply`]) when any op uses `replace_all`, matches
+/// 0 or >1 times in the original, or its range overlaps another's.
+fn try_disjoint_apply(text: &str, edits: &[EditOp]) -> Option<String> {
+    // (target byte range in `text`, re-indented replacement)
+    let mut ranges: Vec<Resolved> = Vec::with_capacity(edits.len());
+    for op in edits {
+        if op.replace_all {
+            return None;
+        }
+        let range = match text.matches(op.old.as_str()).count() {
+            1 => {
+                let start = text.find(op.old.as_str())?;
+                start..start + op.old.len()
+            }
+            _ => editmatch::ws_tolerant_unique_range(text, &op.old)?,
+        };
+        let new = editmatch::reindent_replacement(&op.new, &op.old, &text[range.clone()]);
+        ranges.push((range, new));
+    }
+    ranges.sort_by_key(|(r, _)| r.start);
+    if ranges.windows(2).any(|w| w[0].0.end > w[1].0.start) {
+        return None; // overlapping edits ⇒ not disjoint
+    }
+    let mut s = text.to_string();
+    for (range, new) in ranges.into_iter().rev() {
+        s.replace_range(range, &new);
+    }
+    Some(s)
+}
+
+/// The original chained-capable apply: each op runs against the buffer already
+/// mutated by earlier ops. Used when [`try_disjoint_apply`] can't apply cleanly.
+fn sequential_apply(mut text: String, edits: &[EditOp], total: usize) -> Result<String, ToolError> {
+    for (i, op) in edits.iter().enumerate() {
+        let edit_no = i + 1;
         let count = text.matches(op.old.as_str()).count();
         text = match count {
             0 => {
-                // Whitespace-tolerant fallback (unique run only); else a
-                // recoverable no_match with the closest near-miss line.
-                if let Some(range) = editmatch::ws_tolerant_unique_range(&text, &op.old) {
-                    let mut s = text.clone();
-                    s.replace_range(range, &op.new);
+                // ws-tolerant fallback (unique + re-indented); then a Read-gutter
+                // retry; else a recoverable no_match with the near-miss line.
+                if let Some(s) = editmatch::ws_unique_replace(&text, &op.old, &op.new) {
                     s
+                } else if let Some(stripped) = editmatch::strip_read_gutter(&op.old) {
+                    match text.matches(&stripped).count() {
+                        1 => text.replacen(&stripped, &op.new, 1),
+                        _ => editmatch::ws_unique_replace(&text, &stripped, &op.new)
+                            .ok_or_else(|| no_match(&text, &op.old, edit_no, total))?,
+                    }
                 } else {
-                    let msg = editmatch::closest_ws_line(&text, &op.old).map_or_else(
-                        || format!("edit {edit_no} of {total}: '{}' not found", op.old),
-                        |line| {
-                            format!(
-                                "edit {edit_no} of {total}: '{}' not found (closest match: line {line} differs only in whitespace)",
-                                op.old
-                            )
-                        },
-                    );
-                    return Err(ToolError::new(ErrClass::Edit, "no_match", msg).recoverable(true));
+                    return Err(no_match(&text, &op.old, edit_no, total));
                 }
             }
             1 => text.replacen(op.old.as_str(), op.new.as_str(), 1),
@@ -96,11 +155,16 @@ pub fn multi_edit(args: &MultiEditArgs, guard: Option<&WriteGuard>) -> Result<Va
                 .recoverable(true));
             }
         };
-        applied += 1;
     }
-    let new_bytes = text_fmt::denormalise(&text, &det);
-    atomic_write(&args.file_path, &new_bytes)?;
-    Ok(json!({"ok": true, "applied": applied}))
+    Ok(text)
+}
+
+fn no_match(text: &str, old: &str, edit_no: usize, total: usize) -> ToolError {
+    let msg = editmatch::closest_ws_line(text, old).map_or_else(
+        || format!("edit {edit_no} of {total}: '{old}' not found"),
+        |line| format!("edit {edit_no} of {total}: '{old}' not found (closest match: line {line} differs only in whitespace)"),
+    );
+    ToolError::new(ErrClass::Edit, "no_match", msg).recoverable(true)
 }
 
 fn atomic_write(path: &str, bytes: &[u8]) -> Result<(), ToolError> {

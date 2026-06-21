@@ -4,6 +4,17 @@ All notable changes to `origin` will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely;
 versions correspond to phase milestones from the implementation plan.
 
+## 0.9.13
+
+### Added (harness accuracy — fewer plan/execute errors)
+Two adversarially-verified accuracy passes (25 fixes), each TDD'd:
+- **Execution**: non-zero-exit `Bash` now sets the structural `is_error` flag (a failing `cargo test`/`pytest` no longer reads as a clean result); a new **stuck-loop detector** (`stuck.rs`) nudges then halts a degenerate loop (repeated/ping-ponging actions) that nothing previously bounded; schema-aligned **argument coercion** fixes common LLM shape mistakes (scalar→array, `"3"`→3, fenced JSON) before dispatch; unknown-tool "did you mean" + malformed-arg shape hints.
+- **Editing**: the whitespace fallback now re-indents the replacement (no more `IndentationError`); `ApplyPatch` gets fuzzy hunk relocation + ws-tolerance; Read-gutter strip + no-op rejection; `MultiEdit` disjoint-snapshot apply; `WriteGuard` stat-snapshots so out-of-band (`Bash`/format) edits force a fresh Read.
+- **Verification**: the goal verifier now sees the final syntax/test gate output **and** the actual last tool-result evidence (no more rubber-stamping prose); opt-in repro-gate + regression baseline (green→red classification); `auto_lint` feedback wired into a `<lint-results>` block.
+- **Grounding**: the repo map is **default-on** (`ORIGIN_REPOMAP=0` to opt out) and biased toward files named in the prompt; a `graph_query { kind: by_name }` resolver lets the model verify a symbol exists before referencing it.
+- **Routing / context**: compaction now also fires on the **measured** prefix-token count (token-dense transcripts no longer overflow into a 400) and is sized to the smaller of the session/routed-model window; legacy `gpt-4`/`gpt-4-32k` windows corrected; persistent `Api`/`Auth` provider failures fold into router health; effort re-resolved per routed turn; a failing-validation streak re-enters the stronger Plan model.
+- **Providers**: a single malformed SSE frame no longer kills a non-Anthropic turn (skip-and-continue); empty responses retry.
+
 ## Unreleased
 
 ### Added

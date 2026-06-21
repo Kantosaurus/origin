@@ -38,6 +38,17 @@ pub fn edit_v2(args: EditArgs, guard: Option<&WriteGuard>) -> Result<Value, Tool
         .recoverable(true)
         .hint("provide the exact text to replace"));
     }
+    // A no-op edit (old == new) silently "succeeds" while changing nothing — a
+    // wasted turn the model reads as progress. Reject it so it self-corrects.
+    if args.old_string == args.new_string {
+        return Err(ToolError::new(
+            ErrClass::Edit,
+            "noop",
+            "new_string equals old_string; this edit changes nothing",
+        )
+        .recoverable(true)
+        .hint("edit a different region, or omit this edit"));
+    }
     // Read-before-edit guard (mirrors Write): refuse to edit a file the model has
     // not Read this session, so `old_string` reflects observed content rather than
     // a hallucinated mental model. `None` (tests/headless) ⇒ no guard.
@@ -61,27 +72,23 @@ pub fn edit_v2(args: EditArgs, guard: Option<&WriteGuard>) -> Result<Value, Tool
     let updated = match count {
         0 => {
             // Exact match failed. Try ONE whitespace-tolerant fallback that
-            // absorbs indentation / trailing-whitespace drift — but only when it
-            // resolves to a UNIQUE run (it never guesses). Otherwise return
-            // no_match enriched with the closest whitespace-only near-miss so the
-            // model can correct in one step instead of blind-retrying.
-            if let Some(range) = editmatch::ws_tolerant_unique_range(&text, &args.old_string) {
-                let mut s = text.clone();
-                s.replace_range(range, &args.new_string);
+            // absorbs indentation / trailing-whitespace drift (re-indenting the
+            // replacement to the matched region) — but only when it resolves to a
+            // UNIQUE run (it never guesses). If that also fails and the needle
+            // looks like a pasted Read line-number gutter, retry against the
+            // gutter-stripped needle (the ws-fallback can't fix digit drift).
+            // Otherwise return no_match enriched with the closest near-miss.
+            if let Some(s) = editmatch::ws_unique_replace(&text, &args.old_string, &args.new_string) {
                 s
+            } else if let Some(stripped) = editmatch::strip_read_gutter(&args.old_string) {
+                let updated = match text.matches(&stripped).count() {
+                    1 => text.replacen(&stripped, &args.new_string, 1),
+                    _ => editmatch::ws_unique_replace(&text, &stripped, &args.new_string)
+                        .ok_or_else(|| gutter_or_no_match(&text, &args.old_string, &args.file_path))?,
+                };
+                updated
             } else {
-                let msg = editmatch::closest_ws_line(&text, &args.old_string).map_or_else(
-                    || format!("'{}' not found in {}", args.old_string, args.file_path),
-                    |line| {
-                        format!(
-                            "'{}' not found in {} (closest match: line {line} differs only in whitespace)",
-                            args.old_string, args.file_path
-                        )
-                    },
-                );
-                return Err(ToolError::new(ErrClass::Edit, "no_match", msg)
-                    .recoverable(true)
-                    .hint("widen the needle or add surrounding context"));
+                return Err(gutter_or_no_match(&text, &args.old_string, &args.file_path));
             }
         }
         1 => text.replacen(&args.old_string, &args.new_string, 1),
@@ -112,6 +119,18 @@ pub fn edit_v2(args: EditArgs, guard: Option<&WriteGuard>) -> Result<Value, Tool
         "ok": true,
         "hunks": [hunk],
     }))
+}
+
+/// The `edit.no_match` error, enriched with the closest whitespace-only
+/// near-miss line so the model can correct in one step.
+fn gutter_or_no_match(text: &str, old: &str, path: &str) -> ToolError {
+    let msg = editmatch::closest_ws_line(text, old).map_or_else(
+        || format!("'{old}' not found in {path}"),
+        |line| format!("'{old}' not found in {path} (closest match: line {line} differs only in whitespace)"),
+    );
+    ToolError::new(ErrClass::Edit, "no_match", msg)
+        .recoverable(true)
+        .hint("widen the needle or add surrounding context")
 }
 
 fn build_hunk(before: &str, old: &str, new: &str) -> Value {

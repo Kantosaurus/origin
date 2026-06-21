@@ -2311,6 +2311,38 @@ fn last_assistant_text(session: &Session) -> String {
     String::new()
 }
 
+/// P4: the most recent tool-result evidence (tail-capped), read from inline
+/// bytes or the CAS handle. Gives the goal verifier the ACTUAL last tool output
+/// to check a "Met" claim against — otherwise it rubber-stamps the main model's
+/// self-narrated prose whenever no failure gate fired. `None` when the last turn
+/// ran no tools or the evidence is empty.
+fn last_tool_evidence(session: &Session, cas: Option<&Store>) -> Option<String> {
+    use origin_core::types::{Block, Role};
+    let msg = session.messages.iter().rev().find(|m| matches!(m.role, Role::Tool))?;
+    let mut out = String::new();
+    for b in &msg.blocks {
+        if let Block::ToolResult { handle, inline, .. } = b {
+            let bytes = inline.clone().or_else(|| match (handle, cas) {
+                (Some(h), Some(store)) => store.get(origin_cas::Hash::from_bytes(*h)).ok().flatten(),
+                _ => None,
+            });
+            if let Some(bytes) = bytes {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+    }
+    if out.trim().is_empty() {
+        return None;
+    }
+    // Tail-cap: results/failures surface at the end, and the verifier is cheap.
+    let chars: Vec<char> = out.chars().collect();
+    let start = chars.len().saturating_sub(2_000);
+    Some(chars[start..].iter().collect())
+}
+
 /// The empty `LoopSummary` returned when a goal iteration clears before any
 /// `run_loop` summary is available. Extracted so the return sites that need it
 /// stay identical (`LoopSummary` does not derive `Default`). `const` to satisfy
@@ -2321,6 +2353,7 @@ const fn empty_loop_summary() -> origin_daemon::agent::LoopSummary {
         turns: 0,
         input_tokens: 0,
         output_tokens: 0,
+        gate_signals: None,
     }
 }
 
@@ -2647,6 +2680,7 @@ async fn handle_goal_cleared(
 /// `drive_decision`. Each guard is dropped explicitly at its last use so the
 /// lock is not held over the intervening await (clippy
 /// `significant_drop_tightening`).
+#[allow(clippy::too_many_arguments)]
 async fn run_verifier_dispatch(
     session: &Session,
     active_goal: &tokio::sync::Mutex<Option<origin_goal::GoalState>>,
@@ -2654,8 +2688,25 @@ async fn run_verifier_dispatch(
     event_tx: &tokio::sync::mpsc::Sender<StreamEvent>,
     input_tokens: u64,
     output_tokens: u64,
+    gate_signals: Option<&str>,
+    cas: Option<&Store>,
 ) -> Option<origin_daemon::goal_driver::DriverDecision> {
-    let last_text = last_assistant_text(session);
+    // C15: fold the failure-only harness gate blocks into the text the verifier
+    // judges, so a "Met" claim can't override a still-failing syntax/test gate.
+    // Appended at the END so the driver's tail-truncation keeps it.
+    let mut last_text = match gate_signals {
+        Some(sig) if !sig.is_empty() => {
+            format!("{}\n\n<harness-signals>\n{sig}\n</harness-signals>", last_assistant_text(session))
+        }
+        _ => last_assistant_text(session),
+    };
+    // P4: also give the verifier the ACTUAL last tool output, so it checks the
+    // prose claim against real evidence instead of rubber-stamping narration.
+    if let Some(ev) = last_tool_evidence(session, cas) {
+        last_text.push_str("\n\n<turn-evidence>\n");
+        last_text.push_str(&ev);
+        last_text.push_str("\n</turn-evidence>");
+    }
     let tag = origin_goal::parse_tag(&last_text);
     let inputs = {
         let mut slot = active_goal.lock().await;
@@ -2781,6 +2832,8 @@ async fn drive_goal_loop(
             &event_tx,
             summary.input_tokens,
             summary.output_tokens,
+            summary.gate_signals.as_deref(),
+            opts.cas.as_deref(),
         )
         .await
         else {

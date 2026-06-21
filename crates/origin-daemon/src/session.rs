@@ -18,6 +18,10 @@ pub struct Session {
     /// multi-root workspaces). Empty ⇒ single-root behaviour, and the assembled
     /// system prompt is byte-identical. Populated from `PromptRequest.roots`.
     pub roots: Vec<PathBuf>,
+    /// P2: the last `TodoWrite` todos array, so the foregrounded `<origin-todos>`
+    /// checklist survives across `/goal` iterations and follow-up prompts (each a
+    /// fresh `run_loop`) instead of being wiped to an empty local each time.
+    pub last_todos: Option<serde_json::Value>,
 }
 
 impl Session {
@@ -30,6 +34,7 @@ impl Session {
             messages: Vec::new(),
             next_proposal_id: 1,
             roots: Vec::new(),
+            last_todos: None,
         }
     }
 
@@ -46,6 +51,7 @@ impl Session {
             messages: Vec::new(),
             next_proposal_id: 1,
             roots: Vec::new(),
+            last_todos: None,
         }
     }
 

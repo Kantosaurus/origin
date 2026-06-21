@@ -40,6 +40,14 @@ pub fn model_context_window(model: &str) -> u32 {
         || m.contains("fable")
     {
         200_000
+    } else if m == "gpt-4-32k" || m.starts_with("gpt-4-32k-") {
+        // Legacy 32K variants — match BEFORE the generic gpt-4 → 128K branch so
+        // the compaction cap protects their real (much smaller) window.
+        32_000
+    } else if m == "gpt-4" || m == "gpt-4-0314" || m == "gpt-4-0613" {
+        // Base gpt-4 is an 8K window. Only the exact dated base ids; the 128K
+        // turbo/preview/`o`/4.1 variants below also contain "gpt-4".
+        8_192
     } else if m.contains("gpt-4") || m.contains("gpt-5") || m.contains("o1") || m.contains("o3") {
         128_000
     } else {
@@ -117,6 +125,20 @@ mod tests {
     #[test]
     fn gpt_is_128k() {
         assert_eq!(model_context_window("gpt-4o"), 128_000);
+    }
+
+    #[test]
+    fn legacy_gpt4_windows_are_not_oversized() {
+        // Base gpt-4 (8K) and gpt-4-32k must NOT inherit the 128K bucket, or the
+        // compaction cap would let the request overflow their real window.
+        assert_eq!(model_context_window("gpt-4"), 8_192);
+        assert_eq!(model_context_window("gpt-4-0613"), 8_192);
+        assert_eq!(model_context_window("gpt-4-32k"), 32_000);
+        assert_eq!(model_context_window("gpt-4-32k-0613"), 32_000);
+        // …but the 128K modern variants that also contain "gpt-4" are unaffected.
+        assert_eq!(model_context_window("gpt-4-turbo"), 128_000);
+        assert_eq!(model_context_window("gpt-4-1106-preview"), 128_000);
+        assert_eq!(model_context_window("gpt-4.1"), 128_000);
     }
 
     #[test]

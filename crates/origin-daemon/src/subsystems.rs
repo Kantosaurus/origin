@@ -116,7 +116,7 @@ const REPO_MAP_BUDGET_TOKENS: u32 = 1_024;
 /// never mutates anything. The caller (the agent loop) only invokes it behind
 /// the `ORIGIN_REPOMAP=1` env gate, so the default prompt is unchanged.
 #[must_use]
-pub fn repo_map_block(roots: &[std::path::PathBuf]) -> Option<String> {
+pub fn repo_map_block(roots: &[std::path::PathBuf], focus: &[String]) -> Option<String> {
     let ranked = if roots.len() <= 1 {
         // Single root (or none): original single-corpus path.
         let root = roots.first()?;
@@ -124,7 +124,7 @@ pub fn repo_map_block(roots: &[std::path::PathBuf]) -> Option<String> {
         if files.is_empty() {
             return None;
         }
-        repo_map_for(&files, &[], REPO_MAP_BUDGET_TOKENS).ok()?
+        repo_map_for(&files, focus, REPO_MAP_BUDGET_TOKENS).ok()?
     } else {
         // Multi-root: scan each root into its own corpus.
         let per_root: Vec<Vec<origin_repomap::FileSymbols>> =
@@ -141,7 +141,7 @@ pub fn repo_map_block(roots: &[std::path::PathBuf]) -> Option<String> {
         if std::env::var("ORIGIN_REPOMAP_PER_ROOT").as_deref() == Ok("1") {
             return render_per_root_map(roots, &per_root);
         }
-        origin_repomap::build_map_multi_root(per_root, &[], REPO_MAP_BUDGET_TOKENS).ok()?
+        origin_repomap::build_map_multi_root(per_root, focus, REPO_MAP_BUDGET_TOKENS).ok()?
     };
     if ranked.is_empty() {
         return None;
@@ -446,7 +446,7 @@ mod tests {
         std::fs::write(dir.join("a.rs"), "fn alpha() { beta(); }\n").expect("write a");
         std::fs::write(dir.join("b.py"), "def gamma():\n    return delta()\n").expect("write b");
         std::fs::write(dir.join("ignore.txt"), "not source\n").expect("write txt");
-        let block = repo_map_block(std::slice::from_ref(&dir)).expect("repo map block");
+        let block = repo_map_block(std::slice::from_ref(&dir), &[]).expect("repo map block");
         assert!(block.starts_with("<repo-map>"));
         assert!(block.ends_with("</repo-map>"));
         assert!(block.contains("a.rs") || block.contains("b.py"));
@@ -454,7 +454,7 @@ mod tests {
         let empty = std::env::temp_dir().join(format!("origin_repomap_empty_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&empty);
         std::fs::write(empty.join("notes.txt"), "hi\n").expect("write txt");
-        assert!(repo_map_block(std::slice::from_ref(&empty)).is_none());
+        assert!(repo_map_block(std::slice::from_ref(&empty), &[]).is_none());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&empty);
     }
@@ -520,7 +520,7 @@ mod tests {
         )
         .expect("write b");
         let roots = vec![root_a.clone(), root_b];
-        let block = repo_map_block(&roots).expect("multi-root map block");
+        let block = repo_map_block(&roots, &[]).expect("multi-root map block");
         assert!(block.starts_with("<repo-map>"));
         assert!(
             block.contains("core.rb"),
@@ -531,7 +531,7 @@ mod tests {
             "root B file must appear in merged map: {block}"
         );
         // A single-root call still works (default path) and is a subset.
-        let single = repo_map_block(std::slice::from_ref(&root_a)).expect("single-root block");
+        let single = repo_map_block(std::slice::from_ref(&root_a), &[]).expect("single-root block");
         assert!(single.contains("core.rb"));
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -20,6 +20,10 @@ use thiserror::Error;
 
 use crate::record::{CodeNodeRecord, Confidence, ParseConfidenceError};
 
+/// Max rows [`CodeGraphIndex::nodes_by_name`] returns. Caps fan-out on hot
+/// names (e.g. `new`, `from`) so a single lookup can't flood the caller.
+const NODES_BY_NAME_LIMIT: i64 = 50;
+
 /// Stable 32-byte identity for a code-graph node.
 ///
 /// Derived as `blake3(kind || 0 || name || 0 || file_path || 0 ||
@@ -158,6 +162,50 @@ impl CodeGraphIndex {
                  FROM code_nodes WHERE signature_handle = ?1",
             )?;
             let it = stmt.query_map([&handle[..]], |row| {
+                let entity: Vec<u8> = row.get(0)?;
+                let kind: String = row.get(1)?;
+                let name: String = row.get(2)?;
+                let file_path: String = row.get(3)?;
+                let sig_h: Vec<u8> = row.get(4)?;
+                let body_h: Vec<u8> = row.get(5)?;
+                Ok((entity, kind, name, file_path, sig_h, body_h))
+            })?;
+            it.collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (entity, kind, name, file_path, sig_h, body_h) in rows {
+            out.push(NodeRow {
+                entity_id: EntityId(to32(&entity)?),
+                kind,
+                name,
+                file_path,
+                signature_handle: to32(&sig_h)?,
+                body_handle: to32(&body_h)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Look up every node declared under the bare symbol `name`.
+    ///
+    /// This is the anti-hallucination keystone: callers resolve a bare symbol
+    /// NAME to its declarations (file, kind, signature) before referencing it.
+    /// Results are ordered deterministically (`file_path`, then `entity_id`)
+    /// and capped at [`NODES_BY_NAME_LIMIT`] rows to avoid flooding on hot
+    /// names. The `name` column is indexed (`idx_code_nodes_name`).
+    ///
+    /// # Errors
+    /// Propagates `SQLite` errors and surfaces malformed BLOB shapes.
+    pub fn nodes_by_name(&self, name: &str) -> Result<Vec<NodeRow>, IndexError> {
+        let rows = self.sql.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT entity_id, kind, name, file_path, signature_handle, body_handle
+                 FROM code_nodes WHERE name = ?1
+                 ORDER BY file_path, entity_id
+                 LIMIT ?2",
+            )?;
+            let it = stmt.query_map(params![name, NODES_BY_NAME_LIMIT], |row| {
                 let entity: Vec<u8> = row.get(0)?;
                 let kind: String = row.get(1)?;
                 let name: String = row.get(2)?;

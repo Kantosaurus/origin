@@ -42,6 +42,9 @@ pub enum Query {
     /// Nodes whose `last_seen` is at or after `since_ms` (unix epoch ms),
     /// newest first.
     RecentChanges { since_ms: i64 },
+    /// Declarations resolving the bare symbol `name` (anti-hallucination
+    /// lookup). Delegates to [`CodeGraphIndex::nodes_by_name`].
+    ByName { name: String },
 }
 
 /// Result of dispatching a [`Query`].
@@ -99,6 +102,7 @@ pub fn dispatch(idx: &CodeGraphIndex, q: Query) -> Result<QueryResult, QueryErro
         Query::Neighbors { node, depth } => neighbors(idx, node, depth),
         Query::Path { from, to, max_hops } => path(idx, from, to, max_hops),
         Query::RecentChanges { since_ms } => recent_changes(idx, since_ms),
+        Query::ByName { name } => Ok(QueryResult::Nodes(idx.nodes_by_name(&name)?)),
         Query::Communities => communities(idx),
         Query::GodNodes { top_per_partition } => god_nodes(idx, top_per_partition),
     }

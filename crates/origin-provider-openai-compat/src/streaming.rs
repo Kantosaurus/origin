@@ -112,9 +112,17 @@ pub async fn parse_into_ring(
             break;
         }
 
+        // A single undecodable frame must not abort the whole turn (dropping all
+        // blocks streamed so far): warn and skip it. The stream may still deliver
+        // valid deltas and a terminal `finish_reason`. NOTE: this is the per-frame
+        // JSON decode only — a real transport drop surfaces via `item?` above and
+        // stays a hard error so the connection still surfaces/retries.
         let chunk: WireStreamChunk = match serde_json::from_str(&raw) {
             Ok(c) => c,
-            Err(e) => return Err(ProviderError::Api(format!("sse json: {e}; raw={raw}"))),
+            Err(e) => {
+                tracing::warn!(error = %e, "SSE: skipping undecodable frame");
+                continue;
+            }
         };
 
         // OpenAI emits `usage` on a trailing frame (with empty `choices`) when
