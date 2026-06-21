@@ -81,6 +81,8 @@ fn hot_set_contains_exactly_the_expected_tools() {
         // `CollectTasks` is hot so the model can gather background sub-agent
         // results in-turn (background Task dispatch is the default).
         "CollectTasks",
+        // `TodoWrite` is hot so multi-step plan tracking is always one call away.
+        "TodoWrite",
     ];
     let mut got: Vec<&str> = hot.clone();
     got.sort_unstable();

@@ -3691,6 +3691,11 @@ async fn run_loop_inner(
     // claiming done. Empty (no-op) unless an edited file failed its check.
     let mut compile_check_block = String::new();
     let compile_check_enabled = crate::postcheck::enabled();
+    // In-conversation task checklist (TodoWrite). Replaced wholesale when the
+    // model calls the tool; carried as a volatile block so the plan stays visible
+    // each turn. Intra-prompt only (resets per user prompt) — `/goal` covers the
+    // cross-prompt objective.
+    let mut todos_block = String::new();
 
     // Task 1 (agentgrep exposure-truncation). Already-seen `(file, line)`
     // regions accumulated across this `run_loop` from prior `content`-mode
@@ -3892,6 +3897,7 @@ async fn run_loop_inner(
             let mut blocks: Vec<&str> = Vec::new();
             for b in [
                 &goal_block,
+                &todos_block,
                 &lsp_diag_block,
                 &compile_check_block,
                 &swarm_notices_block,
@@ -4778,6 +4784,24 @@ async fn run_loop_inner(
                         diff_lines,
                     })
                     .await;
+            }
+
+            // TodoWrite: pure state — overwrite the checklist, render it for the
+            // NEXT turn's volatile block, and ack. Empty/malformed clears it.
+            if name == "TodoWrite" {
+                let n = args.get("todos").and_then(Value::as_array).map_or(0, Vec::len);
+                todos_block = origin_tools::builtins::todo_write::render_block(
+                    args.get("todos").unwrap_or(&Value::Null),
+                )
+                .unwrap_or_default();
+                tool_results.push(Block::ToolResult {
+                    tool_use_id: id,
+                    handle: None,
+                    inline: Some(format!("ok: {n} todo item(s) recorded").into_bytes()),
+                    cache_marker: None,
+                    is_error: false,
+                });
+                continue;
             }
 
             // Sub-agent parallelism: spawn the Task worker now (it runs at once
@@ -6698,6 +6722,15 @@ async fn dispatch_tool(
         // there are no background jobs to gather. Return an empty result rather
         // than `UnknownTool` (the tool is advertised, so it must be recognized).
         "CollectTasks" => Ok("{\"finished\":[],\"still_running\":[]}".to_string()),
+        // ── TodoWrite (in-conversation checklist) ──
+        // Real handling lives in `run_loop` (it renders the list into the next
+        // turn's prompt). Reaching `dispatch_tool` is the headless / sub-agent
+        // path with no prompt to render into, so just acknowledge rather than
+        // returning `UnknownTool` (the tool is advertised, so it must be handled).
+        "TodoWrite" => {
+            let n = args.get("todos").and_then(Value::as_array).map_or(0, Vec::len);
+            Ok(format!("{{\"ok\":true,\"recorded\":{n}}}"))
+        }
         // ── Gmail (read-only; permission-gated) ──
         // Loads Google creds from the keyvault, mints a token, and runs the
         // requested op (search | get | list_threads). Mirrors WebFetch's error
