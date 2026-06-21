@@ -296,6 +296,7 @@ mod tests {
                 handle: None,
                 inline: Some(b"file contents".to_vec()),
                 cache_marker: None,
+                is_error: false,
             }],
         }
     }
@@ -395,6 +396,7 @@ mod tests {
                 handle: Some(*h.as_bytes()),
                 inline: None,
                 cache_marker: None,
+                is_error: false,
             }],
         }];
 

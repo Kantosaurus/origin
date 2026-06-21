@@ -62,6 +62,7 @@ async fn large_tool_result_emitted_as_reference_when_volatile() {
             handle: Some(*h.as_bytes()),
             inline: None,
             cache_marker: None,
+            is_error: false,
         }],
     };
     // Precede the tool result with its matching assistant tool_use so the
@@ -160,6 +161,7 @@ async fn large_tool_result_inlined_when_handle_registered_sticky() {
             handle: Some(*h.as_bytes()),
             inline: None,
             cache_marker: None,
+            is_error: false,
         }],
     };
     // Precede the tool result with its matching assistant tool_use so the
@@ -263,6 +265,7 @@ async fn large_tool_result_referenced_when_handle_registered_sliding() {
             handle: Some(*h.as_bytes()),
             inline: None,
             cache_marker: None,
+            is_error: false,
         }],
     };
     // Precede the tool result with its matching assistant tool_use so the

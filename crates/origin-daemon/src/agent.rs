@@ -4458,19 +4458,23 @@ async fn run_loop_inner(
                 if let Some(tool) = runtime_tool(&name) {
                     let args: Value = serde_json::from_slice(&input_bytes).unwrap_or(Value::Null);
                     let allowed = prompter.ask(tool.meta(), &args.to_string()).await;
-                    let inline = if allowed {
+                    let (inline, errored) = if allowed {
                         match tool.invoke(args).await {
-                            Ok(v) => serde_json::to_vec(&v).unwrap_or_else(|_| b"null".to_vec()),
-                            Err(e) => format!("Error: {e}").into_bytes(),
+                            Ok(v) => (serde_json::to_vec(&v).unwrap_or_else(|_| b"null".to_vec()), false),
+                            Err(e) => (format!("Error: {e}").into_bytes(), true),
                         }
                     } else {
-                        format!("Error: tool `{name}` is not in this sub-agent's allow-list").into_bytes()
+                        (
+                            format!("Error: tool `{name}` is not in this sub-agent's allow-list").into_bytes(),
+                            true,
+                        )
                     };
                     tool_results.push(Block::ToolResult {
                         tool_use_id: id,
                         handle: None,
                         inline: Some(inline),
                         cache_marker: None,
+                        is_error: errored,
                     });
                     continue;
                 }
@@ -4480,6 +4484,7 @@ async fn run_loop_inner(
                     handle: None,
                     inline: Some(format!("Error: unknown tool `{name}`").into_bytes()),
                     cache_marker: None,
+                    is_error: true,
                 });
                 continue;
             };
@@ -4499,6 +4504,7 @@ async fn run_loop_inner(
                             handle: None,
                             inline: Some(format!("Error: malformed args: {e}").into_bytes()),
                             cache_marker: None,
+                            is_error: true,
                         });
                         continue;
                     }
@@ -4726,6 +4732,7 @@ async fn run_loop_inner(
                             handle: None,
                             inline: Some(format!("Error: {msg}").into_bytes()),
                             cache_marker: None,
+                            is_error: true,
                         });
                         continue;
                     }
@@ -4820,6 +4827,7 @@ async fn run_loop_inner(
                                         handle: None,
                                         inline: Some(placeholder.to_vec()),
                                         cache_marker: None,
+                                        is_error: false,
                                     });
                                     // Surface the new swarm agent to the TUI live, keyed by
                                     // its stable worker id so later events update the same
@@ -4923,6 +4931,7 @@ async fn run_loop_inner(
                                         handle: None,
                                         inline: Some(format!("Error: {e}").into_bytes()),
                                         cache_marker: None,
+                                        is_error: true,
                                     });
                                 }
                             }
@@ -4933,6 +4942,7 @@ async fn run_loop_inner(
                                 handle: None,
                                 inline: Some(format!("Error: Task: bad args: {e}").into_bytes()),
                                 cache_marker: None,
+                                is_error: true,
                             });
                         }
                     }
@@ -4976,6 +4986,7 @@ async fn run_loop_inner(
                     handle: None,
                     inline: Some(serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec())),
                     cache_marker: None,
+                    is_error: false,
                 });
                 continue;
             }
@@ -4989,7 +5000,7 @@ async fn run_loop_inner(
             // clear "not configured" error.
             if name == "RunWorkflow" {
                 if let Some(coord) = opts.coordinator.as_deref() {
-                    let body = match run_workflow_tool(
+                    let (body, errored) = match run_workflow_tool(
                         &args,
                         coord,
                         opts.skill_catalog.as_deref(),
@@ -4997,14 +5008,15 @@ async fn run_loop_inner(
                     )
                     .await
                     {
-                        Ok(s) => s.into_bytes(),
-                        Err(e) => format!("Error: {e}").into_bytes(),
+                        Ok(s) => (s.into_bytes(), false),
+                        Err(e) => (format!("Error: {e}").into_bytes(), true),
                     };
                     tool_results.push(Block::ToolResult {
                         tool_use_id: id,
                         handle: None,
                         inline: Some(body),
                         cache_marker: None,
+                        is_error: errored,
                     });
                     continue;
                 }
@@ -5076,6 +5088,7 @@ async fn run_loop_inner(
                                 handle: None,
                                 inline: Some(format!("Error: {msg}").into_bytes()),
                                 cache_marker: None,
+                                is_error: true,
                             });
                             continue;
                         }
@@ -5101,6 +5114,7 @@ async fn run_loop_inner(
                                 handle: None,
                                 inline: Some(format!("Error: {msg}").into_bytes()),
                                 cache_marker: None,
+                                is_error: true,
                             });
                             continue;
                         }
@@ -5136,6 +5150,7 @@ async fn run_loop_inner(
                                 handle: None,
                                 inline: Some(format!("Error: {msg}").into_bytes()),
                                 cache_marker: None,
+                                is_error: true,
                             });
                             continue;
                         }
@@ -5201,6 +5216,7 @@ async fn run_loop_inner(
                                 handle: None,
                                 inline: Some(format!("Error: {msg}").into_bytes()),
                                 cache_marker: None,
+                                is_error: true,
                             });
                             continue;
                         }
@@ -5351,6 +5367,7 @@ async fn run_loop_inner(
                     handle: Some(*h.as_bytes()),
                     inline: None,
                     cache_marker: None,
+                    is_error: false,
                 }
             } else {
                 Block::ToolResult {
@@ -5358,6 +5375,7 @@ async fn run_loop_inner(
                     handle: None,
                     inline: Some(result_bytes),
                     cache_marker: None,
+                    is_error: false,
                 }
             };
             // gemini PostTool lifecycle hook (informational): fires after a tool
@@ -5446,6 +5464,7 @@ async fn run_loop_inner(
                         handle: None,
                         inline: Some(result_bytes),
                         cache_marker: None,
+                        is_error: false,
                     };
                 }
             }
@@ -5657,6 +5676,7 @@ mod cache_marker_tests {
                 handle: None,
                 inline: Some(b"ok".to_vec()),
                 cache_marker: None,
+                is_error: false,
             }],
         });
     }

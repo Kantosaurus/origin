@@ -291,7 +291,10 @@ fn block_to_wire(b: &Block) -> Option<WireBlock<'_>> {
             Some(WireBlock::ToolUse { id, name, input })
         }
         Block::ToolResult {
-            tool_use_id, inline, ..
+            tool_use_id,
+            inline,
+            is_error,
+            ..
         } => {
             let content_str: &str = inline
                 .as_deref()
@@ -300,7 +303,7 @@ fn block_to_wire(b: &Block) -> Option<WireBlock<'_>> {
             Some(WireBlock::ToolResult {
                 tool_use_id,
                 content: content_str,
-                is_error: false,
+                is_error: *is_error,
             })
         }
         Block::Thinking { .. } => None,

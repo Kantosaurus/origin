@@ -211,7 +211,9 @@ impl SessionStore {
     /// Load all messages for a session, ordered by turn.
     ///
     /// # Errors
-    /// Returns a sqlite error on read failure or an rkyv error on decode failure.
+    /// Returns a sqlite error on read failure. Individual rows that fail to
+    /// decode (rkyv layout drift from an older binary, or corruption) are
+    /// skipped with a warning rather than failing the whole load.
     pub fn load_messages(&self, session_id: &str) -> Result<Vec<Message>, SessionStoreError> {
         let rows: Vec<Vec<u8>> = self.inner.with_conn(|c| {
             let mut stmt =
@@ -227,14 +229,7 @@ impl SessionStore {
             Ok(out)
         })?;
 
-        let mut messages = Vec::with_capacity(rows.len());
-        for bytes in rows {
-            let archived = rkyv::check_archived_root::<Message>(&bytes)
-                .map_err(|e| SessionStoreError::Rkyv(e.to_string()))?;
-            let m: Message = rkyv::Deserialize::deserialize(archived, &mut rkyv::Infallible)
-                .map_err(|e| SessionStoreError::Rkyv(format!("{e:?}")))?;
-            messages.push(m);
-        }
+        let messages = decode_message_rows(rows);
         // Defense-in-depth: a transcript persisted before the `persist_transcript`
         // tail-truncation fix (or corrupted by any other upstream path) can carry
         // an orphaned `tool_result` — e.g. a stranded tail spliced on after a
@@ -243,6 +238,29 @@ impl SessionStore {
         // `400 unexpected tool_use_id`.
         Ok(origin_core::types::strip_orphan_tool_results(messages))
     }
+}
+
+/// Decode persisted message rows, SKIPPING (with a warning) any row that fails
+/// to decode rather than failing the whole load. A row can be undecodable when
+/// it was persisted by an older binary whose rkyv layout has since changed (a
+/// new `Block` field), or when it is corrupt — in either case losing one row
+/// (and orphan-repairing the rest) is far better than making the entire session
+/// unresumable.
+fn decode_message_rows(rows: Vec<Vec<u8>>) -> Vec<Message> {
+    let mut messages = Vec::with_capacity(rows.len());
+    for bytes in rows {
+        let Ok(archived) = rkyv::check_archived_root::<Message>(&bytes) else {
+            tracing::warn!("session_store: skipping undecodable message row (format drift or corruption)");
+            continue;
+        };
+        // Deserialization into the owned `Message` is infallible (rkyv `Infallible`),
+        // so the `Err` arm is uninhabited — `match never {}` is its canonical handler.
+        match rkyv::Deserialize::<Message, _>::deserialize(archived, &mut rkyv::Infallible) {
+            Ok(m) => messages.push(m),
+            Err(never) => match never {},
+        }
+    }
+    messages
 }
 
 impl SessionStore {
@@ -463,6 +481,19 @@ mod tests {
     use origin_core::types::{Block, Message, Role};
 
     #[test]
+    fn decode_message_rows_skips_garbage_keeps_valid() {
+        // A valid rkyv row plus a garbage row (stand-in for older-layout / corrupt
+        // data): the valid one survives, the garbage one is skipped — not a hard
+        // failure of the whole load.
+        let good = rkyv::to_bytes::<_, 256>(&Message::new(Role::User).with_block(Block::text("ok")))
+            .expect("serialize")
+            .to_vec();
+        let rows = vec![good, vec![0xFF_u8; 8]];
+        let out = super::decode_message_rows(rows);
+        assert_eq!(out.len(), 1, "valid row kept, garbage row skipped");
+    }
+
+    #[test]
     fn truncate_after_keeps_first_n_turns() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::open(dir.path().join("sessions.db")).expect("open");
@@ -579,6 +610,7 @@ mod tests {
                 handle: None,
                 inline: Some(b"result body".to_vec()),
                 cache_marker: None,
+                is_error: false,
             }],
         }
     }

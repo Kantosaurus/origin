@@ -533,6 +533,54 @@ mod transient_tests {
         assert!(!status_is_transient(StatusCode::BAD_REQUEST), "400 stays fatal");
         assert!(!status_is_transient(StatusCode::NOT_FOUND), "404 stays fatal");
     }
+
+    #[test]
+    fn tool_result_is_error_flag_reaches_the_wire() {
+        use super::{block_to_wire, wire};
+        use origin_core::types::Block;
+
+        // A structured error result serializes is_error:true.
+        let err = Block::ToolResult {
+            tool_use_id: "x".into(),
+            handle: None,
+            inline: Some(b"denied".to_vec()),
+            cache_marker: None,
+            is_error: true,
+        };
+        match block_to_wire(&err, None) {
+            Some(wire::WireBlock::ToolResult { is_error, .. }) => assert!(is_error, "structured error flag"),
+            _ => panic!("expected a ToolResult wire block"),
+        }
+
+        // A success result with non-error content stays false.
+        let ok = Block::ToolResult {
+            tool_use_id: "y".into(),
+            handle: None,
+            inline: Some(b"{\"ok\":true}".to_vec()),
+            cache_marker: None,
+            is_error: false,
+        };
+        match block_to_wire(&ok, None) {
+            Some(wire::WireBlock::ToolResult { is_error, .. }) => assert!(!is_error, "success stays false"),
+            _ => panic!("expected a ToolResult wire block"),
+        }
+
+        // Safety net: an "Error:"-prefixed result whose flag was left false is
+        // still surfaced as an error on the wire (false-negative guard).
+        let legacy = Block::ToolResult {
+            tool_use_id: "z".into(),
+            handle: None,
+            inline: Some(b"Error: legacy convention".to_vec()),
+            cache_marker: None,
+            is_error: false,
+        };
+        match block_to_wire(&legacy, None) {
+            Some(wire::WireBlock::ToolResult { is_error, .. }) => {
+                assert!(is_error, "content fallback flags the legacy Error: convention");
+            }
+            _ => panic!("expected a ToolResult wire block"),
+        }
+    }
 }
 
 /// Anthropic's Messages API rejects any request carrying more than this many
@@ -719,7 +767,10 @@ fn block_to_wire(b: &Block, cache_control: Option<wire::WireCacheControl>) -> Op
             })
         }
         Block::ToolResult {
-            tool_use_id, inline, ..
+            tool_use_id,
+            inline,
+            is_error,
+            ..
         } => {
             // Borrow the inline bytes; convert to &str via str::from_utf8 with a fallback.
             let content_str: &str = inline
@@ -729,7 +780,11 @@ fn block_to_wire(b: &Block, cache_control: Option<wire::WireCacheControl>) -> Op
             Some(wire::WireBlock::ToolResult {
                 tool_use_id,
                 content: content_str,
-                is_error: false,
+                // The structured flag is authoritative; the "Error:" content
+                // prefix is a safety net so a construction site that forgot to
+                // set the flag still surfaces a failure (a false negative — the
+                // model missing an error — is the costly direction).
+                is_error: *is_error || content_str.starts_with("Error:"),
                 cache_control,
             })
         }
@@ -764,6 +819,7 @@ fn expand_messages_for_wire(
                 handle: Some(h),
                 inline: None,
                 cache_marker,
+                is_error,
             } = b
             {
                 let store = cas.ok_or_else(|| {
@@ -805,6 +861,7 @@ fn expand_messages_for_wire(
                             handle: None,
                             inline: Some(bytes),
                             cache_marker: *cache_marker,
+                            is_error: *is_error,
                         });
                     }
                     origin_planner::WireDecision::Reference => {
@@ -815,6 +872,7 @@ fn expand_messages_for_wire(
                             handle: None,
                             inline: Some(preview.into_bytes()),
                             cache_marker: *cache_marker,
+                            is_error: *is_error,
                         });
                     }
                 }

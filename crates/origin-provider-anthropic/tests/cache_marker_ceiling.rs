@@ -110,6 +110,7 @@ fn strip_dropping_a_turn_does_not_overflow_the_ceiling() {
             handle: None,
             inline: Some(b"orphan".to_vec()),
             cache_marker: None,
+            is_error: false,
         }],
     });
     // 2..=9: four well-formed assistant(tool_use)/tool(tool_result) turns. The
@@ -132,6 +133,7 @@ fn strip_dropping_a_turn_does_not_overflow_the_ceiling() {
                 handle: None,
                 inline: Some(b"ok".to_vec()),
                 cache_marker: Some(CacheBoundary::Sticky),
+                is_error: false,
             }],
         });
     }

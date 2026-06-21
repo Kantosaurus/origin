@@ -84,6 +84,11 @@ pub enum Block {
         handle: Option<[u8; 32]>,
         inline: Option<Vec<u8>>,
         cache_marker: Option<CacheBoundary>,
+        /// Whether this result represents a tool FAILURE (denied, errored,
+        /// malformed args, CAS miss). Surfaced to the provider as the Anthropic
+        /// `tool_result.is_error` flag so the model's recovery signal is
+        /// structured, not just inferred from an "Error:" text prefix.
+        is_error: bool,
     },
     Thinking {
         tokens: String,
@@ -223,6 +228,7 @@ mod tool_pairing_tests {
                 handle: None,
                 inline: Some(b"r".to_vec()),
                 cache_marker: None,
+                is_error: false,
             }],
         }
     }
@@ -286,12 +292,14 @@ mod tool_pairing_tests {
                         handle: None,
                         inline: Some(b"ok".to_vec()),
                         cache_marker: None,
+                        is_error: false,
                     },
                     Block::ToolResult {
                         tool_use_id: "b".into(),
                         handle: None,
                         inline: Some(b"stale".to_vec()),
                         cache_marker: None,
+                        is_error: false,
                     },
                 ],
             },
