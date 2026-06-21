@@ -186,6 +186,13 @@ impl Consolidator {
                 // Flag if one body has positive markers and the other has negative.
                 if (m_pos && c_neg) || (m_neg && c_pos) {
                     contradictions_flagged.push((record_m.id, record_c.id));
+                    // Resolve, don't just log: demote the OLDER contradicting
+                    // memory once so the newer view wins recall. The older-than
+                    // guard fires this exactly once per pair (when M is the newer
+                    // member), mirroring the supersede path above.
+                    if record_c.created_at_ms < record_m.created_at_ms {
+                        self.store.bump_priority(record_c.id, -0.1)?;
+                    }
                 }
             }
 

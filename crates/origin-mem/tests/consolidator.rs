@@ -161,6 +161,55 @@ fn consolidator_uses_stable_memory_id_not_positional_index() {
     assert_eq!(winner, id_b, "newer row (by real MemoryId) is the winner");
 }
 
+/// A flagged contradiction must DEMOTE the older member's priority (not just be
+/// logged), so the newer, contradicting view wins recall — and the priority is
+/// floor-clamped so it can never go negative.
+#[test]
+fn contradiction_demotes_the_older_member() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let sql = Arc::new(origin_store::Store::open(tmp.path().join("o.db")).expect("sql"));
+    let cas = Arc::new(
+        origin_cas::Store::open(origin_cas::StoreConfig {
+            root: tmp.path().join("cas"),
+            hot_capacity: 16,
+            warm_pack_target_bytes: 64 * 1024,
+            cold_zstd_level: 1,
+        })
+        .expect("cas"),
+    );
+    let store = Arc::new(MemoryStore::new(Arc::clone(&sql), Arc::clone(&cas)));
+    store.install_quantizer(&degenerate_quantizer()).expect("install");
+
+    let t0: i64 = 1_700_000_000_000;
+    // Older = positive preference; newer = negative. Near-identical vectors keep
+    // them high-similarity peers so the contradiction is detected.
+    // Marker words must match the consolidator's word-boundary regexes
+    // (prefer/like vs not/never/hate/…), so use exact whole words.
+    let id_old = store
+        .save_at("user prefer dark mode", &unit_vec(0.0), &[], t0)
+        .expect("save");
+    let id_new = store
+        .save_at("user hate dark mode", &unit_vec(0.001), &[], t0 + 1_000)
+        .expect("save");
+
+    let mut idx = MemIndex::new();
+    idx.insert(memory_id_to_u64(&id_old), &unit_vec(0.0)).expect("ins");
+    idx.insert(memory_id_to_u64(&id_new), &unit_vec(0.001)).expect("ins");
+    let index = Arc::new(RwLock::new(idx));
+    let cons = Consolidator::new(Arc::clone(&store), index);
+
+    cons.run_pass(32).expect("pass");
+
+    let after = store.iter_all().expect("iter_all");
+    let older = after.iter().find(|r| r.id == id_old).expect("id_old present");
+    assert!(
+        older.cluster_priority < 1.0,
+        "older contradicting memory must be demoted (got {})",
+        older.cluster_priority
+    );
+    assert!(older.cluster_priority >= 0.0, "priority is floor-clamped");
+}
+
 /// Regression: a detected supersede must be WRITTEN BACK to the store, not just
 /// reported. Before the fix `run_pass` only collected proposals, so
 /// `superseded_by` stayed NULL forever and the default `drop_superseded` search

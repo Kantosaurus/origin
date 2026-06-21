@@ -11,7 +11,7 @@ use crate::{SideEffects, Tier, Urgency};
 
 crate::origin_tool! {
     name: "mem_search",
-    description: "Semantic search over the user's cross-session memory. Returns top-k hits with previews.",
+    description: "Semantic search over the user's cross-session memory. Returns top-k hits with previews (which may be stale — verify before relying). Set fresh=true to order newest-first.",
     tier: Tier::AutoAllowed,
     urgency: Urgency::Low,
     side_effects: SideEffects::Pure,

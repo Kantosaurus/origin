@@ -384,8 +384,11 @@ impl MemoryStore {
                 params![id_str],
                 |r| r.get(0),
             )?;
+            // Clamp to [0, 2]: a negative `delta` (demoting a contradicted
+            // memory) must not drive priority below zero (which would zero the
+            // re-ranked score and silently bury the memory entirely).
             #[allow(clippy::cast_possible_truncation)]
-            let new_priority = ((current as f32) + delta).min(2.0_f32);
+            let new_priority = ((current as f32) + delta).clamp(0.0_f32, 2.0_f32);
             tx.execute(
                 "UPDATE memories SET cluster_priority = ?1 WHERE id = ?2",
                 params![f64::from(new_priority), id_str],

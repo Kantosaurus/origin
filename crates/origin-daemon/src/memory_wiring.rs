@@ -157,7 +157,7 @@ impl std::fmt::Debug for MemoryDispatchHandle {
 }
 
 impl MemoryHandle for MemoryDispatchHandle {
-    fn search(&self, query: &str, k: usize, _fresh: bool) -> Result<Vec<SearchHit>, MemoryToolError> {
+    fn search(&self, query: &str, k: usize, fresh: bool) -> Result<Vec<SearchHit>, MemoryToolError> {
         // Naïve fallback: linear substring scan + age-based ranking.
         // We use the naïve path whenever (a) no embedder, or (b) embed fails.
         // This keeps the daemon usable without ONNX installed.
@@ -257,6 +257,16 @@ impl MemoryHandle for MemoryDispatchHandle {
                         tags: r.tags.clone(),
                     });
                 }
+            }
+            // Honor `fresh`: prioritise recency over pure relevance by ordering
+            // newest-first (the naive path is already age-ordered). Previously the
+            // flag was parsed and advertised but silently ignored.
+            if fresh {
+                out.sort_by(|a, b| {
+                    a.age_days
+                        .partial_cmp(&b.age_days)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
             return Ok(out);
         }

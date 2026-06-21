@@ -16,6 +16,19 @@ use crate::{Embedder, EMBED_DIM};
 /// Minimum re-ranked score for a candidate to be included in the injected block.
 const MIN_SCORE: f32 = 0.2;
 
+/// Independent raw cosine-similarity floor. The re-ranked `score` multiplies
+/// `raw_sim` by a recency-decay and cluster-priority boost, so a stale,
+/// high-priority memory can clear [`MIN_SCORE`] on boost alone despite being
+/// barely relevant. Requiring the RAW similarity to clear its own floor keeps
+/// inclusion tied to actual relevance, not just recency/priority.
+const MIN_RAW_SIM: f32 = 0.15;
+
+/// A candidate is injected only when BOTH its re-ranked score and its raw
+/// similarity clear their floors.
+fn passes_inclusion(score: f32, raw_sim: f32) -> bool {
+    score >= MIN_SCORE && raw_sim >= MIN_RAW_SIM
+}
+
 use crate::MS_PER_DAY;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -109,7 +122,10 @@ impl Injector {
         })?;
 
         // Step 4 — filter by minimum score and return early if nothing qualifies.
-        let survivors: Vec<_> = hits.into_iter().filter(|c| c.score >= MIN_SCORE).collect();
+        let survivors: Vec<_> = hits
+            .into_iter()
+            .filter(|c| passes_inclusion(c.score, c.raw_sim))
+            .collect();
         if survivors.is_empty() {
             return Ok(None);
         }
@@ -189,4 +205,20 @@ pub(crate) fn format_memory_line(id: &MemoryId, age_days: f32, tags: &[String], 
     let tags_str = tags.join(",");
     let id_str = id.to_string();
     format!("  <memory id=\"{id_str}\" age=\"{age_days:.1}d\" tags=\"{tags_str}\">{preview}</memory>")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::passes_inclusion;
+
+    #[test]
+    fn boosted_but_irrelevant_memory_is_excluded() {
+        // High re-ranked score driven purely by a recency/priority boost, but a
+        // near-zero raw similarity ⇒ not actually relevant ⇒ excluded.
+        assert!(!passes_inclusion(0.9, 0.05), "boost must not smuggle in a stale, irrelevant memory");
+        // Genuinely relevant ⇒ included.
+        assert!(passes_inclusion(0.9, 0.8));
+        // Below the score floor ⇒ excluded regardless of similarity.
+        assert!(!passes_inclusion(0.1, 0.9));
+    }
 }
