@@ -20,6 +20,7 @@ pub mod model_default;
 pub mod model_window;
 pub mod pairing;
 pub mod plan_bus;
+pub mod postcheck;
 pub mod proposal_registry;
 pub mod protocol;
 pub mod provider_factory;

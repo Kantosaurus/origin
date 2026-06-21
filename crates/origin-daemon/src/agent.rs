@@ -3685,6 +3685,12 @@ async fn run_loop_inner(
     // byte-identical to before when the feature is off.
     let mut lsp_diag_block = String::new();
     let lsp_diag_enabled = crate::lsp_diagnostics::enabled();
+    // Default-on, fail-open post-edit syntax gate (fast per-file checks). Like
+    // `lsp_diag_block`, it is computed after dispatch and carried as a volatile
+    // trailing block on the NEXT turn, so the model fixes a broken edit before
+    // claiming done. Empty (no-op) unless an edited file failed its check.
+    let mut compile_check_block = String::new();
+    let compile_check_enabled = crate::postcheck::enabled();
 
     // Task 1 (agentgrep exposure-truncation). Already-seen `(file, line)`
     // regions accumulated across this `run_loop` from prior `content`-mode
@@ -3884,7 +3890,13 @@ async fn run_loop_inner(
         // invalidating that whole prefix on every request.
         let volatile_context = {
             let mut blocks: Vec<&str> = Vec::new();
-            for b in [&goal_block, &lsp_diag_block, &swarm_notices_block, &bg_results_block] {
+            for b in [
+                &goal_block,
+                &lsp_diag_block,
+                &compile_check_block,
+                &swarm_notices_block,
+                &bg_results_block,
+            ] {
                 if !b.is_empty() {
                     blocks.push(b);
                 }
@@ -4745,10 +4757,11 @@ async fn run_loop_inner(
             if matches!(meta.side_effects, SideEffects::Mutating) {
                 turn_mutated = true;
                 // Autonomous post-edit LSP diagnostics (opencode): record the
-                // distinct files this edit touched so the end-of-turn probe can
-                // feed compiler/linter diagnostics back to the model. Gated:
-                // collects nothing unless `ORIGIN_LSP_DIAGNOSTICS=1`.
-                if lsp_diag_enabled {
+                // distinct files this edit touched so the end-of-turn probes can
+                // feed diagnostics back to the model. Collected when EITHER the
+                // LSP-diagnostics path (`ORIGIN_LSP_DIAGNOSTICS=1`) or the
+                // default-on fast post-edit syntax gate needs them.
+                if lsp_diag_enabled || compile_check_enabled {
                     for p in edited_paths_from_tool(&name, &args) {
                         lsp_edited_paths.insert(p);
                     }
@@ -5509,6 +5522,12 @@ async fn run_loop_inner(
                     .await
                     .unwrap_or_default()
             };
+        }
+        // Fast post-edit syntax gate on the same edited-path set (Python/JS).
+        if compile_check_enabled && !lsp_edited_paths.is_empty() {
+            compile_check_block = crate::postcheck::check_block(&lsp_edited_paths)
+                .await
+                .unwrap_or_default();
         }
     }
     // Task 4 / Stage C5: the loop exhausted its `max_turns` budget without the
