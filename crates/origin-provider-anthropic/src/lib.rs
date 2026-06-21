@@ -401,7 +401,7 @@ impl Provider for Anthropic {
             let sse = cassette::replay(path, "POST", &url, &req_body_text)?;
             crate::streaming::parse_into_ring(sse.as_bytes(), ring)
                 .await
-                .map_err(|e| ProviderError::Api(e.to_string()))?;
+                .map_err(streaming_err_to_provider)?;
             ring.close();
             return Ok(());
         }
@@ -438,7 +438,7 @@ impl Provider for Anthropic {
             cassette::record(path, "POST", &url, &req_body_text, 200, &sse)?;
             crate::streaming::parse_into_ring(sse.as_bytes(), ring)
                 .await
-                .map_err(|e| ProviderError::Api(e.to_string()))?;
+                .map_err(streaming_err_to_provider)?;
             ring.close();
             return Ok(());
         }
@@ -462,6 +462,23 @@ fn status_is_transient(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS
         || status.as_u16() == 529 // Anthropic `overloaded_error`
         || status.is_server_error() // any 5xx
+}
+
+/// Map a streaming-parse failure to a `ProviderError`, classifying a mid-stream
+/// Anthropic `error` event (overloaded/rate-limit/api) as retryable `RateLimit`
+/// so the daemon's backoff loop retries instead of killing the turn on a
+/// transient blip mid-stream.
+#[allow(clippy::needless_pass_by_value)] // consumed by `map_err`
+fn streaming_err_to_provider(e: crate::streaming::StreamingError) -> ProviderError {
+    if let crate::streaming::StreamingError::MidStream { kind, message } = &e {
+        if crate::streaming::is_retryable_error_kind(kind) {
+            return ProviderError::RateLimit {
+                retry_after_secs: 1,
+                message: message.clone(),
+            };
+        }
+    }
+    ProviderError::Api(e.to_string())
 }
 
 /// Build a [`ProviderError::RateLimit`] from a transient response: honor

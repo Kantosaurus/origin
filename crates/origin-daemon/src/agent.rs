@@ -7915,6 +7915,9 @@ async fn drain_subscriber_into_response(
     // byte-identical.
     let stream_start = std::time::Instant::now();
     let mut first_token_ms: Option<u64> = None;
+    // Set when the provider signals a length-limit (max_tokens) cutoff via the
+    // shared TurnEnd marker — the output is incomplete.
+    let mut truncated = false;
 
     while let Some(ev) = sub
         .next()
@@ -8031,7 +8034,16 @@ async fn drain_subscriber_into_response(
                     }
                 }
             }
-            origin_stream::TokenKind::TurnEnd => break,
+            origin_stream::TokenKind::TurnEnd => {
+                // A TurnEnd carrying the shared `b"truncated"` marker means the
+                // provider hit a length limit (max_tokens) mid-output — the turn
+                // is incomplete, not a clean stop. Both the Anthropic and
+                // OpenAI-compat providers emit this exact literal.
+                if ev.payload() == b"truncated" {
+                    truncated = true;
+                }
+                break;
+            }
             origin_stream::TokenKind::ThinkingDelta => {
                 // A thinking delta is the model's first emitted token on
                 // reasoning models, so it counts toward time-to-first-token
@@ -8060,6 +8072,15 @@ async fn drain_subscriber_into_response(
             input_json: buf.clone(),
             cache_marker: None,
         });
+    }
+    if truncated {
+        // Make the cutoff visible to the model on the next turn: a length-limited
+        // response looks identical to a clean stop otherwise, so the model would
+        // proceed on incomplete output (or dispatch a half-written tool call).
+        blocks.push(Block::text(
+            "[note: the response above was cut off at the model's output token limit and is \
+             incomplete — continue from where it stopped]",
+        ));
     }
     let assistant = Message {
         role: Role::Assistant,

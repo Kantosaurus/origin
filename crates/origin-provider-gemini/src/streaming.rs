@@ -98,6 +98,7 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
         // present so consumers can record real token counts for streaming.
         let usage_meta = chunk.usage_metadata;
         let mut finished = false;
+        let mut truncated = false;
         for cand in chunk.candidates {
             for part in cand.content.parts {
                 if let Some(text) = part.text {
@@ -137,6 +138,11 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
             }
             if cand.finish_reason.is_some() {
                 finished = true;
+                // A MAX_TOKENS finish is a length-limit cutoff: mark it so the
+                // daemon can tell the model its output is incomplete.
+                if cand.finish_reason.as_deref() == Some("MAX_TOKENS") {
+                    truncated = true;
+                }
             }
         }
         if let Some(um) = usage_meta {
@@ -144,7 +150,10 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
                 .map_err(|e| ProviderError::Api(e.to_string()))?;
         }
         if finished {
-            ring.publish(&TokenEvent::new(TokenKind::TurnEnd, Vec::new()))
+            // Same `b"truncated"` marker the Anthropic / OpenAI-compat providers
+            // use, so the daemon drain consumes one literal regardless of provider.
+            let payload: Vec<u8> = if truncated { b"truncated".to_vec() } else { Vec::new() };
+            ring.publish(&TokenEvent::new(TokenKind::TurnEnd, payload))
                 .map_err(|e| ProviderError::Api(e.to_string()))?;
             return Ok(());
         }

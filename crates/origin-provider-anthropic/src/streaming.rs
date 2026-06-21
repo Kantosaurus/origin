@@ -20,6 +20,26 @@ pub enum StreamingError {
     Ring(#[from] RingError),
     #[error("sse: {0}")]
     Sse(String),
+    /// A mid-stream Anthropic `error` event (e.g. `overloaded_error`). Carries
+    /// the inner `type`/`message` so the provider can classify it as retryable
+    /// (`RateLimit`) instead of dropping it and treating a short, incomplete
+    /// stream as a clean completion.
+    #[error("mid-stream {kind}: {message}")]
+    MidStream { kind: String, message: String },
+}
+
+/// Whether a mid-stream Anthropic error type is worth retrying with backoff.
+#[must_use]
+pub fn is_retryable_error_kind(kind: &str) -> bool {
+    matches!(kind, "overloaded_error" | "rate_limit_error" | "api_error")
+}
+
+#[derive(Deserialize, Default)]
+struct WireErrorBody {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    message: String,
 }
 
 #[derive(Deserialize)]
@@ -58,6 +78,10 @@ enum WireEvent {
         usage: Option<WireUsage>,
     },
     MessageStop {},
+    Error {
+        #[serde(default)]
+        error: WireErrorBody,
+    },
     #[serde(other)]
     Other,
 }
@@ -123,8 +147,16 @@ where
         if raw.is_empty() {
             continue;
         }
-        let parsed: WireEvent =
-            serde_json::from_str(&raw).map_err(|e| StreamingError::Sse(format!("json: {e}; raw={raw}")))?;
+        // A single undecodable frame must not abort the whole turn (dropping all
+        // blocks streamed so far): warn and skip it — the stream may still
+        // deliver a valid TurnEnd.
+        let parsed: WireEvent = match serde_json::from_str(&raw) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "anthropic SSE: skipping undecodable event frame");
+                continue;
+            }
+        };
         match parsed {
             WireEvent::ContentBlockStart {
                 index,
@@ -174,15 +206,36 @@ where
                 }
                 if let Some(d) = delta {
                     if d.stop_reason.is_some() {
-                        ring.publish(&TokenEvent::new(TokenKind::TurnEnd, Vec::new()))?;
+                        // Signal a length-limit cutoff so the daemon can tell the
+                        // model its output is incomplete (vs a clean stop).
+                        let payload = if d.stop_reason.as_deref() == Some("max_tokens") {
+                            TURNEND_TRUNCATED.to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        ring.publish(&TokenEvent::new(TokenKind::TurnEnd, payload))?;
                     }
                 }
+            }
+            WireEvent::Error { error } => {
+                // Mid-stream server error (overloaded/rate-limit/api): surface it
+                // as a typed error so the provider retries instead of returning a
+                // truncated stream that looks complete.
+                return Err(StreamingError::MidStream {
+                    kind: error.kind,
+                    message: error.message,
+                });
             }
             _ => {}
         }
     }
     Ok(())
 }
+
+/// `TurnEnd` payload marking a length-limit (`max_tokens`) cutoff. Matches the
+/// OpenAI-compat provider's marker byte-for-byte so the daemon drain consumes a
+/// single literal regardless of provider.
+pub const TURNEND_TRUNCATED: &[u8] = b"truncated";
 
 /// Panic-free synchronous SSE wire-event decoder for fuzz targets.
 ///
@@ -281,7 +334,7 @@ pub fn parse_chunk_for_test(line: &[u8]) -> Option<TestFrame> {
         WireEvent::ContentBlockStop { index } => (index, None),
         WireEvent::MessageStart { message } => (None, message.and_then(|m| m.usage)),
         WireEvent::MessageDelta { usage, .. } => (None, usage),
-        WireEvent::MessageStop {} | WireEvent::Other => (None, None),
+        WireEvent::MessageStop {} | WireEvent::Error { .. } | WireEvent::Other => (None, None),
     };
     Some(TestFrame {
         index,
