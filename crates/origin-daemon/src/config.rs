@@ -133,6 +133,12 @@ struct PostEditConfigToml {
     /// Test command (program + flags) run after an edit when `auto_test`.
     #[serde(default)]
     test_command: Option<String>,
+    /// Reproduction gate: instruct the model to write a failing test FIRST for a
+    /// reported bug, and enforce the fail→pass transition at turn-end via
+    /// `test_command` — even outside a `/goal`. Implies a turn-end test run.
+    /// Omitted ⇒ `false` (the crate default), byte-identical to before.
+    #[serde(default)]
+    repro_gate: bool,
     /// Per-extension formatter overrides as `{ ext = "command" }`. Tried before
     /// the builtin formatter table; extensions match case-insensitively.
     #[serde(default)]
@@ -379,6 +385,7 @@ fn governance_from_config(cfg: GovernanceConfig, path: &Path) -> Result<Governan
             lint_command: pe.lint_command,
             auto_test: pe.auto_test,
             test_command: pe.test_command,
+            repro_gate: pe.repro_gate,
             format_overrides: pe.format_overrides.into_iter().collect(),
             ..origin_postedit::PostEditConfig::default()
         };
@@ -419,6 +426,104 @@ fn governance_from_config(cfg: GovernanceConfig, path: &Path) -> Result<Governan
     })
 }
 
+/// Probe `root` for the ecosystem marker files [`origin_postedit::detect_test_command`]
+/// keys on. Pure I/O — the decision (which command) stays in `origin-postedit`.
+///
+/// The `Makefile` probe additionally greps for a `test:` target so we only pick
+/// `make test` when it actually exists (a bare `Makefile` with no test target
+/// would otherwise mislead the gate).
+#[must_use]
+pub fn probe_repo_markers(root: &Path) -> origin_postedit::RepoMarkers {
+    let has = |name: &str| root.join(name).exists();
+    let makefile_test_target = ["Makefile", "makefile", "GNUmakefile"]
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(root.join(f)).ok())
+        .any(|body| {
+            // A line beginning `test:` (optionally `.PHONY`-adjacent). Cheap and
+            // conservative; false negatives just leave the gate unset.
+            body.lines()
+                .any(|l| l.trim_start().starts_with("test:") || l.trim_start().starts_with("test :"))
+        });
+    origin_postedit::RepoMarkers {
+        cargo_toml: has("Cargo.toml"),
+        package_json: has("package.json"),
+        pyproject_toml: has("pyproject.toml"),
+        python_legacy: has("setup.py") || has("setup.cfg") || has("tox.ini"),
+        go_mod: has("go.mod"),
+        pom_xml: has("pom.xml"),
+        build_gradle: has("build.gradle") || has("build.gradle.kts"),
+        gemfile: has("Gemfile"),
+        makefile_test_target,
+    }
+}
+
+/// Resolve the effective post-edit policy for a session, honoring the
+/// `ORIGIN_REPRO_GATE` env on-switch.
+///
+/// Precedence:
+/// 1. If `ORIGIN_REPRO_GATE` is unset/`0`/`false` ⇒ return `base` unchanged
+///    (the `[post_edit]` config, or `None`) — byte-identical to before.
+/// 2. Otherwise the reproduction/regression gate is requested for THIS run:
+///    - start from the configured `[post_edit]` (so a user's formatter
+///      overrides / `max_repair_iters` are preserved) or a fresh default,
+///    - set `repro_gate = true`,
+///    - if no `test_command` is configured, auto-derive one from `root`'s
+///      ecosystem markers ([`probe_repo_markers`] + `detect_test_command`).
+///
+/// When the gate is requested but no test command can be resolved (unknown
+/// ecosystem, no marker files) the returned config still carries `repro_gate`
+/// so the `<repro-gate>` *instruction* is injected, but `test_gate_armed()`
+/// stays `false` so nothing is executed — the loop degrades to a prompt-only
+/// nudge rather than blocking on a command that does not exist.
+///
+/// The env value may also be an explicit command (anything other than the
+/// boolean tokens), in which case it is used verbatim as the `test_command`
+/// — an escape hatch for repos whose runner auto-detection can't guess.
+#[must_use]
+pub fn resolve_post_edit_with_repro_gate(
+    base: Option<Arc<origin_postedit::PostEditConfig>>,
+    root: &Path,
+) -> Option<Arc<origin_postedit::PostEditConfig>> {
+    let Some(raw) = std::env::var("ORIGIN_REPRO_GATE").ok() else {
+        return base;
+    };
+    let raw = raw.trim();
+    // Off tokens ⇒ no change.
+    if raw.is_empty() || raw == "0" || raw.eq_ignore_ascii_case("false") || raw.eq_ignore_ascii_case("off") {
+        return base;
+    }
+    // On. Start from the configured policy (preserve overrides) or a default.
+    let mut cfg = base
+        .as_deref()
+        .cloned()
+        .unwrap_or_default();
+    cfg.repro_gate = true;
+    // An explicit non-boolean value is a command override.
+    let explicit_cmd = if raw == "1" || raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("on") {
+        None
+    } else {
+        Some(raw.to_string())
+    };
+    if let Some(cmd) = explicit_cmd {
+        cfg.test_command = Some(cmd);
+    } else if cfg.test_command.is_none() {
+        cfg.test_command = origin_postedit::detect_test_command(&probe_repo_markers(root));
+    }
+    if cfg.test_command.is_some() {
+        tracing::info!(
+            test_command = cfg.test_command.as_deref().unwrap_or(""),
+            "repro-gate armed: turn-end tests will be enforced without a /goal"
+        );
+    } else {
+        tracing::warn!(
+            "ORIGIN_REPRO_GATE set but no test command could be resolved for this repo; \
+             injecting the repro-gate instruction only (no turn-end enforcement). \
+             Set ORIGIN_REPRO_GATE=<command> or [post_edit] test_command to enforce."
+        );
+    }
+    Some(Arc::new(cfg))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
@@ -431,6 +536,122 @@ mod tests {
         let gov = load_governance(&path).unwrap();
         assert!(gov.policy.is_none(), "absent config ⇒ no policy");
         assert!(gov.conseca.is_none(), "absent config ⇒ no conseca");
+    }
+
+    /// Serializes tests that mutate the process-wide `ORIGIN_REPRO_GATE` env var
+    /// so they can't interleave (the workspace convention for env-var tests).
+    static REPRO_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn probe_repo_markers_detects_common_ecosystems() {
+        let dir = tempfile::tempdir().unwrap();
+        // Rust + a Makefile WITHOUT a test target.
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname='x'\n").unwrap();
+        std::fs::write(dir.path().join("Makefile"), "build:\n\tcargo build\n").unwrap();
+        let m = probe_repo_markers(dir.path());
+        assert!(m.cargo_toml);
+        assert!(!m.makefile_test_target, "no `test:` target ⇒ not detected");
+        assert!(!m.package_json);
+
+        // Add a Makefile test target and a package.json.
+        std::fs::write(dir.path().join("Makefile"), "test:\n\tcargo test\n").unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let m2 = probe_repo_markers(dir.path());
+        assert!(m2.makefile_test_target, "`test:` target ⇒ detected");
+        assert!(m2.package_json);
+        // Cargo still wins the derived command (precedence).
+        assert_eq!(
+            origin_postedit::detect_test_command(&m2).as_deref(),
+            Some("cargo test")
+        );
+    }
+
+    #[test]
+    fn repro_gate_env_unset_passes_config_through() {
+        let _guard = REPRO_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ORIGIN_REPRO_GATE");
+        let dir = tempfile::tempdir().unwrap();
+        // No base config ⇒ stays None (byte-identical default).
+        assert!(resolve_post_edit_with_repro_gate(None, dir.path()).is_none());
+        // A base config passes through unchanged.
+        let base = Arc::new(origin_postedit::PostEditConfig {
+            auto_lint: true,
+            lint_command: Some("cargo clippy".into()),
+            ..Default::default()
+        });
+        let out = resolve_post_edit_with_repro_gate(Some(base.clone()), dir.path()).unwrap();
+        assert_eq!(*out, *base, "unset ⇒ config unchanged");
+        assert!(!out.repro_gate);
+    }
+
+    #[test]
+    fn repro_gate_env_on_arms_and_auto_derives_command() {
+        let _guard = REPRO_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname='x'\n").unwrap();
+        std::env::set_var("ORIGIN_REPRO_GATE", "1");
+        let out = resolve_post_edit_with_repro_gate(None, dir.path()).unwrap();
+        std::env::remove_var("ORIGIN_REPRO_GATE");
+        assert!(out.repro_gate, "=1 ⇒ repro_gate on");
+        assert_eq!(out.test_command.as_deref(), Some("cargo test"), "auto-derived from Cargo.toml");
+        assert!(out.test_gate_armed(), "armed: enforcement will run");
+    }
+
+    #[test]
+    fn repro_gate_env_explicit_command_wins() {
+        let _guard = REPRO_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // Even with a Cargo.toml present, an explicit command overrides.
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname='x'\n").unwrap();
+        std::env::set_var("ORIGIN_REPRO_GATE", "pytest -q tests/test_bug.py");
+        let out = resolve_post_edit_with_repro_gate(None, dir.path()).unwrap();
+        std::env::remove_var("ORIGIN_REPRO_GATE");
+        assert!(out.repro_gate);
+        assert_eq!(out.test_command.as_deref(), Some("pytest -q tests/test_bug.py"));
+    }
+
+    #[test]
+    fn repro_gate_env_on_unknown_ecosystem_injects_instruction_only() {
+        let _guard = REPRO_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap(); // no marker files
+        std::env::set_var("ORIGIN_REPRO_GATE", "true");
+        let out = resolve_post_edit_with_repro_gate(None, dir.path()).unwrap();
+        std::env::remove_var("ORIGIN_REPRO_GATE");
+        assert!(out.repro_gate, "instruction still injected");
+        assert!(out.test_command.is_none(), "no ecosystem ⇒ no command");
+        assert!(!out.test_gate_armed(), "no command ⇒ nothing to enforce (prompt-only)");
+    }
+
+    #[test]
+    fn repro_gate_env_off_tokens_are_noops() {
+        let _guard = REPRO_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname='x'\n").unwrap();
+        for off in ["0", "false", "off", ""] {
+            std::env::set_var("ORIGIN_REPRO_GATE", off);
+            let out = resolve_post_edit_with_repro_gate(None, dir.path());
+            std::env::remove_var("ORIGIN_REPRO_GATE");
+            assert!(out.is_none(), "`{off}` ⇒ off ⇒ config unchanged (None)");
+        }
+    }
+
+    #[test]
+    fn repro_gate_env_on_preserves_base_overrides() {
+        let _guard = REPRO_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module x\n").unwrap();
+        let base = Arc::new(origin_postedit::PostEditConfig {
+            max_repair_iters: 5,
+            format_overrides: vec![("rs".into(), "leptosfmt".into())],
+            ..Default::default()
+        });
+        std::env::set_var("ORIGIN_REPRO_GATE", "1");
+        let out = resolve_post_edit_with_repro_gate(Some(base), dir.path()).unwrap();
+        std::env::remove_var("ORIGIN_REPRO_GATE");
+        assert!(out.repro_gate);
+        assert_eq!(out.test_command.as_deref(), Some("go test ./..."));
+        assert_eq!(out.max_repair_iters, 5, "base budget preserved");
+        assert_eq!(out.format_overrides.len(), 1, "base overrides preserved");
     }
 
     #[test]

@@ -100,6 +100,27 @@ fn query_recent_changes() {
     }
 }
 
+#[test]
+fn reverse_dep_files_returns_callers_of_edited_files() {
+    // Fixture: a.rs(alpha) → b.rs(beta) → c.rs(gamma) via `calls` edges.
+    let (_dir, idx, _a, _b, _c) = make_idx();
+
+    // Editing b.rs: its reverse-deps are its callers (a.rs) plus itself.
+    let deps = origin_codegraph::query::reverse_dep_files(&idx, &["b.rs".to_string()]).expect("q");
+    assert!(deps.contains(&"b.rs".to_string()), "a file is its own dependency: {deps:?}");
+    assert!(deps.contains(&"a.rs".to_string()), "a.rs calls beta ⇒ must be retested: {deps:?}");
+    assert!(!deps.contains(&"c.rs".to_string()), "gamma is a CALLEE of beta, not a caller: {deps:?}");
+
+    // Editing a.rs (the root caller): nobody calls alpha ⇒ just itself.
+    let deps_a = origin_codegraph::query::reverse_dep_files(&idx, &["a.rs".to_string()]).expect("q");
+    assert_eq!(deps_a, vec!["a.rs".to_string()], "no inbound edges ⇒ self only");
+
+    // A file the graph never saw ⇒ still self (so the caller can scope to it).
+    let deps_unknown =
+        origin_codegraph::query::reverse_dep_files(&idx, &["nope.rs".to_string()]).expect("q");
+    assert_eq!(deps_unknown, vec!["nope.rs".to_string()]);
+}
+
 /// Seed two disjoint call clusters (`a→b→c` and `d→e→f`) and assert
 /// `Communities` returns exactly two partitions.
 #[allow(clippy::many_single_char_names)] // canonical 6-node fixture

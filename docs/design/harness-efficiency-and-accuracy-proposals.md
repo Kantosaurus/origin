@@ -19,20 +19,27 @@ SWE-bench systems have and `origin` does not yet**.
 
 Ranked by **accuracy-per-dollar uplift ÷ implementation effort**:
 
-| # | Proposal | Acc | Tokens | Cost | Effort |
-|---|----------|:---:|:------:|:----:|:------:|
-| 1 | **Reproduction-test gate** (generate failing test → confirm RED → require GREEN before "done") | ★★★ | ~ | ↓ (kills wasted retries) | M |
-| 2 | **Uncertainty-gated model cascade** (cheap model drives; escalate only when stuck) | ★★ | ~ | ↓↓↓ | M |
-| 3 | **Regression-test selection before final answer** (run the touched-area tests, feed failures back) | ★★★ | ↑ small | ↓ (fewer bad patches) | S–M |
-| 4 | **Localize-then-edit retrieval band** (repo-map + codegraph "suspect set" injected before the agent reads files) | ★★ | ↓↓ | ↓ | S |
-| 5 | **Best-of-N with execution-grounded selection** (only when a test oracle exists) | ★★★ | ↑↑ | ↑ but bounded | M |
-| 6 | **Sub-agent return-contract compression** (force structured `CompletionReport`, drop raw transcript) | ★ | ↓↓ | ↓ | S |
-| 7 | **Adaptive thinking-budget by phase/uncertainty** | ★ | ↓ | ↓ | S |
-| 8 | **"Anchored" file reads / edit-anchored re-reads** (never re-emit a whole file the model already saw) | ~ | ↓↓ | ↓ | S |
-| 9 | **Semantic + exact prompt-prefix cache across sessions** (warm the cache from a sibling session) | ~ | ↓ | ↓↓ | M |
-| 10 | **Speculative *next-tool* prefetch** (extend the existing speculative path to chains) | ↑ latency | ~ | ~ | M |
-| 11 | **Token-budgeted, model-tuned system prompt** (trim the always-on directive; make it conditional) | ~ | ↓ | ↓ | S |
-| 12 | **Diagnostic-driven repair loop already exists in `postedit` — wire it into the main loop** | ★★ | ↑ small | ↓ | S |
+| # | Proposal | Acc | Tokens | Cost | Effort | Status |
+|---|----------|:---:|:------:|:----:|:------:|:------:|
+| 1 | **Reproduction-test gate** (generate failing test → confirm RED → require GREEN before "done") | ★★★ | ~ | ↓ (kills wasted retries) | M | ✅ **shipped** (`ORIGIN_REPRO_GATE`) |
+| 2 | **Uncertainty-gated model cascade** (cheap model drives; escalate only when stuck) | ★★ | ~ | ↓↓↓ | M | ◑ partial (`choose_model_ref_struggling`; opt-in `ORIGIN_ROUTER`) |
+| 3 | **Regression-test selection before final answer** (run the touched-area tests, feed failures back) | ★★★ | ↑ small | ↓ (fewer bad patches) | S–M | ✅ **shipped** (`ORIGIN_TEST_SELECT`) |
+| 4 | **Localize-then-edit retrieval band** (repo-map + codegraph "suspect set" injected before the agent reads files) | ★★ | ↓↓ | ↓ | S | ◑ partial (repomap `focus` on by default) |
+| 5 | **Best-of-N with execution-grounded selection** (only when a test oracle exists) | ★★★ | ↑↑ | ↑ but bounded | M | ✅ **shipped** (`ORIGIN_BESTOFN=N`) |
+| 6 | **Sub-agent return-contract compression** (force structured `CompletionReport`, drop raw transcript) | ★ | ↓↓ | ↓ | S | ☐ |
+| 7 | **Adaptive thinking-budget by phase/uncertainty** | ★ | ↓ | ↓ | S | ☐ |
+| 8 | **"Anchored" file reads / edit-anchored re-reads** (never re-emit a whole file the model already saw) | ~ | ↓↓ | ↓ | S | ◑ partial (`ORIGIN_AGENTGREP_TRUNCATE` for Grep) |
+| 9 | **Semantic + exact prompt-prefix cache across sessions** (warm the cache from a sibling session) | ~ | ↓ | ↓↓ | M | ☐ |
+| 10 | **Speculative *next-tool* prefetch** (extend the existing speculative path to chains) | ↑ latency | ~ | ~ | M | ☐ |
+| 11 | **Token-budgeted, model-tuned system prompt** (trim the always-on directive; make it conditional) | ~ | ↓ | ↓ | S | ☐ |
+| 12 | **Diagnostic-driven repair loop already exists in `postedit` — wire it into the main loop** | ★★ | ↑ small | ↓ | S | ✅ **shipped** (`auto_lint`/`auto_test` + terminal enforcement) |
+
+> **Implementation status (workspace 0.9.13+).** Proposals **1, 3, 5, 12** — the
+> execution-feedback stack the TL;DR calls the highest-leverage change — are now
+> implemented and wired into the **default headless path** (no `/goal` required).
+> See [§9 "What shipped"](#9-what-shipped-implementation-notes) for the exact
+> env switches, code seams, and the A/B protocol. Proposals 2, 4, 8 have partial
+> substrate already in tree. The rest remain open.
 
 `~` = roughly neutral. The single highest-leverage change is **#1 + #3 + #5
 together**: an execution-grounded "propose → reproduce → verify → (rarely)
@@ -525,3 +532,78 @@ reuses substrate `origin` already ships (proc-supervisor, postedit, swarm,
 worktrees, router, cost meter, repomap, codegraph, CAS, the embedder). The work
 is mostly **assembly and wiring**, not new subsystems — which is the cheapest
 possible way to move all three KPIs at once.
+
+---
+
+## 9. What shipped (implementation notes)
+
+The execution-feedback stack (proposals **1, 3, 5, 12**) is implemented and
+default-off. Every switch below is byte-identical to the prior behaviour when
+unset. The design constraint that drove this work: these mechanisms already
+existed at the prompt/decision layer but were **dormant on the benchmarked
+path** — `bench/swe/adapters/origin.sh` runs a plain `origin run <issue>` with
+no `/goal`, no `governance.toml`, and no test command, so the gate never fired
+and `LoopSummary.gate_signals` was computed and dropped. The fix makes the gate
+**armable by env and enforced without a `/goal`**.
+
+### 9.1 Env switches (operator surface)
+
+| Env | Effect | Default |
+|-----|--------|---------|
+| `ORIGIN_REPRO_GATE=1` | Arm the reproduction/regression gate on the current run: inject the `<repro-gate>` contract, run the test command at turn-end, and **refuse to return a tool-free "done" while tests are RED** — even with no `/goal`. Auto-derives a `test_command` from the repo's ecosystem markers. | off |
+| `ORIGIN_REPRO_GATE=<command>` | As above, but use `<command>` verbatim as the test oracle (escape hatch for non-standard runners). | — |
+| `ORIGIN_TEST_SELECT=1` | Regression-test **selection**: narrow the gate's test command to `{edited ∪ code-graph reverse-deps}` (pytest/go) instead of the whole suite. Falls back to the full command whenever narrowing could drop coverage. | off |
+| `ORIGIN_BESTOFN=N` (N≥2, capped at 6) | For a **hard** instance (gate still RED), run N candidate attempts in isolated `git worktree` lanes, score each against the test oracle, and apply the verified winner's diff. Requires an armed oracle (`ORIGIN_REPRO_GATE`). | off |
+
+`[post_edit]` in `governance.toml` also gained a `repro_gate` key (previously the
+field existed on `PostEditConfig` but had **no config surface** — it was
+unreachable).
+
+### 9.2 Code seams (for maintainers)
+
+- **Gate on-switch + auto-derived command:** `config::resolve_post_edit_with_repro_gate`
+  + `config::probe_repo_markers` (daemon) over the pure
+  `origin_postedit::{detect_test_command, RepoMarkers}`. Wired at the
+  `LoopOptions.post_edit` build site in `main.rs`.
+- **No-goal enforcement (the key change):** the terminal branch of
+  `run_loop_inner` (`agent.rs`, the "no tool_use ⇒ return `Ok`" site) now runs
+  the oracle *there* — fixing the ordering gap where the post-turn test block
+  never executed on the final tool-free turn and the terminal branch reused a
+  *stale* prior-turn result — and on RED pushes a continuation user turn and
+  `continue`s instead of returning, bounded by `PostEditConfig::max_repair_iters`.
+  The predicate is `origin_postedit::PostEditConfig::test_gate_armed`.
+- **Test selection:** `origin_codegraph::query::reverse_dep_files` (new inbound
+  `edges_to` / `nodes_in_file` primitives) → `origin_postedit::select_tests` →
+  `agent::effective_test_command`, called at every gate execution site.
+- **Sub-agent enforcement:** `swarm_worker::worker_post_edit` arms `auto_test`
+  (turn-end regression run + terminal enforcement) — but **not** `repro_gate`
+  (the "write a failing test first" contract is a top-level bug-report
+  discipline, not a delegated sub-task's).
+- **Best-of-N:** pure policy in `origin_swarm::bestofn`
+  (`select_best`/`has_verified_winner`/`DifficultySignals`, fully unit-tested);
+  orchestration in `origin_daemon::bestofn_runner` (`WorktreeArena` +
+  `run_best_of_n`), invoked from `main::maybe_run_best_of_n`. The batch runs on a
+  blocking thread and serializes on a process-wide cwd lock (candidates edit
+  cwd-relative paths, so each runs with cwd pointed at its worktree).
+
+### 9.3 A/B protocol (unchanged from §6, restated per feature)
+
+Each feature is default-off; measure it on `bench/swe/` with the **model held
+constant** before turning it on in the published run:
+
+```bash
+# baseline (all off) vs. the execution-feedback stack:
+python bench/swe/run.py --harness origin --adapter bench/swe/adapters/origin.sh -n 50 --seeds 3
+ORIGIN_REPRO_GATE=1 python bench/swe/run.py --harness origin-gate --adapter bench/swe/adapters/origin.sh -n 50 --seeds 3
+ORIGIN_REPRO_GATE=1 ORIGIN_TEST_SELECT=1 ORIGIN_BESTOFN=3 \
+  python bench/swe/run.py --harness origin-full --adapter bench/swe/adapters/origin.sh -n 50 --seeds 3
+python bench/swe/evaluate.py --out bench/swe/out --max-workers 8
+```
+
+Accept a knob only if it moves pass@1's CI upward (accuracy features) or holds
+pass@1 while cutting tokens/$ (efficiency features). To make the *published*
+number reflect the gate, export the switches in the adapter (or a wrapper) — note
+that **SWE-bench hides the `FAIL_TO_PASS`/`PASS_TO_PASS` tests**, so the
+auto-derived whole-suite command (e.g. `pytest`) is what the gate runs; it
+verifies the model's *own* reproduction test and any repo tests it can see, not
+the hidden grader.

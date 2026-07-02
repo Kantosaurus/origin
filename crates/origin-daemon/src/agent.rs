@@ -188,7 +188,7 @@ mod compaction_cap_tests {
         let window = 200_000u32;
         let token_cap = token_soft_cap(window); // 120_000
         assert!(
-            should_compact(10_000, 480_000, token_cap as u32, token_cap),
+            should_compact(10_000, 480_000, u32::try_from(token_cap).unwrap_or(u32::MAX), token_cap),
             "measured tokens over the window fraction must force compaction"
         );
         // Under both caps ⇒ no compaction.
@@ -557,11 +557,63 @@ async fn run_turn_end_command(cmd: &str, tag: &str, label: &str) -> Option<Strin
     }
 }
 
+/// Compute the effective test command for a gate check, applying code-graph
+/// regression-test *selection* (#4 / SWE-bench proposal 2.2).
+///
+/// Given the base `test_command` and the set of files the turn mutated, this
+/// narrows the command to just the impacted tests when it is safe to do so:
+/// 1. expand `edited` → `{edited ∪ reverse-deps}` via
+///    [`origin_codegraph::query::reverse_dep_files`] (the caller direction), and
+/// 2. render a scoped invocation via [`origin_postedit::select_tests`]
+///    (pytest/go narrowing; everything else runs unchanged).
+///
+/// Returns the base command verbatim when: the feature is off
+/// (`ORIGIN_TEST_SELECT` unset), no code graph is wired, `edited` is empty, the
+/// graph knew nothing about the edited files, or the runner can't be safely
+/// narrowed. A false GREEN is worse than a slightly-broad run, so every
+/// uncertain case falls back to the full suite.
+async fn effective_test_command(
+    base: &str,
+    edited: &BTreeSet<String>,
+    code_graph: Option<&Arc<tokio::sync::Mutex<origin_codegraph::index::CodeGraphIndex>>>,
+) -> String {
+    // Opt-in: selection changes WHICH tests run, so it ships behind a flag until
+    // measured on the A/B harness. Unset/0 ⇒ base command, byte-identical.
+    if !matches!(std::env::var("ORIGIN_TEST_SELECT").as_deref(), Ok("1")) {
+        return base.to_string();
+    }
+    let (Some(graph), false) = (code_graph, edited.is_empty()) else {
+        return base.to_string();
+    };
+    let edited_vec: Vec<String> = edited.iter().cloned().collect();
+    // Reverse-dep expansion is a synchronous SQLite walk; hold the graph lock
+    // only for that call, never across an await.
+    let impacted = {
+        let idx = graph.lock().await;
+        match origin_codegraph::query::reverse_dep_files(&idx, &edited_vec) {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::debug!(error = %e, "test-selection: reverse-dep query failed; running full suite");
+                return base.to_string();
+            }
+        }
+    };
+    match origin_postedit::select_tests(base, &impacted) {
+        origin_postedit::Selection::Narrowed(cmd) => {
+            tracing::info!(
+                base, narrowed = %cmd, impacted = impacted.len(),
+                "test-selection: narrowed the regression suite to the edit's blast radius"
+            );
+            cmd
+        }
+        origin_postedit::Selection::Full => base.to_string(),
+    }
+}
+
 /// Render a `<workspace-roots>` system-prompt block listing the additional
 /// workspace roots the agent may operate across (cline multi-root workspaces).
 /// Empty `roots` ⇒ empty string, leaving the assembled prompt byte-identical.
-fn workspace_roots_block(roots: &[std::path::PathBuf]) -> String {
-    if roots.is_empty() {
+fn workspace_roots_block(roots: &[std::path::PathBuf]) -> String {    if roots.is_empty() {
         return String::new();
     }
     let mut s = String::from(
@@ -3846,6 +3898,22 @@ async fn run_loop_inner(
     // spot — complements C2 (which keys on identical repeated actions).
     let mut edit_check_fail_streak: u32 = 0;
     let mut relocalize_block = String::new();
+    // #1: repro/regression gate repair budget consumed at the TERMINAL branch.
+    // When the gate is armed (`PostEditConfig::test_gate_armed`) the loop refuses
+    // to return a tool-free "done" while the test command is RED — it pushes a
+    // continuation turn and re-enters the loop instead, up to `max_repair_iters`
+    // times. This enforces the fail→pass transition WITHOUT requiring a `/goal`
+    // (the goal-driver path enforces the same signal via the verifier). Counts
+    // only the gate-driven continuations, so a normal run never touches it.
+    let mut repro_gate_repairs: u32 = 0;
+    // The number of terminal-branch RED→continue attempts allowed before the
+    // loop yields control (surfacing the still-failing suite to the user/goal
+    // verifier). Reuses the post-edit `max_repair_iters` budget; 0 when no gate
+    // config is present (the gate is then never armed anyway).
+    let gate_repair_budget: u32 = opts
+        .post_edit
+        .as_deref()
+        .map_or(0, |c| c.max_repair_iters);
     // C9: regression baseline. With auto_test on, run the suite ONCE before any
     // edit, so a post-edit failure can be classified as a true regression
     // (green→red) vs a pre-existing failure. Opt-in ⇒ no default cost.
@@ -4679,6 +4747,67 @@ async fn run_loop_inner(
             // gate + test results) so the goal verifier sees them. Advisory
             // blocks (LSP diagnostics, which may be warnings) are deliberately
             // excluded — only hard failures should auto-block a "Met" claim.
+            //
+            // #1: the post-turn gate block (below the dispatch section) never
+            // runs on THIS tool-free terminal turn — we early-return before it.
+            // So when the repro/regression gate is armed we must run the test
+            // command HERE, on the final turn, to catch a still-RED suite. This
+            // both (a) fixes the ordering gap where the terminal branch reused a
+            // stale prior-turn `test_block`, and (b) lets the loop ENFORCE the
+            // fail→pass transition without a `/goal`: on RED we synthesize a
+            // continuation turn and re-enter the loop instead of returning.
+            let gate_armed = opts.post_edit.as_deref().is_some_and(origin_postedit::PostEditConfig::test_gate_armed);
+            if gate_armed && repro_gate_repairs < gate_repair_budget {
+                if let Some(cfg) = opts.post_edit.as_deref() {
+                    if let Some(cmd) = cfg.test_command.as_deref() {
+                        // #4: narrow the suite to the edit's blast radius when
+                        // test-selection is enabled; falls back to `cmd` verbatim.
+                        let cmd = effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
+                        // Run the oracle now (fresh, not the stale `test_block`).
+                        let mut fresh = run_post_edit_test(&cmd).await.unwrap_or_default();
+                        if !fresh.is_empty() {
+                            // Classify against the pre-edit baseline exactly like
+                            // the per-turn path (C9), so the model is told whether
+                            // it introduced a regression vs a pre-existing failure.
+                            match baseline_tests_passed {
+                                Some(true) => fresh.insert_str(
+                                    0,
+                                    "<regression>\nThese tests PASSED before your change — your edit \
+                                     introduced a regression. Fix it before finishing.\n</regression>\n",
+                                ),
+                                Some(false) => fresh.push_str(
+                                    "\n\n(note: the suite was already failing before your change — \
+                                     not all of these failures are necessarily caused by your edit.)",
+                                ),
+                                None => {}
+                            }
+                            // Keep the freshly-run failure as the terminal gate
+                            // signal too (so a downstream `/goal` verifier, if any,
+                            // sees the current state rather than a stale block).
+                            repro_gate_repairs += 1;
+                            let remaining = gate_repair_budget - repro_gate_repairs;
+                            tracing::info!(
+                                remaining, "repro-gate: tests RED at terminal turn; continuing the loop"
+                            );
+                            // Synthesize a continuation user turn and re-enter the
+                            // loop. This is the no-goal enforcement path. Build the
+                            // prompt (borrowing `fresh`) BEFORE moving `fresh` into
+                            // `test_block` so we neither clone nor re-borrow.
+                            let cont = format!(
+                                "[repro-gate] You indicated you were finished, but the test command is \
+                                 still failing. Do NOT stop yet. Read the failure below, fix the cause, \
+                                 and continue until the tests pass ({remaining} automatic attempt(s) \
+                                 left before the loop yields control to the user).\n\n{fresh}"
+                            );
+                            test_block = fresh;
+                            session.push(Message::new(Role::User).with_block(Block::text(&cont)));
+                            continue;
+                        }
+                        // GREEN (or unrunnable/fail-open) ⇒ fall through to return.
+                        test_block.clear();
+                    }
+                }
+            }
             let gate_signals = {
                 let mut s = String::new();
                 for b in [&compile_check_block, &test_block] {
@@ -5838,7 +5967,10 @@ async fn run_loop_inner(
                 // the model's failing→passing reproduction test is execution-checked.
                 if cfg.auto_test || cfg.repro_gate {
                     if let Some(cmd) = cfg.test_command.as_deref() {
-                        test_block = run_post_edit_test(cmd).await.unwrap_or_default();
+                        // #4: narrow the suite to the edit's blast radius when
+                        // test-selection is enabled; falls back to `cmd` verbatim.
+                        let cmd = effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
+                        test_block = run_post_edit_test(&cmd).await.unwrap_or_default();
                         // C9: classify a post-edit failure against the pre-edit
                         // baseline — a true regression (was green) vs failures
                         // that were already red before this change.
@@ -10929,7 +11061,7 @@ mod bash_streaming_tests {
         assert_eq!(v["exit_code"], 0);
     }
 
-    /// C4: a non-zero exit must surface as the structural is_error flag (the
+    /// C4: a non-zero exit must surface as the structural `is_error` flag (the
     /// returned bool), not merely a `failed` field buried in the body — so a
     /// failing `cargo test`/`pytest`/lint run via Bash can't read as a clean
     /// result and drive a false "done" claim.

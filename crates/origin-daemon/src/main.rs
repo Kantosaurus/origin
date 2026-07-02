@@ -975,6 +975,7 @@ fn spawn_handler_task(
                     let outcome = handle_request(
                         &conn,
                         provider_snapshot.as_ref(),
+                        Arc::clone(&provider_snapshot),
                         Arc::clone(&session_store),
                         Arc::clone(&cas),
                         Arc::clone(&sidecar),
@@ -1710,6 +1711,10 @@ fn resolve_turn_effort(
 async fn handle_request(
     conn: &SharedConnection,
     provider: &dyn Provider,
+    // #5: owned provider snapshot for the best-of-N candidate runs, which drive
+    // fresh `run_loop`s off the async worker (`spawn_blocking`) and therefore
+    // need a `Send`, owned handle rather than the borrowed `&dyn Provider`.
+    provider_owned: Arc<dyn Provider>,
     session_store: Arc<SessionStore>,
     cas: Arc<Store>,
     sidecar: Arc<Sidecar>,
@@ -1996,11 +2001,20 @@ async fn handle_request(
             // auto-approves a `RequiresPermission` tool and an explicit deny
             // blocks it, before the interactive prompter is consulted. Absent
             // (the default) ⇒ `None` ⇒ byte-identical to before this wiring.
-            post_edit: governance.post_edit.clone(),
+            post_edit: origin_daemon::config::resolve_post_edit_with_repro_gate(
+                governance.post_edit.clone(),
+                &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            ),
             // ^ Task 2: `[post_edit]` from `governance.toml`. When present, a
             // successful edit consults the config's formatter overrides and runs
             // the configured lint with its `RepairDecision`. Absent ⇒ `None` ⇒
             // builtin formatter table only, byte-identical to before.
+            //
+            // #1: `ORIGIN_REPRO_GATE=1` (or `=<command>`) additionally arms the
+            // reproduction/regression gate on THIS run — even with no `/goal` and
+            // no `governance.toml` — auto-deriving a `test_command` from the
+            // repo's ecosystem markers when one isn't configured. Unset ⇒ the
+            // config passes through untouched, byte-identical.
             notify: governance.notify.clone(),
             // ^ notify: `[notify]` from `governance.toml`. When present, the
             // completion notification is gated through `should_send` (quiet
@@ -2041,10 +2055,36 @@ async fn handle_request(
             event_tx.clone(),
             prompter,
         );
-        tokio::select! {
+        let turn_end = tokio::select! {
             res = turn_fut => TurnEnd::Normal(res),
             outcome = poll_for_interrupt(conn, &pending_message) => TurnEnd::Interrupted(outcome),
+        };
+        // #5: best-of-N with execution-grounded selection. Opt-in via
+        // `ORIGIN_BESTOFN=N` (N≥2) and gated to HARD instances. After the normal
+        // single-shot turn, if the instance looks hard (tests still red / stuck /
+        // budget-blown) we run N candidate attempts in isolated git worktrees,
+        // score each against the test oracle, and apply the verified winner's
+        // diff to the user's tree. Unset ⇒ this is a no-op and the single-shot
+        // result stands, byte-identical. `apply_winner` mutates the real tree, so
+        // we re-`git add -A`-free: the caller's later `git diff` picks it up.
+        if let (TurnEnd::Normal(Ok(summary)), Some(n)) =
+            (&turn_end, origin_daemon::bestofn_runner::configured_n())
+        {
+            maybe_run_best_of_n(
+                n,
+                summary,
+                &req.user_text,
+                Arc::clone(&provider_owned),
+                opts.post_edit.clone(),
+                Arc::clone(&cas),
+                Arc::clone(&code_graph),
+                session.model.clone(),
+                session.id.clone(),
+                summary.gate_signals.is_some(),
+            )
+            .await;
         }
+        turn_end
     };
     // Mid-turn interrupt teardown. Done BEFORE the channels close so the
     // `GoalCleared` event `interrupt_cleanup` may emit still reaches the client
@@ -2126,6 +2166,141 @@ async fn handle_request(
             submit_summarize_jobs(&sidecar, &session_store, &session);
             PromptOutcome::Succeeded
         }
+    }
+}
+
+/// #5: run best-of-N over `n` candidates for a HARD instance, applying the
+/// verified winner's diff to the user's tree. No-op (logs + returns) when the
+/// instance isn't hard, git isn't usable, or no candidate passes.
+///
+/// Each candidate runs a fresh [`run_loop`](origin_daemon::agent::run_loop) on a
+/// clone of the *original* prompt inside an isolated `git worktree` checked out
+/// at the pre-run HEAD; the worktree's post-run diff is scored with the same
+/// test command the repro gate uses. Selection is the pure
+/// [`origin_daemon::bestofn_runner::run_best_of_n`] policy.
+///
+/// The whole batch runs on a blocking thread ([`tokio::task::spawn_blocking`]):
+/// the [`WorktreeArena`] changes the *process* cwd into each worktree (the tool
+/// builtins edit cwd-relative paths), which it serializes with a process-wide
+/// lock, and each candidate drives the async agent loop via a dedicated
+/// current-thread runtime. This keeps cwd correct for the entire
+/// run→capture→score sequence and never blocks the main async worker.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_run_best_of_n(
+    n: u32,
+    summary: &origin_daemon::agent::LoopSummary,
+    user_text: &str,
+    provider: Arc<dyn Provider>,
+    post_edit: Option<Arc<origin_postedit::PostEditConfig>>,
+    cas: Arc<Store>,
+    code_graph: Arc<tokio::sync::Mutex<CodeGraphIndex>>,
+    model: String,
+    session_id: String,
+    hard_tests_red: bool,
+) {
+    use origin_daemon::bestofn_runner::{run_best_of_n, WorktreeArena};
+    use origin_swarm::bestofn::DifficultySignals;
+
+    // Difficulty gate: only spend N× when the single-shot run looks hard. Today
+    // the strongest no-goal signal available here is "the final harness gate
+    // still reported a failure" (tests/syntax RED). `no_edits` vetoes (nothing
+    // to select among).
+    let difficulty = DifficultySignals {
+        tests_red: hard_tests_red || summary.gate_signals.is_some(),
+        no_edits: false,
+        ..Default::default()
+    };
+    if !difficulty.is_hard() {
+        return;
+    }
+
+    // The test oracle: reuse the repro/regression gate's command. Without one
+    // there is no way to *verify* a candidate ⇒ decline rather than guess.
+    let Some(test_command) = post_edit
+        .as_deref()
+        .filter(|c| c.test_gate_armed())
+        .and_then(|c| c.test_command.clone())
+    else {
+        tracing::info!("best-of-N: no armed test oracle (set ORIGIN_REPRO_GATE); skipping selection");
+        return;
+    };
+
+    let workspace = selfdev_workspace_root();
+    let goal_text = user_text.to_string();
+
+    // Everything below is blocking (git worktree, chdir, subprocess tests, plus
+    // a nested current-thread runtime per candidate), so it runs off the async
+    // worker on a blocking thread. Values captured must be owned/`Send`.
+    let join = tokio::task::spawn_blocking(move || {
+        use origin_vcs::GitRunner as _;
+        let git = origin_daemon::selfdev::ProcessGitRunner::new(workspace.clone());
+        let base_commit = match git.run(&["rev-parse", "HEAD"]) {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                tracing::info!(error = %e, "best-of-N: cannot resolve HEAD (not a git repo?); skipping");
+                return;
+            }
+        };
+        let scratch = std::env::temp_dir().join(format!("origin-bestofn-{session_id}"));
+        let _ = std::fs::create_dir_all(&scratch);
+
+        // Per-candidate runner: fresh session + fresh run_loop on the ORIGINAL
+        // prompt. cwd is already the worktree (the arena set it under the
+        // process-wide lock right before calling us), so edits land there. We
+        // drive the async loop with a dedicated current-thread runtime.
+        //
+        // A candidate is an ISOLATED, SILENT attempt: it gets only the handles a
+        // fresh run genuinely needs (the test gate, CAS, code graph) — no event/
+        // relay channels, no goal slot, no metrics — so it never emits to the
+        // user's stream or mutates shared per-connection state. This deliberately
+        // builds a MINIMAL `LoopOptions` rather than cloning the live one.
+        let prompter = AlwaysAllow;
+        let runner = move |_idx: usize, _wt: &std::path::Path| -> Result<(), String> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("candidate runtime: {e}"))?;
+            let mut cand_session = Session::new(provider.name(), &model);
+            let cand_opts = LoopOptions {
+                max_turns: 60,
+                cas: Some(Arc::clone(&cas)),
+                code_graph: Some(Arc::clone(&code_graph)),
+                // The gate is what makes the candidate self-verify (turn-end
+                // tests + terminal enforcement), so it MUST carry post_edit.
+                post_edit: post_edit.clone(),
+                // Match the orchestrator's effort so candidates aren't downgraded.
+                effort: resolve_turn_effort(None, provider.name()),
+                ..LoopOptions::default()
+            };
+            let res = rt.block_on(origin_daemon::agent::run_loop(
+                &mut cand_session,
+                &goal_text,
+                provider.as_ref(),
+                &prompter,
+                &cand_opts,
+            ));
+            // The candidate's DIFF (captured by the arena) is what we score, not
+            // the loop's own success signal — a run that errored may still have
+            // produced a useful partial diff. So any terminal outcome is "ran".
+            if let Err(e) = res {
+                tracing::debug!(error = %e, "best-of-N candidate loop ended with error; scoring its diff anyway");
+            }
+            Ok(())
+        };
+
+        let mut arena = WorktreeArena::new(
+            &git,
+            base_commit,
+            scratch,
+            workspace,
+            Some(test_command),
+            Box::new(runner),
+        );
+        let outcome = run_best_of_n(&mut arena, n, difficulty);
+        tracing::info!(?outcome, "best-of-N finished");
+    });
+    if let Err(e) = join.await {
+        tracing::warn!(error = %e, "best-of-N blocking task panicked");
     }
 }
 

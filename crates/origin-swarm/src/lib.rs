@@ -23,6 +23,7 @@
 //! - **P9.9:** subscribes the TUI plan panel to [`PlanHandle::subscribe`].
 
 pub mod admission;
+pub mod bestofn;
 pub mod collab;
 pub mod coordinator;
 pub mod error;
@@ -36,6 +37,7 @@ pub mod worker;
 pub use admission::{
     default_probe, AdmissionGate, AdmissionTicket, GateCfg, MemReading, MemoryProbe, NullProbe, ScriptedProbe,
 };
+pub use bestofn::{has_verified_winner, select_best, Candidate, DifficultySignals, TestOutcome};
 pub use collab::{FileRegistry, FileShiftNotice, Mailbox, Message, MsgScope};
 pub use coordinator::{collab_enabled, Coordinator, WorkerHandle, WorkerId};
 pub use error::SwarmError;

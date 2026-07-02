@@ -307,6 +307,85 @@ impl CodeGraphIndex {
         }
         Ok(out)
     }
+
+    /// Fetch every *incoming* edge to `to` — the reverse-dependency direction.
+    ///
+    /// Where [`edges_from`](Self::edges_from) walks callees (what a symbol uses),
+    /// this walks callers (what uses the symbol). It is the primitive behind
+    /// regression-test *selection*: the set of nodes that reference an edited
+    /// symbol are exactly the ones whose behaviour the edit can break.
+    ///
+    /// # Errors
+    /// Propagates `SQLite` errors and surfaces malformed BLOB shapes /
+    /// unknown confidence tags.
+    pub fn edges_to(&self, to: EntityId) -> Result<Vec<EdgeRow>, IndexError> {
+        let rows = self.sql.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT from_id, to_id, kind, confidence, evidence_handle
+                 FROM code_edges WHERE to_id = ?1",
+            )?;
+            let it = stmt.query_map([&to.0[..]], |row| {
+                let f: Vec<u8> = row.get(0)?;
+                let t: Vec<u8> = row.get(1)?;
+                let kind: String = row.get(2)?;
+                let conf: String = row.get(3)?;
+                let ev: Vec<u8> = row.get(4)?;
+                Ok((f, t, kind, conf, ev))
+            })?;
+            it.collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (f, t, kind, conf, ev) in rows {
+            out.push(EdgeRow {
+                from: EntityId(to32(&f)?),
+                to: EntityId(to32(&t)?),
+                kind,
+                confidence: Confidence::from_str(&conf)?,
+                evidence_handle: to32(&ev)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Every node declared in `file_path` (exact match).
+    ///
+    /// The regression-selection entry point: an edited file → the symbols it
+    /// defines → (via [`edges_to`](Self::edges_to)) the callers to retest.
+    ///
+    /// # Errors
+    /// Propagates `SQLite` errors and surfaces malformed BLOB shapes.
+    pub fn nodes_in_file(&self, file_path: &str) -> Result<Vec<NodeRow>, IndexError> {
+        let rows = self.sql.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT entity_id, kind, name, file_path, signature_handle, body_handle
+                 FROM code_nodes WHERE file_path = ?1
+                 ORDER BY entity_id",
+            )?;
+            let it = stmt.query_map([file_path], |row| {
+                let entity: Vec<u8> = row.get(0)?;
+                let kind: String = row.get(1)?;
+                let name: String = row.get(2)?;
+                let file_path: String = row.get(3)?;
+                let sig_h: Vec<u8> = row.get(4)?;
+                let body_h: Vec<u8> = row.get(5)?;
+                Ok((entity, kind, name, file_path, sig_h, body_h))
+            })?;
+            it.collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (entity, kind, name, file_path, sig_h, body_h) in rows {
+            out.push(NodeRow {
+                entity_id: EntityId(to32(&entity)?),
+                kind,
+                name,
+                file_path,
+                signature_handle: to32(&sig_h)?,
+                body_handle: to32(&body_h)?,
+            });
+        }
+        Ok(out)
+    }
 }
 
 fn derive_entity_id(rec: &CodeNodeRecord) -> EntityId {

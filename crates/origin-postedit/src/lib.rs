@@ -202,6 +202,19 @@ impl PostEditConfig {
         }
         formatter_for(path).map(ToString::to_string)
     }
+
+    /// Is a turn-end test run armed for this config?
+    ///
+    /// True when the model has been asked to run tests at turn end for *any*
+    /// reason — an explicit `auto_test`, or the reproduction gate (which also
+    /// execution-checks the fail→pass transition). Both require a resolvable
+    /// `test_command`; without one there is nothing to run, so this is `false`.
+    /// This is the single predicate the agent loop consults to decide whether
+    /// to run — and, for the repro gate, *enforce* — the turn-end oracle.
+    #[must_use]
+    pub const fn test_gate_armed(&self) -> bool {
+        (self.auto_test || self.repro_gate) && self.test_command.is_some()
+    }
 }
 
 /// What to do after evaluating post-edit check results.
@@ -242,10 +255,183 @@ pub const fn repair_decision(failures: u32, prev_iters: u32, cfg: &PostEditConfi
     }
 }
 
+/// Which ecosystem marker files are present at a repository root.
+///
+/// This is a *pure input* to [`detect_test_command`]: the caller probes the
+/// filesystem (the crate never does) and reports which markers exist, keeping
+/// this crate std-only, deterministic, and trivially testable. Fields are
+/// ordered by detection precedence (see [`detect_test_command`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // a flag record per ecosystem marker — named bools read clearer than a bitset
+pub struct RepoMarkers {
+    /// A `Cargo.toml` at the root → Rust (`cargo test`).
+    pub cargo_toml: bool,
+    /// A `package.json` at the root → Node (`npm test`).
+    pub package_json: bool,
+    /// A `pyproject.toml` at the root → Python (`pytest`).
+    pub pyproject_toml: bool,
+    /// A `setup.py` / `setup.cfg` / `tox.ini` at the root → Python (`pytest`).
+    pub python_legacy: bool,
+    /// A `go.mod` at the root → Go (`go test ./...`).
+    pub go_mod: bool,
+    /// A `pom.xml` at the root → Java/Maven (`mvn -q test`).
+    pub pom_xml: bool,
+    /// A `build.gradle` / `build.gradle.kts` at the root → Gradle (`gradle test`).
+    pub build_gradle: bool,
+    /// A `Gemfile` at the root → Ruby (`bundle exec rake test`).
+    pub gemfile: bool,
+    /// A `Makefile` at the root exposing a `test` target → `make test`.
+    /// (The caller confirms the target exists; this crate never reads files.)
+    pub makefile_test_target: bool,
+}
+
+/// Best-effort ecosystem default test command from the repo's marker files.
+///
+/// Precedence is deliberate: language toolchains that own the whole repo
+/// (`Cargo.toml`, `go.mod`) win over generic `Makefile`/build-tool wrappers,
+/// and a concrete Python project file beats the legacy fallback. Returns
+/// `None` when no marker is recognized — the caller should then leave
+/// `test_command` unset (the gate stays inert rather than guessing).
+///
+/// This is intentionally conservative: it favours the single most common,
+/// zero-config invocation per ecosystem. Projects with a non-standard runner
+/// override it explicitly via `[post_edit] test_command` in `governance.toml`.
+///
+/// ```
+/// use origin_postedit::{detect_test_command, RepoMarkers};
+///
+/// let rust = RepoMarkers { cargo_toml: true, ..RepoMarkers::default() };
+/// assert_eq!(detect_test_command(&rust).as_deref(), Some("cargo test"));
+///
+/// let node = RepoMarkers { package_json: true, ..RepoMarkers::default() };
+/// assert_eq!(detect_test_command(&node).as_deref(), Some("npm test"));
+///
+/// assert_eq!(detect_test_command(&RepoMarkers::default()), None);
+/// ```
+#[must_use]
+pub fn detect_test_command(markers: &RepoMarkers) -> Option<String> {
+    let cmd = if markers.cargo_toml {
+        // `--no-fail-fast` would be nicer for regression coverage, but plain
+        // `cargo test` is the universally-understood default; overriders can
+        // opt into flags.
+        "cargo test"
+    } else if markers.go_mod {
+        "go test ./..."
+    } else if markers.pyproject_toml || markers.python_legacy {
+        // `pytest` discovers tests without config in the overwhelming majority
+        // of Python repos and is what SWE-bench's Python tasks use.
+        "pytest"
+    } else if markers.package_json {
+        "npm test"
+    } else if markers.pom_xml {
+        "mvn -q test"
+    } else if markers.build_gradle {
+        "gradle test"
+    } else if markers.gemfile {
+        "bundle exec rake test"
+    } else if markers.makefile_test_target {
+        "make test"
+    } else {
+        return None;
+    };
+    Some(cmd.to_string())
+}
+
+/// How to narrow a whole-repo test command to a set of impacted files.
+///
+/// Regression-test *selection* (SWE-bench proposal 2.2): rather than run the
+/// entire suite on every gate check, scope it to the files an edit could break
+/// (`{edited ∪ code-graph reverse-deps}`). This is pure string logic — the
+/// caller supplies the impacted file set (from the code graph); this crate
+/// decides how to express "test just these" for the detected runner.
+///
+/// It is deliberately conservative: it only narrows runners where a
+/// path/package argument is unambiguous and safe, and returns [`Selection::Full`]
+/// (run the base command unchanged) whenever narrowing could *miss* a failure —
+/// a false "GREEN" is far worse than a slightly-too-broad run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection {
+    /// Run the base command unchanged (narrowing unsafe or unsupported).
+    Full,
+    /// Run this narrowed command instead — covers the impacted files.
+    Narrowed(String),
+}
+
+/// Narrow `base_command` to the impacted `files`, if the runner supports it.
+///
+/// `files` is the union of edited paths and their code-graph reverse-deps
+/// (relative to the repo root, `/`-separated). `base_command` is the ecosystem
+/// default (from [`detect_test_command`] or config). Recognised narrowings:
+///
+/// * **pytest** → append the impacted test files (only `test_*.py`/`*_test.py`;
+///   a non-test edit contributes its *directory* so pytest still discovers the
+///   tests beside it). Non-Python files are ignored.
+/// * **go test** → replace `./...` with the distinct Go *package dirs* touched.
+/// * **cargo test** — NOT narrowed by file (cargo selects by crate/test target,
+///   not path; a path arg means something else). Returns [`Selection::Full`] so
+///   correctness is preserved; crate-level selection is a caller concern.
+///
+/// Any unrecognised runner, an empty `files`, or a `files` set that would not
+/// clearly cover the suite ⇒ [`Selection::Full`].
+#[must_use]
+pub fn select_tests(base_command: &str, files: &[String]) -> Selection {
+    if files.is_empty() {
+        return Selection::Full;
+    }
+    let base = base_command.trim();
+    // pytest: append impacted test files / their dirs.
+    if base == "pytest" || base.starts_with("pytest ") {
+        let mut targets: Vec<String> = Vec::new();
+        for f in files {
+            // Extension check via the trailing component (avoids clippy's
+            // case-sensitive `ends_with(".py")` lint and dotfile edge cases).
+            if extension_of(f).as_deref() != Some("py") {
+                continue;
+            }
+            let name = f.rsplit(['/', '\\']).next().unwrap_or(f);
+            let is_test = name.starts_with("test_") || name.ends_with("_test.py") || name == "tests.py";
+            if is_test {
+                targets.push(f.clone());
+            } else if let Some((dir, _)) = f.rsplit_once('/') {
+                // A non-test edit: hand pytest the directory so it discovers the
+                // sibling tests without us guessing the test file's name.
+                targets.push(dir.to_string());
+            }
+        }
+        targets.sort_unstable();
+        targets.dedup();
+        if targets.is_empty() {
+            return Selection::Full;
+        }
+        // Quote nothing / assume no spaces in repo paths (SWE-bench holds); the
+        // caller runs this through a shell, so ordinary path chars are fine.
+        return Selection::Narrowed(format!("{base} {}", targets.join(" ")));
+    }
+    // go test: swap the ./... wildcard for the touched package dirs.
+    if base == "go test ./..." || base == "go test ./…" {
+        let mut pkgs: Vec<String> = Vec::new();
+        for f in files {
+            if extension_of(f).as_deref() != Some("go") {
+                continue;
+            }
+            let dir = f.rsplit_once('/').map_or(".", |(d, _)| d);
+            pkgs.push(format!("./{}", dir.trim_start_matches("./")));
+        }
+        pkgs.sort_unstable();
+        pkgs.dedup();
+        if pkgs.is_empty() {
+            return Selection::Full;
+        }
+        return Selection::Narrowed(format!("go test {}", pkgs.join(" ")));
+    }
+    // Everything else (cargo, npm, mvn, gradle, make, custom): don't risk a
+    // path-based narrowing that could silently drop coverage.
+    Selection::Full
+}
+
 /// Errors that can arise when constructing or validating a [`PostEditConfig`].
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum PostEditError {
-    /// An override entry carried an empty extension or empty command.
+pub enum PostEditError {    /// An override entry carried an empty extension or empty command.
     #[error("invalid formatter override: extension and command must be non-empty")]
     EmptyOverride,
     /// `auto_lint` was requested without any resolvable lint command.
@@ -264,8 +450,9 @@ impl PostEditConfig {
     /// Returns [`PostEditError::EmptyOverride`] if any override has an empty
     /// extension or command, [`PostEditError::MissingLintCommand`] if
     /// `auto_lint` is set without a `lint_command`, or
-    /// [`PostEditError::MissingTestCommand`] if `auto_test` is set without a
-    /// `test_command`.
+    /// [`PostEditError::MissingTestCommand`] if `auto_test` **or** `repro_gate`
+    /// is set without a `test_command` (the repro gate has nothing to
+    /// execution-check without one).
     pub fn validate(&self) -> Result<(), PostEditError> {
         if self
             .format_overrides
@@ -277,7 +464,7 @@ impl PostEditConfig {
         if self.auto_lint && self.lint_command.is_none() {
             return Err(PostEditError::MissingLintCommand);
         }
-        if self.auto_test && self.test_command.is_none() {
+        if (self.auto_test || self.repro_gate) && self.test_command.is_none() {
             return Err(PostEditError::MissingTestCommand);
         }
         Ok(())
@@ -285,7 +472,7 @@ impl PostEditConfig {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::float_cmp)]
+#[allow(clippy::unwrap_used, clippy::float_cmp, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -431,5 +618,199 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let back: PostEditConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn repro_gate_requires_a_test_command() {
+        // The repro gate execution-checks a fail→pass transition, so it needs a
+        // command to run — validate must reject it without one, like auto_test.
+        let no_cmd = PostEditConfig {
+            repro_gate: true,
+            ..PostEditConfig::default()
+        };
+        assert_eq!(no_cmd.validate(), Err(PostEditError::MissingTestCommand));
+
+        let ok = PostEditConfig {
+            repro_gate: true,
+            test_command: Some("cargo test".to_string()),
+            ..PostEditConfig::default()
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn test_gate_armed_predicate() {
+        // Neither flag ⇒ not armed.
+        assert!(!PostEditConfig::default().test_gate_armed());
+        // auto_test but no command ⇒ nothing to run ⇒ not armed.
+        assert!(!PostEditConfig {
+            auto_test: true,
+            ..PostEditConfig::default()
+        }
+        .test_gate_armed());
+        // repro_gate + command ⇒ armed.
+        assert!(PostEditConfig {
+            repro_gate: true,
+            test_command: Some("pytest".to_string()),
+            ..PostEditConfig::default()
+        }
+        .test_gate_armed());
+        // auto_test + command ⇒ armed.
+        assert!(PostEditConfig {
+            auto_test: true,
+            test_command: Some("cargo test".to_string()),
+            ..PostEditConfig::default()
+        }
+        .test_gate_armed());
+    }
+
+    #[test]
+    fn detect_test_command_precedence() {
+        // Empty ⇒ None (never guess).
+        assert_eq!(detect_test_command(&RepoMarkers::default()), None);
+        // Each ecosystem's canonical command.
+        assert_eq!(
+            detect_test_command(&RepoMarkers {
+                cargo_toml: true,
+                ..RepoMarkers::default()
+            })
+            .as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(
+            detect_test_command(&RepoMarkers {
+                go_mod: true,
+                ..RepoMarkers::default()
+            })
+            .as_deref(),
+            Some("go test ./...")
+        );
+        assert_eq!(
+            detect_test_command(&RepoMarkers {
+                pyproject_toml: true,
+                ..RepoMarkers::default()
+            })
+            .as_deref(),
+            Some("pytest")
+        );
+        assert_eq!(
+            detect_test_command(&RepoMarkers {
+                python_legacy: true,
+                ..RepoMarkers::default()
+            })
+            .as_deref(),
+            Some("pytest")
+        );
+        assert_eq!(
+            detect_test_command(&RepoMarkers {
+                package_json: true,
+                ..RepoMarkers::default()
+            })
+            .as_deref(),
+            Some("npm test")
+        );
+        assert_eq!(
+            detect_test_command(&RepoMarkers {
+                makefile_test_target: true,
+                ..RepoMarkers::default()
+            })
+            .as_deref(),
+            Some("make test")
+        );
+    }
+
+    #[test]
+    fn detect_test_command_rust_wins_over_generic_wrappers() {
+        // A Rust repo that also ships a Makefile/package.json still tests via
+        // cargo — language toolchains that own the repo win over wrappers.
+        let mixed = RepoMarkers {
+            cargo_toml: true,
+            package_json: true,
+            makefile_test_target: true,
+            ..RepoMarkers::default()
+        };
+        assert_eq!(detect_test_command(&mixed).as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn detect_test_command_python_project_beats_makefile() {
+        let py = RepoMarkers {
+            pyproject_toml: true,
+            makefile_test_target: true,
+            ..RepoMarkers::default()
+        };
+        assert_eq!(detect_test_command(&py).as_deref(), Some("pytest"));
+    }
+
+    #[test]
+    fn select_tests_empty_is_full() {
+        assert_eq!(select_tests("pytest", &[]), Selection::Full);
+    }
+
+    #[test]
+    fn select_tests_pytest_appends_test_files_and_dirs() {
+        let files = vec![
+            "pkg/mod.py".to_string(),           // non-test ⇒ contributes its dir
+            "pkg/tests/test_mod.py".to_string(), // test ⇒ contributes the file
+            "README.md".to_string(),            // ignored (not .py)
+        ];
+        match select_tests("pytest", &files) {
+            Selection::Narrowed(cmd) => {
+                assert!(cmd.starts_with("pytest "));
+                assert!(cmd.contains("pkg"), "dir of the non-test edit: {cmd}");
+                assert!(cmd.contains("pkg/tests/test_mod.py"), "the test file: {cmd}");
+                assert!(!cmd.contains("README"), "non-py excluded: {cmd}");
+            }
+            Selection::Full => panic!("expected a narrowed pytest command"),
+        }
+    }
+
+    #[test]
+    fn select_tests_pytest_preserves_base_flags() {
+        let files = vec!["a/test_x.py".to_string()];
+        match select_tests("pytest -q --no-header", &files) {
+            Selection::Narrowed(cmd) => {
+                assert!(cmd.starts_with("pytest -q --no-header "), "flags kept: {cmd}");
+                assert!(cmd.ends_with("a/test_x.py"));
+            }
+            Selection::Full => panic!("expected narrowed"),
+        }
+    }
+
+    #[test]
+    fn select_tests_pytest_no_python_files_is_full() {
+        // Only non-Python edits ⇒ we can't scope pytest ⇒ run the full suite.
+        let files = vec!["src/main.rs".to_string(), "go.mod".to_string()];
+        assert_eq!(select_tests("pytest", &files), Selection::Full);
+    }
+
+    #[test]
+    fn select_tests_go_swaps_wildcard_for_packages() {
+        let files = vec![
+            "internal/foo/foo.go".to_string(),
+            "internal/foo/bar.go".to_string(), // same pkg ⇒ deduped
+            "cmd/app/main.go".to_string(),
+            "docs/x.md".to_string(), // ignored
+        ];
+        match select_tests("go test ./...", &files) {
+            Selection::Narrowed(cmd) => {
+                assert!(cmd.starts_with("go test "));
+                assert!(cmd.contains("./internal/foo"), "{cmd}");
+                assert!(cmd.contains("./cmd/app"), "{cmd}");
+                // Dedup: `internal/foo` appears once.
+                assert_eq!(cmd.matches("./internal/foo").count(), 1, "{cmd}");
+                assert!(!cmd.contains("docs"), "{cmd}");
+            }
+            Selection::Full => panic!("expected narrowed go command"),
+        }
+    }
+
+    #[test]
+    fn select_tests_cargo_and_npm_stay_full() {
+        // Cargo selects by target/crate, not path — never narrow by file.
+        let files = vec!["crates/x/src/lib.rs".to_string()];
+        assert_eq!(select_tests("cargo test", &files), Selection::Full);
+        assert_eq!(select_tests("npm test", &files), Selection::Full);
+        assert_eq!(select_tests("make test", &files), Selection::Full);
     }
 }

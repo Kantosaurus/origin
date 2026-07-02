@@ -108,8 +108,56 @@ pub fn dispatch(idx: &CodeGraphIndex, q: Query) -> Result<QueryResult, QueryErro
     }
 }
 
-fn neighbors(idx: &CodeGraphIndex, start: EntityId, depth: usize) -> Result<QueryResult, QueryError> {
-    let mut seen: HashSet<[u8; 32]> = HashSet::new();
+/// Maximum reverse-dependency files returned by [`reverse_dep_files`].
+///
+/// Caps the blast radius so a "god node" edited file (referenced everywhere)
+/// cannot expand the selected test set back to the whole repo — at which point
+/// running the full suite is cheaper than the selection overhead.
+pub const REVERSE_DEP_FILE_CAP: usize = 64;
+
+/// Files whose symbols reference symbols defined in `edited_files` — the
+/// regression blast radius of an edit, for test *selection*.
+///
+/// For each edited file we resolve its declared nodes ([`CodeGraphIndex::nodes_in_file`]),
+/// walk one hop of *inbound* edges ([`CodeGraphIndex::edges_to`], the caller
+/// direction), and collect the distinct `file_path`s of those callers. The
+/// edited files themselves are always included (a change is trivially its own
+/// dependency — e.g. an in-file unit test). Results are sorted, deduped, and
+/// capped at [`REVERSE_DEP_FILE_CAP`]; an empty return means the graph knew
+/// nothing about the edited files (fall back to the full suite).
+///
+/// One hop is deliberate: it captures direct callers (the overwhelming majority
+/// of regressions) without the combinatorial fan-out of transitive closure,
+/// keeping this cheap enough to run on the hot gate path.
+///
+/// # Errors
+/// Propagates index / `SQLite` errors from the underlying lookups.
+pub fn reverse_dep_files(
+    idx: &CodeGraphIndex,
+    edited_files: &[String],
+) -> Result<Vec<String>, QueryError> {
+    let mut files: HashSet<String> = HashSet::new();
+    for f in edited_files {
+        // A change is its own dependency (in-file tests, same-file callers).
+        files.insert(f.clone());
+        for node in idx.nodes_in_file(f)? {
+            for edge in idx.edges_to(node.entity_id)? {
+                if let Some(caller) = fetch_node(idx, edge.from)? {
+                    files.insert(caller.file_path);
+                    if files.len() > REVERSE_DEP_FILE_CAP {
+                        // Blast radius too large to be worth selecting over.
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+        }
+    }
+    let mut out: Vec<String> = files.into_iter().collect();
+    out.sort_unstable();
+    Ok(out)
+}
+
+fn neighbors(idx: &CodeGraphIndex, start: EntityId, depth: usize) -> Result<QueryResult, QueryError> {    let mut seen: HashSet<[u8; 32]> = HashSet::new();
     let mut queue: VecDeque<(EntityId, usize)> = VecDeque::new();
     let mut out: Vec<NodeRow> = Vec::new();
     seen.insert(start.0);

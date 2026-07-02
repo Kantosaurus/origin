@@ -340,6 +340,14 @@ async fn run_worker(
         // Match the orchestrator's reasoning effort so the workers that do the
         // actual editing are not silently downgraded (anthropic ⇒ Ultracode).
         effort: worker_effort(provider.name()),
+        // #3: sub-agents that EDIT get the same regression enforcement as the
+        // top-level loop — a worker must not report "Completed" while the test
+        // suite is RED. We arm `auto_test` (turn-end run + terminal-branch
+        // enforcement) but NOT `repro_gate`: the "write a failing test first"
+        // contract is a top-level bug-report discipline, whereas a worker's goal
+        // is a delegated sub-task. Resolved once here; `None` (no config / gate
+        // off / unknown ecosystem) ⇒ byte-identical to before.
+        post_edit: worker_post_edit(),
         ..Default::default()
     };
 
@@ -427,10 +435,39 @@ fn worker_effort(provider_name: &str) -> Option<origin_provider::ReasoningEffort
     (provider_name == "anthropic").then_some(origin_provider::ReasoningEffort::Ultracode)
 }
 
+/// Resolve the post-edit policy for a sub-agent (#3).
+///
+/// A worker that edits code must not report `Completed` while the test suite is
+/// RED, exactly like the top-level loop. When the operator armed the gate
+/// (`ORIGIN_REPRO_GATE`) we turn on `auto_test` with an auto-derived
+/// `test_command` so the worker's terminal branch enforces the suite.
+///
+/// Deliberately *not* `repro_gate`: the "write a failing test FIRST" contract is
+/// a top-level bug-report discipline. A worker's goal is a delegated sub-task
+/// (often a refactor/impl step with no single reproducing test), so we arm the
+/// regression enforcement (`auto_test`) without the reproduction prompt. When
+/// the gate is off, or the ecosystem is unknown, this is `None`/inert ⇒
+/// byte-identical to before.
+fn worker_post_edit() -> Option<std::sync::Arc<origin_postedit::PostEditConfig>> {
+    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // Reuse the same env-driven resolver as the top-level loop (base `None` — a
+    // worker doesn't carry the daemon's `[post_edit]` governance handle), then
+    // demote `repro_gate` → `auto_test` for the worker semantics above.
+    let resolved = crate::config::resolve_post_edit_with_repro_gate(None, &root)?;
+    let mut cfg = (*resolved).clone();
+    if cfg.repro_gate {
+        cfg.repro_gate = false;
+        // Promote to the regression semantics: run tests at turn-end + enforce
+        // (only when a command actually resolved; otherwise nothing to run).
+        cfg.auto_test = cfg.test_command.is_some();
+    }
+    Some(std::sync::Arc::new(cfg))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{worker_effort, AllowList};
+    use super::{worker_effort, worker_post_edit, AllowList};
     use origin_permission::prompt::Prompter;
     use origin_provider::ReasoningEffort;
     use origin_tools::{registry_iter, ToolMeta};
@@ -443,6 +480,32 @@ mod tests {
             "workers must not be silently downgraded below the orchestrator's effort"
         );
         assert_eq!(worker_effort("openai"), None, "non-anthropic stays wire byte-identical");
+    }
+
+    /// Serializes the `ORIGIN_REPRO_GATE` mutations in THIS module's tests.
+    static WORKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn worker_post_edit_unset_is_none() {
+        let _g = WORKER_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ORIGIN_REPRO_GATE");
+        assert!(
+            worker_post_edit().is_none(),
+            "gate off ⇒ workers get no post-edit config (byte-identical)"
+        );
+    }
+
+    #[test]
+    fn worker_post_edit_arms_auto_test_not_repro_gate() {
+        let _g = WORKER_ENV_LOCK.lock().unwrap();
+        // Explicit command bypasses the ecosystem probe, so cwd is irrelevant.
+        std::env::set_var("ORIGIN_REPRO_GATE", "cargo test -p somecrate");
+        let cfg = worker_post_edit().expect("gate armed ⇒ Some");
+        std::env::remove_var("ORIGIN_REPRO_GATE");
+        assert!(!cfg.repro_gate, "workers must NOT get the write-failing-test-first prompt");
+        assert!(cfg.auto_test, "workers DO get turn-end regression enforcement");
+        assert_eq!(cfg.test_command.as_deref(), Some("cargo test -p somecrate"));
+        assert!(cfg.test_gate_armed(), "worker terminal branch will enforce RED→continue");
     }
 
     fn meta(name: &str) -> &'static ToolMeta {

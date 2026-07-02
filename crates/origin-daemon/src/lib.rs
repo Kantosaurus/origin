@@ -6,6 +6,7 @@ pub mod agent;
 pub mod anthropic_verifier;
 pub mod auth;
 pub mod bg_jobs;
+pub mod bestofn_runner;
 pub mod compactor;
 pub mod config;
 pub mod daemon_memory_handle;
