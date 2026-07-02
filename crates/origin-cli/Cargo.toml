@@ -88,7 +88,7 @@ async-trait = "0.1"
 tracing = { workspace = true }
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8"
 origin-stream = { path = "../origin-stream" }
 tempfile = "3"
 ulid = "1"
