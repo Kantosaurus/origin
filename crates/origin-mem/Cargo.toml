@@ -23,7 +23,7 @@ ort         = { version = "2.0.0-rc.12", features = ["ndarray"] }
 ndarray     = "0.15"
 tokenizers  = { version = "0.20", default-features = false, features = ["onig"] }
 hnsw_rs     = "0.3"
-rand        = "0.8"
+rand        = "0.9"
 rand_chacha = "0.3"
 rusqlite    = { version = "0.31", features = ["bundled", "blob"] }
 ulid        = { version = "1", features = ["serde"] }
