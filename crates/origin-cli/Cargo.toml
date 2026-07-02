@@ -81,7 +81,7 @@ origin-ponytail = { path = "../origin-ponytail" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "blocking"] }
 which = "8"
 sha2 = "0.10"
-rand = "0.8"
+rand = "0.9"
 urlencoding = "2"
 toml = "0.8"
 async-trait = "0.1"
