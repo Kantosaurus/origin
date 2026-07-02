@@ -7465,6 +7465,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-language"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
+
+[[package]]
 name = "tree-sitter-lua"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7516,12 +7522,12 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-scala"
-version = "0.22.1"
+version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a464d8e2e1837cf20b34204c51c369da3483e55c3ea013c6db81a04439e17895"
+checksum = "de5a4a7ff23a55474ce6a741d52aaeca7a82fe9421bb982b86e98c6ac8629397"
 dependencies = [
  "cc",
- "tree-sitter",
+ "tree-sitter-language",
 ]
 
 [[package]]
