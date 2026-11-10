@@ -119,6 +119,12 @@ pub enum Cmd {
         /// block.
         #[arg(long = "root")]
         root: Vec<String>,
+        /// Run every tool call that would otherwise need approval (permission
+        /// mode `off` for this run; also `ORIGIN_ALLOW_ALL=1`). Without it a
+        /// headless run denies such calls, since nobody can answer. Explicit
+        /// `[[permission_rules]]` deny rules still apply.
+        #[arg(long = "dangerously-allow-all")]
+        dangerously_allow_all: bool,
     },
     /// Workload Identity Federation token exchange (RFC 8693): mint a bearer
     /// token from a CI OIDC id token for keyless provider auth.

@@ -18,7 +18,9 @@ use origin_daemon::memory_wiring::MemoryWiring;
 use origin_daemon::pairing::{Pairing, RedeemResult};
 use origin_daemon::plan_bus::PlanBus;
 use origin_daemon::proposal_registry::ProposalRegistry;
-use origin_daemon::protocol::{ClientMessage, MemoryAction, PromptReply, PromptRequest, StreamEvent};
+use origin_daemon::protocol::{
+    ClientMessage, MemoryAction, PermissionMode, PromptReply, PromptRequest, StreamEvent,
+};
 use origin_daemon::provider_factory::{ProviderFactory, ProviderId};
 use origin_daemon::runtime_launch::{self, ShutdownSignal};
 use origin_daemon::session::Session;
@@ -1851,6 +1853,11 @@ async fn handle_request(
     if !req.roots.is_empty() {
         session.roots = req.roots.iter().map(std::path::PathBuf::from).collect();
     }
+    // C2: session taint survives reloads, compaction and resume (marker file);
+    // a history that already holds an external result counts too.
+    session.tainted =
+        session_store.is_tainted(&session.id) || origin_daemon::agent::external_result_in(&session.messages);
+    let (permission_mode, can_ask) = req.permission();
     // Bug #8: stash the session id so a later `/goal` activation on this
     // connection can checkpoint without waiting for the first iteration
     // to complete.
@@ -2088,19 +2095,23 @@ async fn handle_request(
             },
             // ^ B5: `interactive` is false for headless `origin run` and the
             // daemon's self-dispatch; those omit the default-workflow directive.
+            permission_mode,
+            // ^ C2: `workspace` by default; see `PromptRequest::permission`.
         };
-        // Opt-in interactive prompting: when the turn requested it, route
-        // RequiresPermission tools through the IPC prompter (asks the client and
-        // blocks on the daemon-wide registry). Default (off) keeps `AlwaysAllow`,
-        // so tool execution is byte-identical. Both owners are locals so the
-        // `&dyn Prompter` borrow outlives the `drive_goal_loop` await.
+        // C2: mode `off` allows; otherwise asks go through the IPC prompter when
+        // a client can answer (the TUI; it blocks on the daemon-wide registry)
+        // and are denied when none can (headless, scheduled). The owners are
+        // locals so the `&dyn Prompter` borrow outlives the `drive_goal_loop` await.
         let always_allow = AlwaysAllow;
+        let no_prompter = origin_permission::prompt::NoPrompter;
         let ipc_prompter;
-        let prompter: &dyn Prompter = if req.permission_ask {
-            ipc_prompter = IpcPrompter::new(event_tx.clone(), Arc::clone(&permission_registry));
-            &ipc_prompter
-        } else {
-            &always_allow
+        let prompter: &dyn Prompter = match (permission_mode, can_ask) {
+            (PermissionMode::Off, _) => &always_allow,
+            (_, true) => {
+                ipc_prompter = IpcPrompter::new(event_tx.clone(), Arc::clone(&permission_registry));
+                &ipc_prompter
+            }
+            (_, false) => &no_prompter,
         };
         // Mid-turn interrupt: race the turn future against `poll_for_interrupt`,
         // the SOLE interrupt reader during the turn (`drive_goal_loop`'s own
@@ -2149,6 +2160,7 @@ async fn handle_request(
                 session.id.clone(),
                 summary.gate_signals.is_some(),
                 opts.effort,
+                permission_mode,
             )
             .await;
         }
@@ -2266,6 +2278,8 @@ async fn maybe_run_best_of_n(
     session_id: String,
     hard_tests_red: bool,
     effort: Option<origin_provider::ReasoningEffort>,
+    // C2: candidates run under the request's mode with nobody to ask.
+    permission_mode: PermissionMode,
 ) {
     use origin_daemon::bestofn_runner::{run_best_of_n, WorktreeArena};
     use origin_swarm::bestofn::DifficultySignals;
@@ -2323,7 +2337,7 @@ async fn maybe_run_best_of_n(
         // relay channels, no goal slot, no metrics — so it never emits to the
         // user's stream or mutates shared per-connection state. This deliberately
         // builds a MINIMAL `LoopOptions` rather than cloning the live one.
-        let prompter = AlwaysAllow;
+        let prompter = origin_permission::prompt::NoPrompter;
         let runner = move |_idx: usize, wt: &std::path::Path| -> Result<(), String> {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2336,6 +2350,7 @@ async fn maybe_run_best_of_n(
                 // The gate is what makes the candidate self-verify (turn-end
                 // tests + terminal enforcement), so it MUST carry post_edit.
                 post_edit: post_edit.clone(),
+                permission_mode,
                 ..candidate_opts(effort, wt)
             };
             let res = rt.block_on(origin_daemon::agent::run_loop(

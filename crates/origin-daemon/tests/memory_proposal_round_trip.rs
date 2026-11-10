@@ -134,6 +134,8 @@ async fn memory_proposed_round_trip_via_stub_provider() {
             touches: None,
             prompt_profile: origin_daemon::agent::PromptProfile::Interactive,
             ponytail: origin_ponytail::PonytailMode::Full,
+            // C2: this test predates permission modes and expects every tool to run.
+            permission_mode: origin_daemon::protocol::PermissionMode::Off,
         };
         let summary = run_loop(&mut session, &prompt.user_text, &provider, &AlwaysAllow, &opts)
             .await

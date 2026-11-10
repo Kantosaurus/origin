@@ -420,78 +420,281 @@ async fn maybe_checkpoint_per_tool_with_hooks(tool: &str, args: &Value, root: Op
 ///    out `meta.name`, the call is denied with `reason = "skill-narrowed"` and
 ///    no user rule or prompter can re-allow it. This mirrors the first half of
 ///    [`origin_permission::check_with_skills`].
-/// 2. **`AutoAllowed` tier**: byte-identical to the historical path — auto
-///    allow, never prompts, never consults rules.
-/// 3. **User permission rules** (only for `RequiresPermission` tools, and only
-///    when `opts.permission_rules` is `Some`): an explicit `allow` rule
-///    auto-approves *without prompting* and an explicit `deny` rule blocks. The
-///    bloom pre-check + exact-rule walk is [`origin_permission::check_with_rules`]
-///    semantics, run at the single canonical
-///    [`crate::config::PERMISSION_RULE_SCOPE`].
-/// 4. **Interactive prompter**: when no rule matched, fall through to the exact
-///    historical prompter path.
+/// 2. **Explicit deny rule** (C2): a `[[permission_rules]]` `allow = false`
+///    rule blocks the tool in every mode, `AutoAllowed` tools and the
+///    allow-all flag included.
+/// 3. **Mode `off`** (C2): allow.
+/// 4. **`AutoAllowed` tier**: allow, except a network tool in `workspace` mode.
+/// 5. **Explicit allow rule**: auto-approves *without prompting* (also after
+///    session taint). Rules are an exact `meta.name@scope` match at the single
+///    canonical [`crate::config::PERMISSION_RULE_SCOPE`]; they carry no argument
+///    pattern.
+/// 6. **Mode** (C2): `workspace` runs [`workspace_need`]; `on` asks for every
+///    call that reaches here.
+/// 7. **Prompter**: a prompter that cannot ask (headless [`NoPrompter`], a
+///    sub-agent's allow-list) denies with [`cannot_ask_reason`] whatever needs a
+///    person; a sub-agent's allow-list answers the other asks.
 ///
-/// **Default-safe / byte-identical:** when `opts.permission_rules` is `None`
-/// (the default everywhere, including tests) step 3 is skipped entirely and the
-/// whole function is equivalent to `check_with_skills(meta, …, prompter,
-/// skills)`. With rules configured, only an *exact* `meta.name@scope` rule can
-/// short-circuit; a tool with no matching rule still prompts exactly as before.
+/// [`NoPrompter`]: origin_permission::prompt::NoPrompter
 async fn decide_permission(
     meta: &ToolMeta,
+    args: &Value,
     args_preview: &str,
     prompter: &dyn Prompter,
     skills: &SkillRegistry,
     opts: &LoopOptions,
+    session: &Session,
 ) -> origin_permission::Decision {
+    use crate::protocol::PermissionMode;
+    let decision = |allow: bool, reason: String| origin_permission::Decision {
+        outcome: if allow { Outcome::Allow } else { Outcome::Deny },
+        reason,
+    };
     // (1) Skill-narrowing is final and must win over any user allow rule.
     if let Some(mask) = skills.allowed_tools() {
         if !mask.contains(meta.name) {
-            return origin_permission::Decision {
-                outcome: Outcome::Deny,
-                reason: "skill-narrowed".into(),
-            };
+            return decision(false, "skill-narrowed".into());
         }
     }
-    // (2) AutoAllowed tools never prompt and never consult rules — unchanged.
-    if matches!(meta.tier, origin_tools::Tier::AutoAllowed) {
-        return origin_permission::Decision {
-            outcome: Outcome::Allow,
-            reason: "tier=AutoAllowed".into(),
-        };
-    }
-    // (3) User permission rules: an exact match pre-answers the prompt. Skipped
-    // entirely (byte-identical) when no rules are configured.
-    if let Some(pr) = opts.permission_rules.as_ref() {
+    let rule = opts.permission_rules.as_ref().and_then(|pr| {
         let key = format!("{}@{}", meta.name, crate::config::PERMISSION_RULE_SCOPE);
-        if pr.bloom.maybe_contains(&key) {
-            if let Some(rule) = pr.rules.iter().find(|r| r.key() == key) {
-                return origin_permission::Decision {
-                    outcome: if rule.allow { Outcome::Allow } else { Outcome::Deny },
-                    reason: format!(
-                        "rule:{}@{}:{}",
-                        meta.name,
-                        crate::config::PERMISSION_RULE_SCOPE,
-                        if rule.allow { "allow" } else { "deny" }
-                    ),
-                };
-            }
+        pr.bloom
+            .maybe_contains(&key)
+            .then(|| pr.rules.iter().find(|r| r.key() == key))
+            .flatten()
+    });
+    let rule_reason = |allow: bool| {
+        format!(
+            "rule:{}@{}:{}",
+            meta.name,
+            crate::config::PERMISSION_RULE_SCOPE,
+            if allow { "allow" } else { "deny" }
+        )
+    };
+    // (2) An explicit deny binds every tool in every mode.
+    if rule.is_some_and(|r| !r.allow) {
+        return decision(false, rule_reason(false));
+    }
+    // (3) Mode off allows the rest.
+    if opts.permission_mode == PermissionMode::Off {
+        return decision(true, MODE_OFF.into());
+    }
+    // (4) AutoAllowed tools never prompt (a network tool still asks in workspace).
+    if matches!(meta.tier, origin_tools::Tier::AutoAllowed)
+        && !(opts.permission_mode == PermissionMode::Workspace && is_external_tool(meta.name))
+    {
+        return decision(true, "tier=AutoAllowed".into());
+    }
+    // (5) An explicit allow rule pre-answers the prompt.
+    if rule.is_some() {
+        return decision(true, rule_reason(true));
+    }
+    // (6) What the mode needs.
+    let sandbox_active = origin_tools::sandbox_status() == origin_tools::SandboxStatus::Active;
+    let ws = Workspace::of(opts, session);
+    let (why, person) = match workspace_need(meta, args, &ws, sandbox_active, session.tainted) {
+        Need::Allow(why) if opts.permission_mode == PermissionMode::Workspace => {
+            return decision(true, why.into());
         }
+        Need::Allow(_) => (format!("{} requires permission", meta.name), false),
+        Need::Ask(why) => (why, false),
+        Need::Person(why) => (why, true),
+    };
+    // (7) Ask.
+    if !prompter.can_ask() {
+        if !person && prompter.ask(meta, args_preview).await {
+            return decision(true, "granted: sub-agent allow-list".into());
+        }
+        return decision(false, cannot_ask_reason(meta.name, &why));
     }
-    // (4) No rule matched ⇒ historical interactive prompter path.
-    let allowed = prompter.ask(meta, args_preview).await;
-    origin_permission::Decision {
-        outcome: if allowed { Outcome::Allow } else { Outcome::Deny },
-        reason: if allowed {
-            USER_APPROVED.into()
-        } else {
-            "user-denied".into()
-        },
-    }
+    let notice;
+    let preview = if meta.name == "Bash"
+        && opts.permission_mode == PermissionMode::Workspace
+        && !sandbox_active
+        && first_bash_ask(&session.id)
+    {
+        notice = format!("{BASH_NO_SANDBOX_NOTICE} | {args_preview}");
+        notice.as_str()
+    } else {
+        args_preview
+    };
+    let allowed = prompter.ask(meta, preview).await;
+    decision(
+        allowed,
+        if allowed { USER_APPROVED } else { "user-denied" }.into(),
+    )
 }
 
 /// `Decision::reason` of an Allow the prompter gave in [`decide_permission`];
 /// [`apply_cmd_guard`] relies on it to avoid asking twice about one call.
 const USER_APPROVED: &str = "user-approved";
+
+/// `Decision::reason` of an Allow given by permission mode `off`;
+/// [`apply_cmd_guard`] lets a `NeedsApproval` command through on it.
+const MODE_OFF: &str = "mode=off";
+
+/// C2: shown once per session, on the first Bash ask in `workspace` mode.
+const BASH_NO_SANDBOX_NOTICE: &str = "note: Bash asks because no OS sandbox is active on this build; \
+     `/permissions off` or a [[permission_rules]] allow rule for Bash stops these asks";
+
+/// C2: `true` the first time it is called for `session_id` in this daemon.
+// ponytail: one short id per session that ever asked for Bash, never evicted;
+// key it on the connection or persist it if the set ever matters.
+fn first_bash_ask(session_id: &str) -> bool {
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    SEEN.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(session_id.to_owned())
+}
+
+/// C2: the denial text when a call needs approval but nobody can be asked.
+fn cannot_ask_reason(tool: &str, why: &str) -> String {
+    format!(
+        "`{tool}` needs approval ({why}) but this run cannot ask anyone (headless run or \
+         sub-agent); to allow it, run with --dangerously-allow-all or ORIGIN_ALLOW_ALL=1, \
+         or add a [[permission_rules]] allow rule for `{tool}`"
+    )
+}
+
+/// C2: tools whose successful result brings outside content into the context.
+/// They are the network tools `workspace` mode asks for, and the ones that taint
+/// a session. Kept as one list so the provenance wrapper's can be unified with it.
+pub(crate) fn is_external_tool(name: &str) -> bool {
+    matches!(name, "WebFetch" | "WebSearch" | "Browser" | "gmail") || name.starts_with("mcp__")
+}
+
+/// C2: whether `messages` hold a successful result of an [`is_external_tool`]
+/// call (session taint). Used per turn and on resume.
+#[must_use]
+pub fn external_result_in(messages: &[Message]) -> bool {
+    let external: HashSet<&str> = messages
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .filter_map(|b| match b {
+            Block::ToolUse { id, name, .. } if is_external_tool(name) => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    messages.iter().flat_map(|m| &m.blocks).any(|b| {
+        matches!(b, Block::ToolResult { tool_use_id, is_error: false, .. }
+            if external.contains(tool_use_id.as_str()))
+    })
+}
+
+/// C2: what `workspace` mode does with a call no rule answered.
+enum Need {
+    /// Run without asking.
+    Allow(&'static str),
+    /// Ask; a sub-agent's allow-list may answer.
+    Ask(String),
+    /// Ask a person; a prompter that cannot ask denies.
+    Person(String),
+}
+
+/// C2 `workspace` verdict: edits whose every target resolves inside a
+/// workspace root, Bash under an active OS sandbox, a read-only `Task` and
+/// `AutoAllowed` tools run; a write outside the roots needs a person; network
+/// tools and unsandboxed Bash ask, and need a person once the session is
+/// tainted; everything else asks.
+fn workspace_need(
+    meta: &ToolMeta,
+    args: &Value,
+    ws: &Workspace,
+    sandbox_active: bool,
+    tainted: bool,
+) -> Need {
+    const AFTER_TAINT: &str = "after external content entered this session";
+    let name = meta.name;
+    if is_external_tool(name) {
+        return if tainted {
+            Need::Person(format!("network tool {AFTER_TAINT}"))
+        } else {
+            Need::Ask("network tool".into())
+        };
+    }
+    match name {
+        "Edit" | "Write" | "MultiEdit" | "ApplyPatch" => write_outside(name, args, ws)
+            .map_or(Need::Allow("workspace: edit inside the workspace"), |p| {
+                Need::Person(format!("write outside the workspace: {p}"))
+            }),
+        "Bash" if sandbox_active => Need::Allow("workspace: Bash under an active OS sandbox"),
+        "Bash" if tainted => Need::Person(format!("Bash without an OS sandbox {AFTER_TAINT}")),
+        "Bash" => Need::Ask("Bash without an OS sandbox".into()),
+        // A9/A4: the same computation the Task prompt shows. `0/<T> gated
+        // tools, 0 mcp servers` grants only read-only auto-allowed tools.
+        "Task"
+            if task_permission_preview(args)
+                .split(" | ")
+                .next()
+                .is_some_and(|h| h.starts_with("0/") && h.ends_with(" gated tools, 0 mcp servers")) =>
+        {
+            Need::Allow("workspace: read-only Task")
+        }
+        _ if matches!(meta.tier, origin_tools::Tier::AutoAllowed) => Need::Allow("tier=AutoAllowed"),
+        _ => Need::Ask(format!("{name} requires permission")),
+    }
+}
+
+/// C2: the session's workspace: the run's working directory (relative tool
+/// paths resolve against it) and the resolved roots — that directory plus the
+/// session's extra roots (relative ones anchored at it).
+struct Workspace {
+    cwd: std::path::PathBuf,
+    roots: Vec<std::path::PathBuf>,
+}
+
+impl Workspace {
+    fn of(opts: &LoopOptions, session: &Session) -> Self {
+        let cwd = loop_cwd(opts).unwrap_or_default();
+        let roots = std::iter::once(cwd.clone())
+            .chain(session.roots.iter().map(|r| cwd.join(r)))
+            .filter_map(|r| origin_conseca::resolve_real(&r))
+            .collect();
+        Self { cwd, roots }
+    }
+}
+
+/// C2: the first target of an edit builtin that does not resolve inside a
+/// workspace root (symlinks resolved; unresolvable or missing counts as
+/// outside), or `None` when every target is inside.
+fn write_outside(name: &str, args: &Value, ws: &Workspace) -> Option<String> {
+    let targets: Vec<String> = if name == "ApplyPatch" {
+        // Every path the patch can create, delete, update or move to.
+        const HEADS: [&str; 5] = [
+            "*** Add File:",
+            "*** Delete File:",
+            "*** Update File:",
+            "*** Move to:",
+            "+++ b/",
+        ];
+        args.get("patch")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                let t = l.trim_start();
+                HEADS
+                    .iter()
+                    .find_map(|h| t.strip_prefix(h))
+                    .map(|p| p.trim().to_owned())
+            })
+            .collect()
+    } else {
+        args.get("file_path")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .into_iter()
+            .collect()
+    };
+    if targets.is_empty() {
+        return Some("<no target path>".into());
+    }
+    targets.into_iter().find(|t| {
+        let resolved = origin_conseca::resolve_real(&ws.cwd.join(t));
+        !resolved.is_some_and(|p| ws.roots.iter().any(|r| p.starts_with(r)))
+    })
+}
 
 /// DENY-ONLY governance overlay (Task 3).
 ///
@@ -541,13 +744,12 @@ fn apply_governance_overlay(
 /// broader `Suspicious` heuristics are never acted on here. `args` is the parsed
 /// JSON arguments; the command is read from the `command` field.
 ///
-/// `Risk::NeedsApproval` (the program cannot be determined statically) goes
-/// through the normal permission prompt: an Allow the prompter already gave for
-/// this exact call stands, any other Allow (a permission rule) is re-asked, and a
-/// prompter that cannot ask (`AlwaysDeny`, a closed IPC channel) denies.
-/// NOTE: an always-allow prompter (the daemon default when the client did not
-/// request permission prompts) therefore ALLOWS a `NeedsApproval` command
-/// today — the `Prompter` trait cannot tell it apart from a human saying yes.
+/// `Risk::NeedsApproval` (the program cannot be determined statically) needs a
+/// person (C2): an Allow a person already gave for this exact call stands (its
+/// ask carried the guard's reason, see [`cmd_guard_ask_preview`]), as does
+/// permission mode `off`; any other Allow (a permission rule, a sub-agent
+/// grant) is re-asked with `args_preview`, and a prompter that cannot ask
+/// (headless, sub-agent) denies with [`cannot_ask_reason`].
 ///
 /// C6: a command that installs a package the project does not declare
 /// ([`crate::dep_gate`]; the manifests from the call's `cwd` up to `run_cwd`,
@@ -590,8 +792,16 @@ async fn apply_cmd_guard(
             outcome: Outcome::Deny,
             reason: format!("cmd-guard: dangerous bash command blocked: {reason}"),
         },
-        // `decide_permission` already asked the prompter about this call.
-        origin_cmdparse::Risk::NeedsApproval(_) if decision.reason == USER_APPROVED => decision,
+        // `decide_permission` already asked a person about this call, or mode off.
+        origin_cmdparse::Risk::NeedsApproval(_)
+            if decision.reason == USER_APPROVED || decision.reason == MODE_OFF =>
+        {
+            decision
+        }
+        origin_cmdparse::Risk::NeedsApproval(reason) if !prompter.can_ask() => origin_permission::Decision {
+            outcome: Outcome::Deny,
+            reason: cannot_ask_reason(meta.name, &format!("cmd-guard: {reason}")),
+        },
         origin_cmdparse::Risk::NeedsApproval(reason) => {
             if prompter.ask(meta, args_preview).await {
                 origin_permission::Decision {
@@ -606,6 +816,22 @@ async fn apply_cmd_guard(
             }
         }
         _ => decision,
+    }
+}
+
+/// C2: the ask text for a `Bash` call the command guard rates
+/// `NeedsApproval`: the guard's reason first, then the call. `None` for any
+/// other call (or with the guard off).
+fn cmd_guard_ask_preview(tool: &str, args: &Value, preview: &str) -> Option<String> {
+    if tool != "Bash" || std::env::var("ORIGIN_CMD_GUARD").as_deref() == Ok("0") {
+        return None;
+    }
+    let cmd = args.get("command").and_then(Value::as_str)?;
+    match origin_cmdparse::worst(&origin_cmdparse::analyze(cmd)) {
+        origin_cmdparse::Risk::NeedsApproval(reason) => {
+            Some(format!("cmd-guard: needs approval: {reason} | {preview}"))
+        }
+        _ => None,
     }
 }
 
@@ -3117,6 +3343,99 @@ mod runtime_tools_tests {
         assert!(runtime_tool("mcp__demo__ping").is_none());
     }
 
+    /// A sub-agent-style grant: answers from a list, cannot ask a person.
+    struct Grant;
+    #[async_trait]
+    impl origin_permission::prompt::Prompter for Grant {
+        async fn ask(&self, _meta: &ToolMeta, _preview: &str) -> bool {
+            true
+        }
+        fn can_ask(&self) -> bool {
+            false
+        }
+    }
+
+    /// One scripted assistant message per turn.
+    struct Turns(std::sync::Mutex<Vec<origin_core::types::Message>>);
+    #[async_trait]
+    impl origin_provider::Provider for Turns {
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+        async fn chat(
+            &self,
+            _req: origin_provider::ChatRequest,
+        ) -> Result<origin_provider::ChatResponse, origin_provider::ProviderError> {
+            let mut q = self.0.lock().expect("lock");
+            if q.is_empty() {
+                return Err(origin_provider::ProviderError::Api("script exhausted".into()));
+            }
+            Ok(origin_provider::ChatResponse {
+                assistant: q.remove(0),
+                usage: origin_provider::Usage::default(),
+            })
+        }
+    }
+
+    /// C2: a successful MCP result taints the session (persisted in the store);
+    /// from then on the same network tool needs a person, so a grant-only
+    /// prompter can no longer run it and the denial says why.
+    #[tokio::test]
+    async fn mcp_result_taints_the_session_and_flips_network_tools_to_a_person() {
+        use origin_core::types::{Block, Message, Role};
+        let ping = |id: &str| {
+            Message::new(Role::Assistant).with_block(Block::ToolUse {
+                id: id.into(),
+                name: "mcp__demo__ping".into(),
+                input_json: b"{}".to_vec(),
+                cache_marker: None,
+            })
+        };
+        let provider = Turns(std::sync::Mutex::new(vec![
+            ping("p1"),
+            ping("p2"),
+            Message::new(Role::Assistant).with_block(Block::text("done")),
+        ]));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            Arc::new(crate::session_store::SessionStore::open(dir.path().join("s.db")).expect("store"));
+        let opts = crate::agent::LoopOptions {
+            session_store: Some(Arc::clone(&store)),
+            ..crate::agent::LoopOptions::default().without_streaming()
+        };
+        let mut session = crate::session::Session::new("scripted", "m");
+        let mut map: HashMap<String, Arc<dyn DynTool>> = HashMap::new();
+        map.insert("mcp__demo__ping".to_string(), fake());
+        let out = scope_runtime_tools(
+            Arc::new(map),
+            crate::agent::run_loop(&mut session, "go", &provider, &Grant, &opts),
+        )
+        .await
+        .expect("run completes");
+        assert_eq!(out.assistant_text, "done");
+        let results: Vec<(bool, String)> = session
+            .messages
+            .iter()
+            .flat_map(|m| &m.blocks)
+            .filter_map(|b| match b {
+                Block::ToolResult { is_error, inline, .. } => Some((
+                    *is_error,
+                    String::from_utf8_lossy(inline.as_deref().unwrap_or_default()).into_owned(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(!results[0].0, "before taint the grant runs the tool: {results:?}");
+        assert!(results[1].0, "after taint it needs a person: {results:?}");
+        assert!(
+            results[1].1.contains("after external content") && results[1].1.contains("cannot ask"),
+            "{results:?}"
+        );
+        assert!(session.tainted);
+        assert!(store.is_tainted(&session.id), "taint is persisted for resume");
+        assert!(crate::agent::external_result_in(&session.messages));
+    }
+
     /// B1: tool schemas reach the wire in a deterministic order. The runtime
     /// registry is a `HashMap`, whose iteration order is randomized per map, so
     /// the advertised list must be sorted rather than iterated as-is.
@@ -3796,6 +4115,10 @@ pub struct LoopOptions {
     /// B5: which system prompt this run gets. Fixed for the run, so the cached
     /// prefix stays byte-identical across its turns.
     pub prompt_profile: PromptProfile,
+    /// C2: which permission-gated calls run without asking (see
+    /// [`decide_permission`]). Default `Workspace`. `Off` is only ever set for a
+    /// parent loop: a sub-agent's allow-list prompter is its confinement.
+    pub permission_mode: crate::protocol::PermissionMode,
 }
 
 /// B8: what a run's successful tool calls changed — the paths its file-editing
@@ -3870,6 +4193,7 @@ impl Default for LoopOptions {
             cwd: None,
             touches: None,
             prompt_profile: PromptProfile::Interactive,
+            permission_mode: crate::protocol::PermissionMode::Workspace,
         }
     }
 }
@@ -4101,6 +4425,11 @@ fn speculation_allowed(opts: &LoopOptions, hooks_configured: bool) -> bool {
         && !opts.read_only
         && opts.skills.as_deref().is_none_or(|s| s.allowed_tools().is_none())
         && opts.cwd.is_none()
+        // C2: a deny rule now binds AutoAllowed tools too.
+        && opts
+            .permission_rules
+            .as_deref()
+            .is_none_or(|pr| pr.rules.iter().all(|r| r.allow))
 }
 
 /// Tracks speculative tasks fired off mid-stream. Keyed by the assistant
@@ -6201,7 +6530,20 @@ async fn run_loop_inner(
                 // like `mcp__github__*` must permit it) then invoked via DynTool.
                 if let Some(tool) = runtime_tool(&name) {
                     let args: Value = serde_json::from_slice(&input_bytes).unwrap_or(Value::Null);
-                    let allowed = prompter.ask(tool.meta(), &args.to_string()).await;
+                    // C2: the same decision as a builtin (deny rules, taint, the
+                    // allow-list answering only what needs no person).
+                    let skills: &SkillRegistry = opts.skills.as_deref().unwrap_or(&EMPTY_SKILLS);
+                    let decision = decide_permission(
+                        tool.meta(),
+                        &args,
+                        &args.to_string(),
+                        prompter,
+                        skills,
+                        opts,
+                        session,
+                    )
+                    .await;
+                    let allowed = decision.outcome == Outcome::Allow;
                     if allowed {
                         turn_allowed = true;
                     } else {
@@ -6233,7 +6575,8 @@ async fn run_loop_inner(
                         }
                     } else {
                         (
-                            format!("Error: tool `{name}` is not in this sub-agent's allow-list").into_bytes(),
+                            format!("Error: permission denied for `{name}`: {}", decision.reason)
+                                .into_bytes(),
                             true,
                         )
                     };
@@ -6350,9 +6693,13 @@ async fn run_loop_inner(
             // `check_with_skills` path.
             let skills: &SkillRegistry = opts.skills.as_deref().unwrap_or(&EMPTY_SKILLS);
             // A4: a delegation's prompt leads with what it unlocks (one-row safe).
-            let task_preview = (meta.name == "Task").then(|| task_permission_preview(&args));
-            let ask_preview = task_preview.as_deref().unwrap_or(&preview);
-            let mut decision = decide_permission(meta, ask_preview, prompter, skills, opts).await;
+            // C2: a `NeedsApproval` Bash prompt leads with the guard's reason.
+            let special_preview = (meta.name == "Task")
+                .then(|| task_permission_preview(&args))
+                .or_else(|| cmd_guard_ask_preview(meta.name, &args, &preview));
+            let ask_preview = special_preview.as_deref().unwrap_or(&preview);
+            let mut decision =
+                decide_permission(meta, &args, ask_preview, prompter, skills, opts, session).await;
 
             // Task 3 — DENY-ONLY governance overlay. After the base check yields
             // a decision, the optional policy/conseca layers may only *narrow*
@@ -6368,7 +6715,8 @@ async fn run_loop_inner(
             // downgrade an Allow to Deny, or route it through the prompter, but
             // never widen.
             if decision.outcome == Outcome::Allow {
-                decision = apply_cmd_guard(decision, meta, &args, &preview, prompter, opts.cwd.as_deref()).await;
+                decision =
+                    apply_cmd_guard(decision, meta, &args, ask_preview, prompter, opts.cwd.as_deref()).await;
             }
 
             // Read-only "plan mode" overlay (gemini Plan Mode). Same deny-only
@@ -7506,6 +7854,19 @@ async fn run_loop_inner(
         let mut tool_msg = Message::new(Role::Tool);
         tool_msg.blocks = tool_results;
         session.push(tool_msg);
+        // C2: session taint, set once a network tool's successful result is in
+        // the context (this turn's assistant `tool_use`s + their results) and
+        // persisted so it survives compaction and resume.
+        if !session.tainted
+            && external_result_in(&session.messages[session.messages.len().saturating_sub(2)..])
+        {
+            session.tainted = true;
+            if let Some(store) = opts.session_store.as_deref() {
+                if let Err(e) = store.mark_tainted(&session.id) {
+                    tracing::warn!(error = %e, session = %session.id, "could not persist session taint");
+                }
+            }
+        }
 
         // A8: denial caps, checked only now so a stop never leaves a `tool_use`
         // unanswered. A turn with a denial and no allowed call counts once
@@ -12510,6 +12871,480 @@ mod wiring_tests {
 
     // ---- P10.12 / R31: user-configured permission rules (Feature 1) ----
 
+    /// [`decide_permission`] for a call with no arguments in a fresh session
+    /// (the P10.12 rule tests predate the C2 argument/session inputs).
+    async fn decide_test(
+        meta: &ToolMeta,
+        preview: &str,
+        prompter: &dyn Prompter,
+        skills: &SkillRegistry,
+        opts: &LoopOptions,
+    ) -> Decision {
+        let session = Session::new("test", "m");
+        decide_permission(
+            meta,
+            &serde_json::json!({}),
+            preview,
+            prompter,
+            skills,
+            opts,
+            &session,
+        )
+        .await
+    }
+
+    // ---- C2: permission modes ----
+
+    /// Records every ask; answers `answer`; `person` = whether it can ask one.
+    struct Rec {
+        asks: std::sync::Mutex<Vec<String>>,
+        answer: bool,
+        person: bool,
+    }
+    impl Rec {
+        fn new(answer: bool, person: bool) -> Self {
+            Self {
+                asks: std::sync::Mutex::new(Vec::new()),
+                answer,
+                person,
+            }
+        }
+        fn asks(&self) -> Vec<String> {
+            self.asks.lock().expect("lock").clone()
+        }
+    }
+    #[async_trait::async_trait]
+    impl Prompter for Rec {
+        async fn ask(&self, _meta: &ToolMeta, preview: &str) -> bool {
+            self.asks.lock().expect("lock").push(preview.to_owned());
+            self.answer
+        }
+        fn can_ask(&self) -> bool {
+            self.person
+        }
+    }
+
+    fn builtin(name: &str) -> &'static ToolMeta {
+        registry_iter()
+            .find(|m| m.name == name)
+            .expect("registered builtin")
+    }
+
+    /// `decide_permission` for `tool(args)` in `session` under `opts`.
+    async fn decide_c2(
+        tool: &str,
+        args: &Value,
+        p: &dyn Prompter,
+        opts: &LoopOptions,
+        session: &Session,
+    ) -> Decision {
+        let preview = args.to_string();
+        decide_permission(
+            builtin(tool),
+            args,
+            &preview,
+            p,
+            &SkillRegistry::new(),
+            opts,
+            session,
+        )
+        .await
+    }
+
+    /// C2 rule 4: an explicit deny rule binds an `AutoAllowed` tool and wins
+    /// over mode `off` (what the allow-all flag sets).
+    #[tokio::test]
+    async fn c2_deny_rule_beats_auto_allowed_and_allow_all() {
+        use crate::protocol::PermissionMode;
+        let session = Session::new("p", "m");
+        for mode in [PermissionMode::Workspace, PermissionMode::On, PermissionMode::Off] {
+            let opts = LoopOptions {
+                permission_rules: Some(rules_bundle(&[("Read", false)])),
+                permission_mode: mode,
+                ..LoopOptions::default()
+            };
+            let d = decide_c2(
+                "Read",
+                &serde_json::json!({"file_path": "x"}),
+                &Rec::new(true, true),
+                &opts,
+                &session,
+            )
+            .await;
+            assert_eq!(d.outcome, Outcome::Deny, "{mode:?}: {}", d.reason);
+            assert!(d.reason.contains("rule:Read"), "{}", d.reason);
+        }
+        // A deny rule also turns speculation off (it can now deny a Read).
+        let opts = LoopOptions {
+            permission_rules: Some(rules_bundle(&[("Read", false)])),
+            ..LoopOptions::default()
+        };
+        assert!(!speculation_allowed(&opts, false));
+    }
+
+    /// C2 rules 2-3: in workspace mode an edit inside the workspace runs without
+    /// an ask; a write outside asks a person, and a run that cannot ask denies
+    /// it with the way out; a symlink inside pointing outside counts as outside.
+    #[tokio::test]
+    async fn c2_workspace_edits_inside_run_and_outside_writes_ask() {
+        let ws = tempfile::tempdir().expect("ws");
+        let out = tempfile::tempdir().expect("out");
+        let opts = LoopOptions {
+            cwd: Some(ws.path().to_path_buf()),
+            ..LoopOptions::default()
+        };
+        let session = Session::new("p", "m");
+        let human = Rec::new(false, true);
+        let write =
+            |p: &std::path::Path| serde_json::json!({"file_path": p.to_string_lossy(), "content": "x"});
+
+        let inside = decide_c2(
+            "Write",
+            &write(&ws.path().join("src/new.rs")),
+            &human,
+            &opts,
+            &session,
+        )
+        .await;
+        assert_eq!(inside.outcome, Outcome::Allow, "{}", inside.reason);
+        let rel = decide_c2(
+            "Edit",
+            &serde_json::json!({"file_path": "a.rs"}),
+            &human,
+            &opts,
+            &session,
+        )
+        .await;
+        assert_eq!(
+            rel.outcome,
+            Outcome::Allow,
+            "relative path anchors at the run cwd"
+        );
+        assert!(human.asks().is_empty(), "no ask for an edit inside the workspace");
+
+        let escape = decide_c2(
+            "Edit",
+            &serde_json::json!({"file_path": "../x.rs"}),
+            &human,
+            &opts,
+            &session,
+        )
+        .await;
+        assert_eq!(
+            escape.outcome,
+            Outcome::Deny,
+            "`..` out of the workspace asks (and is refused)"
+        );
+        let outside = decide_c2("Write", &write(&out.path().join("x")), &human, &opts, &session).await;
+        assert_eq!(outside.outcome, Outcome::Deny);
+        assert_eq!(human.asks().len(), 2, "both outside writes asked the person");
+
+        let patch = serde_json::json!({"patch": format!(
+            "*** Begin Patch\n*** Update File: a.rs\n*** Move to: {}\n*** End Patch\n",
+            out.path().join("moved.rs").display()
+        )});
+        let headless = origin_permission::prompt::NoPrompter;
+        let moved = decide_c2("ApplyPatch", &patch, &headless, &opts, &session).await;
+        assert_eq!(moved.outcome, Outcome::Deny);
+        assert!(
+            moved.reason.contains("write outside the workspace")
+                && moved.reason.contains("cannot ask")
+                && moved.reason.contains("--dangerously-allow-all"),
+            "{}",
+            moved.reason
+        );
+
+        // A link inside the workspace that points outside.
+        let link = ws.path().join("link");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(out.path(), &link).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(out.path(), &link).is_ok()
+            || std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(out.path())
+                .output()
+                .is_ok_and(|o| o.status.success());
+        assert!(linked, "could not create a symlink or junction for the test");
+        let via_link = decide_c2(
+            "Write",
+            &write(&link.join("evil.txt")),
+            &headless,
+            &opts,
+            &session,
+        )
+        .await;
+        assert_eq!(via_link.outcome, Outcome::Deny, "{}", via_link.reason);
+        assert!(
+            via_link.reason.contains("write outside the workspace"),
+            "{}",
+            via_link.reason
+        );
+    }
+
+    /// C2 rules 2-3, 12: unsandboxed Bash asks, the first Bash ask of a session
+    /// carries the no-sandbox notice and later ones do not; with an active
+    /// sandbox Bash runs; mode `on` asks even for an edit inside the workspace.
+    #[tokio::test]
+    async fn c2_bash_asks_without_a_sandbox_with_a_once_per_session_notice() {
+        let session = Session::new("p", "m");
+        let opts = LoopOptions::default();
+        let human = Rec::new(true, true);
+        let ls = serde_json::json!({"command": "ls"});
+        for _ in 0..2 {
+            let d = decide_c2("Bash", &ls, &human, &opts, &session).await;
+            assert_eq!(d.outcome, Outcome::Allow);
+            assert_eq!(d.reason, USER_APPROVED);
+        }
+        let asks = human.asks();
+        assert_eq!(asks.len(), 2, "Bash asks every time without a sandbox");
+        assert!(
+            asks[0].starts_with("note: Bash asks because no OS sandbox is active"),
+            "{}",
+            asks[0]
+        );
+        assert!(
+            !asks[1].contains("no OS sandbox"),
+            "notice only once: {}",
+            asks[1]
+        );
+
+        let ws = Workspace {
+            cwd: std::env::temp_dir(),
+            roots: Vec::new(),
+        };
+        assert!(matches!(
+            workspace_need(builtin("Bash"), &ls, &ws, true, false),
+            Need::Allow(_)
+        ));
+        assert!(matches!(
+            workspace_need(builtin("Bash"), &ls, &ws, true, true),
+            Need::Allow(_)
+        ));
+        assert!(matches!(
+            workspace_need(builtin("Bash"), &ls, &ws, false, false),
+            Need::Ask(_)
+        ));
+
+        let dir = tempfile::tempdir().expect("ws");
+        let on = LoopOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            permission_mode: crate::protocol::PermissionMode::On,
+            ..LoopOptions::default()
+        };
+        let asker = Rec::new(false, true);
+        let d = decide_c2(
+            "Edit",
+            &serde_json::json!({"file_path": "a.rs"}),
+            &asker,
+            &on,
+            &session,
+        )
+        .await;
+        assert_eq!(
+            (d.outcome, asker.asks().len()),
+            (Outcome::Deny, 1),
+            "mode on asks"
+        );
+    }
+
+    /// C2 rules 8-9: a `Task` granting gated tools is asked every time (an
+    /// earlier yes never covers the next delegation); a read-only `Task`
+    /// (`0/<T> gated tools, 0 mcp servers`) runs without an ask in workspace mode.
+    #[tokio::test]
+    async fn c2_task_with_grants_asks_every_time_and_read_only_task_does_not() {
+        let session = Session::new("p", "m");
+        let opts = LoopOptions::default();
+        let human = Rec::new(true, true);
+        let granting = serde_json::json!({"goal": "g", "allowed_tools": ["Read", "Edit"]});
+        for _ in 0..2 {
+            assert_eq!(
+                decide_c2("Task", &granting, &human, &opts, &session)
+                    .await
+                    .outcome,
+                Outcome::Allow
+            );
+        }
+        assert_eq!(human.asks().len(), 2, "every delegation with grants asks");
+
+        let read_only = serde_json::json!({"goal": "g", "allowed_tools": ["Read", "Grep", "Glob"]});
+        let d = decide_c2(
+            "Task",
+            &read_only,
+            &origin_permission::prompt::NoPrompter,
+            &opts,
+            &session,
+        )
+        .await;
+        assert_eq!(d.outcome, Outcome::Allow, "{}", d.reason);
+        let mcp =
+            serde_json::json!({"goal": "g", "allowed_tools": ["Read"], "mcp_servers": [{"name": "gh"}]});
+        let d = decide_c2(
+            "Task",
+            &mcp,
+            &origin_permission::prompt::NoPrompter,
+            &opts,
+            &session,
+        )
+        .await;
+        assert_eq!(d.outcome, Outcome::Deny, "an MCP server is a grant");
+    }
+
+    /// C2 rules 10-11: a standing grant (a sub-agent's allow-list — the only
+    /// "always allow" the code has) runs network tools and unsandboxed Bash
+    /// before taint; after taint they need a person, so it can no longer run
+    /// them. An explicit config allow rule still applies after taint.
+    #[tokio::test]
+    async fn c2_taint_flips_grants_back_to_asking_but_not_config_rules() {
+        let grant = Rec::new(true, false);
+        let opts = LoopOptions::default();
+        let mut session = Session::new("p", "m");
+        let bash = serde_json::json!({"command": "ls"});
+        let fetch = serde_json::json!({"url": "https://example.com"});
+        assert_eq!(
+            decide_c2("Bash", &bash, &grant, &opts, &session).await.outcome,
+            Outcome::Allow
+        );
+        assert_eq!(
+            decide_c2("WebFetch", &fetch, &grant, &opts, &session)
+                .await
+                .outcome,
+            Outcome::Allow
+        );
+
+        session.tainted = true;
+        for (tool, args) in [("Bash", &bash), ("WebFetch", &fetch)] {
+            let d = decide_c2(tool, args, &grant, &opts, &session).await;
+            assert_eq!(d.outcome, Outcome::Deny, "{tool} after taint");
+            assert!(d.reason.contains("after external content"), "{}", d.reason);
+        }
+        let ruled = LoopOptions {
+            permission_rules: Some(rules_bundle(&[("Bash", true)])),
+            ..LoopOptions::default()
+        };
+        let d = decide_c2("Bash", &bash, &grant, &ruled, &session).await;
+        assert_eq!(
+            d.outcome,
+            Outcome::Allow,
+            "a config allow rule survives taint: {}",
+            d.reason
+        );
+    }
+
+    /// C2 rule 11: a sub-agent runs in mode `on`, so an edit `workspace` would
+    /// auto-allow still needs its allow-list grant; with the grant it runs.
+    #[tokio::test]
+    async fn c2_worker_edit_inside_the_workspace_still_needs_its_grant() {
+        let dir = tempfile::tempdir().expect("ws");
+        let worker = LoopOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            permission_mode: crate::protocol::PermissionMode::On,
+            ..LoopOptions::default()
+        };
+        let session = Session::new("p", "m");
+        let edit = serde_json::json!({"file_path": "a.rs"});
+        let no_grant = decide_c2("Edit", &edit, &Rec::new(false, false), &worker, &session).await;
+        assert_eq!(no_grant.outcome, Outcome::Deny, "{}", no_grant.reason);
+        let granted = decide_c2("Edit", &edit, &Rec::new(true, false), &worker, &session).await;
+        assert_eq!(granted.outcome, Outcome::Allow, "{}", granted.reason);
+    }
+
+    /// C2 rule 10: taint is read back from a history that holds a successful
+    /// external result, and not from a failed one.
+    #[test]
+    fn c2_external_result_in_history_taints_only_on_success() {
+        let msgs = |is_error: bool| {
+            vec![
+                Message::new(Role::Assistant).with_block(Block::ToolUse {
+                    id: "w".into(),
+                    name: "WebFetch".into(),
+                    input_json: b"{}".to_vec(),
+                    cache_marker: None,
+                }),
+                Message::new(Role::Tool).with_block(Block::ToolResult {
+                    tool_use_id: "w".into(),
+                    handle: None,
+                    inline: Some(b"page".to_vec()),
+                    cache_marker: None,
+                    is_error,
+                }),
+            ]
+        };
+        assert!(external_result_in(&msgs(false)));
+        assert!(!external_result_in(&msgs(true)));
+        assert!(is_external_tool("mcp__gh__get") && is_external_tool("gmail") && !is_external_tool("Read"));
+    }
+
+    /// C2 rule 6: a `NeedsApproval` command asks a person with the guard's
+    /// reason in the prompt; with nobody to ask it is denied with the way out;
+    /// mode `off` lets it through without asking.
+    #[test]
+    fn c2_needs_approval_carries_its_reason_and_is_denied_headless() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("ORIGIN_CMD_GUARD");
+        let args = serde_json::json!({ "command": "eval \"$CMD\"" });
+        let preview = cmd_guard_ask_preview("Bash", &args, &args.to_string()).expect("guard preview");
+        assert!(preview.starts_with("cmd-guard: needs approval: "), "{preview}");
+        let rule_allow = || Decision {
+            outcome: Outcome::Allow,
+            reason: "rule:Bash@*:allow".into(),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().build().expect("rt");
+        let human = Rec::new(true, true);
+        let asked = rt.block_on(apply_cmd_guard(
+            rule_allow(),
+            builtin("Bash"),
+            &args,
+            &preview,
+            &human,
+        ));
+        assert_eq!(asked.outcome, Outcome::Allow);
+        assert_eq!(
+            human.asks(),
+            vec![preview.clone()],
+            "the ask shows the guard's reason"
+        );
+
+        let headless = origin_permission::prompt::NoPrompter;
+        let denied = rt.block_on(apply_cmd_guard(
+            rule_allow(),
+            builtin("Bash"),
+            &args,
+            &preview,
+            &headless,
+        ));
+        assert_eq!(denied.outcome, Outcome::Deny);
+        assert!(
+            denied.reason.contains("cmd-guard") && denied.reason.contains("ORIGIN_ALLOW_ALL=1"),
+            "{}",
+            denied.reason
+        );
+        // Rule 11: inside a sub-agent, delegated `Bash` (a grant) does not
+        // approve a `NeedsApproval` command.
+        let grant = Rec::new(true, false);
+        let granted = rt.block_on(decide_c2(
+            "Bash",
+            &args,
+            &grant,
+            &LoopOptions::default(),
+            &Session::new("p", "m"),
+        ));
+        assert_eq!(granted.outcome, Outcome::Allow, "the grant covers Bash itself");
+        let in_worker = rt.block_on(apply_cmd_guard(granted, builtin("Bash"), &args, &preview, &grant));
+        assert_eq!(in_worker.outcome, Outcome::Deny, "{}", in_worker.reason);
+        let off = Decision {
+            outcome: Outcome::Allow,
+            reason: MODE_OFF.into(),
+        };
+        let through = rt.block_on(apply_cmd_guard(off, builtin("Bash"), &args, &preview, &headless));
+        assert_eq!(
+            through.outcome,
+            Outcome::Allow,
+            "mode off approves without asking"
+        );
+    }
+
     /// A `RequiresPermission` `ToolMeta` for the named tool, used to exercise the
     /// `decide_permission` resolution path.
     fn rp_meta(name: &'static str) -> ToolMeta {
@@ -12554,14 +13389,14 @@ mod wiring_tests {
         let deny = origin_permission::prompt::AlwaysDeny;
         // No rules ⇒ the prompter is consulted, just like before.
         assert_eq!(
-            decide_permission(&meta, "git status", &allow, &no_skills, &opts)
+            decide_test(&meta, "git status", &allow, &no_skills, &opts)
                 .await
                 .outcome,
             Outcome::Allow,
             "no rules + AlwaysAllow ⇒ allowed (unchanged)"
         );
         assert_eq!(
-            decide_permission(&meta, "git status", &deny, &no_skills, &opts)
+            decide_test(&meta, "git status", &deny, &no_skills, &opts)
                 .await
                 .outcome,
             Outcome::Deny,
@@ -12581,7 +13416,7 @@ mod wiring_tests {
         let no_skills = SkillRegistry::new();
         let meta = rp_meta("Bash");
         // AlwaysAllow would normally allow; the deny rule pre-empts it.
-        let d = decide_permission(
+        let d = decide_test(
             &meta,
             "rm -rf /",
             &origin_permission::prompt::AlwaysAllow,
@@ -12609,7 +13444,7 @@ mod wiring_tests {
         let no_skills = SkillRegistry::new();
         let meta = rp_meta("Read");
         // AlwaysDeny would normally deny; the allow rule pre-empts it.
-        let d = decide_permission(
+        let d = decide_test(
             &meta,
             "/etc/hosts",
             &origin_permission::prompt::AlwaysDeny,
@@ -12636,7 +13471,7 @@ mod wiring_tests {
         };
         let no_skills = SkillRegistry::new();
         let meta = rp_meta("Bash"); // no rule for Bash
-        let d = decide_permission(
+        let d = decide_test(
             &meta,
             "git status",
             &origin_permission::prompt::AlwaysDeny,
@@ -12649,7 +13484,7 @@ mod wiring_tests {
             Outcome::Deny,
             "unmatched tool falls through to prompter (AlwaysDeny)"
         );
-        let d2 = decide_permission(
+        let d2 = decide_test(
             &meta,
             "git status",
             &origin_permission::prompt::AlwaysAllow,
@@ -12685,7 +13520,7 @@ mod wiring_tests {
             String::new(),
         );
         let meta = rp_meta("Bash");
-        let d = decide_permission(
+        let d = decide_test(
             &meta,
             "rm -rf /",
             &origin_permission::prompt::AlwaysAllow,

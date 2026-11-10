@@ -12,10 +12,33 @@ use origin_tools::ToolMeta;
 pub trait Prompter: Send + Sync {
     /// Ask the user to approve a tool invocation. Returns `true` for allow.
     async fn ask(&self, meta: &ToolMeta, args_preview: &str) -> bool;
+
+    /// C2: `false` when no person can answer this prompter (a headless run with
+    /// no attached client, or a sub-agent whose `ask` only checks the grants the
+    /// user approved). An ask that needs a person is then denied without calling
+    /// [`Prompter::ask`].
+    fn can_ask(&self) -> bool {
+        true
+    }
 }
 
 pub struct AlwaysAllow;
 pub struct AlwaysDeny;
+/// C2: nobody can be asked (headless run, no attached client). Every ask is
+/// denied and [`Prompter::can_ask`] says so, so the denial can say why.
+pub struct NoPrompter;
+
+#[async_trait]
+impl Prompter for NoPrompter {
+    #[allow(clippy::unused_async)] // trait signature requires async
+    async fn ask(&self, _meta: &ToolMeta, _args_preview: &str) -> bool {
+        false
+    }
+
+    fn can_ask(&self) -> bool {
+        false
+    }
+}
 
 #[async_trait]
 impl Prompter for AlwaysAllow {

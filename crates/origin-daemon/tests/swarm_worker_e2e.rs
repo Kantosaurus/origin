@@ -140,6 +140,18 @@ async fn parent_allow_rule_does_not_widen_worker_allow_list() {
     assert!(!wrote, "an allow rule let a worker without `Write` run Write");
 }
 
+/// C2 rule 11: a worker that was granted `Write` still cannot write outside
+/// the workspace — that needs a person, and a worker has nobody to ask (the
+/// target is in a temp dir, outside the test's working directory).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_granted_write_still_cannot_write_outside_the_workspace() {
+    let wrote = worker_write_ran("", "Write").await;
+    assert!(
+        !wrote,
+        "a worker wrote outside the workspace without a person approving it"
+    );
+}
+
 /// A4 fix round 2: a worker has no coordinator, so its `Task` call (it is shown
 /// the tool and told to use it) must come back as a recoverable error — not a
 /// denial that ends the worker's whole run.

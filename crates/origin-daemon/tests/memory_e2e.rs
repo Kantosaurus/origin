@@ -131,6 +131,8 @@ async fn memory_e2e_proposer_to_store_via_wiremock() {
         touches: None,
         prompt_profile: origin_daemon::agent::PromptProfile::Interactive,
         ponytail: origin_ponytail::PonytailMode::Full,
+        // C2: this test predates permission modes and expects every tool to run.
+        permission_mode: origin_daemon::protocol::PermissionMode::Off,
     };
     let _summary = run_loop(
         &mut session,

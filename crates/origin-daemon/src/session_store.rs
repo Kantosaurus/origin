@@ -146,6 +146,29 @@ impl SessionStore {
         ResumeToken::load_one(&self.resume_dir(), session_id)
     }
 
+    /// C2: record that external content entered `session_id` (session taint),
+    /// as a marker file `<db_dir>/taint/<hex(id)>` — one boolean, no schema change.
+    ///
+    /// # Errors
+    /// Propagates I/O errors.
+    // ponytail: markers of deleted/pruned sessions are left behind (ids are
+    // unique, so they are inert); remove them in `delete`/`prune` if they pile up.
+    pub fn mark_tainted(&self, session_id: &str) -> std::io::Result<()> {
+        std::fs::create_dir_all(self.db_dir.join("taint"))?;
+        std::fs::write(self.taint_path(session_id), b"")
+    }
+
+    /// C2: whether [`Self::mark_tainted`] was called for `session_id`.
+    #[must_use]
+    pub fn is_tainted(&self, session_id: &str) -> bool {
+        self.taint_path(session_id).exists()
+    }
+
+    /// Hex-encoded so no session id can name a path outside `taint/`.
+    fn taint_path(&self, session_id: &str) -> PathBuf {
+        self.db_dir.join("taint").join(hex::encode(session_id))
+    }
+
     /// Insert (or replace) a session metadata row.
     ///
     /// # Errors

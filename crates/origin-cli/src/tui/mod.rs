@@ -523,11 +523,11 @@ pub struct App {
     /// notification fires on successful turn completion via `origin-notify`.
     /// Default `false` ⇒ no spawn ⇒ byte-identical.
     pub notify_desktop: bool,
-    /// Opt-in interactive tool-permission prompting. When `true`, each
-    /// `PromptRequest` carries `permission_ask`, so the daemon asks before
-    /// running `RequiresPermission` tools. Default `false` ⇒ the daemon stays on
-    /// auto-allow ⇒ byte-identical. Toggled by the `/permissions` command.
-    pub permission_ask: bool,
+    /// C2: the permission mode each `PromptRequest` carries. Default
+    /// `Workspace` (edits inside the workspace run, Bash/network/outside writes
+    /// ask); `On` asks for every gated tool, `Off` runs everything. Set by the
+    /// `/permissions workspace|on|off` command, for this TUI session only.
+    pub permission_mode: origin_daemon::protocol::PermissionMode,
     /// The pending permission ask, if the daemon is currently waiting on the
     /// user. `Some` ⇒ the next `y`/`n` (or `Esc`) answers it; rendered above the
     /// input card. `None` in the common case.
@@ -717,7 +717,7 @@ impl App {
             vim_active: false,
             theme: Theme::Default,
             notify_desktop: false,
-            permission_ask: false,
+            permission_mode: origin_daemon::protocol::PermissionMode::Workspace,
             pending_permission: None,
             active_picker: None,
             running_tool_row: None,
@@ -854,15 +854,12 @@ impl App {
         Some(u8::try_from(pct.min(100)).unwrap_or(100))
     }
 
-    /// Apply a `/permissions [on|off]` toggle, returning the new state. No
-    /// argument flips the current state; `on`/`off` set it explicitly.
-    pub fn set_permission_ask(&mut self, arg: &str) -> bool {
-        self.permission_ask = match arg.trim() {
-            "on" => true,
-            "off" => false,
-            _ => !self.permission_ask,
-        };
-        self.permission_ask
+    /// Apply `/permissions [workspace|on|off]` (C2). A known mode is set; no or
+    /// an unknown argument leaves the mode unchanged and returns `None`.
+    pub fn set_permission_mode(&mut self, arg: &str) -> Option<origin_daemon::protocol::PermissionMode> {
+        let mode = origin_daemon::protocol::PermissionMode::parse(arg)?;
+        self.permission_mode = mode;
+        Some(mode)
     }
 
     /// Apply a `/mouse [on|off]` toggle, returning the new capture state. No
@@ -4485,7 +4482,11 @@ mod tests {
         assert!(!app.vim_active);
         assert_eq!(app.vim_mode, VimMode::Insert);
         assert!(!app.notify_desktop);
-        assert!(!app.permission_ask, "permission prompting defaults off");
+        assert_eq!(
+            app.permission_mode,
+            origin_daemon::protocol::PermissionMode::Workspace,
+            "C2: the TUI defaults to workspace mode, not auto-allow"
+        );
         assert!(app.pending_permission.is_none());
         assert!(app.active_picker.is_none(), "no picker open by default");
         assert_eq!(app.palette(), theme::palette(Theme::Default));
@@ -4572,14 +4573,27 @@ mod tests {
     }
 
     #[test]
-    fn set_permission_ask_toggles_and_sets() {
+    fn set_permission_mode_sets_known_modes_only() {
+        use origin_daemon::protocol::PermissionMode;
         let mut app = App::new("anthropic", "m", CompletionSources::default());
-        assert!(!app.permission_ask, "default off");
-        assert!(app.set_permission_ask(""), "no arg flips on");
-        assert!(app.permission_ask);
-        assert!(!app.set_permission_ask(""), "no arg flips back off");
-        assert!(app.set_permission_ask("on"), "explicit on");
-        assert!(!app.set_permission_ask("off"), "explicit off");
+        assert_eq!(
+            app.permission_mode,
+            PermissionMode::Workspace,
+            "default workspace"
+        );
+        assert_eq!(app.set_permission_mode("on"), Some(PermissionMode::On));
+        assert_eq!(app.set_permission_mode("off"), Some(PermissionMode::Off));
+        assert_eq!(app.set_permission_mode(""), None, "no arg leaves the mode");
+        assert_eq!(
+            app.set_permission_mode("bogus"),
+            None,
+            "unknown arg leaves the mode"
+        );
+        assert_eq!(app.permission_mode, PermissionMode::Off);
+        assert_eq!(
+            app.set_permission_mode("workspace"),
+            Some(PermissionMode::Workspace)
+        );
     }
 
     #[test]

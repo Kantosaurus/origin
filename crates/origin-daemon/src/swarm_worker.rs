@@ -210,6 +210,14 @@ impl Prompter for AllowList {
         // patterns; otherwise glob-match the tool name against the allow-list.
         meta.name != "Task" && self.set.is_match(meta.name)
     }
+
+    /// C2: the allow-list is the grant the user approved through the `Task`
+    /// prompt, not a person: a call that needs a person (a `NeedsApproval`
+    /// command, a write outside the workspace, a network tool after taint) is
+    /// denied. Workers have no path to the parent session's prompter.
+    fn can_ask(&self) -> bool {
+        false
+    }
 }
 
 /// Build the real worker closure, capturing the daemon's active-provider handle.
@@ -395,6 +403,11 @@ async fn run_worker(
         browser_rate_limit: governance.browser_max_actions,
         // B8: record what this worker's successful tool calls changed.
         touches: Some(Arc::clone(&touches)),
+        // C2: mode `on`, so every gated call goes to the allow-list: what
+        // `workspace` would auto-allow (an edit inside the workspace, a
+        // read-only Task) still needs a grant here, and what needs a person is
+        // denied (`AllowList::can_ask` is false).
+        permission_mode: crate::protocol::PermissionMode::On,
         ..Default::default()
     };
 
@@ -754,6 +767,15 @@ mod tests {
             let preview = grants.contains(&format!("\"{entry}\""));
             assert_eq!((worker, preview), (expected, expected), "{entry}: {p}");
         }
+    }
+
+    /// C2 rule 11: the allow-list grants, it is not a person, so whatever needs
+    /// a person (`NeedsApproval`, writes outside the workspace, network after
+    /// taint) is denied inside a worker even when the tool is delegated.
+    #[test]
+    fn allow_list_is_a_grant_not_a_person() {
+        use origin_permission::prompt::Prompter as _;
+        assert!(!AllowList::from_patterns(&["*".to_string()]).can_ask());
     }
 
     #[tokio::test]

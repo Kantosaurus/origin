@@ -36,3 +36,14 @@ async fn requires_permission_asks_prompter_deny() {
     let decision = check(&m, "rm -rf /", &AlwaysDeny).await;
     assert_eq!(decision.outcome, Outcome::Deny);
 }
+
+/// C2: a headless prompter denies and reports that nobody can be asked; a
+/// human-facing prompter keeps the default `can_ask() == true`.
+#[tokio::test]
+async fn no_prompter_denies_and_cannot_ask() {
+    use origin_permission::prompt::{NoPrompter, Prompter};
+    let m = meta("Bash", Tier::RequiresPermission);
+    assert_eq!(check(&m, "ls", &NoPrompter).await.outcome, Outcome::Deny);
+    assert!(!NoPrompter.can_ask());
+    assert!(AlwaysAllow.can_ask() && AlwaysDeny.can_ask());
+}

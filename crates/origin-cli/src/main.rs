@@ -200,6 +200,7 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
             output_format,
             json_schema,
             root,
+            dangerously_allow_all,
         } => {
             // Run-level `--thinking-tokens` wins; otherwise inherit the startup
             // seed. `0` is a hard error (matches the global flag's contract).
@@ -222,6 +223,7 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
                 output_format,
                 json_schema,
                 roots: root,
+                allow_all: dangerously_allow_all || origin_daemon::protocol::allow_all_env(),
             })
             .await
         }
@@ -2004,24 +2006,35 @@ async fn handle_submit(
         handle.mark_dirty();
         return;
     }
-    // `/permissions [on|off]` toggles opt-in interactive tool prompting. When
-    // ON, the daemon asks before running RequiresPermission tools (Bash/Write/
-    // Edit/…) and the user answers each with y/n. Default OFF keeps the historic
-    // auto-allow behaviour (byte-identical wire + tool execution).
+    // `/permissions [workspace|on|off]` (C2) sets which tool calls ask first.
+    // `workspace` (default): edits inside the workspace run, Bash, network tools
+    // and writes outside ask. `on`: every gated tool asks. `off`: all run.
     if let Some(arg) = text
         .trim()
         .strip_prefix("/permissions")
         .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
         .map(str::trim)
     {
+        use origin_daemon::protocol::PermissionMode;
         app.lock().add_line("you> ", text);
-        let now_on = app.lock().set_permission_ask(arg);
-        let msg = if now_on {
-            "permission prompts ON \u{2014} approve Bash/Write/Edit before they run (y/n); /permissions off to disable"
-        } else {
-            "permission prompts OFF \u{2014} tools auto-run (default)"
+        let set = app.lock().set_permission_mode(arg);
+        let mode = app.lock().permission_mode;
+        let what = match mode {
+            PermissionMode::Workspace => {
+                "permissions: workspace (default) \u{2014} edits inside the workspace run; Bash, network \
+                 tools and writes outside the workspace ask first"
+            }
+            PermissionMode::On => "permissions: on \u{2014} every permission-gated tool asks first",
+            PermissionMode::Off => {
+                "permissions: off \u{2014} tools run without asking (deny rules still apply)"
+            }
         };
-        app.lock().add_line("system> ", msg);
+        let msg = if set.is_none() && !arg.is_empty() {
+            format!("unknown mode `{arg}` (use workspace, on or off); {what}")
+        } else {
+            what.to_string()
+        };
+        app.lock().add_line("system> ", &msg);
         handle.mark_dirty();
         return;
     }
@@ -2342,8 +2355,8 @@ async fn handle_prompt_turn(
     let attachments = std::mem::take(&mut app.lock().pending_attachments);
     // Session-wide multi-root list (from the startup `--root` flags).
     let roots = app.lock().workspace_roots.clone();
-    // Opt-in interactive permission prompting (`/permissions on`).
-    let permission_ask = app.lock().permission_ask;
+    // C2: the session's permission mode (`/permissions`).
+    let permission_mode = app.lock().permission_mode;
     // Opt-in per-turn cost line (`ORIGIN_TURN_COST=1`): snapshot the cumulative
     // USD before the turn so we can render its delta afterward. Default-off: when
     // the env var is unset we never read this value and emit no extra line, so the
@@ -2361,7 +2374,7 @@ async fn handle_prompt_turn(
         read_only,
         attachments,
         roots,
-        permission_ask,
+        permission_mode,
         interrupt_rx,
         move |ev: &StreamEvent| {
             // Bug #4: route Goal* events through the dedicated renderer so
@@ -2678,10 +2691,8 @@ async fn call_daemon(
     attachments: Vec<origin_multimodal::ContentBlock>,
     // Session-wide extra workspace roots (`--root`); empty ⇒ single-root.
     roots: Vec<String>,
-    // Opt-in interactive permission prompting (`/permissions on`); false ⇒ the
-    // daemon stays on auto-allow, so the request and tool execution are
-    // byte-identical.
-    permission_ask: bool,
+    // C2: the session's permission mode (`/permissions`, default workspace).
+    permission_mode: origin_daemon::protocol::PermissionMode,
     // Bug #5: one-shot channel surfacing user Ctrl+C while a Prompt is in
     // flight. When a tick lands we write `ClientMessage::Interrupt` to
     // the same connection serving the prompt — the daemon's
@@ -2730,7 +2741,9 @@ async fn call_daemon(
         attachments,
         read_only,
         roots,
-        permission_ask,
+        // `permission_ask` keeps `on` working against an older daemon.
+        permission_ask: permission_mode == origin_daemon::protocol::PermissionMode::On,
+        permission_mode: Some(permission_mode),
         // The interactive TUI always wires the choice picker (this `call_daemon`
         // path sets up `on_choice_ask`), so the model's `ask_user` questions
         // surface a picker regardless of whether `/permissions` is on.

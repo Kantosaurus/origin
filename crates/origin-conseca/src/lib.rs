@@ -207,6 +207,46 @@ fn windows_components(path: &str, cwd: &dyn Fn() -> Option<String>) -> Option<Ve
     Some(out)
 }
 
+/// C2: the real location of the absolute `path`, symlinks (and Windows
+/// junctions) resolved.
+///
+/// The OS canonicalises the longest existing ancestor and
+/// the not-yet-existing rest is re-appended, `.`/`..` resolved lexically (a name
+/// that does not exist cannot be a link). `None` = unresolvable, which callers
+/// treat as "outside": a relative path, a spelling [`path_components`] rejects
+/// (Win32-rewritten names, devices, `:` streams), an existing entry that cannot
+/// be canonicalised (a dangling link would let a write land anywhere), or `..`
+/// above the root.
+#[must_use]
+pub fn resolve_real(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    path_components(path.to_str()?)?;
+    if !path.is_absolute() {
+        return None;
+    }
+    let comps: Vec<Component<'_>> = path.components().collect();
+    for i in (1..=comps.len()).rev() {
+        let Ok(mut base) = std::fs::canonicalize(comps[..i].iter().collect::<std::path::PathBuf>()) else {
+            continue;
+        };
+        for c in &comps[i..] {
+            match c {
+                Component::Normal(name) => {
+                    base.push(name);
+                    if std::fs::symlink_metadata(&base).is_ok() {
+                        return None; // exists, yet canonicalize failed on it
+                    }
+                }
+                Component::ParentDir if base.pop() => {}
+                Component::CurDir => {}
+                _ => return None,
+            }
+        }
+        return Some(base);
+    }
+    None
+}
+
 /// Checks whether a filesystem path may be accessed under the policy.
 ///
 /// Both the path and the policy prefixes are lexically canonicalized with

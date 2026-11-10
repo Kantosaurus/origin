@@ -58,6 +58,12 @@ pub struct Session {
     /// checklist survives across `/goal` iterations and follow-up prompts (each a
     /// fresh `run_loop`) instead of being wiped to an empty local each time.
     pub last_todos: Option<serde_json::Value>,
+    /// C2 session taint: a successful result from a network tool (`WebFetch`,
+    /// `WebSearch`, `Browser`, `gmail`, any `mcp__*`) has entered the context.
+    /// From then on network tools, writes outside the workspace and unsandboxed
+    /// Bash always need a person to approve them. Persisted by
+    /// [`crate::session_store::SessionStore::mark_tainted`].
+    pub tainted: bool,
 }
 
 impl Session {
@@ -71,6 +77,7 @@ impl Session {
             next_proposal_id: 1,
             roots: Vec::new(),
             last_todos: None,
+            tainted: false,
         }
     }
 
@@ -88,6 +95,7 @@ impl Session {
             next_proposal_id: 1,
             roots: Vec::new(),
             last_todos: None,
+            tainted: false,
         }
     }
 

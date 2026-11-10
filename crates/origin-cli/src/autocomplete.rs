@@ -87,7 +87,7 @@ const BUILTIN_VERBS: &[(&str, &str)] = &[
     ("attach", "stage an image/PDF for the next prompt"),
     ("account", "switch the active provider account"),
     ("mem", "manage proposed memories"),
-    ("permissions", "toggle approving tools before they run"),
+    ("permissions", "workspace|on|off: which tools ask before they run"),
     ("mouse", "toggle mouse capture (off to select & copy)"),
     ("theme", "switch palette (default/dark/light/high-contrast)"),
     ("copy", "copy the last reply to the clipboard (OSC 52)"),

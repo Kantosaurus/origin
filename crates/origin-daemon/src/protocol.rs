@@ -59,6 +59,12 @@ pub struct PromptRequest {
     /// tool execution are byte-identical. Headless/swarm never set this.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub permission_ask: bool,
+    /// C2: the permission mode for this turn. `None` ⇒ `on` when the legacy
+    /// `permission_ask` is set, else `workspace`. `origin run
+    /// --dangerously-allow-all` sends `off`, so the flag reaches a daemon that is
+    /// already running. See [`PromptRequest::permission`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<PermissionMode>,
     /// Whether this turn comes from an **interactive** session with a human who
     /// can answer prompts (the TUI). When `true`, the daemon wires the choice
     /// registry so the model's `ask_user` / `AskUserQuestion` tool surfaces an
@@ -81,6 +87,59 @@ pub struct PromptRequest {
     /// byte-identical to the pre-per-request behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+}
+
+/// C2: which tool calls run without asking.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionMode {
+    /// Auto-allow edits inside the workspace and sandboxed Bash; ask for the
+    /// rest of the permission-gated tools (the default).
+    #[default]
+    Workspace,
+    /// Ask for every permission-gated tool (`/permissions on`).
+    On,
+    /// Allow everything an explicit deny rule does not block (`/permissions
+    /// off`, `--dangerously-allow-all`, `ORIGIN_ALLOW_ALL=1`).
+    Off,
+}
+
+impl PermissionMode {
+    /// Parse a `/permissions` argument (`workspace` / `on` / `off`).
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "workspace" => Some(Self::Workspace),
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// C2: `ORIGIN_ALLOW_ALL=1` — permission mode `off` for every run that sees it.
+#[must_use]
+pub fn allow_all_env() -> bool {
+    std::env::var("ORIGIN_ALLOW_ALL").as_deref() == Ok("1")
+}
+
+impl PromptRequest {
+    /// C2: the permission mode this turn runs under, and whether a client can
+    /// answer its asks. `ORIGIN_ALLOW_ALL=1` in the daemon's own environment
+    /// forces `off`; otherwise the request decides (see `permission_mode`).
+    #[must_use]
+    pub fn permission(&self) -> (PermissionMode, bool) {
+        let mode = if allow_all_env() {
+            PermissionMode::Off
+        } else {
+            self.permission_mode.unwrap_or(if self.permission_ask {
+                PermissionMode::On
+            } else {
+                PermissionMode::Workspace
+            })
+        };
+        (mode, self.interactive || self.permission_ask)
+    }
 }
 
 /// Request to rebuild the code graph over a set of paths.
@@ -1121,6 +1180,65 @@ mod permission_wire_tests {
             !json.contains("permission_ask"),
             "default request omits the flag: {json}"
         );
+    }
+
+    /// Serialises the tests that read or write `ORIGIN_ALLOW_ALL`.
+    static ALLOW_ALL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// C2: with no mode on the wire the daemon lands on `workspace`; the legacy
+    /// `permission_ask` still means `on`; the client's mode wins otherwise. A
+    /// request that is neither interactive nor `permission_ask` cannot be asked.
+    #[test]
+    fn permission_mode_defaults_to_workspace_and_legacy_ask_means_on() {
+        let _g = ALLOW_ALL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("ORIGIN_ALLOW_ALL");
+        let headless = PromptRequest::default();
+        assert_eq!(headless.permission(), (PermissionMode::Workspace, false));
+        let tui = PromptRequest {
+            interactive: true,
+            ..Default::default()
+        };
+        assert_eq!(tui.permission(), (PermissionMode::Workspace, true));
+        let legacy = PromptRequest {
+            permission_ask: true,
+            ..Default::default()
+        };
+        assert_eq!(legacy.permission(), (PermissionMode::On, true));
+        let json = serde_json::to_string(&headless).expect("serialize");
+        assert!(!json.contains("permission_mode"), "unset mode is omitted: {json}");
+    }
+
+    /// C2: the CLI's allow-all flag travels in the request, so a daemon whose
+    /// own environment lacks `ORIGIN_ALLOW_ALL` still runs the turn in `off`;
+    /// the daemon's own `ORIGIN_ALLOW_ALL=1` forces `off` for any request.
+    #[test]
+    fn allow_all_reaches_a_daemon_without_the_env_var() {
+        let _g = ALLOW_ALL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("ORIGIN_ALLOW_ALL");
+        let sent = ClientMessage::prompt(PromptRequest {
+            permission_mode: Some(PermissionMode::Off),
+            ..Default::default()
+        });
+        let wire = serde_json::to_string(&sent).expect("serialize");
+        assert!(wire.contains("\"permission_mode\":\"off\""), "{wire}");
+        let ClientMessage::Prompt(got) = serde_json::from_str(&wire).expect("deserialize") else {
+            panic!("not a prompt");
+        };
+        assert_eq!(got.permission().0, PermissionMode::Off);
+
+        std::env::set_var("ORIGIN_ALLOW_ALL", "1");
+        let plain = PromptRequest::default().permission().0;
+        std::env::remove_var("ORIGIN_ALLOW_ALL");
+        assert_eq!(plain, PermissionMode::Off, "daemon-side env forces off");
+        assert_eq!(
+            PermissionMode::parse(" Workspace"),
+            Some(PermissionMode::Workspace)
+        );
+        assert_eq!(PermissionMode::parse("bogus"), None);
     }
 
     #[test]
