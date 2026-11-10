@@ -52,8 +52,9 @@ impl WireCacheControl {
 pub struct WireRequest<'a> {
     pub model: &'a str,
     pub max_tokens: u32,
+    /// System prompt as a block array, so it can carry a `cache_control` marker.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<&'a str>,
+    pub system: Option<Vec<WireBlock<'a>>>,
     pub messages: Vec<WireMessage<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<WireTool<'a>>,

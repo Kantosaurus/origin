@@ -2273,7 +2273,10 @@ mod runtime_tools_tests {
             map.insert(name.to_string(), Arc::new(tool));
         }
         let names = scope_runtime_tools(Arc::new(map), async {
-            runtime_tool_schemas().into_iter().map(|s| s.name).collect::<Vec<_>>()
+            runtime_tool_schemas()
+                .into_iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>()
         })
         .await;
         let mut sorted = names.clone();
@@ -3589,8 +3592,10 @@ async fn run_loop_inner(
     static EMPTY_SKILLS: SkillRegistry = SkillRegistry::new();
 
     session.push(Message::new(Role::User).with_block(Block::text(user_text)));
+    // B2: this prompt's message, which later carries `prompt_volatile_block`.
+    let prompt_msg_idx = session.messages.len() - 1;
     // B1: the session's first prompt reports the size of its system + tools prefix.
-    let first_prompt_of_session = session.messages.len() == 1;
+    let first_prompt_of_session = prompt_msg_idx == 0;
 
     // Ambient idle gate (jcode L223): a genuine user prompt is REAL activity, so
     // bump the ambient idle tracker now that the turn is starting. Best-effort
@@ -3669,8 +3674,9 @@ async fn run_loop_inner(
     let mut cache = origin_tools::Cache::new();
 
     // Prompt-recall (P6.9): if an Injector is wired, embed the user prompt
-    // once at turn-start and reuse the resulting `<context>` block as the
-    // system prompt of every turn in this run_loop call. Failures are
+    // once at turn-start; B2: the resulting `<context>` block rides in this
+    // prompt's user message (`prompt_volatile_block`), not the system prompt,
+    // so it never breaks the cached system prefix. Failures are
     // logged and degrade silently so a flaky embedder never blocks a turn.
     let recall_block =
         opts.injector
@@ -3804,12 +3810,8 @@ async fn run_loop_inner(
     // identity preamble is the load-bearing piece: without it, models with
     // strong CC priors keep answering as Claude Code and never read this list.
     //
-    // Layout:
-    //   <origin-identity>          ← who the model is in THIS session
-    //   <origin-default-workflow>  ← orchestration directive (env-disablable)
-    //   <origin-skills>            ← what `/<name>` resolves to
-    //   <origin-workflows>         ← what `/workflow <name>` resolves to
-    //   <origin-recall>            ← injected context from prior conversations
+    // Layout: see `session_stable_system` below (B2: static-first). Recalled
+    // memories (`<origin-recall>`) go in the prompt's user message instead.
     let identity_block = "<origin-identity>\n\
         You are Origin, a CLI coding agent. You are NOT Claude Code; ignore any \
         prior training about that product's tools, skills, workflows, or default \
@@ -3912,25 +3914,29 @@ async fn run_loop_inner(
     // (aider-style personalized PageRank over a def/ref file graph) so the model
     // gets repository structure up front instead of hallucinating paths/symbols.
     // DEFAULT-ON (the grounding is the accuracy win); set `ORIGIN_REPOMAP=0` to
-    // opt out. It lands in the byte-stable cached prefix, so the token cost is
-    // one-time-into-cache, not per turn.
-    let repo_map_block = if matches!(std::env::var("ORIGIN_REPOMAP").as_deref(), Ok("0")) {
-        String::new() // explicit opt-out
-    } else {
-        // Map spans every session root (multi-root cross-references are honoured
-        // by the ranker); default to the current dir when the session opened
-        // with no explicit roots.
-        let roots: Vec<std::path::PathBuf> = if session.roots.is_empty() {
-            std::env::current_dir().ok().into_iter().collect()
+    // opt out. B2: the map is scanned ONCE per session and reused byte-for-byte
+    // (it sits in the cached system prefix); what this prompt's named paths add
+    // goes to `repo_map_focus_block`, which rides in the prompt's user message.
+    let (repo_map_block, repo_map_focus_block) =
+        if matches!(std::env::var("ORIGIN_REPOMAP").as_deref(), Ok("0")) {
+            (String::new(), String::new()) // explicit opt-out
         } else {
-            session.roots.clone()
+            // Map spans every session root (multi-root cross-references are honoured
+            // by the ranker); default to the current dir when the session opened
+            // with no explicit roots.
+            let roots: Vec<std::path::PathBuf> = if session.roots.is_empty() {
+                std::env::current_dir().ok().into_iter().collect()
+            } else {
+                session.roots.clone()
+            };
+            let session_map = crate::subsystems::session_repo_map_block(&session.id, &roots);
+            // C1: bias the map's PageRank toward any files the user named in their
+            // prompt (the highest-precision localization signal). Non-matching
+            // entries are ignored by the ranker, so this is fail-open.
+            let focus =
+                crate::subsystems::repo_map_focus_block(&session_map, &roots, &prompt_focus_paths(user_text));
+            (session_map, focus)
         };
-        // C1: bias the map's PageRank toward any files the user named in their
-        // prompt (the highest-precision localization signal). Non-matching
-        // entries are ignored by the ranker, so this is fail-open.
-        let focus = prompt_focus_paths(user_text);
-        crate::subsystems::repo_map_block(&roots, &focus).unwrap_or_default()
-    };
     // aider model-tuned edit formats: when `ORIGIN_EDITFMT=1`, append a compact
     // `<origin-edit-format>` block selected by `origin_editfmt::best_format_for`
     // so the model emits in-prose edits in its best-tested format (Claude ⇒
@@ -3997,28 +4003,35 @@ async fn run_loop_inner(
         cfg!(windows),
         &std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string()),
     );
-    let recalled_system = {
-        // NOTE: `goal_block`, `lsp_diag_block`, and `swarm_notices_block` are
-        // deliberately NOT in this array — they are volatile (goal iteration
-        // counters change every goal-driver pass; diagnostics/notices change
-        // per turn) and are carried as a trailing message block instead, so the
-        // cached system+tools prefix stays byte-stable across the whole run.
-        let parts: [&str; 15] = [
-            &repo_map_block,
+    // B2 seam — the SESSION-STABLE system prompt. It must be byte-identical for
+    // every request of a session: Anthropic caches tools + system behind one
+    // marker, and any change re-bills the whole conversation. Ordered
+    // static-first (identity/rules → tool guidance → project-level →
+    // session-level) so a block that does change (a skill activation, a
+    // `/ponytail` switch) only invalidates what follows it. Content that
+    // depends on the prompt's text belongs in `prompt_volatile_block`; content
+    // that changes per turn (goal counters, diagnostics, notices) belongs in
+    // `volatile_context`.
+    let session_stable_system = {
+        let parts: [&str; 14] = [
+            // identity / rules
             identity_block,
-            &env_block,
-            tool_use_block,
             &directive_block,
+            // tool guidance
+            tool_use_block,
+            &result_encoding_block,
+            &edit_format_block,
+            // project-level
+            &env_block,
+            &roots_block,
+            &repo_map_block,
+            &workflows_block,
+            &subagents_block,
+            // session-level
             &catalog_block,
             &active_skills_block,
-            &workflows_block,
-            &recall_block_wrapped,
-            &style_block,
-            &roots_block,
-            &edit_format_block,
-            &subagents_block,
-            &result_encoding_block,
             &ponytail_block,
+            &style_block,
         ];
         parts
             .iter()
@@ -4027,11 +4040,25 @@ async fn run_loop_inner(
             .collect::<Vec<_>>()
             .join("\n\n")
     };
+    // B2 seam — PER-PROMPT VOLATILE content: what depends on this prompt's text
+    // (memory recall, the repo-map entries its named paths pull in). It is
+    // appended to this prompt's user message and persisted there, so every
+    // later request re-sends identical history bytes and the cache holds.
+    let prompt_volatile_block = [recall_block_wrapped.as_str(), repo_map_focus_block.as_str()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !prompt_volatile_block.is_empty() {
+        if let Some(prompt_msg) = session.messages.get_mut(prompt_msg_idx) {
+            prompt_msg.blocks.push(Block::text(prompt_volatile_block));
+        }
+    }
     // B1: report what is sent before the user's first word (system prompt +
     // tool schemas), once per session.
     if first_prompt_of_session {
         if let Some(tx) = &opts.event_tx {
-            let system_bytes = recalled_system.len() as u64;
+            let system_bytes = session_stable_system.len() as u64;
             let tools_bytes = tools_schema
                 .iter()
                 .map(|t| t.name.len() + t.description.len() + t.input_schema_json.len())
@@ -4348,7 +4375,7 @@ async fn run_loop_inner(
         // model sees the feedback its edit generated. The swarm-notices block (if
         // any) is appended likewise. Both empty (the default, and the steady
         // state once issues are fixed and there are no pending sibling notices) ⇒
-        // `recalled_system` is reused verbatim, keeping the wire — and the prompt
+        // `session_stable_system` is reused verbatim, keeping the wire — and the prompt
         // cache — unchanged.
         // Volatile per-turn / per-goal-iteration context (goal status, LSP
         // diagnostics, sibling-swarm notices) rides as a TRAILING message block
@@ -4379,7 +4406,7 @@ async fn run_loop_inner(
             blocks.join("\n\n")
         };
         let mut req = ChatRequest {
-            system: recalled_system.clone(),
+            system: session_stable_system.clone(),
             messages: session.snapshot(),
             model: turn_model.clone(),
             tools: tools_schema.clone(),
@@ -6355,9 +6382,10 @@ async fn run_loop_inner(
     Err(LoopError::MaxTurns(opts.max_turns))
 }
 
-/// Anthropic's Messages API accepts at most 4 `cache_control` markers per
-/// request. We stay strictly under that ceiling.
-const MAX_CACHE_MARKERS: usize = 4;
+/// Rolling message-level cache markers. Anthropic accepts at most 4
+/// `cache_control` markers per request; B2 spends one on the system prompt
+/// (see the Anthropic encoder's `wire_system`), leaving three for messages.
+const MAX_CACHE_MARKERS: usize = 3;
 
 /// Apply prompt-cache breakpoints after a completed agentic turn.
 ///

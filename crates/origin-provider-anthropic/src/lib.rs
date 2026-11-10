@@ -211,7 +211,6 @@ impl Anthropic {
         // the provider, so it applies to every provider alike.
         let expanded = origin_provider::inflate_tool_result_handles(&req.messages, self.cas.as_ref())?;
         let plan = self.plan.as_ref();
-        let wire_messages = build_wire_messages(&expanded, plan);
         let wire_tools = req
             .tools
             .iter()
@@ -230,6 +229,7 @@ impl Anthropic {
         } else {
             req.system.clone()
         };
+        let wire_messages = build_wire_messages(&expanded, plan, message_marker_budget(&system_text));
 
         let body = wire::WireRequest {
             model: &req.model,
@@ -237,11 +237,7 @@ impl Anthropic {
             // (Anthropic requires `max_tokens` > `budget_tokens`); otherwise
             // unchanged at `DEFAULT_MAX_TOKENS` ⇒ byte-identical default.
             max_tokens: resolve_max_tokens(req.thinking_tokens),
-            system: if system_text.is_empty() {
-                None
-            } else {
-                Some(system_text.as_str())
-            },
+            system: wire_system(&system_text),
             messages: wire_messages,
             tools: wire_tools,
             metadata: self.oauth_metadata.as_ref().map(|m| wire::WireMetadata {
@@ -327,7 +323,6 @@ impl Provider for Anthropic {
     async fn chat_stream(&self, req: ChatRequest, ring: &origin_stream::Ring) -> Result<(), ProviderError> {
         let expanded = origin_provider::inflate_tool_result_handles(&req.messages, self.cas.as_ref())?;
         let plan = self.plan.as_ref();
-        let wire_messages = build_wire_messages(&expanded, plan);
         let wire_tools = req
             .tools
             .iter()
@@ -346,6 +341,7 @@ impl Provider for Anthropic {
         } else {
             req.system.clone()
         };
+        let wire_messages = build_wire_messages(&expanded, plan, message_marker_budget(&system_text));
 
         let mut body_json = serde_json::json!({
             "model": req.model,
@@ -353,11 +349,7 @@ impl Provider for Anthropic {
             // (Anthropic requires `max_tokens` > `budget_tokens`); otherwise
             // unchanged at `DEFAULT_MAX_TOKENS` ⇒ byte-identical default.
             "max_tokens": resolve_max_tokens(req.thinking_tokens),
-            "system": if system_text.is_empty() {
-                serde_json::Value::Null
-            } else {
-                serde_json::Value::String(system_text)
-            },
+            "system": wire_system(&system_text),
             "messages": wire_messages,
             "tools": wire_tools,
             "stream": true,
@@ -590,10 +582,39 @@ mod transient_tests {
 /// Anthropic's Messages API rejects any request carrying more than this many
 /// blocks with `cache_control` (`invalid_request_error: "A maximum of 4 blocks
 /// with cache_control may be provided."`). The ceiling spans the WHOLE request
-/// (tools + system + messages); in this encoder `system` is a plain string and
-/// `WireTool` carries no marker, so every marker lives on a message block and
-/// this is the only place the budget is spent.
+/// (tools + system + messages). `WireTool` carries no marker; a non-empty
+/// `system` carries exactly one ([`wire_system`]), and the messages get the
+/// rest ([`message_marker_budget`]).
 const WIRE_MAX_CACHE_MARKERS: usize = 4;
+
+/// B2: encode `system` as a one-block array whose block carries a
+/// `cache_control` marker, so the tools + system prefix is written to the
+/// cache from a session's very first request (which has no tool-result marker
+/// yet). The daemon keeps that text session-stable, so later requests read it.
+/// Under `ORIGIN_CACHE_TTL_1H=1` it takes the 1h TTL: it is the earliest
+/// breakpoint, and a longer-TTL breakpoint must not follow a shorter one.
+fn wire_system(text: &str) -> Option<Vec<wire::WireBlock<'_>>> {
+    (!text.is_empty()).then(|| {
+        vec![wire::WireBlock::Text {
+            text,
+            cache_control: Some(if ttl_1h_enabled() {
+                wire::WireCacheControl::ephemeral_1h()
+            } else {
+                wire::WireCacheControl::ephemeral()
+            }),
+        }]
+    })
+}
+
+/// How many `cache_control` markers the messages may carry: the request-wide
+/// ceiling minus the one [`wire_system`] spends on a non-empty system prompt.
+const fn message_marker_budget(system_text: &str) -> usize {
+    if system_text.is_empty() {
+        WIRE_MAX_CACHE_MARKERS
+    } else {
+        WIRE_MAX_CACHE_MARKERS - 1
+    }
+}
 
 /// Block indices within message `m` (at `msg_idx`) that any emission path would
 /// flag with `cache_control`, BEFORE the per-request ceiling is applied. Three
@@ -642,7 +663,11 @@ fn marker_block_indices(m: &Message, plan: Option<&Plan>, msg_idx: usize) -> Vec
 /// was dropped by `strip_orphan_tool_results`). Without this clamp such a drift
 /// is fatal: the API 400s the entire turn with `"A maximum of 4 blocks with
 /// cache_control may be provided. Found 5."`.
-fn build_wire_messages<'a>(messages: &'a [Message], plan: Option<&Plan>) -> Vec<wire::WireMessage<'a>> {
+fn build_wire_messages<'a>(
+    messages: &'a [Message],
+    plan: Option<&Plan>,
+    max_markers: usize,
+) -> Vec<wire::WireMessage<'a>> {
     // Pass 1: collect every (msg_idx, block_idx) any path would mark, in
     // document order (ascending msg_idx, then block_idx).
     let selected: Vec<(usize, usize)> = messages
@@ -658,21 +683,17 @@ fn build_wire_messages<'a>(messages: &'a [Message], plan: Option<&Plan>) -> Vec<
     // Clamp to the ceiling, keeping the LATEST markers: Anthropic's prompt cache
     // hits on prefix-extension, so a newer marker amortizes across more
     // subsequent turns than an older one. Since `selected` is in document order,
-    // the last `WIRE_MAX_CACHE_MARKERS` entries are the latest.
-    if selected.len() > WIRE_MAX_CACHE_MARKERS {
+    // the last `max_markers` entries are the latest.
+    if selected.len() > max_markers {
         tracing::warn!(
             selected = selected.len(),
-            kept = WIRE_MAX_CACHE_MARKERS,
+            kept = max_markers,
             "cache_control marker selection exceeded Anthropic's per-request ceiling; \
              keeping the latest and dropping the earliest to avoid a 400"
         );
     }
-    let keep: std::collections::HashSet<(usize, usize)> = selected
-        .iter()
-        .rev()
-        .take(WIRE_MAX_CACHE_MARKERS)
-        .copied()
-        .collect();
+    let keep: std::collections::HashSet<(usize, usize)> =
+        selected.iter().rev().take(max_markers).copied().collect();
 
     // Pass 2: serialize, emitting `cache_control` only on the kept positions.
     // Drop any message whose content serialized to empty — e.g. a thinking-only
@@ -1008,7 +1029,7 @@ fn encode_request_body_for_test(req: &ChatRequest, plan: Option<&Plan>) -> serde
     // places cache markers on — including any index shift from a dropped turn.
     let expanded = origin_provider::inflate_tool_result_handles(&req.messages, None)
         .expect("test requests carry no CAS handles, so expansion cannot fail");
-    let wire_messages = build_wire_messages(&expanded, plan);
+    let wire_messages = build_wire_messages(&expanded, plan, message_marker_budget(&req.system));
     let wire_tools = req
         .tools
         .iter()
@@ -1021,11 +1042,7 @@ fn encode_request_body_for_test(req: &ChatRequest, plan: Option<&Plan>) -> serde
     let body = wire::WireRequest {
         model: &req.model,
         max_tokens: resolve_max_tokens(req.thinking_tokens),
-        system: if req.system.is_empty() {
-            None
-        } else {
-            Some(req.system.as_str())
-        },
+        system: wire_system(&req.system),
         messages: wire_messages,
         tools: wire_tools,
         metadata: None,

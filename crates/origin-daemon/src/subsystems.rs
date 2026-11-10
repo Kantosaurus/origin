@@ -160,6 +160,61 @@ pub fn repo_map_block(roots: &[std::path::PathBuf], focus: &[String]) -> Option<
     Some(out)
 }
 
+/// B2: the session's unfocused `<repo-map>` block, scanned once per session id.
+///
+/// Reused byte-for-byte afterwards, so edits made during the session never
+/// change the cached system prefix. Empty when nothing ranks. A new session
+/// (or a daemon restart) rescans.
+#[must_use]
+pub fn session_repo_map_block(session_id: &str, roots: &[std::path::PathBuf]) -> String {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+    // ponytail: process-wide and never evicted (one ≤1k-token string per
+    // session id); evict on session removal if a daemon ever hosts thousands.
+    static MAPS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let maps = MAPS.get_or_init(Mutex::default);
+    if let Some(map) = maps
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(session_id)
+    {
+        return map.clone();
+    }
+    // Scan outside the lock; if two prompts race, the first insert wins.
+    let map = repo_map_block(roots, &[]).unwrap_or_default();
+    maps.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(session_id.to_string())
+        .or_insert(map)
+        .clone()
+}
+
+/// B2: the `<repo-map-focus>` block for the paths a prompt names.
+///
+/// Holds the focused-map entries `session_map` lacks — new files, or files
+/// whose symbols changed. Goes in that prompt's user message, never the system
+/// prompt. Empty when the prompt names no path or the focused map adds nothing.
+#[must_use]
+pub fn repo_map_focus_block(session_map: &str, roots: &[std::path::PathBuf], focus: &[String]) -> String {
+    if focus.is_empty() {
+        return String::new();
+    }
+    let Some(focused) = repo_map_block(roots, focus) else {
+        return String::new();
+    };
+    let fresh: Vec<&str> = focused
+        .lines()
+        .filter(|l| l.starts_with("- ") && !session_map.lines().any(|s| s == *l))
+        .collect();
+    if fresh.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<repo-map-focus>\nFiles relevant to this prompt, beyond the session <repo-map>:\n{}\n</repo-map-focus>",
+        fresh.join("\n")
+    )
+}
+
 /// Render a `<repo-map>` block with one labelled section per workspace root.
 ///
 /// Each root is ranked INDEPENDENTLY via [`origin_repomap::build_map_per_root`]

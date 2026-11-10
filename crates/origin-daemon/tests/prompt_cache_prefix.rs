@@ -96,7 +96,6 @@ fn anthropic_prefix(req: &ChatRequest) -> (String, String) {
 }
 
 #[tokio::test]
-#[ignore = "fails until B2 (Task 10) makes the system prompt session-stable"]
 async fn tools_and_system_bytes_identical_across_two_prompts() {
     let dir = workspace();
     let provider = recording();
@@ -128,6 +127,71 @@ async fn tools_and_system_bytes_identical_across_two_prompts() {
     assert!(tools0.len() > 2, "tools must be advertised");
     assert_same_bytes("tools", &tools0, &tools1);
     assert_same_bytes("system", &system0, &system1);
+}
+
+#[tokio::test]
+async fn edit_between_prompts_leaves_system_bytes_and_marks_the_first_request() {
+    let dir = workspace();
+    let provider = recording();
+    let mut session = session_in(&dir);
+    let opts = opts();
+    run_loop(&mut session, "hi", &provider, &AlwaysAllow, &opts)
+        .await
+        .unwrap();
+    // An edit that re-ranks the map: a new, heavily-referenced file.
+    std::fs::write(
+        dir.path().join("src").join("hub.rs"),
+        "pub fn hub_fn() { crate::leaf::lonely_leaf(); crate::leaf::other_leaf(); }\n",
+    )
+    .unwrap();
+    run_loop(
+        &mut session,
+        "what does src/hub.rs do?",
+        &provider,
+        &AlwaysAllow,
+        &opts,
+    )
+    .await
+    .unwrap();
+
+    let reqs = provider.requests.lock().unwrap().clone();
+    let (_, system0) = anthropic_prefix(&reqs[0]);
+    let (_, system1) = anthropic_prefix(&reqs[1]);
+    assert_same_bytes("system", &system0, &system1);
+    assert!(
+        !reqs[1].system.contains("hub.rs"),
+        "the session map is not re-scanned"
+    );
+
+    // The prompt-focused map entry rides in that prompt's user message, and
+    // stays there (persisted) so later requests keep the same history bytes.
+    let prompt_msg = session
+        .messages
+        .iter()
+        .filter(|m| matches!(m.role, Role::User))
+        .find(|m| {
+            m.blocks
+                .iter()
+                .any(|b| matches!(b, Block::Text { text, .. } if text.contains("src/hub.rs do")))
+        })
+        .expect("second prompt in the session");
+    assert!(
+        prompt_msg
+            .blocks
+            .iter()
+            .any(|b| matches!(b, Block::Text { text, .. } if text.contains("<repo-map-focus>") && text.contains("- src/hub.rs: hub_fn"))),
+        "focused map entry must ride in the prompt's user message: {prompt_msg:?}"
+    );
+
+    // The very first request of the session already carries a cache marker
+    // (on the system block), and no request exceeds Anthropic's 4 breakpoints.
+    for req in &reqs {
+        let body = origin_provider_anthropic::encode_request_for_test(req);
+        let system = body["system"].as_array().expect("system is a block array");
+        assert!(system.last().unwrap().get("cache_control").is_some());
+        let markers = body.to_string().matches("\"cache_control\"").count();
+        assert!((1..=4).contains(&markers), "{markers} cache_control markers");
+    }
 }
 
 /// Byte equality with a readable failure: the first differing offset and the

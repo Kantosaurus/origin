@@ -88,6 +88,42 @@ fn request_never_emits_more_than_four_cache_control_markers() {
     );
 }
 
+/// B2: `system` is sent as a block array whose last block carries a marker, so
+/// even a session's first request (no tool results yet) writes the tools +
+/// system prefix to the cache.
+#[test]
+fn system_is_a_marked_block_array_on_the_first_request() {
+    let req = ChatRequest {
+        system: "you are origin".into(),
+        messages: vec![user_text("first prompt")],
+        model: "claude".into(),
+        ..ChatRequest::default()
+    };
+    let body = origin_provider_anthropic::encode_request_for_test(&req);
+    assert_eq!(
+        body["system"],
+        serde_json::json!([{ "type": "text", "text": "you are origin", "cache_control": { "type": "ephemeral" } }]),
+    );
+}
+
+/// B2: with the system marker spending one breakpoint, the messages get at
+/// most three, so the WHOLE request never exceeds Anthropic's four.
+#[test]
+fn system_marker_counts_against_the_four_marker_ceiling() {
+    let plan = Plan::default();
+    plan.set_dynamic_message_markers(vec![0, 1, 2, 3, 4, 5]);
+    let req = ChatRequest {
+        system: "you are origin".into(),
+        messages: (0..6).map(|i| user_text(&format!("m{i}"))).collect(),
+        model: "claude".into(),
+        ..ChatRequest::default()
+    };
+    let body = encode_request_with_plan_for_test(&req, &plan);
+    let total = body.to_string().matches("\"cache_control\"").count();
+    assert_eq!(total, 4, "system + three latest messages: {body}");
+    assert_eq!(marked_message_indices(&body), vec![3, 4, 5]);
+}
+
 #[test]
 fn strip_dropping_a_turn_does_not_overflow_the_ceiling() {
     // Faithful reproduction of the production 400. The daemon marked the latest
