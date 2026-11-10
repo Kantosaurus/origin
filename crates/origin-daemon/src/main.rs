@@ -497,6 +497,27 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
         warn!("memory subsystem disabled (store init failed)");
     }
 
+    // Optional governance config (5-tier policy engine + per-prompt ConSeca
+    // security policy). Loaded once at startup from `governance.toml`. When the
+    // file is absent both handles are `None` ⇒ the deny-only overlay is inert
+    // and daemon behavior is byte-identical to before this wiring landed.
+    // Loaded before the swarm coordinator so sub-agents inherit it (A4).
+    let governance: Governance = {
+        let path = governance_path();
+        match load_governance(&path) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "governance config load failed; running with no governance overlay");
+                Governance::default()
+            }
+        }
+    };
+    info!(
+        policy = governance.policy.is_some(),
+        conseca = governance.conseca.is_some(),
+        "governance config loaded at startup"
+    );
+
     // Swarm coordinator (P9.6). We open a dedicated SqlStore for the plan op-log
     // so the plan tables are isolated from the session-store connection.
     // `PlanStore::open` is currently infallible (returns `Ok(Self)` always) so
@@ -553,6 +574,7 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
             // wire-encoder); each sub-agent forks a session-isolated view that
             // shares the content-addressed handle bands (prefix-cache inheritance).
             wire_plan.clone(),
+            governance.clone(),
         ));
         Arc::new(coord)
     };
@@ -600,26 +622,6 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     info!(
         workflow_count = workflows_catalog.workflows.len(),
         "workflows catalog loaded at startup"
-    );
-
-    // Optional governance config (5-tier policy engine + per-prompt ConSeca
-    // security policy). Loaded once at startup from `governance.toml`. When the
-    // file is absent both handles are `None` ⇒ the deny-only overlay is inert
-    // and daemon behavior is byte-identical to before this wiring landed.
-    let governance: Governance = {
-        let path = governance_path();
-        match load_governance(&path) {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::warn!(error = %e, path = %path.display(), "governance config load failed; running with no governance overlay");
-                Governance::default()
-            }
-        }
-    };
-    info!(
-        policy = governance.policy.is_some(),
-        conseca = governance.conseca.is_some(),
-        "governance config loaded at startup"
     );
 
     spawn_idle_consolidator(memory.as_ref());

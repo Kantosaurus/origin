@@ -277,8 +277,9 @@ crate::origin_tool! {
     name: "Task",
     description: "Dispatch a sub-agent (swarm worker) with a goal, allowed tools, and budget; it runs CONCURRENTLY in the background and returns a structured CompletionReport summary. By default (`background:true`) the dispatch returns immediately so you stay responsive — the sub-agent's result is delivered automatically at the start of your next turn (a `<background-results>` block), or gather it on demand with `CollectTasks`. Set `background:false` only when you must have the result WITHIN this turn. Prefer this to parallelize independent units of work — spawn several at once. No permission prompt is required; the sub-agent is confined to the `allowed_tools` you grant it.",
     // AutoAllowed: spawning a swarm worker never prompts. The child is confined
-    // to the `allowed_tools` allow-list the parent grants, and any governance /
-    // conseca deny overlay still applies — so removing the parent-side prompt is
+    // to the `allowed_tools` allow-list the parent grants, and the child inherits
+    // the daemon's governance / conseca / permission-rule deny overlays (A4, see
+    // `origin_daemon::swarm_worker::real_worker`) — so removing the parent-side prompt is
     // safe while making swarm delegation friction-free (always-on swarm).
     tier: crate::Tier::AutoAllowed,
     urgency: crate::Urgency::Medium,

@@ -203,23 +203,29 @@ impl Prompter for AllowList {
 /// Installed once at startup via `Coordinator::set_default_worker`. Each spawned
 /// worker snapshots the provider, runs a bounded agent loop for its goal, and
 /// returns a structured report.
+///
+/// `governance` is the same daemon-wide `governance.toml` overlay every parent
+/// loop runs under; each worker inherits it (A4) so a sub-agent is never more
+/// privileged than the agent that spawned it.
 #[must_use]
 pub fn real_worker(
     active: ActiveProvider,
     cas: Arc<CasStore>,
     vault: KeyVault,
     plan: origin_planner::Plan,
+    governance: crate::config::Governance,
 ) -> WorkerFn {
     Arc::new(move |ctx: WorkerContext| {
         let active = Arc::clone(&active);
         let cas = Arc::clone(&cas);
         let vault = vault.clone();
+        let governance = governance.clone();
         // The daemon's process-wide cache-band `Plan` (shared with the provider
         // wire-encoder). Each worker forks a session-isolated view sharing the
         // content-addressed handle bands (sub-agent prefix-cache inheritance).
         let plan = plan.clone();
         // Heap-box the (large) worker future to keep the closure's stack small.
-        Box::pin(async move { Box::pin(run_worker(active, cas, vault, plan, ctx)).await })
+        Box::pin(async move { Box::pin(run_worker(active, cas, vault, plan, governance, ctx)).await })
     })
 }
 
@@ -286,6 +292,7 @@ async fn run_worker(
     cas: Arc<CasStore>,
     vault: KeyVault,
     plan: origin_planner::Plan,
+    governance: crate::config::Governance,
     mut ctx: WorkerContext,
 ) -> Result<CompletionReport, origin_swarm::SwarmError> {
     let provider = active.read().await.clone();
@@ -348,6 +355,17 @@ async fn run_worker(
         // is a delegated sub-task. Resolved once here; `None` (no config / gate
         // off / unknown ecosystem) ⇒ byte-identical to before.
         post_edit: worker_post_edit(),
+        // A4: inherit the parent's deny-only governance overlays (policy layers,
+        // conseca tool/path/domain lists, `[[permission_rules]]`, browser cap) so
+        // the worker can never do what its parent may not. `read_only` stays
+        // false: a plan-mode parent cannot dispatch a worker at all (`Task` and
+        // `RunWorkflow` are Mutating, so the read-only overlay denies them).
+        // ponytail: browser cap is per worker run (fresh count), not shared with
+        // the parent's; share a counter via the spawn path if that matters.
+        policy: governance.policy,
+        conseca: governance.conseca,
+        permission_rules: governance.permission_rules,
+        browser_rate_limit: governance.browser_max_actions,
         ..Default::default()
     };
 

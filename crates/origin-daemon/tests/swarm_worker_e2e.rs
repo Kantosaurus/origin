@@ -84,6 +84,7 @@ async fn real_worker_runs_a_subagent_to_completion() {
         Arc::clone(&cas),
         vault,
         wire_plan,
+        origin_daemon::config::Governance::default(),
     ));
 
     let spec = WorkerSpec {
@@ -115,5 +116,79 @@ async fn real_worker_runs_a_subagent_to_completion() {
     assert_eq!(
         report.usage.output_tokens, 7,
         "scripted output tokens must flow through"
+    );
+}
+
+/// A4: a worker inherits its parent's governance. The parent's
+/// `governance.toml` denies `Write`; the worker's own allow-list grants `Write`
+/// (the model chose it) — the deny rule must still win, so the file is never
+/// written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_inherits_parent_deny_rule() {
+    let tmp = TempDir::new().expect("tmp");
+    let store = Arc::new(origin_store::Store::open(tmp.path().join("origin.db")).expect("store"));
+    let cas = Arc::new(open_cas(tmp.path().join("cas")));
+    let plan_store = Arc::new(PlanStore::open(Arc::clone(&store), Arc::clone(&cas)).expect("plan store"));
+    let plan = PlanHandle::new(Arc::new(AsyncMutex::new(Plan::default())), plan_store);
+
+    let gov_path = tmp.path().join("governance.toml");
+    std::fs::write(
+        &gov_path,
+        "[[permission_rules]]\ntool = \"Write\"\nallow = false\n",
+    )
+    .expect("gov");
+    let governance = origin_daemon::config::load_governance(&gov_path).expect("load governance");
+
+    let target = tmp.path().join("escalated.txt");
+    let write = ChatResponse {
+        assistant: Message::new(Role::Assistant).with_block(Block::ToolUse {
+            id: "tu_1".into(),
+            name: "Write".into(),
+            input_json: serde_json::to_vec(
+                &serde_json::json!({"file_path": target.to_string_lossy(), "content": "pwned"}),
+            )
+            .expect("json"),
+            cache_marker: None,
+        }),
+        usage: ProviderUsage::default(),
+    };
+    let done = ChatResponse {
+        assistant: Message::new(Role::Assistant).with_block(Block::text("done")),
+        usage: ProviderUsage::default(),
+    };
+    let active: Arc<RwLock<Arc<dyn Provider>>> = Arc::new(RwLock::new(Arc::new(ScriptedProvider {
+        responses: Mutex::new(vec![write, done]),
+    })));
+
+    let mut coord = Coordinator::new(plan, format!("origin-worker-gov-{}", std::process::id()));
+    coord.set_default_worker(origin_daemon::swarm_worker::real_worker(
+        active,
+        Arc::clone(&cas),
+        origin_keyvault::KeyVault::in_memory(),
+        origin_planner::Plan::default(),
+        governance,
+    ));
+
+    let spec = WorkerSpec {
+        goal: "write a file".into(),
+        allowed_tools: vec!["Write".into()],
+        budget: Budget {
+            max_wall_ms: 5_000,
+            max_input_tokens: 10_000,
+            max_output_tokens: 10_000,
+            max_tool_calls: 4,
+        },
+        workspace: None,
+        parent_actor: origin_plan::ActorId::new(0),
+        model: None,
+        mcp_servers: Vec::new(),
+    };
+    let handle = coord.spawn(spec).await.expect("spawn worker");
+    let _ = coord.await_completion(&handle).await;
+
+    assert!(
+        !target.exists(),
+        "the parent's deny rule must bind the worker: Write ran and created {}",
+        target.display()
     );
 }
