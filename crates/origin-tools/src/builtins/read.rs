@@ -4,6 +4,7 @@
 use crate::error::{ErrClass, ToolError};
 use crate::text_fmt;
 use crate::{SideEffects, Tier, Urgency};
+use std::borrow::Cow;
 use std::fmt::Write as _;
 
 #[allow(clippy::module_name_repetitions)]
@@ -53,8 +54,20 @@ pub fn read_v2(args: ReadArgs) -> Result<String, ToolError> {
 
 /// Byte cap on one text `Read` result, footer included.
 const MAX_READ_BYTES: usize = 100_000;
-/// Lines longer than this many characters are cut and marked.
+/// Lines longer than this many characters are cut and marked (Read rows and Edit diff lines).
 const MAX_LINE_CHARS: usize = 2_000;
+
+/// `line` cut to [`MAX_LINE_CHARS`] chars plus a `… [line truncated: N chars]` marker; unchanged if shorter.
+pub(crate) fn cap_line(line: &str) -> Cow<'_, str> {
+    match line.char_indices().nth(MAX_LINE_CHARS) {
+        Some((cut, _)) => Cow::Owned(format!(
+            "{}\u{2026} [line truncated: {} chars]",
+            &line[..cut],
+            line.chars().count()
+        )),
+        None => Cow::Borrowed(line),
+    }
+}
 /// Room kept under [`MAX_READ_BYTES`] for the continuation footer.
 const FOOTER_RESERVE: usize = 128;
 
@@ -68,14 +81,7 @@ fn read_text(bytes: &[u8], args: &ReadArgs) -> Result<String, ToolError> {
     let mut next = offset;
     for (idx, line) in text.lines().enumerate().skip(offset).take(limit) {
         let line_no = idx + 1;
-        let row = match line.char_indices().nth(MAX_LINE_CHARS) {
-            Some((cut, _)) => format!(
-                "{line_no:>6}\t{}\u{2026} [line truncated: {} chars]\n",
-                &line[..cut],
-                line.chars().count()
-            ),
-            None => format!("{line_no:>6}\t{line}\n"),
-        };
+        let row = format!("{line_no:>6}\t{}\n", cap_line(line));
         // A capped row is ≤ ~8 KB, so the first row always fits: paging always advances.
         if out.len() + row.len() > MAX_READ_BYTES - FOOTER_RESERVE {
             break;
