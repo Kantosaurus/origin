@@ -741,14 +741,9 @@ fn workspace_need(
         "Bash" if sandbox_active => Need::Allow("workspace: Bash under an active OS sandbox"),
         "Bash" if tainted => Need::Person(format!("Bash without an OS sandbox {AFTER_TAINT}")),
         "Bash" => Need::Ask("Bash without an OS sandbox".into()),
-        // A9/A4: the same computation the Task prompt shows. `0/<T> gated
-        // tools, 0 mcp servers` grants only read-only auto-allowed tools.
-        "Task"
-            if task_permission_preview(args)
-                .split(" | ")
-                .next()
-                .is_some_and(|h| h.starts_with("0/") && h.ends_with(" gated tools, 0 mcp servers")) =>
-        {
+        // A9/A4: the same computation the Task prompt shows. No gated tool and
+        // no MCP server reached grants only read-only auto-allowed tools.
+        "Task" if matches!(task_preview_and_reach(args), (_, 0, 0)) => {
             Need::Allow("workspace: read-only Task")
         }
         _ if matches!(meta.tier, origin_tools::Tier::AutoAllowed) => Need::Allow("tier=AutoAllowed"),
@@ -1058,8 +1053,10 @@ fn cmd_guard_ask_preview(
 ///
 /// The prompt is shown on at most a few rows and cut, so the total reach comes
 /// first, where nothing can pad it away:
-/// `<G>/<T> gated tools, <D> mcp servers | mcp: <names> | grants: <entries> | other: <entries> | goal: <goal>`
-/// (`T` gated registry tools, `G` of them reached by some entry, `D` distinct servers).
+/// `<G>/<T> gated tools (<tools>), <D> mcp servers | mcp: <names> | grants: <entries> | other: <entries> | goal: <goal>`
+/// (`T` gated registry tools, `G` of them reached by some entry, named in
+/// registry order — `(all)` when `G == T`, omitted when `G == 0` — and `D`
+/// distinct servers).
 /// Each `allowed_tools` entry is classified by what it GRANTS, using the worker's
 /// own matcher (`swarm_worker::allow_entry_glob`): it is a grant if it matches a
 /// gated (not read-only) registry tool, could match an MCP tool name
@@ -1070,6 +1067,13 @@ fn cmd_guard_ask_preview(
 /// model-chosen value is escaped (`escape_debug`: no raw control chars), quoted so
 /// it can never fake a separator, and capped (names 32 chars, goal 200).
 pub(crate) fn task_permission_preview(args: &Value) -> String {
+    task_preview_and_reach(args).0
+}
+
+/// [`task_permission_preview`] with its computed `G` (gated tools reached)
+/// and `D` (distinct MCP servers).
+#[allow(clippy::too_many_lines)] // one linear rendering; its helpers are closures over `args`
+fn task_preview_and_reach(args: &Value) -> (String, usize, usize) {
     /// Distinct items in first-seen order, with their repeat counts.
     fn collapse<'a>(items: impl Iterator<Item = &'a str>) -> Vec<(&'a str, usize)> {
         let mut out: Vec<(&str, usize)> = Vec::new();
@@ -1163,8 +1167,15 @@ pub(crate) fn task_permission_preview(args: &Value) -> String {
     granted.sort_by_key(|&(_, _, reach)| std::cmp::Reverse(reach)); // stable: broadest first
     let granted: Vec<(&str, usize)> = granted.into_iter().map(|(t, k, _)| (t, k)).collect();
     let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
-    format!(
-        "{}/{} gated tools, {} mcp servers | mcp: {} | grants: {} | other: {} | goal: {}",
+    // Registry names, never model text: nothing the model chose can pad them away.
+    let names: Vec<&str> = gated.iter().copied().filter(|n| reached.contains(n)).collect();
+    let names = match names.len() {
+        0 => String::new(),
+        g if g == gated.len() => " (all)".to_owned(),
+        _ => format!(" ({})", names.join(", ")),
+    };
+    let preview = format!(
+        "{}/{} gated tools{names}, {} mcp servers | mcp: {} | grants: {} | other: {} | goal: {}",
         reached.len(),
         gated.len(),
         servers.len(),
@@ -1172,7 +1183,8 @@ pub(crate) fn task_permission_preview(args: &Value) -> String {
         list(&granted, usize::MAX),
         list(&other, 3),
         shown(goal, 200)
-    )
+    );
+    (preview, reached.len(), servers.len())
 }
 
 #[cfg(test)]
@@ -1187,14 +1199,18 @@ mod task_preview_tests {
         });
         let p = super::task_permission_preview(&args);
         let t = gated_total();
+        let names = in_registry_order(&["Edit", "MultiEdit", "Write", "Bash"]);
         assert!(
             p.starts_with(&format!(
-                "4/{t} gated tools, 1 mcp servers | mcp: \"github\" | grants: "
+                "4/{t} gated tools ({names}), 1 mcp servers | mcp: \"github\" | grants: "
             )),
             "{p}"
         );
         let head: String = p.chars().take(120).collect();
-        assert!(head.contains("\"Bash\""), "Bash must survive a 120-col cut: {p}");
+        assert!(
+            head.contains(&format!("({names})")),
+            "Bash must survive a 120-col cut: {p}"
+        );
         let (mcp, goal) = (
             p.find("\"github\"").expect("mcp"),
             p.find("refactor").expect("goal"),
@@ -1231,6 +1247,35 @@ mod task_preview_tests {
             .count()
     }
 
+    /// `names` as the preview lists them: registry order, comma-joined.
+    fn in_registry_order(names: &[&str]) -> String {
+        super::registry_iter()
+            .map(|m| m.name)
+            .filter(|n| names.contains(n))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// A4: the gated tools a delegation reaches are named in the count, from
+    /// the registry, so padding patterns cannot push them past the cut.
+    #[test]
+    fn task_preview_names_the_reached_gated_tools_before_any_cut() {
+        let mut tools: Vec<String> = (1..=8)
+            .map(|n| format!("{{Edit,Edit_long_padding_alternative_number_{n}}}"))
+            .collect();
+        tools.push("Bash".into());
+        let tools: Vec<&str> = tools.iter().map(String::as_str).collect();
+        let p = preview(&tools, &[]);
+        let head: String = p.chars().take(80).collect();
+        let names = in_registry_order(&["Bash", "Edit"]);
+        assert_eq!(names.len(), "Bash, Edit".len());
+        assert!(head.contains(&format!("({names})")), "{p}");
+        assert!(
+            !head.contains("\"Bash\""),
+            "the grants list alone would hide it: {p}"
+        );
+    }
+
     fn docs_patterns() -> Vec<String> {
         (1..=9)
             .map(|n| format!("mcp__docs__get_page_{n}_summary_*"))
@@ -1245,7 +1290,7 @@ mod task_preview_tests {
         let p = preview(&tools, &["docs"]);
         let t = gated_total();
         assert!(
-            p.starts_with(&format!("{t}/{t} gated tools, 1 mcp servers")),
+            p.starts_with(&format!("{t}/{t} gated tools (all), 1 mcp servers")),
             "{p}"
         );
         let at = p.find("grants: ").expect("grants") + "grants: ".len();
@@ -1259,7 +1304,10 @@ mod task_preview_tests {
         let tools: Vec<&str> = tools.iter().map(String::as_str).collect();
         let p = preview(&tools, &["docs"]);
         let t = gated_total();
-        assert!(p.starts_with(&format!("1/{t} gated tools, 1 mcp servers")), "{p}");
+        assert!(
+            p.starts_with(&format!("1/{t} gated tools (Bash), 1 mcp servers")),
+            "{p}"
+        );
         assert!(seg(&p, "grants").starts_with("\"Bash\", "), "{p}");
     }
 
@@ -1354,13 +1402,13 @@ mod task_preview_tests {
         let t = gated_total();
         assert!(
             p.starts_with(&format!(
-                "1/{t} gated tools, 1 mcp servers | mcp: \"github\" | grants: \"Bash\" | "
+                "1/{t} gated tools (Bash), 1 mcp servers | mcp: \"github\" | grants: \"Bash\" | "
             )),
             "{p}"
         );
         assert_eq!(
             outside_quotes(&p),
-            format!("1/{t} gated tools, 1 mcp servers | mcp: Q | grants: Q | other: Q | goal: Q"),
+            format!("1/{t} gated tools (Bash), 1 mcp servers | mcp: Q | grants: Q | other: Q | goal: Q"),
             "separators may appear only inside quoted names: {p}"
         );
     }
