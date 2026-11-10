@@ -175,19 +175,30 @@ pub fn best_format_for(model: &str) -> EditFormat {
 
 /// C7: the edit format a session's edit tools are advertised for.
 ///
-/// `editfmt_env` is the value of `ORIGIN_EDITFMT` and wins over the table:
-/// `0` bypasses the table ([`EditFormat::SearchReplace`], the full edit-tool
-/// set), and a format name (`search-replace`, `diff-fenced`, `whole-file`,
-/// `udiff`) forces that format. Unset, `1` or anything else ⇒
-/// [`best_format_for`] `model`.
+/// `editfmt_env` is the value of `ORIGIN_EDITFMT`; a [`forced_format`] wins
+/// over the table. Unset, `1` or an unrecognised value ⇒ [`best_format_for`]
+/// `model`.
 #[must_use]
 pub fn session_format(model: &str, editfmt_env: Option<&str>) -> EditFormat {
-    match editfmt_env {
-        Some("0" | "search-replace") => EditFormat::SearchReplace,
-        Some("diff-fenced") => EditFormat::DiffFenced,
-        Some("whole-file") => EditFormat::WholeFile,
-        Some("udiff") => EditFormat::Udiff,
-        _ => best_format_for(model),
+    editfmt_env
+        .and_then(forced_format)
+        .unwrap_or_else(|| best_format_for(model))
+}
+
+/// C7: the format an `ORIGIN_EDITFMT` value forces, if any.
+///
+/// Matched ASCII-case-insensitively: `0`/`off`/`false` bypass the table ([`EditFormat::SearchReplace`], the full
+/// edit-tool set); a format name (`search-replace`, `diff-fenced`,
+/// `whole-file`, `udiff`) forces that format. `None` for `1` (use the table)
+/// and for anything unrecognised.
+#[must_use]
+pub fn forced_format(value: &str) -> Option<EditFormat> {
+    match value.to_ascii_lowercase().as_str() {
+        "0" | "off" | "false" | "search-replace" => Some(EditFormat::SearchReplace),
+        "diff-fenced" => Some(EditFormat::DiffFenced),
+        "whole-file" => Some(EditFormat::WholeFile),
+        "udiff" => Some(EditFormat::Udiff),
+        _ => None,
     }
 }
 
@@ -626,6 +637,29 @@ mod tests {
             EditFormat::WholeFile
         );
         assert_eq!(session_format("claude-opus-4", Some("udiff")), EditFormat::Udiff);
+        // Case-insensitive; `off`/`false` mean `0`; garbage is not an override.
+        assert_eq!(
+            session_format("claude-opus-4", Some("Whole-File")),
+            EditFormat::WholeFile
+        );
+        for off in ["off", "OFF", "false"] {
+            assert_eq!(
+                session_format("gpt-3.5-turbo", Some(off)),
+                EditFormat::SearchReplace
+            );
+        }
+        assert_eq!(forced_format("garbage"), None);
+        assert_eq!(forced_format("1"), None);
+        // The table only narrows on an exact prefix: provider-namespaced or
+        // region-prefixed ids keep the full edit-tool list.
+        assert_eq!(
+            session_format("openai/gpt-3.5-turbo", None),
+            EditFormat::SearchReplace
+        );
+        assert_eq!(
+            session_format("us.anthropic.claude-sonnet-4-5-20250929-v1:0", None),
+            EditFormat::SearchReplace
+        );
     }
 
     #[test]

@@ -2901,6 +2901,12 @@ impl ToolAdvert {
                 false
             }
         };
+        if let Some(v) = editfmt_env.filter(|v| *v != "1" && origin_editfmt::forced_format(v).is_none()) {
+            tracing::warn!(
+                value = v,
+                "ORIGIN_EDITFMT is not recognised; using the edit-format table"
+            );
+        }
         Self {
             whole_file: origin_editfmt::session_format(model, editfmt_env)
                 == origin_editfmt::EditFormat::WholeFile,
@@ -2961,6 +2967,10 @@ mod tool_advert_tests {
         assert!(a.advertises("Write") && a.advertises("Read"));
         assert!(!a.advertises("Edit") && !a.advertises("MultiEdit") && !a.advertises("ApplyPatch"));
         assert!(!a.advertises("WebFetch"));
+        // ORIGIN_EDITFMT: case-insensitive, `off` bypasses, garbage falls back to the table.
+        assert!(ToolAdvert::new("claude-opus-4", Some("Whole-File"), None).whole_file);
+        assert!(!ToolAdvert::new("gpt-3.5-turbo", Some("off"), None).whole_file);
+        assert!(ToolAdvert::new("gpt-3.5-turbo", Some("garbage"), None).whole_file);
     }
 }
 
