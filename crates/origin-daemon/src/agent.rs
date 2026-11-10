@@ -1628,8 +1628,9 @@ async fn announce_refused_gates(opts: &LoopOptions, session_id: &str) {
             }
             let text = format!(
                 "[origin] The {gate} gate command `{cmd}` will not run: the command guard refuses \
-                 it ({why}). Configure a different command, or set ORIGIN_CMD_GUARD=0 \
-                 to turn the guard off.\n\n"
+                 it ({why}). Configure a different command, or use a command the guard can analyse \
+                 (no substitution or variable where the program name goes — for example, call a \
+                 script file).\n\n"
             );
             let text = crate::redact::text(&text).into_owned();
             let _ = tx.send(StreamEvent::TextDelta { text }).await;
@@ -1653,8 +1654,9 @@ pub(crate) async fn run_gate_command(cmd: &str, cwd: Option<&std::path::Path>) -
     if let Some(reason) = gate_guard_refusal(cmd) {
         tracing::warn!(
             cmd,
-            "gate command skipped by the command guard: {reason}; simplify the command or set \
-             ORIGIN_CMD_GUARD=0"
+            "gate command skipped by the command guard: {reason}; simplify the command or use a \
+             command the guard can analyse (no substitution or variable where the program name goes \
+             — for example, call a script file)"
         );
         return None;
     }

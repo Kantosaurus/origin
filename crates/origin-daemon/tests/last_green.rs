@@ -410,8 +410,12 @@ fn a_gate_the_guard_refuses_is_named_once_on_the_event_stream() {
         "names the gate and its command: {note}"
     );
     assert!(
-        note.contains("ORIGIN_CMD_GUARD=0"),
+        note.contains("use a command the guard can analyse") && note.contains("call a script file"),
         "says how to change it: {note}"
+    );
+    assert!(
+        !note.contains("ORIGIN_CMD_GUARD=0"),
+        "never advises turning the guard off: {note}"
     );
     assert!(!texts(&session).iter().any(|t| t.contains("will not run")));
 }

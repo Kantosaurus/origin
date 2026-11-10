@@ -265,10 +265,11 @@ selection, best-of-N's oracle) go through the same analysis with nobody to ask:
 a command rated `Dangerous` or `NeedsApproval` is **not run**. Each run logs it
 (`gate command skipped by the command guard: …`), and the user is told once per
 session per gate with one `[origin]` line naming the gate, the command, the
-guard's reason and the way out (a different command, or `ORIGIN_CMD_GUARD=0`).
-A configured test command whose program is a substitution or variable (only
-known at run time) therefore stops running
-until it is simplified or the guard is turned off.
+guard's reason and the way out (a different command, or one the guard can
+analyse: no substitution or variable where the program name goes — for example,
+call a script file). A configured test command whose program is a substitution
+or variable (only known at run time) therefore stops running until it is
+simplified.
 
 ### How it analyzes a line
 

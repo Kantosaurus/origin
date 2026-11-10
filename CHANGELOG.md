@@ -35,7 +35,8 @@ Defaults that changed, each with its escape hatch:
 - **Sub-agent results** report `status` `completed`/`budget_exhausted`/`aborted`/`goal_unreachable` and cap report
   text at 8,000 characters (was a silent 4,000 cut) (B8). **A full `origin rewind`** now needs git 2.23+ (C8).
   **Windows turn-end gate commands** return the program's own exit code instead of 1 (C5). **Turn-end gate commands**
-  the command guard rates `NeedsApproval` (e.g. a `$(…)` or variable as the program) are no longer run (C3; escape `ORIGIN_CMD_GUARD=0`).
+  the command guard rates `NeedsApproval` (e.g. a `$(…)` or variable as the program) are no longer run (C3; use a
+  command the guard can analyse — for example, call a script file).
 - **Prose edits (`ORIGIN_EDITFMT=1`) now obey the permission mode** (C2, C7): an edit block written in reply text is
   applied only where a `Write` would be allowed without asking, so nothing lands in mode `on`, outside the workspace
   or on protected paths, and a whole-file edit needs a path line directly above a closed fence. Escape: use the edit
