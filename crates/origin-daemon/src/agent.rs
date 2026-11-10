@@ -1226,7 +1226,7 @@ fn anchor_patch_paths(patch: &str, cwd: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod anchor_tests {
-    use super::{anchor_tool_args, run_streaming_turn, LoopOptions};
+    use super::{anchor_tool_args, run_streaming_turn, speculation_allowed, LoopOptions};
 
     /// A12: a non-builtin tool (MCP / runtime) keeps its arguments verbatim —
     /// its `path` may name something remote, not a local file.
@@ -1345,14 +1345,15 @@ mod anchor_tests {
             cwd: Some(std::env::temp_dir()),
             ..LoopOptions::default()
         };
-        let turn = run_streaming_turn(&OneRead, req.clone(), &with_cwd)
+        let turn = run_streaming_turn(&OneRead, req.clone(), &with_cwd, speculation_allowed(&with_cwd, false))
             .await
             .expect("turn");
         assert!(
             turn.speculative.in_flight.is_empty(),
             "no pre-dispatch with a run cwd"
         );
-        let turn = run_streaming_turn(&OneRead, req, &LoopOptions::default())
+        let defaults = LoopOptions::default();
+        let turn = run_streaming_turn(&OneRead, req, &defaults, speculation_allowed(&defaults, false))
             .await
             .expect("turn");
         assert_eq!(
@@ -3842,13 +3843,18 @@ pub enum LoopError {
 /// A3: whether this run may pre-run tools mid-stream. Speculation runs a tool
 /// before the deny-only layers (skill mask, governance policy, conseca, the
 /// read-only flag, `PreTool` hooks) get their say, so it is off whenever any of
-/// them is configured. Computed once per run; fails closed.
+/// them is configured. Computed once per run; fails closed. A12: also off for a
+/// run with its own cwd — a pre-run would resolve its paths against the
+/// daemon's process cwd.
 fn speculation_allowed(opts: &LoopOptions, hooks_configured: bool) -> bool {
+    // ponytail: candidate runs lose speculative pre-runs; anchor the speculative
+    // arguments and pass the run cwd to `dispatch_tool` if that latency matters.
     !hooks_configured
         && opts.policy.is_none()
         && opts.conseca.is_none()
         && !opts.read_only
         && opts.skills.as_deref().is_none_or(|s| s.allowed_tools().is_none())
+        && opts.cwd.is_none()
 }
 
 /// Tracks speculative tasks fired off mid-stream. Keyed by the assistant
@@ -4784,7 +4790,11 @@ async fn run_loop_inner(
     // per-turn system prompt — and thus the prompt-cache breakpoints — are
     // byte-identical to before when the feature is off.
     let mut lsp_diag_block = String::new();
-    let lsp_diag_enabled = crate::lsp_diagnostics::enabled();
+    // A12: a run with its own cwd (a best-of-N candidate) must never start or
+    // query a pooled language server, which may be rooted at the real checkout.
+    // ponytail: candidates get no turn-end LSP diagnostics; upgrade path is a
+    // per-candidate pool rooted at the run cwd.
+    let lsp_diag_enabled = crate::lsp_diagnostics::enabled() && opts.cwd.is_none();
     let lsp_pool = opts.lsp_pool.clone().unwrap_or_default();
     if lsp_diag_enabled {
         // Files may have changed since the last prompt (the user's editor, git)
@@ -7646,7 +7656,7 @@ async fn dispatch_tool(
     // formatter/linter spawns and the rust-analyzer root follow it; `None` ⇒
     // the process cwd. The main-loop dispatch passes `opts.cwd`; the
     // speculative pre-dispatch passes `None`, which is correct because
-    // speculation never runs for a run with its own cwd (`run_streaming_turn`).
+    // speculation never runs for a run with its own cwd (`speculation_allowed`).
     cwd: Option<&std::path::Path>,
 ) -> Result<String, LoopError> {
     // C9: the model only ever sees `[REDACTED:<NAME>]` in place of a real secret.
@@ -11764,14 +11774,14 @@ mod wiring_tests {
         #[cfg(not(windows))]
         let needs_approval = "$(echo echo) gate-ran";
         assert!(
-            rt.block_on(run_gate_command(dangerous)).is_none(),
+            rt.block_on(run_gate_command(dangerous, None)).is_none(),
             "Dangerous gate command ran"
         );
         assert!(
-            rt.block_on(run_gate_command(needs_approval)).is_none(),
+            rt.block_on(run_gate_command(needs_approval, None)).is_none(),
             "NeedsApproval gate command ran"
         );
-        let ran = rt.block_on(run_gate_command("echo gate-ok"));
+        let ran = rt.block_on(run_gate_command("echo gate-ok", None));
         assert_eq!(
             ran.map(|(code, _)| code),
             Some(0),
@@ -12540,7 +12550,7 @@ mod wiring_tests {
             lint_command: Some(script.to_string_lossy().into_owned()),
             ..origin_postedit::PostEditConfig::default()
         };
-        let decision = run_post_edit_lint(&cfg, "src/main.rs");
+        let decision = run_post_edit_lint(&cfg, "src/main.rs", None);
         std::env::remove_var("A6_LINT_PROBE_TOKEN");
         assert!(
             !inherited.success(),
