@@ -737,6 +737,13 @@ fn workspace_need(
 ) -> Need {
     const AFTER_TAINT: &str = "after external content entered this session";
     let name = meta.name;
+    // A `Browser` screenshot `path` is a file write: where a `Write` would need
+    // a person (outside the workspace, a protected path), so does it.
+    if let Some(path) = args.get("path").filter(|_| name == "Browser") {
+        if let Some(why) = write_outside("Write", &serde_json::json!({ "file_path": path }), ws) {
+            return Need::Person(why);
+        }
+    }
     if crate::external_content::is_external_tool(name) {
         return if tainted {
             Need::Person(format!("network tool {AFTER_TAINT}"))
@@ -14777,6 +14784,32 @@ mod wiring_tests {
             vec![false, false],
             "Task and person-asks offer no always"
         );
+    }
+
+    /// C2 (final fix S8): a `Browser` screenshot `path` is a file write, so
+    /// outside the workspace or to a protected path a standing "always allow
+    /// Browser" does not cover it: a person is asked, as for a `Write` there.
+    #[tokio::test]
+    async fn browser_screenshot_path_outside_the_workspace_needs_a_person() {
+        let ws = tempfile::tempdir().expect("ws");
+        let out = tempfile::tempdir().expect("out");
+        let opts = LoopOptions {
+            cwd: Some(ws.path().to_path_buf()),
+            ..LoopOptions::default()
+        };
+        let session = Session::new("p", "m");
+        let shot = |path: &str| serde_json::json!({"v": "screenshot", "session": "s", "path": path});
+        let outside = out.path().join("x.png").to_string_lossy().into_owned();
+        for path in [outside.as_str(), ".git/x.png"] {
+            let standing = Rec::standing();
+            let d = decide_c2("Browser", &shot(path), &standing, &opts, &session).await;
+            assert_eq!(d.reason, USER_APPROVED, "{path}: asked");
+            assert_eq!(standing.offers(), vec![false], "{path}: no always");
+            let d = decide_c2("Browser", &shot(path), &Rec::new(true, false), &opts, &session).await;
+            assert_eq!(d.outcome, Outcome::Deny, "{path}: nobody to ask");
+        }
+        let inside = decide_c2("Browser", &shot("x.png"), &Rec::standing(), &opts, &session).await;
+        assert_eq!(inside.reason, STANDING_ALLOW, "inside: an ordinary ask");
     }
 
     /// A4 (final fix S5): `AuthorWorkflow` writes a file that later grants
