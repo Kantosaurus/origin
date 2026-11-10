@@ -4063,6 +4063,77 @@ mod runtime_tools_tests {
         assert!(crate::agent::external_result_in(&session.messages));
     }
 
+    /// A7: the 200 KB cap runs after `SchemaCrush`, so an array over the cap is
+    /// crushed (and still within the cap), not cut into invalid JSON.
+    #[tokio::test]
+    async fn an_array_over_the_result_cap_is_crushed_not_cut() {
+        use origin_core::types::{Block, Message, Role};
+        // A `Grep` (pure, builtin) over 3,000 matching lines: ~400 KB of
+        // homogeneous `{file, line, text}` rows.
+        let src = tempfile::tempdir().expect("tempdir");
+        let line = format!("needle {}\n", "x".repeat(100));
+        std::fs::write(src.path().join("big.txt"), line.repeat(3_000)).expect("write");
+        let args = json!({
+            "pattern": "needle",
+            "path": src.path().to_string_lossy(),
+            "output_mode": "content",
+            "head_limit": 3_000,
+        });
+        let provider = Turns(std::sync::Mutex::new(vec![
+            Message::new(Role::Assistant).with_block(Block::ToolUse {
+                id: "g".into(),
+                name: "Grep".into(),
+                input_json: serde_json::to_vec(&args).expect("args"),
+                cache_marker: None,
+            }),
+            Message::new(Role::Assistant).with_block(Block::text("done")),
+        ]));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cas = Arc::new(
+            origin_cas::Store::open(origin_cas::StoreConfig {
+                root: dir.path().to_path_buf(),
+                hot_capacity: 64,
+                warm_pack_target_bytes: 64 * 1024,
+                cold_zstd_level: 3,
+            })
+            .expect("cas"),
+        );
+        let opts = crate::agent::LoopOptions::default()
+            .with_cas(Arc::clone(&cas))
+            .without_streaming();
+        let mut session = crate::session::Session::new("scripted", "m");
+        crate::agent::run_loop(
+            &mut session,
+            "go",
+            &provider,
+            &origin_permission::prompt::AlwaysAllow,
+            &opts,
+        )
+        .await
+        .expect("run completes");
+        let body = session
+            .messages
+            .iter()
+            .flat_map(|m| &m.blocks)
+            .find_map(|b| match b {
+                Block::ToolResult { inline: Some(v), .. } => Some(v.clone()),
+                Block::ToolResult { handle: Some(h), .. } => {
+                    cas.get(origin_cas::Hash::from_bytes(*h)).expect("get")
+                }
+                _ => None,
+            })
+            .expect("a tool result");
+        let body = String::from_utf8(body).expect("utf8");
+        assert!(
+            body.contains("__schema_crush") || body.contains("__offloaded"),
+            "not crushed: {} bytes, {:?}",
+            body.len(),
+            &body[..body.len().min(300)]
+        );
+        assert!(!body.contains("[truncated:"), "cut, not crushed");
+        assert!(body.len() <= 200_100, "len {}", body.len());
+    }
+
     /// A11: the empty `graph_query` that starts the session's background build
     /// says the index is building (retry shortly), not "run `graph_rebuild`"; a
     /// later empty query keeps the usual note.
@@ -8555,16 +8626,6 @@ async fn run_loop_inner(
             // so the CAS blob, TUI preview, transcript and model all see the same
             // redacted bytes.
             let result_bytes = crate::redact::bytes(result_bytes);
-            // A7: one hard cap on any single result, so one huge result cannot
-            // overflow the window (the overflow retry cannot elide the last
-            // turns). Above `Read`'s and Bash's own caps; a memo hit was capped
-            // when first stored.
-            // ponytail: fixed 200 KB cap; make it window-relative and CAS-paged if small-window models matter
-            let result_bytes = if cache_hit.is_none() {
-                crate::external_content::bound_result(result_bytes, 200_000)
-            } else {
-                result_bytes
-            };
             // C6: note tripwire hits in the lines this edit added (never blocks).
             let result_bytes = crate::diff_review::with_tripwire_notes(result_bytes, &call_before);
 
@@ -8621,6 +8682,14 @@ async fn run_loop_inner(
                         }
                     }
                 }
+            }
+            // A7: one hard cap on any single result, so one huge result cannot
+            // overflow the window (the overflow retry cannot elide the last
+            // turns). Above `Read`'s and Bash's own caps; a memo hit was capped
+            // when first stored. After SchemaCrush, which needs the whole JSON.
+            // ponytail: fixed 200 KB cap; make it window-relative and CAS-paged if small-window models matter
+            if cache_hit.is_none() {
+                result_bytes = crate::external_content::bound_result(result_bytes, 200_000);
             }
 
             // Stage C5 Task 1/2: reaching here means the tool produced a result
