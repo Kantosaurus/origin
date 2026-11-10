@@ -396,16 +396,17 @@ async fn background_results_drain_taints_the_parent() {
     assert_bash_asked_after_taint(&human);
 }
 
-/// A person who answers yes to every ask, choosing "always" whenever it is
+/// A person who denies every command-guard ask (so no flagged command ever
+/// runs) and approves every other ask, choosing "always" whenever it is
 /// offered (which records a standing allow, as the IPC prompter does).
 #[derive(Default)]
-struct AlwaysWhenOffered {
+struct DeniesGuardAsks {
     asks: Mutex<Vec<(String, String, bool)>>,
     standing: Mutex<std::collections::HashSet<String>>,
 }
 
 #[async_trait]
-impl origin_permission::prompt::Prompter for AlwaysWhenOffered {
+impl origin_permission::prompt::Prompter for DeniesGuardAsks {
     async fn ask(&self, meta: &origin_tools::ToolMeta, preview: &str) -> bool {
         self.ask_offering(meta, preview, false).await
     }
@@ -414,10 +415,11 @@ impl origin_permission::prompt::Prompter for AlwaysWhenOffered {
             .lock()
             .expect("lock")
             .push((meta.name.to_owned(), preview.to_owned(), offer_always));
-        if offer_always {
+        let approve = !preview.contains("cmd-guard");
+        if approve && offer_always {
             self.standing.lock().expect("lock").insert(meta.name.to_owned());
         }
-        true
+        approve
     }
     fn standing_allow(&self, tool: &str) -> bool {
         self.standing.lock().expect("lock").contains(tool)
@@ -425,8 +427,9 @@ impl origin_permission::prompt::Prompter for AlwaysWhenOffered {
 }
 
 /// C2: an ask the command guard raised (here an undeclared package install)
-/// is about that one command: it never offers "always", so answering it
-/// leaves no standing allow and the next plain Bash call is still asked.
+/// is about that one command: it never offers "always", and the next plain
+/// Bash call is still asked. The flagged ask is denied, so no package
+/// manager runs.
 #[tokio::test]
 async fn a_command_guard_ask_never_offers_always() {
     if origin_tools::sandbox_status() == origin_tools::SandboxStatus::Active {
@@ -437,7 +440,7 @@ async fn a_command_guard_ask_never_offers_always() {
         tool(
             "i",
             "Bash",
-            &serde_json::json!({ "command": "npm install --offline --no-audit --no-fund left-pad" }),
+            &serde_json::json!({ "command": "npm install left-pad" }),
         ),
         tool("b", "Bash", &serde_json::json!({ "command": "echo hi" })),
         Block::text("done"),
@@ -447,7 +450,7 @@ async fn a_command_guard_ask_never_offers_always() {
         ..LoopOptions::default().without_streaming()
     };
     let mut session = Session::new("scripted", "m");
-    let human = AlwaysWhenOffered::default();
+    let human = DeniesGuardAsks::default();
     run_loop(&mut session, "go", &provider, &human, &opts)
         .await
         .expect("run");
@@ -459,6 +462,8 @@ async fn a_command_guard_ask_never_offers_always() {
         "{asks:?}"
     );
     assert!(!bash[0].2, "a command-guard ask never offers always: {asks:?}");
+    let (err, text) = result_of(&session, "i");
+    assert!(err && text.contains("permission denied"), "never ran: {text}");
 }
 
 /// Serialises the tests that set `ORIGIN_HOME` in this binary.
