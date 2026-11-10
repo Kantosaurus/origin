@@ -4966,6 +4966,8 @@ async fn run_loop_inner(
     // trailing block on the NEXT turn, so the model fixes a broken edit before
     // claiming done. Empty (no-op) unless an edited file failed its check.
     let mut compile_check_block = String::new();
+    // B7: the gate's tree-sitter notes — advisory, so not a gate failure.
+    let mut syntax_advisory_block = String::new();
     let compile_check_enabled = crate::postcheck::enabled();
     // In-conversation task checklist (TodoWrite). Replaced wholesale when the
     // model calls the tool; carried as a volatile block so the plan stays visible
@@ -5107,6 +5109,8 @@ async fn run_loop_inner(
         // Set when this turn ran a mutating tool that does not report which
         // files it changed (Bash, MCP, …): the LSP pool is recycled.
         let mut lsp_unlisted_mutation = false;
+        // B7: pre-edit tree-sitter problem counts of the files this turn edits.
+        let mut parse_baseline = crate::postcheck::ParseBaseline::new();
         // Live per-turn model routing (origin-router). When a router is wired it
         // picks a model for this turn's phase (turn 1 ⇒ Plan, later ⇒ Edit).
         //
@@ -5254,6 +5258,7 @@ async fn run_loop_inner(
                 &todos_block,
                 &lsp_diag_block,
                 &compile_check_block,
+                &syntax_advisory_block,
                 &test_block,
                 &lint_block,
                 &stuck_block,
@@ -6142,6 +6147,13 @@ async fn run_loop_inner(
                 // may change any file, so no memoized read survives its dispatch.
                 cache.clear();
                 batch_mutated = true;
+                // B7: the syntax gate reports only parse errors an edit adds,
+                // so count them in each target file before it changes.
+                if compile_check_enabled {
+                    for p in edited_paths_from_tool(&name, &args) {
+                        crate::postcheck::record_baseline(&mut parse_baseline, &p).await;
+                    }
+                }
                 None
             } else if cache.is_skipped(meta.name) {
                 None
@@ -7351,11 +7363,10 @@ async fn run_loop_inner(
         // Fast post-edit syntax gate on the same edited-path set (Python/JS
         // interpreters, tree-sitter for the codegraph grammars).
         if compile_check_enabled && !lsp_edited_paths.is_empty() {
-            compile_check_block = crate::redact::string(
-                crate::postcheck::check_block(&lsp_edited_paths)
-                    .await
-                    .unwrap_or_default(),
-            );
+            let (check, advisory) = crate::postcheck::check_block(&lsp_edited_paths, &parse_baseline).await;
+            // C9: both carry child-process / file-derived text; redact at the source.
+            compile_check_block = crate::redact::string(check);
+            syntax_advisory_block = crate::redact::string(advisory);
         }
         // Opt-in post-edit test run. Default-off (auto_test defaults false), so it
         // adds NO latency unless the user explicitly configured it — they then

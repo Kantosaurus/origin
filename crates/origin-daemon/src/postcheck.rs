@@ -15,12 +15,15 @@
 //! wired LSP-diagnostics path, so they are intentionally not duplicated here.
 //! B7: files in a language whose tree-sitter grammar `origin-codegraph` links
 //! (Rust, TypeScript, Go, Java, C/C++, …) — and Python when no interpreter
-//! ran — are parsed in-process and `ERROR`/`MISSING` nodes reported by line.
+//! ran — are parsed in-process and `ERROR`/`MISSING` nodes reported by line,
+//! but only when the edit raised their count over a pre-edit baseline, and as
+//! an advisory (`<syntax-advisory>`), not a must-fix: the pinned grammars lag
+//! the languages.
 //!
 //! Fail-open everywhere: an unrecognised extension, a missing interpreter, or a
 //! timeout is silently skipped — the gate can never block or stall a turn.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 /// The gate is on unless explicitly opted out with `ORIGIN_EDIT_CHECK=0`.
@@ -58,48 +61,111 @@ fn checker_for(path: &str) -> Option<(&'static str, Vec<String>)> {
     }
 }
 
-/// Run the fast checker for each edited path under a per-file timeout.
+/// B7: pre-edit tree-sitter problem-line count per edited path (see
+/// [`record_baseline`]); a path missing from it counts 0.
+pub type ParseBaseline = HashMap<String, usize>;
+
+/// One edited file's finding.
+#[derive(Debug, PartialEq, Eq)]
+enum Finding {
+    /// The interpreter-based checker failed: a real syntax error.
+    Failure(String),
+    /// B7: tree-sitter found more problem lines than before the edit (advisory).
+    Advisory(String),
+}
+
+/// Run the fast checks for each edited path.
 ///
-/// Collects failures into an `<edit-check>` block; returns `None` when nothing
-/// checkable failed. Fail-open: missing interpreter / timeout / unknown type are
-/// skipped.
-pub async fn check_block(paths: &BTreeSet<String>) -> Option<String> {
+/// Returns `(edit_check, syntax_advisory)`: an `<edit-check>` block of
+/// interpreter failures (the model must fix them) and a `<syntax-advisory>`
+/// block of tree-sitter notes (may be a parser limitation); each is empty when
+/// it has nothing to say. Fail-open: missing interpreter / timeout / unknown
+/// type are skipped.
+pub async fn check_block(paths: &BTreeSet<String>, baseline: &ParseBaseline) -> (String, String) {
     let mut failures: Vec<String> = Vec::new();
+    let mut advisories: Vec<String> = Vec::new();
     for p in paths {
-        if let Some((prog, args)) = checker_for(p) {
-            let mut cmd = tokio::process::Command::new(prog);
-            origin_tools::scrub_env(cmd.as_std_mut()); // A6
-            let run = cmd.args(&args).output();
-            if let Ok(Ok(out)) = tokio::time::timeout(PER_FILE_TIMEOUT, run).await {
-                if !out.status.success() {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let msg = stderr.trim();
-                    let msg = if msg.is_empty() {
-                        String::from_utf8_lossy(&out.stdout).trim().to_string()
-                    } else {
-                        msg.to_string()
-                    };
-                    if !msg.is_empty() {
-                        failures.push(format!("{p}:\n{}", truncate(&msg)));
-                    }
-                }
+        let before = baseline.get(p).copied().unwrap_or(0);
+        match check_file(p, checker_for(p), before).await {
+            Some(Finding::Failure(msg)) => failures.push(format!("{p}:\n{msg}")),
+            Some(Finding::Advisory(msg)) => advisories.push(format!("{p}:\n{msg}")),
+            None => {}
+        }
+    }
+    let edit_check = if failures.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<edit-check>\nA post-edit syntax check found problems in files you just edited. \
+             Fix these before continuing or claiming done:\n\n{}\n</edit-check>",
+            failures.join("\n\n")
+        )
+    };
+    let advisory = if advisories.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<syntax-advisory>\nA tree-sitter parse found new parse errors in files you just edited:\n\n{}\n\
+             </syntax-advisory>",
+            advisories.join("\n\n")
+        )
+    };
+    (edit_check, advisory)
+}
+
+/// Check one edited file: the interpreter-based `checker` when it can run,
+/// else (B7) tree-sitter, reported only when the edit raised the problem-line
+/// count above `before`.
+async fn check_file<S: AsRef<std::ffi::OsStr>>(
+    path: &str,
+    checker: Option<(S, Vec<String>)>,
+    before: usize,
+) -> Option<Finding> {
+    if let Some((prog, args)) = checker {
+        let mut cmd = tokio::process::Command::new(prog);
+        origin_tools::scrub_env(cmd.as_std_mut()); // A6
+        let run = cmd.args(&args).output();
+        if let Ok(Ok(out)) = tokio::time::timeout(PER_FILE_TIMEOUT, run).await {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !interpreter_missing(out.status.code(), &stderr) {
                 // The interpreter ran: one diagnostic per problem, so no tree-sitter pass.
-                continue;
+                if out.status.success() {
+                    return None;
+                }
+                let msg = stderr.trim();
+                let msg = if msg.is_empty() {
+                    String::from_utf8_lossy(&out.stdout).trim().to_string()
+                } else {
+                    msg.to_string()
+                };
+                return (!msg.is_empty()).then(|| Finding::Failure(truncate(&msg)));
             }
-            // Spawn error (no interpreter) or timeout ⇒ tree-sitter may cover it.
         }
-        if let Some(msg) = tree_sitter_check(p) {
-            failures.push(format!("{p}:\n{msg}"));
-        }
+        // Spawn error, timeout or a stub interpreter ⇒ tree-sitter may cover it.
     }
-    if failures.is_empty() {
-        return None;
+    let lines = parse_error_lines(path).await;
+    (lines.len() > before).then(|| Finding::Advisory(advisory_text(&lines)))
+}
+
+/// B7: the run produced no check at all. The Windows Store `python` "App
+/// Execution Alias" (installed by default) runs, exits 9009 and prints
+/// `Python was not found; run without arguments to install from the Microsoft
+/// Store, …` — no interpreter, not a syntax error.
+fn interpreter_missing(code: Option<i32>, stderr: &str) -> bool {
+    code == Some(9009) || stderr.trim_start().starts_with("Python was not found")
+}
+
+/// B7: record `path`'s pre-edit tree-sitter problem-line count in `baseline`.
+///
+/// Call before the tool that edits `path` runs; the first call per path wins
+/// (a file that does not exist yet counts 0). No-op for files tree-sitter
+/// does not check.
+pub async fn record_baseline(baseline: &mut ParseBaseline, path: &str) {
+    if baseline.contains_key(path) || parse_language(path).is_none() {
+        return;
     }
-    Some(format!(
-        "<edit-check>\nA post-edit syntax check found problems in files you just edited. \
-         Fix these before continuing or claiming done:\n\n{}\n</edit-check>",
-        failures.join("\n\n")
-    ))
+    let count = parse_error_lines(path).await.len();
+    baseline.insert(path.to_string(), count);
 }
 
 /// B7: the tree-sitter grammar for `path`, or `None` (skipped) when
@@ -115,24 +181,32 @@ fn parse_language(path: &str) -> Option<origin_codegraph::Language> {
     origin_codegraph::Language::from_path(p)
 }
 
-/// B7: parse the edited file with tree-sitter; fail-open on any read/parse
-/// problem and for files over [`MAX_PARSE_BYTES`].
-// ponytail: reports every ERROR/MISSING node, including ones the file had
-// before the edit (the gate only sees post-edit paths); compare against a
-// pre-edit parse captured before tool dispatch if pre-existing errors nag.
-fn tree_sitter_check(path: &str) -> Option<String> {
-    let lang = parse_language(path)?;
-    if std::fs::metadata(path).ok()?.len() > MAX_PARSE_BYTES {
-        return None;
+/// B7: the lines of tree-sitter `ERROR`/`MISSING` nodes in `path`, read and
+/// parsed off the async runtime under [`PER_FILE_TIMEOUT`]. Empty (fail-open)
+/// for unchecked types, files over [`MAX_PARSE_BYTES`], missing files, and on
+/// any read/parse error or timeout.
+async fn parse_error_lines(path: &str) -> Vec<usize> {
+    let Some(lang) = parse_language(path) else {
+        return Vec::new();
+    };
+    let path = path.to_string();
+    let parse = tokio::task::spawn_blocking(move || {
+        if std::fs::metadata(&path).map_or(true, |m| m.len() > MAX_PARSE_BYTES) {
+            return Vec::new();
+        }
+        std::fs::read(&path)
+            .ok()
+            .and_then(|src| lang.syntax_error_lines(&src).ok())
+            .unwrap_or_default()
+    });
+    match tokio::time::timeout(PER_FILE_TIMEOUT, parse).await {
+        Ok(Ok(lines)) => lines,
+        _ => Vec::new(),
     }
-    tree_sitter_errors(&std::fs::read(path).ok()?, lang)
 }
 
-fn tree_sitter_errors(src: &[u8], lang: origin_codegraph::Language) -> Option<String> {
-    let lines = lang.syntax_error_lines(src).ok()?;
-    if lines.is_empty() {
-        return None;
-    }
+/// B7: the advisory note for a file's tree-sitter problem `lines`.
+fn advisory_text(lines: &[usize]) -> String {
     let shown: Vec<String> = lines
         .iter()
         .take(MAX_ERROR_LINES)
@@ -142,10 +216,11 @@ fn tree_sitter_errors(src: &[u8], lang: origin_codegraph::Language) -> Option<St
         0 => String::new(),
         k => format!(" (+{k} more)"),
     };
-    Some(format!(
-        "possible syntax error (tree-sitter) at line {}{more}",
+    format!(
+        "possible syntax error (tree-sitter) at line {}{more}; may be a parser limitation — ignore if \
+         the code builds",
         shown.join(", ")
-    ))
+    )
 }
 
 fn truncate(s: &str) -> String {
@@ -171,19 +246,25 @@ mod tests {
 
     #[tokio::test]
     async fn empty_paths_yield_no_block() {
-        assert!(check_block(&BTreeSet::new()).await.is_none());
+        let none = (String::new(), String::new());
+        assert_eq!(check_block(&BTreeSet::new(), &ParseBaseline::new()).await, none);
     }
 
-    /// Runs the gate on one file named `name` holding `body`.
-    async fn check_one(name: &str, body: &str) -> Option<String> {
+    /// Runs the gate on a new file (no baseline) named `name` holding `body`;
+    /// returns `(edit_check, syntax_advisory)`.
+    async fn check_one(name: &str, body: &str) -> (String, String) {
         let dir = tempfile::tempdir().expect("tmp");
         let p = dir.path().join(name);
         std::fs::write(&p, body).expect("write");
-        check_block(&BTreeSet::from([p.to_string_lossy().into_owned()])).await
+        check_block(
+            &BTreeSet::from([p.to_string_lossy().into_owned()]),
+            &ParseBaseline::new(),
+        )
+        .await
     }
 
-    /// B7: an unbalanced brace in a tree-sitter language is reported, as parser
-    /// feedback with its line number, in the same `<edit-check>` block.
+    /// B7: an unbalanced brace in a tree-sitter language is reported with its
+    /// line number, as an advisory outside the must-fix `<edit-check>` block.
     #[tokio::test]
     async fn tree_sitter_flags_an_unbalanced_brace_in_rust_and_typescript() {
         for (name, body, line) in [
@@ -198,54 +279,133 @@ mod tests {
             ("open.rs", "fn main() {\n    let x = 1;\n", "at line 1"),
             ("open.ts", "function f(): number {\n  return 1;\n", "at line 2"),
         ] {
-            let block = check_one(name, body).await.expect(name);
-            assert!(block.contains("<edit-check>"), "{block}");
-            assert!(block.contains(name), "{block}");
-            assert!(block.contains("possible syntax error (tree-sitter)"), "{block}");
-            assert!(block.contains(line), "{name} must name {line}: {block}");
+            let (edit_check, advisory) = check_one(name, body).await;
+            assert_eq!(edit_check, "", "{name}: tree-sitter is never a must-fix");
+            assert!(advisory.starts_with("<syntax-advisory>"), "{name}: {advisory}");
+            assert!(advisory.contains(name), "{advisory}");
+            assert!(
+                advisory.contains("possible syntax error (tree-sitter)"),
+                "{advisory}"
+            );
+            assert!(advisory.contains("ignore if the code builds"), "{advisory}");
+            assert!(!advisory.contains("Fix these"), "{advisory}");
+            assert!(advisory.contains(line), "{name} must name {line}: {advisory}");
         }
     }
 
-    /// B7: valid source and unknown file types yield no diagnostic.
+    /// B7: valid source, unknown file types, `.tsx`/`.h` (wrong grammar) and
+    /// files over 1 MB yield nothing.
     #[tokio::test]
-    async fn tree_sitter_is_silent_on_valid_files_and_unknown_types() {
+    async fn tree_sitter_is_silent_on_valid_unknown_skipped_and_large_files() {
+        let none = (String::new(), String::new());
         assert_eq!(
             check_one("ok.rs", "fn main() {\n    let _x = 1;\n}\n").await,
-            None
+            none
         );
         assert_eq!(
             check_one("ok.ts", "export function f(): number {\n  return 1;\n}\n").await,
-            None
+            none
         );
-        assert_eq!(check_one("notes.xyz", "}}} not code {{{\n").await, None);
+        for name in ["notes.xyz", "view.tsx", "api.h"] {
+            assert_eq!(check_one(name, "}}} not code {{{\n").await, none, "{name}");
+        }
+        let large = "}\n".repeat(600_000);
+        assert_eq!(check_one("large.rs", &large).await, none);
     }
 
     /// B7: only the first five problem lines are listed, then a count.
     #[test]
     fn tree_sitter_report_is_capped_at_five_lines() {
-        let body = "fn main() {}\n}\n".repeat(7);
-        let msg = tree_sitter_errors(body.as_bytes(), origin_codegraph::Language::Rust).expect("errors");
         assert_eq!(
-            msg,
-            "possible syntax error (tree-sitter) at line 2, 4, 6, 8, 10 (+2 more)"
+            advisory_text(&[2, 4, 6, 8, 10, 12, 14]),
+            "possible syntax error (tree-sitter) at line 2, 4, 6, 8, 10 (+2 more); may be a parser \
+             limitation — ignore if the code builds"
         );
+    }
+
+    /// Edits `path` from `before` (`None`: the file does not exist yet) to
+    /// `after` with the baseline recorded in between, as the agent loop does.
+    async fn edit(path: &std::path::Path, before: Option<&str>, after: &str) -> String {
+        if let Some(body) = before {
+            std::fs::write(path, body).expect("write");
+        }
+        let p = path.to_string_lossy().into_owned();
+        let mut baseline = ParseBaseline::new();
+        record_baseline(&mut baseline, &p).await;
+        std::fs::write(path, after).expect("write");
+        check_block(&BTreeSet::from([p]), &baseline).await.1
+    }
+
+    /// B7: only parse errors the edit ADDED are reported — a file that already
+    /// had an unbalanced brace does not nag on every later edit.
+    #[tokio::test]
+    async fn tree_sitter_reports_only_errors_the_edit_added() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let p = dir.path().join("lib.rs");
+        let broken = "fn a() {}\n}\n";
+        // Pre-existing error, the edit adds a valid fn: silent.
+        let unchanged = edit(&p, Some(broken), "fn a() {}\n}\nfn b() {}\n").await;
+        assert_eq!(unchanged, "");
+        // The edit adds a second stray brace: reported.
+        let added = edit(&p, Some(broken), "fn a() {}\n}\nfn b() {}\n}\n").await;
+        assert!(added.contains("possible syntax error (tree-sitter)"), "{added}");
+        // A new file with an error: reported (a missing file counts 0).
+        let q = dir.path().join("new.rs");
+        let new_file = edit(&q, None, broken).await;
+        assert!(new_file.contains("new.rs"), "{new_file}");
+    }
+
+    /// B7: when the interpreter-based check ran, tree-sitter does not run too
+    /// (one diagnostic per problem); when it could not run, tree-sitter covers.
+    #[tokio::test]
+    async fn tree_sitter_runs_only_when_the_interpreter_check_did_not() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let p = dir.path().join("broken.rs");
+        std::fs::write(&p, "fn main() {\n}\n}\n").expect("write");
+        let p = p.to_string_lossy().into_owned();
+        // This test binary stands in for an interpreter that runs: `--list`
+        // exits 0, an unknown flag exits non-zero with a message.
+        let exe = std::env::current_exe().expect("current exe");
+        let clean = check_file(&p, Some((&exe, vec!["--list".into()])), 0).await;
+        assert_eq!(clean, None);
+        let failed = check_file(&p, Some((&exe, vec!["--no-such-flag".into()])), 0).await;
+        assert!(matches!(failed, Some(Finding::Failure(_))), "{failed:?}");
+        let missing = check_file(&p, Some(("origin-no-such-interpreter", Vec::new())), 0).await;
+        assert!(matches!(missing, Some(Finding::Advisory(_))), "{missing:?}");
+    }
+
+    /// B7: the Windows Store `python` alias (exit 9009, "Python was not
+    /// found; …", observed on Windows 11) counts as no interpreter; a real
+    /// `py_compile` failure does not.
+    #[test]
+    fn store_python_alias_counts_as_a_missing_interpreter() {
+        let alias = "Python was not found; run without arguments to install from the Microsoft Store, or \
+                     disable this shortcut from Settings > Apps > Advanced app settings > App execution aliases.\r\n";
+        assert!(interpreter_missing(Some(9009), alias));
+        assert!(interpreter_missing(Some(9009), ""));
+        assert!(interpreter_missing(Some(1), alias));
+        let real = "  File \"x.py\", line 1\n    def f(:\n          ^\nSyntaxError: invalid syntax\n";
+        assert!(!interpreter_missing(Some(1), real));
+        assert!(!interpreter_missing(Some(0), ""));
     }
 
     #[tokio::test]
     async fn a_broken_python_file_is_reported_when_python_is_present() {
-        // Fail-open: if `python` isn't on PATH this asserts None (skipped), which
-        // is the correct degraded behavior; when present, the syntax error is
-        // surfaced in an <edit-check> block.
+        // When `python` runs, the syntax error is surfaced in an <edit-check>
+        // block; without one (or with only the Store alias), tree-sitter covers.
         let dir = tempfile::tempdir().expect("tmp");
         let p = dir.path().join("broken.py");
         std::fs::write(&p, "def f(:\n").expect("write");
         let mut set = BTreeSet::new();
         set.insert(p.to_string_lossy().into_owned());
-        let out = check_block(&set).await;
-        if let Some(block) = out {
+        let (block, advisory) = check_block(&set, &ParseBaseline::new()).await;
+        if block.is_empty() {
+            // No python here ⇒ tree-sitter covers the file instead.
+            assert!(advisory.contains("broken.py"), "{advisory}");
+        } else {
             assert!(block.contains("<edit-check>"));
             assert!(block.contains("broken.py"));
+            assert_eq!(advisory, "", "one diagnostic per problem");
         }
-        // else: python not installed in this environment ⇒ fail-open skip (ok).
     }
 }
