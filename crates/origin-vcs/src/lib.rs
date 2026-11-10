@@ -37,6 +37,13 @@ const RECORD_SEP: char = '\u{1e}';
 /// writes, so a round-trip preserves the checkpoint's timestamp and file count.
 pub const LOG_FORMAT: &str = "--format=%H\x1f%s\x1f%b\x1e";
 
+/// The shadow repo's own directory, relative to the work tree root. When it
+/// lives inside the tree (`<root>/.origin/shadow.git`, the daemon and CLI
+/// layout), snapshots, status and restores must never touch it.
+const SHADOW_REL: &str = ".origin/shadow.git";
+/// Pathspec that leaves [`SHADOW_REL`] out of a whole-tree operation.
+const NOT_SHADOW: &str = ":(exclude).origin/shadow.git";
+
 /// Error raised by the VCS safety layer.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VcsError {
@@ -119,6 +126,27 @@ impl<'a> ShadowGit<'a> {
         self.runner.run(&full)
     }
 
+    /// [`Self::git`] for a command that writes commits, refs or the work tree:
+    /// it runs self-contained — never the user's hooks (`core.hooksPath` points
+    /// at the shadow's own sample-only hooks dir), never commit signing, and
+    /// with a fixed identity — so the user's global git config cannot make it
+    /// fail or run anything.
+    fn git_isolated(&self, args: &[&str]) -> Result<String, VcsError> {
+        let hooks = format!("core.hooksPath={}/hooks", self.shadow_dir);
+        let mut full: Vec<&str> = vec![
+            "-c",
+            &hooks,
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "user.name=origin",
+            "-c",
+            "user.email=origin@localhost",
+        ];
+        full.extend_from_slice(args);
+        self.git(&full)
+    }
+
     /// Verify a checkpoint id resolves to an object in the shadow repo.
     fn ensure_exists(&self, id: &str) -> Result<(), VcsError> {
         self.git(&["cat-file", "-e", id])
@@ -135,28 +163,16 @@ impl<'a> ShadowGit<'a> {
     ///
     /// Returns [`VcsError::Git`] if any underlying git command fails.
     pub fn snapshot(&self, label: &str, now_ms: u64) -> Result<Checkpoint, VcsError> {
-        self.git(&["add", "-A"])?;
+        // C8: never record the shadow repo itself; untrack it where an older
+        // checkpoint did.
+        self.git(&["rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", SHADOW_REL])?;
+        self.git(&["add", "-A", "--", ".", NOT_SHADOW])?;
         let staged = self.git(&["diff", "--cached", "--name-only"])?;
         let files = staged.lines().filter(|l| !l.trim().is_empty()).count();
         let files_changed = u32::try_from(files).unwrap_or(u32::MAX);
 
         let body = format!("origin-checkpoint ms={now_ms} files={files_changed}");
-        // C8: self-contained — the user's global signing config or a missing
-        // identity must not make every checkpoint fail silently.
-        self.git(&[
-            "-c",
-            "commit.gpgsign=false",
-            "-c",
-            "user.name=origin",
-            "-c",
-            "user.email=origin@localhost",
-            "commit",
-            "--allow-empty",
-            "--message",
-            label,
-            "--message",
-            &body,
-        ])?;
+        self.git_isolated(&["commit", "--allow-empty", "--message", label, "--message", &body])?;
         let id = self.git(&["rev-parse", "HEAD"])?.trim().to_string();
 
         Ok(Checkpoint {
@@ -185,23 +201,68 @@ impl<'a> ShadowGit<'a> {
     /// [`VcsError::Git`] if the restoring git command fails.
     pub fn restore(&self, id: &str, mode: &RestoreMode) -> Result<(), VcsError> {
         self.ensure_exists(id)?;
+        // C8: every restore leaves the shadow repo's own directory alone, even
+        // when `id` is an old checkpoint that recorded it.
         match mode {
             RestoreMode::WorkingTree => {
-                self.git(&["checkout", id, "--", "."])?;
+                self.git_isolated(&["checkout", id, "--", ".", NOT_SHADOW])?;
             }
             RestoreMode::Files(paths) => {
-                let mut args: Vec<&str> = Vec::with_capacity(paths.len() + 3);
+                let mut args: Vec<&str> = Vec::with_capacity(paths.len() + 4);
                 args.push("checkout");
                 args.push(id);
                 args.push("--");
                 args.extend(paths.iter().map(String::as_str));
-                self.git(&args)?;
+                args.push(NOT_SHADOW);
+                self.git_isolated(&args)?;
             }
             RestoreMode::Full => {
-                self.git(&["reset", "--hard", id])?;
+                // `reset --hard` minus the shadow dir: make index and tree match
+                // `id` (removing files it lacks), then move HEAD.
+                let source = format!("--source={id}");
+                self.git_isolated(&[
+                    "restore",
+                    &source,
+                    "--staged",
+                    "--worktree",
+                    "--",
+                    ".",
+                    NOT_SHADOW,
+                ])?;
+                self.git_isolated(&["reset", "-q", "--soft", id])?;
             }
         }
         Ok(())
+    }
+
+    /// The newest checkpoint id when the work tree (minus the shadow dir) has
+    /// nothing a snapshot would record; `None` when it has, or there is none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VcsError::Git`] if `git status` fails.
+    pub fn unchanged_head(&self) -> Result<Option<String>, VcsError> {
+        if !self
+            .git(&["status", "--porcelain", "--", ".", NOT_SHADOW])?
+            .trim()
+            .is_empty()
+        {
+            return Ok(None);
+        }
+        Ok(self
+            .git(&["rev-parse", "--verify", "-q", "HEAD"])
+            .ok()
+            .map(|h| h.trim().to_string()))
+    }
+
+    /// Point `refs/tags/<name>` at checkpoint `id` (created or moved).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VcsError::Git`] if `git update-ref` fails.
+    pub fn tag(&self, name: &str, id: &str) -> Result<(), VcsError> {
+        let reference = format!("refs/tags/{name}");
+        self.git_isolated(&["update-ref", &reference, id]).map(|_| ())
     }
 
     /// Return the patch (`git show -p`) for checkpoint `id`.
@@ -409,6 +470,7 @@ mod tests {
     #[test]
     fn snapshot_issues_add_and_commit_and_returns_checkpoint() {
         let mock = MockGit::scripted(vec![
+            Ok(String::new()),         // rm --cached (untrack the shadow dir)
             Ok(String::new()),         // add -A
             Ok("a.rs\nb.rs\n".into()), // diff --cached --name-only -> 2 files
             Ok(String::new()),         // commit
@@ -467,12 +529,10 @@ mod tests {
         sg.restore("cafe", &RestoreMode::WorkingTree).unwrap();
 
         let calls = mock.calls();
-        // First: existence check; second: the checkout.
+        // First: existence check; second: the checkout, minus the shadow dir.
         assert_eq!(calls[0], vec!["--git-dir", "shadow", "cat-file", "-e", "cafe"]);
-        assert_eq!(
-            calls[1],
-            vec!["--git-dir", "shadow", "checkout", "cafe", "--", "."]
-        );
+        assert!(calls[1].ends_with(&["checkout", "cafe", "--", ".", NOT_SHADOW].map(String::from)));
+        assert!(calls[1].contains(&"core.hooksPath=shadow/hooks".to_string()));
     }
 
     #[test]
@@ -483,28 +543,31 @@ mod tests {
         sg.restore("cafe", &mode).unwrap();
 
         let calls = mock.calls();
-        assert_eq!(
-            calls[1],
-            vec![
-                "--git-dir",
-                "shadow",
-                "checkout",
-                "cafe",
-                "--",
-                "src/a.rs",
-                "src/b.rs"
-            ]
-        );
+        assert!(calls[1]
+            .ends_with(&["checkout", "cafe", "--", "src/a.rs", "src/b.rs", NOT_SHADOW].map(String::from)));
     }
 
     #[test]
-    fn restore_full_emits_hard_reset() {
-        let mock = MockGit::scripted(vec![Ok(String::new()), Ok(String::new())]);
+    fn restore_full_restores_tree_then_moves_head() {
+        let mock = MockGit::scripted(vec![Ok(String::new()), Ok(String::new()), Ok(String::new())]);
         let sg = ShadowGit::new(&mock, "shadow".to_string());
         sg.restore("cafe", &RestoreMode::Full).unwrap();
 
         let calls = mock.calls();
-        assert_eq!(calls[1], vec!["--git-dir", "shadow", "reset", "--hard", "cafe"]);
+        assert!(calls[1].ends_with(
+            &[
+                "restore",
+                "--source=cafe",
+                "--staged",
+                "--worktree",
+                "--",
+                ".",
+                NOT_SHADOW
+            ]
+            .map(String::from)
+        ));
+        assert!(calls[2].ends_with(&["reset", "-q", "--soft", "cafe"].map(String::from)));
+        assert!(!has_call_with(&calls, "--hard"));
     }
 
     #[test]
@@ -661,6 +724,7 @@ mod tests {
     #[test]
     fn snapshot_with_no_staged_changes_reports_zero_files() {
         let mock = MockGit::scripted(vec![
+            Ok(String::new()), // rm --cached
             Ok(String::new()), // add
             Ok(String::new()), // diff --cached --name-only -> nothing
             Ok(String::new()), // commit (allowed empty)
