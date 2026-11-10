@@ -1148,7 +1148,7 @@ fn loop_cwd(opts: &LoopOptions) -> Option<std::path::PathBuf> {
 /// against their schemas are touched; any other tool (MCP, runtime tools)
 /// passes through unchanged — its `path` may not be local at all. Absolute
 /// paths pass through (`Path::join` keeps them). A `Bash`/`Glob`/`Grep` call
-/// naming no directory (absent or `null`) gets `cwd`; `ApplyPatch` file paths are
+/// naming no string directory (absent, `null`, object, array) gets `cwd`; `ApplyPatch` file paths are
 /// anchored by [`anchor_patch_paths`].
 fn anchor_tool_args(name: &str, mut args: Value, cwd: &std::path::Path) -> Value {
     let key = match name {
@@ -1164,6 +1164,13 @@ fn anchor_tool_args(name: &str, mut args: Value, cwd: &std::path::Path) -> Value
     let Some(obj) = args.as_object_mut() else {
         return args;
     };
+    // A `Bash`/`Glob`/`Grep` directory that is absent or not a string (`null`,
+    // object, array — dispatch reads it with `as_str`, so any of those would
+    // fall back to the process cwd) runs in `cwd`. Fail closed.
+    if matches!(name, "Bash" | "Glob" | "Grep") && !obj.get(key).is_some_and(Value::is_string) {
+        obj.insert(key.to_string(), Value::String(cwd.to_string_lossy().into_owned()));
+        return args;
+    }
     match obj.get_mut(key) {
         Some(Value::String(patch)) if key == "patch" => *patch = anchor_patch_paths(patch, cwd),
         Some(Value::String(p)) => *p = anchor(p),
@@ -1173,11 +1180,6 @@ fn anchor_tool_args(name: &str, mut args: Value, cwd: &std::path::Path) -> Value
                     *s = anchor(s);
                 }
             }
-        }
-        // A `Bash`/`Glob`/`Grep` call that names no directory (absent or JSON
-        // `null`) runs in `cwd`.
-        None | Some(Value::Null) if matches!(name, "Bash" | "Glob" | "Grep") => {
-            obj.insert(key.to_string(), Value::String(cwd.to_string_lossy().into_owned()));
         }
         _ => {}
     }
@@ -1259,28 +1261,26 @@ mod anchor_tests {
         );
     }
 
-    /// A12: an explicit JSON `null` directory is treated like an absent one —
-    /// the call runs in the run's cwd, never the daemon's process cwd.
+    /// A12: a `Bash`/`Glob`/`Grep` directory that is not a string (JSON `null`,
+    /// an object, an array) is treated like an absent one — the call runs in
+    /// the run's cwd, never the daemon's process cwd (dispatch reads the
+    /// directory with `as_str`, so any non-string would fall back to it).
     #[test]
-    fn null_directory_defaults_to_the_run_cwd() {
+    fn non_string_directory_defaults_to_the_run_cwd() {
         let cwd = std::env::temp_dir().join("a12-run-cwd");
         let want = serde_json::Value::String(cwd.to_string_lossy().into_owned());
-        let cases = [
-            ("Bash", serde_json::json!({ "command": "ls", "cwd": null }), "cwd"),
-            (
-                "Glob",
-                serde_json::json!({ "pattern": "*", "path": null }),
-                "path",
-            ),
-            (
-                "Grep",
-                serde_json::json!({ "pattern": "x", "path": null }),
-                "path",
-            ),
+        let bad = [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!(["src"]),
         ];
-        for (tool, args, key) in cases {
-            let out = anchor_tool_args(tool, args, &cwd);
-            assert_eq!(out[key], want, "{tool}");
+        for (tool, key) in [("Bash", "cwd"), ("Glob", "path"), ("Grep", "path")] {
+            for value in &bad {
+                let mut args = serde_json::json!({ "command": "touch x", "pattern": "x" });
+                args[key] = value.clone();
+                let out = anchor_tool_args(tool, args, &cwd);
+                assert_eq!(out[key], want, "{tool} {key}={value}");
+            }
         }
     }
 
