@@ -14135,8 +14135,11 @@ mod wiring_tests {
         };
         assert!(external_result_in(&msgs(false)));
         assert!(!external_result_in(&msgs(true)));
-        use crate::external_content::is_external_tool;
-        assert!(is_external_tool("mcp__gh__get") && is_external_tool("gmail") && !is_external_tool("Read"));
+        assert!(
+            crate::external_content::is_external_tool("mcp__gh__get")
+                && crate::external_content::is_external_tool("gmail")
+                && !crate::external_content::is_external_tool("Read")
+        );
     }
 
     /// C2 rule 6: a `NeedsApproval` command asks a person with the guard's

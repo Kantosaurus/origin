@@ -430,11 +430,12 @@ async fn run_fake_mcp(result: Result<Value, String>) -> (Scripted, Session) {
     );
     let mut session = Session::new_with_id("sess-c4-mcp".into(), "test-model".into());
     let opts = LoopOptions::default().without_streaming();
-    scope_runtime_tools(Arc::new(tools), async {
-        run_loop(&mut session, "get the issue", &provider, &AlwaysAllow, &opts)
+    // Boxed: run_loop's future is large (clippy::large_futures).
+    Box::pin(scope_runtime_tools(Arc::new(tools), async {
+        Box::pin(run_loop(&mut session, "get the issue", &provider, &AlwaysAllow, &opts))
             .await
             .unwrap();
-    })
+    }))
     .await;
     (provider, session)
 }
