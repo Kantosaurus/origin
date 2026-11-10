@@ -127,6 +127,27 @@ impl Language {
             .map_err(|_| LangError::SetLanguage(self))?;
         parser.parse(source, None).ok_or(LangError::Empty)
     }
+
+    /// 1-based line numbers of the tree-sitter `ERROR` / `MISSING` nodes in
+    /// `source`, in document order, one entry per line. An `ERROR` node is
+    /// reported once, not again for errors nested inside it.
+    ///
+    /// # Errors
+    /// As [`Language::parse`].
+    pub fn syntax_error_lines(self, source: &[u8]) -> Result<Vec<usize>, LangError> {
+        let tree = self.parse(source)?;
+        let mut lines: Vec<usize> = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.is_error() || node.is_missing() {
+                lines.push(node.start_position().row + 1);
+            } else if node.has_error() {
+                stack.extend((0..node.child_count()).rev().filter_map(|i| node.child(i)));
+            }
+        }
+        lines.dedup();
+        Ok(lines)
+    }
 }
 
 /// Thin re-export so downstream modules can construct a parser without

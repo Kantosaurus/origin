@@ -7352,7 +7352,8 @@ async fn run_loop_inner(
                 .unwrap_or_default(),
             );
         }
-        // Fast post-edit syntax gate on the same edited-path set (Python/JS).
+        // Fast post-edit syntax gate on the same edited-path set (Python/JS
+        // interpreters, tree-sitter for the codegraph grammars).
         if compile_check_enabled && !lsp_edited_paths.is_empty() {
             compile_check_block = crate::redact::string(
                 crate::postcheck::check_block(&lsp_edited_paths)
