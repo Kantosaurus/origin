@@ -22,7 +22,7 @@ pub mod backend_macos;
 #[cfg(all(target_os = "windows", feature = "windows", not(feature = "no-sandbox")))]
 pub mod backend_windows;
 
-pub use env::{is_secret_env_name, scrub_env};
+pub use env::{is_redactable_secret_env_name, is_secret_env_name, scrub_env};
 pub use profile::{ProfileOrdinal, SandboxProfile};
 
 use thiserror::Error;

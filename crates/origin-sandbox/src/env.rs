@@ -85,6 +85,24 @@ pub fn is_secret_env_name(name: &str) -> bool {
         || (n.starts_with("ORIGIN_") && n.contains("KEY"))
 }
 
+/// C9: the narrower set whose VALUES are redacted by value from tool output:
+/// `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `GITHUB_TOKEN`, `GH_TOKEN`,
+/// `ORIGIN_*KEY*`, and `AWS_SECRET_ACCESS_KEY` (case-insensitive). Unlike
+/// [`is_secret_env_name`] it omits the whole-vendor prefixes (`AWS_REGION`,
+/// `OPENAI_BASE_URL`, `ANTHROPIC_MODEL`…): scrubbing too much only drops a
+/// variable, but redacting too much rewrites ordinary text.
+#[must_use]
+pub fn is_redactable_secret_env_name(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    ["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"]
+        .iter()
+        .any(|s| n.ends_with(s))
+        || n == "GITHUB_TOKEN"
+        || n == "GH_TOKEN"
+        || n == "AWS_SECRET_ACCESS_KEY"
+        || (n.starts_with("ORIGIN_") && n.contains("KEY"))
+}
+
 /// Whether a child keeps `name`, given the raw `ORIGIN_ENV_PASSTHROUGH` value.
 fn keep(name: &str, passthrough: &str) -> bool {
     if passthrough
@@ -112,7 +130,39 @@ pub fn scrub_env(cmd: &mut std::process::Command) {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_secret_env_name, keep};
+    use super::{is_redactable_secret_env_name, is_secret_env_name, keep};
+
+    #[test]
+    fn redactable_names_are_credentials_only() {
+        for s in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "AZURE_CLIENT_SECRET",
+            "DB_PASSWORD",
+            "ORIGIN_VAULT_KEY",
+        ] {
+            assert!(is_redactable_secret_env_name(s), "{s}");
+        }
+        for s in [
+            "AWS_REGION",
+            "AWS_PROFILE",
+            "AWS_ACCESS_KEY_ID",
+            "OPENAI_BASE_URL",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_MODEL",
+            "GOOGLE_CLOUD_PROJECT",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "PATH",
+        ] {
+            assert!(!is_redactable_secret_env_name(s), "{s}");
+        }
+    }
 
     #[test]
     fn secret_names() {

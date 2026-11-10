@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 //! C9: redact the harness's own credentials by VALUE.
 //!
-//! At daemon start [`collect`] reads the values of secret-named env vars (the
-//! A6 matcher, `origin_tools::is_secret_env_name`) and of the keyvault entries
+//! At daemon start [`collect`] reads the values of credential-named env vars
+//! (`origin_tools::is_redactable_secret_env_name`) and of the keyvault entries
 //! the provider factory reads, and [`install`] makes them process-wide. Every
 //! exact occurrence is then replaced with `[REDACTED:<NAME>]` where a tool
-//! result is captured (agent loop, before CAS/TUI/transcript) and where a
-//! message is persisted (`SessionStore`). Values shorter than [`MIN_LEN`] are
-//! ignored. Nothing installed ⇒ every helper is a no-op.
+//! result is captured (agent loop, before CAS/TUI/transcript), in turn-end gate
+//! output, and where a message is persisted (`SessionStore`). Values shorter
+//! than [`MIN_LEN`] or blank are ignored. Nothing installed ⇒ every helper is a
+//! no-op. File-mutating tools refuse content carrying an installed marker
+//! ([`installed_marker_in`]), so a redacted value is never written back to disk.
+//!
+//! Not covered: keys added at runtime (`KeyringSet`), OAuth tokens rotated
+//! after startup, accounts other than the startup account, a secret that
+//! appears multi-line or JSON-escaped (exact-value match only), and a secret cut
+//! in half by output truncation (the surviving fragment does not match).
 
 use std::borrow::Cow;
 use std::sync::OnceLock;
@@ -19,20 +26,28 @@ use origin_core::types::{Block, Message};
 pub const MIN_LEN: usize = 8;
 
 /// Exact-value matcher, built once.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Redactor {
     /// `(value, "[REDACTED:<NAME>]")`, longest value first so a value that
     /// contains another is replaced whole.
     pairs: Vec<(String, String)>,
 }
 
+/// Prints only the markers (names), never a value.
+impl std::fmt::Debug for Redactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.pairs.iter().map(|(_, m)| m)).finish()
+    }
+}
+
 impl Redactor {
-    /// Build from `(name, value)` pairs; values shorter than [`MIN_LEN`] are dropped.
+    /// Build from `(name, value)` pairs; values shorter than [`MIN_LEN`] or
+    /// blank after trimming are dropped.
     #[must_use]
     pub fn new(secrets: impl IntoIterator<Item = (String, String)>) -> Self {
         let mut pairs: Vec<(String, String)> = secrets
             .into_iter()
-            .filter(|(_, v)| v.len() >= MIN_LEN)
+            .filter(|(_, v)| v.len() >= MIN_LEN && !v.trim().is_empty())
             .map(|(n, v)| (v, format!("[REDACTED:{n}]")))
             .collect();
         // Stable: on equal values the first-collected name (env before vault) wins.
@@ -68,6 +83,18 @@ fn owned(c: Cow<'_, str>) -> Option<String> {
         Cow::Owned(s) => Some(s),
         Cow::Borrowed(_) => None,
     }
+}
+
+/// The first installed `[REDACTED:<NAME>]` marker found in `s`, if any. A
+/// marker for a name that is not installed is ordinary text (`None`).
+#[must_use]
+pub fn installed_marker_in(s: &str) -> Option<&'static str> {
+    ACTIVE
+        .get()?
+        .pairs
+        .iter()
+        .map(|(_, m)| m.as_str())
+        .find(|m| s.contains(m))
 }
 
 /// Redact `s` with the installed redactor.
@@ -116,7 +143,7 @@ pub fn message(m: &Message) -> Cow<'_, Message> {
 
 /// Collect the secret values to redact.
 ///
-/// Every secret-named env var, plus the keyvault credential of each catalog
+/// Every credential-named env var (`*_API_KEY`, `*_TOKEN`, …), plus the keyvault credential of each catalog
 /// provider for `account` (the raw key, or the `access`/`refresh`/`secret`
 /// fields of a JSON blob). Fail-safe: a vault read error skips that entry and
 /// is logged once (never the value).
@@ -128,7 +155,7 @@ pub async fn collect(
     use origin_provider::catalog::AuthScheme;
     let mut secrets: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-        .filter(|(k, _)| origin_tools::is_secret_env_name(k))
+        .filter(|(k, _)| origin_tools::is_redactable_secret_env_name(k))
         .collect();
     let mut failed = 0u32;
     // ponytail: sequential reads (one per catalog provider) at startup; run them

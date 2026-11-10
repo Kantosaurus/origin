@@ -17,10 +17,36 @@ use std::sync::{Arc, Mutex};
 
 const KEY: &str = "sk-ant-c9-test-value-0123456789";
 const MARKER: &str = "[REDACTED:ANTHROPIC_API_KEY]";
+/// Installed too, but under the 8-char floor ⇒ never redacted.
+const SHORT: &str = "short12";
+
+/// Every test installs the same redactor; first call wins.
+fn setup() {
+    install(Redactor::new([
+        ("ANTHROPIC_API_KEY".to_string(), KEY.to_string()),
+        ("SHORT_TOKEN".to_string(), SHORT.to_string()),
+    ]));
+}
 
 struct Recording {
     responses: Mutex<Vec<ChatResponse>>,
     seen: Mutex<Vec<Vec<Message>>>,
+}
+
+impl Recording {
+    fn new(blocks: Vec<Block>) -> Self {
+        let responses = blocks
+            .into_iter()
+            .map(|b| ChatResponse {
+                assistant: Message::new(Role::Assistant).with_block(b),
+                usage: Usage::default(),
+            })
+            .collect();
+        Self {
+            responses: Mutex::new(responses),
+            seen: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 #[async_trait]
@@ -38,6 +64,15 @@ impl Provider for Recording {
     }
 }
 
+fn tool_use(name: &str, args: &serde_json::Value) -> Block {
+    Block::ToolUse {
+        id: format!("tu_{}", ulid::Ulid::new()),
+        name: name.into(),
+        input_json: serde_json::to_vec(args).unwrap(),
+        cache_marker: None,
+    }
+}
+
 fn tool_result_text(msgs: &[Message]) -> String {
     msgs.iter()
         .flat_map(|m| &m.blocks)
@@ -50,11 +85,7 @@ fn tool_result_text(msgs: &[Message]) -> String {
 
 #[tokio::test]
 async fn tool_result_echoing_a_key_is_redacted_for_model_and_saved_session() {
-    install(Redactor::new([(
-        "ANTHROPIC_API_KEY".to_string(),
-        KEY.to_string(),
-    )]));
-
+    setup();
     let dir = tempfile::tempdir().unwrap();
     let cas = Arc::new(
         Store::open(StoreConfig {
@@ -66,27 +97,12 @@ async fn tool_result_echoing_a_key_is_redacted_for_model_and_saved_session() {
         .unwrap(),
     );
     let file = dir.path().join("dotenv.txt");
-    std::fs::write(&file, format!("ANTHROPIC_API_KEY={KEY}\nOTHER=short12\n")).unwrap();
+    std::fs::write(&file, format!("ANTHROPIC_API_KEY={KEY}\nSHORT_TOKEN={SHORT}\n")).unwrap();
 
-    let tool_use = Block::ToolUse {
-        id: "tu_1".into(),
-        name: "Read".into(),
-        input_json: serde_json::to_vec(&serde_json::json!({"file_path": file.to_str().unwrap()})).unwrap(),
-        cache_marker: None,
-    };
-    let provider = Recording {
-        responses: Mutex::new(vec![
-            ChatResponse {
-                assistant: Message::new(Role::Assistant).with_block(tool_use),
-                usage: Usage::default(),
-            },
-            ChatResponse {
-                assistant: Message::new(Role::Assistant).with_block(Block::text("done")),
-                usage: Usage::default(),
-            },
-        ]),
-        seen: Mutex::new(Vec::new()),
-    };
+    let provider = Recording::new(vec![
+        tool_use("Read", &serde_json::json!({"file_path": file.to_str().unwrap()})),
+        Block::text("done"),
+    ]);
     let opts = LoopOptions {
         cas: Some(Arc::clone(&cas)),
         streaming_disabled: true,
@@ -109,7 +125,10 @@ async fn tool_result_echoing_a_key_is_redacted_for_model_and_saved_session() {
     let body = tool_result_text(&wire);
     assert!(body.contains(MARKER), "model-facing tool result: {body}");
     assert!(!body.contains(KEY), "raw key reached the model: {body}");
-    assert!(body.contains("short12"), "non-secret text is untouched: {body}");
+    assert!(
+        body.contains(&format!("SHORT_TOKEN={SHORT}")),
+        "an installed value under 8 chars is not redacted: {body}"
+    );
 
     // Saved session: persisted through the store, reloaded, inflated from CAS.
     let store = SessionStore::open(dir.path().join("sessions.db")).unwrap();
@@ -123,4 +142,169 @@ async fn tool_result_echoing_a_key_is_redacted_for_model_and_saved_session() {
     // The session title is derived from that first user line.
     let title = store.list_summaries().unwrap()[0].title.clone().unwrap();
     assert!(title.contains(MARKER) && !title.contains(KEY), "title: {title}");
+}
+
+/// Finding 1: only credential-shaped env names (and vault entries) are
+/// collected; vendor config like `AWS_REGION` stays readable text.
+#[tokio::test]
+async fn collect_redacts_credentials_not_vendor_config() {
+    for (k, v) in [
+        ("AWS_REGION", "us-east-1"),
+        ("OPENAI_BASE_URL", "https://api.example.test/v1"),
+        ("ANTHROPIC_MODEL", "claude-c9-test-model"),
+        ("C9_INDENT_TOKEN", "          "),
+        ("OPENAI_API_KEY", "sk-openai-c9-value-0123"),
+        ("AWS_SECRET_ACCESS_KEY", "aws-secret-c9-value-0123"),
+    ] {
+        std::env::set_var(k, v);
+    }
+    let vault = origin_keyvault::KeyVault::in_memory();
+    vault
+        .set(
+            "anthropic",
+            "default",
+            origin_keyvault::Secret::new("sk-vault-c9-0123456789".to_string()),
+        )
+        .await
+        .unwrap();
+    let r = origin_daemon::redact::collect(&vault, &origin_provider::catalog::Catalog::builtin(), "default")
+        .await;
+
+    let text = "region=us-east-1 url=https://api.example.test/v1 model=claude-c9-test-model \
+                indent=[          ] openai=sk-openai-c9-value-0123 aws=aws-secret-c9-value-0123 \
+                vault=sk-vault-c9-0123456789";
+    let out = r.redact(text);
+    for kept in [
+        "us-east-1",
+        "https://api.example.test/v1",
+        "claude-c9-test-model",
+        "[          ]",
+    ] {
+        assert!(out.contains(kept), "{kept} must not be redacted: {out}");
+    }
+    for gone in [
+        "[REDACTED:OPENAI_API_KEY]",
+        "[REDACTED:AWS_SECRET_ACCESS_KEY]",
+        "[REDACTED:anthropic]",
+    ] {
+        assert!(out.contains(gone), "{gone} missing: {out}");
+    }
+}
+
+async fn run_one_tool(name: &str, args: &serde_json::Value) -> (bool, String) {
+    let provider = Recording::new(vec![tool_use(name, args), Block::text("done")]);
+    let opts = LoopOptions {
+        streaming_disabled: true,
+        ..LoopOptions::default()
+    };
+    let mut session = Session::new("test", "claude-opus-4-7");
+    run_loop(&mut session, "edit", &provider, &AlwaysAllow, &opts)
+        .await
+        .expect("loop ok");
+    let is_error = session
+        .messages
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .any(|b| matches!(b, Block::ToolResult { is_error: true, .. }));
+    (is_error, tool_result_text(&session.messages))
+}
+
+/// Finding 2: writing an installed marker would replace the user's real secret
+/// on disk; the shared dispatch path refuses it. Other bracketed text is fine.
+#[tokio::test]
+async fn file_writes_carrying_an_installed_marker_are_refused() {
+    setup();
+    let dir = tempfile::tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    let original = format!("ANTHROPIC_API_KEY={KEY}\n");
+    std::fs::write(&env_file, &original).unwrap();
+    let path = env_file.to_str().unwrap();
+
+    let (err, body) = run_one_tool(
+        "Write",
+        &serde_json::json!({"file_path": path, "content": format!("ANTHROPIC_API_KEY={MARKER}\nX=1\n"), "force": true}),
+    )
+    .await;
+    assert!(err && body.contains("redacted"), "Write refused: {body}");
+    assert_eq!(
+        std::fs::read_to_string(&env_file).unwrap(),
+        original,
+        "file unchanged"
+    );
+
+    let (err, body) = run_one_tool(
+        "Edit",
+        &serde_json::json!({"file_path": path, "old_string": "ANTHROPIC_API_KEY=", "new_string": format!("ANTHROPIC_API_KEY={MARKER} #")}),
+    )
+    .await;
+    assert!(err && body.contains("redacted"), "Edit refused: {body}");
+    assert_eq!(
+        std::fs::read_to_string(&env_file).unwrap(),
+        original,
+        "file unchanged"
+    );
+
+    let other = dir.path().join("notes.md");
+    let (err, body) = run_one_tool(
+        "Write",
+        &serde_json::json!({"file_path": other.to_str().unwrap(), "content": "see [REDACTED:SOMETHING_ELSE]\n"}),
+    )
+    .await;
+    assert!(!err, "an uninstalled marker is ordinary text: {body}");
+    assert!(std::fs::read_to_string(&other)
+        .unwrap()
+        .contains("[REDACTED:SOMETHING_ELSE]"));
+}
+
+/// Finding 3: turn-end gate output (child-process stdout) is redacted before it
+/// rides to the model as volatile context or as the repro-gate continuation.
+#[tokio::test]
+async fn gate_output_echoing_a_key_is_redacted_for_the_model() {
+    setup();
+    let dir = tempfile::tempdir().unwrap();
+    let edited = dir.path().join("lib.py");
+    let provider = Recording::new(vec![
+        tool_use(
+            "Write",
+            &serde_json::json!({"file_path": edited.to_str().unwrap(), "content": "x = 1\n"}),
+        ),
+        Block::text("done"),
+        Block::text("done"),
+        Block::text("done"),
+        Block::text("done"),
+    ]);
+    let opts = LoopOptions {
+        streaming_disabled: true,
+        post_edit: Some(Arc::new(origin_postedit::PostEditConfig {
+            auto_test: true,
+            test_command: Some(format!("echo {KEY}; exit 1")),
+            ..origin_postedit::PostEditConfig::default()
+        })),
+        ..LoopOptions::default()
+    };
+    let mut session = Session::new("test", "claude-opus-4-7");
+    let _ = run_loop(&mut session, "write it", &provider, &AlwaysAllow, &opts).await;
+
+    let seen = provider.seen.lock().unwrap().clone();
+    let texts: Vec<String> = seen
+        .iter()
+        .flatten()
+        .flat_map(|m| &m.blocks)
+        .filter_map(|b| match b {
+            Block::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    let all = texts.join("\n---\n");
+    assert!(
+        !all.contains(KEY),
+        "raw key reached the model via gate output: {all}"
+    );
+    assert!(all.contains(MARKER), "gate output never reached the model: {all}");
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.starts_with("[repro-gate]") && t.contains(MARKER)),
+        "repro-gate continuation carries the marker: {all}"
+    );
 }

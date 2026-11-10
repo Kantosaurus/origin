@@ -4455,7 +4455,8 @@ async fn run_loop_inner(
                     blocks.push(b);
                 }
             }
-            blocks.join("\n\n")
+            // C9: gate blocks carry child-process output (tests can print a .env).
+            crate::redact::text(&blocks.join("\n\n")).into_owned()
         };
         let mut req = ChatRequest {
             system: session_stable_system.clone(),
@@ -5098,7 +5099,10 @@ async fn run_loop_inner(
                         // test-selection is enabled; falls back to `cmd` verbatim.
                         let cmd = effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
                         // Run the oracle now (fresh, not the stale `test_block`).
-                        let mut fresh = run_post_edit_test(&cmd).await.unwrap_or_default();
+                        // C9: redact before it becomes a model-facing User message.
+                        let mut fresh =
+                            crate::redact::text(&run_post_edit_test(&cmd).await.unwrap_or_default())
+                                .into_owned();
                         if !fresh.is_empty() {
                             // Classify against the pre-edit baseline exactly like
                             // the per-turn path (C9), so the model is told whether
@@ -5499,7 +5503,7 @@ async fn run_loop_inner(
                                 .send(StreamEvent::ToolResult {
                                     tool: name.clone(),
                                     ok: false,
-                                    preview: msg.clone(),
+                                    preview: crate::redact::text(&msg).into_owned(),
                                     elided_bytes: 0,
                                 })
                                 .await;
@@ -5948,7 +5952,7 @@ async fn run_loop_inner(
                                     .send(StreamEvent::ToolResult {
                                         tool: name.clone(),
                                         ok: false,
-                                        preview: msg.clone(),
+                                        preview: crate::redact::text(&msg).into_owned(),
                                         elided_bytes: 0,
                                     })
                                     .await;
@@ -6015,7 +6019,7 @@ async fn run_loop_inner(
                                     .send(StreamEvent::ToolResult {
                                         tool: name.clone(),
                                         ok: false,
-                                        preview: msg.clone(),
+                                        preview: crate::redact::text(&msg).into_owned(),
                                         elided_bytes: 0,
                                     })
                                     .await;
@@ -6892,6 +6896,18 @@ async fn dispatch_tool(
     // `RepairDecision` consulted.
     post_edit: Option<&Arc<origin_postedit::PostEditConfig>>,
 ) -> Result<String, LoopError> {
+    // C9: the model only ever sees `[REDACTED:<NAME>]` in place of a real secret.
+    // Writing that marker back would silently replace the user's value on disk.
+    if matches!(meta.name, "Write" | "Edit" | "MultiEdit" | "ApplyPatch") {
+        if let Some(marker) = crate::redact::installed_marker_in(&args.to_string()) {
+            return Err(LoopError::ToolFailure(format!(
+                "{}: refused — the content contains `{marker}`, a placeholder for a secret value that \
+                 was redacted from your view. Writing it would replace the real value on disk. Edit \
+                 around it instead: use Edit on the surrounding lines and never rewrite the redacted value.",
+                meta.name
+            )));
+        }
+    }
     match meta.name {
         "Read" => {
             let args = origin_tools::builtins::read::ReadArgs {

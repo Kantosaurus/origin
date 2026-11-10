@@ -70,12 +70,14 @@ impl SessionStore {
         })
     }
 
-    /// C9 retention: delete every session whose last activity (newest message
-    /// row, else its creation) is older than `days`, with its rows and resume
-    /// token. `0` keeps everything. Returns how many sessions were removed.
+    /// C9 opt-in retention: delete every session whose last activity (newest
+    /// message row, else its creation) is older than `days`, with its rows and
+    /// resume token, in ONE transaction. `0` keeps everything. Content-store
+    /// (CAS) blobs are left in place: this limits history, not disk content.
+    /// Returns how many sessions were removed.
     ///
     /// # Errors
-    /// Propagates sqlite errors.
+    /// Propagates sqlite errors (the transaction is rolled back).
     pub fn prune_older_than(&self, days: u64) -> Result<usize, SessionStoreError> {
         if days == 0 {
             return Ok(0);
@@ -83,20 +85,34 @@ impl SessionStore {
         let age_ms = i64::try_from(days.saturating_mul(86_400_000)).unwrap_or(i64::MAX);
         let cutoff = now_ms().saturating_sub(age_ms);
         let ids: Vec<String> = self.inner.with_conn(|c| {
-            let mut stmt = c.prepare(
-                "SELECT s.id FROM sessions s WHERE COALESCE( \
-                     (SELECT MAX(m.created_at) FROM messages m WHERE m.session_id = s.id), \
-                     s.created_at) < ?1",
-            )?;
-            let rows = stmt.query_map([cutoff], |r| r.get(0))?;
-            rows.collect()
+            let tx = c.unchecked_transaction()?;
+            let ids: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT s.id FROM sessions s WHERE COALESCE( \
+                         (SELECT MAX(m.created_at) FROM messages m WHERE m.session_id = s.id), \
+                         s.created_at) < ?1",
+                )?;
+                let rows = stmt.query_map([cutoff], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            for id in &ids {
+                for table in ["message_snapshots", "messages"] {
+                    tx.execute(&format!("DELETE FROM {table} WHERE session_id = ?1"), [id])?;
+                }
+                tx.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+            }
+            tx.commit()?;
+            Ok(ids)
         })?;
+        if !ids.is_empty() {
+            tracing::warn!(
+                count = ids.len(),
+                retention_days = days,
+                ids = ?ids,
+                "pruned sessions idle past ORIGIN_SESSION_RETENTION_DAYS"
+            );
+        }
         for id in &ids {
-            self.inner.with_conn(|c| {
-                c.execute("DELETE FROM message_snapshots WHERE session_id = ?1", [id])?;
-                Ok(())
-            })?;
-            self.delete(id)?;
             // Ids come from our own rows; still never let one escape the dir.
             if !id.contains(['/', '\\', '.']) {
                 let _ = std::fs::remove_file(self.resume_dir().join(format!("{id}.json")));
@@ -747,6 +763,16 @@ mod tests {
     fn prune_removes_only_sessions_older_than_the_limit() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::open(dir.path().join("sessions.db")).expect("open");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(dir.path().join("sessions.db")).expect("db exists");
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o600,
+                "session db is user-only"
+            );
+        }
         std::fs::create_dir_all(store.resume_dir()).expect("resume dir");
         let day_ms: i64 = 86_400_000;
         let old = super::now_ms() - 40 * day_ms;

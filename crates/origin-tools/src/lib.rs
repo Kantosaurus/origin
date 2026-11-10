@@ -22,7 +22,9 @@ pub use dispatch::{Cache, CacheHit, NormalizedInput, MEMOIZATION_SKIPLIST};
 // without taking a direct dep on `origin-sandbox` (P11.5).
 pub use origin_sandbox::{ProfileOrdinal, SandboxProfile};
 // A6: the child-env allow-list, for spawn sites outside the supervisor (MCP).
-pub use origin_sandbox::{is_secret_env_name, sandbox_status, scrub_env, SandboxStatus};
+pub use origin_sandbox::{
+    is_redactable_secret_env_name, is_secret_env_name, sandbox_status, scrub_env, SandboxStatus,
+};
 pub use registry::{registry_iter, ToolMeta};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

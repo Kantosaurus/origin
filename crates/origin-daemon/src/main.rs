@@ -368,10 +368,6 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
         .with_plan(wire_plan.clone());
 
     let initial_account = env::var("ORIGIN_ACCOUNT").unwrap_or_else(|_| "default".into());
-    // C9: build the by-value secret redactor once, before any tool can run.
-    origin_daemon::redact::install(
-        origin_daemon::redact::collect(&vault, factory.catalog(), &initial_account).await,
-    );
     // Register the factory process-wide so the agent loop can rebuild a provider
     // mid-loop for a CROSS-PROVIDER router pick (foundation L84 / kilo L265). This
     // is inert unless `ORIGIN_ROUTER` is set and a pick lands on a different
@@ -407,19 +403,21 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
         "initial provider ready"
     );
     let active: ActiveProvider = Arc::new(RwLock::new(initial_provider));
+    // C9: build the by-value secret redactor once, before any tool can run, and
+    // after the initial provider build so an OAuth token refreshed at startup is
+    // the one collected.
+    origin_daemon::redact::install(
+        origin_daemon::redact::collect(&vault, factory.catalog(), &initial_account).await,
+    );
 
     let db_path = env::var("ORIGIN_DB").unwrap_or_else(|_| default_db_path());
     let session_store = Arc::new(SessionStore::open(&db_path)?);
     info!(db = %db_path, "session store ready");
-    // C9: session retention. ORIGIN_SESSION_RETENTION_DAYS (default 30; 0 = keep forever).
-    let retention_days = env::var("ORIGIN_SESSION_RETENTION_DAYS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(30);
-    match session_store.prune_older_than(retention_days) {
-        Ok(0) => {}
-        Ok(n) => info!(pruned = n, retention_days, "pruned sessions past retention"),
-        Err(e) => warn!(error = %e, "session retention prune failed"),
+    // C9: opt-in session retention. ORIGIN_SESSION_RETENTION_DAYS = N > 0 prunes
+    // sessions idle for N days; unset / 0 / unparsable keeps everything.
+    let retention_days = session_retention_days(env::var("ORIGIN_SESSION_RETENTION_DAYS").ok().as_deref());
+    if let Err(e) = session_store.prune_older_than(retention_days) {
+        warn!(error = %e, "session retention prune failed");
     }
 
     // Code-graph subsystem (P7.8 Subsystem A). Opens its own CAS root and
@@ -4346,6 +4344,17 @@ fn persist(session_store: &SessionStore, cas: Option<&Arc<Store>>, session: &Ses
     }
 }
 
+/// C9: `ORIGIN_SESSION_RETENTION_DAYS` → days to keep; `0` = keep forever.
+/// Unset, `0`, or anything that is not a whole number of days (`off`, `-1`)
+/// keeps everything (an unparsable value warns once): pruning is opt-in.
+fn session_retention_days(raw: Option<&str>) -> u64 {
+    let Some(v) = raw else { return 0 };
+    v.trim().parse::<u64>().unwrap_or_else(|_| {
+        warn!(value = %v, "ORIGIN_SESSION_RETENTION_DAYS is not a whole number of days; keeping all sessions");
+        0
+    })
+}
+
 /// A7: persist what a FAILED request already completed. The loop can error
 /// between an assistant `tool_use` and its `tool_result` (e.g. the stuck-loop
 /// halt), so the orphaned tail is dropped first, exactly as on interrupt.
@@ -4722,6 +4731,17 @@ mod tests {
         let before = balanced.len();
         super::drop_orphan_tool_use_tail(&mut balanced);
         assert_eq!(balanced.len(), before, "a balanced transcript is left intact");
+    }
+
+    /// C9: pruning is opt-in — only a positive whole number of days prunes.
+    #[test]
+    fn session_retention_is_opt_in() {
+        use super::session_retention_days as days;
+        assert_eq!(days(None), 0, "unset keeps everything");
+        for keep in ["0", "off", "never", "-1", "", "3.5"] {
+            assert_eq!(days(Some(keep)), 0, "{keep:?} keeps everything");
+        }
+        assert_eq!(days(Some(" 45 ")), 45);
     }
 
     #[test]
