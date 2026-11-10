@@ -8,6 +8,8 @@ versions correspond to phase milestones from the implementation plan.
 
 The harness-improvements work: one entry per item id. Measurements quoted below are the ones taken while building
 (bytes of prompts and tool definitions); no benchmark baseline has been run, so no accuracy or cost effect is claimed.
+The older `## Unreleased` and `## 1.0.0 — 2026-06-17` headings further down are historical and unverified: which
+release their entries belong to cannot be told from the repository (the current version is pre-1.0 `0.9.14`).
 
 ### Breaking changes
 
@@ -27,9 +29,23 @@ Defaults that changed, each with its escape hatch:
   input.
 - **Dependency-install gate**: installing a package the project does not declare needs approval (C6). Escape:
   `ORIGIN_CMD_GUARD=0` (also turns off the command guard).
-- **`WebFetch` requires a `prompt`** and returns a cheap model's answer, not the page (C4). Escape:
-  `ORIGIN_WEBFETCH_RAW=1`.
+- **`WebFetch` requires a `prompt`** (whenever the quarantine call runs) and returns a cheap model's answer, not the
+  page (C4). Escape: `ORIGIN_WEBFETCH_RAW=1`.
 - **The stealth-browser fallback is off** (D11). Escape: `ORIGIN_STEALTH_FALLBACK=1`.
+- **Sub-agent results** report `status` `completed`/`budget_exhausted`/`aborted`/`goal_unreachable` and cap report
+  text at 8,000 characters (was a silent 4,000 cut) (B8). **A full `origin rewind`** now needs git 2.23+ (C8).
+  **Windows turn-end gate commands** return the program's own exit code instead of 1 (C5). **Turn-end gate commands**
+  the command guard rates `NeedsApproval` (e.g. a `$(…)` or variable as the program) are no longer run (C3; escape `ORIGIN_CMD_GUARD=0`).
+- **Prose edits (`ORIGIN_EDITFMT=1`) now obey the permission mode** (C2, C7): an edit block written in reply text is
+  applied only where a `Write` would be allowed without asking, so nothing lands in mode `on`, outside the workspace
+  or on protected paths, and a whole-file edit needs a path line directly above a closed fence. Escape: use the edit
+  tools, or `/permissions off`.
+- **The browser sidecars** (agent-browser, CloakBrowser) get the allow-listed child environment instead of the
+  daemon's, so `AGENT_BROWSER_*` configuration variables no longer reach them (A6). Escape: list the names in
+  `ORIGIN_ENV_PASSTHROUGH`, or `ORIGIN_ENV_SCRUB=0`.
+- **Best-of-N refuses to apply a winner** whose files have uncommitted changes in the workspace (C5); the first
+  attempt's result is kept and the reason is shown. No escape hatch: applying it would fail or mix two untested
+  edits.
 - Also changed by default: child processes get an allow-listed environment without provider keys (A6; escape
   `ORIGIN_ENV_SCRUB=0`, or add names with `ORIGIN_ENV_PASSTHROUGH`); `WebFetch` refuses private and local addresses
   (A9; escape `ORIGIN_WEBFETCH_ALLOW_PRIVATE=1`); the per-model edit-format table picks the advertised edit tools
@@ -39,12 +55,17 @@ Defaults that changed, each with its escape hatch:
 ### Security
 
 - **A4**: Swarm sub-agents inherit the daemon's `governance.toml` overlays (policy layers, conseca tool/path/domain
-  lists, `[[permission_rules]]`, `[browser] max_actions_per_session`); previously a worker ran with none, so a parent
-  denied a tool could delegate it. `Task` is now `RequiresPermission`; its preview starts with
-  `<G>/<T> gated tools, <D> mcp servers` (the gated tools and MCP servers the worker would get). Under a skill mask
-  the requested tools are narrowed to the mask and a `Task` naming MCP servers is refused; a nested `Task` or
-  `RunWorkflow` inside a worker is an error result. Limit: the header counts the gated tools but names them only
-  through the model-chosen entries. Escape hatch: the overlays themselves (remove the rule from `governance.toml`).
+  lists, `[[permission_rules]]` deny rules (never allow rules), `[browser] max_actions_per_session`); previously a
+  worker ran with none, so a parent denied a tool could delegate it. A worker's inline-MCP tools go through the same
+  checks as built-in tools (governance policy, read-only mode, where an MCP tool always counts as mutating, the
+  PreTool hook, the standard denial result, secret redaction of output), and their error bodies are bounded at 16 KiB
+  like their results. `Task` is now `RequiresPermission`; its preview starts with the count of the gated tools and
+  MCP servers the worker would get, naming the gated tools from the registry:
+  `2/14 gated tools (Bash, Edit), 1 mcp servers | …` (up to eight names, then `+K`; `(all)` when every gated tool is
+  granted). Under a skill mask the requested tools are narrowed to the mask and a `Task` naming MCP servers is
+  refused; a nested `Task` or `RunWorkflow` inside a worker is an error result. Best-of-N candidates run under the
+  session's `[[permission_rules]]` (allow and deny), policy layers and conseca. Escape hatch: the overlays themselves
+  (remove the rule from `governance.toml`).
 - **A5**: `Task` inline-MCP servers are admitted only by name against servers defined in user-scope config
   (`~/.origin/subagents/*.md` `mcp:`), and the worker runs the user's definition; a model-supplied `command`/`url` is
   never run, and an unknown entry fails the `Task` with an error showing the refused command line. Escape hatch:
@@ -52,15 +73,18 @@ Defaults that changed, each with its escape hatch:
 - **A6**: child processes get an allow-listed environment instead of the daemon's: Bash, turn-end gate commands
   (`auto_test`/`auto_lint`/repro gate, best-of-N's test oracle and its `git apply`), hooks, MCP stdio servers,
   language servers and the `ORIGIN_LSP_AUTO` installer, post-edit lint/format and syntax checks, notification
-  commands and webhooks, shadow-git checkpoints and self-dev git (desktop toasts excepted). Provider keys and other
+  commands and webhooks, shadow-git checkpoints, self-dev git (desktop toasts excepted) and the `Browser` tool's
+  sidecars (`agent-browser`, and the CloakBrowser sidecar, opt-in since D11), whose `AGENT_BROWSER_*` configuration
+  variables are therefore dropped unless listed in `ORIGIN_ENV_PASSTHROUGH`. Provider keys and other
   `*_API_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD` names are dropped. The allow-list includes Windows build-discovery
   variables (`ProgramFiles`, `ProgramFiles(x86)`, `windir`, `NUMBER_OF_PROCESSORS`, `PROCESSOR_ARCHITECTURE`) and
   project-resolution variables (`PYTHONPATH`, `PYTHONHOME`, `GOFLAGS`, `GOMODCACHE`, `GOPRIVATE`, `GONOSUMDB`,
   `GONOPROXY`, `GOWORK`, `RUSTUP_TOOLCHAIN`, `RUSTFLAGS`, `CARGO_TARGET_DIR`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`,
-  `XDG_DATA_HOME`, `LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, `DOTNET_ROOT`, `NODE_PATH`). Turn-end gate commands run
-  through the supervised spawn (command guard, PowerShell fallback when `pwsh` is absent). Add names with
-  `ORIGIN_ENV_PASSTHROUGH`; `ORIGIN_ENV_SCRUB=0` restores full inheritance. Not covered: the `Browser` tool's
-  backends (`agent-browser`, and the CloakBrowser sidecar, opt-in since D11) inherit the daemon's environment.
+  `XDG_DATA_HOME`, `LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, `DOTNET_ROOT`, `NODE_PATH`), and, for the browser
+  sidecars, `PLAYWRIGHT_BROWSERS_PATH`, `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, `XDG_RUNTIME_DIR` — being on the
+  allow-list, these five reach every child process, Bash included. Turn-end gate commands run through the supervised
+  spawn (command guard, PowerShell fallback when `pwsh` is absent). Add names with `ORIGIN_ENV_PASSTHROUGH`;
+  `ORIGIN_ENV_SCRUB=0` restores full inheritance.
 - **A9**: conseca `allow_paths`/`deny_paths` now gate `Grep` and `Glob` (`path`, or the cwd when omitted) and compare
   lexically canonicalized path components, so `..`, `.` and `//` segments, relative paths and Windows spellings
   (device and UNC prefixes, `\\?\`, trailing dots, alternate data streams) can no longer slip past a rule; anything
@@ -88,8 +112,14 @@ Defaults that changed, each with its escape hatch:
   daemon it spawns; a daemon's own variable applies to non-interactive requests only). Explicit `[[permission_rules]]`
   deny rules now also bind auto-allowed tools and win over the flag. Once a network or MCP result (or a sub-agent
   result that contained one) has entered a session, network tools and unsandboxed Bash need a fresh approval each
-  time. Sub-agents run only what their `Task` grant names and never a command that needs approval or a write outside
-  the workspace. An unattended interactive `/goal` loop blocks on the first ask. Other run-on-next-use files (CI
+  time; a `RunWorkflow` that fails after loading its workflow taints the session when any step could reach a network
+  or MCP tool. **Security fix:** prose edits (`ORIGIN_EDITFMT=1`, edit blocks applied from the model's reply text)
+  previously bypassed every permission check; each is now resolved against the run's working directory and applied
+  only where a `Write` to that path would be allowed without asking (nothing in mode `on`, nothing outside the
+  workspace or on protected paths; deny rules, the governance policy, read-only mode, the conseca path policy and
+  the `pre_tool` hook apply), and edits that were not applied are named in one `[editfmt] … not applied` line at
+  the end of the reply. Sub-agents run only what their `Task` grant names and never a command that needs approval
+  or a write outside the workspace. An unattended interactive `/goal` loop blocks on the first ask. Other run-on-next-use files (CI
   workflows, package scripts, Makefiles) are ordinary project code.
 - **C3**: `origin-cmdparse` parses Bash command lines instead of pattern-matching them: quoting and escapes;
   `;` `&&` `||` `|` `&` and newlines; subshells, `$(…)`, backticks and `<(…)`; the `bash -c`, `pwsh -Command`,
@@ -97,13 +127,16 @@ Defaults that changed, each with its escape hatch:
   analysing the first four non-option words after a prefix (variable, glob and group words skipped; a per-scan budget
   of 4,096 extra starts, then approval is needed). A command whose program cannot be determined statically, or that
   cannot be parsed, gets a new `NeedsApproval` verdict: it goes through the permission prompt and is denied when no
-  one can be asked. Turn-end gate commands rated `Dangerous` or `NeedsApproval` are not run; the only trace is a
-  daemon log line. Known limits: `sudo -u a -g b -h host -p prompt rm -rf ~` (past the four-word window) and bash
-  single-dash long options (`bash -norc < evil.sh`) are rated `Safe`. `ORIGIN_CMD_GUARD=0` still disables the guard.
+  one can be asked; such an ask never offers "Always allow". Turn-end gate commands rated `Dangerous` or
+  `NeedsApproval` are not run; each run logs it, and the user is told once per session per gate with one `[origin]`
+  line naming the gate, the command, the reason and the way out. Known limits:
+  `sudo -u a -g b -h host -p prompt rm -rf ~` (past the four-word window) and bash single-dash long options (`bash -norc < evil.sh`) are rated `Safe`. `ORIGIN_CMD_GUARD=0` still disables the guard.
   Note for bisecting: `origin-daemon` does not build at the six commits `3b022e6..f2f975d`.
-- **C4**: `WebFetch` takes a required `prompt` and returns only the answer of a tool-less quarantine call to a cheap
-  model of the active provider (on Anthropic, the sidecar model `ORIGIN_SIDECAR_MODEL`, default Haiku; other
-  providers fall back to the wrapped page). A failed quarantine call is a tool error, never the raw page — if that
+- **C4**: `WebFetch` takes a `prompt` (its description names `prompt` and `url`/`urls` as required; a missing
+  `prompt` is an error only when the quarantine call will run, not under `ORIGIN_WEBFETCH_RAW=1` and not when the
+  provider has no cheap model) and returns only the answer of a tool-less quarantine call to a cheap model of the
+  active provider (on Anthropic, the sidecar model `ORIGIN_SIDECAR_MODEL`, default Haiku; other providers fall back
+  to the wrapped page). A failed quarantine call is a tool error, never the raw page — if that
   model is not available on the account, every `WebFetch` fails until `ORIGIN_SIDECAR_MODEL` or
   `ORIGIN_WEBFETCH_RAW=1` is set. Results of `WebFetch`, `WebSearch`, `Browser`, `gmail` and every `mcp__*` tool are
   wrapped in `<external source="…" url="…">…</external>` with marker look-alikes escaped, and the system prompt states
@@ -141,7 +174,7 @@ Defaults that changed, each with its escape hatch:
 - **C9**: the daemon redacts its own provider credentials by value — env vars named like credentials (`*_API_KEY`,
   `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `PGPASSWORD`, `GITHUB_TOKEN`/`GH_TOKEN`, `ORIGIN_*_KEY`,
   `AWS_SECRET_ACCESS_KEY`) and keyvault credentials read at startup, values of 8+ chars — as `[REDACTED:<NAME>]` in
-  tool output, turn-end gate output (including what the goal verifier sees) and persisted sessions, and file-writing
+  tool output, recalled memory and the repo-map focus block added to a prompt, turn-end gate output (including what the goal verifier sees) and persisted sessions, and file-writing
   tools refuse to write such a marker back to disk. Best-effort, not complete: keys added or rotated after startup,
   other accounts, and multi-line/escaped or truncated secrets are not caught. The session DB is created 0600 on Unix
   (the content store and resume directory are not). Opt-in `ORIGIN_SESSION_RETENTION_DAYS` prunes idle sessions on
@@ -173,13 +206,16 @@ Defaults that changed, each with its escape hatch:
   VM. **No baseline is committed**: none could be run where this was built (no API key, no Docker scorer).
 - **B6**: the system prompt's `<origin-env>` block lists the toolchains and package managers found on `PATH` in one
   `Tools on PATH: …` line (PATH lookup only, no process spawned; a zero-length or non-executable first match, such
-  as the Windows Store python alias, counts as not found). It is probed once per daemon process with a 2 s budget
+  as the Windows Store python alias, counts as not found, and on Unix a symlink to a directory is ignored so a later
+  real binary is found). It is probed once per daemon process with a 2 s budget
   and stays fixed for every session, so the prompt cache holds. Disable with `ORIGIN_TOOL_PROBE=0`.
 - **B7**: the default-on post-edit syntax gate also parses edited files with tree-sitter for every grammar
   `origin-codegraph` links (Rust, TypeScript, Go, Java, C/C++, C#, Ruby, Bash, PHP, Swift, Kotlin, Scala, Haskell,
   Elixir, Lua; Python when no real interpreter ran, including when only the Windows Store python alias is present).
   It reports only parse errors an edit added, as a separate `<syntax-advisory>` ("may be a parser limitation —
-  ignore if the code builds"), not a must-fix. Files over 1 MB, `.tsx` and `.h` are skipped. The pinned grammars
+  ignore if the code builds"), not a must-fix. Files over 1 MB, `.tsx` and `.h` are skipped. `.jsx` files are no
+  longer sent to `node --check` (node rejects JSX) and are skipped, since no JavaScript tree-sitter grammar is
+  linked. The pinned grammars
   lag current languages (the pinned Rust grammar flags `use<>`, `&raw const` and `gen {}`). Disable the whole gate
   with `ORIGIN_EDIT_CHECK=0`.
 - **B11**: opt-in pre-completion check. With `ORIGIN_PRECOMPLETE_CHECK=1`, a run that edited files
@@ -191,7 +227,8 @@ Defaults that changed, each with its escape hatch:
   tool calls in `/metrics`, `origin usage` and the TUI panel. They now fire after the terminal test gate.
 - **C8**: with checkpoints on (`ORIGIN_CHECKPOINTS=1` / `ORIGIN_CHECKPOINTS_PER_TOOL=1`), a turn-end gate (auto_test
   / auto_lint / repro gate) that runs and passes tags the current tree as `last-green` in the run's shadow repo
-  (`.origin/shadow.git`, ref `refs/tags/last-green`). A run that later ends with a failing gate gets one note in its
+  (`.origin/shadow.git`, ref `refs/tags/last-green`), provided every armed gate ran and none was red (a gate the
+  command guard refused, or that could not run, blocks the tag). A run that later ends with a failing gate gets one note in its
   final output (not the conversation, not a sub-agent result) naming that checkpoint and the restore commands
   (`origin checkpoint-diff <id>`, `origin rewind <id> --files-only`, `origin rewind <id>`); nothing is restored
   automatically, and restoring overwrites current files. Fixed with it: shadow checkpoint commits ignore the user's
@@ -199,8 +236,8 @@ Defaults that changed, each with its escape hatch:
   silently); checkpoints no longer record the shadow repository itself (a legacy shadow that had recorded itself is
   repaired on the next snapshot), and `origin rewind` no longer corrupts it: a full rewind restores the tree with the
   shadow directory excluded and then moves HEAD, so `last-green` and later checkpoints keep working. Shadow commands
-  no longer run the user's git hooks, and the first failed checkpoint in a run is logged at warn. Restoring a
-  checkpoint (`origin rewind`, with or without `--files-only`) requires git 2.23 or newer (`git restore`).
+  no longer run the user's git hooks, and the first failed checkpoint in a run is logged at warn. A full
+  `origin rewind` requires git 2.23 or newer (`git restore`).
 - **C10**: opt-in post-edit LSP diagnostics (`ORIGIN_LSP_DIAGNOSTICS=1`) keep one language server warm across a
   prompt's turns instead of spawning one per edited file; every edited file is reported to it as changed, and the
   servers are restarted after a shell/unlisted mutation and at each new prompt (including each `/goal` iteration);
@@ -221,14 +258,15 @@ Defaults that changed, each with its escape hatch:
   first request.
 - **B3**: reasoning effort defaults to `high` for the main loop and `medium` for swarm sub-agents on Anthropic (was
   `max` for both). `/effort`, `/fast` and `--effort` still win, and an explicit parent effort is handed down to
-  workers and best-of-N candidates; set `ORIGIN_DEFAULT_EFFORT=max` (or `ultracode`) to restore the old main-loop
+  workers (`Task` workers and the step workers of an in-session `RunWorkflow`, which also inherit the session's
+  ponytail level; the `/workflow` command still uses each worker's defaults) and best-of-N candidates; set `ORIGIN_DEFAULT_EFFORT=max` (or `ultracode`) to restore the old main-loop
   default. Other providers still send no effort by default. The quality effect of `high` versus `max` was not
   measured.
 - **B5**: headless `origin run` (and other non-interactive requests) no longer get the default-workflow directive in
   the system prompt; set `ORIGIN_DEFAULT_WORKFLOW=on` to keep it. Swarm sub-agents get a small fixed prompt (role,
   task contract, tool rules, env, the user's ponytail ruleset when active, and the external-content rule) and no
   longer scan for the repo map. Measured system-prompt bytes when this landed: headless 11,257 → 6,797; worker
-  14,136 → 2,282.
+  14,136 → 6,334 (2,282 with ponytail off; the 14,136 baseline included the ponytail ruleset at its default level).
 - **B8**: sub-agent (`Task`) results report the files the worker's successful edits changed (`files_touched`, first
   100), say whether shell commands ran, and return status `completed` / `budget_exhausted` (turn cap) / `aborted`
   (permission denials) / `goal_unreachable` (error) with the partial work kept; the report text is capped at 8,000
@@ -245,7 +283,12 @@ Defaults that changed, each with its escape hatch:
   other model keeps today's list. `ORIGIN_EDITFMT=0` restores the full list. New opt-in `ORIGIN_TOOL_PROFILE=lean`
   advertises only the core tools (Read, edit tools, Write, Bash, Grep, Glob, Recall, TodoWrite; MCP tools
   unaffected): 5,510 versus 14,708 tool-definition bytes (10 versus 32 tools), about 62% fewer. Both are fixed per
-  session at its first prompt. Static prompt text still names some tools `lean` hides.
+  session at its first prompt. Static prompt text still names some tools `lean` hides. With `ORIGIN_EDITFMT=1`, a
+  whole-file prose edit is applied only for a path line standing alone — relative, no `..`, containing a `/` or a
+  file name with an extension that has a letter (`README.md`, `src/a`) — directly followed by a closed fenced block;
+  `Example:`, `Done.` or `v1.2.3` above a snippet, a plain `done`, or prose before a fence are not edits (a plain
+  reply could previously create or overwrite a file). Several path+fence pairs in one reply are several edits. For
+  the permission checks prose edits now get, see C2.
 - **D3**: the "swarm is always on" and "dispatch a separate adversarial-verifier `Task` for every non-trivial change"
   mandates are opt-in via `ORIGIN_SWARM_ALWAYS=1`; the rest of the default-workflow directive is unchanged (it still
   asks for parallel `Task` dispatch in two steps). Measured interactive system prompt: 11,257 → 10,499 bytes.
@@ -276,10 +319,12 @@ Defaults that changed, each with its escape hatch:
 - **A12**: best-of-N (`ORIGIN_BESTOFN`) candidates run in their own git worktree through a per-run working directory
   (`LoopOptions::cwd`) instead of changing the daemon's process-wide cwd, so concurrent sessions are no longer
   affected while candidates run. A candidate's Bash/Glob/Grep directories, checkpoints, per-edit formatter/linter and
-  rust-analyzer root follow its worktree; MCP tool arguments are never rewritten. Bug fix; no default changed.
+  rust-analyzer root follow its worktree; MCP tool arguments are never rewritten. Per-turn `auto_test` / repro gate /
+  `auto_lint` now run even when the syntax gate (`ORIGIN_EDIT_CHECK=0`) and LSP diagnostics are both off. Bug fix;
+  no default changed.
 - **C5**: repro gate (`ORIGIN_REPRO_GATE`): before the model's first source edit, its reproduction test is run,
   narrowed to the test file where the runner allows (pytest, `python -m pytest`, `cargo test --test <stem>`,
-  `go test`). The edit is rejected, with the reason, when the test already passes, fails to load, cannot run, or (in
+  `go test`) and the file names are shell-safe. The edit is rejected, with the reason, when the test already passes, fails to load, cannot run, or (in
   a full-suite run) fails without naming the reproduction or on a suite that was already red; a failure the runner
   cannot classify is accepted with a caution. Rejections count once per turn, up to `[post_edit] max_repair_iters`
   turns, separately from the terminal test gate's budget. A source edit made before any reproduction test, or a spent
@@ -292,7 +337,12 @@ Defaults that changed, each with its escape hatch:
   only); a candidate that changed pre-existing tests is flagged with those paths; a tests-only candidate never wins;
   an unreadable change list scores Unknown; identical candidates (same normalised diff) are scored once, and when the
   first two agree and pass the rest are not run. Best-of-N's `git apply` of the winner runs with the scrubbed child
-  environment. Both stay opt-in (D1, D2).
+  environment. Best-of-N's outcome is shown to the user in one `[origin]` line: the applied candidate and why (it
+  passed with the smallest change), or why none was applied; candidates that changed pre-existing tests, with their
+  paths; candidates excluded as tests-only. A winner whose files have uncommitted changes in the workspace is not
+  applied (it was made against HEAD; applying it would fail or mix both edits), and the first attempt's result is
+  kept; when the winner is applied next to other uncommitted changes, the test gate is re-run once on the real tree
+  and the line names those files and the re-test result. Both stay opt-in (D1, D2).
 
 ### Documentation
 
