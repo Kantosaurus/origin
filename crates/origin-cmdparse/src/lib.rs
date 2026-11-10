@@ -242,8 +242,8 @@ struct Word {
 struct Stdin {
     /// Piped from the previous command.
     piped: bool,
-    /// Redirected (`<`, `<<`, `<<<`).
-    redirected: bool,
+    /// Number of stdin redirections (`<`, `<<`, `<<<`).
+    redirects: usize,
     /// The literal text of a here-document or here-string.
     text: Option<String>,
 }
@@ -439,7 +439,11 @@ impl<'a> Lexer<'a> {
                     self.push(c);
                     self.w.dynamic = true;
                 }
-                '@' if self.sh == Shell::Power && self.opens_here_string() => self.here_string()?,
+                // A here-string starts only at the start of a token; mid-word
+                // `@` is literal (`git@host`).
+                '@' if self.sh == Shell::Power && !self.started && self.opens_here_string() => {
+                    self.here_string()?;
+                }
                 '<' if self.sh == Shell::Power && next == Some('#') => {
                     // `<# … #>` block comment; unclosed ⇒ unparseable.
                     let rest = self.cs.get(self.i + 1..)?;
@@ -697,7 +701,7 @@ impl<'a> Lexer<'a> {
             self.i += 1;
         }
         if op.starts_with('<') {
-            self.cmd.stdin.redirected = true;
+            self.cmd.stdin.redirects += 1;
         }
         let fd = |n: char| n.is_ascii_digit() || n == '-';
         if op.ends_with('&') && self.peek().is_some_and(fd) {
@@ -852,7 +856,7 @@ fn check_cmd(
         // (`[scriptblock]::Create($s).Invoke()`,
         // `$ExecutionContext.InvokeCommand.InvokeScript($s)`) runs code anyway.
         if sh == Shell::Power && !invoked {
-            if cmd.text.to_ascii_lowercase().contains("invoke") {
+            if cmd.text.to_ascii_lowercase().contains(".invoke") {
                 risks.push(needs(format!(
                     "`{}` invokes a script built at run time",
                     cmd.text
@@ -871,6 +875,10 @@ fn check_cmd(
     }
     let name = program_name(&cmd.text);
     match name.as_str() {
+        // An `xargs -I {}` placeholder is never a real program.
+        "{}" => risks.push(needs(
+            "the program `{}` is supplied at run time (xargs placeholder)",
+        )),
         "eval" | "iex" | "invoke-expression" => {
             risks.push(needs(format!("`{name}` runs a string built at run time as code")));
             scan(&join(args), sh, depth + 1, risks);
@@ -902,8 +910,12 @@ fn check_cmd(
             let Some(j) = args.iter().position(|a| !a.text.starts_with('-')) else {
                 return;
             };
-            check_cmd(&args[j..], stdin, multi, sh, depth + 1, risks, false);
-            if j > 0 && !args[j - 1].text.contains('=') && j + 1 < args.len() {
+            let maybe_value = j > 0 && !args[j - 1].text.contains('=') && j + 1 < args.len();
+            // `xargs -I {} cp {} dest/`: that `{}` is `-I`'s value, not the program.
+            if !(maybe_value && args[j].text == "{}") {
+                check_cmd(&args[j..], stdin, multi, sh, depth + 1, risks, false);
+            }
+            if maybe_value {
                 check_cmd(&args[j + 1..], stdin, multi, sh, depth + 1, risks, false);
             }
         }
@@ -966,21 +978,33 @@ fn check_powershell(args: &[Word], stdin: &Stdin, depth: usize, risks: &mut Vec<
 }
 
 /// `sh`/`bash`/… arguments: `-c SCRIPT` (also bundled: `-lc`, `-ec`) runs
-/// SCRIPT; with no script operand (or `-`, `/dev/stdin`, `-s`) the script is
-/// read from stdin.
+/// SCRIPT; with no script operand (or `-`, `/dev/stdin`, an `s` in an option
+/// bundle) the script is read from stdin. `-o`/`+o` take a value.
 fn check_posix_shell(name: &str, args: &[Word], stdin: &Stdin, depth: usize, risks: &mut Vec<Risk>) {
-    let c = args
-        .iter()
-        .position(|a| a.text.starts_with('-') && !a.text.starts_with("--") && a.text.contains('c'));
-    if let Some(k) = c {
-        if let Some(script) = args.get(k + 1) {
-            scan(&script.text, Shell::Posix, depth + 1, risks);
+    let bundle = |t: &str| t.starts_with('-') && !t.starts_with("--") && t.len() > 1;
+    if let Some(k) = args.iter().position(|a| bundle(&a.text) && a.text.contains('c')) {
+        match args.get(k + 1).map(|s| s.text.as_str()) {
+            // An `xargs -I {}` placeholder: the script is whatever comes in.
+            Some("{}") => risks.push(needs(format!(
+                "`{name} -c {{}}` runs a script supplied at run time"
+            ))),
+            Some(script) => scan(script, Shell::Posix, depth + 1, risks),
+            None => {}
         }
-    } else if args.iter().any(|a| a.text == "-s")
-        || args
-            .iter()
-            .find(|a| a.text == "-" || !a.text.starts_with('-'))
-            .is_none_or(|a| matches!(a.text.as_str(), "-" | "/dev/stdin"))
+        return;
+    }
+    let mut operand = None;
+    let mut it = args.iter().map(|a| a.text.as_str());
+    while let Some(t) = it.next() {
+        if matches!(t, "-o" | "+o" | "-O" | "+O") {
+            it.next();
+        } else if t == "-" || !(t.starts_with('-') || t.starts_with('+')) {
+            operand = Some(t);
+            break;
+        }
+    }
+    if args.iter().any(|a| bundle(&a.text) && a.text.contains('s'))
+        || operand.is_none_or(|t| matches!(t, "-" | "/dev/stdin"))
     {
         shell_stdin(name, stdin, Shell::Posix, depth, risks);
     }
@@ -988,11 +1012,16 @@ fn check_posix_shell(name: &str, args: &[Word], stdin: &Stdin, depth: usize, ris
 
 /// A shell with no script operand reads its script from stdin: a literal
 /// here-document or here-string is analysed as that script; any other piped or
-/// redirected input needs approval.
+/// redirected input needs approval. With several stdin redirections the last
+/// one wins, so that case needs approval too.
 fn shell_stdin(name: &str, stdin: &Stdin, sh: Shell, depth: usize, risks: &mut Vec<Risk>) {
-    if let Some(text) = &stdin.text {
+    if stdin.redirects > 1 {
+        risks.push(needs(format!(
+            "`{name}` has several stdin redirections; its script is unclear"
+        )));
+    } else if let Some(text) = &stdin.text {
         scan(text, sh, depth + 1, risks);
-    } else if stdin.piped || stdin.redirected {
+    } else if stdin.piped || stdin.redirects > 0 {
         risks.push(needs(format!("`{name}` executes a script read from its input")));
     }
 }
@@ -1061,11 +1090,13 @@ fn detect_rm_rf_home(args: &[Word], risks: &mut Vec<Risk>) {
     if !(has_recursive && has_force) {
         return;
     }
-    for target in args
-        .iter()
-        .map(|w| w.text.as_str())
-        .filter(|w| !w.starts_with('-'))
-    {
+    // A target is a plain argument or a colon-bound parameter value
+    // (`-Path:~`, `-LiteralPath:$HOME`).
+    for target in args.iter().filter_map(|w| {
+        w.text.strip_prefix('-').map_or(Some(w.text.as_str()), |param| {
+            param.split_once(':').map(|(_, v)| v)
+        })
+    }) {
         if is_home_or_root_target(target) {
             risks.push(Risk::Dangerous(format!(
                 "`rm -rf {target}` targets the home directory or filesystem root"
@@ -1094,18 +1125,21 @@ fn rf_intent(w: &str) -> (bool, bool) {
             _ => (false, false),
         };
     }
-    if let Some(switch) = w.strip_prefix('/') {
-        return match switch.to_ascii_lowercase().as_str() {
-            "s" => (true, false),
-            "q" => (false, true),
-            _ => (false, false),
-        };
+    if let Some(switches) = w.strip_prefix('/') {
+        // Glued switches count too: `/s/q`.
+        let mut rf = (false, false);
+        for s in switches.split('/') {
+            rf.0 |= s.eq_ignore_ascii_case("s");
+            rf.1 |= s.eq_ignore_ascii_case("q");
+        }
+        return rf;
     }
     if let Some(bundle) = w.strip_prefix('-') {
         let (name, value) = bundle.split_once(':').unwrap_or((bundle, "$true"));
         let name = name.to_ascii_lowercase();
         if name.len() >= 2 && ("recurse".starts_with(&name) || "force".starts_with(&name)) {
-            let on = value.eq_ignore_ascii_case("$true");
+            // Anything but an explicit false (`:$true`, `:1`) switches it on.
+            let on = !(value.eq_ignore_ascii_case("$false") || value == "0");
             return (
                 on && "recurse".starts_with(&name),
                 on && "force".starts_with(&name),
@@ -1745,6 +1779,76 @@ mod tests {
     }
 
     #[test]
+    fn here_string_opens_only_at_the_start_of_a_word() {
+        let ps = [
+            "echo x@'\nit's; rm -r -fo ~\n'@ #'",
+            "echo x@\"\nit\"s; rm -r -fo ~\n\"@ #\"",
+        ];
+        expect(Shell::Power, &ps, dangerous, "Dangerous");
+    }
+
+    #[test]
+    fn several_stdin_redirections_into_a_shell_need_approval() {
+        expect(
+            Shell::Posix,
+            &["bash <<< ls < x.sh", "bash <<'EOF' < x.sh\nls\nEOF"],
+            needs_approval,
+            "NeedsApproval",
+        );
+        expect(
+            Shell::Posix,
+            &["bash <<'EOF'\nrm -rf ~\nEOF"],
+            dangerous,
+            "Dangerous",
+        );
+    }
+
+    #[test]
+    fn xargs_placeholder_is_never_a_program() {
+        let posix = [
+            "find . | xargs -I {} sh -c {}",
+            "find . | xargs -I {} bash -c '{}'",
+            "find . | xargs -I {} {}",
+        ];
+        expect(Shell::Posix, &posix, needs_approval, "NeedsApproval");
+        expect(
+            Shell::Posix,
+            &["find . | xargs -I {} cp {} dest/"],
+            allowed,
+            "Safe/Suspicious",
+        );
+    }
+
+    #[test]
+    fn optional_round_2_forms() {
+        expect(
+            Shell::Power,
+            &[
+                "(Invoke-WebRequest $u).Content",
+                "$r = (Invoke-RestMethod $u).data",
+            ],
+            allowed,
+            "Safe/Suspicious",
+        );
+        expect(
+            Shell::Power,
+            &[
+                "Remove-Item -Path:~ -Recurse -Force",
+                "rm -LiteralPath:$HOME -Recurse:1 -Force",
+            ],
+            dangerous,
+            "Dangerous",
+        );
+        expect(Shell::Cmd, &["rd /s/q %USERPROFILE%"], dangerous, "Dangerous");
+        expect(
+            Shell::Posix,
+            &["bash -o errexit < x.sh", "bash -es foo < x.sh"],
+            needs_approval,
+            "NeedsApproval",
+        );
+    }
+
+    #[test]
     fn unparseable_line_needs_approval() {
         expect(
             Shell::Posix,
@@ -1778,6 +1882,7 @@ mod tests {
             "git commit -m \"it's fine\"",
             "wc -l <<< \"$HOME\"",
             "cat <<'EOF' | grep x\nrm -rf ~\nEOF",
+            "git clone git@github.com:org/repo.git",
         ];
         expect(Shell::Posix, &posix, allowed, "Safe/Suspicious");
         let ps = [
@@ -1787,6 +1892,8 @@ mod tests {
             "cargo build 2>&1 | Select-String error",
             "Write-Host \"a`tb\"",
             "Remove-Item C:\\tmp\\build -Recurse",
+            "git clone git@github.com:org/repo.git",
+            "$m = @'\nit's fine\n'@",
         ];
         expect(Shell::Power, &ps, allowed, "Safe/Suspicious");
     }
