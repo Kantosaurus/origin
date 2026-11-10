@@ -173,6 +173,24 @@ pub fn best_format_for(model: &str) -> EditFormat {
     EditFormat::SearchReplace
 }
 
+/// C7: the edit format a session's edit tools are advertised for.
+///
+/// `editfmt_env` is the value of `ORIGIN_EDITFMT` and wins over the table:
+/// `0` bypasses the table ([`EditFormat::SearchReplace`], the full edit-tool
+/// set), and a format name (`search-replace`, `diff-fenced`, `whole-file`,
+/// `udiff`) forces that format. Unset, `1` or anything else ⇒
+/// [`best_format_for`] `model`.
+#[must_use]
+pub fn session_format(model: &str, editfmt_env: Option<&str>) -> EditFormat {
+    match editfmt_env {
+        Some("0" | "search-replace") => EditFormat::SearchReplace,
+        Some("diff-fenced") => EditFormat::DiffFenced,
+        Some("whole-file") => EditFormat::WholeFile,
+        Some("udiff") => EditFormat::Udiff,
+        _ => best_format_for(model),
+    }
+}
+
 /// Builds an `<origin-edit-format>` system-prompt block tuned to `model`.
 ///
 /// The chosen format is resolved via [`best_format_for`]. The returned
@@ -580,6 +598,34 @@ mod tests {
     fn best_format_for_unknown_defaults() {
         assert_eq!(best_format_for("some-random-model"), EditFormat::SearchReplace);
         assert_eq!(best_format_for(""), EditFormat::SearchReplace);
+    }
+
+    #[test]
+    fn session_format_uses_the_table_unless_the_env_overrides_it() {
+        // Exact id, a dated/suffixed form of it (prefix match), and an unknown id.
+        assert_eq!(session_format("gpt-3.5-turbo", None), EditFormat::WholeFile);
+        assert_eq!(session_format("gpt-3.5-turbo-0125", None), EditFormat::WholeFile);
+        assert_eq!(session_format("claude-opus-4", None), EditFormat::SearchReplace);
+        assert_eq!(
+            session_format("some-random-model", None),
+            EditFormat::SearchReplace
+        );
+        // `1` (today's opt-in) and junk keep the table.
+        assert_eq!(session_format("gpt-3.5-turbo", Some("1")), EditFormat::WholeFile);
+        assert_eq!(
+            session_format("gpt-3.5-turbo", Some("junk")),
+            EditFormat::WholeFile
+        );
+        // `0` bypasses the table; a format name forces that format.
+        assert_eq!(
+            session_format("gpt-3.5-turbo", Some("0")),
+            EditFormat::SearchReplace
+        );
+        assert_eq!(
+            session_format("claude-opus-4", Some("whole-file")),
+            EditFormat::WholeFile
+        );
+        assert_eq!(session_format("claude-opus-4", Some("udiff")), EditFormat::Udiff);
     }
 
     #[test]

@@ -2861,6 +2861,109 @@ fn runtime_tool_schemas() -> Vec<origin_provider::ToolSchema> {
         .unwrap_or_default()
 }
 
+/// C7: which builtin tools a session advertises. Narrows the registry before
+/// anything else filters it; the default (`rich`, no whole-file preference) is
+/// the full list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ToolAdvert {
+    /// The edit-format table (or `ORIGIN_EDITFMT`) prefers whole-file `Write`.
+    whole_file: bool,
+    /// `ORIGIN_TOOL_PROFILE=lean`: builtins limited to [`LEAN_TOOLS`].
+    lean: bool,
+}
+
+/// `lean`'s builtins: file read/edit/write, shell and search, plus every tool
+/// the loop's own injected text tells the model to call (`Recall` in offload
+/// hints and the result-encoding block, `TodoWrite` in `<origin-todos>`).
+const LEAN_TOOLS: [&str; 10] = [
+    "Read",
+    "Edit",
+    "MultiEdit",
+    "ApplyPatch",
+    "Write",
+    "Bash",
+    "Grep",
+    "Glob",
+    "Recall",
+    "TodoWrite",
+];
+
+impl ToolAdvert {
+    fn new(model: &str, editfmt_env: Option<&str>, profile_env: Option<&str>) -> Self {
+        let lean = match profile_env {
+            None | Some("rich") => false,
+            Some("lean") => true,
+            Some(other) => {
+                tracing::warn!(
+                    value = other,
+                    "ORIGIN_TOOL_PROFILE is not lean or rich; using rich"
+                );
+                false
+            }
+        };
+        Self {
+            whole_file: origin_editfmt::session_format(model, editfmt_env)
+                == origin_editfmt::EditFormat::WholeFile,
+            lean,
+        }
+    }
+
+    /// `Write` is never dropped by the edit format, so every model can edit.
+    fn advertises(self, name: &str) -> bool {
+        !(self.whole_file && matches!(name, "Edit" | "MultiEdit" | "ApplyPatch"))
+            && (!self.lean || LEAN_TOOLS.contains(&name))
+    }
+}
+
+/// C7: the session's [`ToolAdvert`], decided from its model, `ORIGIN_EDITFMT`
+/// and `ORIGIN_TOOL_PROFILE` at its first prompt and reused afterwards, so the
+/// cached tools prefix never changes mid-session.
+fn session_tool_advert(session_id: &str, model: &str) -> ToolAdvert {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+    // ponytail: fixed at the first prompt — a mid-session model switch keeps the
+    // first model's edit tools; key on the model too if a switch must swap them
+    // (at the cost of one cache miss). Process-wide and never evicted, like
+    // `session_repo_map_block`; a daemon restart re-decides from the env.
+    static ADVERTS: OnceLock<Mutex<HashMap<String, ToolAdvert>>> = OnceLock::new();
+    *ADVERTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(session_id.to_string())
+        .or_insert_with(|| {
+            ToolAdvert::new(
+                model,
+                std::env::var("ORIGIN_EDITFMT").ok().as_deref(),
+                std::env::var("ORIGIN_TOOL_PROFILE").ok().as_deref(),
+            )
+        })
+}
+
+#[cfg(test)]
+mod tool_advert_tests {
+    use super::ToolAdvert;
+
+    #[test]
+    fn profile_selection() {
+        let m = "claude-opus-4";
+        assert!(!ToolAdvert::new(m, None, None).lean, "unset ⇒ rich");
+        assert!(!ToolAdvert::new(m, None, Some("rich")).lean);
+        assert!(ToolAdvert::new(m, None, Some("lean")).lean);
+        assert!(!ToolAdvert::new(m, None, Some("LEAN!")).lean, "garbage ⇒ rich");
+        assert_eq!(ToolAdvert::new(m, None, None), ToolAdvert::default());
+    }
+
+    #[test]
+    fn whole_file_keeps_write() {
+        let a = ToolAdvert::new("gpt-3.5-turbo", None, Some("lean"));
+        assert!(a.whole_file);
+        assert!(a.advertises("Write") && a.advertises("Read"));
+        assert!(!a.advertises("Edit") && !a.advertises("MultiEdit") && !a.advertises("ApplyPatch"));
+        assert!(!a.advertises("WebFetch"));
+    }
+}
+
 #[cfg(test)]
 mod runtime_tools_tests {
     use super::{runtime_tool, runtime_tool_schemas, scope_runtime_tools};
@@ -4330,7 +4433,16 @@ async fn run_loop_inner(
             .await;
     }
 
+    // C7: the edit format and the tool profile narrow the builtins, once per
+    // session. Main loop only: a swarm worker (runtime tools installed) keeps
+    // the full list.
+    let advert = if RUNTIME_TOOLS.try_with(|_| ()).is_ok() {
+        ToolAdvert::default()
+    } else {
+        session_tool_advert(&session.id, &session.model)
+    };
     let mut tools_schema = registry_iter()
+        .filter(|m| advert.advertises(m.name))
         .map(|m| {
             if m.hot {
                 // Full schema embed.
