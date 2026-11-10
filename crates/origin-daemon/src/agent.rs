@@ -3007,6 +3007,12 @@ pub struct LoopSummary {
     pub gate_signals: Option<String>,
 }
 
+/// A8: consecutive tool denials in one run before it stops with
+/// [`LoopError::Denied`]. Below this, a denial is an `is_error` tool result.
+const MAX_CONSECUTIVE_DENIALS: u32 = 3;
+/// A8: total tool denials in one run before it stops with [`LoopError::Denied`].
+const MAX_TOTAL_DENIALS: u32 = 20;
+
 #[derive(Debug, Error)]
 pub enum LoopError {
     #[error("provider: {0}")]
@@ -4042,6 +4048,12 @@ async fn run_loop_inner(
     // and is never consulted when no cap is configured (the default), so the
     // default path is byte-identical.
     let mut browser_action_count: u32 = 0;
+
+    // A8: a denied tool call goes back to the model as an `is_error` result and
+    // the loop continues; only repeated denials stop the run. Consecutive resets
+    // on any allowed call.
+    let mut consecutive_denials: u32 = 0;
+    let mut total_denials: u32 = 0;
 
     // Stage C5 pain-bucket accumulators. All are pure measurement and feed only
     // the opt-in `session_stop` telemetry (off without `ORIGIN_TELEMETRY=1`), so
@@ -5120,12 +5132,40 @@ async fn run_loop_inner(
                     reason = %decision.reason,
                     "tool denied"
                 );
-                // R4: count the denied tool call before the loop bails out.
+                // R4: count the denied tool call.
                 if let Some(m) = opts.metrics.as_deref() {
                     m.tool_call_total(provider.name(), &name, "denied").inc();
                 }
-                return Err(LoopError::Denied(name.clone()));
+                consecutive_denials += 1;
+                total_denials += 1;
+                if consecutive_denials >= MAX_CONSECUTIVE_DENIALS || total_denials >= MAX_TOTAL_DENIALS {
+                    return Err(LoopError::Denied(name.clone()));
+                }
+                let msg = format!(
+                    "permission denied for `{name}` (tier={:?}; {}). The call was not executed. \
+                     Do not retry it unchanged: take a different approach or ask the user.",
+                    meta.tier, decision.reason
+                );
+                if let Some(tx) = &opts.event_tx {
+                    let _ = tx
+                        .send(StreamEvent::ToolResult {
+                            tool: name.clone(),
+                            ok: false,
+                            preview: msg.clone(),
+                            elided_bytes: 0,
+                        })
+                        .await;
+                }
+                tool_results.push(Block::ToolResult {
+                    tool_use_id: id,
+                    handle: None,
+                    inline: Some(format!("Error: {msg}").into_bytes()),
+                    cache_marker: None,
+                    is_error: true,
+                });
+                continue;
             }
+            consecutive_denials = 0;
 
             // --- ponytail dependency gate (ponytail-native) ---
             // After permission/governance has ALLOWED the tool, intercept the

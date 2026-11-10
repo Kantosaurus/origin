@@ -5162,15 +5162,12 @@ mod tests {
             asked.load(Ordering::SeqCst),
             "the prompter passed to drive_goal_loop must govern the regular turn"
         );
-        // A denied Write must never touch disk, and must surface as an error.
+        // A denied Write must never touch disk. A8: a single denial goes back to
+        // the model as an error result and the turn continues to "done".
         assert!(
             !target.exists(),
             "a denied Write must NOT execute (file was created ⇒ tool auto-ran)"
         );
-        let err = result.expect_err("a denied tool must surface as a loop error, not Ok");
-        assert!(
-            format!("{err}").to_lowercase().contains("deni"),
-            "expected a denial error, got: {err}"
-        );
+        result.expect("a single denial must not end the turn (A8)");
     }
 }
