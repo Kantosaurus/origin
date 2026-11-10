@@ -924,8 +924,14 @@ fn apply_path_overlay(
     if policy.allow_paths.is_empty() && policy.deny_paths.is_empty() {
         return decision;
     }
+    // Grep/Glob walk recursively: a deny prefix inside the search root blocks too.
+    let check = if matches!(tool, "Grep" | "Glob") {
+        origin_conseca::check_tree
+    } else {
+        origin_conseca::check_path
+    };
     for path in conseca_target_paths(tool, args) {
-        if let origin_conseca::Decision::Deny(why) = origin_conseca::check_path(policy, &path) {
+        if let origin_conseca::Decision::Deny(why) = check(policy, &path) {
             return origin_permission::Decision {
                 outcome: Outcome::Deny,
                 reason: format!("conseca: filesystem path blocked for `{tool}`: {why}"),
@@ -11111,6 +11117,61 @@ mod wiring_tests {
         );
         assert_eq!(gate("Grep", "/work/project/src"), Outcome::Allow);
         assert_eq!(gate("Glob", "/work/project"), Outcome::Allow);
+    }
+
+    /// A9 fix round 1: Grep/Glob walk recursively, so searching a PARENT of a
+    /// deny prefix must be denied too; a path-less search gates the cwd.
+    #[test]
+    fn path_overlay_denies_search_rooted_above_a_deny_prefix() {
+        let gate = |policy: origin_conseca::SecurityPolicy, tool: &str, args: serde_json::Value| {
+            let opts = LoopOptions {
+                conseca: Some(Arc::new(policy)),
+                ..LoopOptions::default()
+            };
+            let allow = Decision {
+                outcome: Outcome::Allow,
+                reason: "base".into(),
+            };
+            apply_path_overlay(allow, tool, &args, &opts).outcome
+        };
+        let deny_only = || origin_conseca::SecurityPolicy {
+            deny_paths: vec!["/home/u/.ssh".into()],
+            ..origin_conseca::SecurityPolicy::default()
+        };
+        let grep_ssh =
+            serde_json::json!({ "pattern": "PRIVATE KEY", "path": "/home/u", "output_mode": "content" });
+        assert_eq!(gate(deny_only(), "Grep", grep_ssh), Outcome::Deny);
+        let both = || origin_conseca::SecurityPolicy {
+            allow_paths: vec!["/work/project".into()],
+            deny_paths: vec!["/work/project/secrets".into()],
+            ..origin_conseca::SecurityPolicy::default()
+        };
+        let glob_root = serde_json::json!({ "pattern": "**/*", "path": "/work/project" });
+        assert_eq!(gate(both(), "Glob", glob_root), Outcome::Deny);
+        let grep_src = serde_json::json!({ "pattern": "x", "path": "/work/project/src" });
+        assert_eq!(gate(both(), "Grep", grep_src), Outcome::Allow);
+
+        // No `path`: the search root is the process cwd.
+        let cwd = std::env::current_dir()
+            .expect("cwd")
+            .to_string_lossy()
+            .into_owned();
+        let inside = origin_conseca::SecurityPolicy {
+            allow_paths: vec![cwd],
+            ..origin_conseca::SecurityPolicy::default()
+        };
+        assert_eq!(
+            gate(inside, "Grep", serde_json::json!({ "pattern": "x" })),
+            Outcome::Allow
+        );
+        let elsewhere = origin_conseca::SecurityPolicy {
+            allow_paths: vec!["/nowhere/at/all".into()],
+            ..origin_conseca::SecurityPolicy::default()
+        };
+        assert_eq!(
+            gate(elsewhere, "Glob", serde_json::json!({ "pattern": "*" })),
+            Outcome::Deny
+        );
     }
 
     // ---- Task 3 / R14: policy model-list + spend-cap (Feature 3) ----
