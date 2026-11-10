@@ -250,7 +250,7 @@ each module's registration.
 | --- | --- | --- | --- | --- | --- | --- |
 | `Read` | Line-numbered file read; `as: text\|image\|pdf` | AutoAllowed | Pure | `ReadFs` | yes | Refuses symlinks; default limit 1000 lines, max 50000; images report dims, PDFs extract text (`read.rs`). |
 | `Write` | Create/overwrite a UTF-8 file (atomic) | RequiresPermission | Mutating | `WriteCwd` | yes | Refuses to clobber an unread existing file unless `force` (`write.rs`). |
-| `Edit` | Find-and-replace a unique string in a file | RequiresPermission | Mutating | `WriteCwd` | yes | CRLF-safe; `replace_all` for multi-match (`edit.rs`). |
+| `Edit` | Find-and-replace a unique string in a file | RequiresPermission | Mutating | `WriteCwd` | yes | CRLF-safe; `replace_all` for multi-match; returns `{ok, diff}`, a 3-line-context unified diff (`edit.rs`). |
 | `MultiEdit` | Apply a sequence of edits to one file atomically | RequiresPermission | Mutating | `WriteCwd` | yes | Single read + single write per call (`multi_edit.rs`). |
 | `ApplyPatch` | Apply a unified-diff or codex/opencode marker-envelope patch across files | RequiresPermission | Mutating | `WriteCwd` | yes | Add/Delete/Update/Move directives; validates all ops before any write (`apply_patch.rs`). |
 | `Bash` | Execute a shell command; foreground or `run_in_background` | RequiresPermission | Mutating | `Shell` | yes | Timeout default 120s / max 600s; stdout capped to ~96 KiB head+tail; backed by `proc_supervisor` (`bash.rs`). |

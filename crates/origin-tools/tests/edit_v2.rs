@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-#![allow(clippy::unwrap_used, clippy::bool_assert_comparison)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::bool_assert_comparison,
+    clippy::panic,
+    clippy::format_collect
+)]
 
 use origin_tools::builtins::edit::{edit_v2, EditArgs};
 use std::fs;
@@ -18,10 +23,54 @@ fn single_replacement_returns_hunk() {
     }, None)
     .unwrap();
     assert_eq!(out["ok"], true);
-    assert_eq!(out["hunks"][0]["before"].as_str().unwrap().contains("foo"), true);
-    assert_eq!(out["hunks"][0]["after"].as_str().unwrap().contains("bar"), true);
+    assert_eq!(out["diff"], "@@ -1 +1 @@\n-fn foo() {}\n+fn bar() {}\n");
     let actual = fs::read_to_string(&p).unwrap();
     assert_eq!(actual, "fn bar() {}\n");
+}
+
+#[test]
+fn result_is_a_compact_diff_hunk_not_the_full_before_after() {
+    // A 40-line old/new pair differing in ONE line: the result must carry that
+    // change plus a few context lines, not echo both 40-line blocks back.
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("a.txt");
+    let old: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+    let new = old.replace("line 20\n", "line twenty\n");
+    fs::write(&p, &old).unwrap();
+    let out = edit_v2(
+        EditArgs {
+            file_path: p.to_string_lossy().into_owned(),
+            old_string: old.clone(),
+            new_string: new.clone(),
+            replace_all: false,
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(fs::read_to_string(&p).unwrap(), new);
+    let diff = out["diff"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no `diff` field: {out}"));
+    assert!(
+        diff.contains("@@ -17,7 +17,7 @@"),
+        "hunk header with 3 lines of context:\n{diff}"
+    );
+    assert!(
+        diff.contains("-line 20\n") && diff.contains("+line twenty\n"),
+        "{diff}"
+    );
+    assert!(
+        !diff.contains("line 5\n") && !diff.contains("line 35\n"),
+        "lines outside the context leaked:\n{diff}"
+    );
+    assert!(
+        out.get("hunks").is_none(),
+        "old before/after hunks still returned: {out}"
+    );
+    assert!(
+        out.to_string().len() < old.len(),
+        "result not smaller than old_string alone: {out}"
+    );
 }
 
 #[test]

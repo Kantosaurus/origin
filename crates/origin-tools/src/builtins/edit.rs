@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `Edit` v2 — find-and-replace with CRLF safety, hunk return, `replace_all`.
+//! `Edit` v2 — find-and-replace with CRLF safety, unified-diff return, `replace_all`.
 
 use crate::builtins::editmatch;
 use crate::builtins::write::WriteGuard;
@@ -112,13 +112,13 @@ pub fn edit_v2(args: EditArgs, guard: Option<&WriteGuard>) -> Result<Value, Tool
         }
     };
 
-    let hunk = build_hunk(&text, &args.old_string, &args.new_string);
+    let diff = similar::TextDiff::from_lines(&text, &updated)
+        .unified_diff()
+        .context_radius(3)
+        .to_string();
     let new_bytes = text_fmt::denormalise(&updated, &det);
     atomic_write(&args.file_path, &new_bytes)?;
-    Ok(json!({
-        "ok": true,
-        "hunks": [hunk],
-    }))
+    Ok(json!({ "ok": true, "diff": diff }))
 }
 
 /// The `edit.no_match` error, enriched with the closest whitespace-only
@@ -131,15 +131,6 @@ fn gutter_or_no_match(text: &str, old: &str, path: &str) -> ToolError {
     ToolError::new(ErrClass::Edit, "no_match", msg)
         .recoverable(true)
         .hint("widen the needle or add surrounding context")
-}
-
-fn build_hunk(before: &str, old: &str, new: &str) -> Value {
-    let line = before
-        .lines()
-        .enumerate()
-        .find(|(_, l)| l.contains(old))
-        .map_or(0, |(i, _)| i + 1);
-    json!({ "before": old, "after": new, "line": line })
 }
 
 fn atomic_write(path: &str, bytes: &[u8]) -> Result<(), ToolError> {
