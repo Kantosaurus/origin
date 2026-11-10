@@ -2048,6 +2048,7 @@ async fn handle_request(
             cwd: None,
             // ^ A12: the live turn uses the process cwd; only best-of-N
             // candidates run in their own worktree.
+            touches: None, // B8: only swarm workers report their touches
         };
         // Opt-in interactive prompting: when the turn requested it, route
         // RequiresPermission tools through the IPC prompter (asks the client and

@@ -17,8 +17,8 @@ use crate::spec::{DecisionRecord, ReportStatus, TaskRef, Usage};
 ///
 /// `plan_updates` is the in-order sequence of `OpEnvelope` values the worker
 /// authored against the shared plan (already applied via [`crate::PlanHandle`];
-/// included here for audit). `files_touched` is the set of CAS handles for any
-/// files the worker created or modified. `transcript_handle` points at the
+/// included here for audit). `files_touched` lists the paths of the files the
+/// worker created or modified. `transcript_handle` points at the
 /// worker's full chat log (stored separately in CAS by the worker harness).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionReport {
@@ -28,8 +28,9 @@ pub struct CompletionReport {
     pub status: ReportStatus,
     /// Ordered list of plan-op envelopes authored by this worker.
     pub plan_updates: Vec<OpEnvelope>,
-    /// 32-byte CAS handles of files the worker created or rewrote.
-    pub files_touched: Vec<[u8; 32]>,
+    /// Paths of files the worker created or rewrote through its own successful
+    /// file-editing tool calls, as the tool used them, in first-touch order.
+    pub files_touched: Vec<String>,
     /// Decisions the worker explicitly logged.
     pub decisions: Vec<DecisionRecord>,
     /// Suggested follow-up tasks the parent may dispatch.

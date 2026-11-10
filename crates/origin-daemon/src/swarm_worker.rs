@@ -31,7 +31,9 @@ use origin_swarm::{CompletionReport, McpServerSpec, ReportStatus, Usage, WorkerC
 use origin_tools::{DynTool, SandboxProfile, SideEffects, Tier, ToolMeta, Urgency};
 use tokio::sync::RwLock;
 
-use crate::agent::{run_loop, scope_runtime_tools, scope_swarm_collab, LoopOptions, SwarmCollab};
+use crate::agent::{
+    run_loop, scope_runtime_tools, scope_swarm_collab, LoopError, LoopOptions, RunTouches, SwarmCollab,
+};
 use crate::session::Session;
 
 /// Run the MCP `initialize` handshake, then `tools/list`.
@@ -147,8 +149,17 @@ async fn build_runtime_tools(
 /// snapshots it at spawn time so a mid-flight switch is respected.
 type ActiveProvider = Arc<RwLock<Arc<dyn Provider>>>;
 
-/// Default max turns when a worker budget specifies no tool-call cap.
-const DEFAULT_WORKER_TURNS: u32 = 32;
+/// Default max turns when a worker budget specifies no tool-call cap (0). A
+/// `Task` call sets its own with `budget.max_tool_calls` (B8).
+const DEFAULT_WORKER_TURNS: u32 = 50;
+
+/// B8: the most characters of report text a worker returns to its parent
+/// (≈2,000 tokens); the rest is cut with a notice naming how much was dropped.
+const REPORT_TEXT_CAP: usize = 8_000;
+
+/// B8: the most paths a worker's `files_touched` lists; the rest are counted
+/// in its report text.
+const FILES_TOUCHED_CAP: usize = 100;
 
 /// Permission prompter that allows only an explicit tool allow-list. Tools in
 /// the `AutoAllowed` tier never reach the prompter (they are inherently safe,
@@ -332,6 +343,7 @@ async fn run_worker(
     // on the streaming path). Without a consumer the worker stays non-streaming
     // (simpler accounting, byte-identical to before).
     let want_transcript = ctx.progress.is_some();
+    let touches = Arc::new(std::sync::Mutex::new(RunTouches::default()));
     let mut opts = LoopOptions {
         max_turns,
         // Stream only when a transcript consumer is attached (see above).
@@ -372,6 +384,8 @@ async fn run_worker(
         conseca: governance.conseca,
         permission_rules: governance.permission_rules.as_deref().and_then(deny_rules_only),
         browser_rate_limit: governance.browser_max_actions,
+        // B8: record what this worker's successful tool calls changed.
+        touches: Some(Arc::clone(&touches)),
         ..Default::default()
     };
 
@@ -407,47 +421,118 @@ async fn run_worker(
         }
         None => run.await,
     };
-    let report = match loop_result {
-        Ok(summary) => {
-            // Surface the worker's actual final message so the orchestrator gets
-            // real content instead of a context-free "Completed". Truncated so a
-            // chatty worker can't blow the orchestrator's context.
-            let detail = {
-                let t = summary.assistant_text.trim();
-                (!t.is_empty()).then(|| t.chars().take(4000).collect::<String>())
-            };
-            CompletionReport {
-                goal,
-                status: ReportStatus::Completed,
-                plan_updates: Vec::new(),
-                files_touched: Vec::new(),
-                decisions: Vec::new(),
-                follow_ups: Vec::new(),
-                transcript_handle: [0; 32],
-                usage: Usage {
-                    input_tokens: summary.input_tokens,
-                    output_tokens: summary.output_tokens,
-                    tool_calls: summary.turns,
-                },
-                detail,
-            }
-        }
+    let touches = std::mem::take(&mut *touches.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    Ok(build_report(goal, loop_result, &session, touches))
+}
+
+/// Assemble a worker's report (B8). A stop (turn cap, denial cap, error) is
+/// still a normal report that carries the partial work: the files touched so
+/// far and the last assistant text. Notices come first, then that text, with
+/// one cap over the whole.
+fn build_report(
+    goal: String,
+    loop_result: Result<crate::agent::LoopSummary, LoopError>,
+    session: &Session,
+    touches: RunTouches,
+) -> CompletionReport {
+    let (status, text, usage, stop) = match loop_result {
+        Ok(summary) => (
+            ReportStatus::Completed,
+            summary.assistant_text,
+            Usage {
+                input_tokens: summary.input_tokens,
+                output_tokens: summary.output_tokens,
+                tool_calls: summary.turns,
+            },
+            None,
+        ),
+        Err(LoopError::MaxTurns(n)) => (
+            ReportStatus::BudgetExhausted,
+            last_assistant_text(session),
+            Usage::default(),
+            Some(format!("Stopped at the turn cap ({n} turns) before finishing.")),
+        ),
+        Err(LoopError::Denied(d)) => (
+            ReportStatus::Aborted,
+            last_assistant_text(session),
+            Usage::default(),
+            Some(format!("Stopped after repeated permission denials: {d}")),
+        ),
         Err(e) => {
             tracing::warn!(error = %e, goal = %goal, "swarm worker: run_loop failed");
-            CompletionReport {
-                goal,
-                status: ReportStatus::GoalUnreachable,
-                plan_updates: Vec::new(),
-                files_touched: Vec::new(),
-                decisions: Vec::new(),
-                follow_ups: Vec::new(),
-                transcript_handle: [0; 32],
-                usage: Usage::default(),
-                detail: Some(format!("run_loop failed: {e}")),
-            }
+            (
+                ReportStatus::GoalUnreachable,
+                last_assistant_text(session),
+                Usage::default(),
+                Some(format!("run_loop failed: {e}")),
+            )
         }
     };
-    Ok(report)
+    let mut seen = std::collections::HashSet::new();
+    let mut files_touched = touches.paths;
+    files_touched.retain(|p| seen.insert(p.clone()));
+    let more_files = files_touched.len().saturating_sub(FILES_TOUCHED_CAP);
+    files_touched.truncate(FILES_TOUCHED_CAP);
+
+    let mut parts: Vec<String> = stop.into_iter().collect();
+    if more_files > 0 {
+        parts.push(format!(
+            "files_touched lists the first {FILES_TOUCHED_CAP} files; {more_files} more were edited."
+        ));
+    }
+    if touches.ran_shell {
+        parts.push("Ran shell commands; files they changed are not listed in files_touched.".to_owned());
+    }
+    let text = text.trim();
+    if !text.is_empty() {
+        parts.push(text.to_owned());
+    }
+    CompletionReport {
+        goal,
+        status,
+        plan_updates: Vec::new(),
+        files_touched,
+        decisions: Vec::new(),
+        follow_ups: Vec::new(),
+        transcript_handle: [0; 32],
+        usage,
+        detail: (!parts.is_empty()).then(|| cap_report_text(&parts.join("\n\n"))),
+    }
+}
+
+/// The text of the session's last assistant message that has any (B8): what a
+/// worker stopped before finishing last said.
+fn last_assistant_text(session: &Session) -> String {
+    session
+        .messages
+        .iter()
+        .rev()
+        .filter(|m| m.role == origin_core::types::Role::Assistant)
+        .find_map(|m| {
+            let t: String = m
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    origin_core::types::Block::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            (!t.trim().is_empty()).then_some(t)
+        })
+        .unwrap_or_default()
+}
+
+/// Cap `text` at [`REPORT_TEXT_CAP`] characters, cutting on a char boundary and
+/// appending one notice that names how many characters were dropped (B8).
+fn cap_report_text(text: &str) -> String {
+    match text.char_indices().nth(REPORT_TEXT_CAP) {
+        None => text.to_owned(),
+        Some((cut, _)) => format!(
+            "{}\n[report truncated: {} more characters dropped]",
+            &text[..cut],
+            text[cut..].chars().count()
+        ),
+    }
 }
 
 /// The deny rules of `rules` (A4): a worker may inherit its parent's blocks but
@@ -503,10 +588,39 @@ fn worker_post_edit() -> Option<std::sync::Arc<origin_postedit::PostEditConfig>>
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{worker_effort, worker_post_edit, AllowList};
+    use super::{cap_report_text, worker_effort, worker_post_edit, AllowList, REPORT_TEXT_CAP};
     use origin_permission::prompt::Prompter;
     use origin_provider::ReasoningEffort;
     use origin_tools::{registry_iter, ToolMeta};
+
+    /// B8: text at the cap is untouched; longer text keeps exactly the first
+    /// `REPORT_TEXT_CAP` chars plus ONE notice with the exact dropped count.
+    #[test]
+    fn report_text_cap_keeps_the_head_and_counts_the_rest() {
+        let at_cap = "a".repeat(REPORT_TEXT_CAP);
+        assert_eq!(cap_report_text(&at_cap), at_cap);
+        let capped = cap_report_text(&"a".repeat(REPORT_TEXT_CAP + 1234));
+        assert_eq!(capped.matches("report truncated").count(), 1, "{capped}");
+        assert_eq!(
+            capped,
+            format!(
+                "{}\n[report truncated: 1234 more characters dropped]",
+                "a".repeat(REPORT_TEXT_CAP)
+            )
+        );
+    }
+
+    /// B8: a multibyte char straddling the cut never panics; counts are chars.
+    #[test]
+    fn report_text_cap_cuts_multibyte_text_on_a_char_boundary() {
+        let text = format!("{}é😀{}", "a".repeat(REPORT_TEXT_CAP - 1), "ü".repeat(5));
+        let capped = cap_report_text(&text);
+        assert!(capped.starts_with(&format!("{}é\n", "a".repeat(REPORT_TEXT_CAP - 1))));
+        assert!(
+            capped.ends_with("[report truncated: 6 more characters dropped]"),
+            "{capped}"
+        );
+    }
 
     #[test]
     fn sub_agents_inherit_ultracode_effort_on_anthropic() {

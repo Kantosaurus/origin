@@ -2678,12 +2678,17 @@ fn render_background_results(results: &[crate::bg_jobs::BgResult]) -> String {
     );
     for r in results {
         let o = &r.output;
-        let _ = writeln!(block, "- [{}] {}: {}", o.status, r.goal, o.summary.trim());
+        // B8: structured fields first, the worker's report text last.
+        let _ = writeln!(block, "- [{}] {}", o.status, r.goal);
+        if !o.files_touched.is_empty() {
+            let _ = writeln!(block, "    files touched: {}", o.files_touched.join(", "));
+        }
         if !o.follow_ups.is_empty() {
             block.push_str("    follow-ups: ");
             block.push_str(&o.follow_ups.join("; "));
             block.push('\n');
         }
+        let _ = writeln!(block, "    {}", o.summary.trim());
     }
     block.push_str("</background-results>");
     block
@@ -3307,7 +3312,7 @@ mod swarm_collab_wiring_tests {
                 output: TaskOutput {
                     status: "completed".into(),
                     summary: "found 2 issues".into(),
-                    files_touched: vec![],
+                    files_touched: vec!["src/ipc.rs".into(), "src/wire.rs".into()],
                     follow_ups: vec!["fix the handshake".into()],
                 },
             },
@@ -3329,6 +3334,14 @@ mod swarm_collab_wiring_tests {
         assert!(r.contains("audit ipc") && r.contains("found 2 issues"), "lists completed: {r}");
         assert!(r.contains("audit swarm") && r.contains("aborted"), "lists aborted: {r}");
         assert!(r.contains("fix the handshake"), "lists follow-ups: {r}");
+        assert!(
+            r.contains("files touched: src/ipc.rs, src/wire.rs\n"),
+            "lists touched files (B8): {r}"
+        );
+        assert!(
+            r.find("files touched").unwrap_or(usize::MAX) < r.find("found 2 issues").unwrap_or(0),
+            "structured fields before the report text (B8): {r}"
+        );
     }
 
     /// `emit_background_completions`: each reaped background result must stream a
@@ -3712,6 +3725,18 @@ pub struct LoopOptions {
     /// process cwd, byte-identical. Lets a candidate work in its own worktree
     /// without `std::env::set_current_dir`, which is process-wide.
     pub cwd: Option<std::path::PathBuf>,
+    /// B8: when `Some`, every successfully dispatched tool call records what it
+    /// changed here, so a swarm worker can report it to its parent. `None` (the
+    /// default everywhere but swarm workers) ⇒ nothing is recorded.
+    pub touches: Option<Arc<std::sync::Mutex<RunTouches>>>,
+}
+
+/// B8: what a run's successful tool calls changed — the paths its file-editing
+/// calls named (call order, repeats kept) and whether any shell command ran.
+#[derive(Debug, Default)]
+pub struct RunTouches {
+    pub paths: Vec<String>,
+    pub ran_shell: bool,
 }
 
 impl Default for LoopOptions {
@@ -3762,6 +3787,7 @@ impl Default for LoopOptions {
             notify: None,
             lsp_pool: None,
             cwd: None,
+            touches: None,
         }
     }
 }
@@ -7091,6 +7117,13 @@ async fn run_loop_inner(
             let _ = SWARM_COLLAB.try_with(|collab| {
                 record_swarm_collab(collab, &name, &args);
             });
+            // B8: the tool succeeded (failures `continue` above), so its edited
+            // paths are real touches for the worker's report.
+            if let Some(touches) = opts.touches.as_deref() {
+                let mut t = touches.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                t.ran_shell |= name == "Bash";
+                t.paths.extend(edited_paths_from_tool(&name, &args));
+            }
 
             // Optional per-tool-use shadow-git checkpoint (WS-S, cline L163
             // follow-up). Reaching here means the tool succeeded. Only mutating

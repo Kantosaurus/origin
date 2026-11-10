@@ -5,8 +5,9 @@
 //!
 //! The full report stays in CAS via its `transcript_handle`; this tool only
 //! returns the structured fields a parent agent typically needs to keep
-//! reasoning: `status`, `summary`, `files_touched` (hex-encoded CAS handles),
-//! and `follow_ups` (the goal strings of any suggested follow-up tasks).
+//! reasoning: `status`, `files_touched` (paths the worker's edits changed),
+//! `follow_ups` (the goal strings of any suggested follow-up tasks), and
+//! `summary` (the worker's capped report text).
 
 // `Task{Input,Output,Budget,Error}` repeat the module name on purpose: the
 // public surface is documented vocab the agent loop and JSON schemas refer to
@@ -18,10 +19,11 @@ use origin_swarm::{Budget, Coordinator, McpServerSpec, ReportStatus, SwarmError,
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-// Swarm sub-agents run with UNLIMITED budgets by default: a sub-agent runs to
-// completion exactly like the main loop (which itself has no turn cap — see the
-// `max_turns: u32::MAX` change). `u*::MAX` is the "no cap" sentinel; the caller
-// may still pass an explicit, smaller `budget` per `Task` to bound a worker.
+// Swarm sub-agents run with UNLIMITED token and wall-clock budgets by default.
+// `u*::MAX` is the "no cap" sentinel; the caller may still pass an explicit,
+// smaller `budget` per `Task` to bound a worker. `max_tool_calls` is the
+// exception (B8): omitted means 0, "unset", and the worker applies its default
+// turn cap (50); an explicit value, `u32::MAX` included, is used as given.
 const fn default_wall_ms() -> u64 {
     u64::MAX
 }
@@ -32,7 +34,7 @@ const fn default_output_tokens() -> u64 {
     u64::MAX
 }
 const fn default_tool_calls() -> u32 {
-    u32::MAX
+    0
 }
 
 /// Per-task resource budget. Mirrors [`origin_swarm::Budget`] but with serde
@@ -48,7 +50,7 @@ pub struct TaskBudget {
     /// Maximum cumulative output tokens (provider-side).
     #[serde(default = "default_output_tokens")]
     pub max_output_tokens: u64,
-    /// Maximum total tool invocations.
+    /// The worker's turn cap. 0 (the default) ⇒ the worker's default of 50.
     #[serde(default = "default_tool_calls")]
     pub max_tool_calls: u32,
 }
@@ -100,18 +102,22 @@ const fn default_background() -> bool {
     true
 }
 
-/// Actionable inlined view of the worker's [`CompletionReport`].
+/// Actionable inlined view of the worker's [`CompletionReport`]. Structured
+/// fields serialize first, the (capped) report text last.
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskOutput {
-    /// Terminal status, lower-snake-cased: `completed`, `goal_unreachable`,
-    /// `budget_exhausted`, or `aborted`.
+    /// Terminal status, lower-snake-cased: `completed`, `budget_exhausted`
+    /// (stopped at its turn cap), `aborted` (stopped by repeated permission
+    /// denials), or `goal_unreachable` (failed with an error).
     pub status: String,
-    /// Short human-readable summary mentioning the goal and status.
-    pub summary: String,
-    /// Hex-encoded 32-byte CAS handles of files the worker touched.
+    /// Paths the worker's successful edits changed, first-touch order. Files
+    /// changed by shell commands are not listed; the summary says when any ran.
     pub files_touched: Vec<String>,
     /// Goal strings of any follow-up tasks the worker suggested.
     pub follow_ups: Vec<String>,
+    /// Short human-readable summary mentioning the goal and status, followed by
+    /// the worker's report text (capped by the worker).
+    pub summary: String,
 }
 
 /// Errors surfaced by [`task_tool`].
@@ -283,7 +289,7 @@ fn report_to_output(report: origin_swarm::CompletionReport, goal: &str) -> TaskO
     TaskOutput {
         status: status.to_owned(),
         summary,
-        files_touched: report.files_touched.iter().map(hex::encode).collect(),
+        files_touched: report.files_touched,
         follow_ups: report.follow_ups.into_iter().map(|t| t.goal).collect(),
     }
 }
@@ -312,20 +318,20 @@ mod budget_tests {
     use super::TaskBudget;
 
     #[test]
-    fn default_budget_is_unlimited() {
+    fn default_budget_is_unlimited_but_the_turn_cap_is_unset() {
         let b = TaskBudget::default();
         assert_eq!(b.max_wall_ms, u64::MAX);
         assert_eq!(b.max_input_tokens, u64::MAX);
         assert_eq!(b.max_output_tokens, u64::MAX);
-        assert_eq!(b.max_tool_calls, u32::MAX, "no tool-call cap on a default swarm worker");
+        assert_eq!(b.max_tool_calls, 0, "unset ⇒ the worker's default turn cap (B8)");
     }
 
     #[test]
-    fn omitted_budget_fields_deserialize_to_unlimited() {
-        // The model may send `"budget": {}` (or omit fields); each missing field
-        // must fall back to the unlimited sentinel, not a small cap.
+    fn omitted_budget_fields_deserialize_to_defaults() {
+        // The model may send `"budget": {}` (or omit fields); missing token
+        // fields fall back to the unlimited sentinel, a missing turn cap to unset.
         let b: TaskBudget = serde_json::from_str("{}").expect("empty budget");
-        assert_eq!(b.max_tool_calls, u32::MAX);
+        assert_eq!(b.max_tool_calls, 0);
         assert_eq!(b.max_input_tokens, u64::MAX);
     }
 }

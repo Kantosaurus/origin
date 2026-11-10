@@ -127,6 +127,7 @@ async fn memory_e2e_proposer_to_store_via_wiremock() {
         notify: None,
         lsp_pool: None,
         cwd: None,
+        touches: None,
         ponytail: origin_ponytail::PonytailMode::Full,
     };
     let _summary = run_loop(
