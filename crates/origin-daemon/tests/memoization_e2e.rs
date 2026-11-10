@@ -11,6 +11,7 @@ use origin_daemon::agent::{run_loop, LoopOptions};
 use origin_daemon::session::Session;
 use origin_permission::prompt::AlwaysAllow;
 use origin_provider::{ChatRequest, ChatResponse, Provider, ProviderError, Usage};
+use origin_stream::{Ring, TokenEvent, TokenKind};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -284,5 +285,87 @@ async fn write_guard_sees_external_change_after_cached_read() {
         std::fs::read_to_string(&p).expect("read"),
         "changed out of band, longer",
         "the out-of-band bytes must survive"
+    );
+}
+
+/// Streams `turns[t]` as one assistant message of tool calls, then "done".
+/// Streaming is what makes the loop pre-run Pure calls (speculative dispatch).
+struct StreamStepProvider {
+    turn: AtomicU32,
+    turns: Vec<Vec<(&'static str, serde_json::Value)>>,
+}
+
+#[async_trait]
+impl Provider for StreamStepProvider {
+    fn name(&self) -> &'static str {
+        "scripted-stream"
+    }
+    async fn chat(&self, _req: ChatRequest) -> Result<ChatResponse, ProviderError> {
+        Err(ProviderError::Api("non-stream path should not be hit".into()))
+    }
+    async fn chat_stream(&self, _req: ChatRequest, ring: &Ring) -> Result<(), ProviderError> {
+        let t = self.turn.fetch_add(1, Ordering::SeqCst);
+        let publish = |kind, payload: Vec<u8>| {
+            ring.publish(&TokenEvent::new(kind, payload))
+                .map_err(|e| ProviderError::Api(e.to_string()))
+        };
+        match self.turns.get(t as usize) {
+            Some(calls) => {
+                for (i, (name, input)) in calls.iter().enumerate() {
+                    let idx = u32::try_from(i).expect("index").to_le_bytes();
+                    let mut start = idx.to_vec();
+                    start.extend_from_slice(format!("id-{t}-{i}\0{name}").as_bytes());
+                    publish(TokenKind::ToolUseStart, start)?;
+                    let mut delta = idx.to_vec();
+                    delta.extend_from_slice(&serde_json::to_vec(input).expect("json"));
+                    publish(TokenKind::ToolUseDelta, delta)?;
+                }
+                // Let any speculative pre-run finish before the turn ends, so it
+                // deterministically reads the file before the batch dispatches.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            None => publish(TokenKind::TextDelta, b"done".to_vec())?,
+        }
+        publish(TokenKind::TurnEnd, Vec::new())?;
+        ring.close();
+        Ok(())
+    }
+}
+
+/// A2 fix round 1: with streaming on (the default), `[Edit X, Read X]` in ONE
+/// assistant message must not consume the Read pre-run before the Edit, nor let
+/// those pre-edit bytes into the memo for a later identical Read.
+#[tokio::test]
+async fn streamed_edit_then_read_in_one_message_returns_new_bytes() {
+    let dir = tempdir().expect("tempdir");
+    let store = open_store(dir.path());
+    let p = dir.path().join("hello.txt");
+    std::fs::write(&p, "hello world").expect("write");
+    let path = p.to_string_lossy().into_owned();
+    let read = serde_json::json!({"file_path": &path});
+    let edit = serde_json::json!({"file_path": &path, "old_string": "hello", "new_string": "goodbye"});
+
+    let provider = StreamStepProvider {
+        turn: AtomicU32::new(0),
+        turns: vec![vec![("Edit", edit), ("Read", read.clone())], vec![("Read", read)]],
+    };
+    let mut session = Session::new("test-session", "scripted-model");
+    let opts = LoopOptions::default().with_cas(store.clone());
+    let _ = run_loop(&mut session, "go", &provider, &AlwaysAllow, &opts)
+        .await
+        .expect("loop ok");
+
+    assert_eq!(
+        std::fs::read_to_string(&p).expect("read"),
+        "goodbye world",
+        "Edit must have applied"
+    );
+    let bodies = tool_result_bodies(&session, &store);
+    assert_eq!(bodies.len(), 3, "got: {bodies:?}");
+    assert!(
+        bodies[1].contains("goodbye world") && bodies[2].contains("goodbye world"),
+        "stale bytes after Edit; same-message Read: {:?}, next-turn Read: {:?}",
+        bodies[1],
+        bodies[2]
     );
 }

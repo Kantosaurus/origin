@@ -4834,6 +4834,10 @@ async fn run_loop_inner(
         // turn run concurrently instead of one-at-a-time. Tuple: (result index to
         // backfill, tool_use id, goal label, worker handle).
         let mut pending_tasks: Vec<(usize, String, String, origin_swarm::WorkerHandle)> = Vec::new();
+        // A2: set once a Mutating tool in this batch is dispatched. Speculative
+        // pre-runs were computed while streaming, before ANY call in the batch
+        // ran, so after a mutation they may hold pre-mutation bytes.
+        let mut batch_mutated = false;
         for (id, name, input_bytes) in tool_uses {
             let Some(meta) = registry_iter().find(|m| m.name == name) else {
                 // gap 9b: a name absent from the compile-time registry may be a
@@ -4914,6 +4918,7 @@ async fn run_loop_inner(
                 // A2: a mutating tool (Bash, Edit, Write, MultiEdit, Task, ...)
                 // may change any file, so no memoized read survives its dispatch.
                 cache.clear();
+                batch_mutated = true;
                 None
             } else if cache.is_skipped(meta.name) {
                 None
@@ -5481,8 +5486,12 @@ async fn run_loop_inner(
                 annotated.into_bytes()
             } else {
                 // Try speculative precomputed result first; fall back to fresh
-                // synchronous dispatch if the registry has no entry.
-                if let Some(pre) = speculative.take(&id).await {
+                // synchronous dispatch if the registry has no entry. After a
+                // mutation in this batch the pre-run is drained but discarded
+                // (A2): it may predate the mutation, and consuming it would
+                // record stale bytes in the memo and `note_read` them.
+                let pre = speculative.take(&id).await.filter(|_| !batch_mutated);
+                if let Some(pre) = pre {
                     match pre {
                         Ok(bytes) => {
                             // #5: the speculative dispatch path runs Read with no
