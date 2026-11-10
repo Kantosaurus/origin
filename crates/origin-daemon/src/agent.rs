@@ -925,8 +925,8 @@ mod task_preview_tests {
 
 /// Run the configured `auto_test` command at turn end through the platform shell.
 ///
-/// Returns a `<test-results>` feedback block ONLY when the command fails (None on
-/// success, spawn failure, or timeout — fail-open). Bounded to 600s. The output
+/// Returns a `<test-results>` feedback block ONLY when the command fails (empty
+/// on success; None on spawn failure, guard refusal or timeout — fail-open). Bounded to 600s. The output
 /// is tail-truncated since test failures surface at the end. Only ever called
 /// when the user opted into `[post_edit] auto_test=true`, so it adds no default
 /// latency.
@@ -998,7 +998,8 @@ async fn run_post_edit_lint_block(cmd: &str, cwd: Option<&std::path::Path>) -> O
 
 /// Run a turn-end check command via [`run_gate_command`] and, ONLY when it
 /// exits non-zero, return a tail-truncated `<{tag}>` feedback block the model
-/// sees next turn. None on success / spawn failure / timeout — fail-open, so a
+/// sees next turn. An empty block on success (B11: so callers can tell it ran);
+/// None on spawn failure / guard refusal / timeout — fail-open, so a
 /// misconfigured command never blocks the turn. Bounded to 600s.
 async fn run_turn_end_command(
     cmd: &str,
@@ -1016,8 +1017,10 @@ async fn run_turn_end_command(
                  continuing or claiming done:\n\n{tail}\n</{tag}>"
             ))
         }
-        // Success / spawn error / timeout ⇒ fail open (no block).
-        _ => None,
+        // Ran and passed ⇒ an empty block (no feedback, but it did run).
+        Some(_) => Some(String::new()),
+        // Spawn error / guard refusal / timeout ⇒ fail open (no block).
+        None => None,
     }
 }
 
@@ -4782,6 +4785,11 @@ async fn run_loop_inner(
     // the optional, default-off end-of-turn checkpoint (Task 1) so a clean
     // read-only turn never triggers shadow-git work even when the flag is on.
     let mut turn_mutated = false;
+    // B11: a successful file edit not yet followed by a command (a dispatched
+    // Bash call, or a test/lint gate that actually ran). Read only by the opt-in
+    // pre-completion check, which `precomplete_nudged` caps at once per run.
+    let mut edit_unverified = false;
+    let mut precomplete_nudged = false;
 
     // Autonomous post-edit LSP diagnostics (opencode). `lsp_diag_block` is the
     // `<lsp-diagnostics>` block (if any) appended to the NEXT turn's system
@@ -5752,13 +5760,10 @@ async fn run_loop_inner(
                         // test-selection is enabled; falls back to `cmd` verbatim.
                         let cmd = effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
                         // Run the oracle now (fresh, not the stale `test_block`).
+                        let fresh = run_post_edit_test(&cmd, opts.cwd.as_deref()).await;
+                        edit_unverified &= fresh.is_none();
                         // C9: redact before it becomes a model-facing User message.
-                        let mut fresh = crate::redact::text(
-                            &run_post_edit_test(&cmd, opts.cwd.as_deref())
-                                .await
-                                .unwrap_or_default(),
-                        )
-                        .into_owned();
+                        let mut fresh = crate::redact::text(&fresh.unwrap_or_default()).into_owned();
                         if !fresh.is_empty() {
                             // Classify against the pre-edit baseline exactly like
                             // the per-turn path (C9), so the model is told whether
@@ -5801,6 +5806,22 @@ async fn run_loop_inner(
                         test_block.clear();
                     }
                 }
+            }
+            // B11: opt-in soft pre-completion check, after the gates above had
+            // their say. Files were edited and nothing ran since the last edit
+            // ⇒ ask once to verify or explain. A read-only run cannot arm it
+            // (the read-only overlay denies every edit).
+            if edit_unverified
+                && !precomplete_nudged
+                && std::env::var("ORIGIN_PRECOMPLETE_CHECK").as_deref() == Ok("1")
+            {
+                precomplete_nudged = true;
+                session.push(Message::new(Role::User).with_block(Block::text(
+                    "[pre-complete-check] You edited files but nothing has run since your last edit. \
+                     Verify the change (run the relevant test or build), or say plainly why it cannot \
+                     be verified here.",
+                )));
+                continue;
             }
             let gate_signals = {
                 let mut s = String::new();
@@ -6790,6 +6811,13 @@ async fn run_loop_inner(
             // detector. A Bash command that exited non-zero counts as an error
             // (`bash_failed`); all other success-path results are not errors.
             stuck.record(&name, &preview, bash_failed, &result_bytes);
+            // B11: a successful edit arms the pre-completion check; a Bash
+            // call dispatched after it (any exit status) disarms it.
+            match name.as_str() {
+                "Edit" | "Write" | "MultiEdit" | "ApplyPatch" => edit_unverified = true,
+                "Bash" => edit_unverified = false,
+                _ => {}
+            }
 
             // SchemaCrush (headroom SmartCrusher port): compress a large,
             // homogeneous JSON array tool result into a columnar table on its
@@ -7136,11 +7164,9 @@ async fn run_loop_inner(
                         // #4: narrow the suite to the edit's blast radius when
                         // test-selection is enabled; falls back to `cmd` verbatim.
                         let cmd = effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
-                        test_block = crate::redact::string(
-                            run_post_edit_test(&cmd, opts.cwd.as_deref())
-                                .await
-                                .unwrap_or_default(),
-                        );
+                        let ran = run_post_edit_test(&cmd, opts.cwd.as_deref()).await;
+                        edit_unverified &= ran.is_none();
+                        test_block = crate::redact::string(ran.unwrap_or_default());
                         // C9: classify a post-edit failure against the pre-edit
                         // baseline — a true regression (was green) vs failures
                         // that were already red before this change.
@@ -7165,11 +7191,9 @@ async fn run_loop_inner(
                 // per-edit lint only logged its result; surface it to the model.
                 if cfg.auto_lint {
                     if let Some(cmd) = cfg.lint_command.as_deref() {
-                        lint_block = crate::redact::string(
-                            run_post_edit_lint_block(cmd, opts.cwd.as_deref())
-                                .await
-                                .unwrap_or_default(),
-                        );
+                        let ran = run_post_edit_lint_block(cmd, opts.cwd.as_deref()).await;
+                        edit_unverified &= ran.is_none();
+                        lint_block = crate::redact::string(ran.unwrap_or_default());
                     }
                 }
             }
