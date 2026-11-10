@@ -862,6 +862,7 @@ fn apply_domain_overlay(
 ///   be both fragile (shell quoting/expansion) and a source of false denials, so
 ///   tool-level conseca `allow_tools`/`deny_tools` remains the lever for the
 ///   command body itself.
+/// - `Grep` / `Glob`: the search root `path` (`.` when absent, as the tools do).
 ///
 /// Any other (or pathless) tool yields an empty vec, so the overlay never
 /// observes it.
@@ -883,6 +884,13 @@ fn conseca_target_paths(tool: &str, args: &Value) -> Vec<String> {
             .filter(|p| !p.is_empty())
             .map(|p| vec![p.to_owned()])
             .unwrap_or_default(),
+        // A missing/empty `path` searches the process cwd, so gate that.
+        "Grep" | "Glob" => vec![args
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|p| !p.is_empty())
+            .unwrap_or(".")
+            .to_owned()],
         _ => Vec::new(),
     }
 }
@@ -890,7 +898,7 @@ fn conseca_target_paths(tool: &str, args: &Value) -> Vec<String> {
 /// DENY-ONLY conseca filesystem-path overlay (Task 2 / R13).
 ///
 /// Given a base `decision` that is already `Allow`, gate a path-touching tool
-/// (`Read`/`Write`/`Edit`/`MultiEdit`/`ApplyPatch`, and `Bash`'s `cwd`) against
+/// (`Read`/`Write`/`Edit`/`MultiEdit`/`ApplyPatch`/`Grep`/`Glob`, and `Bash`'s `cwd`) against
 /// the active [`origin_conseca::SecurityPolicy`]'s `allow_paths`/`deny_paths`.
 /// Every target path the call would access is checked with
 /// [`origin_conseca::check_path`]; a path outside `allow_paths` or inside
@@ -11067,6 +11075,42 @@ mod wiring_tests {
         assert!(conseca_target_paths("WebFetch", &serde_json::json!({ "url": "x" })).is_empty());
         assert!(conseca_target_paths("Bash", &serde_json::json!({ "command": "ls" })).is_empty());
         assert!(conseca_target_paths("Read", &serde_json::json!({})).is_empty());
+    }
+
+    /// A9a: `Grep`/`Glob` are gated on their `path` like `Read`, and neither a
+    /// sibling directory sharing a textual prefix nor a `..` escape passes an
+    /// allow rule.
+    #[test]
+    fn path_overlay_covers_grep_glob_and_resists_prefix_tricks() {
+        let opts = LoopOptions {
+            conseca: Some(Arc::new(origin_conseca::SecurityPolicy {
+                allow_paths: vec!["/work/project".into()],
+                ..origin_conseca::SecurityPolicy::default()
+            })),
+            ..LoopOptions::default()
+        };
+        let gate = |tool: &str, path: &str| {
+            let allow = Decision {
+                outcome: Outcome::Allow,
+                reason: "base".into(),
+            };
+            let args = serde_json::json!({ "pattern": "x", "path": path });
+            apply_path_overlay(allow, tool, &args, &opts).outcome
+        };
+        assert_eq!(gate("Grep", "/etc"), Outcome::Deny, "Grep outside the allow root");
+        assert_eq!(gate("Glob", "/etc"), Outcome::Deny, "Glob outside the allow root");
+        assert_eq!(
+            gate("Grep", "/work/project-evil"),
+            Outcome::Deny,
+            "sibling prefix"
+        );
+        assert_eq!(
+            gate("Grep", "/work/project/../project-evil"),
+            Outcome::Deny,
+            "`..` escape"
+        );
+        assert_eq!(gate("Grep", "/work/project/src"), Outcome::Allow);
+        assert_eq!(gate("Glob", "/work/project"), Outcome::Allow);
     }
 
     // ---- Task 3 / R14: policy model-list + spend-cap (Feature 3) ----

@@ -96,51 +96,54 @@ pub fn check_tool(p: &SecurityPolicy, tool: &str) -> Decision {
     Decision::Deny(format!("tool '{tool}' is not on the allow list"))
 }
 
-/// Normalizes a filesystem path for prefix comparison.
+/// Lexically canonicalizes a filesystem path into its components.
 ///
-/// Backslashes are converted to forward slashes so that Windows and POSIX
-/// paths compare identically against policy prefixes.
-fn normalize_path(path: &str) -> String {
-    path.replace('\\', "/")
-}
-
-/// Returns `true` when `path` lies under `prefix` on a path-segment boundary.
-///
-/// A bare prefix equal to the path matches, and a prefix followed by a `/`
-/// separator matches, but a prefix that is merely a textual head of a longer
-/// segment (for example `/etc` vs `/etchosts`) does not.
-fn path_under(path: &str, prefix: &str) -> bool {
-    let prefix = prefix.trim_end_matches('/');
-    if prefix.is_empty() {
-        return true;
+/// Backslashes count as separators (Windows and POSIX paths compare alike), a
+/// relative path is anchored at the process cwd (where the tools resolve it),
+/// and empty, `.` and `..` segments are resolved — `..` never climbs above the
+/// root or a leading `X:` drive. `None` when a relative path cannot be anchored.
+// ponytail: lexical only, symlinks are not resolved; canonicalize the longest
+// existing ancestor if symlinked escapes matter.
+fn path_components(path: &str) -> Option<Vec<String>> {
+    let mut path = path.replace('\\', "/");
+    let is_absolute = path.starts_with('/') || path.as_bytes().get(1) == Some(&b':');
+    if !is_absolute {
+        let cwd = std::env::current_dir().ok()?;
+        path = format!("{}/{path}", cwd.to_string_lossy().replace('\\', "/"));
     }
-    if path == prefix {
-        return true;
+    let mut out: Vec<String> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if !(out.len() == 1 && out[0].ends_with(':')) {
+                    out.pop();
+                }
+            }
+            _ => out.push(seg.to_owned()),
+        }
     }
-    path.strip_prefix(prefix)
-        .is_some_and(|rest| rest.starts_with('/'))
+    Some(out)
 }
 
 /// Checks whether a filesystem path may be accessed under the policy.
 ///
-/// Paths are normalized (backslashes to forward slashes) before matching.
-/// Deny prefixes win. When the allow-list is empty any non-denied path is
-/// permitted; when it is non-empty the path must fall under an allow prefix.
+/// Both the path and the policy prefixes are canonicalized with
+/// [`path_components`] and compared component by component, so
+/// `/work/project-evil` is not under `/work/project`. Deny prefixes win. When
+/// the allow-list is empty any non-denied path is permitted; when it is
+/// non-empty the path must fall under an allow prefix. Anything that cannot be
+/// resolved fails closed (path denied, deny prefix treated as matching).
 #[must_use]
 pub fn check_path(p: &SecurityPolicy, path: &str) -> Decision {
-    let normalized = normalize_path(path);
-    if let Some(deny) = p
-        .deny_paths
-        .iter()
-        .find(|d| path_under(&normalized, &normalize_path(d)))
-    {
+    let Some(components) = path_components(path) else {
+        return Decision::Deny(format!("path '{path}' cannot be resolved"));
+    };
+    let under = |prefix: &str| path_components(prefix).map(|pre| components.starts_with(&pre));
+    if let Some(deny) = p.deny_paths.iter().find(|d| under(d).unwrap_or(true)) {
         return Decision::Deny(format!("path '{path}' is under denied prefix '{deny}'"));
     }
-    if p.allow_paths.is_empty()
-        || p.allow_paths
-            .iter()
-            .any(|a| path_under(&normalized, &normalize_path(a)))
-    {
+    if p.allow_paths.is_empty() || p.allow_paths.iter().any(|a| under(a).unwrap_or(false)) {
         return Decision::Allow;
     }
     Decision::Deny(format!("path '{path}' is not under any allowed prefix"))
@@ -331,6 +334,42 @@ mod tests {
             ..SecurityPolicy::default()
         };
         assert_eq!(check_path(&p, r"C:\work\file.txt"), Decision::Allow);
+    }
+
+    #[test]
+    fn path_dot_segments_resolved_before_matching() {
+        let p = SecurityPolicy {
+            allow_paths: vec!["/work/project".to_owned()],
+            deny_paths: vec!["/work/project/secrets".to_owned()],
+            ..SecurityPolicy::default()
+        };
+        // `..` cannot climb out of an allow root into a sibling.
+        assert!(matches!(
+            check_path(&p, "/work/project/../project-evil/x"),
+            Decision::Deny(_)
+        ));
+        // `.`/`..`/doubled separators cannot dodge a deny prefix.
+        assert!(matches!(
+            check_path(&p, "/work/project/src/../secrets/./key.pem"),
+            Decision::Deny(_)
+        ));
+        assert!(matches!(
+            check_path(&p, "/work/project//secrets/key.pem"),
+            Decision::Deny(_)
+        ));
+        assert_eq!(check_path(&p, "/work/project/a/../b"), Decision::Allow);
+    }
+
+    #[test]
+    fn relative_path_is_anchored_at_cwd() {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let p = SecurityPolicy {
+            deny_paths: vec![cwd.to_string_lossy().into_owned()],
+            ..SecurityPolicy::default()
+        };
+        // A relative path lands under the process cwd, which is denied.
+        assert!(matches!(check_path(&p, "src/lib.rs"), Decision::Deny(_)));
+        assert!(matches!(check_path(&p, "."), Decision::Deny(_)));
     }
 
     #[test]
