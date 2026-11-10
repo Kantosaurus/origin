@@ -604,6 +604,66 @@ async fn apply_cmd_guard(
     }
 }
 
+/// Permission-prompt preview for a `Task` delegation (A4).
+///
+/// The prompt is often shown on one row cut at the terminal width, so the facts
+/// that decide the approval come first and their extent is visible even when cut:
+/// `<N> tools: <permission-gated tools…>, <read-only tools…> | mcp: <names> | goal: <goal>`.
+/// Gated/mutating tools (and unknown names or globs) sort before the auto-allowed
+/// pure ones, so truncation can never hide them; the model's order is kept within
+/// each group.
+fn task_permission_preview(args: &Value) -> String {
+    let names = |key: &str, field: Option<&str>| -> Vec<String> {
+        args.get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| field.map_or(Some(v), |f| v.get(f)).and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    };
+    let mut tools = names("allowed_tools", None);
+    tools.sort_by_key(|t| {
+        registry_iter().find(|m| m.name == t.as_str()).is_some_and(|m| {
+            matches!(m.tier, origin_tools::Tier::AutoAllowed) && matches!(m.side_effects, SideEffects::Pure)
+        })
+    });
+    let mcp = names("mcp_servers", Some("name"));
+    let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "none".to_owned()
+        } else {
+            v.join(", ")
+        }
+    };
+    format!(
+        "{} tools: {} | mcp: {} | goal: {goal}",
+        tools.len(),
+        list(&tools),
+        list(&mcp)
+    )
+}
+
+#[cfg(test)]
+mod task_preview_tests {
+    #[test]
+    fn task_preview_leads_with_count_and_gated_tools_then_mcp_then_goal() {
+        let args = serde_json::json!({
+            "goal": "refactor the parser",
+            "allowed_tools": ["Read", "Grep", "Glob", "Edit", "MultiEdit", "Write", "Bash"],
+            "budget": {"max_tool_calls": 50},
+            "mcp_servers": [{"name": "github", "command": "gh-mcp"}],
+        });
+        let p = super::task_permission_preview(&args);
+        assert!(p.starts_with("7 tools: "), "{p}");
+        let head: String = p.chars().take(60).collect();
+        assert!(head.contains("Bash"), "Bash must survive a 60-col cut: {p}");
+        let (mcp, goal) = (p.find("github").expect("mcp"), p.find("refactor").expect("goal"));
+        assert!(mcp < goal, "mcp names come before the goal: {p}");
+    }
+}
+
 /// Run the configured `auto_test` command at turn end through the platform shell.
 ///
 /// Returns a `<test-results>` feedback block ONLY when the command fails (None on
@@ -5261,6 +5321,23 @@ async fn run_loop_inner(
             let args = origin_tools::coerce::coerce(meta.input_schema, &args);
             let preview = args.to_string();
 
+            // A4: with no coordinator (a swarm worker, a headless/candidate loop) a
+            // delegation can never run, so answer it with a recoverable error
+            // BEFORE the permission check — a denial there would end the run.
+            if opts.coordinator.is_none() && matches!(meta.name, "Task" | "RunWorkflow") {
+                tool_results.push(Block::ToolResult {
+                    tool_use_id: id,
+                    handle: None,
+                    inline: Some(
+                        format!("Error: `{name}`: sub-agents cannot delegate here (swarm subsystem not configured)")
+                            .into_bytes(),
+                    ),
+                    cache_marker: None,
+                    is_error: true,
+                });
+                continue;
+            }
+
             // Compute the memoization key using the RAW input bytes (not
             // re-serialized args) so the key is stable across turns.
             let key = origin_tools::NormalizedInput::hash(meta.name, &input_bytes);
@@ -5282,7 +5359,10 @@ async fn run_loop_inner(
             // `[[permission_rules]]` this is byte-identical to the historical
             // `check_with_skills` path.
             let skills: &SkillRegistry = opts.skills.as_deref().unwrap_or(&EMPTY_SKILLS);
-            let mut decision = decide_permission(meta, &preview, prompter, skills, opts).await;
+            // A4: a delegation's prompt leads with what it unlocks (one-row safe).
+            let task_preview = (meta.name == "Task").then(|| task_permission_preview(&args));
+            let ask_preview = task_preview.as_deref().unwrap_or(&preview);
+            let mut decision = decide_permission(meta, ask_preview, prompter, skills, opts).await;
 
             // Task 3 — DENY-ONLY governance overlay. After the base check yields
             // a decision, the optional policy/conseca layers may only *narrow*
@@ -5584,16 +5664,29 @@ async fn run_loop_inner(
                                 input.model = Some(session.model.clone());
                             }
                             // A4: a skill-masked parent may only delegate tools its
-                            // mask permits (exact names; globs are dropped). If the
-                            // request named tools and none survive, refuse the Task.
+                            // mask permits, as exact names: a glob entry (`*`,
+                            // `mcp__x__*`) is dropped even if the mask lists that
+                            // string, since the parent matches it literally but the
+                            // worker would expand it. Inline-MCP servers are refused
+                            // outright (their tools bypass `allowed_tools`), as is a
+                            // request whose named tools are all dropped.
                             // ponytail: AutoAllowed tools inside the worker are not
-                            // narrowed (its AllowList never sees them); upgrade path:
-                            // carry the mask on `WorkerSpec`.
+                            // narrowed (they never reach its AllowList); upgrade
+                            // path: carry the mask on `WorkerSpec`.
                             if let Some(mask) = opts.skills.as_deref().and_then(SkillRegistry::allowed_tools)
                             {
                                 let requested = input.allowed_tools.len();
-                                input.allowed_tools.retain(|t| mask.contains(t));
-                                if requested > 0 && input.allowed_tools.is_empty() {
+                                input
+                                    .allowed_tools
+                                    .retain(|t| !t.contains(['*', '?', '[', '{']) && mask.contains(t));
+                                let why = if !input.mcp_servers.is_empty() {
+                                    Some("inline MCP servers cannot be delegated under")
+                                } else if requested > 0 && input.allowed_tools.is_empty() {
+                                    Some("none of the requested allowed_tools is permitted by")
+                                } else {
+                                    None
+                                };
+                                if let Some(why) = why {
                                     let mut names: Vec<&str> = mask.iter().map(String::as_str).collect();
                                     names.sort_unstable();
                                     tool_results.push(Block::ToolResult {
@@ -5601,8 +5694,7 @@ async fn run_loop_inner(
                                         handle: None,
                                         inline: Some(
                                             format!(
-                                                "Error: Task: none of the requested allowed_tools is \
-                                                 permitted by the active skill mask [{}]",
+                                                "Error: Task: {why} the active skill mask [{}]",
                                                 names.join(", ")
                                             )
                                             .into_bytes(),
@@ -7680,6 +7772,8 @@ async fn dispatch_tool(
         }
         // ── Task ──
         // Requires an `origin_swarm::Coordinator` threaded through `LoopOptions`.
+        // No skill-mask narrowing here: `run_loop` intercepts every Task when a
+        // coordinator exists, so this arm is only reached by direct callers.
         "Task" => {
             let coord =
                 coordinator.ok_or_else(|| LoopError::ToolFailure("Task subsystem not configured".into()))?;

@@ -63,7 +63,7 @@ ARE a swarm sub-agent, you still owe this: verify your own output adversarially 
 before returning, because no one else may re-check it.
 
 SWARM IS ALWAYS ON. The `Task` tool spawns a sub-agent (swarm worker) that \
-runs concurrently; it never requires a permission prompt. Reach for it by \
+runs concurrently; with permission prompts on, the user approves each delegation. Reach for it by \
 default — whenever the work splits into independent units, dispatch one `Task` \
 per unit and let them run in parallel rather than doing the work serially \
 yourself. Scope each sub-agent by granting it only the `allowed_tools` it \

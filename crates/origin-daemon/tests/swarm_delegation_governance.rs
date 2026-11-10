@@ -250,3 +250,83 @@ async fn masked_delegation_with_nothing_permitted_is_refused() {
         "the Task must come back as an is_error result naming the skill mask"
     );
 }
+
+fn mask_of(tools: &[&str]) -> Arc<SkillRegistry> {
+    let mut skills = SkillRegistry::new();
+    skills.activate(SkillFrontmatter {
+        name: "custom-mask".into(),
+        description: "test mask".into(),
+        allowed_tools: tools.iter().map(|t| (*t).to_string()).collect(),
+    });
+    Arc::new(skills)
+}
+
+/// A worker that records the `allowed_tools` it was launched with.
+fn recording_worker(seen: &Arc<Mutex<Vec<Vec<String>>>>) -> WorkerFn {
+    let seen = Arc::clone(seen);
+    let inner = counting_worker(&Arc::new(AtomicUsize::new(0)));
+    Arc::new(move |ctx: WorkerContext| {
+        seen.lock().expect("lock").push(ctx.spec.allowed_tools.clone());
+        inner(ctx)
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn masked_parent_cannot_delegate_inline_mcp_servers() {
+    // The mask {Read, Task} gives the parent no mcp__* tool, so it must not hand a
+    // worker a whole MCP server (its tools bypass `allowed_tools`).
+    let tmp = TempDir::new().expect("tmp");
+    let spawned = Arc::new(AtomicUsize::new(0));
+    let (coord, _cas) = coordinator(&tmp, counting_worker(&spawned));
+    let mut opts = LoopOptions::default()
+        .without_streaming()
+        .with_skills(read_task_mask());
+    opts.coordinator = Some(coord);
+    let call = tool_use(
+        "Task",
+        &serde_json::json!({"goal": "use github", "allowed_tools": ["Read"], "background": false,
+                            "mcp_servers": [{"name": "github"}]}),
+    );
+    let provider = scripted(vec![reply(call), reply(Block::text("done"))]);
+    let mut session = Session::new("masked-mcp", "scripted-model");
+    run_loop(&mut session, "go", &provider, &AlwaysAllow, &opts)
+        .await
+        .expect("parent loop completes");
+    assert_eq!(
+        spawned.load(Ordering::SeqCst),
+        0,
+        "masked MCP delegation must not spawn"
+    );
+    let refused = session.messages.iter().flat_map(|m| m.blocks.iter()).any(|b| {
+        matches!(b, Block::ToolResult { is_error: true, inline: Some(body), .. }
+            if String::from_utf8_lossy(body).contains("skill mask"))
+    });
+    assert!(
+        refused,
+        "the Task must come back as an is_error result naming the skill mask"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn masked_parent_glob_entry_is_not_forwarded_even_if_the_mask_lists_it() {
+    // The mask lists the literal string `*`; the parent matches it as a name, but
+    // the worker would treat it as "every tool" — it must be dropped.
+    let tmp = TempDir::new().expect("tmp");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (coord, _cas) = coordinator(&tmp, recording_worker(&seen));
+    let mut opts = LoopOptions::default()
+        .without_streaming()
+        .with_skills(mask_of(&["*", "Read", "Task"]));
+    opts.coordinator = Some(coord);
+    let provider = scripted(vec![reply(task_call(&["*", "Read"])), reply(Block::text("done"))]);
+    let mut session = Session::new("masked-glob", "scripted-model");
+    run_loop(&mut session, "go", &provider, &AlwaysAllow, &opts)
+        .await
+        .expect("parent loop completes");
+    let seen = seen.lock().expect("lock").clone();
+    assert_eq!(
+        seen,
+        vec![vec!["Read".to_string()]],
+        "the worker must not get `*`"
+    );
+}

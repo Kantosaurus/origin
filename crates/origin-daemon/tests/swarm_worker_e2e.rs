@@ -138,6 +138,65 @@ async fn parent_allow_rule_does_not_widen_worker_allow_list() {
     assert!(!wrote, "an allow rule let a worker without `Write` run Write");
 }
 
+/// A4 fix round 2: a worker has no coordinator, so its `Task` call (it is shown
+/// the tool and told to use it) must come back as a recoverable error — not a
+/// denial that ends the worker's whole run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_calling_task_recovers_and_completes() {
+    let tmp = TempDir::new().expect("tmp");
+    let store = Arc::new(origin_store::Store::open(tmp.path().join("origin.db")).expect("store"));
+    let cas = Arc::new(open_cas(tmp.path().join("cas")));
+    let plan_store = Arc::new(PlanStore::open(Arc::clone(&store), Arc::clone(&cas)).expect("plan store"));
+    let plan = PlanHandle::new(Arc::new(AsyncMutex::new(Plan::default())), plan_store);
+    let task = ChatResponse {
+        assistant: Message::new(Role::Assistant).with_block(Block::ToolUse {
+            id: "tu_1".into(),
+            name: "Task".into(),
+            input_json: serde_json::to_vec(&serde_json::json!({"goal": "nested", "allowed_tools": []}))
+                .expect("json"),
+            cache_marker: None,
+        }),
+        usage: ProviderUsage::default(),
+    };
+    let done = ChatResponse {
+        assistant: Message::new(Role::Assistant).with_block(Block::text("done")),
+        usage: ProviderUsage::default(),
+    };
+    let active: Arc<RwLock<Arc<dyn Provider>>> = Arc::new(RwLock::new(Arc::new(ScriptedProvider {
+        responses: Mutex::new(vec![task, done]),
+    })));
+    let mut coord = Coordinator::new(plan, format!("origin-worker-nested-{}", std::process::id()));
+    coord.set_default_worker(origin_daemon::swarm_worker::real_worker(
+        active,
+        Arc::clone(&cas),
+        origin_keyvault::KeyVault::in_memory(),
+        origin_planner::Plan::default(),
+        origin_daemon::config::Governance::default(),
+    ));
+    let spec = WorkerSpec {
+        goal: "try to delegate".into(),
+        allowed_tools: vec!["Read".into()],
+        budget: Budget {
+            max_wall_ms: 5_000,
+            max_input_tokens: 10_000,
+            max_output_tokens: 10_000,
+            max_tool_calls: 4,
+        },
+        workspace: None,
+        parent_actor: origin_plan::ActorId::new(0),
+        model: None,
+        mcp_servers: Vec::new(),
+    };
+    let handle = coord.spawn(spec).await.expect("spawn worker");
+    let report = coord.await_completion(&handle).await.expect("await");
+    assert_eq!(
+        report.status,
+        ReportStatus::Completed,
+        "a nested Task must not end the worker: {:?}",
+        report.detail
+    );
+}
+
 /// Run a real worker under `gov_toml` with `allowed_tools = [allowed]` whose
 /// scripted model issues one `Write`; returns whether the file was created.
 async fn worker_write_ran(gov_toml: &str, allowed: &str) -> bool {

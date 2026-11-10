@@ -220,24 +220,40 @@ fn confirm_selection(state: &PickerState) -> PickerOutcome {
     }
 }
 
+/// Most rows a wrapped picker question may take.
+const QUESTION_MAX_ROWS: usize = 4;
+
 /// Lay out the picker into [`RenderRow`]s: the bold question, each option row
 /// (`▸` cursor / `□■` boxes / number hints / `muted` description), and the
 /// `✎ type your own…` row when allowed.
 ///
-/// One row per option, preceded by the bold question and followed (when
-/// `allow_custom`) by the custom row, so the total height is
-/// `1 + options.len() + allow_custom as usize`. `width` clips long descriptions.
+/// One row per option, preceded by the bold question (wrapped to `width`, at
+/// most [`QUESTION_MAX_ROWS`] rows) and followed (when `allow_custom`) by the
+/// custom row. `width` also clips long descriptions.
 #[must_use]
 pub fn layout_picker(state: &PickerState, width: u16, tok: &Tokens) -> Vec<RenderRow> {
-    let mut rows = Vec::with_capacity(state.options.len() + 2);
+    let mut rows = Vec::with_capacity(state.options.len() + QUESTION_MAX_ROWS + 1);
 
-    // Question header (bold, bright).
-    rows.push(RenderRow::one(RowSpan::new(
-        state.question.clone(),
-        tok.bright,
-        0,
-        Attr::BOLD,
-    )));
+    // Question header (bold, bright), wrapped so a long permission preview stays
+    // readable; capped (last row ends in `…`) so the options stay on screen.
+    let chars: Vec<char> = state.question.chars().collect();
+    let mut lines: Vec<String> = chars
+        .chunks(usize::from(width.max(1)))
+        .map(String::from_iter)
+        .collect();
+    if lines.len() > QUESTION_MAX_ROWS {
+        lines.truncate(QUESTION_MAX_ROWS);
+        if let Some(last) = lines.last_mut() {
+            last.pop();
+            last.push('…');
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    for line in lines {
+        rows.push(RenderRow::one(RowSpan::new(line, tok.bright, 0, Attr::BOLD)));
+    }
 
     for (i, opt) in state.options.iter().enumerate() {
         let cursored = i == state.cursor && !state.typing_custom;
@@ -591,6 +607,22 @@ mod tests {
             "question is bold"
         );
         assert_eq!(q.spans[0].text, "pick one");
+    }
+
+    #[test]
+    fn layout_long_question_wraps_and_is_capped() {
+        let tok = Tokens::default_tokens();
+        let mut s = single(2);
+        s.question = "x".repeat(25);
+        let rows = layout_picker(&s, 10, &tok);
+        // 25 chars at width 10 ⇒ 3 question rows, then 2 options.
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[2].spans[0].text, "xxxxx");
+        s.question = "y".repeat(100);
+        let rows = layout_picker(&s, 10, &tok);
+        // Capped at QUESTION_MAX_ROWS, last row marked as cut.
+        assert_eq!(rows.len(), QUESTION_MAX_ROWS + 2);
+        assert!(rows[QUESTION_MAX_ROWS - 1].spans[0].text.ends_with('…'));
     }
 
     #[test]
