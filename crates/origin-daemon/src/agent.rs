@@ -869,7 +869,7 @@ fn write_outside(name: &str, args: &Value, ws: &Workspace) -> Option<String> {
 
 /// C2: `s` escaped (`escape_debug`) and quoted, keeping its last 200 characters
 /// with `…` in front when longer — the end of a path names its real target.
-fn quoted_tail(s: &str) -> String {
+pub(crate) fn quoted_tail(s: &str) -> String {
     const CAP: usize = 200;
     let esc: Vec<char> = s.escape_debug().collect();
     let tail: String = esc[esc.len().saturating_sub(CAP)..].iter().collect();
