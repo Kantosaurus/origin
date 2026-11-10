@@ -578,10 +578,11 @@ async fn decide_permission(
     }
     // An "always allow" answer covers later ordinary asks for the tool in this
     // session; never a `Task` or `RunWorkflow` (each delegation or workflow
-    // grants something different), never an ask that needs a person, and never
+    // grants something different) or an `AuthorWorkflow` (it writes a file
+    // that later grants tools), never an ask that needs a person, and never
     // a command-guard ask (it is about that one flagged command).
     let offer_always = !person
-        && !matches!(meta.name, "Task" | "RunWorkflow")
+        && !matches!(meta.name, "Task" | "RunWorkflow" | "AuthorWorkflow")
         && cmd_guard_ask_preview(meta.name, args, args_preview, opts.cwd.as_deref()).is_none();
     if offer_always && prompter.standing_allow(meta.name) {
         return decision(true, STANDING_ALLOW.into());
@@ -1200,6 +1201,35 @@ fn task_preview_and_reach(args: &Value) -> (String, usize, usize) {
     (preview, reached.len(), servers.len())
 }
 
+/// A4: the `RunWorkflow` permission prompt: what its step workers reach (the
+/// union of their grants, rendered as a `Task` prompt is), then the workflow
+/// name. `path` is the workflows file ([`crate::workflows::path`]); a workflow
+/// that cannot be loaded is named with `(workflow not found)`.
+fn run_workflow_preview(
+    args: &Value,
+    path: std::io::Result<std::path::PathBuf>,
+    catalog: Option<&SkillCatalog>,
+) -> String {
+    let name = args.get("name").and_then(Value::as_str).map_or("", str::trim);
+    let shown: String = name.escape_debug().take(64).collect();
+    let workflow = path
+        .and_then(|p| crate::workflows::load_from(&p))
+        .ok()
+        .and_then(|f| f.workflows.into_iter().find(|w| w.name == name));
+    let Some(workflow) = workflow else {
+        return format!("workflow: \"{shown}\" (workflow not found)");
+    };
+    let empty = SkillCatalog::default();
+    let catalog = catalog.unwrap_or(&empty);
+    let tools: Vec<String> = workflow
+        .steps
+        .iter()
+        .flat_map(|s| crate::workflow_runner::step_worker_spec(s, catalog).allowed_tools)
+        .collect();
+    let (reach, _, _) = task_preview_and_reach(&serde_json::json!({ "allowed_tools": tools }));
+    format!("{reach} | workflow: \"{shown}\"")
+}
+
 #[cfg(test)]
 mod task_preview_tests {
     #[test]
@@ -1325,6 +1355,36 @@ mod task_preview_tests {
             let p = preview(&[tool], &[]);
             assert!(p.starts_with(&format!("1/{t} gated tools ({tool})")), "{p}");
         }
+    }
+
+    /// A4 (final fix S5): a `RunWorkflow` ask states the reach of its steps'
+    /// workers, then the workflow name; an unknown workflow says so.
+    #[test]
+    fn run_workflow_preview_states_the_union_of_step_grants() {
+        let dir = tempfile::tempdir().expect("tmp");
+        for (skill, tool) in [("wf-shell", "Bash"), ("wf-write", "Write")] {
+            let d = dir.path().join("skills").join(skill);
+            std::fs::create_dir_all(&d).expect("mkdir");
+            let body =
+                format!("---\nname: {skill}\ndescription: t\nallowed-tools: [\"{tool}\"]\n---\nbody\n");
+            std::fs::write(d.join("SKILL.md"), body).expect("write");
+        }
+        let catalog =
+            crate::skill_catalog::SkillCatalog::load_from(&dir.path().join("skills")).expect("catalog");
+        let wf = dir.path().join("workflows.toml");
+        let toml = "[[workflows]]\nname = \"ship\"\n[[workflows.steps]]\nskill = \"wf-shell\"\n\
+                    [[workflows.steps]]\nid = 1\nskill = \"wf-write\"\n";
+        std::fs::write(&wf, toml).expect("write");
+        let t = gated_total();
+        let p = super::run_workflow_preview(
+            &serde_json::json!({"name": "ship"}),
+            Ok(wf.clone()),
+            Some(&catalog),
+        );
+        assert!(p.starts_with(&format!("2/{t} gated tools")), "{p}");
+        assert!(p.ends_with(" | workflow: \"ship\""), "{p}");
+        let p = super::run_workflow_preview(&serde_json::json!({"name": "nope"}), Ok(wf), Some(&catalog));
+        assert_eq!(p, "workflow: \"nope\" (workflow not found)");
     }
 
     fn docs_patterns() -> Vec<String> {
@@ -7459,6 +7519,11 @@ async fn run_loop_inner(
             // C2: a `NeedsApproval` Bash prompt leads with the guard's reason.
             let special_preview = (meta.name == "Task")
                 .then(|| task_permission_preview(&args))
+                .or_else(|| {
+                    (meta.name == "RunWorkflow").then(|| {
+                        run_workflow_preview(&args, crate::workflows::path(), opts.skill_catalog.as_deref())
+                    })
+                })
                 .or_else(|| cmd_guard_ask_preview(meta.name, &args, &preview, opts.cwd.as_deref()));
             let ask_preview = special_preview.as_deref().unwrap_or(&preview);
             // C2: a `Dangerous` command is denied before anyone is asked.
@@ -14669,6 +14734,24 @@ mod wiring_tests {
             vec![false, false],
             "Task and person-asks offer no always"
         );
+    }
+
+    /// A4 (final fix S5): `AuthorWorkflow` writes a file that later grants
+    /// tools, so it is asked every time and never offers "always".
+    #[tokio::test]
+    async fn author_workflow_is_asked_despite_a_standing_allow() {
+        let standing = Rec::standing();
+        let args = serde_json::json!({"goal": "g"});
+        let d = decide_c2(
+            "AuthorWorkflow",
+            &args,
+            &standing,
+            &LoopOptions::default(),
+            &Session::new("p", "m"),
+        )
+        .await;
+        assert_eq!(d.reason, USER_APPROVED, "asked every time");
+        assert_eq!(standing.offers(), vec![false], "no always offered");
     }
     /// C2 fix round 1: inside a workspace root, `.git` and `.origin` paths need
     /// a person (asked interactively, denied headless); an ordinary file does
