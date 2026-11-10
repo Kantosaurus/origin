@@ -45,6 +45,27 @@ const ALLOW: &[&str] = &[
     "windir",
     "NUMBER_OF_PROCESSORS",
     "PROCESSOR_ARCHITECTURE",
+    // Project resolution: without these a child (test run, language server)
+    // reports false import/resolution failures. No registry/proxy URL vars here:
+    // those can embed `user:token@` credentials (use ORIGIN_ENV_PASSTHROUGH).
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "GOFLAGS",
+    "GOMODCACHE",
+    "GOPRIVATE",
+    "GONOSUMDB",
+    "GONOPROXY",
+    "GOWORK",
+    "RUSTUP_TOOLCHAIN",
+    "RUSTFLAGS",
+    "CARGO_TARGET_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+    "DOTNET_ROOT",
+    "NODE_PATH",
 ];
 
 /// True when `name` looks like a credential: `*_API_KEY`, `*_TOKEN`,
@@ -129,6 +150,36 @@ mod tests {
             "PROCESSOR_ARCHITECTURE",
         ] {
             assert!(keep(n, ""), "Windows build discovery needs {n}");
+        }
+        for n in [
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "GOFLAGS",
+            "GOMODCACHE",
+            "GOPRIVATE",
+            "GONOSUMDB",
+            "GONOPROXY",
+            "GOWORK",
+            "RUSTUP_TOOLCHAIN",
+            "RUSTFLAGS",
+            "CARGO_TARGET_DIR",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "LD_LIBRARY_PATH",
+            "DYLD_LIBRARY_PATH",
+            "DOTNET_ROOT",
+            "NODE_PATH",
+        ] {
+            assert!(keep(n, ""), "project resolution needs {n}");
+        }
+        for n in [
+            "GOPROXY",
+            "PIP_INDEX_URL",
+            "NPM_CONFIG_REGISTRY",
+            "CARGO_REGISTRY_TOKEN",
+        ] {
+            assert!(!keep(n, ""), "{n} may carry credentials");
         }
         assert!(!keep("RANDOM_VAR", ""));
         assert!(keep("RANDOM_VAR", "X, random_var"));
