@@ -80,7 +80,100 @@ fn tool_result_payload_bytes(
 pub const ELIDE_KEEP_TURNS: usize = 10;
 /// A7: the tighter window used after a provider context-length error.
 pub const ELIDE_KEEP_TURNS_AGGRESSIVE: usize = 3;
+/// A7: percent of the model window a high-water elision aims to get under.
+pub const ELIDE_LOW_WATER_PCT: usize = 50;
+/// A7: a firing that cannot reach low water must free at least this percent
+/// of the model window, or it is skipped.
+pub const ELIDE_MIN_FREE_PCT: usize = 10;
 const ELIDED_PREFIX: &[u8] = b"[tool result elided:";
+
+type ToolNames = std::collections::HashMap<String, String>;
+
+/// Index of the oldest of the last `keep_turns` assistant messages (everything
+/// before it is eligible), plus the tool names of the `tool_use`s before it.
+fn elision_scope(transcript: &[Message], keep_turns: usize) -> Option<(usize, ToolNames)> {
+    let cutoff = transcript
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, m)| m.role == Role::Assistant)
+        .nth(keep_turns.saturating_sub(1))
+        .map(|(i, _)| i)?;
+    let names = transcript[..cutoff]
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .filter_map(|b| match b {
+            Block::ToolUse { id, name, .. } => Some((id.clone(), name.clone())),
+            _ => None,
+        })
+        .collect();
+    Some((cutoff, names))
+}
+
+/// The placeholder for `block` and the bytes swapping it in frees, or `None`
+/// when `block` is not a tool result, is already elided, or is no larger than
+/// its placeholder.
+fn elision_of(block: &Block, names: &ToolNames, cas: Option<&Store>) -> Option<(Vec<u8>, usize)> {
+    let Block::ToolResult {
+        tool_use_id,
+        handle,
+        inline,
+        ..
+    } = block
+    else {
+        return None;
+    };
+    if inline.as_ref().is_some_and(|b| b.starts_with(ELIDED_PREFIX)) {
+        return None;
+    }
+    let bytes = tool_result_payload_bytes(handle.as_ref(), inline.as_ref(), cas);
+    let tool = names.get(tool_use_id.as_str()).map_or("unknown", String::as_str);
+    let placeholder = format!("[tool result elided: {tool} {bytes} bytes]").into_bytes();
+    let freed = bytes.checked_sub(placeholder.len()).filter(|&f| f > 0)?;
+    Some((placeholder, freed))
+}
+
+/// Bytes [`elide_old_tool_results`] with `keep_turns` would free, without
+/// touching the transcript.
+#[must_use]
+pub fn elision_savings(transcript: &[Message], keep_turns: usize, cas: Option<&Store>) -> usize {
+    elision_scope(transcript, keep_turns).map_or(0, |(cutoff, names)| {
+        transcript[..cutoff]
+            .iter()
+            .flat_map(|m| &m.blocks)
+            .filter_map(|b| elision_of(b, &names, cas))
+            .map(|(_, freed)| freed)
+            .sum()
+    })
+}
+
+/// One high-water elision firing (A7); sizes are in transcript bytes.
+///
+/// Elides once with the LARGEST window from [`ELIDE_KEEP_TURNS`] down to
+/// [`ELIDE_KEEP_TURNS_AGGRESSIVE`] that brings `current_bytes` under the
+/// [`ELIDE_LOW_WATER_PCT`] mark, so the next firing is far away. When no
+/// window gets there (e.g. a system prompt elision can never shrink), the
+/// 3-turn window fires only if it frees at least [`ELIDE_MIN_FREE_PCT`] of the
+/// window; otherwise nothing is touched — eliding a sliver every turn would
+/// break the prompt cache each turn without relieving the pressure. Returns
+/// the number of results elided.
+pub fn elide_to_low_water(
+    transcript: &mut [Message],
+    cas: Option<&Store>,
+    current_bytes: usize,
+    window_bytes: usize,
+) -> usize {
+    let low_water = window_bytes.saturating_mul(ELIDE_LOW_WATER_PCT) / 100;
+    let min_free = window_bytes.saturating_mul(ELIDE_MIN_FREE_PCT) / 100;
+    let keep = (ELIDE_KEEP_TURNS_AGGRESSIVE..=ELIDE_KEEP_TURNS)
+        .rev()
+        .find(|&k| current_bytes.saturating_sub(elision_savings(transcript, k, cas)) < low_water)
+        .or_else(|| {
+            (elision_savings(transcript, ELIDE_KEEP_TURNS_AGGRESSIVE, cas) >= min_free)
+                .then_some(ELIDE_KEEP_TURNS_AGGRESSIVE)
+        });
+    keep.map_or(0, |k| elide_old_tool_results(transcript, k, cas))
+}
 
 /// Summary-free elision (A7): stub out tool results older than the last `keep_turns` assistant turns.
 ///
@@ -94,47 +187,19 @@ const ELIDED_PREFIX: &[u8] = b"[tool result elided:";
 /// or no larger than their placeholder, are skipped, so a repeat call returns 0
 /// and rewrites nothing. Returns the number of results elided.
 pub fn elide_old_tool_results(transcript: &mut [Message], keep_turns: usize, cas: Option<&Store>) -> usize {
-    let Some(cutoff) = transcript
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, m)| m.role == Role::Assistant)
-        .nth(keep_turns.saturating_sub(1))
-        .map(|(i, _)| i)
-    else {
+    let Some((cutoff, names)) = elision_scope(transcript, keep_turns) else {
         return 0;
     };
-    let names: std::collections::HashMap<String, String> = transcript[..cutoff]
-        .iter()
-        .flat_map(|m| &m.blocks)
-        .filter_map(|b| match b {
-            Block::ToolUse { id, name, .. } => Some((id.clone(), name.clone())),
-            _ => None,
-        })
-        .collect();
     let mut elided = 0;
     for block in transcript[..cutoff].iter_mut().flat_map(|m| &mut m.blocks) {
-        let Block::ToolResult {
-            tool_use_id,
-            handle,
-            inline,
-            ..
-        } = block
-        else {
+        let Some((placeholder, _)) = elision_of(block, &names, cas) else {
             continue;
         };
-        if inline.as_ref().is_some_and(|b| b.starts_with(ELIDED_PREFIX)) {
-            continue;
+        if let Block::ToolResult { handle, inline, .. } = block {
+            *handle = None;
+            *inline = Some(placeholder);
+            elided += 1;
         }
-        let bytes = tool_result_payload_bytes(handle.as_ref(), inline.as_ref(), cas);
-        let tool = names.get(tool_use_id.as_str()).map_or("unknown", String::as_str);
-        let placeholder = format!("[tool result elided: {tool} {bytes} bytes]").into_bytes();
-        if bytes <= placeholder.len() {
-            continue;
-        }
-        *handle = None;
-        *inline = Some(placeholder);
-        elided += 1;
     }
     elided
 }
@@ -561,6 +626,45 @@ mod tests {
             elide_old_tool_results(&mut transcript, ELIDE_KEEP_TURNS_AGGRESSIVE, None),
             7
         );
+    }
+
+    /// 14 tool turns of 30 KB results (~421 KB) against a 400 KB window
+    /// (low water 200 KB, minimum useful firing 40 KB).
+    fn pressured() -> Vec<Message> {
+        let mut transcript = vec![user("task")];
+        for k in 0..14 {
+            transcript.push(assistant_tool_use(&format!("T{k}")));
+            transcript.push(big_tool_result(&format!("T{k}"), 30_000));
+        }
+        transcript
+    }
+
+    #[test]
+    fn low_water_elision_steps_the_window_down_or_skips() {
+        const WINDOW: usize = 400_000;
+        // Keeping 10 or 7 leaves the context above low water; keeping 6 is
+        // the largest window that gets under it, so 8 results go in one batch.
+        let mut t = pressured();
+        let current = estimate_transcript_bytes(&t, None);
+        assert_eq!(elide_to_low_water(&mut t, None, current, WINDOW), 8);
+        assert!(estimate_transcript_bytes(&t, None) < WINDOW / 2);
+        assert_eq!(
+            elision_savings(&t, 6, None),
+            0,
+            "everything older than 6 turns went"
+        );
+
+        // A measured prompt so large (system prompt + schemas) that no window
+        // gets under low water: the 3-turn window still frees >= 10 % of the
+        // window, so it fires once with everything it can reach.
+        let mut t = pressured();
+        assert_eq!(elide_to_low_water(&mut t, None, WINDOW * 2, WINDOW), 11);
+
+        // ...but when even that frees < 10 % of the window, nothing is touched.
+        let mut t = pressured();
+        let before = t.clone();
+        assert_eq!(elide_to_low_water(&mut t, None, WINDOW * 10, WINDOW * 10), 0);
+        assert_eq!(t, before);
     }
 
     #[test]

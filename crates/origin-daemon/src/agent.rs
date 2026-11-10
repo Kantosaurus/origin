@@ -312,9 +312,9 @@ const ELIDE_HIGH_WATER_PCT: usize = 70;
 /// Summary compaction can only fold turns that already have a Haiku summary,
 /// and those are produced after the request returns — so inside one long
 /// autonomous prompt nothing is foldable. Once the context passes the
-/// high-water mark (bytes or last measured prefix tokens), every tool result
-/// older than the last [`crate::compactor::ELIDE_KEEP_TURNS`] assistant turns
-/// is replaced by a one-line placeholder in a single batch.
+/// high-water mark (bytes or last measured prefix tokens), old tool results are
+/// replaced by one-line placeholders in a single batch sized to get back under
+/// the low-water mark (see [`crate::compactor::elide_to_low_water`]).
 /// `ORIGIN_ELIDE_HIGH_WATER` overrides the percent (1–100); `0` disables it.
 fn maybe_elide_session(session: &mut Session, opts: &LoopOptions, last_input_tokens: u32, turn_model: &str) {
     let pct = std::env::var("ORIGIN_ELIDE_HIGH_WATER")
@@ -337,13 +337,18 @@ fn maybe_elide_session(session: &mut Session, opts: &LoopOptions, last_input_tok
     ) {
         return;
     }
-    // ponytail: a transcript whose last 10 turns alone exceed the mark elides
-    // one newly-aged result per turn; add a minimum-freed-bytes floor if the
-    // resulting cache churn shows up in cost.
-    let elided = crate::compactor::elide_old_tool_results(
+    // The measured prompt also counts the system prompt and tool schemas, which
+    // elision can never shrink, so the context estimate takes the larger.
+    let measured = usize::try_from(last_input_tokens)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(BYTES_PER_TOKEN);
+    let elided = crate::compactor::elide_to_low_water(
         &mut session.messages,
-        crate::compactor::ELIDE_KEEP_TURNS,
         opts.cas.as_deref(),
+        bytes.max(measured),
+        usize::try_from(window)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(BYTES_PER_TOKEN),
     );
     if elided > 0 {
         tracing::info!(
@@ -4492,9 +4497,16 @@ async fn run_loop_inner(
                     // A7: the request overflowed the model's context window. Elide
                     // old tool results with the aggressive window (session AND the
                     // built request, so the retry and later turns both shrink) and
-                    // retry exactly once; a second overflow falls through below.
+                    // retry exactly once; a second overflow — or one with nothing
+                    // to elide, whose retry would be identical — falls through below.
                     Err(LoopError::Provider(origin_provider::ProviderError::Api(msg)))
-                        if !overflow_retried && crate::compactor::is_context_length_error(&msg) =>
+                        if !overflow_retried
+                            && crate::compactor::is_context_length_error(&msg)
+                            && crate::compactor::elision_savings(
+                                &req.messages,
+                                crate::compactor::ELIDE_KEEP_TURNS_AGGRESSIVE,
+                                opts.cas.as_deref(),
+                            ) > 0 =>
                     {
                         overflow_retried = true;
                         let keep = crate::compactor::ELIDE_KEEP_TURNS_AGGRESSIVE;
