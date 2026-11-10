@@ -7,6 +7,7 @@ versions correspond to phase milestones from the implementation plan.
 ## [Unreleased]
 
 - **A1**: on the Anthropic provider, a tool result over 2,048 bytes from a Mutating tool (`Bash`, `Edit`, `Write`, `MultiEdit`, `ApplyPatch`, `Browser`, `Task`, …), or from any handle the shared `Plan` had not registered (e.g. a session resumed after a daemon restart), is now sent to the model verbatim instead of as a `<result handle:XXXXXXXX — N bytes>` stub that `Recall` could not resolve. Anthropic now uses the same `inflate_tool_result_handles` helper as every other provider; `origin_planner::WireDecision` and `INLINE_BYTE_BUDGET` are removed. No escape hatch: the stub was never resolvable, so there is no prior behaviour worth opting back into.
+- **A2**: the per-run tool memo (`Read`, `Grep`, `Glob`, `Diagnostics`, …) is now cleared whenever a Mutating tool (`Bash`, `Edit`, `Write`, `MultiEdit`, `ApplyPatch`, `Task`, …) is dispatched, so a re-`Read` after an edit returns the new bytes instead of a `(cached from turn N)` copy of the old ones. Repeated reads with no mutation in between are still memoized. No escape hatch: serving pre-edit bytes was never correct.
 
 ## 0.9.13
 

@@ -67,6 +67,12 @@ impl Cache {
         self.table.get(key)
     }
 
+    /// Drop every memoized result. Called before any mutating tool runs, since
+    /// it may change files a cached `Read`/`Grep`/`Glob` result describes.
+    pub fn clear(&mut self) {
+        self.table.clear();
+    }
+
     /// Record a result. `turn` is the conversation turn number for the
     /// `(cached from turn N)` annotation the agent appends when serving
     /// a hit.

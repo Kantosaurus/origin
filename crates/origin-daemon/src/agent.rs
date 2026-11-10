@@ -4910,7 +4910,12 @@ async fn run_loop_inner(
             // Compute the memoization key using the RAW input bytes (not
             // re-serialized args) so the key is stable across turns.
             let key = origin_tools::NormalizedInput::hash(meta.name, &input_bytes);
-            let cache_hit = if cache.is_skipped(meta.name) {
+            let cache_hit = if matches!(meta.side_effects, SideEffects::Mutating) {
+                // A2: a mutating tool (Bash, Edit, Write, MultiEdit, Task, ...)
+                // may change any file, so no memoized read survives its dispatch.
+                cache.clear();
+                None
+            } else if cache.is_skipped(meta.name) {
                 None
             } else {
                 cache.lookup(&key).copied()
