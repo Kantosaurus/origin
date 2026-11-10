@@ -6208,6 +6208,10 @@ async fn run_loop_inner(
         let bg_results_block = match (opts.background_jobs.as_deref(), opts.coordinator.as_deref()) {
             (Some(bg), Some(coord)) if !is_self_dispatch_session(&session.id) => {
                 let finished = bg.drain_terminal(&session.id, coord).await;
+                // A2: a finished worker may have changed files the memo holds.
+                if !finished.is_empty() {
+                    cache.clear();
+                }
                 // Flip the TUI panel rows for these now-settled background workers
                 // (their dispatch streamed "spawned" but no completion). Done
                 // before rendering the prose block; the order is immaterial.
@@ -6782,7 +6786,15 @@ async fn run_loop_inner(
             // logged and the file is left untouched, never failing the turn.
             let prose_not_applied = if std::env::var("ORIGIN_EDITFMT").as_deref() == Ok("1") {
                 let skills = opts.skills.as_deref().unwrap_or(&EMPTY_SKILLS);
-                apply_prose_edits(&text, opts, session, skills, hooks.as_deref(), &mut turn_mutated).await
+                let mut applied = false;
+                let not_applied =
+                    apply_prose_edits(&text, opts, session, skills, hooks.as_deref(), &mut applied).await;
+                // A2: an applied prose edit may have changed files the memo holds.
+                if applied {
+                    turn_mutated = true;
+                    cache.clear();
+                }
+                not_applied
             } else {
                 Vec::new()
             };
@@ -7870,6 +7882,10 @@ async fn run_loop_inner(
                     match (opts.background_jobs.as_deref(), opts.coordinator.as_deref()) {
                         (Some(bg), Some(coord)) => {
                             let finished = bg.drain_terminal(&session.id, coord).await;
+                            // A2: a finished worker may have changed files the memo holds.
+                            if !finished.is_empty() {
+                                cache.clear();
+                            }
                             // Flip the TUI panel rows for the workers reaped here, the
                             // same as the next-turn delivery path — `CollectTasks` is
                             // the other place a background job settles.
@@ -8461,6 +8477,11 @@ async fn run_loop_inner(
                 || origin_tools::ProfileOrdinal(0),
                 |m| m.sandbox_profile.ordinal(),
             );
+            // A2: a worker may have changed files a memoized read describes
+            // (nothing below records into the memo before the next dispatch).
+            if !pending_tasks.is_empty() {
+                cache.clear();
+            }
             for (idx, id, goal, handle) in std::mem::take(&mut pending_tasks) {
                 // Resolve the worker, capturing both the bytes the model sees and
                 // the terminal (status, detail) the TUI shows on the agent's row.

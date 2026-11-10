@@ -288,6 +288,144 @@ async fn write_guard_sees_external_change_after_cached_read() {
     );
 }
 
+/// A2: `Monitor` polls a live process, so an identical second poll must reach
+/// the tool instead of replaying the first answer from the memo.
+#[tokio::test]
+async fn identical_monitor_polls_both_reach_the_tool() {
+    let dir = tempdir().expect("tempdir");
+    let store = open_store(dir.path());
+    let sup = origin_tools::proc_supervisor::Supervisor::new();
+    let pid = sup
+        .spawn("echo hi", &origin_tools::proc_supervisor::SpawnOpts::default())
+        .expect("spawn");
+    let poll = serde_json::json!({"pid": pid});
+    let provider = StepProvider {
+        turn: AtomicU32::new(0),
+        steps: vec![("Monitor", poll.clone()), ("Monitor", poll)],
+        on_turn: Box::new(|_| {}),
+    };
+    let mut session = Session::new("test-session", "scripted-model");
+    let mut opts = LoopOptions::default().with_cas(store.clone()).without_streaming();
+    opts.proc_supervisor = Some(sup);
+    let _ = run_loop(&mut session, "go", &provider, &AlwaysAllow, &opts)
+        .await
+        .expect("loop ok");
+    let bodies = tool_result_bodies(&session, &store);
+    assert_eq!(bodies.len(), 2, "got: {bodies:?}");
+    assert!(
+        !bodies[1].contains("(cached from turn"),
+        "second Monitor poll was served from the memo: {}",
+        bodies[1]
+    );
+}
+
+/// Plays `turns[t]` as one assistant message of tool calls, then "done".
+struct BatchProvider {
+    turn: AtomicU32,
+    turns: Vec<Vec<(&'static str, serde_json::Value)>>,
+}
+
+#[async_trait]
+impl Provider for BatchProvider {
+    fn name(&self) -> &'static str {
+        "scripted"
+    }
+    async fn chat(&self, _req: ChatRequest) -> Result<ChatResponse, ProviderError> {
+        let t = self.turn.fetch_add(1, Ordering::SeqCst);
+        let blocks = match self.turns.get(t as usize) {
+            Some(calls) => calls
+                .iter()
+                .enumerate()
+                .map(|(i, (name, input))| Block::ToolUse {
+                    id: format!("id-{t}-{i}"),
+                    name: (*name).into(),
+                    input_json: serde_json::to_vec(input).expect("json"),
+                    cache_marker: None,
+                })
+                .collect(),
+            None => vec![Block::Text {
+                text: "done".into(),
+                cache_marker: None,
+            }],
+        };
+        Ok(ChatResponse {
+            assistant: Message {
+                role: Role::Assistant,
+                blocks,
+            },
+            usage: Usage::default(),
+        })
+    }
+}
+
+/// A2: a blocking `Task` whose worker edits a file after a sibling `Read` of
+/// it ran (and was memoized) must drop the memo once the worker is awaited,
+/// so the next identical `Read` sees the worker's bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_after_a_blocking_task_that_edits_the_file_is_fresh() {
+    use origin_plan::{Plan, PlanStore};
+    use origin_swarm::{CompletionReport, Coordinator, PlanHandle, ReportStatus, WorkerContext};
+    let dir = tempdir().expect("tempdir");
+    let store = open_store(dir.path());
+    let p = dir.path().join("hello.txt");
+    std::fs::write(&p, "hello world").expect("write");
+    let path = p.to_string_lossy().into_owned();
+    let read = serde_json::json!({"file_path": &path});
+
+    let sql = Arc::new(origin_store::Store::open(dir.path().join("origin.db")).expect("store"));
+    let plan_store = Arc::new(PlanStore::open(sql, Arc::clone(&store)).expect("plan store"));
+    let plan = PlanHandle::new(Arc::new(tokio::sync::Mutex::new(Plan::default())), plan_store);
+    let mut coord = Coordinator::new(plan, format!("origin-memo-{}", ulid::Ulid::new()));
+    let target = p.clone();
+    coord.set_default_worker(Arc::new(move |ctx: WorkerContext| {
+        let target = target.clone();
+        Box::pin(async move {
+            // Edit after the sibling Read in the same message has run.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            std::fs::write(&target, "edited by worker").expect("worker write");
+            Ok(CompletionReport {
+                goal: ctx.spec.goal.clone(),
+                status: ReportStatus::Completed,
+                plan_updates: Vec::new(),
+                files_touched: Vec::new(),
+                decisions: Vec::new(),
+                follow_ups: Vec::new(),
+                transcript_handle: [0; 32],
+                usage: origin_swarm::Usage::default(),
+                detail: None,
+                tainted: false,
+            })
+        })
+    }));
+
+    let provider = BatchProvider {
+        turn: AtomicU32::new(0),
+        turns: vec![
+            vec![
+                (
+                    "Task",
+                    serde_json::json!({"goal": "edit", "allowed_tools": [], "background": false}),
+                ),
+                ("Read", read.clone()),
+            ],
+            vec![("Read", read)],
+        ],
+    };
+    let mut session = Session::new("test-session", "scripted-model");
+    let mut opts = LoopOptions::default().with_cas(store.clone()).without_streaming();
+    opts.coordinator = Some(Arc::new(coord));
+    let _ = run_loop(&mut session, "go", &provider, &AlwaysAllow, &opts)
+        .await
+        .expect("loop ok");
+    let bodies = tool_result_bodies(&session, &store);
+    assert_eq!(bodies.len(), 3, "got: {bodies:?}");
+    assert!(
+        bodies[2].contains("edited by worker") && !bodies[2].contains("(cached from turn"),
+        "Read after the worker's edit was stale: {}",
+        bodies[2]
+    );
+}
+
 /// Streams `turns[t]` as one assistant message of tool calls, then "done".
 /// Streaming is what makes the loop pre-run Pure calls (speculative dispatch).
 struct StreamStepProvider {
