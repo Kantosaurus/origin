@@ -38,6 +38,13 @@ const ALLOW: &[&str] = &[
     // crate) reads Visual Studio instances under %ProgramData%; without it
     // `cargo build` fails with "linker `link.exe` not found".
     "ProgramData",
+    // Windows: node-gyp and Python's MSVC discovery find `vswhere.exe` under
+    // these; the rest are path/count values common build scripts read.
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "windir",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
 ];
 
 /// True when `name` looks like a credential: `*_API_KEY`, `*_TOKEN`,
@@ -114,6 +121,15 @@ mod tests {
         assert!(keep("Path", ""), "Windows spells it Path");
         assert!(keep("LC_ALL", ""));
         assert!(!keep("ANTHROPIC_API_KEY", ""));
+        for n in [
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "windir",
+            "NUMBER_OF_PROCESSORS",
+            "PROCESSOR_ARCHITECTURE",
+        ] {
+            assert!(keep(n, ""), "Windows build discovery needs {n}");
+        }
         assert!(!keep("RANDOM_VAR", ""));
         assert!(keep("RANDOM_VAR", "X, random_var"));
         assert!(
