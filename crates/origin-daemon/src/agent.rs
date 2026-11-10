@@ -4757,12 +4757,13 @@ pub struct LoopOptions {
     /// increments are co-located with it. `None` (the default everywhere,
     /// including tests) ⇒ the counters stay at zero, byte-identical to before.
     pub metrics: Option<Arc<origin_metrics::Metrics>>,
-    /// Optional user-configured permission rules + bloom pre-check (P10.12).
-    /// When `Some`, a `RequiresPermission` tool is first matched against the
-    /// rule list via [`origin_permission::check_with_rules`]: an explicit
-    /// `allow` rule auto-approves and an explicit `deny` rule blocks, BEFORE the
-    /// interactive prompter is ever asked. When no rule matches the tool, the
-    /// gate falls through to the existing skill-narrowed prompter path. `None`
+    /// Optional user-configured permission rules (P10.12). When `Some`,
+    /// `decide_permission` scans the rule list for the tool's name
+    /// (case-insensitively; the bloom pre-check is not consulted, and a deny
+    /// wins over an allow for the same tool): an explicit `deny` rule blocks
+    /// every tool in every mode, and an explicit `allow` rule answers the
+    /// prompt, BEFORE the interactive prompter is ever asked. When no rule
+    /// matches the tool, the gate falls through to the mode's own check. `None`
     /// (the default everywhere, including tests) ⇒ the rule path is never
     /// consulted and the decision is byte-identical to before this wiring.
     /// Sourced from `[[permission_rules]]` in `governance.toml`.
