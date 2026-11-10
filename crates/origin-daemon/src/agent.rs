@@ -1450,7 +1450,9 @@ async fn confirm_repro(
     let chars: Vec<char> = out.chars().collect();
     let tail: String = chars[chars.len().saturating_sub(4_000)..].iter().collect();
     let run = classify_repro_run(&cmd, code, &out);
-    if full_suite && matches!(run, ReproRun::Failed | ReproRun::Unclear) {
+    // A full-suite failure — or load error — is the reproduction's only when
+    // the output's failure lines name it: anything else may be another test.
+    if full_suite && run != ReproRun::Passed {
         if baseline_passed == Some(false) {
             return Err(format!(
                 "`{cmd}` runs the whole suite, which was already failing before your reproduction test \
@@ -1528,9 +1530,15 @@ pub(crate) async fn run_gate_command(cmd: &str, cwd: Option<&std::path::Path>) -
     // C5: `pwsh -Command` folds a failing native program's exit code to 1, so
     // pytest's 2–5 (collection errors) would read as 1 (tests failed). Exit
     // with the program's own code when the last statement failed. On its own
-    // line, so a trailing `#` comment in `cmd` cannot swallow it.
+    // line, so a trailing `#` comment in `cmd` cannot swallow it; a trailing
+    // backtick (a line continuation onto nothing) is dropped so the suffix is
+    // not joined onto the command's last line.
     #[cfg(windows)]
-    let command = format!("{cmd}\nif (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}");
+    let command = {
+        let body = cmd.trim_end();
+        let body = body.strip_suffix('`').unwrap_or(body);
+        format!("{body}\nif (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}")
+    };
     #[cfg(not(windows))]
     let command = cmd.to_string();
     let args = origin_tools::builtins::bash::BashArgs {
@@ -1554,9 +1562,22 @@ pub(crate) async fn run_gate_command(cmd: &str, cwd: Option<&std::path::Path>) -
 mod gate_exit_code_tests {
     /// C5: exit-code classification (pytest's 2–5 = collection error) needs
     /// the native program's own code, not a shell's folded 0/1.
+    #[cfg(windows)]
+    const EXIT_2: &str = "cmd /c exit 2";
+    #[cfg(not(windows))]
+    const EXIT_2: &str = "exit 2";
+
     #[tokio::test]
     async fn a_native_exit_code_other_than_one_reaches_the_gate() {
-        let got = super::run_gate_command("python -c \"import sys; sys.exit(2)\"", None).await;
+        let got = super::run_gate_command(EXIT_2, None).await;
+        assert_eq!(got.map(|(code, _)| code), Some(2));
+    }
+
+    /// A trailing PowerShell line continuation must not swallow the exit suffix.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_trailing_line_continuation_keeps_the_exit_code() {
+        let got = super::run_gate_command("cmd /c exit 2 `", None).await;
         assert_eq!(got.map(|(code, _)| code), Some(2));
     }
 }
@@ -6921,8 +6942,10 @@ async fn run_loop_inner(
         let mut turn_allowed = false;
         let mut turn_denied: Option<String> = None;
         // C5: why this turn's reproduction was not confirmed; the turn's later
-        // source edits are rejected with it, without another run or charge.
+        // source edits are rejected with it, without another run or charge,
+        // until the test is edited again. At most one charge per turn.
         let mut repro_turn_rejection: Option<String> = None;
+        let mut repro_turn_charged = false;
         for (id, name, input_bytes) in tool_uses {
             let Some(meta) = registry_iter().find(|m| m.name == name) else {
                 // gap 9b: a name absent from the compile-time registry may be a
@@ -7384,7 +7407,7 @@ async fn run_loop_inner(
                         match confirm_repro(cmd, &repro_tests, opts.cwd.as_deref(), baseline_tests_passed)
                             .await
                         {
-                            Err(why) if repro_rejections >= gate_repair_budget => {
+                            Err(why) if repro_rejections >= gate_repair_budget && !repro_turn_charged => {
                                 tracing::info!(%why, "repro-gate: rejection budget spent; proceeding unconfirmed");
                                 repro_unconfirmed = Some(
                                     "the reproduction test never failed for the right reason before the fix",
@@ -7392,7 +7415,10 @@ async fn run_loop_inner(
                                 Ok(String::new())
                             }
                             Err(why) => {
-                                repro_rejections += 1;
+                                if !repro_turn_charged {
+                                    repro_rejections += 1;
+                                    repro_turn_charged = true;
+                                }
                                 repro_turn_rejection = Some(why.clone());
                                 Err(why)
                             }
@@ -7427,6 +7453,10 @@ async fn run_loop_inner(
                             continue;
                         }
                     }
+                }
+                // A rewritten test gets a fresh confirmation (still one charge per turn).
+                if !tests.is_empty() {
+                    repro_turn_rejection = None;
                 }
                 repro_tests.extend(tests);
             }

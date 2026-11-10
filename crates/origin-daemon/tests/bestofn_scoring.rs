@@ -324,6 +324,52 @@ fn a_deleted_pre_existing_test_is_restored_for_scoring_then_deleted_again() {
     assert!(!wt.join("tests/expect.txt").exists(), "the deletion is put back");
 }
 
+/// A pre-existing test whose name has glob characters: as a pathspec,
+/// `[ab]c.txt` would match `ac.txt`/`bc.txt`, never itself.
+#[test]
+fn a_test_named_with_glob_characters_round_trips() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (dir, _) = repo();
+    let git = ProcessGitRunner::new(dir.path());
+    std::fs::write(dir.path().join("tests/[ab]c.txt"), "original\n").unwrap();
+    git.run(&["add", "-A"]).unwrap();
+    git.run(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "glob-named test",
+    ])
+    .unwrap();
+    let base = git.run(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+    let scratch = tempfile::tempdir().unwrap();
+    let count = scratch.path().join("count");
+    let calls = std::cell::Cell::new(0);
+    let mut a = arena(
+        &git,
+        &base,
+        scratch.path(),
+        dir.path(),
+        &count,
+        vec![vec![("lib.txt", "fixed\n"), ("tests/[ab]c.txt", "weakened\n")]],
+        &calls,
+    );
+    let res = a.run_candidate(0).unwrap();
+    assert_eq!(res.outcome, TestOutcome::Passed, "the restore found the file");
+    assert_eq!(res.tampered, ["tests/[ab]c.txt"]);
+    let wt = scratch.path().join("origin-bestofn-0");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("tests/[ab]c.txt")).unwrap(),
+        "weakened\n",
+        "the candidate's version is put back"
+    );
+}
+
 /// A6: `git apply` honours `GIT_TRACE`, which the allow-list drops; an
 /// inherited one would make it write the trace file.
 #[test]

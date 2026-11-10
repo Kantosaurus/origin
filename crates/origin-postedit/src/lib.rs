@@ -375,7 +375,7 @@ pub enum Selection {
 /// clearly cover the suite ⇒ [`Selection::Full`].
 #[must_use]
 pub fn select_tests(base_command: &str, files: &[String]) -> Selection {
-    if files.is_empty() {
+    if files.is_empty() || !all_shell_safe(files) {
         return Selection::Full;
     }
     let base = base_command.trim();
@@ -402,8 +402,7 @@ pub fn select_tests(base_command: &str, files: &[String]) -> Selection {
         if targets.is_empty() {
             return Selection::Full;
         }
-        // Quote nothing / assume no spaces in repo paths (SWE-bench holds); the
-        // caller runs this through a shell, so ordinary path chars are fine.
+        // Unquoted: `all_shell_safe` admitted only plain path characters.
         return Selection::Narrowed(format!("{base} {}", targets.join(" ")));
     }
     // go test: swap the ./... wildcard for the touched package dirs.
@@ -426,6 +425,27 @@ pub fn select_tests(base_command: &str, files: &[String]) -> Selection {
     // Everything else (cargo, npm, mvn, gradle, make, custom): don't risk a
     // path-based narrowing that could silently drop coverage.
     Selection::Full
+}
+
+/// C5: may every path go into a shell line unquoted? Only `[A-Za-z0-9_./-]`,
+/// and no leading `-` (an option); a drive prefix (`C:`) is allowed, and on
+/// Windows — where gates run in PowerShell, which gives `\` no meaning — so is
+/// `\`. Anything else ⇒ the caller does not narrow (runs the full suite)
+/// rather than quote for an unknown shell.
+fn all_shell_safe(paths: &[String]) -> bool {
+    paths.iter().all(|p| {
+        let rest = match p.as_bytes() {
+            [d, b':', ..] if d.is_ascii_alphabetic() => &p[2..],
+            _ => p.as_str(),
+        };
+        !rest.is_empty()
+            && !p.starts_with('-')
+            && rest.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(c, '_' | '.' | '/' | '-')
+                    || (cfg!(windows) && c == '\\')
+            })
+    })
 }
 
 /// Is the file name `name` a test by naming convention: `test_*`, `*_test`,
@@ -493,7 +513,7 @@ pub fn classify_repro_run(command: &str, exit_code: i32, output: &str) -> ReproR
         };
     }
     if command.contains("cargo test") {
-        if output.contains("could not compile") {
+        if output.contains("could not compile") || output.contains("no test target named") {
             return ReproRun::CollectionError;
         }
         if output.contains("test result: FAILED") {
@@ -526,12 +546,17 @@ pub fn classify_repro_run(command: &str, exit_code: i32, output: &str) -> ReproR
 
 /// C5: `base` narrowed to just the reproduction test `files`.
 ///
-/// Only where the runner takes test files: pytest (also `python -m pytest`) gets the `.py` files
-/// themselves, so a file its default patterns would skip still runs;
+/// Only where the runner takes test files: pytest (also `python -m pytest`)
+/// gets the `.py` files among them themselves, so a file its default patterns
+/// would skip still runs (a non-`.py` fixture is left out);
 /// `cargo test` gets `--test <stem>` for each `tests/<stem>.rs`; `go test ./...`
-/// gets the packages, as in [`select_tests`]. `None` ⇒ run the full command.
+/// gets the packages, as in [`select_tests`]. `None` ⇒ run the full command,
+/// also when any path is not plain enough to put in a shell line unquoted.
 #[must_use]
 pub fn narrow_to_test_files(base: &str, files: &[String]) -> Option<String> {
+    if !all_shell_safe(files) {
+        return None;
+    }
     let base = base.trim();
     let is_pytest = ["pytest", "python -m pytest", "python3 -m pytest"]
         .iter()
@@ -542,7 +567,7 @@ pub fn narrow_to_test_files(base: &str, files: &[String]) -> Option<String> {
             .map(String::as_str)
             .filter(|f| extension_of(f).as_deref() == Some("py"))
             .collect();
-        return (!py.is_empty() && py.len() == files.len()).then(|| format!("{base} {}", py.join(" ")));
+        return (!py.is_empty()).then(|| format!("{base} {}", py.join(" ")));
     }
     if (base == "cargo test" || base.starts_with("cargo test ")) && !base.contains(" -- ") {
         let targets: Option<Vec<String>> = files
@@ -565,11 +590,12 @@ pub fn narrow_to_test_files(base: &str, files: &[String]) -> Option<String> {
 
 /// C5: does a full-suite failure `output` name the reproduction test?
 ///
-/// It does when it contains the file stem `stem`, or a function `source`
-/// defines (`def`/`fn`/`func`/`void` names). Names shorter than 4 characters
-/// are ignored as too common.
-// ponytail: plain substring match — a test elsewhere sharing a name, or the
-// runner echoing the file name of a passing target, still matches; per-runner
+/// It does when a line that reports a failure (contains `fail` or `error`,
+/// any case) also contains the file stem `stem` or a function `source`
+/// defines (`def`/`fn`/`func`/`void` names) — progress and `PASS` lines name
+/// passing files too. Names shorter than 4 characters are ignored as too common.
+// ponytail: substring match per line — a same-named test elsewhere failing, or
+// a failure line that merely mentions the file, still matches; per-runner
 // result parsing (JUnit XML) is the upgrade path.
 #[must_use]
 pub fn output_names_reproduction(output: &str, stem: &str, source: &str) -> bool {
@@ -582,7 +608,11 @@ pub fn output_names_reproduction(output: &str, stem: &str, source: &str) -> bool
             names.extend(tokens.next());
         }
     }
-    names.iter().any(|n| n.len() >= 4 && output.contains(n))
+    names.retain(|n| n.len() >= 4);
+    output.lines().any(|l| {
+        let lower = l.to_ascii_lowercase();
+        (lower.contains("fail") || lower.contains("error")) && names.iter().any(|n| l.contains(n))
+    })
 }
 
 /// Errors that can arise when constructing or validating a [`PostEditConfig`].
@@ -1027,6 +1057,14 @@ mod tests {
         assert_eq!(classify_repro_run("npm test", 1, "1 failing"), Unclear);
         assert_eq!(classify_repro_run("cargo test", 101, "killed"), Unclear);
         assert_eq!(
+            classify_repro_run(
+                "cargo test --test repro",
+                101,
+                "error: no test target named `repro`"
+            ),
+            CollectionError
+        );
+        assert_eq!(
             classify_repro_run("npm test", 1, "FAIL a.test.js\n  ● Test suite failed to run"),
             CollectionError
         );
@@ -1074,6 +1112,36 @@ mod tests {
             Some("go test ./pkg")
         );
         assert_eq!(narrow_to_test_files("npm test", &f(&["a.test.js"])), None);
+        assert_eq!(
+            narrow_to_test_files("pytest", &f(&["tests/test_a.py", "tests/data.json"])).as_deref(),
+            Some("pytest tests/test_a.py"),
+            "the .py subset; a fixture does not switch narrowing off"
+        );
+    }
+
+    #[test]
+    fn narrowing_refuses_paths_that_are_not_plain() {
+        let f = |p: &str| vec![p.to_string()];
+        for bad in [
+            "tests/a; touch x #.py",
+            "tests/a b.py",
+            "tests/$(id).py",
+            "tests/a`b.py",
+            "-k.py",
+        ] {
+            assert_eq!(narrow_to_test_files("pytest", &f(bad)), None, "{bad}");
+            assert_eq!(select_tests("pytest", &f(bad)), Selection::Full, "{bad}");
+        }
+        assert!(narrow_to_test_files("pytest", &f("tests/test_ok-1.py")).is_some());
+        assert!(
+            narrow_to_test_files("pytest", &f("C:/w/tests/test_a.py")).is_some(),
+            "a drive prefix is plain"
+        );
+        assert_eq!(narrow_to_test_files("pytest", &f("C:")), None);
+        assert!(matches!(
+            select_tests("pytest", &f("tests/test_ok-1.py")),
+            Selection::Narrowed(_)
+        ));
     }
 
     #[test]
@@ -1083,6 +1151,11 @@ mod tests {
         assert!(names("FAILED x::test_slug_keeps_dashes"));
         assert!(names("FAIL tests/repro_slug.py"));
         assert!(!names("FAILED test_other.py::test_old"));
+        // A progress/PASS line names a passing file: that is no attribution.
+        assert!(!names(
+            "tests/repro_slug.py .                [ 50%]\nFAILED tests/test_other.py::test_old"
+        ));
+        assert!(!names("PASS tests/repro_slug.test.js\nFAIL tests/other.test.js"));
         // Short names are too common to count.
         assert!(!output_names_reproduction("fn ab failed", "ab", "fn ab() {}"));
     }

@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use origin_core::types::{Block, Message, Role};
 use origin_daemon::agent::{run_loop, LoopError, LoopOptions, LoopSummary};
+use origin_daemon::protocol::StreamEvent;
 use origin_daemon::session::Session;
 use origin_permission::prompt::AlwaysAllow;
 use origin_postedit::PostEditConfig;
@@ -56,12 +57,12 @@ fn write(id: &str, path: &str, content: &str) -> Block {
 /// else exit 0. Every run appends a line to `runs.log`.
 #[cfg(unix)]
 const FAKE_PYTEST: &str = "echo x >> runs.log; if grep -q collect-error tests/test_bug.py; then echo 'ERROR \
-     collecting pytest'; exit 2; fi; if grep -q fails tests/test_bug.py; then if grep -q fixed src.py; then \
+     collecting tests/test_bug.py pytest'; exit 2; fi; if grep -q fails tests/test_bug.py; then if grep -q fixed src.py; then \
      echo 'passed pytest'; else echo 'FAILED test_bug pytest'; exit 1; fi; fi; echo 'passed pytest'";
 #[cfg(windows)]
 const FAKE_PYTEST: &str =
     "Add-Content runs.log x; if (Select-String -Quiet collect-error tests/test_bug.py) { \
-     echo 'ERROR collecting pytest'; exit 2 }; if ((Select-String -Quiet fails tests/test_bug.py) -and -not \
+     echo 'ERROR collecting tests/test_bug.py pytest'; exit 2 }; if ((Select-String -Quiet fails tests/test_bug.py) -and -not \
      (Select-String -Quiet fixed src.py)) { echo 'FAILED test_bug pytest'; exit 1 }; echo 'passed pytest'";
 
 struct Run {
@@ -73,6 +74,8 @@ struct Run {
     src: String,
     /// How many times the test command ran.
     runs: usize,
+    /// Stream events, when the run had an event channel.
+    events: Vec<StreamEvent>,
 }
 
 impl Run {
@@ -87,6 +90,11 @@ fn run(cfg: PostEditConfig, max_turns: u32, turns: Vec<Block>) -> Run {
 
 /// [`run`] with any number of blocks per assistant turn.
 fn run_turns(cfg: PostEditConfig, max_turns: u32, turns: Vec<Vec<Block>>) -> Run {
+    run_with(cfg, max_turns, turns, false)
+}
+
+/// [`run_turns`], optionally with an event channel whose events are kept.
+fn run_with(cfg: PostEditConfig, max_turns: u32, turns: Vec<Vec<Block>>, with_events: bool) -> Run {
     let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::remove_var("ORIGIN_CMD_GUARD");
     std::env::remove_var("ORIGIN_TEST_SELECT");
@@ -94,10 +102,13 @@ fn run_turns(cfg: PostEditConfig, max_turns: u32, turns: Vec<Vec<Block>>) -> Run
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir(dir.path().join("tests")).expect("mkdir");
     std::fs::write(dir.path().join("src.py"), "buggy\n").expect("seed");
+    // Large enough that the loop never waits on a full channel (drained after).
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<StreamEvent>(10_000);
     let opts = LoopOptions {
         max_turns,
         cwd: Some(dir.path().to_path_buf()),
         post_edit: Some(Arc::new(cfg)),
+        event_tx: with_events.then_some(event_tx),
         ..LoopOptions::default().without_streaming()
     };
     let provider = ScriptedProvider {
@@ -151,12 +162,18 @@ fn run_turns(cfg: PostEditConfig, max_turns: u32, turns: Vec<Vec<Block>>) -> Run
         .collect();
     let src = std::fs::read_to_string(dir.path().join("src.py")).expect("src");
     let runs = std::fs::read_to_string(dir.path().join("runs.log")).map_or(0, |s| s.lines().count());
+    drop(opts);
+    let mut events = Vec::new();
+    while let Ok(e) = event_rx.try_recv() {
+        events.push(e);
+    }
     Run {
         result,
         tool_results,
         user_texts,
         src,
         runs,
+        events,
     }
 }
 
@@ -442,4 +459,104 @@ fn an_unclear_runner_failing_is_accepted_with_a_caution() {
         "{body}"
     );
     assert_eq!(r.src, "fixed");
+}
+
+/// The first two lines of a full-suite run: the reproduction on a progress
+/// line (it passed), another test failing.
+fn full_suite_run(repro_line: &str) -> PostEditConfig {
+    repro_gate(
+        &format!("echo '{repro_line}'; echo 'FAILED tests/test_old.py::test_legacy pytest'; exit 1"),
+        2,
+    )
+}
+
+fn repro_then_fix() -> Vec<Block> {
+    vec![
+        write(
+            "t1",
+            "tests/test_bug.py",
+            "def test_reproduces():\n    assert False\n",
+        ),
+        write("s1", "src.py", "fixed"),
+        Block::text("done"),
+        Block::text("done"),
+        Block::text("done"),
+    ]
+}
+
+#[test]
+fn a_reproduction_named_only_on_a_progress_line_does_not_confirm() {
+    let r = run(
+        full_suite_run("tests/test_bug.py .   [ 50%]"),
+        12,
+        repro_then_fix(),
+    );
+    let (err, body) = &r.tool_results[1];
+    assert!(*err, "{body}");
+    assert!(body.contains("never names your reproduction test"), "{body}");
+}
+
+#[test]
+fn a_reproduction_named_on_a_failure_line_confirms() {
+    let r = run(
+        full_suite_run("FAILED tests/test_bug.py::test_reproduces"),
+        12,
+        repro_then_fix(),
+    );
+    let (err, body) = &r.tool_results[1];
+    assert!(!err, "{body}");
+    assert!(body.contains("<repro-confirmed>"), "{body}");
+}
+
+#[test]
+fn rewriting_the_test_in_the_same_turn_gets_a_fresh_confirmation() {
+    let r = run_turns(
+        repro_gate(FAKE_PYTEST, 2),
+        10,
+        vec![
+            vec![write("t1", "tests/test_bug.py", "passes-already")],
+            vec![
+                write("s1", "src.py", "fixed"),
+                write("t2", "tests/test_bug.py", "fails"),
+                write("s2", "src.py", "fixed"),
+            ],
+            vec![Block::text("done")],
+        ],
+    );
+    let errs: Vec<bool> = r.tool_results.iter().map(|(e, _)| *e).collect();
+    assert_eq!(errs, [false, true, false, false], "{:?}", r.tool_results);
+    assert!(r.tool_results[3].1.contains("<repro-confirmed>"));
+    assert_eq!(r.src, "fixed");
+}
+
+#[test]
+fn a_rejected_edit_emits_a_failed_tool_result_event() {
+    let r = run_with(
+        repro_gate(FAKE_PYTEST, 2),
+        10,
+        vec![
+            vec![write("t1", "tests/test_bug.py", "passes-already")],
+            vec![write("s1", "src.py", "fixed")],
+            vec![write("t2", "tests/test_bug.py", "fails")],
+            vec![write("s2", "src.py", "fixed")],
+            vec![Block::text("done")],
+        ],
+        true,
+    );
+    let failed: Vec<&str> = r
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::ToolResult {
+                ok: false, preview, ..
+            } => Some(preview.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(
+        failed[0].contains("[repro-gate] edit NOT applied"),
+        "{}",
+        failed[0]
+    );
 }
