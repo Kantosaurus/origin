@@ -2519,6 +2519,40 @@ fn run_turn_end_effects(
 ) {
     maybe_record_turn_telemetry(provider, model, input_tokens, output_tokens);
     maybe_notify_completion(notify);
+    record_usage_counters(
+        provider,
+        model,
+        &LoopTotals {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            tool_calls,
+            turns: 0,
+        },
+        latency_ms,
+        metrics,
+    );
+}
+
+/// The token counters a finished `run_loop` adds its totals to — the
+/// `gen_ai` usage record and the Prometheus counters. B1: also recorded for a
+/// run that ends in an error (counters only: no hooks or notifications).
+fn record_usage_counters(
+    provider: &str,
+    model: &str,
+    totals: &LoopTotals,
+    latency_ms: f64,
+    metrics: Option<&origin_metrics::Metrics>,
+) {
+    let LoopTotals {
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        tool_calls,
+        ..
+    } = *totals;
     // Task 3 (gen_ai metrics emit). Unconditional by design: this is a cheap
     // `const` no-op unless the daemon is built `--features otel` AND the OTLP
     // exporter has been installed (which requires `ORIGIN_OTLP_ENDPOINT`). The
@@ -4904,6 +4938,21 @@ impl ExtractDeliverer for NoopExtractDeliverer {
     }
 }
 
+/// B1: the running token totals of a `run_loop`, kept where the caller can
+/// read them even when the run ends in an error (see [`run_loop_with_totals`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LoopTotals {
+    /// Uncached input tokens across every provider call so far.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    /// Model-issued tool calls so far.
+    pub tool_calls: u64,
+    /// Turns that reached a provider response so far.
+    pub turns: u32,
+}
+
 #[derive(Debug)]
 pub struct LoopSummary {
     pub assistant_text: String,
@@ -5376,14 +5425,47 @@ pub async fn run_loop(
     prompter: &dyn Prompter,
     opts: &LoopOptions,
 ) -> Result<LoopSummary, LoopError> {
+    run_loop_with_totals(
+        session,
+        user_text,
+        provider,
+        prompter,
+        opts,
+        &mut LoopTotals::default(),
+    )
+    .await
+}
+
+/// [`run_loop`], keeping its running token totals in `totals` so the caller
+/// still has them when the run ends in an error (B1: a worker's report).
+///
+/// # Errors
+/// As [`run_loop`].
+pub async fn run_loop_with_totals(
+    session: &mut Session,
+    user_text: &str,
+    provider: &dyn Provider,
+    prompter: &dyn Prompter,
+    opts: &LoopOptions,
+    totals: &mut LoopTotals,
+) -> Result<LoopSummary, LoopError> {
     let started = std::time::Instant::now();
     let result = CHECKPOINT_WARNED
         .scope(
             std::cell::Cell::new(false),
-            run_loop_inner(session, user_text, provider, prompter, opts),
+            run_loop_inner(session, user_text, provider, prompter, opts, totals),
         )
         .await;
     if let Err(e) = &result {
+        // B1: the success path records these at loop end; an error exit still
+        // counts the tokens it spent (counters only).
+        record_usage_counters(
+            provider.name(),
+            &session.model,
+            totals,
+            started.elapsed().as_secs_f64() * 1_000.0,
+            opts.metrics.as_deref(),
+        );
         // `MaxTurns` already emitted its own `BudgetExhausted` bucket inside
         // the inner loop; every other error is a fatal, unrecovered exit ⇒
         // `Error`. The inner loop holds the model/tool split, which is not
@@ -5410,7 +5492,7 @@ pub async fn run_loop(
 #[allow(clippy::too_many_lines)] // turn loop + memoization path; extraction would require extra allocations
 #[tracing::instrument(
     level = "info",
-    skip(session, user_text, provider, prompter, opts),
+    skip(session, user_text, provider, prompter, opts, totals),
     fields(kind = "turn", provider = provider.name())
 )]
 async fn run_loop_inner(
@@ -5419,6 +5501,7 @@ async fn run_loop_inner(
     provider: &dyn Provider,
     prompter: &dyn Prompter,
     opts: &LoopOptions,
+    totals: &mut LoopTotals,
 ) -> Result<LoopSummary, LoopError> {
     // Falls back to an empty static `SkillRegistry` when none is wired,
     // so the call path is identical; an empty stack's mask is `None`,
@@ -6863,6 +6946,15 @@ async fn run_loop_inner(
         // `gen_ai` usage record (no-op without `otel`) and the opt-in pain
         // telemetry. Saturating so a pathological session can never overflow.
         total_tool_calls = total_tool_calls.saturating_add(tool_uses.len() as u64);
+        // B1: kept where `run_loop_with_totals` can read them after an error.
+        *totals = LoopTotals {
+            input_tokens: total_input_tokens,
+            output_tokens: total_output_tokens,
+            cache_read_tokens: total_cache_read_tokens,
+            cache_write_tokens: total_cache_write_tokens,
+            tool_calls: total_tool_calls,
+            turns: turn,
+        };
 
         if tool_uses.is_empty() {
             let text = resp
@@ -7026,6 +7118,13 @@ async fn run_loop_inner(
                                 total_cache_read_tokens.saturating_add(u64::from(u.cache_read_input_tokens));
                             total_cache_write_tokens = total_cache_write_tokens
                                 .saturating_add(u64::from(u.cache_creation_input_tokens));
+                            *totals = LoopTotals {
+                                input_tokens: total_input_tokens,
+                                output_tokens: total_output_tokens,
+                                cache_read_tokens: total_cache_read_tokens,
+                                cache_write_tokens: total_cache_write_tokens,
+                                ..*totals
+                            };
                             if let Some(tx) = &opts.event_tx {
                                 let _ = tx
                                     .send(StreamEvent::RequestUsage {
@@ -13548,6 +13647,66 @@ mod wiring_tests {
             (value_of("origin_cache_write_total") - 21.0).abs() < f64::EPSILON,
             "B1: cache_write counter must advance to 21"
         );
+    }
+
+    /// B1: a run that ends in an error (here `MaxTurns` after one request)
+    /// still adds that request's tokens to the usage counters.
+    #[tokio::test]
+    async fn a_run_ending_in_max_turns_still_counts_its_tokens() {
+        struct OneCall;
+        #[async_trait::async_trait]
+        impl origin_provider::Provider for OneCall {
+            fn name(&self) -> &'static str {
+                "scripted"
+            }
+            async fn chat(
+                &self,
+                _req: origin_provider::ChatRequest,
+            ) -> Result<origin_provider::ChatResponse, origin_provider::ProviderError> {
+                Ok(origin_provider::ChatResponse {
+                    assistant: Message::new(Role::Assistant).with_block(Block::ToolUse {
+                        id: "t".into(),
+                        name: "TodoWrite".into(),
+                        input_json: br#"{"todos":[]}"#.to_vec(),
+                        cache_marker: None,
+                    }),
+                    usage: origin_provider::Usage {
+                        input_tokens: 100,
+                        output_tokens: 7,
+                        cache_read_input_tokens: 5,
+                        cache_creation_input_tokens: 3,
+                    },
+                })
+            }
+        }
+        let metrics = Arc::new(origin_metrics::Metrics::new());
+        let opts = LoopOptions {
+            max_turns: 1,
+            metrics: Some(Arc::clone(&metrics)),
+            ..LoopOptions::default().without_streaming()
+        };
+        let mut session = Session::new("scripted", "m");
+        let err = run_loop(
+            &mut session,
+            "go",
+            &OneCall,
+            &origin_permission::prompt::AlwaysAllow,
+            &opts,
+        )
+        .await
+        .expect_err("stops at the turn cap");
+        assert!(matches!(err, LoopError::MaxTurns(1)), "{err:?}");
+        let snap = metrics.snapshot();
+        let value_of =
+            |family: &str| -> f64 { snap.iter().find(|r| r.name == family).map_or(0.0, |r| r.value) };
+        assert!(
+            (value_of("origin_tokens_in_total") - 100.0).abs() < f64::EPSILON,
+            "{:?}",
+            snap.rows
+        );
+        assert!((value_of("origin_tokens_out_total") - 7.0).abs() < f64::EPSILON);
+        assert!((value_of("origin_cache_hit_total") - 5.0).abs() < f64::EPSILON);
+        assert!((value_of("origin_cache_write_total") - 3.0).abs() < f64::EPSILON);
     }
 
     /// R4: with no `Metrics` handle (the default everywhere, including tests),

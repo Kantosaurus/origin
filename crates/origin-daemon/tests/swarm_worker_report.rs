@@ -73,6 +73,18 @@ fn s(path: &Path) -> String {
 /// the parent-visible output and how many model calls the worker made.
 async fn run_task(input: serde_json::Value, script: Script) -> (TaskOutput, u32) {
     let tmp = TempDir::new().expect("tmp");
+    let provider = Arc::new(ScriptedProvider {
+        calls: AtomicU32::new(0),
+        script,
+    });
+    let coord = worker_coordinator(&tmp, Arc::clone(&provider));
+    let input: TaskInput = serde_json::from_value(input).expect("task input");
+    let out = task_tool(&coord, input, &[]).await.expect("task result");
+    (out, provider.calls.load(Ordering::SeqCst))
+}
+
+/// A coordinator whose workers are the daemon's real worker on `provider`.
+fn worker_coordinator(tmp: &TempDir, provider: Arc<ScriptedProvider>) -> Coordinator {
     let store = Arc::new(origin_store::Store::open(tmp.path().join("origin.db")).expect("store"));
     let cas = Arc::new(
         CasStore::open(StoreConfig {
@@ -85,12 +97,7 @@ async fn run_task(input: serde_json::Value, script: Script) -> (TaskOutput, u32)
     );
     let plan_store = Arc::new(PlanStore::open(Arc::clone(&store), Arc::clone(&cas)).expect("plan store"));
     let plan = PlanHandle::new(Arc::new(AsyncMutex::new(Plan::default())), plan_store);
-    let provider = Arc::new(ScriptedProvider {
-        calls: AtomicU32::new(0),
-        script,
-    });
-    let active: Arc<RwLock<Arc<dyn Provider>>> =
-        Arc::new(RwLock::new(Arc::clone(&provider) as Arc<dyn Provider>));
+    let active: Arc<RwLock<Arc<dyn Provider>>> = Arc::new(RwLock::new(provider as Arc<dyn Provider>));
     let mut coord = Coordinator::new(plan, format!("origin-worker-b8-{}", std::process::id()));
     coord.set_default_worker(origin_daemon::swarm_worker::real_worker(
         active,
@@ -99,9 +106,7 @@ async fn run_task(input: serde_json::Value, script: Script) -> (TaskOutput, u32)
         origin_planner::Plan::default(),
         origin_daemon::config::Governance::default(),
     ));
-    let input: TaskInput = serde_json::from_value(input).expect("task input");
-    let out = task_tool(&coord, input, &[]).await.expect("task result");
-    (out, provider.calls.load(Ordering::SeqCst))
+    coord
 }
 
 /// A scratch directory inside the worker's workspace (the test's working
@@ -224,6 +229,46 @@ async fn runaway_worker_stops_at_the_default_cap_with_its_partial_work() {
         "{}",
         out.summary
     );
+}
+
+/// B1: a worker stopped at its turn cap reports the tokens its request used
+/// (not zero) in its completion report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capped_worker_reports_its_token_usage() {
+    let tmp = TempDir::new().expect("tmp");
+    let dir = workdir();
+    let target = dir.path().join("a.txt");
+    let provider = Arc::new(ScriptedProvider {
+        calls: AtomicU32::new(0),
+        script: Box::new(move |n| ChatResponse {
+            usage: Usage {
+                input_tokens: 100,
+                output_tokens: 7,
+                ..Usage::default()
+            },
+            ..reply(vec![write(n, &target, "x")])
+        }),
+    });
+    let coord = worker_coordinator(&tmp, provider);
+    let spec = origin_swarm::WorkerSpec {
+        goal: "edit a file".into(),
+        allowed_tools: vec!["Write".into()],
+        budget: origin_swarm::Budget::new(60_000, 1_000_000, 1_000_000, 1),
+        workspace: None,
+        parent_actor: origin_plan::ActorId::new(0),
+        model: None,
+        mcp_servers: Vec::new(),
+        effort: None,
+        ponytail: None,
+    };
+    let handle = coord.spawn(spec).await.expect("spawn");
+    let report = coord.await_completion(&handle).await.expect("report");
+    assert!(
+        matches!(report.status, origin_swarm::ReportStatus::BudgetExhausted),
+        "{:?}",
+        report.status
+    );
+    assert_eq!((report.usage.input_tokens, report.usage.output_tokens), (100, 7));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

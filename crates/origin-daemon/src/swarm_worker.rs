@@ -32,7 +32,8 @@ use origin_tools::{DynTool, SandboxProfile, SideEffects, Tier, ToolMeta, Urgency
 use tokio::sync::RwLock;
 
 use crate::agent::{
-    run_loop, scope_runtime_tools, scope_swarm_collab, LoopError, LoopOptions, RunTouches, SwarmCollab,
+    run_loop_with_totals, scope_runtime_tools, scope_swarm_collab, LoopError, LoopOptions, LoopTotals,
+    RunTouches, SwarmCollab,
 };
 use crate::session::Session;
 
@@ -429,7 +430,19 @@ async fn run_worker(
     // of every sibling that had read a path this worker just edited. When the
     // handle is absent (the default) we call the bare `run_loop`, so the loop
     // sees an unset task-local and behaves exactly as before — byte-identical.
-    let run = async { run_loop(&mut session, &goal, provider.as_ref(), &prompter, &opts).await };
+    // B1: the totals outlive an error exit, so a stopped worker reports its usage.
+    let mut totals = LoopTotals::default();
+    let run = async {
+        run_loop_with_totals(
+            &mut session,
+            &goal,
+            provider.as_ref(),
+            &prompter,
+            &opts,
+            &mut totals,
+        )
+        .await
+    };
     // gap 9b: install the worker's inline-MCP runtime registry for the duration
     // of its loop so the dispatch path can resolve + invoke those tools (empty
     // map ⇒ no effect). Heap-box the (large) composed future.
@@ -446,7 +459,7 @@ async fn run_worker(
         None => run.await,
     };
     let touches = std::mem::take(&mut *touches.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
-    Ok(build_report(goal, loop_result, &session, touches))
+    Ok(build_report(goal, loop_result, &session, touches, &totals))
 }
 
 /// Assemble a worker's report (B8). A stop (turn cap, denial cap, error) is
@@ -458,7 +471,14 @@ fn build_report(
     loop_result: Result<crate::agent::LoopSummary, LoopError>,
     session: &Session,
     touches: RunTouches,
+    totals: &LoopTotals,
 ) -> CompletionReport {
+    // B1: a stopped run still spent tokens; report them, not zero.
+    let spent = Usage {
+        input_tokens: totals.input_tokens,
+        output_tokens: totals.output_tokens,
+        tool_calls: totals.turns,
+    };
     let (status, text, usage, stop) = match loop_result {
         Ok(summary) => (
             ReportStatus::Completed,
@@ -473,13 +493,13 @@ fn build_report(
         Err(LoopError::MaxTurns(n)) => (
             ReportStatus::BudgetExhausted,
             last_assistant_text(session),
-            Usage::default(),
+            spent,
             Some(format!("Stopped at the turn cap ({n} turns) before finishing.")),
         ),
         Err(LoopError::Denied(d)) => (
             ReportStatus::Aborted,
             last_assistant_text(session),
-            Usage::default(),
+            spent,
             Some(format!("Stopped after repeated permission denials: {d}")),
         ),
         Err(e) => {
@@ -487,7 +507,7 @@ fn build_report(
             (
                 ReportStatus::GoalUnreachable,
                 last_assistant_text(session),
-                Usage::default(),
+                spent,
                 Some(format!("run_loop failed: {e}")),
             )
         }
