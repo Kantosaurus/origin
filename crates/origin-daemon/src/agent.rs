@@ -5916,9 +5916,13 @@ async fn run_loop_inner(
     let mut repro_gate_repairs: u32 = 0;
     // C8: the checkpoint id and turn of this run's last passing gate.
     let mut last_green: Option<(String, u32)> = None;
-    // C8: the armed lint gate did not run on its latest turn (`lint_block` is
-    // then empty without meaning green).
-    let mut lint_unrun = false;
+    // C8: the armed lint gate has not run green-or-red on its latest turn
+    // (`lint_block` is then empty without meaning green). Armed ⇒ starts true:
+    // a lint that never ran in this run blocks the terminal-path tag too.
+    let mut lint_unrun = opts
+        .post_edit
+        .as_deref()
+        .is_some_and(|c| c.auto_lint && c.lint_command.is_some());
     // The number of terminal-branch RED→continue attempts allowed before the
     // loop yields control (surfacing the still-failing suite to the user/goal
     // verifier). Reuses the post-edit `max_repair_iters` budget; 0 when no gate

@@ -470,6 +470,28 @@ fn a_green_gate_with_another_that_did_not_run_tags_nothing() {
     }
 }
 
+/// C8: an armed lint that never ran in the run (no file edit, so no per-turn
+/// gate) blocks the terminal test re-run's tag too.
+#[test]
+fn an_armed_lint_that_never_ran_blocks_the_terminal_tag() {
+    let ws = workspace();
+    let cfg = PostEditConfig {
+        auto_lint: true,
+        lint_command: Some("echo lint-ok".into()),
+        ..test_gate("echo test-ok", 1)
+    };
+    run(
+        ws.path(),
+        true,
+        cfg,
+        vec![
+            tool("b1", "Bash", &serde_json::json!({ "command": "echo hi" })),
+            Block::text("done"),
+        ],
+    );
+    assert_eq!(git(ws.path(), &["rev-parse", "--verify", "-q", TAG]), None);
+}
+
 #[test]
 fn a_green_lint_alone_tags() {
     let ws = workspace();
