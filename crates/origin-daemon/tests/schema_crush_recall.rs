@@ -88,6 +88,77 @@ async fn lossy_offload_handle_recalls_the_original() {
     );
 }
 
+/// A1: `Recall` of an offloaded array returns its rows — the loop does not
+/// crush the recalled body again (which would offload the same rows behind
+/// the same handle, so they could never be seen).
+#[tokio::test]
+async fn recall_of_an_offloaded_array_is_not_crushed_again() {
+    use origin_core::types::{Block, Message, Role};
+    use origin_daemon::agent::{run_loop, LoopOptions};
+    use origin_provider::{ChatRequest, ChatResponse, Provider, ProviderError, Usage};
+    use std::sync::{Arc, Mutex};
+
+    struct Script(Mutex<Vec<Block>>);
+    #[async_trait::async_trait]
+    impl Provider for Script {
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+        async fn chat(&self, _req: ChatRequest) -> Result<ChatResponse, ProviderError> {
+            let mut q = self.0.lock().unwrap();
+            let b = if q.is_empty() {
+                Block::text("done")
+            } else {
+                q.remove(0)
+            };
+            Ok(ChatResponse {
+                assistant: Message::new(Role::Assistant).with_block(b),
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    let (cas, _guard) = open_cas();
+    let cas = Arc::new(cas);
+    let original = serde_json::to_vec(&grep_like(600)).unwrap();
+    let hex = hex::encode(cas.put(&original).unwrap().as_bytes());
+    let provider = Script(Mutex::new(vec![Block::ToolUse {
+        id: "r".into(),
+        name: "Recall".into(),
+        input_json: serde_json::to_vec(&json!({ "handle": hex })).unwrap(),
+        cache_marker: None,
+    }]));
+    let opts = LoopOptions::default()
+        .with_cas(Arc::clone(&cas))
+        .without_streaming();
+    let mut session = origin_daemon::session::Session::new("scripted", "m");
+    run_loop(
+        &mut session,
+        "go",
+        &provider,
+        &origin_permission::prompt::AlwaysAllow,
+        &opts,
+    )
+    .await
+    .unwrap();
+    let body = session
+        .messages
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .find_map(|b| match b {
+            Block::ToolResult { handle: Some(h), .. } => {
+                Some(String::from_utf8(cas.get(origin_cas::Hash::from_bytes(*h)).unwrap().unwrap()).unwrap())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        body.contains("file_599.rs") && !body.contains("__offloaded"),
+        "recalled rows were crushed again: {}",
+        &body[..body.len().min(400)]
+    );
+}
+
 #[tokio::test]
 async fn lossless_tier_is_smaller_and_below_budget_keeps_all_rows() {
     let (cas, _guard) = open_cas();

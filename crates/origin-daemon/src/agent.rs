@@ -8384,8 +8384,11 @@ async fn run_loop_inner(
             let mut result_bytes = result_bytes;
             // C4: external results are not crushed — the crush anchors the
             // unwrapped original for `Recall`, which would bypass the marker.
+            // A1: nor is a `Recall` — crushing it offloads the same rows behind
+            // the same handle, so they could never be seen.
             if schema_crush_enabled
                 && cache_hit.is_none()
+                && meta.name != "Recall"
                 && matches!(meta.side_effects, SideEffects::Pure)
                 && crate::external_content::external_source(&name, &args).is_none()
             {
