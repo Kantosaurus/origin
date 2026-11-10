@@ -30,20 +30,39 @@ pub struct CandidateResult {
     pub diff: String,
     /// The test-oracle verdict for the candidate's worktree.
     pub outcome: TestOutcome,
-    /// C5: the diff modified or deleted a test file that existed before the
-    /// run. The candidate was still scored, on the original tests.
-    pub tampered: bool,
+    /// C5: the pre-existing test files the diff modified or deleted (empty ⇒
+    /// not tampered). The candidate was still scored, on the original tests.
+    pub tampered: Vec<String>,
+    /// C5: every path the diff changes is a test file. Such a candidate fixed
+    /// nothing, so it is never a verified winner, whatever it scored.
+    pub tests_only: bool,
 }
 
 /// C5: `diff` with line endings, trailing whitespace and `index` header lines
 /// (blob hashes, which change with the bytes) normalised away, so candidates
-/// that made the same change compare equal.
+/// that made the same change compare equal. A binary file's section keeps its
+/// `index` line: there it is the only thing that tells two changes apart.
 fn normalize_diff(diff: &str) -> String {
-    diff.lines()
-        .filter(|l| !l.starts_with("index "))
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n")
+    fn flush(section: &mut Vec<&str>, out: &mut Vec<String>) {
+        let binary = section
+            .iter()
+            .any(|l| l.starts_with("Binary files ") || *l == "GIT binary patch");
+        out.extend(
+            section
+                .drain(..)
+                .filter(|l| binary || !l.starts_with("index "))
+                .map(|l| l.trim_end().to_string()),
+        );
+    }
+    let (mut out, mut section) = (Vec::new(), Vec::new());
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            flush(&mut section, &mut out);
+        }
+        section.push(line);
+    }
+    flush(&mut section, &mut out);
+    out.join("\n")
 }
 
 /// The effect surface best-of-N needs, behind a trait so the policy is testable.
@@ -80,13 +99,14 @@ pub enum BestOfNOutcome {
     /// keeps the single-shot result untouched.
     Skipped,
     /// A verified (passing, non-empty) winner was found and applied. Carries the
-    /// winning candidate index, how many candidates passed, and (C5) the
-    /// candidates flagged for changing a pre-existing test — the winner's own
-    /// test changes are part of the applied diff when it is among them.
+    /// winning candidate index, how many candidates passed, and (C5) each
+    /// candidate flagged for changing pre-existing tests, with those test paths
+    /// — the winner's own test changes are part of the applied diff when it is
+    /// among them.
     Applied {
         winner: usize,
         passed: usize,
-        tampered: Vec<usize>,
+        tampered: Vec<(usize, Vec<String>)>,
     },
     /// N candidates ran but none was a verified winner; nothing was applied and
     /// the caller keeps the single-shot result.
@@ -139,21 +159,30 @@ pub fn run_best_of_n(
                 CandidateResult {
                     diff: String::new(),
                     outcome: TestOutcome::Unknown,
-                    tampered: false,
+                    tampered: Vec::new(),
+                    tests_only: false,
                 }
             }
         };
-        if res.tampered {
+        if !res.tampered.is_empty() {
             tracing::warn!(
                 candidate = i,
-                "best-of-N: candidate changed a pre-existing test; scored on the original"
+                tests = ?res.tampered,
+                "best-of-N: candidate changed pre-existing tests; scored on the originals"
+            );
+        }
+        if res.tests_only {
+            tracing::info!(
+                candidate = i,
+                "best-of-N: candidate changed only tests; not a winner"
             );
         }
         candidates.push(Candidate {
             index: i,
             outcome: res.outcome,
             diff_len: res.diff.len(),
-            non_empty: !res.diff.trim().is_empty(),
+            // A tests-only change fixed nothing: select it like an empty diff.
+            non_empty: !res.diff.trim().is_empty() && !res.tests_only,
         });
         results.push(res);
         if i == 1
@@ -186,7 +215,12 @@ pub fn run_best_of_n(
         tracing::warn!(winner, error = %e, "best-of-N: applying the winning diff failed; keeping single-shot result");
         return BestOfNOutcome::NoWinner { attempted };
     }
-    let tampered: Vec<usize> = (0..attempted).filter(|&i| results[i].tampered).collect();
+    let tampered: Vec<(usize, Vec<String>)> = results
+        .into_iter()
+        .enumerate()
+        .filter(|(_, r)| !r.tampered.is_empty())
+        .map(|(i, r)| (i, r.tampered))
+        .collect();
     tracing::info!(
         winner,
         passed,
@@ -235,7 +269,7 @@ pub struct WorktreeArena<'a> {
     created: Vec<std::path::PathBuf>,
     /// C5: verdict + tamper flag per normalised diff already scored, so an
     /// identical candidate shares it instead of re-running the tests.
-    scored: std::collections::HashMap<String, (TestOutcome, bool)>,
+    scored: std::collections::HashMap<String, CandidateResult>,
 }
 
 impl<'a> WorktreeArena<'a> {
@@ -267,42 +301,59 @@ impl<'a> WorktreeArena<'a> {
     /// base commit: a pre-existing test file the candidate modified or deleted
     /// is restored, a test file it added is set aside; afterwards its own
     /// versions are put back (its diff was captured before). Returns the
-    /// verdict and whether a pre-existing test was changed. A restore that
-    /// fails scores `Unknown`, never a pass on tampered tests.
+    /// verdict, the pre-existing tests it changed, and whether it changed only
+    /// tests (`diff` is left empty for the caller). A change list that cannot
+    /// be read, or a restore that fails, scores `Unknown`, never a pass on
+    /// tampered tests.
     // ponytail: "test file" is `origin_postedit::is_test_file`'s naming
-    // convention — a changed helper/fixture outside it (conftest.py, testdata)
-    // is not restored; a runner-reported list of collected files is the upgrade.
+    // convention, so this cannot see tampering with: inline `#[cfg(test)]`
+    // modules, Go `testdata/`, a root `conftest.py` or other helper/fixture
+    // outside a test dir, runner configuration (`pytest.ini`, jest config), or
+    // an added `#[ignore]`/skip marker inside a source file. A runner-reported
+    // list of collected files is the upgrade path.
     fn score_on_base_tests(
         &self,
         git: &dyn origin_vcs::GitRunner,
         wt: &std::path::Path,
         cmd: &str,
-    ) -> (TestOutcome, bool) {
+    ) -> CandidateResult {
+        // Paths per git call: far below the Windows command-line limit.
+        const PATHS_PER_CALL: usize = 100;
+        let base = self.base_commit.as_str();
+        let unknown = CandidateResult {
+            diff: String::new(),
+            outcome: TestOutcome::Unknown,
+            tampered: Vec::new(),
+            tests_only: false,
+        };
         // `-z`: NUL-separated `status, path` pairs, no path quoting;
         // `--no-renames`: a renamed test reads as deleted + added.
-        let base = self.base_commit.as_str();
-        let listing = git
-            .run(&["diff", "--cached", "--name-status", "--no-renames", "-z", base])
-            .unwrap_or_default();
+        let Ok(listing) = git.run(&["diff", "--cached", "--name-status", "--no-renames", "-z", base]) else {
+            return unknown;
+        };
         let fields: Vec<&str> = listing.split('\0').collect();
+        let pairs: Vec<&[&str]> = fields.chunks_exact(2).collect();
+        let tests_only = !pairs.is_empty() && pairs.iter().all(|p| origin_postedit::is_test_file(p[1]));
         let (mut existing, mut added): (Vec<(&str, &str)>, Vec<&str>) = (Vec::new(), Vec::new());
-        for pair in fields.chunks_exact(2) {
-            if !origin_postedit::is_test_file(pair[1]) {
-                continue;
-            }
+        for pair in pairs.iter().filter(|p| origin_postedit::is_test_file(p[1])) {
             if pair[0] == "A" {
                 added.push(pair[1]);
             } else {
                 existing.push((pair[0], pair[1]));
             }
         }
-        let tampered = !existing.is_empty();
-        let mut ok = true;
-        if tampered {
-            let mut args = vec!["restore", "--source", base, "--worktree", "--"];
-            args.extend(existing.iter().map(|&(_, p)| p));
-            ok &= git.run(&args).is_ok();
-        }
+        // `--literal-pathspecs`: a file name with `*`/`?`/`[` is a name, not a glob.
+        let run_chunked = |head: &[&str], paths: &[&str]| {
+            paths.chunks(PATHS_PER_CALL).fold(true, |ok, chunk| {
+                let mut args = vec!["--literal-pathspecs"];
+                args.extend_from_slice(head);
+                args.push("--");
+                args.extend_from_slice(chunk);
+                git.run(&args).is_ok() && ok
+            })
+        };
+        let changed: Vec<&str> = existing.iter().map(|&(_, p)| p).collect();
+        let mut ok = run_chunked(&["restore", "--source", base, "--worktree"], &changed);
         for p in &added {
             ok &= std::fs::remove_file(wt.join(p)).is_ok();
         }
@@ -319,15 +370,16 @@ impl<'a> WorktreeArena<'a> {
             .map(|&(_, p)| p)
             .chain(added.iter().copied())
             .collect();
-        if !staged.is_empty() {
-            let mut args = vec!["checkout", "--"];
-            args.extend(staged);
-            let _ = git.run(&args);
-        }
+        let _ = run_chunked(&["checkout"], &staged);
         for &(_, p) in existing.iter().filter(|&&(s, _)| s == "D") {
             let _ = std::fs::remove_file(wt.join(p));
         }
-        (outcome, tampered)
+        CandidateResult {
+            outcome,
+            tampered: changed.into_iter().map(str::to_string).collect(),
+            tests_only,
+            ..unknown
+        }
     }
 
     /// Run the test command with `dir` as cwd; map the exit status to a verdict.
@@ -369,26 +421,23 @@ impl CandidateArena for WorktreeArena<'_> {
             return Ok(CandidateResult {
                 diff,
                 outcome: TestOutcome::Unknown,
-                tampered: false,
+                tampered: Vec::new(),
+                tests_only: false,
             });
         };
         // C5: an identical change was scored already ⇒ share its verdict.
         let key = normalize_diff(&diff);
-        let (outcome, tampered) = if let Some(&hit) = self.scored.get(&key) {
-            hit
+        let scored = if let Some(hit) = self.scored.get(&key) {
+            hit.clone()
         } else {
             let scored = self.score_on_base_tests(&wt_git, &wt_path, cmd);
             // A gate that did not run is not cached: the next one may run.
-            if scored.0 != TestOutcome::Unknown {
-                self.scored.insert(key, scored);
+            if scored.outcome != TestOutcome::Unknown {
+                self.scored.insert(key, scored.clone());
             }
             scored
         };
-        Ok(CandidateResult {
-            diff,
-            outcome,
-            tampered,
-        })
+        Ok(CandidateResult { diff, ..scored })
     }
 
     fn apply_winner(&mut self, diff: &str) -> Result<(), String> {
@@ -468,19 +517,19 @@ mod tests {
         }
     }
 
-    fn pass(diff: &str) -> Result<CandidateResult, String> {
+    fn result(diff: &str, outcome: TestOutcome) -> Result<CandidateResult, String> {
         Ok(CandidateResult {
             diff: diff.into(),
-            outcome: TestOutcome::Passed,
-            tampered: false,
+            outcome,
+            tampered: Vec::new(),
+            tests_only: false,
         })
     }
+    fn pass(diff: &str) -> Result<CandidateResult, String> {
+        result(diff, TestOutcome::Passed)
+    }
     fn fail(diff: &str) -> Result<CandidateResult, String> {
-        Ok(CandidateResult {
-            diff: diff.into(),
-            outcome: TestOutcome::Failed,
-            tampered: false,
-        })
+        result(diff, TestOutcome::Failed)
     }
     fn hard() -> DifficultySignals {
         DifficultySignals {
@@ -599,16 +648,8 @@ mod tests {
         for first_two in [
             vec![fail("+fix"), fail("+fix")],
             vec![
-                Ok(CandidateResult {
-                    diff: "+fix".into(),
-                    outcome: TestOutcome::Unknown,
-                    tampered: false,
-                }),
-                Ok(CandidateResult {
-                    diff: "+fix".into(),
-                    outcome: TestOutcome::Unknown,
-                    tampered: false,
-                }),
+                result("+fix", TestOutcome::Unknown),
+                result("+fix", TestOutcome::Unknown),
             ],
             vec![pass("+fix"), pass("+other")],
         ] {
@@ -618,6 +659,32 @@ mod tests {
             let _ = run_best_of_n(&mut a, 3, hard());
             assert_eq!(a.runs, 3);
         }
+    }
+
+    #[test]
+    fn a_tests_only_candidate_is_not_a_winner() {
+        let tests_only = Ok(CandidateResult {
+            tests_only: true,
+            ..pass("+t").unwrap()
+        });
+        let mut a = MockArena::new(vec![tests_only, fail("+real-fix-attempt")]);
+        assert_eq!(
+            run_best_of_n(&mut a, 2, hard()),
+            BestOfNOutcome::NoWinner { attempted: 2 }
+        );
+        assert!(a.applied.is_none());
+    }
+
+    #[test]
+    fn binary_index_lines_tell_two_binary_changes_apart() {
+        let bin = |h: &str| {
+            format!(
+                "diff --git a/x.png b/x.png\nindex 1..{h} 100644\nBinary files a/x.png and b/x.png differ\n"
+            )
+        };
+        assert_ne!(normalize_diff(&bin("2")), normalize_diff(&bin("3")));
+        let text = |h: &str| format!("diff --git a/x b/x\nindex 1..{h} 100644\n--- a/x\n+++ b/x\n+y\n");
+        assert_eq!(normalize_diff(&text("2")), normalize_diff(&text("3")));
     }
 
     #[test]

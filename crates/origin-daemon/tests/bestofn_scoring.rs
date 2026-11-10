@@ -20,12 +20,17 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// A repo whose pre-existing test `tests/expect.txt` says `lib.txt` must read
 /// `fixed`; it starts as `bug`. Returns (repo dir, base commit).
 fn repo() -> (tempfile::TempDir, String) {
+    repo_with("bug\n")
+}
+
+/// [`repo`] with `lib.txt` starting as `lib`.
+fn repo_with(lib: &str) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let git = ProcessGitRunner::new(dir.path());
     git.run(&["init", "-q"]).unwrap();
     git.run(&["config", "core.autocrlf", "false"]).unwrap();
     std::fs::create_dir(dir.path().join("tests")).unwrap();
-    std::fs::write(dir.path().join("lib.txt"), "bug\n").unwrap();
+    std::fs::write(dir.path().join("lib.txt"), lib).unwrap();
     std::fs::write(dir.path().join("tests/expect.txt"), "fixed\n").unwrap();
     git.run(&["add", "-A"]).unwrap();
     git.run(&[
@@ -66,6 +71,9 @@ fn runs(count: &Path) -> usize {
 
 type Edit = (&'static str, &'static str);
 
+/// Content that makes the scripted agent delete the path instead.
+const DELETE: &str = "<delete>";
+
 /// Run candidate `index` whose agent writes `edits` (path, content).
 fn arena<'a>(
     git: &'a ProcessGitRunner,
@@ -79,7 +87,12 @@ fn arena<'a>(
     let runner = move |i: usize, wt: &Path| -> Result<(), String> {
         calls.set(calls.get() + 1);
         for (p, c) in &edits[i] {
-            std::fs::write(wt.join(p), c).map_err(|e| e.to_string())?;
+            let done = if *c == DELETE {
+                std::fs::remove_file(wt.join(p))
+            } else {
+                std::fs::write(wt.join(p), c)
+            };
+            done.map_err(|e| e.to_string())?;
         }
         Ok(())
     };
@@ -112,7 +125,7 @@ fn a_candidate_that_weakens_a_pre_existing_test_is_scored_on_the_original_and_fl
     );
     let res = a.run_candidate(0).unwrap();
     assert_eq!(res.outcome, TestOutcome::Failed, "scored on the ORIGINAL test");
-    assert!(res.tampered, "the weakened test is flagged");
+    assert_eq!(res.tampered, ["tests/expect.txt"], "the weakened test is flagged");
     assert!(
         res.diff.contains("tests/expect.txt"),
         "the diff is unchanged: {}",
@@ -149,7 +162,7 @@ fn a_test_the_candidate_added_does_not_affect_its_score() {
         TestOutcome::Passed,
         "the added veto test is set aside"
     );
-    assert!(!res.tampered, "adding a test is not tampering");
+    assert!(res.tampered.is_empty(), "adding a test is not tampering");
     let wt = scratch.path().join("origin-bestofn-0");
     assert!(wt.join("tests/veto.txt").exists(), "the added test is put back");
 }
@@ -217,6 +230,98 @@ fn different_candidates_are_each_scored() {
     assert_eq!(a.run_candidate(0).unwrap().outcome, TestOutcome::Passed);
     assert_eq!(a.run_candidate(1).unwrap().outcome, TestOutcome::Failed);
     assert_eq!(runs(&count), 2);
+}
+
+#[test]
+fn a_candidate_that_changes_only_tests_does_not_win() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A green base: a tests-only change "passes" without fixing anything.
+    let (dir, base) = repo_with("fixed\n");
+    let scratch = tempfile::tempdir().unwrap();
+    let count = scratch.path().join("count");
+    let git = ProcessGitRunner::new(dir.path());
+    let calls = std::cell::Cell::new(0);
+    let mut a = arena(
+        &git,
+        &base,
+        scratch.path(),
+        dir.path(),
+        &count,
+        vec![vec![("tests/extra.txt", "more\n")], vec![("lib.txt", "other\n")]],
+        &calls,
+    );
+    let res = a.run_candidate(0).unwrap();
+    assert_eq!(res.outcome, TestOutcome::Passed);
+    assert!(res.tests_only, "its result says it changed only tests");
+    let hard = DifficultySignals {
+        tests_red: true,
+        ..Default::default()
+    };
+    let scratch2 = tempfile::tempdir().unwrap();
+    let mut a = arena(
+        &git,
+        &base,
+        scratch2.path(),
+        dir.path(),
+        &count,
+        vec![vec![("tests/extra.txt", "more\n")], vec![("lib.txt", "other\n")]],
+        &calls,
+    );
+    assert_eq!(
+        run_best_of_n(&mut a, 2, hard),
+        BestOfNOutcome::NoWinner { attempted: 2 }
+    );
+}
+
+#[test]
+fn a_change_list_that_cannot_be_read_scores_unknown() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (dir, base) = repo_with("fixed\n");
+    let scratch = tempfile::tempdir().unwrap();
+    let count = scratch.path().join("count");
+    let git = ProcessGitRunner::new(dir.path());
+    let calls = std::cell::Cell::new(0);
+    // A broken `.git` link makes every git call in the worktree fail (without
+    // git walking up to some enclosing repository).
+    let mut a = arena(
+        &git,
+        &base,
+        scratch.path(),
+        dir.path(),
+        &count,
+        vec![vec![
+            ("tests/expect.txt", "weakened\n"),
+            (".git", "gitdir: no-such-dir\n"),
+        ]],
+        &calls,
+    );
+    let res = a.run_candidate(0).unwrap();
+    assert_eq!(res.outcome, TestOutcome::Unknown, "never scored on its own tests");
+    assert_eq!(runs(&count), 0);
+}
+
+#[test]
+fn a_deleted_pre_existing_test_is_restored_for_scoring_then_deleted_again() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (dir, base) = repo();
+    let scratch = tempfile::tempdir().unwrap();
+    let count = scratch.path().join("count");
+    let git = ProcessGitRunner::new(dir.path());
+    let calls = std::cell::Cell::new(0);
+    let mut a = arena(
+        &git,
+        &base,
+        scratch.path(),
+        dir.path(),
+        &count,
+        vec![vec![("lib.txt", "wrong\n"), ("tests/expect.txt", DELETE)]],
+        &calls,
+    );
+    let res = a.run_candidate(0).unwrap();
+    assert_eq!(res.outcome, TestOutcome::Failed, "scored on the restored test");
+    assert_eq!(res.tampered, ["tests/expect.txt"]);
+    let wt = scratch.path().join("origin-bestofn-0");
+    assert!(!wt.join("tests/expect.txt").exists(), "the deletion is put back");
 }
 
 /// A6: `git apply` honours `GIT_TRACE`, which the allow-list drops; an
