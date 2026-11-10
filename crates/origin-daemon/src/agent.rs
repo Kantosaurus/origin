@@ -12276,6 +12276,34 @@ mod wiring_tests {
         assert!(out.reason.contains("dangerous"), "{}", out.reason);
     }
 
+    /// C6 M8: npm aliases go through the gate, and of two packages only the
+    /// undeclared one is named (the test cwd is this crate, whose Cargo.toml
+    /// declares `serde`).
+    #[test]
+    fn cmd_guard_names_only_the_undeclared_package() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("ORIGIN_CMD_GUARD");
+        let allow = || Decision {
+            outcome: Outcome::Allow,
+            reason: "rule:Bash@project:allow".into(),
+        };
+        let deny = origin_permission::prompt::AlwaysDeny;
+        for cmd in ["npm i left-pad", "npm add left-pad"] {
+            let out = run_cmd_guard(allow(), "Bash", &serde_json::json!({ "command": cmd }), &deny);
+            assert_eq!(out.outcome, Outcome::Deny, "{cmd}: {}", out.reason);
+        }
+        let args = serde_json::json!({ "command": "cargo add serde c6-not-a-dependency" });
+        let out = run_cmd_guard(allow(), "Bash", &args, &deny);
+        assert_eq!(out.outcome, Outcome::Deny, "{}", out.reason);
+        assert!(out.reason.contains("c6-not-a-dependency"), "{}", out.reason);
+        assert!(!out.reason.contains("serde"), "{}", out.reason);
+        let declared = serde_json::json!({ "command": "cargo add serde" });
+        assert_eq!(
+            run_cmd_guard(allow(), "Bash", &declared, &deny).outcome,
+            Outcome::Allow
+        );
+    }
+
     /// WS-D browser visual loop: the gate is OFF by default. With
     /// `ORIGIN_BROWSER_VISUAL` unset, the `Browser` arm serializes the bare
     /// `SnapshotResp` — so `browser_visual_result` is never invoked and the

