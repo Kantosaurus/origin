@@ -143,10 +143,12 @@ async fn rich_profile_with_an_unflagged_or_frontier_model_advertises_todays_list
 async fn a_whole_file_model_keeps_write_but_not_the_search_replace_tools() {
     let _g = env_lock();
     let expected = todays_names_without(&["Edit", "MultiEdit", "ApplyPatch"]);
-    // From the table (dated id: prefix match) and forced by `ORIGIN_EDITFMT`.
+    // From the table (dated id: prefix match; an unrecognised value falls back
+    // to it) and forced by `ORIGIN_EDITFMT`. Never `1` here: it arms the prose
+    // edit applier, which would write the reply "done" to a file named `done`.
     for (model, editfmt) in [
         ("gpt-3.5-turbo", None),
-        ("gpt-3.5-turbo-0125", Some("1")),
+        ("gpt-3.5-turbo-0125", Some("junk")),
         ("claude-opus-4", Some("whole-file")),
     ] {
         let tools = advertised(model, editfmt, None).await;
