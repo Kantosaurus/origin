@@ -219,16 +219,7 @@ const TOOL_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2)
 /// hundreds of milliseconds on Windows.
 #[must_use]
 pub fn tools_on_path_line(path: &std::ffi::OsStr) -> String {
-    let exts: Vec<String> = if cfg!(windows) {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
-            .split(';')
-            .filter(|e| !e.is_empty())
-            .map(str::to_ascii_lowercase)
-            .collect()
-    } else {
-        vec![String::new()]
-    };
+    let exts = path_exts();
     // `Some(real)` once a tool's first match is seen.
     let mut decided: [Option<bool>; PROBED_TOOLS.len()] = [None; PROBED_TOOLS.len()];
     for dir in std::env::split_paths(path) {
@@ -282,6 +273,36 @@ pub fn tools_on_path_line(path: &std::ffi::OsStr) -> String {
     } else {
         format!("Tools on PATH: {}", found.join(", "))
     }
+}
+
+/// The extensions a bare program name may take: Windows' `PATHEXT`
+/// (lower-cased), or just the name itself elsewhere.
+fn path_exts() -> Vec<String> {
+    if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    } else {
+        vec![String::new()]
+    }
+}
+
+/// B7: the file the shell would run for `name` on `path` (a `PATH`-style list).
+///
+/// The same rules as [`tools_on_path_line`]: the first match in
+/// `PATH` order (within one directory, the earliest `PATHEXT` extension),
+/// directories and, on Unix, files without the execute bit skipped. `None`
+/// when nothing matches or the first match is a zero-length Store stub.
+#[must_use]
+pub fn resolve_on_path(name: &str, path: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+    let exts = path_exts();
+    std::env::split_paths(path)
+        .flat_map(|dir| exts.iter().map(move |ext| dir.join(format!("{name}{ext}"))))
+        .find(|p| std::fs::symlink_metadata(p).is_ok_and(|m| !m.is_dir()) && shell_candidate(p))
+        .filter(|p| is_real_executable(p))
 }
 
 /// B6: whether the shell would try to run `p`. On Unix it skips anything but

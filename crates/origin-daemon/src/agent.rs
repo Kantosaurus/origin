@@ -8956,7 +8956,12 @@ async fn run_loop_inner(
         // Fast post-edit syntax gate on the same edited-path set (Python/JS
         // interpreters, tree-sitter for the codegraph grammars).
         if compile_check_enabled && !lsp_edited_paths.is_empty() {
-            let (check, advisory) = crate::postcheck::check_block(&lsp_edited_paths, &parse_baseline).await;
+            // B7: every root of the session, project or not, counts as the
+            // workspace here: an interpreter under one is never run.
+            let ws = Workspace::of(opts, session);
+            let roots: Vec<_> = ws.roots.into_iter().chain(ws.not_projects).collect();
+            let (check, advisory) =
+                crate::postcheck::check_block(&lsp_edited_paths, &parse_baseline, &roots).await;
             // C9: both carry child-process / file-derived text; redact at the source.
             compile_check_block = crate::redact::string(check);
             syntax_advisory_block = crate::redact::string(advisory);

@@ -216,9 +216,11 @@ Defaults that changed, each with its escape hatch:
   backend's bot-detected response as is. `playwright-core` in `vendor/cloak-browser/package.json` is pinned to
   `1.45.0` (there is no lockfile; this is the minimum of the old `^1.45.0` range).
 - **B7**: the post-edit syntax check no longer runs code from the workspace: Python is run as
-  `python -I -m py_compile <absolute path>`, and both checkers (`python`, `node --check`) run from the system temp
+  `python -I -S -m py_compile <absolute path>`, and both checkers (`python`, `node --check`) run from the system temp
   directory on an absolute file path. A Python that rejects `-I` counts as no interpreter (the tree-sitter check
-  covers the file). Previously a `py_compile.py` written to the workspace was imported and run at turn end without
+  covers the file). An interpreter located inside the workspace (e.g. an activated `.venv`) is never run: the
+  checker is resolved on `PATH` first and, when it lies under a workspace root or the run's directory, the
+  tree-sitter check covers the file instead; otherwise that resolved absolute path is what runs. Previously a `py_compile.py` written to the workspace was imported and run at turn end without
   an ask. `ORIGIN_EDIT_CHECK=0` still turns the check off.
 - **C2**: `Diagnostics` and `LspNavigate` are `RequiresPermission` (they start rust-analyzer, which runs
   `cargo metadata`, build scripts and proc-macros of the workspace). In mode `workspace` it is an ordinary ask that

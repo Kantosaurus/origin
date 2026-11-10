@@ -441,7 +441,8 @@ Not covered: the self-development `cargo build` / `cargo test` (`ORIGIN_SELFDEV`
 `crates/origin-selfdev/src/cargo.rs`) is not scrubbed and sees the daemon's full
 environment, provider keys included. The post-edit syntax checkers (`python`,
 `node --check`) run from the system temp directory on an absolute file path,
-Python as `python -I -m py_compile`.
+Python as `python -I -S -m py_compile`. An interpreter located inside the
+workspace is never run (the tree-sitter check covers the file instead).
 
 Why the backends are not enabled (inventory at the time of writing; Linux and
 macOS behaviour was read from code, not run):
@@ -619,9 +620,11 @@ workflows, `package.json` scripts, Makefiles, build scripts,
 `.hg/hgrc`, `justfile` / `Taskfile.yml`) are ordinary project code and are
 edited without asking. Code also runs after an edit: by default, after a turn
 that edits a file, origin may run the language's own syntax checker on it
-(`python -I -m py_compile`, `node --check`; `ORIGIN_EDIT_CHECK=0` turns it off),
+(`python -I -S -m py_compile`, `node --check`; `ORIGIN_EDIT_CHECK=0` turns it off),
 in isolated mode, from the system temp directory, on an absolute path, so it does
-not import or load configuration from the workspace; and opt-in features
+not import or load configuration from the workspace; an interpreter located
+inside the workspace is never run (the tree-sitter check covers the file
+instead); and opt-in features
 (autoformat, `auto_test`, LSP build scripts) turn such an edit into code
 execution.
 

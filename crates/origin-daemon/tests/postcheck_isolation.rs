@@ -29,6 +29,7 @@ async fn py_compile_in_the_workspace_is_not_imported() {
     let (check, _) = origin_daemon::postcheck::check_block(
         &BTreeSet::from(["x.py".to_string()]),
         &origin_daemon::postcheck::ParseBaseline::new(),
+        &[std::fs::canonicalize(ws.path()).expect("resolve")],
     )
     .await;
     assert_eq!(check, "", "x.py is valid");

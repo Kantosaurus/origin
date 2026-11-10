@@ -15,7 +15,8 @@
 //! wired LSP-diagnostics path, so they are intentionally not duplicated here.
 //! B7: files in a language whose tree-sitter grammar `origin-codegraph` links
 //! (Rust, TypeScript, Go, Java, C/C++, …) — and Python when no interpreter
-//! ran — are parsed in-process and `ERROR`/`MISSING` nodes reported by line,
+//! ran, including one never run because it lies inside the workspace — are
+//! parsed in-process and `ERROR`/`MISSING` nodes reported by line,
 //! but only when the edit raised their count over a pre-edit baseline, and as
 //! an advisory (`<syntax-advisory>`), not a must-fix: the pinned grammars lag
 //! the languages.
@@ -54,9 +55,11 @@ const MAX_ERROR_LINES: usize = 5;
 /// tools resolve an unanchored path), so a file name is never read as an
 /// option. Python runs isolated (`-I`: no cwd or script dir on `sys.path`, no
 /// `PYTHON*` variables, no user site), so a `py_compile.py` in the workspace is
-/// never imported. `node --check` only parses (no `--require`/preload comes
-/// from anywhere but `NODE_OPTIONS`, which the env scrub drops); the nearest
-/// `package.json` is read for the module type only.
+/// never imported, and without `site` (`-S`), so no `.pth` file or
+/// `sitecustomize` of the interpreter's environment runs. `node --check` only
+/// parses (no `--require`/preload comes from anywhere but `NODE_OPTIONS`,
+/// which the env scrub drops); the nearest `package.json` is read for the
+/// module type only.
 fn checker_for(path: &str) -> Option<(&'static str, Vec<String>)> {
     let ext = std::path::Path::new(path)
         .extension()
@@ -70,12 +73,27 @@ fn checker_for(path: &str) -> Option<(&'static str, Vec<String>)> {
     match ext.as_str() {
         "py" => Some((
             "python",
-            vec!["-I".into(), "-m".into(), "py_compile".into(), abs()?],
+            vec!["-I".into(), "-S".into(), "-m".into(), "py_compile".into(), abs()?],
         )),
         // Not `.jsx`: `node --check` rejects JSX (B7).
         "js" | "mjs" | "cjs" => Some(("node", vec!["--check".into(), abs()?])),
         _ => None,
     }
+}
+
+/// B7: [`checker_for`] with its program resolved on `path_var` (the `PATH`
+/// the child gets: the env scrub keeps it) to a canonical absolute path, which
+/// is what runs. `None` — no external checker; tree-sitter covers the file —
+/// when the lookup fails or the interpreter lies under a workspace root in
+/// `roots` (resolved paths): a file there may be written without an ask.
+fn checker(
+    path: &str,
+    path_var: &std::ffi::OsStr,
+    roots: &[std::path::PathBuf],
+) -> Option<(std::path::PathBuf, Vec<String>)> {
+    let (prog, args) = checker_for(path)?;
+    let real = origin_conseca::resolve_real(&crate::subsystems::resolve_on_path(prog, path_var)?)?;
+    (!roots.iter().any(|r| real.starts_with(r))).then_some((real, args))
 }
 
 /// The checker's process: scrubbed env (A6), run from the temp directory so
@@ -107,16 +125,22 @@ enum Finding {
 /// block of tree-sitter notes (may be a parser limitation); each is empty when
 /// it has nothing to say. Fail-open: missing interpreter / timeout / unknown
 /// type / a file that no longer exists (deleted or moved by `ApplyPatch`) are
-/// skipped.
-pub async fn check_block(paths: &BTreeSet<String>, baseline: &ParseBaseline) -> (String, String) {
+/// skipped. `roots` are the session's resolved workspace roots: an
+/// interpreter under one is never run (see [`checker`]).
+pub async fn check_block(
+    paths: &BTreeSet<String>,
+    baseline: &ParseBaseline,
+    roots: &[std::path::PathBuf],
+) -> (String, String) {
     let mut failures: Vec<String> = Vec::new();
     let mut advisories: Vec<String> = Vec::new();
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
     for p in paths {
         if !std::path::Path::new(p).exists() {
             continue; // B8: deleted or moved away by ApplyPatch
         }
         let before = baseline.get(p).copied().unwrap_or(0);
-        match check_file(p, checker_for(p), before).await {
+        match check_file(p, checker(p, &path_var, roots), before).await {
             Some(Finding::Failure(msg)) => failures.push(format!("{p}:\n{msg}")),
             Some(Finding::Advisory(msg)) => advisories.push(format!("{p}:\n{msg}")),
             None => {}
@@ -313,6 +337,37 @@ mod tests {
         let (_, args) = checker_for("x.py").expect("python");
         let at = |a: &str| args.iter().position(|x| x == a);
         assert!(at("-I").expect("-I") < at("-m").expect("-m"), "{args:?}");
+        // B7: no `site` either, so no `.pth`/`sitecustomize` runs.
+        assert!(at("-S").expect("-S") < at("-m").expect("-m"), "{args:?}");
+    }
+
+    /// B7: an interpreter that resolves inside a workspace root (an activated
+    /// `.venv`) is never run; the same one outside every root runs by its
+    /// resolved absolute path.
+    #[test]
+    fn an_interpreter_inside_the_workspace_is_never_run() {
+        let ws = tempfile::tempdir().expect("tmp");
+        let root = origin_conseca::resolve_real(ws.path()).expect("resolve");
+        let bin = root.join(".venv").join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        let fake = bin.join(if cfg!(windows) { "python.exe" } else { "python" });
+        std::fs::write(&fake, "#!/bin/sh\n").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let path_var = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .expect("PATH");
+        let file = root.join("x.py").to_string_lossy().into_owned();
+        assert_eq!(checker(&file, &path_var, std::slice::from_ref(&root)), None);
+        let (prog, args) = checker(&file, &path_var, &[]).expect("outside every root");
+        assert_eq!(prog, fake);
+        assert_eq!(args.last(), Some(&file));
+        // Not found on PATH ⇒ no external checker.
+        assert_eq!(checker(&file, std::ffi::OsStr::new(""), &[]), None);
     }
 
     /// S1: an interpreter that rejects `-I` counts as missing (tree-sitter
@@ -330,7 +385,10 @@ mod tests {
     #[tokio::test]
     async fn empty_paths_yield_no_block() {
         let none = (String::new(), String::new());
-        assert_eq!(check_block(&BTreeSet::new(), &ParseBaseline::new()).await, none);
+        assert_eq!(
+            check_block(&BTreeSet::new(), &ParseBaseline::new(), &[]).await,
+            none
+        );
     }
 
     /// Runs the gate on a new file (no baseline) named `name` holding `body`;
@@ -342,6 +400,7 @@ mod tests {
         check_block(
             &BTreeSet::from([p.to_string_lossy().into_owned()]),
             &ParseBaseline::new(),
+            &[],
         )
         .await
     }
@@ -429,7 +488,7 @@ mod tests {
         let mut baseline = ParseBaseline::new();
         record_baseline(&mut baseline, &p).await;
         std::fs::write(path, after).expect("write");
-        check_block(&BTreeSet::from([p]), &baseline).await.1
+        check_block(&BTreeSet::from([p]), &baseline, &[]).await.1
     }
 
     /// B7: only parse errors the edit ADDED are reported — a file that already
@@ -494,7 +553,7 @@ mod tests {
         std::fs::write(&p, "def f(:\n").expect("write");
         let mut set = BTreeSet::new();
         set.insert(p.to_string_lossy().into_owned());
-        let (block, advisory) = check_block(&set, &ParseBaseline::new()).await;
+        let (block, advisory) = check_block(&set, &ParseBaseline::new(), &[]).await;
         if block.is_empty() {
             // No python here ⇒ tree-sitter covers the file instead.
             assert!(advisory.contains("broken.py"), "{advisory}");
@@ -513,7 +572,7 @@ mod tests {
         let mut set = BTreeSet::new();
         set.insert(dir.path().join("gone.py").to_string_lossy().into_owned());
         assert_eq!(
-            check_block(&set, &ParseBaseline::new()).await,
+            check_block(&set, &ParseBaseline::new(), &[]).await,
             (String::new(), String::new())
         );
     }
@@ -531,6 +590,6 @@ mod tests {
         record_moved_baseline(&mut baseline, &from_s, &to_s).await;
         record_baseline(&mut baseline, &to_s).await;
         std::fs::rename(&from, &to).expect("move");
-        assert_eq!(check_block(&BTreeSet::from([to_s]), &baseline).await.1, "");
+        assert_eq!(check_block(&BTreeSet::from([to_s]), &baseline, &[]).await.1, "");
     }
 }
