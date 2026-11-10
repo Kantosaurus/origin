@@ -205,7 +205,8 @@ impl Prompter for AllowList {
 /// returns a structured report.
 ///
 /// `governance` is the same daemon-wide `governance.toml` overlay every parent
-/// loop runs under; each worker inherits it (A4) so a sub-agent is never more
+/// loop runs under; each worker inherits its narrowing parts (A4: policy, conseca,
+/// browser cap, deny rules — never allow rules) so a sub-agent is never more
 /// privileged than the agent that spawned it.
 #[must_use]
 pub fn real_worker(
@@ -356,15 +357,17 @@ async fn run_worker(
         // off / unknown ecosystem) ⇒ byte-identical to before.
         post_edit: worker_post_edit(),
         // A4: inherit the parent's deny-only governance overlays (policy layers,
-        // conseca tool/path/domain lists, `[[permission_rules]]`, browser cap) so
-        // the worker can never do what its parent may not. `read_only` stays
-        // false: a plan-mode parent cannot dispatch a worker at all (`Task` and
-        // `RunWorkflow` are Mutating, so the read-only overlay denies them).
-        // ponytail: browser cap is per worker run (fresh count), not shared with
-        // the parent's; share a counter via the spawn path if that matters.
+        // conseca tool/path/domain lists, browser cap) plus ONLY the deny half of
+        // `[[permission_rules]]` — an allow rule is consulted before the prompter,
+        // so it would bypass this worker's `AllowList`, its only confinement for
+        // permission-gated tools. `read_only` stays false: a plan-mode parent
+        // cannot dispatch a worker at all (`Task`/`RunWorkflow` are Mutating, so
+        // the read-only overlay denies them).
+        // ponytail: browser cap is per `run_loop` call (fresh count), not shared
+        // with the parent's; share a counter via the spawn path if that matters.
         policy: governance.policy,
         conseca: governance.conseca,
-        permission_rules: governance.permission_rules,
+        permission_rules: governance.permission_rules.as_deref().and_then(deny_rules_only),
         browser_rate_limit: governance.browser_max_actions,
         ..Default::default()
     };
@@ -442,6 +445,18 @@ async fn run_worker(
         }
     };
     Ok(report)
+}
+
+/// The deny rules of `rules` (A4): a worker may inherit its parent's blocks but
+/// never its auto-approvals. `None` when there are no deny rules.
+fn deny_rules_only(rules: &crate::config::PermissionRules) -> Option<Arc<crate::config::PermissionRules>> {
+    let deny: Vec<_> = rules.rules.iter().filter(|r| !r.allow).cloned().collect();
+    (!deny.is_empty()).then(|| {
+        Arc::new(crate::config::PermissionRules {
+            bloom: origin_permission::bloom::BloomPreCheck::build(&deny),
+            rules: deny,
+        })
+    })
 }
 
 /// Reasoning effort for a sub-agent turn. Workers do the actual editing, so a

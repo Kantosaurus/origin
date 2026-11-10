@@ -34,14 +34,14 @@ fn tool_meta_fields_present() {
 }
 
 #[test]
-fn task_is_autoallowed_and_hot_for_always_on_swarm() {
+fn task_is_permission_gated_and_hot_for_always_on_swarm() {
     let meta = registry_iter()
         .find(|m| m.name == "Task")
         .expect("Task must be registered");
     assert_eq!(
         meta.tier,
-        Tier::AutoAllowed,
-        "swarm delegation must not require a permission prompt",
+        Tier::RequiresPermission,
+        "delegation unlocks tools for the worker, so it must pass the parent's prompter (A4)",
     );
     assert!(meta.hot, "Task must be hot so the model can call it without ToolSearch");
 }

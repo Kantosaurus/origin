@@ -5583,6 +5583,36 @@ async fn run_loop_inner(
                             if input.model.is_none() {
                                 input.model = Some(session.model.clone());
                             }
+                            // A4: a skill-masked parent may only delegate tools its
+                            // mask permits (exact names; globs are dropped). If the
+                            // request named tools and none survive, refuse the Task.
+                            // ponytail: AutoAllowed tools inside the worker are not
+                            // narrowed (its AllowList never sees them); upgrade path:
+                            // carry the mask on `WorkerSpec`.
+                            if let Some(mask) = opts.skills.as_deref().and_then(SkillRegistry::allowed_tools)
+                            {
+                                let requested = input.allowed_tools.len();
+                                input.allowed_tools.retain(|t| mask.contains(t));
+                                if requested > 0 && input.allowed_tools.is_empty() {
+                                    let mut names: Vec<&str> = mask.iter().map(String::as_str).collect();
+                                    names.sort_unstable();
+                                    tool_results.push(Block::ToolResult {
+                                        tool_use_id: id,
+                                        handle: None,
+                                        inline: Some(
+                                            format!(
+                                                "Error: Task: none of the requested allowed_tools is \
+                                                 permitted by the active skill mask [{}]",
+                                                names.join(", ")
+                                            )
+                                            .into_bytes(),
+                                        ),
+                                        cache_marker: None,
+                                        is_error: true,
+                                    });
+                                    continue;
+                                }
+                            }
                             let goal = input.goal.clone();
                             // Non-blocking dispatch: background:true (the default)
                             // registers the worker and returns the turn immediately;

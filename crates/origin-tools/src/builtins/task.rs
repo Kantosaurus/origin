@@ -376,13 +376,15 @@ mod mcp_admission_tests {
 
 crate::origin_tool! {
     name: "Task",
-    description: "Dispatch a sub-agent (swarm worker) with a goal, allowed tools, and budget; it runs CONCURRENTLY in the background and returns a structured CompletionReport summary. By default (`background:true`) the dispatch returns immediately so you stay responsive — the sub-agent's result is delivered automatically at the start of your next turn (a `<background-results>` block), or gather it on demand with `CollectTasks`. Set `background:false` only when you must have the result WITHIN this turn. Prefer this to parallelize independent units of work — spawn several at once. No permission prompt is required; the sub-agent is confined to the `allowed_tools` you grant it.",
-    // AutoAllowed: spawning a swarm worker never prompts. The child is confined
-    // to the `allowed_tools` allow-list the parent grants, and the child inherits
-    // the daemon's governance / conseca / permission-rule deny overlays (A4, see
-    // `origin_daemon::swarm_worker::real_worker`) — so removing the parent-side prompt is
-    // safe while making swarm delegation friction-free (always-on swarm).
-    tier: crate::Tier::AutoAllowed,
+    description: "Dispatch a sub-agent (swarm worker) with a goal, allowed tools, and budget; it runs CONCURRENTLY in the background and returns a structured CompletionReport summary. By default (`background:true`) the dispatch returns immediately so you stay responsive — the sub-agent's result is delivered automatically at the start of your next turn (a `<background-results>` block), or gather it on demand with `CollectTasks`. Set `background:false` only when you must have the result WITHIN this turn. Prefer this to parallelize independent units of work — spawn several at once. The delegation is permission-checked like the tools it grants; the sub-agent is confined to the `allowed_tools` you grant it.",
+    // RequiresPermission (A4): the child auto-approves anything in the
+    // model-chosen `allowed_tools`, so delegating must be approved like the tools
+    // it unlocks — otherwise in ask mode a Write/Bash the parent would prompt for
+    // runs unprompted once delegated. The prompt preview is the full JSON args
+    // (goal, `allowed_tools`, `mcp_servers`), so approving it approves the
+    // worker's tool set. In the default `AlwaysAllow` mode nothing changes. The
+    // child also inherits the daemon's governance / conseca / deny-rule overlays.
+    tier: crate::Tier::RequiresPermission,
     urgency: crate::Urgency::Medium,
     side_effects: crate::SideEffects::Mutating,
     input_schema: r#"{"type":"object","required":["goal","allowed_tools"],"properties":{"goal":{"type":"string"},"allowed_tools":{"type":"array","items":{"type":"string"}},"budget":{"type":"object"},"model":{"type":"string"},"background":{"type":"boolean","description":"Run non-blocking in the background (default true). Set false to await the result in this turn."},"mcp_servers":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"url":{"type":"string"}},"required":["name"]}}}}"#,

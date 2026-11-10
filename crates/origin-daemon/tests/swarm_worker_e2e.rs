@@ -125,6 +125,22 @@ async fn real_worker_runs_a_subagent_to_completion() {
 /// written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_inherits_parent_deny_rule() {
+    let wrote = worker_write_ran("[[permission_rules]]\ntool = \"Write\"\nallow = false\n", "Write").await;
+    assert!(!wrote, "the parent's deny rule must bind the worker: Write ran");
+}
+
+/// A4 fix round 1: a parent's `allow` rule must NOT widen a worker past its own
+/// allow-list (rules are consulted before the worker's `AllowList` prompter).
+/// The worker only has `Read`, so its `Write` must be refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parent_allow_rule_does_not_widen_worker_allow_list() {
+    let wrote = worker_write_ran("[[permission_rules]]\ntool = \"Write\"\nallow = true\n", "Read").await;
+    assert!(!wrote, "an allow rule let a worker without `Write` run Write");
+}
+
+/// Run a real worker under `gov_toml` with `allowed_tools = [allowed]` whose
+/// scripted model issues one `Write`; returns whether the file was created.
+async fn worker_write_ran(gov_toml: &str, allowed: &str) -> bool {
     let tmp = TempDir::new().expect("tmp");
     let store = Arc::new(origin_store::Store::open(tmp.path().join("origin.db")).expect("store"));
     let cas = Arc::new(open_cas(tmp.path().join("cas")));
@@ -132,11 +148,7 @@ async fn worker_inherits_parent_deny_rule() {
     let plan = PlanHandle::new(Arc::new(AsyncMutex::new(Plan::default())), plan_store);
 
     let gov_path = tmp.path().join("governance.toml");
-    std::fs::write(
-        &gov_path,
-        "[[permission_rules]]\ntool = \"Write\"\nallow = false\n",
-    )
-    .expect("gov");
+    std::fs::write(&gov_path, gov_toml).expect("gov");
     let governance = origin_daemon::config::load_governance(&gov_path).expect("load governance");
 
     let target = tmp.path().join("escalated.txt");
@@ -171,7 +183,7 @@ async fn worker_inherits_parent_deny_rule() {
 
     let spec = WorkerSpec {
         goal: "write a file".into(),
-        allowed_tools: vec!["Write".into()],
+        allowed_tools: vec![allowed.into()],
         budget: Budget {
             max_wall_ms: 5_000,
             max_input_tokens: 10_000,
@@ -185,12 +197,7 @@ async fn worker_inherits_parent_deny_rule() {
     };
     let handle = coord.spawn(spec).await.expect("spawn worker");
     let _ = coord.await_completion(&handle).await;
-
-    assert!(
-        !target.exists(),
-        "the parent's deny rule must bind the worker: Write ran and created {}",
-        target.display()
-    );
+    target.exists()
 }
 
 /// A5: a model-supplied inline-MCP `command` that matches no user-scope server
