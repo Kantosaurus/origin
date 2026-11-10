@@ -5898,10 +5898,10 @@ async fn run_loop_inner(
     // collected under the feature flag, and (A12) whenever a per-turn test or
     // lint gate is armed, since those gates and test selection read them too.
     let lsp_collect = crate::lsp_diagnostics::enabled()
-        || opts.post_edit.as_deref().is_some_and(|c| {
-            ((c.auto_test || c.repro_gate) && c.test_command.is_some())
-                || (c.auto_lint && c.lint_command.is_some())
-        });
+        || opts
+            .post_edit
+            .as_deref()
+            .is_some_and(|c| c.test_gate_armed() || (c.auto_lint && c.lint_command.is_some()));
     let lsp_pool = opts.lsp_pool.clone().unwrap_or_default();
     if lsp_diag_enabled {
         // Files may have changed since the last prompt (the user's editor, git)
