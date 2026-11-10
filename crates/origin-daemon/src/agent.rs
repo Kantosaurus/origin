@@ -6635,7 +6635,8 @@ async fn run_loop_inner(
             // byte-identical. A best-effort apply: any parse/apply failure is
             // logged and the file is left untouched, never failing the turn.
             if std::env::var("ORIGIN_EDITFMT").as_deref() == Ok("1") {
-                apply_prose_edits(&text, &session.model, &mut turn_mutated);
+                let skills = opts.skills.as_deref().unwrap_or(&EMPTY_SKILLS);
+                apply_prose_edits(&text, opts, session, skills, &mut turn_mutated).await;
             }
 
             // C15: bundle the final turn's FAILURE-only gate blocks (syntax
@@ -8873,10 +8874,17 @@ fn harvest_grep_exposure(
 /// `turn_mutated` is set to `true` if any hunk is successfully applied, so the
 /// optional end-of-turn shadow-git checkpoint snapshots the change exactly as it
 /// would for a structured Edit. Every failure (no parseable block, an empty or
-/// flag-like path, a missing/ambiguous match, or an I/O error) is logged and
-/// skipped — a malformed prose edit must never fail the turn.
-fn apply_prose_edits(text: &str, model: &str, turn_mutated: &mut bool) {
-    let hunks = match origin_editfmt::extract_all_hunks(text, model) {
+/// flag-like path, a path a `Write` could not take without asking, a
+/// missing/ambiguous match, or an I/O error) is logged and skipped — a
+/// malformed prose edit must never fail the turn.
+async fn apply_prose_edits(
+    text: &str,
+    opts: &LoopOptions,
+    session: &Session,
+    skills: &SkillRegistry,
+    turn_mutated: &mut bool,
+) {
+    let hunks = match origin_editfmt::extract_all_hunks(text, &session.model) {
         Ok(h) => h,
         Err(e) => {
             // The common case (no edit block in the prose) lands here; keep it
@@ -8886,7 +8894,7 @@ fn apply_prose_edits(text: &str, model: &str, turn_mutated: &mut bool) {
         }
     };
     for hunk in hunks {
-        if apply_one_prose_hunk(&hunk) {
+        if apply_one_prose_hunk(&hunk, opts, session, skills).await {
             *turn_mutated = true;
         }
     }
@@ -8899,8 +8907,13 @@ fn apply_prose_edits(text: &str, model: &str, turn_mutated: &mut bool) {
 /// write error) is logged once and yields `false`, so a malformed prose edit
 /// can never fail the turn. The fallible work is funneled through
 /// [`try_apply_one_prose_hunk`] so this wrapper has a single log/return site.
-fn apply_one_prose_hunk(hunk: &origin_editfmt::Hunk) -> bool {
-    match try_apply_one_prose_hunk(hunk) {
+async fn apply_one_prose_hunk(
+    hunk: &origin_editfmt::Hunk,
+    opts: &LoopOptions,
+    session: &Session,
+    skills: &SkillRegistry,
+) -> bool {
+    match try_apply_one_prose_hunk(hunk, opts, session, skills).await {
         Ok(()) => {
             tracing::info!(file = %hunk.file, "editfmt: applied prose edit");
             true
@@ -8917,7 +8930,12 @@ fn apply_one_prose_hunk(hunk: &origin_editfmt::Hunk) -> bool {
 /// Returns a short human reason on any guard/failure so the caller emits a
 /// single structured log line. Linear control flow via `?` keeps the cognitive
 /// complexity low.
-fn try_apply_one_prose_hunk(hunk: &origin_editfmt::Hunk) -> Result<(), String> {
+async fn try_apply_one_prose_hunk(
+    hunk: &origin_editfmt::Hunk,
+    opts: &LoopOptions,
+    session: &Session,
+    skills: &SkillRegistry,
+) -> Result<(), String> {
     if hunk.file.is_empty() {
         return Err("no file path".to_string());
     }
@@ -8926,16 +8944,58 @@ fn try_apply_one_prose_hunk(hunk: &origin_editfmt::Hunk) -> Result<(), String> {
     if hunk.file.starts_with('-') {
         return Err("path looks like a flag".to_string());
     }
+    // C2: anchored at the run's working directory, as tool calls are.
+    let path = loop_cwd(opts).unwrap_or_default().join(&hunk.file);
+    prose_write_allowed(&path, opts, session, skills).await?;
     // Whole-file hunks (`before` empty) write `after` verbatim even when the
     // file does not yet exist; in-place hunks need the current contents.
     let original = if hunk.before.is_empty() {
         String::new()
     } else {
-        std::fs::read_to_string(&hunk.file).map_err(|e| format!("cannot read target: {e}"))?
+        std::fs::read_to_string(&path).map_err(|e| format!("cannot read target: {e}"))?
     };
     let updated = origin_editfmt::apply(hunk, &original).map_err(|e| e.to_string())?;
-    std::fs::write(&hunk.file, updated).map_err(|e| format!("write failed: {e}"))?;
+    std::fs::write(&path, updated).map_err(|e| format!("write failed: {e}"))?;
     Ok(())
+}
+
+/// C2: a prose edit lands only where a `Write` to `path` would be allowed
+/// WITHOUT asking.
+///
+/// The same decision a `Write` call gets — skill narrowing, rules, permission
+/// mode, workspace and protected-path checks — judged with a prompter that
+/// cannot ask, then the governance, read-only and path-policy overlays. Fails
+/// closed: anything that would ask is refused, and the applier never asks.
+async fn prose_write_allowed(
+    path: &std::path::Path,
+    opts: &LoopOptions,
+    session: &Session,
+    skills: &SkillRegistry,
+) -> Result<(), String> {
+    let meta = origin_tools::registry_iter()
+        .find(|m| m.name == "Write")
+        .ok_or("no Write tool to judge the edit by")?;
+    let args = serde_json::json!({ "file_path": path.to_string_lossy(), "content": "" });
+    let preview = format!("prose edit of {}", path.display());
+    let prompter = origin_permission::prompt::NoPrompter;
+    let mut d = decide_permission(meta, &args, &preview, &prompter, skills, opts, session).await;
+    if d.outcome == Outcome::Allow {
+        d = apply_governance_overlay(d, meta.name, opts);
+    }
+    if d.outcome == Outcome::Allow {
+        d = apply_read_only_overlay(d, opts.read_only, meta.side_effects, meta.name);
+    }
+    if d.outcome == Outcome::Allow {
+        d = apply_path_overlay(d, meta.name, &args, opts);
+    }
+    if d.outcome == Outcome::Allow {
+        Ok(())
+    } else {
+        Err(format!(
+            "not permitted without asking ({}); use the edit tools",
+            d.reason
+        ))
+    }
 }
 
 /// Rebuild entry-point invoked by the future IPC handler / git hook.
@@ -12859,12 +12919,13 @@ mod wiring_tests {
     /// model emits a search/replace block in prose, `apply_prose_edits` parses
     /// it via `origin_editfmt` and writes the edit to disk, flagging the turn as
     /// mutated. Both halves of the round-trip (parse → apply) are exercised.
-    #[test]
-    fn editfmt_apply_gate_off_by_default_and_round_trips() {
+    #[tokio::test]
+    async fn editfmt_apply_gate_off_by_default_and_round_trips() {
         let enabled = std::env::var("ORIGIN_EDITFMT").as_deref() == Ok("1");
         assert!(!enabled, "editfmt must be opt-in via ORIGIN_EDITFMT=1");
 
         let tmp = tempfile::tempdir().expect("tempdir");
+        let (opts, session, skills) = prose_edit_ctx(tmp.path());
         let file = tmp.path().join("target.txt");
         std::fs::write(&file, "let x = 1;\n").expect("seed file");
 
@@ -12881,23 +12942,41 @@ mod wiring_tests {
         );
 
         let mut mutated = false;
-        apply_prose_edits(&prose, "claude-opus-4", &mut mutated);
+        apply_prose_edits(&prose, &opts, &session, &skills, &mut mutated).await;
         assert!(mutated, "a successful prose edit flags the turn as mutated");
         let after = std::fs::read_to_string(&file).expect("read back");
         assert_eq!(after, "let x = 2;\n", "the edit was applied to disk");
 
         // Plain prose with no edit block is a no-op (no parse, no mutation).
         let mut mutated2 = false;
-        apply_prose_edits("just chatting, no edits here", "claude-opus-4", &mut mutated2);
+        apply_prose_edits(
+            "just chatting, no edits here",
+            &opts,
+            &session,
+            &skills,
+            &mut mutated2,
+        )
+        .await;
         assert!(!mutated2, "prose without an edit block changes nothing");
+    }
+
+    /// C2: a run anchored at `cwd` (its workspace), default permission mode.
+    fn prose_edit_ctx(cwd: &std::path::Path) -> (LoopOptions, Session, SkillRegistry) {
+        let opts = LoopOptions {
+            cwd: Some(cwd.to_path_buf()),
+            ..LoopOptions::default()
+        };
+        let session = Session::new_with_id("prose".into(), "claude-opus-4".into());
+        (opts, session, SkillRegistry::new())
     }
 
     /// AGENT-LOOP Task 2: an edit block whose `before` text is absent in the
     /// target leaves the file untouched and never flags a mutation (best-effort:
     /// a no-match must not fail the turn).
-    #[test]
-    fn editfmt_apply_no_match_is_a_noop() {
+    #[tokio::test]
+    async fn editfmt_apply_no_match_is_a_noop() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let (opts, session, skills) = prose_edit_ctx(tmp.path());
         let file = tmp.path().join("nomatch.txt");
         std::fs::write(&file, "original contents\n").expect("seed file");
 
@@ -12911,7 +12990,7 @@ mod wiring_tests {
             file.display()
         );
         let mut mutated = false;
-        apply_prose_edits(&prose, "claude-opus-4", &mut mutated);
+        apply_prose_edits(&prose, &opts, &session, &skills, &mut mutated).await;
         assert!(!mutated, "a no-match apply must not flag a mutation");
         assert_eq!(
             std::fs::read_to_string(&file).expect("read back"),
