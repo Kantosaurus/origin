@@ -195,6 +195,20 @@ async fn headless_system_prompt_omits_the_directive() {
     );
 }
 
+/// D3: the default interactive directive no longer mandates the always-on swarm
+/// or a separate verifier `Task` (opt in with `ORIGIN_SWARM_ALWAYS=1`; see
+/// `tests/swarm_always_opt_in.rs`).
+#[tokio::test]
+async fn default_directive_has_no_swarm_mandates() {
+    let system = main_loop_system(&opts()).await;
+    assert!(
+        system.contains("ADVERSARIAL VERIFICATION IS MANDATORY"),
+        "{system}"
+    );
+    assert!(!system.contains("SWARM IS ALWAYS ON"), "{system}");
+    assert!(!system.contains("dispatch a SEPARATE Task"), "{system}");
+}
+
 /// B5: a worker gets a small fixed prompt — no directive, catalogs, repo map,
 /// sub-agent section or swarm language, and no tool it can never use.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

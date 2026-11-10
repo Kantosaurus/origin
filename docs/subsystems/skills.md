@@ -637,7 +637,7 @@ for the `RunWorkflow` tool / `origin workflow run`:
 ### The baked-in default workflow
 
 `crates/origin-daemon/src/default_workflow.rs` prepends a **default workflow
-directive** to every system prompt so the model self-orchestrates without the
+directive** to interactive system prompts so the model self-orchestrates without the
 user invoking each skill by name. Trivial requests (single facts, one-line edits)
 bypass it. The flow:
 
@@ -652,14 +652,17 @@ bypass it. The flow:
    each running **`/test-driven-development`** (RED → GREEN) then
    **`/verification-before-completion`** (paste fresh evidence).
 
-Two cross-cutting mandates the directive enforces: **ADVERSARIAL VERIFICATION IS
-MANDATORY** (try to *refute* the work; for non-trivial changes dispatch a
-separate verifier subagent) and **SWARM IS ALWAYS ON** (reach for parallel `Task`
+The directive enforces **ADVERSARIAL VERIFICATION IS MANDATORY** (try to
+*refute* the work). Two stronger mandates are opt-in with `ORIGIN_SWARM_ALWAYS=1`
+(read once per daemon process): dispatch a separate verifier `Task` for every
+non-trivial change, and **SWARM IS ALWAYS ON** (reach for parallel `Task`
 delegation by default). The directive maps directly onto the embedded skills
 (`goal`, `brainstorming`, `writing-plans`, `dispatching-parallel-agents`,
-`test-driven-development`, `verification-before-completion`) and is disabled
-globally with `ORIGIN_DEFAULT_WORKFLOW=off` (`directive()` returns `""`, which the
-caller concatenates unconditionally so the prompt stays byte-identical when off).
+`test-driven-development`, `verification-before-completion`). Headless runs
+(`origin run`, self-dispatch) omit it and swarm workers get their own small fixed
+prompt; `ORIGIN_DEFAULT_WORKFLOW=off` disables it everywhere and `=on` forces it
+into headless runs too (`directive()` returns `""` when omitted, which the caller
+concatenates unconditionally).
 
 ---
 

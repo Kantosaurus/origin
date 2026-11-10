@@ -8,8 +8,12 @@
 //! B5: headless runs (`origin run`, self-dispatch) omit it and swarm workers
 //! get their own fixed prompt. `ORIGIN_DEFAULT_WORKFLOW=off` disables it
 //! everywhere; `=on` forces it into headless runs too.
+//!
+//! D3: the "swarm is always on" and mandatory adversarial-verifier `Task`
+//! mandates are opt-in via `ORIGIN_SWARM_ALWAYS=1`.
 
-pub const DEFAULT_WORKFLOW: &str = "\
+/// The directive up to where the opt-in verifier-`Task` mandate goes.
+const HEAD: &str = "\
 DEFAULT WORKFLOW
 
 For trivial requests — single-fact questions, one-line edits, direct lookups, \
@@ -57,13 +61,24 @@ agent and for EVERY swarm sub-agent alike. Verifying means actively trying to \
 REFUTE the work, not confirm it: run /verification-before-completion, run the \
 real verification command (build/test/lint/repro), and paste its fresh output. \
 Never claim success, and a sub-agent must never report `completed`, without \
-that evidence in hand. For any non-trivial change, dispatch a SEPARATE Task \
+that evidence in hand. ";
+
+/// D3: opt-in (`ORIGIN_SWARM_ALWAYS=1`) — the mandatory adversarial-verifier `Task`.
+const VERIFIER_TASK_MANDATE: &str = "\
+For any non-trivial change, dispatch a SEPARATE Task \
 sub-agent whose sole job is to adversarially verify the change — read the diff \
 and try to break it, find the failing case, the unhandled edge, the false \
-green — and only accept the work if that independent verifier cannot. If you \
+green — and only accept the work if that independent verifier cannot. ";
+
+const MIDDLE: &str = "\
+If you \
 ARE a swarm sub-agent, you still owe this: verify your own output adversarially \
 before returning, because no one else may re-check it.
 
+";
+
+/// D3: opt-in (`ORIGIN_SWARM_ALWAYS=1`) — "swarm is always on".
+const SWARM_ALWAYS_MANDATE: &str = "\
 SWARM IS ALWAYS ON. The `Task` tool spawns a sub-agent (swarm worker) that \
 runs concurrently; with permission prompts on, the user approves each delegation. Reach for it by \
 default — whenever the work splits into independent units, dispatch one `Task` \
@@ -71,6 +86,9 @@ per unit and let them run in parallel rather than doing the work serially \
 yourself. Scope each sub-agent by granting it only the `allowed_tools` it \
 needs. Prefer parallel `Task` delegation wherever it is possible and safe.
 
+";
+
+const TAIL: &str = "\
 TASKS RUN IN THE BACKGROUND BY DEFAULT. A `Task` dispatch returns immediately \
 (background:true) so you and the user stay responsive while sub-agents work — \
 you do NOT block waiting for them. Each finished sub-agent's result is delivered \
@@ -86,22 +104,41 @@ question; their results will arrive and you will fold them in.
 This is the default. Skip it only when the work is genuinely trivial.\
 ";
 
+/// The directive text; `swarm_always` adds the two D3 mandates back, giving the
+/// pre-D3 text byte for byte.
+#[must_use]
+pub fn directive_text(swarm_always: bool) -> String {
+    if swarm_always {
+        [HEAD, VERIFIER_TASK_MANDATE, MIDDLE, SWARM_ALWAYS_MANDATE, TAIL].concat()
+    } else {
+        [HEAD, MIDDLE, TAIL].concat()
+    }
+}
+
+/// `ORIGIN_SWARM_ALWAYS=1`, read once per daemon process so no session's
+/// prompt prefix changes under it.
+// ponytail: process-wide; a changed value needs a daemon restart.
+fn swarm_always() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ORIGIN_SWARM_ALWAYS").as_deref() == Ok("1"))
+}
+
 /// The workflow directive for a run, or `""` when it is omitted.
 ///
 /// `ORIGIN_DEFAULT_WORKFLOW=off|false|0` omits it, `=on|true|1` includes it
 /// even in a headless run (B5); unset (or any other value) includes it only
 /// when `interactive`. The caller concatenates unconditionally.
 #[must_use]
-pub fn directive(interactive: bool) -> &'static str {
+pub fn directive(interactive: bool) -> String {
     let on = match std::env::var("ORIGIN_DEFAULT_WORKFLOW").as_deref() {
         Ok("off" | "false" | "0") => false,
         Ok("on" | "true" | "1") => true,
         _ => interactive,
     };
     if on {
-        DEFAULT_WORKFLOW
+        directive_text(swarm_always())
     } else {
-        ""
+        String::new()
     }
 }
 
@@ -111,7 +148,7 @@ mod tests {
 
     #[test]
     fn directive_contains_workflow_phases() {
-        let d = DEFAULT_WORKFLOW;
+        let d = directive_text(false);
         for phase in [
             "/goal",
             "/brainstorming",
@@ -122,15 +159,32 @@ mod tests {
             "WebFetch",
             "WebSearch",
             "AskUserQuestion",
-            // Always-on swarm: the directive must push parallel Task delegation.
-            "SWARM IS ALWAYS ON",
             "Task",
-            // Adversarial verification mandate (applies to swarm sub-agents too).
+            // Adversarial verification stays mandatory for the agent itself.
             "ADVERSARIAL VERIFICATION IS MANDATORY",
-            "adversarially verify",
         ] {
-            assert!(d.contains(phase), "DEFAULT_WORKFLOW missing `{phase}`");
+            assert!(d.contains(phase), "directive missing `{phase}`");
         }
+    }
+
+    /// D3: both mandates are opt-in; nothing else in the text changes.
+    #[test]
+    fn swarm_mandates_are_opt_in() {
+        let default = directive_text(false);
+        let opted = directive_text(true);
+        for mandate in ["SWARM IS ALWAYS ON", "dispatch a SEPARATE Task"] {
+            assert!(
+                !default.contains(mandate),
+                "default directive carries `{mandate}`"
+            );
+            assert!(opted.contains(mandate), "ORIGIN_SWARM_ALWAYS=1 lost `{mandate}`");
+        }
+        assert_eq!(
+            opted
+                .replace(VERIFIER_TASK_MANDATE, "")
+                .replace(SWARM_ALWAYS_MANDATE, ""),
+            default
+        );
     }
 
     /// Serializes this module's `ORIGIN_DEFAULT_WORKFLOW` mutations.
@@ -144,11 +198,11 @@ mod tests {
         std::env::set_var("ORIGIN_DEFAULT_WORKFLOW", "on");
         assert_eq!(
             directive(false),
-            DEFAULT_WORKFLOW,
+            directive_text(swarm_always()),
             "on forces it into headless runs"
         );
         std::env::remove_var("ORIGIN_DEFAULT_WORKFLOW");
-        assert_eq!(directive(true), DEFAULT_WORKFLOW);
+        assert_eq!(directive(true), directive_text(swarm_always()));
         assert_eq!(directive(false), "", "headless omits it by default");
     }
 }
