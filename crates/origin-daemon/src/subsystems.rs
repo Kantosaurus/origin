@@ -284,15 +284,16 @@ pub fn tools_on_path_line(path: &std::ffi::OsStr) -> String {
     }
 }
 
-/// B6: whether the shell would try to run `p`. On Unix it skips a file
-/// without the execute bit and keeps searching `PATH`; on Windows a `PATHEXT`
-/// name match is run, even a zero-length Store stub.
+/// B6: whether the shell would try to run `p`. On Unix it skips anything but
+/// a regular file (links followed: a symlink to a directory is skipped) with
+/// the execute bit and keeps searching `PATH`; on Windows a `PATHEXT` name
+/// match is run, even a zero-length Store stub.
 #[cfg_attr(not(unix), allow(clippy::missing_const_for_fn))] // const only off Unix
 fn shell_candidate(p: &std::path::Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     }
     #[cfg(not(unix))]
     {
@@ -633,6 +634,20 @@ mod tests {
             let path = std::env::join_paths([no_x.path(), x.path()]).expect("join");
             assert_eq!(tools_on_path_line(&path), "Tools on PATH: node");
         }
+    }
+
+    /// B6: a symlink to a DIRECTORY named like a tool is not a candidate (the
+    /// shell cannot run it), so a later real binary in PATH counts.
+    #[cfg(unix)]
+    #[test]
+    fn tools_line_skips_a_symlink_to_a_directory() {
+        let linked = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("tempdir");
+        let real = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(target.path(), linked.path().join("python")).expect("symlink");
+        fake_exe(real.path(), "python", 4);
+        let path = std::env::join_paths([linked.path(), real.path()]).expect("join");
+        assert_eq!(tools_on_path_line(&path), "Tools on PATH: python");
     }
 
     /// B6: the probe runs off the runtime on the injected PATH; no PATH, no line.
