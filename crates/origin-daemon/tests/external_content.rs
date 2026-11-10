@@ -327,6 +327,29 @@ async fn webfetch_without_a_prompt_is_bad_args() {
     }
 }
 
+/// `prompt` only feeds the quarantine call: raw mode does not demand it.
+#[tokio::test]
+async fn raw_mode_webfetch_without_a_prompt_returns_the_wrapped_page() {
+    let _g = ENV_LOCK.lock().await;
+    set_env(true);
+    let server = wiremock::MockServer::start().await;
+    let url = serve_page(&server).await;
+    let provider = Scripted::new(
+        vec![tool_call("WebFetch", &json!({ "url": url })), text("done")],
+        Ok("unused"),
+    );
+    let session = run_webfetch(&provider, &url).await;
+    std::env::remove_var("ORIGIN_WEBFETCH_RAW");
+
+    let (body, is_error) = tool_result(&session);
+    assert!(!is_error, "{body}");
+    assert!(
+        body.starts_with(&format!("<external source=\"webfetch\" url=\"{url}\">\n")),
+        "{body}"
+    );
+    assert!(body.contains("The answer is 42."), "{body}");
+}
+
 /// A served memo hit is the stored (already wrapped) body: never wrapped twice.
 #[tokio::test]
 async fn a_memo_hit_for_an_external_tool_stays_single_wrapped() {

@@ -8004,22 +8004,31 @@ async fn run_loop_inner(
                     if meta.name == "graph_query" {
                         start_code_graph_build(opts, &session.id, &session.roots);
                     }
-                    let dispatched = dispatch_tool(
-                        meta,
-                        &args,
-                        opts.cas.as_deref(),
-                        opts.code_graph.as_ref(),
-                        opts.mem_router.as_ref().map(Arc::as_ref),
-                        opts.memory_handle.as_deref(),
-                        opts.coordinator.as_deref(),
-                        exposure_arg,
-                        opts.skill_catalog.as_deref(),
-                        opts.proc_supervisor.as_ref(),
-                        opts.write_guard.as_ref(),
-                        opts.post_edit.as_ref(),
-                        opts.cwd.as_deref(),
-                    )
-                    .await;
+                    // C4: `prompt` is required only when the quarantine call
+                    // (its one consumer) will be made; checked before the fetch.
+                    let missing_prompt = (meta.name == "WebFetch")
+                        .then(|| crate::external_content::missing_prompt(turn_provider.name(), &args))
+                        .flatten();
+                    let dispatched = if let Some(msg) = missing_prompt {
+                        Err(LoopError::BadArgs(msg))
+                    } else {
+                        dispatch_tool(
+                            meta,
+                            &args,
+                            opts.cas.as_deref(),
+                            opts.code_graph.as_ref(),
+                            opts.mem_router.as_ref().map(Arc::as_ref),
+                            opts.memory_handle.as_deref(),
+                            opts.coordinator.as_deref(),
+                            exposure_arg,
+                            opts.skill_catalog.as_deref(),
+                            opts.proc_supervisor.as_ref(),
+                            opts.write_guard.as_ref(),
+                            opts.post_edit.as_ref(),
+                            opts.cwd.as_deref(),
+                        )
+                        .await
+                    };
                     // C4: a fetched page reaches the loop only as the quarantine
                     // model's answer (fails closed on a quarantine-call error).
                     let dispatched = match dispatched {
@@ -9695,14 +9704,7 @@ async fn dispatch_tool(
         }
         // ── Web tools (stateless) ──
         "WebFetch" => {
-            // C4: `prompt` is what the quarantine model answers about the page.
-            if args
-                .get("prompt")
-                .and_then(Value::as_str)
-                .is_none_or(|p| p.trim().is_empty())
-            {
-                return Err(LoopError::BadArgs("WebFetch: missing `prompt`".into()));
-            }
+            // C4: `prompt` is checked by the caller, which knows the provider.
             // Accepts either a single `url` or a `urls` array (up to 20);
             // `web_fetch_args` validates that at least one URL is present and
             // renders combined per-URL markdown when several are requested.

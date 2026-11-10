@@ -175,6 +175,22 @@ pub fn quarantine_model(provider_name: &str) -> Option<String> {
     })
 }
 
+/// A `WebFetch` call's missing-`prompt` error, if any.
+///
+/// `prompt` is required only when the quarantine call, its one consumer, will
+/// be made: `None` under `ORIGIN_WEBFETCH_RAW=1` or with no cheap model for
+/// `provider_name`.
+#[must_use]
+pub fn missing_prompt(provider_name: &str, args: &Value) -> Option<String> {
+    let quarantined = std::env::var("ORIGIN_WEBFETCH_RAW").as_deref() != Ok("1")
+        && quarantine_model(provider_name).is_some();
+    let blank = args
+        .get("prompt")
+        .and_then(Value::as_str)
+        .is_none_or(|p| p.trim().is_empty());
+    (quarantined && blank).then(|| "WebFetch: missing `prompt`".to_string())
+}
+
 /// What the main loop sees of a fetched `WebFetch` page, before wrapping.
 ///
 /// The quarantine model's bounded answer to `args.prompt`, or the page itself

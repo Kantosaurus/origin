@@ -82,7 +82,7 @@ pub async fn web_fetch_args(args: &Value) -> Result<String, String> {
 
 crate::origin_tool! {
     name: "WebFetch",
-    description: "Fetch one or more URLs and answer `prompt` about their content. Pass a single `url` string, or a `urls` array (up to 20) to fetch several at once. Where available, the page is read by a separate tool-less model and only its answer is returned; the result is wrapped in an <external> marker.",
+    description: "Fetch one or more URLs and answer `prompt` about their content. Required: `prompt` (what to find out from the page) and `url` or `urls`. Pass a single `url` string, or a `urls` array (up to 20) to fetch several at once. Where available, the page is read by a separate tool-less model and only its answer is returned; the result is wrapped in an <external> marker.",
     tier: Tier::RequiresPermission,
     urgency: Urgency::Low,
     side_effects: SideEffects::Pure,
@@ -127,6 +127,20 @@ mod tests {
         assert_eq!(
             urls,
             vec!["https://a.test".to_owned(), "https://b.test".to_owned()]
+        );
+    }
+
+    #[test]
+    fn description_names_the_required_arguments() {
+        // C4: a deferred tool's model sees only the description, not the schema.
+        let meta = crate::registry_iter()
+            .find(|m| m.name == "WebFetch")
+            .expect("WebFetch registered");
+        assert!(
+            meta.description
+                .contains("Required: `prompt` (what to find out from the page) and `url` or `urls`."),
+            "{}",
+            meta.description
         );
     }
 
