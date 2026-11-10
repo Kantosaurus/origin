@@ -1,9 +1,9 @@
 # Roadmap
 
-origin is **pre-1.0** (`0.0.1`). The core is landed and gated — content-addressed
+origin is **pre-1.0** (`0.9.14`). The core is landed and gated — content-addressed
 storage, archived IR, the two-runtime daemon, planner, provider catalog,
-KeyVault, sandboxing, and deterministic replay. Some subsystems are "real but
-young." This roadmap sketches direction; it is not a commitment of dates.
+KeyVault, and deterministic replay. Some subsystems are "real but young"; the
+OS sandbox backends exist but are not enabled on shipped builds. This roadmap sketches direction; it is not a commitment of dates.
 
 ## Now (toward a stable 0.x)
 

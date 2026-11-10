@@ -99,14 +99,13 @@ corrupt skill can't deny service.
 **Content addressing.** Each body is hashed with blake3 into `SkillHash`; two
 skills with identical bodies dedupe in CAS regardless of path.
 
-**Lazy injection.** `SkillEmbedder` embeds `(name + description + first line of
-body)` into the same `origin_mem` HNSW index the conversation memory uses, tagged
-kind `Skill`. The per-turn recall pass proposes the top-K skills; their bodies
-materialize into the prompt-cache Sticky band. Session-start scan cost is
-therefore zero even with hundreds of installed skills. In production the embedder
-shares an `Arc<origin_mem::Embedder>` with the daemon so skills and memories land
-in the same vector space; a deterministic `stub_for_tests()` arm avoids ONNX in
-unit tests.
+**Lazy injection (not wired).** `SkillEmbedder` can embed skill text into the
+same `origin_mem` HNSW index the conversation memory uses, tagged kind `Skill`,
+for a per-turn top-K pick. No daemon or CLI code constructs it, so no such pick
+runs: the daemon lists every skill by name and description in the system prompt
+and injects a body only after activation (`/<name>`). The 2026-11 evidence
+review (D6) decided not to wire it. A deterministic `stub_for_tests()` arm avoids
+ONNX in unit tests.
 
 **Activation.** The daemon pushes onto a per-connection `SkillRegistry` via
 `activate_with_body(front, body)`; `iter_active_entries()` feeds the

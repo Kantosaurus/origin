@@ -20,9 +20,9 @@ run.
   Markdown body — that carry (a) model-facing instructions injected verbatim
   into the per-turn system prompt and (b) an `allowed-tools` mask that *narrows*
   the permission surface. Every body is content-addressed by a blake3
-  `SkillHash` and embedded into the same HNSW vector index the memory subsystem
-  uses, so the *right* skills surface lazily per turn with zero session-start
-  scan cost.
+  `SkillHash`. The system prompt lists every skill by name and description
+  (`<origin-skills>`); a skill's body is injected only once it is activated
+  (`/<name>`).
 - **Hooks** (`origin-hooks`) are long-lived NUL-framed shell responders bound to
   typed lifecycle events (`PreTool`, `PostTool`, `SessionStart`, …). A
   pre-spawned `ShellPool` amortizes dispatch to one `write_all` + one
@@ -35,9 +35,9 @@ run.
   `workflow_progress.rs`) or fans it out as a dependency-layered parallel DAG of
   swarm workers (`workflow_runner.rs`, the `RunWorkflow` tool).
 
-The README's "embedding-indexed lazy injection" tagline is this subsystem: the
-catalog is loaded once, embedded once, and queried per turn so only the
-top-K relevant skill bodies materialize into the cache's `Sticky` band.
+An embedding-indexed, top-K-per-turn skill injection is designed (see
+[below](#embedding-indexed-lazy-injection)) but **not wired**: nothing in the
+daemon constructs `SkillEmbedder`, and the README no longer claims it (A10, D6).
 
 ---
 
@@ -257,9 +257,18 @@ upstream superpowers project and are the building blocks the default workflow an
 
 ## Embedding-indexed lazy injection
 
+> **Not wired (design only).** `SkillEmbedder` exists in
+> `crates/origin-skills/src/embed.rs` and is unit-tested, but no daemon or CLI
+> code constructs it, and no per-turn skill query runs. What runs today: the
+> system prompt carries the whole catalog as one line per skill (name and
+> description, `*` marking active skills), and an activated skill's full body is
+> injected under `<origin-active-skills>`. The 2026-11 evidence review (D6, in the
+> [design doc](../design/harness-efficiency-and-accuracy-proposals.md)) decided
+> not to wire it. The rest of this section describes the unwired design.
+
 The naïve approach — dump every skill description into every system prompt — is
 quadratic in catalog size and burns cache budget on skills that don't apply. The
-README's "embedding-indexed lazy injection" is the alternative.
+embedding-indexed design below is the alternative.
 
 ### `SkillEmbedder` — upsert into the shared HNSW index
 
@@ -669,6 +678,10 @@ concatenates unconditionally).
 ## Diagrams
 
 ### Skill injection flow (load → embed → per-turn materialization)
+
+> The embed and per-turn materialization steps are the **unwired design** (see
+> [Embedding-indexed lazy injection](#embedding-indexed-lazy-injection)); today
+> the catalog is listed in full and bodies are injected on activation.
 
 ```mermaid
 flowchart TD
