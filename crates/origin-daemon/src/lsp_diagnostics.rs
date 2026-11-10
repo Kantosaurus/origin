@@ -13,8 +13,11 @@
 //! that the agent loop appends to the *next* turn's system prompt so the model
 //! sees the compiler/linter feedback its edit produced. A timeout is reported
 //! in the block (with the file's previous result, marked as possibly stale)
-//! rather than as an empty result. The pool lives as long as the connection
-//! (session); dropping it kills the servers.
+//! rather than as an empty result. Every edited file is reported to the live
+//! servers as changed; after a turn whose mutations cannot be listed (`Bash`,
+//! MCP tools) and at the start of each prompt the pool is recycled, so no
+//! server analyses a stale copy of a file it was not told about. The pool
+//! lives as long as the connection (session); dropping it kills the servers.
 //!
 //! Everything here is best-effort and **gated behind `ORIGIN_LSP_DIAGNOSTICS=1`**
 //! (default off ⇒ the agent loop's per-turn system prompt is byte-identical).
@@ -283,11 +286,25 @@ fn probe_outcome(path: &Path, probe: Result<Probe, LspError>) -> (Vec<Diagnostic
     let p = path.display();
     match probe {
         Ok(Probe::Fresh(diags)) => (diags, None),
-        Ok(Probe::TimedOut { previous }) if previous.is_empty() => (
+        Ok(Probe::MaybeStale(diags)) => (
+            diags,
+            Some(format!(
+                "{p}: diagnostics may be stale (the server did not say which edit they \
+                 answer, and the previous check of this file timed out)"
+            )),
+        ),
+        Ok(Probe::TimedOut { starting: true, .. }) => (
+            Vec::new(),
+            Some(format!(
+                "{p}: diagnostics timed out after {PER_FILE_TIMEOUT:?}; the language server \
+                 is still starting"
+            )),
+        ),
+        Ok(Probe::TimedOut { previous, .. }) if previous.is_empty() => (
             Vec::new(),
             Some(format!("{p}: diagnostics timed out after {PER_FILE_TIMEOUT:?}")),
         ),
-        Ok(Probe::TimedOut { previous }) => (
+        Ok(Probe::TimedOut { previous, .. }) => (
             previous,
             Some(format!(
                 "{p}: diagnostics timed out after {PER_FILE_TIMEOUT:?}; showing the previous \
@@ -312,16 +329,32 @@ fn probe_outcome(path: &Path, probe: Result<Probe, LspError>) -> (Vec<Diagnostic
 ///
 /// `pool` holds the session's live servers. `workspace_root` is the directory
 /// a server `initialize`s against when first spawned (the session cwd).
-/// `edited` is the set of file paths the turn mutated.
+/// `edited` is the set of file paths the turn mutated; every one of them (not
+/// just the probed ones) is reported to the live servers as changed.
+/// `unlisted_mutation` is true when the turn also ran a mutating tool that
+/// does not report which files it changed (`Bash`, MCP tools, …): the pool is
+/// then recycled so no server analyses a stale copy of those files.
 #[allow(clippy::module_name_repetitions)] // `lsp_diagnostics_block` is the documented entry point callers expect.
 pub async fn lsp_diagnostics_block(
     pool: &LspPool,
     workspace_root: &Path,
     edited: &BTreeSet<String>,
+    unlisted_mutation: bool,
 ) -> Option<String> {
-    if !enabled() || edited.is_empty() {
+    if !enabled() {
         return None;
     }
+    if unlisted_mutation {
+        // ponytail: a cold server start after every shell-mutation turn (slow
+        // for rust-analyzer/jdtls); upgrade path is a workspace file watcher or
+        // an mtime snapshot diff, reported via `notify_changed` instead.
+        pool.recycle().await;
+    }
+    if edited.is_empty() {
+        return None;
+    }
+    let changed: Vec<&Path> = edited.iter().map(Path::new).collect();
+    pool.notify_changed(&changed).await;
     let mut all: Vec<Diagnostic> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     for path_str in edited.iter().take(MAX_FILES_PER_TURN) {
@@ -373,7 +406,7 @@ mod tests {
             let mut edited = std::collections::BTreeSet::new();
             edited.insert("main.rs".to_string());
             let pool = origin_lsp_client::LspPool::default();
-            let block = super::lsp_diagnostics_block(&pool, Path::new("."), &edited).await;
+            let block = super::lsp_diagnostics_block(&pool, Path::new("."), &edited, true).await;
             assert!(block.is_none(), "disabled gate must yield no block");
         }
     }
@@ -440,7 +473,13 @@ mod tests {
 
     #[test]
     fn timeout_is_reported_not_returned_as_clean() {
-        let (diags, note) = probe_outcome(Path::new("a.rs"), Ok(Probe::TimedOut { previous: Vec::new() }));
+        let (diags, note) = probe_outcome(
+            Path::new("a.rs"),
+            Ok(Probe::TimedOut {
+                previous: Vec::new(),
+                starting: false,
+            }),
+        );
         assert!(diags.is_empty());
         let block = format_diagnostics_block(&diags, &Vec::from_iter(note)).unwrap();
         assert!(
@@ -459,11 +498,34 @@ mod tests {
             Path::new("a.rs"),
             Ok(Probe::TimedOut {
                 previous: vec![diag("a.rs", 0, 0, 1, "old error", None)],
+                starting: false,
             }),
         );
         let block = format_diagnostics_block(&diags, &Vec::from_iter(note)).unwrap();
         assert!(block.contains("a.rs:1:1 error old error"), "{block}");
         assert!(block.contains("diagnostics may be stale"), "{block}");
+    }
+
+    #[test]
+    fn starting_server_and_untagged_publish_get_their_own_notes() {
+        let (diags, note) = probe_outcome(
+            Path::new("a.rs"),
+            Ok(Probe::TimedOut {
+                previous: Vec::new(),
+                starting: true,
+            }),
+        );
+        assert!(diags.is_empty());
+        assert_eq!(
+            note.as_deref(),
+            Some("a.rs: diagnostics timed out after 2.5s; the language server is still starting")
+        );
+        let (diags, note) = probe_outcome(
+            Path::new("a.rs"),
+            Ok(Probe::MaybeStale(vec![diag("a.rs", 0, 0, 1, "e", None)])),
+        );
+        assert_eq!(diags.len(), 1);
+        assert!(note.unwrap().contains("a.rs: diagnostics may be stale"));
     }
 
     #[test]

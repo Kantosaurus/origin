@@ -128,6 +128,12 @@ path = "src/lib.rs"
 name = "origin-daemon"
 path = "src/main.rs"
 
+# Own `main`: the test binary doubles as the fake language server (run when it
+# is launched under the name `rust-analyzer`), so it needs no real server.
+[[test]]
+name = "lsp_diagnostics_turns"
+harness = false
+
 [[bench]]
 name = "phase2_ram_soak"
 harness = false

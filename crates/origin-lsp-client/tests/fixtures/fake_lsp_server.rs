@@ -5,10 +5,17 @@
 //! on `textDocument/didOpen` publishes one diagnostic for the opened document
 //! whose `message` is the trimmed document text and whose `code` is this
 //! process's pid. Text `ENV:<NAME>` publishes the value of env var `<NAME>`
-//! instead (`<unset>` when absent). Fault modes, by document text:
-//! `SLOW:<ms>` publishes after `<ms>` while still answering requests, `HANG`
-//! publishes then stops reading and answering anything, `EXIT` publishes then
-//! exits.
+//! instead (`<unset>` when absent), and text `LOG` publishes the space-joined log
+//! of what the server received so far (method names; `initialize:watch` when
+//! the client declared watched-files support; `changed:<uri>` per
+//! `workspace/didChangeWatchedFiles` entry).
+//!
+//! Fault modes, by document text: `SLOW:<ms>` publishes after `<ms>` while
+//! still answering requests, `HANG` publishes then stops reading and answering
+//! anything, `EXIT` publishes then exits when the document is closed.
+//! By argument: `--init-delay=<ms>` reads nothing for `<ms>` after start (a
+//! slow-starting server), `--exit-at-start` exits at once, `--untagged` sends
+//! publishes without a document `version`.
 #![allow(clippy::unwrap_used)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -44,10 +51,34 @@ fn read_frame(r: &mut impl BufRead) -> Option<Value> {
     serde_json::from_slice(&body).ok()
 }
 
-fn main() {
+// `pub` so origin-daemon's `lsp_diagnostics_turns` test can run it in-process.
+pub fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--exit-at-start") {
+        return;
+    }
+    if let Some(ms) = args.iter().find_map(|a| a.strip_prefix("--init-delay=")) {
+        std::thread::sleep(Duration::from_millis(ms.parse().unwrap()));
+    }
+    let untagged = args.iter().any(|a| a == "--untagged");
+    let mut log: Vec<String> = Vec::new();
+    let mut exit_on_close = false;
     let mut stdin = BufReader::new(std::io::stdin().lock());
     while let Some(msg) = read_frame(&mut stdin) {
         let method = msg["method"].as_str().unwrap_or_default();
+        match method {
+            "initialize"
+                if !msg["params"]["capabilities"]["workspace"]["didChangeWatchedFiles"].is_null() =>
+            {
+                log.push("initialize:watch".to_owned());
+            }
+            "workspace/didChangeWatchedFiles" => {
+                for c in msg["params"]["changes"].as_array().into_iter().flatten() {
+                    log.push(format!("changed:{}", c["uri"].as_str().unwrap_or_default()));
+                }
+            }
+            _ => log.push(method.to_owned()),
+        }
         if let Some(id) = msg.get("id") {
             if method == "initialize" {
                 send(&json!({"jsonrpc": "2.0", "id": id, "result": {"capabilities": {}}}));
@@ -58,21 +89,33 @@ fn main() {
             }
             continue;
         }
+        if method == "textDocument/didClose" && exit_on_close {
+            return;
+        }
         if method != "textDocument/didOpen" {
             continue;
         }
         let doc = &msg["params"]["textDocument"];
         let text = doc["text"].as_str().unwrap_or_default().trim().to_owned();
-        let message = text.strip_prefix("ENV:").map_or_else(
-            || text.clone(),
-            |name| std::env::var(name).unwrap_or_else(|_| "<unset>".to_owned()),
-        );
+        let message = if text == "LOG" {
+            log.join(" ")
+        } else {
+            text.strip_prefix("ENV:").map_or_else(
+                || text.clone(),
+                |name| std::env::var(name).unwrap_or_else(|_| "<unset>".to_owned()),
+            )
+        };
+        let version = if untagged {
+            Value::Null
+        } else {
+            doc["version"].clone()
+        };
         let publish = json!({
             "jsonrpc": "2.0",
             "method": "textDocument/publishDiagnostics",
             "params": {
                 "uri": doc["uri"],
-                "version": doc["version"],
+                "version": version,
                 "diagnostics": [{
                     "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
                     "severity": 1,
@@ -92,7 +135,7 @@ fn main() {
         send(&publish);
         match text.as_str() {
             "HANG" => std::thread::sleep(Duration::from_secs(3600)),
-            "EXIT" => return,
+            "EXIT" => exit_on_close = true,
             _ => {}
         }
     }

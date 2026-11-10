@@ -915,7 +915,8 @@ fn spawn_handler_task(
         // mutability, so a single `Arc<WriteGuard>` records reads across calls.
         let write_guard = Arc::new(origin_tools::builtins::write::WriteGuard::default());
         // C10: per-connection (per-session) language servers for the opt-in
-        // post-edit diagnostics, kept warm across prompts. Empty unless
+        // post-edit diagnostics, kept warm across a prompt's turns (recycled
+        // when files may have changed unseen). Empty unless
         // `ORIGIN_LSP_DIAGNOSTICS=1`; dropped (servers killed) when the
         // connection ends.
         let lsp_pool = Arc::new(origin_lsp_client::LspPool::default());
@@ -2029,7 +2030,7 @@ async fn handle_request(
             // ⇒ unconditional desktop toast under `ORIGIN_NOTIFY=1`,
             // byte-identical to before.
             lsp_pool: Some(lsp_pool),
-            // ^ C10: the connection's language servers, reused across prompts.
+            // ^ C10: the connection's language servers.
         };
         // Opt-in interactive prompting: when the turn requested it, route
         // RequiresPermission tools through the IPC prompter (asks the client and

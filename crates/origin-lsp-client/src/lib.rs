@@ -155,7 +155,11 @@ impl LspClient {
             "params": {
                 "processId": std::process::id(),
                 "rootUri": root_uri,
-                "capabilities": {}
+                // We send `workspace/didChangeWatchedFiles` for files we know
+                // changed (see `LspPool::notify_changed`); no dynamic watchers.
+                "capabilities": {
+                    "workspace": { "didChangeWatchedFiles": { "dynamicRegistration": false } }
+                }
             }
         });
         write_frame(stdin.clone(), &init).await?;
@@ -225,8 +229,14 @@ impl LspClient {
     }
 
     /// Poll until the server publishes diagnostics for `path` tagged with
-    /// `version` (or untagged), for at most `timeout`. `None` on timeout.
-    async fn wait_for(&self, path: &Path, version: i32, timeout: Duration) -> Option<Vec<Diagnostic>> {
+    /// `version` (or untagged), for at most `timeout`. Returns the diagnostics
+    /// and whether the publish was untagged; `None` on timeout.
+    async fn wait_for(
+        &self,
+        path: &Path,
+        version: i32,
+        timeout: Duration,
+    ) -> Option<(Vec<Diagnostic>, bool)> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let published = self.diags.read().await.get(path).cloned();
@@ -234,7 +244,7 @@ impl LspClient {
             // earlier call: returning it would report stale diagnostics.
             if let Some((v, diags)) = published {
                 if v.is_none_or(|v| v == i64::from(version)) {
-                    return Some(diags);
+                    return Some((diags, v.is_none()));
                 }
             }
             if tokio::time::Instant::now() >= deadline {
@@ -457,41 +467,119 @@ impl LspClient {
 /// liveness ping before it is treated as hung and dropped.
 const PING_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long after spawn a server that has never answered counts as still
+/// starting (indexing, loading the workspace) rather than hung, so a slow
+/// starter is kept warming up instead of being killed on every call.
+const STARTUP_GRACE: Duration = Duration::from_secs(60);
+
+/// Consecutive startup failures (spawn error, or exit/eviction before it ever
+/// answered) after which a program is not spawned again by this pool.
+const MAX_STARTUP_FAILURES: u32 = 3;
+
 /// Outcome of [`LspPool::diagnose`].
 #[derive(Debug)]
 pub enum Probe {
     /// The server published diagnostics for exactly the text just sent.
     Fresh(Vec<Diagnostic>),
+    /// A publish arrived, but without a document version while the previous
+    /// call for this file had timed out: it may answer that earlier edit.
+    MaybeStale(Vec<Diagnostic>),
     /// Nothing was published within the deadline. `previous` is the last
     /// result the server reported for this file before this call (it may be
-    /// stale; empty when there was none).
-    TimedOut { previous: Vec<Diagnostic> },
+    /// stale; empty when there was none). `starting` is true when the server
+    /// has not answered anything yet and is kept because it is still starting.
+    TimedOut {
+        previous: Vec<Diagnostic>,
+        starting: bool,
+    },
+}
+
+/// One pooled server.
+struct Server {
+    client: LspClient,
+    spawned: std::time::Instant,
+    /// Has published or answered a request at least once.
+    ready: bool,
+    /// Files whose last probe timed out: an untagged publish for them may be
+    /// that probe's late answer.
+    timed_out: std::collections::HashSet<PathBuf>,
+}
+
+#[derive(Default)]
+struct PoolState {
+    servers: HashMap<String, Server>,
+    startup_failures: HashMap<String, u32>,
+}
+
+impl PoolState {
+    /// Drop (kill) `program`'s server. One that never answered counts as a
+    /// startup failure.
+    fn evict(&mut self, program: &str) {
+        if self.servers.remove(program).is_some_and(|s| !s.ready) {
+            *self.startup_failures.entry(program.to_owned()).or_default() += 1;
+        }
+    }
 }
 
 /// Language servers kept alive across diagnostics calls, one per launch program.
 ///
 /// A server stays warm instead of being spawned per call. One that exited is
 /// respawned on the next call; one that misses a deadline AND a liveness ping
-/// is dropped (killed). Dropping the pool kills every server (`kill_on_drop`).
+/// is dropped (killed), unless it is still within its startup grace. Dropping
+/// the pool kills every server (`kill_on_drop`).
 #[derive(Default)]
 pub struct LspPool {
-    servers: Mutex<HashMap<String, LspClient>>,
+    state: Mutex<PoolState>,
 }
 
 impl LspPool {
+    /// Tell every live server that `paths` changed on disk
+    /// (`workspace/didChangeWatchedFiles`, type Changed), so a server does not
+    /// keep analysing other files from a copy older than the agent's edits. A
+    /// server whose input does not accept the write in time is dropped.
+    pub async fn notify_changed(&self, paths: &[&Path]) {
+        let changes: Vec<Value> = paths
+            .iter()
+            .map(|p| json!({ "uri": path_to_uri(p), "type": 2 }))
+            .collect();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWatchedFiles",
+            "params": { "changes": changes }
+        });
+        let mut state = self.state.lock().await;
+        let mut dead = Vec::new();
+        for (program, s) in &state.servers {
+            let sent = tokio::time::timeout(PING_TIMEOUT, write_frame(s.client.stdin.clone(), &msg)).await;
+            if !matches!(sent, Ok(Ok(()))) {
+                dead.push(program.clone());
+            }
+        }
+        for program in dead {
+            state.evict(&program);
+        }
+    }
+
+    /// Drop (kill) every server; the next probe spawns a fresh one that reads
+    /// the whole workspace from disk. Use when files changed in ways that
+    /// cannot be reported path by path. Startup-failure counts are kept.
+    pub async fn recycle(&self) {
+        self.state.lock().await.servers.clear();
+    }
+
     /// Diagnose `path`, whose current contents are `text`, with the pooled
     /// server launched as `program args` (spawned on first use).
     ///
     /// Each call re-syncs the document — `didOpen` with a new version, wait up
     /// to `timeout` for that version's publish, `didClose` — so the server
-    /// never keeps a stale in-memory copy between calls: while closed it reads
-    /// the file from disk, which also covers edits made outside the agent's
-    /// edit tools.
+    /// never keeps a stale in-memory copy of it between calls.
     ///
     /// # Errors
-    /// `LspError::Spawn` / `Protocol` if the server cannot be started, `Io` if
-    /// the `didOpen` write fails (the server is dropped and respawned next call).
-    #[allow(clippy::too_many_arguments)]
+    /// `LspError::Spawn` / `Protocol` / `Io` if the server cannot be started
+    /// (or has failed to start [`MAX_STARTUP_FAILURES`] times in a row, after
+    /// which it is no longer spawned), `Io` if the `didOpen` write fails (the
+    /// server is dropped and respawned next call).
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn diagnose(
         &self,
         program: &str,
@@ -502,48 +590,97 @@ impl LspPool {
         text: &str,
         timeout: Duration,
     ) -> Result<Probe, LspError> {
-        let mut servers = self.servers.lock().await;
-        if servers.get_mut(program).is_some_and(LspClient::has_exited) {
-            servers.remove(program);
+        let mut guard = self.state.lock().await;
+        let state = &mut *guard;
+        if state
+            .servers
+            .get_mut(program)
+            .is_some_and(|s| s.client.has_exited())
+        {
+            state.evict(program);
         }
-        let client = match servers.entry(program.to_owned()) {
+        let failures = state.startup_failures.get(program).copied().unwrap_or(0);
+        let server = match state.servers.entry(program.to_owned()) {
             Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(LspClient::spawn_with_args(program, args, workspace_root).await?),
+            Entry::Vacant(_) if failures >= MAX_STARTUP_FAILURES => {
+                return Err(LspError::Spawn(format!(
+                    "{program} failed to start {failures} times in a row; not restarting it this session"
+                )));
+            }
+            Entry::Vacant(e) => match LspClient::spawn_with_args(program, args, workspace_root).await {
+                Ok(client) => e.insert(Server {
+                    client,
+                    spawned: std::time::Instant::now(),
+                    ready: false,
+                    timed_out: std::collections::HashSet::new(),
+                }),
+                Err(err) => {
+                    *state.startup_failures.entry(program.to_owned()).or_default() += 1;
+                    return Err(err);
+                }
+            },
         };
-        let previous = client
+        let previous = server
+            .client
             .diags
             .write()
             .await
             .remove(path)
             .map(|(_, d)| d)
             .unwrap_or_default();
+        let late_answer_possible = server.timed_out.remove(path);
         // Every write is bounded: a server that stopped reading its input would
         // otherwise block it forever once the pipe buffer is full.
-        let version = match tokio::time::timeout(timeout, client.did_open(path, language_id, text)).await {
-            Ok(Ok(version)) => version,
-            Ok(Err(e)) => {
-                servers.remove(program);
-                return Err(e);
-            }
-            Err(_) => {
-                servers.remove(program);
-                return Ok(Probe::TimedOut { previous });
-            }
-        };
-        let fresh = client.wait_for(path, version, timeout).await;
-        // On a miss, slow (still indexing) or hung? A live server answers the
-        // ping and is kept so it can warm up; a hung or dead one is killed and
-        // respawned on the next call instead of costing every call a timeout.
-        let healthy = tokio::time::timeout(PING_TIMEOUT, async {
-            client.did_close(path).await.is_ok() && (fresh.is_some() || client.ping(PING_TIMEOUT).await)
+        let version =
+            match tokio::time::timeout(timeout, server.client.did_open(path, language_id, text)).await {
+                Ok(Ok(version)) => version,
+                Ok(Err(e)) => {
+                    state.evict(program);
+                    return Err(e);
+                }
+                Err(_) => {
+                    state.evict(program);
+                    return Ok(Probe::TimedOut {
+                        previous,
+                        starting: false,
+                    });
+                }
+            };
+        let published = server.client.wait_for(path, version, timeout).await;
+        // On a miss, slow or hung? A live server answers the ping and is kept;
+        // a hung or dead one is killed and respawned on the next call instead
+        // of costing every call a timeout.
+        let answered = tokio::time::timeout(PING_TIMEOUT, async {
+            server.client.did_close(path).await.is_ok()
+                && (published.is_some() || server.client.ping(PING_TIMEOUT).await)
         })
         .await
         .unwrap_or(false);
-        if !healthy {
-            servers.remove(program);
+        if answered || published.is_some() {
+            server.ready = true;
+            state.startup_failures.remove(program);
         }
-        drop(servers);
-        Ok(fresh.map_or(Probe::TimedOut { previous }, Probe::Fresh))
+        // Never answered yet, but young and alive: still starting, keep it.
+        let starting =
+            !server.ready && server.spawned.elapsed() < STARTUP_GRACE && !server.client.has_exited();
+        let Some((diags, untagged)) = published else {
+            if answered || starting {
+                server.timed_out.insert(path.to_path_buf());
+            } else {
+                state.evict(program);
+            }
+            drop(guard);
+            return Ok(Probe::TimedOut { previous, starting });
+        };
+        if !answered {
+            state.evict(program);
+        }
+        drop(guard);
+        Ok(if untagged && late_answer_possible {
+            Probe::MaybeStale(diags)
+        } else {
+            Probe::Fresh(diags)
+        })
     }
 }
 

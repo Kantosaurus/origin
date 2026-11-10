@@ -22,8 +22,9 @@ the low-level transport that `origin-lspfleet` decides *which* server to drive.
 | `request` | fn | Generic id-correlated JSON-RPC request with a timeout. |
 | `definition` / `references` | fn | Resolve symbol locations (0-based wire coords). |
 | `incoming_calls` / `outgoing_calls` | fn | Call-hierarchy via prepare + incoming/outgoing. |
-| `LspPool` / `LspPool::diagnose` | struct / fn | Servers kept alive across calls (one per launch program): `didOpen` → wait for that version's publish → `didClose`; respawns exited servers, drops hung ones; dropping the pool kills them. |
-| `Probe` | enum | `Fresh(diags)` or `TimedOut { previous }` (last result, possibly stale). |
+| `LspPool` / `LspPool::diagnose` | struct / fn | Servers kept alive across calls (one per launch program): `didOpen` → wait for that version's publish → `didClose`; respawns exited servers, drops hung ones (after a 60 s startup grace), stops respawning after 3 startup failures; dropping the pool kills them. |
+| `LspPool::notify_changed` / `recycle` | fn | Report changed files to live servers (`workspace/didChangeWatchedFiles`); drop every server so the next probe starts fresh. |
+| `Probe` | enum | `Fresh(diags)`, `MaybeStale(diags)` (untagged publish after a timed-out call), or `TimedOut { previous, starting }`. |
 | `Diagnostic` / `Location` / `CallHierarchyItem` | struct | Result types. |
 | `LspError` | enum | `Spawn` / `Io` / `Protocol` / `Timeout(Duration)`. |
 
@@ -67,6 +68,12 @@ older version is ignored. A missed deadline returns `Probe::TimedOut`; the
 server is then pinged with a `$/` request (which LSP servers must reject with
 `MethodNotFound`) and dropped if it does not answer within 1 s, so a hung
 server is respawned on the next call while a slow (still indexing) one is kept.
+A server that has never answered is kept for 60 s after spawn
+(`TimedOut { starting: true }`); a program that fails to start 3 times in a
+row is not spawned again by that pool. `initialize` declares
+`workspace.didChangeWatchedFiles` (no dynamic registration): the caller reports
+the files it knows changed with `notify_changed` and calls `recycle` when files
+changed in ways it cannot list.
 
 ```
 spawn ─▶ initialize(id 0) ─▶ initialized
@@ -99,7 +106,10 @@ array, `LocationLink`, `null`), call-hierarchy incoming/outgoing parsing,
 requests), and `percent_decode`/`file_uri_to_path` round-trips (including the
 Windows drive form). `tempfile` provides workspace fixtures. Integration tests
 drive the test-only `fake-lsp-server` binary (`tests/fixtures/`): `env_scrub`
-(A6) and `pool` (reuse, stale late publish, hung/exited respawn, kill on drop).
+(A6) and `pool` (reuse, stale late publish, hung/exited respawn, kill on drop,
+`didClose`, changed-file notification, recycle, startup grace and backoff,
+untagged publish). origin-daemon's `lsp_diagnostics_turns` test runs the same
+fixture in-process to check the per-turn notify/recycle wiring.
 
 ## See also
 

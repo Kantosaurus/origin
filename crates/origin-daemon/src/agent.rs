@@ -2927,9 +2927,10 @@ pub struct LoopOptions {
     /// `[notify]` in `governance.toml`.
     pub notify: Option<Arc<crate::config::NotifyPolicy>>,
     /// Live language servers for the opt-in post-edit diagnostics
-    /// (`ORIGIN_LSP_DIAGNOSTICS=1`), shared across every run of this
-    /// connection (session) so servers stay warm; dropping the last clone
-    /// kills them. `None` ⇒ the run uses its own pool, dropped when it ends.
+    /// (`ORIGIN_LSP_DIAGNOSTICS=1`), owned by this connection (session) so the
+    /// servers die with it; each run recycles it at start, then keeps servers
+    /// warm across its turns. `None` ⇒ the run uses its own pool, dropped
+    /// when it ends.
     pub lsp_pool: Option<Arc<origin_lsp_client::LspPool>>,
 }
 
@@ -4142,6 +4143,13 @@ async fn run_loop_inner(
     let mut lsp_diag_block = String::new();
     let lsp_diag_enabled = crate::lsp_diagnostics::enabled();
     let lsp_pool = opts.lsp_pool.clone().unwrap_or_default();
+    if lsp_diag_enabled {
+        // Files may have changed since the last prompt (the user's editor, git)
+        // in ways no server was told about: start this prompt with fresh
+        // servers. Same ceiling and upgrade path as the per-turn recycle in
+        // `lsp_diagnostics_block`.
+        lsp_pool.recycle().await;
+    }
     // Default-on, fail-open post-edit syntax gate (fast per-file checks). Like
     // `lsp_diag_block`, it is computed after dispatch and carried as a volatile
     // trailing block on the NEXT turn, so the model fixes a broken edit before
@@ -4285,6 +4293,9 @@ async fn run_loop_inner(
         // Always empty unless the feature is enabled, so it allocates nothing on
         // the default path.
         let mut lsp_edited_paths: BTreeSet<String> = BTreeSet::new();
+        // Set when this turn ran a mutating tool that does not report which
+        // files it changed (Bash, MCP, …): the LSP pool is recycled.
+        let mut lsp_unlisted_mutation = false;
         // Live per-turn model routing (origin-router). When a router is wired it
         // picks a model for this turn's phase (turn 1 ⇒ Plan, later ⇒ Edit).
         //
@@ -5515,9 +5526,9 @@ async fn run_loop_inner(
                 // LSP-diagnostics path (`ORIGIN_LSP_DIAGNOSTICS=1`) or the
                 // default-on fast post-edit syntax gate needs them.
                 if lsp_diag_enabled || compile_check_enabled {
-                    for p in edited_paths_from_tool(&name, &args) {
-                        lsp_edited_paths.insert(p);
-                    }
+                    let paths = edited_paths_from_tool(&name, &args);
+                    lsp_unlisted_mutation |= paths.is_empty();
+                    lsp_edited_paths.extend(paths);
                 }
             }
 
@@ -6333,14 +6344,15 @@ async fn run_loop_inner(
         // note in the block, never a loop error. Default-off ⇒ this whole
         // block is skipped and the prompt stays byte-identical.
         if lsp_diag_enabled {
-            lsp_diag_block = if lsp_edited_paths.is_empty() {
-                String::new()
-            } else {
-                let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                crate::lsp_diagnostics::lsp_diagnostics_block(&lsp_pool, &root, &lsp_edited_paths)
-                    .await
-                    .unwrap_or_default()
-            };
+            let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            lsp_diag_block = crate::lsp_diagnostics::lsp_diagnostics_block(
+                &lsp_pool,
+                &root,
+                &lsp_edited_paths,
+                lsp_unlisted_mutation,
+            )
+            .await
+            .unwrap_or_default();
         }
         // Fast post-edit syntax gate on the same edited-path set (Python/JS).
         if compile_check_enabled && !lsp_edited_paths.is_empty() {
