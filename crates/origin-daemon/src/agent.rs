@@ -548,6 +548,10 @@ fn apply_governance_overlay(
 /// NOTE: an always-allow prompter (the daemon default when the client did not
 /// request permission prompts) therefore ALLOWS a `NeedsApproval` command
 /// today — the `Prompter` trait cannot tell it apart from a human saying yes.
+///
+/// C6: a command that installs a package the project does not declare
+/// ([`crate::dep_gate`]; the manifests from the call's `cwd` up to the daemon's
+/// working directory) is raised to `NeedsApproval` with the package named.
 async fn apply_cmd_guard(
     decision: origin_permission::Decision,
     meta: &ToolMeta,
@@ -562,7 +566,20 @@ async fn apply_cmd_guard(
         return decision;
     };
     let analysis = origin_cmdparse::analyze(cmd);
-    match origin_cmdparse::worst(&analysis) {
+    let mut verdict = origin_cmdparse::worst(&analysis);
+    // C6: installing a package the project does not declare needs approval.
+    // Only ever raises the verdict (a Dangerous one is left as it is).
+    if !matches!(verdict, origin_cmdparse::Risk::Dangerous(_)) {
+        let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let cwd = args.get("cwd").and_then(Value::as_str);
+        if let Some(why) = crate::dep_gate::reason(cmd, cwd, &root) {
+            verdict = origin_cmdparse::Risk::NeedsApproval(match verdict {
+                origin_cmdparse::Risk::NeedsApproval(prev) => format!("{prev}; {why}"),
+                _ => why,
+            });
+        }
+    }
+    match verdict {
         origin_cmdparse::Risk::Dangerous(reason) => origin_permission::Decision {
             outcome: Outcome::Deny,
             reason: format!("cmd-guard: dangerous bash command blocked: {reason}"),
@@ -12167,6 +12184,43 @@ mod wiring_tests {
 
         let asked = run_cmd_guard(decision(USER_APPROVED), "Bash", &args, &deny);
         assert_eq!(asked.outcome, Outcome::Allow, "already prompted ⇒ not re-asked");
+    }
+
+    /// C6: installing a package the project does not declare needs approval
+    /// (here: the test's cwd has no package.json, so nothing is declared); a
+    /// bare `npm install` names no package and passes.
+    #[test]
+    fn cmd_guard_asks_before_installing_an_undeclared_package() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("ORIGIN_CMD_GUARD");
+        let allow = || Decision {
+            outcome: Outcome::Allow,
+            reason: "rule:Bash@project:allow".into(),
+        };
+        let deny = origin_permission::prompt::AlwaysDeny;
+        let install = serde_json::json!({ "command": "npm install left-pad" });
+        let out = run_cmd_guard(allow(), "Bash", &install, &deny);
+        assert_eq!(out.outcome, Outcome::Deny, "undeclared package ⇒ asked ⇒ denied");
+        assert!(
+            out.reason.contains("left-pad"),
+            "reason names the package: {}",
+            out.reason
+        );
+        let bare = serde_json::json!({ "command": "npm install" });
+        assert_eq!(
+            run_cmd_guard(allow(), "Bash", &bare, &deny).outcome,
+            Outcome::Allow
+        );
+        // Never lowers a Dangerous verdict.
+        let both = serde_json::json!({ "command": "npm install left-pad; rm -rf ~" });
+        let out = run_cmd_guard(allow(), "Bash", &both, &origin_permission::prompt::AlwaysAllow);
+        assert_eq!(
+            out.outcome,
+            Outcome::Deny,
+            "Dangerous stays denied: {}",
+            out.reason
+        );
+        assert!(out.reason.contains("dangerous"), "{}", out.reason);
     }
 
     /// WS-D browser visual loop: the gate is OFF by default. With

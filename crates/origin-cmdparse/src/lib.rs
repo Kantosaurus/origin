@@ -174,9 +174,69 @@ pub fn analyze(line: &str) -> Analysis {
 /// `proc_supervisor`: `sh -c` on unix, `pwsh -Command` on Windows).
 const HOST_SHELL: Shell = if cfg!(windows) { Shell::Power } else { Shell::Posix };
 
+/// Package ecosystem of an [`Install`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ecosystem {
+    /// `npm`/`pnpm`/`yarn`/`bun` (`package.json`).
+    Npm,
+    /// `cargo add` (`Cargo.toml`).
+    Cargo,
+    /// `pip`/`pip3`/`uv pip` (`requirements*.txt`, `pyproject.toml`).
+    Python,
+    /// `go get` (`go.mod`).
+    Go,
+}
+
+/// A package-manager command that names packages to install
+/// (`npm install left-pad`, `cargo add serde`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Install {
+    /// Which manifest the packages belong in.
+    pub ecosystem: Ecosystem,
+    /// `-g`/`--global` or `yarn global add`: installs outside the project.
+    pub global: bool,
+    /// The package arguments as written (versions, extras, URLs, paths kept);
+    /// option values (`-r file`, `--features x`) are left out, except a
+    /// `-e`/`--editable`, `--git` or `--path` value, which is a package source.
+    pub packages: Vec<String>,
+}
+
+/// Every named-package install in `line`.
+///
+/// Found wherever [`analyze`] looks: after prefixes (`sudo`, `env X=1`), inside wrappers (`bash -c`), in every
+/// command of a chain or pipeline. A command that names no package
+/// (`npm install`, `npm ci`, `pip install -r reqs.txt`) is not listed.
+#[must_use]
+pub fn installs(line: &str) -> Vec<Install> {
+    let mut sink = Sink::default();
+    scan(line, HOST_SHELL, 0, &mut sink);
+    sink.installs
+}
+
+/// Everything a scan observes. Derefs to the risk list so detectors that only
+/// push risks keep taking `&mut Vec<Risk>`.
+#[derive(Default)]
+struct Sink {
+    risks: Vec<Risk>,
+    installs: Vec<Install>,
+}
+
+impl std::ops::Deref for Sink {
+    type Target = Vec<Risk>;
+    fn deref(&self) -> &Vec<Risk> {
+        &self.risks
+    }
+}
+
+impl std::ops::DerefMut for Sink {
+    fn deref_mut(&mut self) -> &mut Vec<Risk> {
+        &mut self.risks
+    }
+}
+
 /// [`analyze`] for an explicit shell dialect.
 fn analyze_in(line: &str, sh: Shell) -> Analysis {
-    let mut risks: Vec<Risk> = Vec::new();
+    let mut risks = Sink::default();
 
     // Cross-command shapes operate on the whole (lower-cased) line.
     let lower = line.to_ascii_lowercase();
@@ -193,7 +253,7 @@ fn analyze_in(line: &str, sh: Shell) -> Analysis {
         risks.push(Risk::Safe);
     }
     Analysis {
-        risks,
+        risks: risks.risks,
         commands: split_commands(line),
     }
 }
@@ -293,7 +353,7 @@ const fn ps_ascii(c: char) -> char {
 
 /// Parse `src` under `sh`, analyse every nested body and check every simple
 /// command. Input that cannot be parsed needs approval.
-fn scan(src: &str, sh: Shell, depth: usize, risks: &mut Vec<Risk>) {
+fn scan(src: &str, sh: Shell, depth: usize, risks: &mut Sink) {
     if depth > MAX_DEPTH {
         risks.push(needs(
             "the command nests shells or substitutions too deeply to analyse",
@@ -832,7 +892,7 @@ fn check_cmd(
     multi: bool,
     sh: Shell,
     depth: usize,
-    risks: &mut Vec<Risk>,
+    risks: &mut Sink,
     invoked: bool,
 ) {
     if depth > MAX_DEPTH {
@@ -951,7 +1011,8 @@ fn check_cmd(
                  which can escape an allowed directory"
             )));
         }
-        _ => {}
+        // Package installs (`npm install x`, `cargo add y`, ...).
+        _ => detect_install(&name, args, risks),
     }
 }
 
@@ -983,7 +1044,7 @@ fn ps_target_prefix(t: &str) -> bool {
 
 /// `cmd` arguments: `cmd /c SCRIPT` (or `/k`, `/r`, even glued: `/crm`) runs
 /// the rest of the line; with none of those the script is read from stdin.
-fn check_cmd_exe(args: &[Word], stdin: &Stdin, depth: usize, risks: &mut Vec<Risk>) {
+fn check_cmd_exe(args: &[Word], stdin: &Stdin, depth: usize, risks: &mut Sink) {
     let k = args.iter().position(|a| {
         let t = a.text.to_ascii_lowercase();
         t.starts_with("/c") || t.starts_with("/k") || t.starts_with("/r")
@@ -1024,7 +1085,7 @@ fn ps_assignment(ws: &[Word], i: usize) -> Option<(&str, usize)> {
 /// abbreviation) needs approval, `-Command` runs the rest of the line, and
 /// with neither Windows PowerShell runs the bare arguments as a command.
 /// Parameters may start with `-`, `/` or a typographic dash.
-fn check_powershell(args: &[Word], stdin: &Stdin, depth: usize, risks: &mut Vec<Risk>) {
+fn check_powershell(args: &[Word], stdin: &Stdin, depth: usize, risks: &mut Sink) {
     let param = |w: &Word| {
         w.text
             .strip_prefix(['-', '/', '\u{2013}', '\u{2014}', '\u{2015}'])
@@ -1068,7 +1129,7 @@ fn check_powershell(args: &[Word], stdin: &Stdin, depth: usize, risks: &mut Vec<
 /// SCRIPT; with no script operand (or `-`, `/dev/stdin`, an `s` in an option
 /// bundle) the script is read from stdin. `-o`/`+o`/`--rcfile`/`--init-file`
 /// take a value.
-fn check_posix_shell(name: &str, args: &[Word], stdin: &Stdin, depth: usize, risks: &mut Vec<Risk>) {
+fn check_posix_shell(name: &str, args: &[Word], stdin: &Stdin, depth: usize, risks: &mut Sink) {
     let bundle = |t: &str| t.starts_with('-') && !t.starts_with("--") && t.len() > 1;
     // An rcfile may itself be stdin (`--rcfile /dev/stdin -i`): with stdin fed,
     // fail closed instead of reasoning about which word is the value.
@@ -1121,7 +1182,7 @@ fn check_posix_shell(name: &str, args: &[Word], stdin: &Stdin, depth: usize, ris
 /// here-document or here-string is analysed as that script; any other piped or
 /// redirected input needs approval. With several stdin redirections the last
 /// one wins, so that case needs approval too.
-fn shell_stdin(name: &str, stdin: &Stdin, sh: Shell, depth: usize, risks: &mut Vec<Risk>) {
+fn shell_stdin(name: &str, stdin: &Stdin, sh: Shell, depth: usize, risks: &mut Sink) {
     if stdin.redirects > 1 {
         risks.push(needs(format!(
             "`{name}` has several stdin redirections; its script is unclear"
@@ -1175,6 +1236,88 @@ fn is_command_wrapper(name: &str) -> bool {
             | "stdbuf"
             | "xargs"
     )
+}
+
+/// Record an install (`npm|pnpm|yarn|bun install|i|add`, `yarn global add`,
+/// `pip|pip3 install`, `uv pip install`, `cargo add`, `go get`) and the
+/// packages it names. `args` are the words after the program name.
+fn detect_install(name: &str, args: &[Word], sink: &mut Sink) {
+    if !matches!(
+        name,
+        "npm" | "pnpm" | "yarn" | "bun" | "pip" | "pip3" | "uv" | "cargo" | "go"
+    ) {
+        return;
+    }
+    let words: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
+    // ponytail: the subcommand is the first non-option word, so a value-taking
+    // option before it (`npm --prefix app install x`) hides the install; add
+    // per-manager global-option tables if that gap matters.
+    let Some(k) = words.iter().position(|w| !w.starts_with(['-', '+'])) else {
+        return;
+    };
+    let mut rest = &words[k + 1..];
+    let mut global = false;
+    let ecosystem = match (name, words[k]) {
+        ("npm" | "pnpm" | "bun", "install" | "i" | "add") | ("yarn", "install" | "add") => Ecosystem::Npm,
+        ("yarn", "global") if rest.first() == Some(&"add") => {
+            global = true;
+            rest = &rest[1..];
+            Ecosystem::Npm
+        }
+        ("pip" | "pip3", "install") => Ecosystem::Python,
+        ("uv", "pip") if rest.first() == Some(&"install") => {
+            rest = &rest[1..];
+            Ecosystem::Python
+        }
+        ("cargo", "add") => Ecosystem::Cargo,
+        ("go", "get") => Ecosystem::Go,
+        _ => return,
+    };
+    // Options whose value is the next word (space-separated); for `source` that
+    // value is itself a package source (a path or repository).
+    let (takes_value, source) = match ecosystem {
+        Ecosystem::Npm => (
+            "--registry --prefix --tag -w --workspace -C --dir --filter --cwd",
+            "",
+        ),
+        Ecosystem::Python => (
+            "-r --requirement -c --constraint -i --index-url --extra-index-url -f --find-links -t --target \
+             --prefix --root --python",
+            "-e --editable",
+        ),
+        Ecosystem::Cargo => (
+            "-F --features --rename -p --package --manifest-path --registry --target --branch --tag --rev",
+            "--git --path",
+        ),
+        Ecosystem::Go => ("", ""),
+    };
+    let mut packages = Vec::new();
+    let mut i = 0;
+    while let Some(&w) = rest.get(i) {
+        i += 1;
+        if matches!(w, "-g" | "--global") {
+            global = true;
+        } else if source.split_whitespace().any(|o| o == w) {
+            packages.extend(rest.get(i).map(|v| (*v).to_string()));
+            i += 1;
+        } else if let Some(v) = source
+            .split_whitespace()
+            .find_map(|o| w.strip_prefix(o).and_then(|r| r.strip_prefix('=')))
+        {
+            packages.push(v.to_string());
+        } else if takes_value.split_whitespace().any(|o| o == w) {
+            i += 1;
+        } else if !w.starts_with('-') {
+            packages.push(w.to_string());
+        }
+    }
+    if !packages.is_empty() {
+        sink.installs.push(Install {
+            ecosystem,
+            global,
+            packages,
+        });
+    }
 }
 
 // --- detectors ------------------------------------------------------------
@@ -2253,5 +2396,62 @@ mod tests {
         // The reserved error variant exists and renders.
         let e = CmdParseError::Empty;
         assert_eq!(e.to_string(), "empty command line");
+    }
+
+    /// C6: installs are found through prefixes, chains and `bash -c`, with
+    /// their package arguments; installs that name no package are not listed.
+    #[test]
+    fn installs_are_found_wherever_the_parser_looks() {
+        let one = |line: &str| {
+            let mut v = installs(line);
+            assert_eq!(v.len(), 1, "{line:?}: {v:?}");
+            v.remove(0)
+        };
+        let i = one("sudo npm install left-pad");
+        assert_eq!(
+            (i.ecosystem, i.global, i.packages),
+            (Ecosystem::Npm, false, vec!["left-pad".into()])
+        );
+        let i = one("cd app && pip install --upgrade requests==2.31");
+        assert_eq!(
+            (i.ecosystem, i.packages),
+            (Ecosystem::Python, vec!["requests==2.31".into()])
+        );
+        let i = one("bash -c \"cargo add serde --features derive\"");
+        assert_eq!(
+            (i.ecosystem, i.packages),
+            (Ecosystem::Cargo, vec!["serde".into()])
+        );
+        let i = one("env CI=1 uv pip install -r reqs.txt \"requests[socks]>=2\"");
+        assert_eq!(
+            (i.ecosystem, i.packages),
+            (Ecosystem::Python, vec!["requests[socks]>=2".into()])
+        );
+        let i = one("yarn global add @scope/name@^2");
+        assert_eq!(
+            (i.ecosystem, i.global, i.packages),
+            (Ecosystem::Npm, true, vec!["@scope/name@^2".into()])
+        );
+        assert!(one("npm i -g left-pad").global);
+        assert_eq!(
+            one("cargo add --git https://x/y.git y").packages,
+            ["https://x/y.git", "y"]
+        );
+        assert_eq!(one("pip install -e .").packages, ["."]);
+        assert_eq!(one("go get example.com/mod@v1.2.0").ecosystem, Ecosystem::Go);
+        for none in [
+            "npm install",
+            "npm install --save-dev",
+            "pnpm install",
+            "yarn",
+            "bun install",
+            "npm ci",
+            "pip install -r requirements.txt",
+            "go get",
+            "cargo build",
+            "echo npm install left-pad",
+        ] {
+            assert!(installs(none).is_empty(), "{none:?}: {:?}", installs(none));
+        }
     }
 }
