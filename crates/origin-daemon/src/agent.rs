@@ -1091,6 +1091,79 @@ async fn effective_test_command(
     }
 }
 
+/// Cap on files the A11 auto-build indexes (same bound as the repo-map scan).
+const CODE_GRAPH_AUTO_MAX_FILES: usize = 2_000;
+
+/// A11: per-session state of the auto-built code graph — present once a build
+/// started, `true` once it finished.
+// ponytail: one small entry per session for the daemon's lifetime; evict on
+// session end if that ever matters.
+static CODE_GRAPH_BUILDS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// A11: build the code graph over the run's workspace in the background, once
+/// per session. Nothing else builds it (only the deferred `graph_rebuild`
+/// tool), so test selection and `graph_query by_name` silently fell back.
+/// Called when a consumer is enabled: test selection at run start, or the first
+/// `graph_query`. Locks the graph per file so consumers interleave with the
+/// build. Fail-open: an unparsable file is skipped; a fatal index error ends
+/// the build with the session left "not ready", so consumers keep falling back.
+fn start_code_graph_build(opts: &LoopOptions, session_id: &str) {
+    let (Some(graph), Some(root)) = (opts.code_graph.as_ref(), loop_cwd(opts)) else {
+        return;
+    };
+    let done = {
+        let mut builds = CODE_GRAPH_BUILDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if builds.contains_key(session_id) {
+            return;
+        }
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        builds.insert(session_id.to_string(), Arc::clone(&done));
+        done
+    };
+    let graph = Arc::clone(graph);
+    tokio::task::spawn_blocking(move || {
+        use origin_tools::builtins::{glob_tool, graph_rebuild};
+        // Gitignore-aware walk (the `Glob` tool's), then the supported grammars.
+        let Ok(found) = glob_tool::glob_v2(glob_tool::GlobArgs {
+            pattern: "**/*".into(),
+            path: Some(root.to_string_lossy().into_owned()),
+            head_limit: Some(u32::MAX),
+        }) else {
+            return;
+        };
+        let files = found
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(std::path::PathBuf::from)
+            .filter_map(|p| origin_codegraph::Language::from_path(&p).map(|lang| (lang, p)))
+            .take(CODE_GRAPH_AUTO_MAX_FILES);
+        for (lang, path) in files {
+            let mut idx = graph.blocking_lock();
+            if let Err(e) = graph_rebuild::graph_rebuild_tool(&mut idx, vec![path], lang) {
+                tracing::debug!(error = %e, "code-graph auto-build stopped; consumers keep their fallback");
+                return;
+            }
+        }
+        done.store(true, std::sync::atomic::Ordering::Release);
+    });
+}
+
+/// A11: whether this session's code-graph auto-build has finished. Until then
+/// test selection runs the full suite.
+fn code_graph_ready(session_id: &str) -> bool {
+    CODE_GRAPH_BUILDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(session_id)
+        .is_some_and(|done| done.load(std::sync::atomic::Ordering::Acquire))
+}
+
 /// A12: the run's working directory — [`LoopOptions::cwd`] when set (a
 /// best-of-N candidate's worktree), else the process cwd.
 fn loop_cwd(opts: &LoopOptions) -> Option<std::path::PathBuf> {
@@ -4635,6 +4708,12 @@ async fn run_loop_inner(
         },
         _ => None,
     };
+    // A11: test selection reads the code graph, so start building it now (in
+    // the background, once per session); selection runs the full suite until
+    // the build finishes.
+    if matches!(std::env::var("ORIGIN_TEST_SELECT").as_deref(), Ok("1")) {
+        start_code_graph_build(opts, &session.id);
+    }
     // C8: reproduction-gate contract (opt-in). A standing instruction to write a
     // failing test FIRST for a reported bug, so a fix is verified against a real
     // fail→pass transition (execution-checked by the turn-end test run below).
@@ -5522,7 +5601,9 @@ async fn run_loop_inner(
                     if let Some(cmd) = cfg.test_command.as_deref() {
                         // #4: narrow the suite to the edit's blast radius when
                         // test-selection is enabled; falls back to `cmd` verbatim.
-                        let cmd = effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
+                        // A11: only once this session's graph build finished.
+                        let graph = opts.code_graph.as_ref().filter(|_| code_graph_ready(&session.id));
+                        let cmd = effective_test_command(cmd, &lsp_edited_paths, graph).await;
                         // Run the oracle now (fresh, not the stale `test_block`).
                         // C9: redact before it becomes a model-facing User message.
                         let mut fresh = crate::redact::text(
@@ -6486,6 +6567,13 @@ async fn run_loop_inner(
                         } else {
                             None
                         };
+                    // A11: the first `graph_query` starts the session's
+                    // background graph build; this call answers from whatever
+                    // is indexed so far (the result's note points at
+                    // `graph_rebuild` when it is empty).
+                    if meta.name == "graph_query" {
+                        start_code_graph_build(opts, &session.id);
+                    }
                     match dispatch_tool(
                         meta,
                         &args,
@@ -6899,7 +6987,9 @@ async fn run_loop_inner(
                     if let Some(cmd) = cfg.test_command.as_deref() {
                         // #4: narrow the suite to the edit's blast radius when
                         // test-selection is enabled; falls back to `cmd` verbatim.
-                        let cmd = effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
+                        // A11: only once this session's graph build finished.
+                        let graph = opts.code_graph.as_ref().filter(|_| code_graph_ready(&session.id));
+                        let cmd = effective_test_command(cmd, &lsp_edited_paths, graph).await;
                         test_block = crate::redact::string(
                             run_post_edit_test(&cmd, opts.cwd.as_deref())
                                 .await

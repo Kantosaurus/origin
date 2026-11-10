@@ -365,6 +365,50 @@ async fn relative_tool_paths_resolve_against_loop_cwd() {
     );
 }
 
+/// A11: with test selection enabled and no `graph_rebuild` call, the code
+/// graph is built in the background for the run's workspace.
+#[tokio::test]
+async fn test_selection_builds_the_code_graph_in_the_background() {
+    let ws = tempdir().expect("tempdir");
+    let src = ws.path().join("calc.py");
+    std::fs::write(&src, "def add(a, b):\n    return a + b\n").expect("write");
+    let db = tempdir().expect("tempdir");
+    let cas = Store::open(StoreConfig {
+        root: db.path().join("cas"),
+        hot_capacity: 32,
+        warm_pack_target_bytes: 1024 * 1024,
+        cold_zstd_level: 3,
+    })
+    .expect("cas");
+    let sql = origin_store::Store::open(db.path().join("origin.db")).expect("sql");
+    let graph = Arc::new(tokio::sync::Mutex::new(
+        origin_codegraph::index::CodeGraphIndex::new(cas, sql),
+    ));
+    let provider = ScriptedProvider::new(vec![ChatResponse {
+        assistant: Message::new(Role::Assistant).with_block(Block::text("done")),
+        usage: Usage::default(),
+    }]);
+    let opts = LoopOptions {
+        code_graph: Some(Arc::clone(&graph)),
+        cwd: Some(ws.path().to_path_buf()),
+        ..LoopOptions::default().without_streaming()
+    };
+    let mut session = Session::new("test", "claude-opus-4-7");
+    std::env::set_var("ORIGIN_TEST_SELECT", "1");
+    let res = run_loop(&mut session, "hi", &provider, &AlwaysAllow, &opts).await;
+    std::env::remove_var("ORIGIN_TEST_SELECT");
+    res.expect("loop ok");
+
+    let file = src.display().to_string();
+    for _ in 0..100 {
+        if !graph.lock().await.nodes_in_file(&file).expect("query").is_empty() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("code graph never indexed {file}");
+}
+
 /// A1 regression: a fresh >2 KiB result from a Mutating tool (Bash) must reach
 /// the model verbatim on the very next request. Drives the production wiring
 /// end to end — real `run_loop`, real Bash, CAS, the shared `Plan` the daemon
