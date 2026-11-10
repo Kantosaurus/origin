@@ -103,45 +103,52 @@ async fn maybe_checkpoint_turn_with_hooks(root: Option<&std::path::Path>) {
     }
 }
 
+/// Run `f` against `root`'s shadow repo. Synchronous: `ShadowGit` borrows a
+/// non-`Sync` runner, so it must never be held across an await.
+fn with_shadow<T>(root: &std::path::Path, f: impl FnOnce(&origin_vcs::ShadowGit<'_>) -> T) -> T {
+    let runner = crate::selfdev::ProcessGitRunner::new(root);
+    let dir = root
+        .join(".origin")
+        .join("shadow.git")
+        .to_string_lossy()
+        .into_owned();
+    f(&origin_vcs::ShadowGit::new(&runner, dir))
+}
+
 /// C8: remember the run's current tree as the last state in which the gate
 /// passed: reuse the newest checkpoint when it already holds this tree, else
 /// take one, then point `refs/tags/last-green` in `root`'s shadow repo at it.
 /// Returns the checkpoint id. No git is spawned unless checkpoints are on
 /// (`ORIGIN_CHECKPOINTS=1` or `ORIGIN_CHECKPOINTS_PER_TOOL=1`); fail-open.
 async fn tag_last_green(root: Option<&std::path::Path>) -> Option<String> {
-    use origin_vcs::GitRunner as _;
     let on = std::env::var("ORIGIN_CHECKPOINTS").as_deref() == Ok("1") || per_tool_checkpoints_enabled();
     let root = root.filter(|_| on)?;
-    let shadow = root
-        .join(".origin")
-        .join("shadow.git")
-        .to_string_lossy()
-        .into_owned();
-    let runner = crate::selfdev::ProcessGitRunner::new(root);
-    let git = |args: &[&str]| runner.run(&[&["--git-dir", shadow.as_str()][..], args].concat());
-    // Nothing to stage ⇒ HEAD already holds this tree.
-    let head = match git(&["status", "--porcelain"]) {
-        Ok(s) if s.trim().is_empty() => git(&["rev-parse", "HEAD"]).ok().map(|h| h.trim().to_string()),
-        _ => None,
+    // The method path is not general over `ShadowGit<'a>`; the closure is.
+    #[allow(clippy::redundant_closure_for_method_calls, clippy::redundant_closure)]
+    let id = match with_shadow(root, |sg| sg.unchanged_head()) {
+        Ok(Some(id)) => id,
+        _ => checkpoint_with_commit_hooks("green", root).await?,
     };
-    let id = match head {
-        Some(id) => id,
-        None => checkpoint_with_commit_hooks("green", root).await?,
-    };
-    if let Err(e) = git(&["update-ref", "refs/tags/last-green", &id]) {
+    if let Err(e) = with_shadow(root, |sg| sg.tag("last-green", &id)) {
         tracing::warn!(error = %e, "could not tag the last green checkpoint (ignored)");
         return None;
     }
     Some(id)
 }
 
-/// C8: appended to a run that ends with a failing gate after it passed at
-/// `turn` of the same run. `origin rewind <id>` is the CLI restore command.
-fn last_green_note(id: &str, turn: u32) -> String {
+/// C8: shown to the user (never stored in the conversation) when a run ends
+/// with a failing gate after it passed at `turn` of the same run. The
+/// commands are origin-cli's `checkpoint-diff` and `rewind`, which find the
+/// shadow repo from the directory they run in: the run's `root`.
+fn last_green_note(id: &str, turn: u32, root: &std::path::Path) -> String {
+    let root = root.display();
     format!(
-        "\n\n[origin] The gate is failing now, but it passed at turn {turn} of this run. That state is \
-         checkpoint {id} (shadow ref `last-green`); nothing was restored. To go back to it, run \
-         `origin rewind {id}`."
+        "\n\n[origin] The gate is failing now, but it passed at turn {turn} of this run (checkpoint {id}, \
+         shadow ref `last-green`); nothing was restored. Restoring overwrites the current files and \
+         discards every change made after that checkpoint, hand edits included, so inspect it first; \
+         run these in {root}:\n  origin checkpoint-diff {id}\n  origin rewind {id} --files-only   \
+         (restores the checkpoint's files; files added since stay)\n  origin rewind {id}   \
+         (the whole tree, and the checkpoint history goes back to it)"
     )
 }
 
@@ -6696,15 +6703,13 @@ async fn run_loop_inner(
                 turn,
             ));
 
-            // C8: ending red after a green turn of this run ⇒ say how to get
-            // back there, once, on the final result (user stream, summary, and
-            // the final assistant message the model sees next). Never restores.
-            let text = match &last_green {
-                Some((id, green_turn)) if !(test_block.is_empty() && lint_block.is_empty()) => {
-                    let note = last_green_note(id, *green_turn);
-                    if let Some(m) = session.messages.last_mut() {
-                        m.blocks.push(Block::text(note.clone()));
-                    }
+            // C8: ending red after a green turn of this run ⇒ tell the user how
+            // to get back there, once, on the final result (event stream and
+            // summary). Kept out of the conversation: the model would read the
+            // destructive restore command as its own advice. Never restores.
+            let text = match (&last_green, loop_cwd(opts)) {
+                (Some((id, green_turn)), Some(root)) if !(test_block.is_empty() && lint_block.is_empty()) => {
+                    let note = last_green_note(id, *green_turn, &root);
                     if let Some(tx) = &opts.event_tx {
                         let _ = tx.send(StreamEvent::TextDelta { text: note.clone() }).await;
                     }

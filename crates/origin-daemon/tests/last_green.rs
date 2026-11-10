@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! C8: with checkpoints on, a turn-end gate that passes tags the current tree
 //! as `last-green` in the run's shadow repo; a run that then ends with a failing
-//! gate tells the user (and model) how to get back to it. Never restores.
+//! gate tells the user how to get back to it. Never restores.
 
 #![allow(clippy::panic)]
 
@@ -87,6 +87,20 @@ fn git(ws: &Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// The files a shadow revision records; asserts none is the shadow repo itself.
+fn tree(ws: &Path, rev: &str) -> Vec<String> {
+    let files: Vec<String> = git(ws, &["ls-tree", "-r", "--name-only", rev])
+        .unwrap_or_else(|| panic!("no shadow revision {rev}"))
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        !files.iter().any(|f| f.starts_with(".origin/shadow.git")),
+        "{rev} records the shadow repo itself: {files:?}"
+    );
+    files
+}
+
 /// A workspace whose shadow repo is initialised the way `origin checkpoint`
 /// (origin-cli vcs.rs) does it — no identity or signing config of its own.
 fn workspace() -> tempfile::TempDir {
@@ -98,11 +112,21 @@ fn workspace() -> tempfile::TempDir {
     ws
 }
 
-/// Drive `run_loop` in `ws` with `checkpoints` on or off, the test gate
-/// `gate`, one block per assistant turn. The user's global git config asks
-/// for commit signing with a gpg that does not exist, so a checkpoint commit
-/// that is not self-contained fails.
-fn run(ws: &Path, checkpoints: bool, gate: &str, repairs: u32, turns: Vec<Block>) -> (String, Session) {
+/// The test gate `cmd` (`auto_test`), `repairs` terminal re-runs.
+fn test_gate(cmd: &str, repairs: u32) -> PostEditConfig {
+    PostEditConfig {
+        auto_test: true,
+        test_command: Some(cmd.into()),
+        max_repair_iters: repairs,
+        ..PostEditConfig::default()
+    }
+}
+
+/// Drive `run_loop` in `ws` with `checkpoints` on or off and the post-edit
+/// gates `cfg`, one block per assistant turn. The user's global git config
+/// asks for commit signing with a gpg that does not exist, so a checkpoint
+/// commit that is not self-contained fails.
+fn run(ws: &Path, checkpoints: bool, cfg: PostEditConfig, turns: Vec<Block>) -> (String, Session) {
     let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let global = ws.join("hostile.gitconfig");
     std::fs::write(
@@ -132,12 +156,7 @@ fn run(ws: &Path, checkpoints: bool, gate: &str, repairs: u32, turns: Vec<Block>
     };
     let opts = LoopOptions {
         cwd: Some(ws.to_path_buf()),
-        post_edit: Some(Arc::new(PostEditConfig {
-            auto_test: true,
-            test_command: Some(gate.into()),
-            max_repair_iters: repairs,
-            ..PostEditConfig::default()
-        })),
+        post_edit: Some(Arc::new(cfg)),
         ..LoopOptions::default().without_streaming()
     };
     let mut session = Session::new("last-green", "scripted-model");
@@ -172,11 +191,10 @@ fn green_then_red() -> Vec<Block> {
     ]
 }
 
-fn texts(session: &Session, role: Role) -> Vec<String> {
+fn texts(session: &Session) -> Vec<String> {
     session
         .messages
         .iter()
-        .filter(|m| m.role == role)
         .flat_map(|m| &m.blocks)
         .filter_map(|b| match b {
             Block::Text { text, .. } => Some(text.clone()),
@@ -191,57 +209,67 @@ fn a_checkpoint_commit_ignores_the_users_signing_config() {
     run(
         ws.path(),
         true,
-        "echo ok",
-        0,
+        test_gate("echo ok", 0),
         vec![write("w1", "a.txt"), Block::text("done")],
     );
-    let files = git(ws.path(), &["ls-tree", "--name-only", "HEAD"]).unwrap_or_default();
+    let files = tree(ws.path(), "HEAD");
     assert!(
-        files.lines().any(|l| l == "a.txt"),
+        files.iter().any(|l| l == "a.txt"),
         "the turn checkpoint was committed: {files:?}"
     );
 }
 
 #[test]
-fn a_passing_gate_tags_the_current_tree_last_green() {
+fn a_passing_gate_tags_the_current_tree_and_reuses_an_unchanged_one() {
     let ws = workspace();
+    // Green after the edit (tags a new checkpoint), green again at the
+    // terminal re-run on the same tree (must reuse it).
     run(
         ws.path(),
         true,
-        GATE,
-        0,
+        test_gate(GATE, 1),
         vec![write("w1", "ok.txt"), Block::text("done")],
     );
-    let files = git(ws.path(), &["ls-tree", "--name-only", TAG]).expect("last-green tag exists");
-    assert!(files.lines().any(|l| l == "ok.txt"), "tagged tree: {files:?}");
+    let files = tree(ws.path(), TAG);
+    assert!(files.iter().any(|l| l == "ok.txt"), "tagged tree: {files:?}");
+    let labels = git(ws.path(), &["log", "--format=%s", "HEAD"]).unwrap_or_default();
+    assert_eq!(
+        labels.lines().filter(|l| *l == "green").count(),
+        1,
+        "an unchanged tree reuses its checkpoint: {labels:?}"
+    );
 }
 
 #[test]
-fn a_red_end_after_a_green_turn_names_the_restore_command_once() {
+fn a_red_end_after_a_green_turn_tells_the_user_how_to_restore_once() {
     let ws = workspace();
-    let (text, session) = run(ws.path(), true, GATE, 1, green_then_red());
+    let (text, session) = run(ws.path(), true, test_gate(GATE, 1), green_then_red());
     let id = git(ws.path(), &["rev-parse", TAG]).expect("last-green tag exists");
-    let files = git(ws.path(), &["ls-tree", "--name-only", &id]).unwrap_or_default();
-    assert!(files.lines().any(|l| l == "ok.txt"), "the green tree: {files:?}");
+    let files = tree(ws.path(), &id);
+    assert!(files.iter().any(|l| l == "ok.txt"), "the green tree: {files:?}");
     assert!(text.contains(NOTE), "final result carries the note: {text}");
+    assert_eq!(text.matches(NOTE).count(), 1, "{text}");
     assert!(text.contains("turn 1"), "names when: {text}");
-    // `origin rewind <id>` (origin-cli cli_def.rs `Rewind { id }`).
+    // origin-cli cli_def.rs: `CheckpointDiff { id }`, `Rewind { id, --files-only }`.
+    for cmd in [
+        format!("origin checkpoint-diff {id}"),
+        format!("origin rewind {id} --files-only"),
+        format!("origin rewind {id}"),
+    ] {
+        assert!(text.contains(&cmd), "names `{cmd}`: {text}");
+    }
+    assert!(text.contains("discards"), "warns it is destructive: {text}");
     assert!(
-        text.contains(&format!("`origin rewind {id}`")),
-        "names the restore command: {text}"
+        text.contains(&ws.path().display().to_string()),
+        "names where to run it: {text}"
     );
     assert!(
         ws.path().join("ok.txt").metadata().is_err(),
         "nothing was restored"
     );
-    // Once, on the final assistant message (what the model sees next), never
-    // on the repro-gate continuation.
-    let assistant: Vec<_> = texts(&session, Role::Assistant)
-        .into_iter()
-        .filter(|t| t.contains(NOTE))
-        .collect();
-    assert_eq!(assistant.len(), 1, "{assistant:?}");
-    assert!(!texts(&session, Role::User).iter().any(|t| t.contains(NOTE)));
+    // Not in the conversation: neither the model's messages nor a
+    // repro-gate continuation carry it.
+    assert!(!texts(&session).iter().any(|t| t.contains(NOTE)));
 }
 
 #[test]
@@ -250,8 +278,7 @@ fn no_green_state_no_note() {
     let (text, _) = run(
         ws.path(),
         true,
-        GATE,
-        0,
+        test_gate(GATE, 0),
         vec![write("w1", "other.txt"), Block::text("done")],
     );
     assert!(!text.contains(NOTE), "{text}");
@@ -265,8 +292,7 @@ fn a_gate_that_did_not_run_tags_nothing() {
     run(
         ws.path(),
         true,
-        "echo .env curl",
-        0,
+        test_gate("echo .env curl", 0),
         vec![write("w1", "a.txt"), Block::text("done")],
     );
     assert!(
@@ -277,10 +303,49 @@ fn a_gate_that_did_not_run_tags_nothing() {
 }
 
 #[test]
+fn a_green_test_with_a_red_lint_tags_nothing() {
+    let ws = workspace();
+    let cfg = PostEditConfig {
+        auto_lint: true,
+        lint_command: Some("cat no-such-lint-input.txt".into()),
+        ..test_gate("echo test-ok", 1)
+    };
+    run(
+        ws.path(),
+        true,
+        cfg,
+        vec![write("w1", "a.txt"), Block::text("done")],
+    );
+    assert!(
+        git(ws.path(), &["rev-parse", "HEAD"]).is_some(),
+        "checkpoints were on"
+    );
+    assert_eq!(git(ws.path(), &["rev-parse", "--verify", "-q", TAG]), None);
+}
+
+#[test]
+fn a_green_lint_alone_tags() {
+    let ws = workspace();
+    let cfg = PostEditConfig {
+        auto_lint: true,
+        lint_command: Some("echo lint-ok".into()),
+        ..PostEditConfig::default()
+    };
+    run(
+        ws.path(),
+        true,
+        cfg,
+        vec![write("w1", "a.txt"), Block::text("done")],
+    );
+    let files = tree(ws.path(), TAG);
+    assert!(files.iter().any(|l| l == "a.txt"), "tagged tree: {files:?}");
+}
+
+#[test]
 fn a_last_green_from_before_the_run_is_not_mentioned() {
     let ws = workspace();
     std::fs::write(ws.path().join("ok.txt"), "x\n").expect("write");
-    git(ws.path(), &["add", "-A"]).expect("add");
+    git(ws.path(), &["add", "-A", "--", ".", ":(exclude).origin"]).expect("add");
     git(ws.path(), &["commit", "-q", "-m", "earlier run"]).expect("commit");
     git(ws.path(), &["update-ref", TAG, "HEAD"]).expect("tag");
     let before = git(ws.path(), &["rev-parse", TAG]);
@@ -288,8 +353,7 @@ fn a_last_green_from_before_the_run_is_not_mentioned() {
     let (text, _) = run(
         ws.path(),
         true,
-        GATE,
-        0,
+        test_gate(GATE, 0),
         vec![write("w1", "other.txt"), Block::text("done")],
     );
     assert!(!text.contains(NOTE), "{text}");
@@ -299,7 +363,7 @@ fn a_last_green_from_before_the_run_is_not_mentioned() {
 #[test]
 fn checkpoints_off_tags_nothing_and_adds_no_note() {
     let ws = workspace();
-    let (text, _) = run(ws.path(), false, GATE, 1, green_then_red());
+    let (text, _) = run(ws.path(), false, test_gate(GATE, 1), green_then_red());
     assert!(!text.contains(NOTE), "{text}");
     assert_eq!(
         git(ws.path(), &["rev-parse", "--verify", "-q", "HEAD"]),
