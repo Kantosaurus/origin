@@ -69,6 +69,8 @@ struct WireStreamUsage {
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: crate::wire::PromptTokensDetails,
 }
 
 #[derive(Deserialize)]
@@ -201,11 +203,12 @@ pub async fn parse_into_ring(
 
 fn encode_usage(u: WireStreamUsage) -> Vec<u8> {
     // 4 × u32 BE. Order: input, output, cache_read, cache_creation. OpenAI
-    // does not report cache token counts on Chat Completions streams.
+    // reports cache reads (`prompt_tokens_details.cached_tokens`) but no
+    // cache-write count.
     let mut out = Vec::with_capacity(16);
     out.extend_from_slice(&u.prompt_tokens.to_be_bytes());
     out.extend_from_slice(&u.completion_tokens.to_be_bytes());
-    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&u.prompt_tokens_details.cached_tokens.to_be_bytes());
     out.extend_from_slice(&0u32.to_be_bytes());
     out
 }
@@ -243,7 +246,7 @@ pub fn parse_chunk_for_test(line: &[u8]) -> Option<TestFrame> {
     let usage = chunk.usage.map(|u| Usage {
         input_tokens: u.prompt_tokens,
         output_tokens: u.completion_tokens,
-        cache_read_input_tokens: 0,
+        cache_read_input_tokens: u.prompt_tokens_details.cached_tokens,
         cache_creation_input_tokens: 0,
     });
     Some(TestFrame { index, usage })

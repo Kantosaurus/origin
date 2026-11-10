@@ -387,6 +387,25 @@ pub enum StreamEvent {
         cache_read_input_tokens: u32,
         cache_creation_input_tokens: u32,
     },
+    /// B1: the provider-reported token counts of ONE model request, emitted by
+    /// the agent loop after every provider call (streaming or not). Unlike the
+    /// raw `Usage` frames, which relay each provider usage event as it streams
+    /// (Anthropic splits one request over two), there is exactly one of these
+    /// per request, so a consumer can sum them.
+    RequestUsage {
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_read_input_tokens: u32,
+        cache_creation_input_tokens: u32,
+    },
+    /// B1: size of what is sent before the user's first word — the system
+    /// prompt plus the tool schemas. Emitted once per session (its first
+    /// prompt). `approx_tokens` is bytes / 4, not a tokenizer count.
+    PromptPrefix {
+        system_bytes: u64,
+        tools_bytes: u64,
+        approx_tokens: u64,
+    },
     ToolActivity {
         tool: String,
         summary: String,

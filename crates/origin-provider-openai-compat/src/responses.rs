@@ -317,6 +317,9 @@ struct WireUsage {
     input_tokens: u32,
     #[serde(default)]
     output_tokens: u32,
+    /// `input_tokens_details.cached_tokens` — the prompt-cache read count.
+    #[serde(default)]
+    input_tokens_details: crate::wire::PromptTokensDetails,
 }
 
 /// Decode a Responses-API body into the canonical [`ChatResponse`].
@@ -365,7 +368,7 @@ fn decode_response(wire: WireResponse) -> ChatResponse {
         usage: Usage {
             input_tokens: wire.usage.input_tokens,
             output_tokens: wire.usage.output_tokens,
-            cache_read_input_tokens: 0,
+            cache_read_input_tokens: wire.usage.input_tokens_details.cached_tokens,
             cache_creation_input_tokens: 0,
         },
     }
@@ -408,6 +411,21 @@ mod tests {
         assert_eq!(input[0]["content"][0]["type"], json!("input_text"));
         assert_eq!(input[0]["content"][0]["text"], json!("hello"));
         assert_eq!(body["model"], json!("gpt-5-codex"));
+    }
+
+    #[test]
+    fn decode_reads_input_cached_tokens_as_cache_reads() {
+        // B1: the Responses API reports prompt-cache reads under
+        // `usage.input_tokens_details.cached_tokens`.
+        let wire: WireResponse = serde_json::from_value(json!({
+            "output": [],
+            "usage": { "input_tokens": 900, "output_tokens": 4,
+                       "input_tokens_details": { "cached_tokens": 512 } }
+        }))
+        .unwrap();
+        let usage = decode_response(wire).usage;
+        assert_eq!(usage.input_tokens, 900);
+        assert_eq!(usage.cache_read_input_tokens, 512);
     }
 
     #[test]

@@ -2170,10 +2170,13 @@ fn runtime_tool(name: &str) -> Option<std::sync::Arc<dyn origin_tools::DynTool>>
 
 /// Schemas for the worker's runtime (inline-MCP) tools, to advertise alongside
 /// the static registry. Empty when the task-local is unset (the default).
+/// Sorted by name: the registry is a `HashMap`, and its iteration order must
+/// not reach the wire (it would break the cached tools prefix).
 fn runtime_tool_schemas() -> Vec<origin_provider::ToolSchema> {
     RUNTIME_TOOLS
         .try_with(|m| {
-            m.values()
+            let mut schemas = m
+                .values()
                 .map(|t| {
                     let meta = t.meta();
                     origin_provider::ToolSchema {
@@ -2182,7 +2185,9 @@ fn runtime_tool_schemas() -> Vec<origin_provider::ToolSchema> {
                         input_schema_json: meta.input_schema.to_string(),
                     }
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            schemas.sort_by(|a, b| a.name.cmp(&b.name));
+            schemas
         })
         .unwrap_or_default()
 }
@@ -2241,6 +2246,39 @@ mod runtime_tools_tests {
 
         // Outside the scope the task-local is unset again.
         assert!(runtime_tool("mcp__demo__ping").is_none());
+    }
+
+    /// B1: tool schemas reach the wire in a deterministic order. The runtime
+    /// registry is a `HashMap`, whose iteration order is randomized per map, so
+    /// the advertised list must be sorted rather than iterated as-is.
+    #[tokio::test]
+    async fn runtime_tool_schemas_are_name_sorted_not_hashmap_ordered() {
+        const NAMES: [&str; 12] = [
+            "mcp__l", "mcp__b", "mcp__k", "mcp__a", "mcp__j", "mcp__c", "mcp__i", "mcp__d", "mcp__h",
+            "mcp__e", "mcp__g", "mcp__f",
+        ];
+        let mut map: HashMap<String, Arc<dyn DynTool>> = HashMap::new();
+        for name in NAMES {
+            let tool = FakeMcpTool(ToolMeta {
+                name,
+                description: "demo mcp tool",
+                tier: Tier::RequiresPermission,
+                urgency: Urgency::Low,
+                side_effects: SideEffects::Mutating,
+                input_schema: r#"{"type":"object"}"#,
+                sandbox_profile: SandboxProfile::Inherit,
+                token_budget: 1024,
+                hot: false,
+            });
+            map.insert(name.to_string(), Arc::new(tool));
+        }
+        let names = scope_runtime_tools(Arc::new(map), async {
+            runtime_tool_schemas().into_iter().map(|s| s.name).collect::<Vec<_>>()
+        })
+        .await;
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "runtime tool schemas must be name-sorted");
     }
 }
 
@@ -3551,6 +3589,8 @@ async fn run_loop_inner(
     static EMPTY_SKILLS: SkillRegistry = SkillRegistry::new();
 
     session.push(Message::new(Role::User).with_block(Block::text(user_text)));
+    // B1: the session's first prompt reports the size of its system + tools prefix.
+    let first_prompt_of_session = session.messages.len() == 1;
 
     // Ambient idle gate (jcode L223): a genuine user prompt is REAL activity, so
     // bump the ambient idle tracker now that the turn is starting. Best-effort
@@ -3987,6 +4027,24 @@ async fn run_loop_inner(
             .collect::<Vec<_>>()
             .join("\n\n")
     };
+    // B1: report what is sent before the user's first word (system prompt +
+    // tool schemas), once per session.
+    if first_prompt_of_session {
+        if let Some(tx) = &opts.event_tx {
+            let system_bytes = recalled_system.len() as u64;
+            let tools_bytes = tools_schema
+                .iter()
+                .map(|t| t.name.len() + t.description.len() + t.input_schema_json.len())
+                .sum::<usize>() as u64;
+            let _ = tx
+                .send(StreamEvent::PromptPrefix {
+                    system_bytes,
+                    tools_bytes,
+                    approx_tokens: (system_bytes + tools_bytes) / BYTES_PER_TOKEN as u64,
+                })
+                .await;
+        }
+    }
 
     // Cumulative token counters for this `run_loop` invocation. Surfaced
     // via `LoopSummary` so the goal driver can charge the per-iteration
@@ -4787,6 +4845,18 @@ async fn run_loop_inner(
         // counter (fed once at loop end alongside the token totals).
         total_cache_read_tokens =
             total_cache_read_tokens.saturating_add(u64::from(resp.usage.cache_read_input_tokens));
+        // B1: one authoritative usage record per provider request (streaming
+        // or not), readable from `origin run --output-format stream-json`.
+        if let Some(tx) = &opts.event_tx {
+            let _ = tx
+                .send(StreamEvent::RequestUsage {
+                    input_tokens: resp.usage.input_tokens,
+                    output_tokens: resp.usage.output_tokens,
+                    cache_read_input_tokens: resp.usage.cache_read_input_tokens,
+                    cache_creation_input_tokens: resp.usage.cache_creation_input_tokens,
+                })
+                .await;
+        }
 
         session.push(resp.assistant.clone());
 

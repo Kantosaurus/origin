@@ -160,8 +160,8 @@ fn decode_response(wire: WireResponse) -> ChatResponse {
     let usage = Usage {
         input_tokens: wire.usage.input_tokens,
         output_tokens: wire.usage.output_tokens,
-        cache_read_input_tokens: 0,
-        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: wire.usage.cache_read_input_tokens,
+        cache_creation_input_tokens: wire.usage.cache_creation_input_tokens,
     };
     ChatResponse { assistant, usage }
 }
@@ -232,11 +232,19 @@ enum WireRespBlock {
 }
 
 #[derive(Deserialize, Default)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "field names are the Anthropic wire format"
+)]
 struct WireUsage {
     #[serde(default)]
     input_tokens: u32,
     #[serde(default)]
     output_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
 }
 
 fn encode_request(req: &ChatRequest) -> WireRequest<'_> {
@@ -307,5 +315,23 @@ fn block_to_wire(b: &Block) -> Option<WireBlock<'_>> {
             })
         }
         Block::Thinking { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn decode_reads_anthropic_cache_counts() {
+        // B1: Anthropic-on-Bedrock `InvokeModel` returns the Anthropic usage
+        // shape, including the prompt-cache read and write counts.
+        let wire: super::WireResponse = serde_json::from_value(serde_json::json!({
+            "content": [{ "type": "text", "text": "ok" }],
+            "usage": { "input_tokens": 10, "output_tokens": 3,
+                       "cache_read_input_tokens": 4000, "cache_creation_input_tokens": 250 }
+        }))
+        .expect("fixture decodes");
+        let usage = super::decode_response(wire).usage;
+        assert_eq!(usage.cache_read_input_tokens, 4000);
+        assert_eq!(usage.cache_creation_input_tokens, 250);
     }
 }

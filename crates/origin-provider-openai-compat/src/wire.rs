@@ -110,6 +110,18 @@ pub struct WireUsage {
     pub prompt_tokens: u32,
     #[serde(default)]
     pub completion_tokens: u32,
+    /// `prompt_tokens_details.cached_tokens`: the prompt-cache read count
+    /// (already included in `prompt_tokens`). Absent on most compat servers.
+    #[serde(default)]
+    pub prompt_tokens_details: PromptTokensDetails,
+}
+
+/// `usage.prompt_tokens_details` (Chat Completions). Only the cache-read count
+/// is read; `OpenAI` reports no cache-write count.
+#[derive(Deserialize, Default, Clone, Copy)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: u32,
 }
 
 /// Encode a `ChatRequest` into the `OpenAI` wire-shape request.
