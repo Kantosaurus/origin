@@ -2412,6 +2412,26 @@ fn patch_target_paths(patch: &str) -> Vec<String> {
     out
 }
 
+/// B8: `(from, to)` for each `*** Update File:` an apply-patch body moves with
+/// `*** Move to:`.
+fn patch_moves(patch: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut from: Option<&str> = None;
+    for line in patch.lines() {
+        let t = line.trim_start();
+        if let Some(p) = t.strip_prefix("*** Update File: ") {
+            from = Some(p.trim());
+        } else if let Some(to) = t.strip_prefix("*** Move to: ") {
+            if let (Some(f), to) = (from.take(), to.trim()) {
+                if !f.is_empty() && !to.is_empty() {
+                    out.push((f.to_string(), to.to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Extract the file path(s) a mutating tool call edited, for the optional
 /// autonomous LSP-diagnostics feedback ([`crate::lsp_diagnostics`]).
 ///
@@ -6197,6 +6217,14 @@ async fn run_loop_inner(
                 // B7: the syntax gate reports only parse errors an edit adds,
                 // so count them in each target file before it changes.
                 if compile_check_enabled {
+                    // B8: a moved file is checked at its destination, so it
+                    // keeps the problem count it had at its source.
+                    if name == "ApplyPatch" {
+                        let patch = args.get("patch").and_then(Value::as_str).unwrap_or_default();
+                        for (from, to) in patch_moves(patch) {
+                            crate::postcheck::record_moved_baseline(&mut parse_baseline, &from, &to).await;
+                        }
+                    }
                     for p in edited_paths_from_tool(&name, &args) {
                         crate::postcheck::record_baseline(&mut parse_baseline, &p).await;
                     }
@@ -11400,6 +11428,7 @@ mod wiring_tests {
         let marker = "*** Begin Patch\n*** Delete File: gone.py\n*** Update File: old.py\n\
                       *** Move to: new.py\n@@\n-a\n+b\n*** End Patch\n";
         assert_eq!(patch_target_paths(marker), vec!["gone.py", "new.py"]);
+        assert_eq!(patch_moves(marker), vec![("old.py".to_string(), "new.py".to_string())]);
         let unified = "--- a/dead.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n--- a/kept.rs\n+++ b/kept.rs\n";
         assert_eq!(patch_target_paths(unified), vec!["dead.rs", "kept.rs"]);
     }

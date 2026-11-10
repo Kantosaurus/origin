@@ -172,6 +172,17 @@ pub async fn record_baseline(baseline: &mut ParseBaseline, path: &str) {
     baseline.insert(path.to_string(), count);
 }
 
+/// B8: record the baseline of `to`, the destination of a move, as `from`'s
+/// pre-edit count, so problems the file already had are not reported as new
+/// at its new path. Same first-call-wins rule as [`record_baseline`].
+pub async fn record_moved_baseline(baseline: &mut ParseBaseline, from: &str, to: &str) {
+    if baseline.contains_key(to) || parse_language(to).is_none() {
+        return;
+    }
+    let count = parse_error_lines(from).await.len();
+    baseline.insert(to.to_string(), count);
+}
+
 /// B7: the tree-sitter grammar for `path`, or `None` (skipped) when
 /// `origin-codegraph` links none — or links the wrong one: `.tsx` maps to the
 /// plain TypeScript grammar (JSX is an error there) and `.h` to C (C++ headers
@@ -424,5 +435,21 @@ mod tests {
             check_block(&set, &ParseBaseline::new()).await,
             (String::new(), String::new())
         );
+    }
+
+    /// B8: a file moved with its pre-existing parse error is not reported as
+    /// new at its destination.
+    #[tokio::test]
+    async fn a_moved_file_keeps_its_baseline() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let from = dir.path().join("old.rs");
+        let to = dir.path().join("new.rs");
+        std::fs::write(&from, "fn a() {}\n}\n").expect("write");
+        let (from_s, to_s) = (from.to_string_lossy().into_owned(), to.to_string_lossy().into_owned());
+        let mut baseline = ParseBaseline::new();
+        record_moved_baseline(&mut baseline, &from_s, &to_s).await;
+        record_baseline(&mut baseline, &to_s).await;
+        std::fs::rename(&from, &to).expect("move");
+        assert_eq!(check_block(&BTreeSet::from([to_s]), &baseline).await.1, "");
     }
 }
