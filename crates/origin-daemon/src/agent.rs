@@ -1058,8 +1058,8 @@ fn cmd_guard_ask_preview(
 /// first, where nothing can pad it away:
 /// `<G>/<T> gated tools (<tools>), <D> mcp servers | mcp: <names> | grants: <entries> | other: <entries> | goal: <goal>`
 /// (`T` gated registry tools, `G` of them reached by some entry, named in
-/// registry order — `(all)` when `G == T`, omitted when `G == 0` — and `D`
-/// distinct servers).
+/// registry order — at most eight, then `+K`; `(all)` when `G == T`,
+/// omitted when `G == 0` — and `D` distinct servers).
 /// Each `allowed_tools` entry is classified by what it GRANTS, using the worker's
 /// own matcher (`swarm_worker::allow_entry_glob`): it is a grant if it matches a
 /// gated (not read-only) registry tool, could match an MCP tool name
@@ -1172,9 +1172,11 @@ fn task_preview_and_reach(args: &Value) -> (String, usize, usize) {
     let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
     // Registry names, never model text: nothing the model chose can pad them away.
     let names: Vec<&str> = gated.iter().copied().filter(|n| reached.contains(n)).collect();
+    // At most eight names, so the server count stays near the front.
     let names = match names.len() {
         0 => String::new(),
         g if g == gated.len() => " (all)".to_owned(),
+        g if g > 8 => format!(" ({} +{})", names[..8].join(", "), g - 8),
         _ => format!(" ({})", names.join(", ")),
     };
     let preview = format!(
@@ -1276,6 +1278,33 @@ mod task_preview_tests {
         assert!(
             !head.contains("\"Bash\""),
             "the grants list alone would hide it: {p}"
+        );
+    }
+
+    /// A4: at most eight names, then `+K`, so the server count stays near
+    /// the front.
+    #[test]
+    fn task_preview_caps_the_reached_names_at_eight() {
+        let gated: Vec<&str> = super::registry_iter()
+            .filter(|m| {
+                m.name != "Task"
+                    && !(matches!(m.tier, origin_tools::Tier::AutoAllowed)
+                        && matches!(m.side_effects, super::SideEffects::Pure))
+            })
+            .map(|m| m.name)
+            .collect();
+        let t = gated.len();
+        assert!(t > 9, "needs more than nine gated tools: {gated:?}");
+        let reached = &gated[..t - 1];
+        let p = preview(reached, &[]);
+        let names = reached[..8].join(", ");
+        assert!(
+            p.starts_with(&format!(
+                "{}/{t} gated tools ({names} +{}), 0 mcp servers",
+                t - 1,
+                t - 9
+            )),
+            "{p}"
         );
     }
 
