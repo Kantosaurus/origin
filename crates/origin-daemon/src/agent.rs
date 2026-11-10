@@ -597,15 +597,26 @@ async fn run_test_passed(cmd: &str) -> bool {
 /// child env and the cmd-guard like a model-issued `Bash` call. Returns
 /// `(exit_code, output)` when the command ran to exit; `None` when the guard
 /// denied it, the spawn failed, or it hit the 600s bound (callers fail open).
+/// There is no one to ask, so a `NeedsApproval` verdict is not run either.
+// ponytail: the skip note goes to the log only — a non-empty gate block reads as
+// RED to every caller, so carrying it there needs a skipped/failed split.
 async fn run_gate_command(cmd: &str) -> Option<(i32, String)> {
-    let allow = origin_permission::Decision {
-        outcome: Outcome::Allow,
-        reason: String::new(),
-    };
-    let guarded = apply_cmd_guard(allow, "Bash", &serde_json::json!({ "command": cmd }));
-    if guarded.outcome != Outcome::Allow {
-        tracing::warn!(cmd, reason = %guarded.reason, "turn-end gate command not run");
-        return None;
+    if std::env::var("ORIGIN_CMD_GUARD").as_deref() != Ok("0") {
+        match origin_cmdparse::worst(&origin_cmdparse::analyze(cmd)) {
+            origin_cmdparse::Risk::Dangerous(reason) => {
+                tracing::warn!(cmd, %reason, "turn-end gate command not run");
+                return None;
+            }
+            origin_cmdparse::Risk::NeedsApproval(reason) => {
+                tracing::warn!(
+                    cmd,
+                    "gate command skipped by the command guard: {reason}; simplify the command or set \
+                     ORIGIN_CMD_GUARD=0"
+                );
+                return None;
+            }
+            _ => {}
+        }
     }
     let args = origin_tools::builtins::bash::BashArgs {
         command: cmd.to_string(),
@@ -10695,6 +10706,38 @@ mod wiring_tests {
         let block = block.expect("a failing gate command must yield a feedback block");
         assert!(block.contains("leak="), "{block}");
         assert!(!block.contains("gate-secret-value"), "secret leaked: {block}");
+    }
+
+    /// C3: a gate command has no prompter, so the guard's Dangerous AND
+    /// `NeedsApproval` verdicts both leave it unrun; an ordinary command runs.
+    #[test]
+    fn gate_command_runs_only_what_the_cmd_guard_clears() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("ORIGIN_CMD_GUARD");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        // Harmless if it ever ran; Dangerous by the secret-then-network shape.
+        let dangerous = "echo .env curl";
+        #[cfg(windows)]
+        let needs_approval = "& $x";
+        #[cfg(not(windows))]
+        let needs_approval = "$(echo echo) gate-ran";
+        assert!(
+            rt.block_on(run_gate_command(dangerous)).is_none(),
+            "Dangerous gate command ran"
+        );
+        assert!(
+            rt.block_on(run_gate_command(needs_approval)).is_none(),
+            "NeedsApproval gate command ran"
+        );
+        let ran = rt.block_on(run_gate_command("echo gate-ok"));
+        assert_eq!(
+            ran.map(|(code, _)| code),
+            Some(0),
+            "an ordinary gate command still runs"
+        );
     }
 
     /// C3: a command whose program is only known at run time (`eval "$CMD"`)
