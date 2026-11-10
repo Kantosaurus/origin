@@ -146,8 +146,86 @@ pub fn run_best_of_n(
     n: u32,
     difficulty: DifficultySignals,
 ) -> BestOfNOutcome {
+    run_best_of_n_noted(arena, n, difficulty).0
+}
+
+/// C5: [`run_best_of_n`], then tell the user how it went.
+///
+/// ONE `[origin]` line on `event_tx` (never into the session) once it ran:
+/// which candidate was applied and why, or why none was; candidates that
+/// changed pre-existing tests (up to five paths each); candidates excluded as
+/// tests-only. Call it off the async runtime (it uses `blocking_send`).
+pub fn run_best_of_n_reported(
+    arena: &mut dyn CandidateArena,
+    n: u32,
+    difficulty: DifficultySignals,
+    event_tx: Option<&tokio::sync::mpsc::Sender<crate::protocol::StreamEvent>>,
+) -> BestOfNOutcome {
+    let (outcome, note) = run_best_of_n_noted(arena, n, difficulty);
+    if let (Some(tx), Some(text)) = (event_tx, note) {
+        let text = crate::redact::string(text);
+        let _ = tx.blocking_send(crate::protocol::StreamEvent::TextDelta { text });
+    }
+    outcome
+}
+
+/// C5: the user-facing note on a finished run (candidates counted 1-based):
+/// the applied winner (`Ok(index)`) or why none was applied, then the
+/// pre-existing tests each candidate changed (up to five paths, then
+/// `+K more`) and the candidates excluded as tests-only.
+fn outcome_note(results: &[CandidateResult], passed: usize, applied: Result<usize, String>) -> String {
+    use std::fmt::Write as _;
+    let attempted = results.len();
+    let mut out = match applied {
+        Ok(w) => format!(
+            "\n\n[origin] Best-of-N applied candidate {} of {attempted} to your working tree: it passed \
+             the tests with the smallest change ({} diff bytes; {passed} of {attempted} candidates passed).",
+            w + 1,
+            results[w].diff.len()
+        ),
+        Err(why) => format!(
+            "\n\n[origin] Best-of-N: none of {attempted} candidates was applied ({why}); your working \
+             tree is as the first attempt left it."
+        ),
+    };
+    for (i, r) in results.iter().enumerate().filter(|(_, r)| !r.tampered.is_empty()) {
+        let shown = r.tampered.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+        let more = r.tampered.len().saturating_sub(5);
+        let more = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
+        let _ = write!(
+            out,
+            " Candidate {} changed pre-existing tests: {shown}{more} (scored on the originals).",
+            i + 1
+        );
+    }
+    let tests_only: Vec<String> = results
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.tests_only)
+        .map(|(i, _)| format!("candidate {}", i + 1))
+        .collect();
+    if !tests_only.is_empty() {
+        let _ = write!(
+            out,
+            " Excluded as tests-only (changed only test files): {}.",
+            tests_only.join(", ")
+        );
+    }
+    out
+}
+
+/// [`run_best_of_n`] and, once it ran, its user-facing note.
+fn run_best_of_n_noted(
+    arena: &mut dyn CandidateArena,
+    n: u32,
+    difficulty: DifficultySignals,
+) -> (BestOfNOutcome, Option<String>) {
     if n < 2 || !difficulty.is_hard() {
-        return BestOfNOutcome::Skipped;
+        return (BestOfNOutcome::Skipped, None);
     }
     let mut results: Vec<CandidateResult> = Vec::with_capacity(n as usize);
     let mut candidates: Vec<Candidate> = Vec::with_capacity(n as usize);
@@ -197,24 +275,34 @@ pub fn run_best_of_n(
 
     let attempted = results.len();
     let passed = candidates.iter().filter(|c| c.outcome.is_passed() && c.non_empty).count();
+    let no_winner = |why: String| {
+        (
+            BestOfNOutcome::NoWinner { attempted },
+            Some(outcome_note(&results, passed, Err(why))),
+        )
+    };
     if !has_verified_winner(&candidates) {
         tracing::info!(
             attempted,
             "best-of-N: no verified winner; keeping single-shot result"
         );
-        return BestOfNOutcome::NoWinner { attempted };
+        return no_winner("no candidate passed the tests with a change outside the tests".into());
     }
     // `select_best` returns `Some` because the slice is non-empty; the winner is
     // a verified one because `has_verified_winner` held (the ordering puts a
     // passing non-empty candidate strictly above any non-passing/empty one).
     let Some(winner) = select_best(&candidates) else {
-        return BestOfNOutcome::NoWinner { attempted };
+        return no_winner("no candidate could be selected".into());
     };
     let diff = &results[winner].diff;
     if let Err(e) = arena.apply_winner(diff) {
         tracing::warn!(winner, error = %e, "best-of-N: applying the winning diff failed; keeping single-shot result");
-        return BestOfNOutcome::NoWinner { attempted };
+        return no_winner(format!(
+            "candidate {} won, but applying its diff failed: {e}",
+            winner + 1
+        ));
     }
+    let note = outcome_note(&results, passed, Ok(winner));
     let tampered: Vec<(usize, Vec<String>)> = results
         .into_iter()
         .enumerate()
@@ -228,11 +316,14 @@ pub fn run_best_of_n(
         ?tampered,
         "best-of-N: applied verified winner"
     );
-    BestOfNOutcome::Applied {
-        winner,
-        passed,
-        tampered,
-    }
+    (
+        BestOfNOutcome::Applied {
+            winner,
+            passed,
+            tampered,
+        },
+        Some(note),
+    )
 }
 
 /// The signature of the per-candidate agent runner the daemon supplies.
@@ -685,6 +776,69 @@ mod tests {
         assert_ne!(normalize_diff(&bin("2")), normalize_diff(&bin("3")));
         let text = |h: &str| format!("diff --git a/x b/x\nindex 1..{h} 100644\n--- a/x\n+++ b/x\n+y\n");
         assert_eq!(normalize_diff(&text("2")), normalize_diff(&text("3")));
+    }
+
+    /// C5: the outcome reaches the user once, on the event channel: what was
+    /// applied (or why nothing was), tampering candidates with up to five
+    /// paths each, and tests-only candidates.
+    #[test]
+    fn the_outcome_reaches_the_user_once_on_the_event_channel() {
+        use crate::protocol::StreamEvent;
+        let note_of = |arena: &mut MockArena, n: u32| {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let out = run_best_of_n_reported(arena, n, hard(), Some(&tx));
+            let events: Vec<StreamEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let notes: Vec<String> = events
+                .iter()
+                .filter_map(|e| match e {
+                    StreamEvent::TextDelta { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            (out, notes[0].clone())
+        };
+        let tampered = Ok(CandidateResult {
+            tampered: (1..=7).map(|i| format!("tests/t{i}.py")).collect(),
+            ..fail("+a").unwrap()
+        });
+        let tests_only = Ok(CandidateResult {
+            tests_only: true,
+            ..pass("+t").unwrap()
+        });
+        let mut a = MockArena::new(vec![tampered, tests_only, pass("+fix")]);
+        let (out, note) = note_of(&mut a, 3);
+        assert!(
+            matches!(out, BestOfNOutcome::Applied { winner: 2, .. }),
+            "{out:?}"
+        );
+        assert!(
+            note.contains("[origin] Best-of-N applied candidate 3 of 3"),
+            "{note}"
+        );
+        assert!(note.contains("passed the tests"), "{note}");
+        assert!(
+            note.contains(
+                "Candidate 1 changed pre-existing tests: tests/t1.py, tests/t2.py, tests/t3.py, \
+                 tests/t4.py, tests/t5.py (+2 more)"
+            ),
+            "{note}"
+        );
+        assert!(
+            note.contains("tests-only") && note.contains("candidate 2"),
+            "{note}"
+        );
+
+        let mut b = MockArena::new(vec![fail("x"), fail("y")]);
+        let (_, note) = note_of(&mut b, 2);
+        assert!(note.contains("none of 2 candidates was applied"), "{note}");
+        assert!(note.contains("no candidate passed the tests"), "{note}");
+
+        let mut c = MockArena::new(vec![pass("good"), fail("x")]);
+        c.apply_fails = true;
+        let (_, note) = note_of(&mut c, 2);
+        assert!(note.contains("apply failed"), "names why: {note}");
     }
 
     #[test]

@@ -2163,6 +2163,7 @@ async fn handle_request(
                 summary.gate_signals.is_some(),
                 opts.effort,
                 permission_mode,
+                Some(event_tx.clone()),
             )
             .await;
         }
@@ -2282,8 +2283,10 @@ async fn maybe_run_best_of_n(
     effort: Option<origin_provider::ReasoningEffort>,
     // C2: candidates run under the request's mode with nobody to ask.
     permission_mode: PermissionMode,
+    // C5: where the one-line outcome goes (never the session).
+    event_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
 ) {
-    use origin_daemon::bestofn_runner::{run_best_of_n, WorktreeArena};
+    use origin_daemon::bestofn_runner::{run_best_of_n_reported, WorktreeArena};
     use origin_swarm::bestofn::DifficultySignals;
 
     if permission_mode == PermissionMode::On {
@@ -2388,7 +2391,7 @@ async fn maybe_run_best_of_n(
             Some(test_command),
             Box::new(runner),
         );
-        let outcome = run_best_of_n(&mut arena, n, difficulty);
+        let outcome = run_best_of_n_reported(&mut arena, n, difficulty, event_tx.as_ref());
         tracing::info!(?outcome, "best-of-N finished");
     });
     if let Err(e) = join.await {
