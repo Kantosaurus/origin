@@ -205,7 +205,11 @@ impl Anthropic {
     /// Propagates [`ProviderError`] from CAS handle expansion, or
     /// [`ProviderError::Api`] if the typed body fails to serialize.
     fn build_chat_body(&self, req: &ChatRequest) -> Result<serde_json::Value, ProviderError> {
-        let expanded = expand_messages_for_wire(&req.messages, self.cas.as_ref(), self.plan.as_ref())?;
+        // A1: every tool-result handle is inlined verbatim (no size-based
+        // `<result handle:…>` stub the model cannot resolve). Replacing OLD
+        // results with placeholders is a transcript-level step upstream of
+        // the provider, so it applies to every provider alike.
+        let expanded = origin_provider::inflate_tool_result_handles(&req.messages, self.cas.as_ref())?;
         let plan = self.plan.as_ref();
         let wire_messages = build_wire_messages(&expanded, plan);
         let wire_tools = req
@@ -321,7 +325,7 @@ impl Provider for Anthropic {
 
     #[allow(clippy::too_many_lines)] // cohesive streaming method: body build + status handling + optional cassette record/replay tap
     async fn chat_stream(&self, req: ChatRequest, ring: &origin_stream::Ring) -> Result<(), ProviderError> {
-        let expanded = expand_messages_for_wire(&req.messages, self.cas.as_ref(), self.plan.as_ref())?;
+        let expanded = origin_provider::inflate_tool_result_handles(&req.messages, self.cas.as_ref())?;
         let plan = self.plan.as_ref();
         let wire_messages = build_wire_messages(&expanded, plan);
         let wire_tools = req
@@ -793,109 +797,6 @@ fn block_to_wire(b: &Block, cache_control: Option<wire::WireCacheControl>) -> Op
     }
 }
 
-/// Re-inflate any `ToolResult` blocks that carry a CAS `handle` (but no
-/// inline bytes) by fetching the payload from the attached store.
-///
-/// When a `plan` is provided, consults `WireDecision` to decide whether to
-/// inline the bytes or emit a short `<result handle:… — N bytes>` reference.
-///
-/// Blocks with inline bytes (or unrelated kinds) are passed through unchanged.
-///
-/// # Errors
-/// Returns `ProviderError::Api` if a handle is encountered without a CAS, or if
-/// the CAS lookup itself errors. A CAS *miss* degrades to an inline
-/// `CAS_MISS_PLACEHOLDER` (payload lost in a restart) rather than failing.
-fn expand_messages_for_wire(
-    messages: &[Message],
-    cas: Option<&std::sync::Arc<origin_cas::Store>>,
-    plan: Option<&origin_planner::Plan>,
-) -> Result<Vec<Message>, ProviderError> {
-    let mut out = Vec::with_capacity(messages.len());
-    for m in messages {
-        let mut blocks = Vec::with_capacity(m.blocks.len());
-        for b in &m.blocks {
-            if let Block::ToolResult {
-                tool_use_id,
-                handle: Some(h),
-                inline: None,
-                cache_marker,
-                is_error,
-            } = b
-            {
-                let store = cas.ok_or_else(|| {
-                    ProviderError::Api("ToolResult handle present but no CAS configured".into())
-                })?;
-                let bytes = store
-                    .get(origin_cas::Hash::from_bytes(*h))
-                    .map_err(|e| ProviderError::Api(format!("cas get: {e}")))?
-                    .unwrap_or_else(|| {
-                        // Degrade rather than fail the turn: the payload was lost
-                        // in a daemon restart (Hot tier not flushed). Inline a
-                        // placeholder so the tool_use/tool_result pairing holds.
-                        tracing::warn!(
-                            "cas miss for tool result handle; substituting placeholder \
-                             (cached output lost across a daemon restart)"
-                        );
-                        origin_provider::CAS_MISS_PLACEHOLDER.as_bytes().to_vec()
-                    });
-
-                // N4.3: consult the per-handle band index in `O(1)`. The
-                // planner populates this via `Plan::register_handle` as
-                // it threads sections through the compactor; callers that
-                // have not registered a particular handle fall through to
-                // the safe floor (`Band::Volatile`), which preserves the
-                // pre-N4.3 behavior of aggressive inlining.
-                //
-                // This is the novel angle that beats openclaude/jcode/
-                // opencode on tokens: they re-serialize every tool result
-                // unconditionally, while we can demote long-lived handles
-                // to a short `<result handle:… — N bytes>` reference.
-                let band = plan
-                    .and_then(|p| p.band_for_handle(h))
-                    .unwrap_or(origin_planner::Band::Volatile);
-
-                match origin_planner::WireDecision::for_block(band, bytes.len()) {
-                    origin_planner::WireDecision::Inline => {
-                        blocks.push(Block::ToolResult {
-                            tool_use_id: tool_use_id.clone(),
-                            handle: None,
-                            inline: Some(bytes),
-                            cache_marker: *cache_marker,
-                            is_error: *is_error,
-                        });
-                    }
-                    origin_planner::WireDecision::Reference => {
-                        let preview =
-                            format!("<result handle:{} \u{2014} {} bytes>", short_hex(h), bytes.len());
-                        blocks.push(Block::ToolResult {
-                            tool_use_id: tool_use_id.clone(),
-                            handle: None,
-                            inline: Some(preview.into_bytes()),
-                            cache_marker: *cache_marker,
-                            is_error: *is_error,
-                        });
-                    }
-                }
-            } else {
-                blocks.push(b.clone());
-            }
-        }
-        out.push(Message { role: m.role, blocks });
-    }
-    // Defense-in-depth at the API boundary: drop any `tool_result` whose
-    // `tool_use` is missing from the preceding message. The Messages API rejects
-    // such an orphan with a hard `400 ... unexpected tool_use_id found in
-    // tool_result blocks`, taking down the whole turn over one malformed entry
-    // deep in the history (e.g. a stranded tail spliced on after a reused session
-    // id, or a compaction hole). Stripping it here keeps a corrupted transcript
-    // recoverable instead of fatal; a well-formed transcript is unchanged.
-    // Two-sided pairing repair at the wire choke: drop orphaned tool_results
-    // AND a trailing orphan tool_use (the latter previously fixed only on the
-    // daemon's interrupt path, leaving resume/corruption/migration to 400).
-    let out = origin_core::types::strip_orphan_tool_results(out);
-    Ok(origin_core::types::strip_trailing_orphan_tool_use(out))
-}
-
 fn load_oauth_metadata(session_id: &str) -> wire::WireMetadata {
     let home = dirs::home_dir().unwrap_or_default();
     let claude_json = home.join(".claude.json");
@@ -1071,14 +972,6 @@ mod cassette {
     }
 }
 
-fn short_hex(h: &[u8; 32]) -> String {
-    origin_cas::Hash::from_bytes(*h)
-        .to_string()
-        .chars()
-        .take(8)
-        .collect()
-}
-
 /// Test-only: build the JSON body that `Provider::chat` would POST to
 /// `/v1/messages`, without any plan, CAS expansion, or network I/O.
 ///
@@ -1113,7 +1006,7 @@ fn encode_request_body_for_test(req: &ChatRequest, plan: Option<&Plan>) -> serde
     // Mirror the production encode pipeline (expand CAS handles + strip orphan
     // tool_results) so tests observe the exact message list the wire encoder
     // places cache markers on — including any index shift from a dropped turn.
-    let expanded = expand_messages_for_wire(&req.messages, None, plan)
+    let expanded = origin_provider::inflate_tool_result_handles(&req.messages, None)
         .expect("test requests carry no CAS handles, so expansion cannot fail");
     let wire_messages = build_wire_messages(&expanded, plan);
     let wire_tools = req

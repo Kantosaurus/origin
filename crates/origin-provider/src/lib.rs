@@ -212,8 +212,8 @@ pub const CAS_MISS_PLACEHOLDER: &str =
 /// Each provider's wire encoder only understands inline content, so a provider
 /// must inflate handles back into bytes before encoding — otherwise the model
 /// receives empty tool results on every follow-up turn and the agentic loop
-/// silently breaks. The Anthropic provider does this with extra Plan-aware
-/// `Reference` downgrading; every other provider can use this plain helper.
+/// silently breaks. Every provider, Anthropic included, uses this helper, so a
+/// fresh tool result always reaches the model verbatim.
 ///
 /// Returns a cloned message vector with handles resolved. A handle present with
 /// no CAS configured is still a hard error (a misconfiguration). A CAS *miss*,

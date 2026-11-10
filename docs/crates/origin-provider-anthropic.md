@@ -71,9 +71,9 @@ A warning fires past Anthropic's 4-marker-per-request ceiling.
 4.7+), older models use `{"type":"enabled","budget_tokens":n}`, and `max_tokens`
 is bumped above the budget.
 
-**Tool results / CAS.** `expand_messages_for_wire` resolves CAS handles, consults
-the `Plan`'s per-handle band to decide inline-vs-`<result handle:… — N bytes>`
-reference, and strips orphan `tool_result` blocks before the API rejects them.
+**Tool results / CAS.** `origin_provider::inflate_tool_result_handles` (shared
+with every provider) inlines each CAS handle's full body verbatim and strips orphan
+`tool_result` blocks before the API rejects them.
 
 **Cassette tap.** `ORIGIN_CASSETTE=record:<path>|replay:<path>` records/replays
 both `chat` JSON and `chat_stream` SSE bodies (secret-scrubbed, save-gated).

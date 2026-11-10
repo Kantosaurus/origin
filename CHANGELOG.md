@@ -4,6 +4,10 @@ All notable changes to `origin` will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely;
 versions correspond to phase milestones from the implementation plan.
 
+## [Unreleased]
+
+- **A1**: on the Anthropic provider, a tool result over 2,048 bytes from a Mutating tool (`Bash`, `Edit`, `Write`, `MultiEdit`, `ApplyPatch`, `Browser`, `Task`, …), or from any handle the shared `Plan` had not registered (e.g. a session resumed after a daemon restart), is now sent to the model verbatim instead of as a `<result handle:XXXXXXXX — N bytes>` stub that `Recall` could not resolve. Anthropic now uses the same `inflate_tool_result_handles` helper as every other provider; `origin_planner::WireDecision` and `INLINE_BYTE_BUDGET` are removed. No escape hatch: the stub was never resolvable, so there is no prior behaviour worth opting back into.
+
 ## 0.9.13
 
 ### Added (harness accuracy — fewer plan/execute errors)

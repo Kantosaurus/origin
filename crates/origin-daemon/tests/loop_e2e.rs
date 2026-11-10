@@ -303,3 +303,113 @@ async fn dispatch_registers_pure_tool_handle_as_sticky_in_shared_plan() {
         "Read (SideEffects::Pure) must map to Band::Sticky in the encoder's plan view"
     );
 }
+
+/// A1 regression: a fresh >2 KiB result from a Mutating tool (Bash) must reach
+/// the model verbatim on the very next request. Drives the production wiring
+/// end to end — real `run_loop`, real Bash, CAS, the shared `Plan` the daemon
+/// gives both sides, and the real `Anthropic` wire encoder against a mock
+/// `/v1/messages` — and asserts on the bytes actually sent.
+#[tokio::test]
+async fn large_bash_result_reaches_anthropic_verbatim_on_next_request() {
+    use origin_provider_anthropic::Anthropic;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let cap = Arc::clone(&bodies);
+    // `seq`/`1..1000` print ~4-5 KB, well over the old 2,048-byte inline budget.
+    let command = if cfg!(windows) { "1..1000" } else { "seq 1 1000" };
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: serde_json::Value = req.body_json().expect("json");
+            let after_tool = body["messages"]
+                .as_array()
+                .and_then(|m| m.last())
+                .is_some_and(|m| m["content"][0]["type"] == "tool_result");
+            cap.lock().expect("lock").push(body);
+            let content = if after_tool {
+                serde_json::json!([{"type": "text", "text": "done"}])
+            } else {
+                serde_json::json!([{"type": "tool_use", "id": "tu_bash", "name": "Bash",
+                                    "input": {"command": command, "timeout": 30}}])
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": content,
+                "usage": {"input_tokens": 1, "output_tokens": 1,
+                          "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().expect("tempdir");
+    let store = Arc::new(
+        Store::open(StoreConfig {
+            root: dir.path().to_path_buf(),
+            hot_capacity: 32,
+            warm_pack_target_bytes: 1024 * 1024,
+            cold_zstd_level: 3,
+        })
+        .expect("store"),
+    );
+    // Production wiring (main.rs): one Plan shared by the provider and the loop.
+    let plan = origin_planner::Plan::default();
+    let provider = Anthropic::with_endpoint(server.uri(), "test", "claude-opus-4-7")
+        .with_cas(Arc::clone(&store))
+        .with_plan(plan.clone());
+    let mut session = Session::new("test", "claude-opus-4-7");
+    let opts = LoopOptions {
+        max_turns: 5,
+        cas: Some(Arc::clone(&store)),
+        relay_tx: None,
+        streaming_disabled: true,
+        plan: Some(plan),
+        ..LoopOptions::default()
+    };
+    run_loop(&mut session, "print some numbers", &provider, &AlwaysAllow, &opts)
+        .await
+        .expect("loop");
+
+    // The full result body the loop stored for this Bash call.
+    let handle = session
+        .messages
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .find_map(|b| match b {
+            Block::ToolResult { handle: Some(h), .. } => Some(*h),
+            _ => None,
+        })
+        .expect("Bash result stored as a CAS handle");
+    let stored = store
+        .get(Hash::from_bytes(handle))
+        .expect("get")
+        .expect("present");
+    assert!(
+        stored.len() > 2048,
+        "fixture must exceed 2,048 bytes, got {}",
+        stored.len()
+    );
+
+    // The first request after the tool call must carry that body verbatim.
+    let next = bodies
+        .lock()
+        .expect("lock")
+        .get(1)
+        .cloned()
+        .expect("a follow-up request after the Bash call");
+    let sent = next["messages"]
+        .as_array()
+        .and_then(|m| m.last())
+        .map(|m| m["content"][0]["content"].clone())
+        .expect("tool_result content");
+    let sent = sent.as_str().expect("content str");
+    assert!(
+        sent.as_bytes() == stored.as_slice(),
+        "Bash result ({} bytes) must be sent verbatim; got {} bytes: {:.120}",
+        stored.len(),
+        sent.len(),
+        sent
+    );
+}

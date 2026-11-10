@@ -1927,8 +1927,7 @@ async fn handle_request(
             // ^ shared with the Anthropic provider's wire-encoder via the
             // `Arc<RwLock<…>>` inside `Plan`. The dispatch loop registers
             // every produced CAS handle (Sticky for Pure tools, Volatile
-            // for Mutating) so the encoder can downgrade `Inline` to
-            // `Reference` on subsequent turns.
+            // for Mutating); the encoder still inlines every result (A1).
             goal: Arc::clone(&active_goal),
             // ^ per-connection goal slot. When `Some(Active|Verifying)` the
             // `run_loop` body renders an `<origin-goal>` block on each turn;

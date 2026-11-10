@@ -2571,15 +2571,12 @@ pub struct LoopOptions {
     /// block) or via `CollectTasks`. `None` (tests / non-daemon) ⇒ every Task awaits
     /// in-turn, byte-identical to the pre-background behaviour.
     pub background_jobs: Option<Arc<crate::bg_jobs::BackgroundJobs>>,
-    /// Optional N4.3 handle→band index, shared with the active provider's
-    /// wire-encoder (the Anthropic provider's `expand_messages_for_wire`
-    /// reads `band_for_handle` to decide `Inline` vs `Reference`). When
-    /// `Some`, the per-tool-result dispatch path calls `register_handle`
-    /// for every CAS handle produced by a tool, classifying the band from
-    /// the tool's `SideEffects` metadata (`Pure` → `Sticky`, `Mutating` →
-    /// `Volatile`). When `None`, no registrations happen and the wire-
-    /// encoder falls through to the `Volatile` floor — exactly the
-    /// behavior before Phase 11 N4.3 landed.
+    /// Optional plan shared with the active provider's wire-encoder (cache
+    /// markers). When `Some`, the per-tool-result dispatch path also calls
+    /// `register_handle` for every CAS handle produced by a tool, classifying
+    /// the band from the tool's `SideEffects` metadata (`Pure` → `Sticky`,
+    /// `Mutating` → `Volatile`). The band never changes what the model sees:
+    /// every tool result is sent verbatim (A1).
     pub plan: Option<origin_planner::Plan>,
     /// Per-connection `/goal` slot. The driver in `main.rs` mutates this
     /// under the lock; `run_loop` reads it while assembling the system
@@ -5759,9 +5756,8 @@ async fn run_loop_inner(
                     .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
 
                 // Phase 11 N4.3 wiring: register the freshly produced handle
-                // with the active Plan so the Anthropic wire-encoder can
-                // downgrade `Inline` → `Reference` for handles whose bodies
-                // are stable enough to cache client-side. Heuristic: a Pure
+                // with the active Plan (informational since A1 — the wire
+                // encoder inlines every result verbatim). Heuristic: a Pure
                 // tool's output is reusable across turns (`Sticky`);
                 // a Mutating tool's output is a snapshot of state that just
                 // changed (`Volatile`, the safe floor). Tools missing meta
