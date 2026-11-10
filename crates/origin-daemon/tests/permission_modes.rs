@@ -249,3 +249,190 @@ async fn tainted_worker_result_taints_the_parent() {
         assert_eq!(session.tainted, tainted, "parent taint follows the worker's");
     }
 }
+
+/// A person who answered "Always allow" for every tool, records each ask
+/// (tool, preview, offered "always"), and approves everything but `deny`.
+struct StandingHuman {
+    asks: Mutex<Vec<(String, String, bool)>>,
+    deny: &'static str,
+}
+
+impl StandingHuman {
+    const fn new(deny: &'static str) -> Self {
+        Self {
+            asks: Mutex::new(Vec::new()),
+            deny,
+        }
+    }
+    fn asks(&self) -> Vec<(String, String, bool)> {
+        self.asks.lock().expect("lock").clone()
+    }
+}
+
+#[async_trait]
+impl origin_permission::prompt::Prompter for StandingHuman {
+    async fn ask(&self, meta: &origin_tools::ToolMeta, preview: &str) -> bool {
+        self.ask_offering(meta, preview, false).await
+    }
+    async fn ask_offering(&self, meta: &origin_tools::ToolMeta, preview: &str, offer_always: bool) -> bool {
+        self.asks
+            .lock()
+            .expect("lock")
+            .push((meta.name.to_owned(), preview.to_owned(), offer_always));
+        meta.name != self.deny
+    }
+    fn standing_allow(&self, _tool: &str) -> bool {
+        true
+    }
+}
+
+/// Spawn one (tainted) worker on `coord` and wait until it is terminal.
+async fn finished_worker(coord: &origin_swarm::Coordinator) -> origin_swarm::WorkerHandle {
+    let spec = origin_swarm::WorkerSpec {
+        goal: "fetch the page".into(),
+        allowed_tools: vec!["WebFetch".into()],
+        budget: origin_swarm::Budget::new(5_000, 10_000, 10_000, 4),
+        workspace: None,
+        parent_actor: origin_plan::ActorId::new(0),
+        model: None,
+        mcp_servers: Vec::new(),
+    };
+    let handle = coord.spawn(spec).await.expect("spawn");
+    for _ in 0..500 {
+        if coord.try_completion(&handle).await.is_some() {
+            return handle;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("worker never finished");
+}
+
+/// The Bash ask after taint: asked (a standing allow no longer covers it),
+/// naming the taint, never offering "always".
+fn assert_bash_asked_after_taint(human: &StandingHuman) {
+    let bash: Vec<_> = human.asks().into_iter().filter(|(t, ..)| t == "Bash").collect();
+    assert_eq!(bash.len(), 1, "{:?}", human.asks());
+    assert!(
+        bash[0].1.contains("external content entered this session"),
+        "{bash:?}"
+    );
+    assert!(!bash[0].2, "a person-ask never offers always");
+}
+
+/// C2 fix round 2: `CollectTasks` returning a tainted worker's result taints the
+/// parent, so a later Bash call is asked despite a standing "Always allow".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collect_tasks_with_a_tainted_worker_taints_the_parent() {
+    let tmp = tempfile::TempDir::new().expect("tmp");
+    let coord = coordinator_reporting(&tmp, true);
+    let handle = finished_worker(&coord).await;
+    let bg = std::sync::Arc::new(origin_daemon::bg_jobs::BackgroundJobs::new());
+    // A self-dispatch id skips the per-turn `<background-results>` drain, so the
+    // finished job is reaped by `CollectTasks` itself (deterministically).
+    let mut session = Session::new_with_id("sched-c2-collect".into(), "m".into());
+    bg.register(
+        &session.id,
+        origin_daemon::bg_jobs::BgJob {
+            id_hex: "w1".into(),
+            goal: "fetch the page".into(),
+            handle,
+            dispatched_at: std::time::Instant::now(),
+        },
+    )
+    .await
+    .expect("register");
+    let provider = ScriptedProvider::new(vec![
+        tool("c", "CollectTasks", &serde_json::json!({})),
+        tool("b", "Bash", &serde_json::json!({ "command": "echo hi" })),
+        Block::text("done"),
+    ]);
+    let mut opts = LoopOptions::default().without_streaming();
+    opts.coordinator = Some(coord);
+    opts.background_jobs = Some(std::sync::Arc::clone(&bg));
+    let human = StandingHuman::new("Bash");
+    run_loop(&mut session, "go", &provider, &human, &opts)
+        .await
+        .expect("run");
+    assert!(session.tainted, "the collected tainted result taints the parent");
+    let (_, collected) = result_of(&session, "c");
+    assert!(collected.contains("\"tainted\":true"), "{collected}");
+    assert_bash_asked_after_taint(&human);
+}
+
+/// C2 fix round 2: the `<background-results>` drain at a turn's start taints
+/// the parent when a reaped worker was tainted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn background_results_drain_taints_the_parent() {
+    let tmp = tempfile::TempDir::new().expect("tmp");
+    let coord = coordinator_reporting(&tmp, true);
+    let handle = finished_worker(&coord).await;
+    let bg = std::sync::Arc::new(origin_daemon::bg_jobs::BackgroundJobs::new());
+    let mut session = Session::new("scripted", "m");
+    bg.register(
+        &session.id,
+        origin_daemon::bg_jobs::BgJob {
+            id_hex: "w1".into(),
+            goal: "fetch the page".into(),
+            handle,
+            dispatched_at: std::time::Instant::now(),
+        },
+    )
+    .await
+    .expect("register");
+    let provider = ScriptedProvider::new(vec![
+        tool("b", "Bash", &serde_json::json!({ "command": "echo hi" })),
+        Block::text("done"),
+    ]);
+    let mut opts = LoopOptions::default().without_streaming();
+    opts.coordinator = Some(coord);
+    opts.background_jobs = Some(bg);
+    let human = StandingHuman::new("Bash");
+    run_loop(&mut session, "go", &provider, &human, &opts)
+        .await
+        .expect("run");
+    assert!(session.tainted, "the drained tainted result taints the parent");
+    assert_bash_asked_after_taint(&human);
+}
+
+/// Serialises the tests that set `ORIGIN_HOME` in this binary.
+static ORIGIN_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// C2 fix round 2: a `RunWorkflow` whose step worker was tainted taints the
+/// parent; `RunWorkflow` itself is asked despite a standing allow and never
+/// offered "always" (each workflow grants different tools).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_workflow_with_a_tainted_step_taints_the_parent() {
+    let _env = ORIGIN_HOME_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().expect("tmp");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(home.join(".origin")).expect("mkdir");
+    std::fs::write(
+        home.join(".origin").join("workflows.toml"),
+        "[[workflows]]\nname = \"wf\"\n[[workflows.steps]]\nid = 0\nskill = \"x\"\nargs = \"fetch it\"\n",
+    )
+    .expect("write workflows");
+    std::env::set_var("ORIGIN_HOME", &home);
+    let provider = ScriptedProvider::new(vec![
+        tool("r", "RunWorkflow", &serde_json::json!({ "name": "wf" })),
+        tool("b", "Bash", &serde_json::json!({ "command": "echo hi" })),
+        Block::text("done"),
+    ]);
+    let mut opts = LoopOptions::default().without_streaming();
+    opts.coordinator = Some(coordinator_reporting(&tmp, true));
+    let mut session = Session::new("scripted", "m");
+    let human = StandingHuman::new("Bash");
+    let res = run_loop(&mut session, "go", &provider, &human, &opts).await;
+    std::env::remove_var("ORIGIN_HOME");
+    res.expect("run");
+    let (err, body) = result_of(&session, "r");
+    assert!(!err && body.contains("\"tainted\":true"), "{body}");
+    assert!(session.tainted, "a tainted step taints the parent");
+    let wf: Vec<_> = human
+        .asks()
+        .into_iter()
+        .filter(|(t, ..)| t == "RunWorkflow")
+        .collect();
+    assert_eq!(wf.len(), 1, "RunWorkflow is asked despite a standing allow");
+    assert!(!wf[0].2, "RunWorkflow is never offered always");
+    assert_bash_asked_after_taint(&human);
+}

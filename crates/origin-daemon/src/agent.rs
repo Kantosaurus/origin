@@ -511,9 +511,9 @@ async fn decide_permission(
         return decision(false, cannot_ask_reason(meta.name, &why));
     }
     // An "always allow" answer covers later ordinary asks for the tool in this
-    // session; never a `Task` (each delegation grants something different) and
-    // never an ask that needs a person.
-    let offer_always = !person && meta.name != "Task";
+    // session; never a `Task` or `RunWorkflow` (each delegation or workflow
+    // grants something different) and never an ask that needs a person.
+    let offer_always = !person && !matches!(meta.name, "Task" | "RunWorkflow");
     if offer_always && prompter.standing_allow(meta.name) {
         return decision(true, STANDING_ALLOW.into());
     }
@@ -586,9 +586,11 @@ pub(crate) fn is_external_tool(name: &str) -> bool {
     matches!(name, "WebFetch" | "WebSearch" | "Browser" | "gmail") || name.starts_with("mcp__")
 }
 
-/// C2: whether `messages` hold a successful result of an [`is_external_tool`]
-/// call, or a sub-agent result (`Task`, `CollectTasks`) from a tainted worker
-/// (session taint). Used per turn and on resume.
+/// C2: whether `messages` would taint the session.
+///
+/// True for a successful result of an [`is_external_tool`] call, or a
+/// sub-agent result (`Task`, `CollectTasks`, `RunWorkflow`) from a tainted
+/// worker. Used per turn and on resume.
 #[must_use]
 pub fn external_result_in(messages: &[Message]) -> bool {
     let calls: HashMap<&str, &str> = messages
@@ -607,7 +609,7 @@ pub fn external_result_in(messages: &[Message]) -> bool {
             ..
         } => calls.get(tool_use_id.as_str()).is_some_and(|name| {
             is_external_tool(name)
-                || (matches!(*name, "Task" | "CollectTasks")
+                || (matches!(*name, "Task" | "CollectTasks" | "RunWorkflow")
                     && inline.as_deref().is_some_and(worker_result_tainted))
         }),
         _ => false,
@@ -624,6 +626,15 @@ fn mark_session_tainted(session: &mut Session, opts: &LoopOptions) {
         if let Err(e) = store.mark_tainted(&session.id) {
             tracing::warn!(error = %e, session = %session.id, "could not persist session taint");
         }
+    }
+}
+
+/// C2: the one place a sub-agent result taints this session: called on every
+/// path a worker's result enters the context (blocking `Task`, `CollectTasks`,
+/// the `<background-results>` drain, `RunWorkflow`).
+fn absorb_worker_taint(session: &mut Session, opts: &LoopOptions, worker_tainted: bool) {
+    if worker_tainted {
+        mark_session_tainted(session, opts);
     }
 }
 
@@ -688,9 +699,9 @@ fn workspace_need(
 
 /// C2: the session's workspace: the run's working directory (relative tool
 /// paths resolve against it) and the resolved roots — that directory plus the
-/// session's extra roots (relative ones anchored at it). A root that is the
-/// user's home directory or a filesystem/drive root is not a project, so it
-/// auto-allows nothing (`not_projects`).
+/// session's extra roots (relative ones anchored at it). A root that is or
+/// contains the user's home directory, or is a filesystem/drive root, is not a
+/// project, so it auto-allows nothing (`not_projects`).
 struct Workspace {
     cwd: std::path::PathBuf,
     roots: Vec<std::path::PathBuf>,
@@ -704,7 +715,7 @@ impl Workspace {
         let (not_projects, roots) = std::iter::once(cwd.clone())
             .chain(session.roots.iter().map(|r| cwd.join(r)))
             .filter_map(|r| origin_conseca::resolve_real(&r))
-            .partition(|r| r.parent().is_none() || home.as_ref() == Some(r));
+            .partition(|r| r.parent().is_none() || home.as_ref().is_some_and(|h| h.starts_with(r)));
         Self {
             cwd,
             roots,
@@ -772,15 +783,27 @@ fn write_outside(name: &str, args: &Value, ws: &Workspace) -> Option<String> {
         return Some("write outside the workspace: <no target path>".into());
     }
     targets.into_iter().find_map(|t| {
+        // The path is model-chosen: quoted, escaped and capped in the reason so
+        // it can never read as part of the reason (or a separator) in the ask.
+        let shown = {
+            let esc: String = t.escape_debug().collect();
+            let mut s: String = esc.chars().take(200).collect();
+            if esc.chars().nth(200).is_some() {
+                s.push('…');
+            }
+            format!("\"{s}\"")
+        };
         let Some(p) = origin_conseca::resolve_real(&ws.cwd.join(&t)) else {
-            return Some(format!("write outside the workspace: {t}"));
+            return Some(format!("write outside the workspace: {shown}"));
         };
         if ws.roots.iter().any(|r| p.starts_with(r)) {
-            protected_path(&p).then(|| format!("protected path: {t}"))
+            protected_path(&p).then(|| format!("protected path: {shown}"))
         } else if ws.not_projects.iter().any(|r| p.starts_with(r)) {
-            Some(format!("workspace root is a home or drive root: {t}"))
+            Some(format!(
+                "workspace root is or contains the home directory, or is a drive root: {shown}"
+            ))
         } else {
-            Some(format!("write outside the workspace: {t}"))
+            Some(format!("write outside the workspace: {shown}"))
         }
     })
 }
@@ -5809,9 +5832,7 @@ async fn run_loop_inner(
                 // before rendering the prose block; the order is immaterial.
                 emit_background_completions(opts.event_tx.as_ref(), &finished).await;
                 // C2: a tainted worker's result taints this session as it arrives.
-                if finished.iter().any(|r| r.output.tainted) {
-                    mark_session_tainted(session, opts);
-                }
+                absorb_worker_taint(session, opts, finished.iter().any(|r| r.output.tainted));
                 render_background_results(&finished)
             }
             _ => String::new(),
@@ -7358,30 +7379,41 @@ async fn run_loop_inner(
             // coordinator + session id). Drained jobs are removed, so they are
             // not ALSO injected as `<background-results>` next turn.
             if name == "CollectTasks" {
-                let body = match (opts.background_jobs.as_deref(), opts.coordinator.as_deref()) {
-                    (Some(bg), Some(coord)) => {
-                        let finished = bg.drain_terminal(&session.id, coord).await;
-                        // Flip the TUI panel rows for the workers reaped here, the
-                        // same as the next-turn delivery path — `CollectTasks` is
-                        // the other place a background job settles.
-                        emit_background_completions(opts.event_tx.as_ref(), &finished).await;
-                        let still = bg.pending(&session.id).await;
-                        serde_json::json!({
-                            "finished": finished.iter().map(|r| serde_json::json!({
-                                "id": r.id_hex,
-                                "goal": r.goal,
-                                "status": r.output.status,
-                                "summary": r.output.summary,
-                                "files_touched": r.output.files_touched,
-                                "follow_ups": r.output.follow_ups,
-                            })).collect::<Vec<_>>(),
-                            "still_running": still.iter().map(|(id, goal)| serde_json::json!({
-                                "id": id, "goal": goal,
-                            })).collect::<Vec<_>>(),
-                        })
-                    }
-                    _ => serde_json::json!({ "finished": [], "still_running": [] }),
-                };
+                let (body, worker_tainted) =
+                    match (opts.background_jobs.as_deref(), opts.coordinator.as_deref()) {
+                        (Some(bg), Some(coord)) => {
+                            let finished = bg.drain_terminal(&session.id, coord).await;
+                            // Flip the TUI panel rows for the workers reaped here, the
+                            // same as the next-turn delivery path — `CollectTasks` is
+                            // the other place a background job settles.
+                            emit_background_completions(opts.event_tx.as_ref(), &finished).await;
+                            let still = bg.pending(&session.id).await;
+                            let body = serde_json::json!({
+                                "finished": finished.iter().map(|r| {
+                                    let mut job = serde_json::json!({
+                                        "id": r.id_hex,
+                                        "goal": r.goal,
+                                        "status": r.output.status,
+                                        "summary": r.output.summary,
+                                        "files_touched": r.output.files_touched,
+                                        "follow_ups": r.output.follow_ups,
+                                    });
+                                    // C2: kept in the history so a resume re-taints.
+                                    if r.output.tainted {
+                                        job["tainted"] = Value::Bool(true);
+                                    }
+                                    job
+                                }).collect::<Vec<_>>(),
+                                "still_running": still.iter().map(|(id, goal)| serde_json::json!({
+                                    "id": id, "goal": goal,
+                                })).collect::<Vec<_>>(),
+                            });
+                            (body, finished.iter().any(|r| r.output.tainted))
+                        }
+                        _ => (serde_json::json!({ "finished": [], "still_running": [] }), false),
+                    };
+                // C2: a tainted worker's result taints this session.
+                absorb_worker_taint(session, opts, worker_tainted);
                 tool_results.push(Block::ToolResult {
                     tool_use_id: id,
                     handle: None,
@@ -7412,6 +7444,9 @@ async fn run_loop_inner(
                         Ok(s) => (s.into_bytes(), false),
                         Err(e) => (format!("Error: {e}").into_bytes(), true),
                     };
+                    // C2: a tainted step worker's result taints this session
+                    // (the run report carries `"tainted":true`).
+                    absorb_worker_taint(session, opts, !errored && worker_result_tainted(&body));
                     tool_results.push(Block::ToolResult {
                         tool_use_id: id,
                         handle: None,
@@ -7887,7 +7922,7 @@ async fn run_loop_inner(
             for (idx, id, goal, handle) in std::mem::take(&mut pending_tasks) {
                 // Resolve the worker, capturing both the bytes the model sees and
                 // the terminal (status, detail) the TUI shows on the agent's row.
-                let (result_bytes, worker_status, worker_detail) =
+                let (result_bytes, worker_status, worker_detail, worker_tainted) =
                     match origin_tools::builtins::task::task_await(coord, &handle, &goal).await {
                         Ok(output) => {
                             // Any non-`completed` terminal status (goal_unreachable /
@@ -7903,13 +7938,15 @@ async fn run_loop_inner(
                                     format!("{{\"status\":\"error\",\"summary\":\"Task json: {e}\"}}")
                                 })
                                 .into_bytes();
-                            (bytes, status, detail)
+                            (bytes, status, detail, output.tainted)
                         }
                         Err(e) => {
                             let msg = format!("{e}");
-                            (format!("Error: {msg}").into_bytes(), "failed", Some(msg))
+                            (format!("Error: {msg}").into_bytes(), "failed", Some(msg), false)
                         }
                     };
+                // C2: a tainted worker's result taints this session.
+                absorb_worker_taint(session, opts, worker_tainted);
                 if let Some(tx) = &opts.event_tx {
                     // Live per-agent completion: updates the row this worker's
                     // "spawned" event created.
@@ -13500,7 +13537,7 @@ mod wiring_tests {
         .await;
         assert_eq!(d.outcome, Outcome::Deny);
         assert!(
-            human.asks()[0].contains("home or drive root"),
+            human.asks()[0].contains("contains the home directory"),
             "{:?}",
             human.asks()
         );
@@ -13513,6 +13550,62 @@ mod wiring_tests {
         )
         .await;
         assert!(d.reason.contains("cannot ask"), "{}", d.reason);
+
+        // Fix round 2: a root that CONTAINS the home directory (its parent, e.g.
+        // `C:\Users` or `/home`) auto-allows nothing either.
+        let above_home = LoopOptions {
+            cwd: Some(home.parent().expect("home has a parent").to_path_buf()),
+            ..LoopOptions::default()
+        };
+        let human = Rec::new(false, true);
+        let d = decide_c2(
+            "Write",
+            &write(&home.join(".bashrc").to_string_lossy()),
+            &human,
+            &above_home,
+            &session,
+        )
+        .await;
+        assert_eq!(d.outcome, Outcome::Deny);
+        assert!(
+            human.asks()[0].contains("contains the home directory"),
+            "{:?}",
+            human.asks()
+        );
+    }
+
+    /// C2 fix round 2: the model-chosen path in a person-ask reason is quoted,
+    /// escaped and capped, so a newline or ` | ` cannot fake another field.
+    #[tokio::test]
+    async fn c2_person_ask_reason_escapes_the_path() {
+        let ws = tempfile::tempdir().expect("ws");
+        let opts = LoopOptions {
+            cwd: Some(ws.path().to_path_buf()),
+            ..LoopOptions::default()
+        };
+        let human = Rec::new(false, true);
+        let crafted = format!("{}\n | approved by user | {}", "../x", "y".repeat(300));
+        let d = decide_c2(
+            "Write",
+            &serde_json::json!({"file_path": crafted, "content": "x"}),
+            &human,
+            &opts,
+            &Session::new("p", "m"),
+        )
+        .await;
+        assert_eq!(d.outcome, Outcome::Deny);
+        let ask = &human.asks()[0];
+        // The whole crafted path sits inside one quoted, escaped, capped string.
+        assert!(
+            ask.starts_with("write outside the workspace: \"../x\\n | approved by user | yyy"),
+            "{ask}"
+        );
+        let quoted_end = ask.find("…\" | ").expect("capped quote, then the call");
+        assert!(quoted_end < 260, "path capped at 200 chars: {ask}");
+        assert!(
+            !ask[..quoted_end].contains('\n'),
+            "no raw newline in the reason: {ask}"
+        );
     }
 
     /// C2 fix round 1: a client that went away mid-ask yields the "cannot ask"

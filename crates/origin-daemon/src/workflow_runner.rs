@@ -79,6 +79,10 @@ pub struct RunReport {
     pub layers: usize,
     /// Per-step outcomes, in execution order (layer-major, then step order).
     pub steps: Vec<StepReport>,
+    /// C2: some step's worker was tainted (network/MCP content entered its
+    /// context); the calling session becomes tainted too. Omitted when `false`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tainted: bool,
 }
 
 /// Map a daemon [`Workflow`]'s steps into dependency layers of **positions**
@@ -209,6 +213,7 @@ pub async fn run_workflow(
 ) -> Result<RunReport, RunError> {
     let layers = compute_layers(workflow)?;
     let mut steps_out: Vec<StepReport> = Vec::with_capacity(workflow.steps.len());
+    let mut tainted = false;
 
     for (layer_idx, layer) in layers.iter().enumerate() {
         // Spawn EVERY step in this layer before awaiting any of them — this is
@@ -237,6 +242,7 @@ pub async fn run_workflow(
         for (pos, handle, goal_preview) in handles {
             match coordinator.await_completion(&handle).await {
                 Ok(report) => {
+                    tainted |= report.tainted;
                     if let Some(tx) = event_tx {
                         // Only `Completed` is a panel "success"; every other
                         // terminal state shows as a failed row.
@@ -287,6 +293,7 @@ pub async fn run_workflow(
         name: workflow.name.clone(),
         layers: layers.len(),
         steps: steps_out,
+        tainted,
     })
 }
 
