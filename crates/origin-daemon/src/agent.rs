@@ -3007,8 +3007,9 @@ pub struct LoopSummary {
     pub gate_signals: Option<String>,
 }
 
-/// A8: consecutive tool denials in one run before it stops with
-/// [`LoopError::Denied`]. Below this, a denial is an `is_error` tool result.
+/// A8: consecutive assistant turns whose tool calls were all denied before the
+/// run stops with [`LoopError::Denied`]. Below the caps, a denial is an
+/// `is_error` tool result and the loop continues.
 const MAX_CONSECUTIVE_DENIALS: u32 = 3;
 /// A8: total tool denials in one run before it stops with [`LoopError::Denied`].
 const MAX_TOTAL_DENIALS: u32 = 20;
@@ -4063,8 +4064,9 @@ async fn run_loop_inner(
     let mut browser_action_count: u32 = 0;
 
     // A8: a denied tool call goes back to the model as an `is_error` result and
-    // the loop continues; only repeated denials stop the run. Consecutive resets
-    // on any allowed call.
+    // the loop continues; only repeated denials stop the run. `consecutive`
+    // counts all-denied assistant turns (any allowed call resets it); `total`
+    // counts denied calls. Both caps are checked once the batch is answered.
     let mut consecutive_denials: u32 = 0;
     let mut total_denials: u32 = 0;
 
@@ -4959,6 +4961,9 @@ async fn run_loop_inner(
         // pre-runs were computed while streaming, before ANY call in the batch
         // ran, so after a mutation they may hold pre-mutation bytes.
         let mut batch_mutated = false;
+        // A8: per-turn denial bookkeeping; see `consecutive_denials`.
+        let mut turn_allowed = false;
+        let mut turn_denied: Option<String> = None;
         for (id, name, input_bytes) in tool_uses {
             let Some(meta) = registry_iter().find(|m| m.name == name) else {
                 // gap 9b: a name absent from the compile-time registry may be a
@@ -4968,6 +4973,12 @@ async fn run_loop_inner(
                 if let Some(tool) = runtime_tool(&name) {
                     let args: Value = serde_json::from_slice(&input_bytes).unwrap_or(Value::Null);
                     let allowed = prompter.ask(tool.meta(), &args.to_string()).await;
+                    if allowed {
+                        turn_allowed = true;
+                    } else {
+                        total_denials += 1;
+                        turn_denied = Some(name.clone());
+                    }
                     let (inline, errored) = if allowed {
                         match tool.invoke(args).await {
                             Ok(v) => (serde_json::to_vec(&v).unwrap_or_else(|_| b"null".to_vec()), false),
@@ -5149,11 +5160,8 @@ async fn run_loop_inner(
                 if let Some(m) = opts.metrics.as_deref() {
                     m.tool_call_total(provider.name(), &name, "denied").inc();
                 }
-                consecutive_denials += 1;
                 total_denials += 1;
-                if consecutive_denials >= MAX_CONSECUTIVE_DENIALS || total_denials >= MAX_TOTAL_DENIALS {
-                    return Err(LoopError::Denied(name.clone()));
-                }
+                turn_denied = Some(name.clone());
                 let msg = format!(
                     "permission denied for `{name}` (tier={:?}; {}). The call was not executed. \
                      Do not retry it unchanged: take a different approach or ask the user.",
@@ -5178,7 +5186,7 @@ async fn run_loop_inner(
                 });
                 continue;
             }
-            consecutive_denials = 0;
+            turn_allowed = true;
 
             // --- ponytail dependency gate (ponytail-native) ---
             // After permission/governance has ALLOWED the tool, intercept the
@@ -6077,6 +6085,20 @@ async fn run_loop_inner(
         let mut tool_msg = Message::new(Role::Tool);
         tool_msg.blocks = tool_results;
         session.push(tool_msg);
+
+        // A8: denial caps, checked only now so a stop never leaves a `tool_use`
+        // unanswered. A turn with a denial and no allowed call counts once
+        // toward the consecutive cap; any allowed call resets it.
+        if turn_allowed {
+            consecutive_denials = 0;
+        } else if turn_denied.is_some() {
+            consecutive_denials += 1;
+        }
+        if let Some(denied) = turn_denied {
+            if consecutive_denials >= MAX_CONSECUTIVE_DENIALS || total_denials >= MAX_TOTAL_DENIALS {
+                return Err(LoopError::Denied(denied));
+            }
+        }
 
         // Live transcript compaction (P5.4 runtime wiring). With the freshly
         // closed turn now appended, fold the oldest summarized turns into their
