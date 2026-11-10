@@ -6724,6 +6724,18 @@ async fn run_loop_inner(
                 turn,
             ));
 
+            let gate_signals = {
+                let mut s = String::new();
+                for b in [&compile_check_block, &test_block] {
+                    if !b.is_empty() {
+                        if !s.is_empty() {
+                            s.push_str("\n\n");
+                        }
+                        s.push_str(b);
+                    }
+                }
+                (!s.is_empty()).then_some(s)
+            };
             // C8: ending red after a green turn of this run ⇒ tell the user how
             // to get back there, once, on the final result (event stream and
             // summary). Kept out of the conversation: the model would read the
@@ -6741,18 +6753,6 @@ async fn run_loop_inner(
                     text + &note
                 }
                 _ => text,
-            };
-            let gate_signals = {
-                let mut s = String::new();
-                for b in [&compile_check_block, &test_block] {
-                    if !b.is_empty() {
-                        if !s.is_empty() {
-                            s.push_str("\n\n");
-                        }
-                        s.push_str(b);
-                    }
-                }
-                (!s.is_empty()).then_some(s)
             };
             return Ok(LoopSummary {
                 assistant_text: text,
