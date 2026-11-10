@@ -577,6 +577,27 @@ async fn long_answers_are_bounded() {
     assert!(out.ends_with('…'));
 }
 
+/// C9 x C4: the cheap model never sees a configured secret value in the page.
+#[tokio::test]
+async fn the_quarantine_model_sees_the_page_redacted() {
+    const KEY: &str = "sk-ant-c4-quarantine-0123456789";
+    origin_daemon::redact::install(origin_daemon::redact::Redactor::new([(
+        "ANTHROPIC_API_KEY".to_string(),
+        KEY.to_string(),
+    )]));
+    let _g = ENV_LOCK.lock().await;
+    set_env(false);
+    let provider = Scripted::new(Vec::new(), Ok("answer"));
+    let args = json!({ "url": "https://a.test", "prompt": "q" });
+    quarantine_web_fetch(&provider, &args, format!("key={KEY}"))
+        .await
+        .unwrap();
+    let Block::Text { text: user, .. } = &provider.seen()[0].messages[0].blocks[0] else {
+        panic!("quarantine user message is text")
+    };
+    assert!(!user.contains(KEY) && user.contains("[REDACTED:ANTHROPIC_API_KEY]"), "{user}");
+}
+
 /// A page larger than the cheap model's window is cut to fit, not refused.
 #[tokio::test]
 async fn an_oversized_page_is_cut_to_the_quarantine_window() {

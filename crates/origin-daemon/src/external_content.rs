@@ -187,6 +187,9 @@ pub async fn quarantine_web_fetch(
     };
     let prompt = args.get("prompt").and_then(Value::as_str).unwrap_or_default();
     let url = external_source("WebFetch", args).and_then(|(_, u)| u);
+    // C9: the cheap model sees the page before the loop's capture-point
+    // redaction does, so redact it here (before the cut, so no value is split).
+    let page = crate::redact::string(page);
     // Fit the page into the cheap model's window instead of failing closed on a
     // long page. Half the window is headroom: system prompt, question, answer,
     // and text that tokenises denser than `BYTES_PER_TOKEN`.
