@@ -42,8 +42,33 @@ fn reply(b: Block) -> ChatResponse {
     }
 }
 
+/// Serialises the tests: they set process-wide env vars.
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn a_cwd_run_with_lsp_on_and_the_syntax_gate_off_still_gets_per_turn_test_results() {
+    let second = second_request_text(true).await;
+    assert!(
+        second.contains("<test-results>"),
+        "the per-turn test gate never ran: {second}"
+    );
+}
+
+/// A12: with LSP diagnostics AND the syntax gate off, an armed per-turn test
+/// gate still sees the edit.
+#[tokio::test]
+async fn lsp_and_the_syntax_gate_off_still_get_per_turn_test_results() {
+    let second = second_request_text(false).await;
+    assert!(
+        second.contains("<test-results>"),
+        "the per-turn test gate never ran: {second}"
+    );
+}
+
+/// One `Write` in a cwd run with the syntax gate off, LSP diagnostics `lsp`,
+/// and a red `auto_test`; the text of the request after the edit.
+async fn second_request_text(lsp: bool) -> String {
+    let _env = ENV_LOCK.lock().await;
     let ws = tempfile::tempdir().unwrap();
     let write = Block::ToolUse {
         id: "tu_w".into(),
@@ -64,7 +89,11 @@ async fn a_cwd_run_with_lsp_on_and_the_syntax_gate_off_still_gets_per_turn_test_
         })),
         ..LoopOptions::default().without_streaming()
     };
-    std::env::set_var("ORIGIN_LSP_DIAGNOSTICS", "1");
+    if lsp {
+        std::env::set_var("ORIGIN_LSP_DIAGNOSTICS", "1");
+    } else {
+        std::env::remove_var("ORIGIN_LSP_DIAGNOSTICS");
+    }
     std::env::set_var("ORIGIN_EDIT_CHECK", "0");
     std::env::remove_var("ORIGIN_CMD_GUARD");
     let mut session = Session::new("test", "claude-opus-4-7");
@@ -73,7 +102,7 @@ async fn a_cwd_run_with_lsp_on_and_the_syntax_gate_off_still_gets_per_turn_test_
     let _ = run_loop(&mut session, "write it", &provider, &AlwaysAllow, &opts).await;
 
     let seen = provider.seen.lock().unwrap().clone();
-    let second = seen[1]
+    seen[1]
         .iter()
         .flat_map(|m| &m.blocks)
         .filter_map(|b| match b {
@@ -81,9 +110,5 @@ async fn a_cwd_run_with_lsp_on_and_the_syntax_gate_off_still_gets_per_turn_test_
             _ => None,
         })
         .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        second.contains("<test-results>"),
-        "the per-turn test gate never ran: {second}"
-    );
+        .join("\n")
 }
