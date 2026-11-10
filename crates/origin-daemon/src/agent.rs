@@ -53,10 +53,26 @@ fn checkpoint_with_label(label: &str, root: &std::path::Path) -> Option<String> 
     match sg.snapshot(label, now_ms) {
         Ok(checkpoint) => Some(checkpoint.id),
         Err(e) => {
-            tracing::debug!(error = %e, "shadow-git checkpoint failed (ignored)");
+            // C8: the first failure in a run is a warning, so a user with
+            // checkpoints on learns they are not being taken; repeats stay quiet.
+            if CHECKPOINT_WARNED.try_with(|w| w.replace(true)).unwrap_or(false) {
+                tracing::debug!(error = %e, "shadow-git checkpoint failed (ignored)");
+            } else {
+                tracing::warn!(
+                    error = %e, shadow = %shadow_dir.display(),
+                    "shadow-git checkpoint failed; checkpoints are not being taken (further failures \
+                     in this run are logged at debug)"
+                );
+            }
             None
         }
     }
+}
+
+tokio::task_local! {
+    /// C8: set for the duration of one [`run_loop`]; whether that run already
+    /// warned about a failed checkpoint.
+    static CHECKPOINT_WARNED: std::cell::Cell<bool>;
 }
 
 /// Fire `PreCommit` (informational), take a shadow-git checkpoint via
@@ -5015,7 +5031,12 @@ pub async fn run_loop(
     opts: &LoopOptions,
 ) -> Result<LoopSummary, LoopError> {
     let started = std::time::Instant::now();
-    let result = run_loop_inner(session, user_text, provider, prompter, opts).await;
+    let result = CHECKPOINT_WARNED
+        .scope(
+            std::cell::Cell::new(false),
+            run_loop_inner(session, user_text, provider, prompter, opts),
+        )
+        .await;
     if let Err(e) = &result {
         // `MaxTurns` already emitted its own `BudgetExhausted` bucket inside
         // the inner loop; every other error is a fatal, unrecovered exit ⇒
@@ -12093,6 +12114,23 @@ mod wiring_tests {
         let enabled = std::env::var("ORIGIN_CHECKPOINTS").as_deref() == Ok("1");
         assert!(!enabled, "checkpoints must be opt-in via ORIGIN_CHECKPOINTS=1");
         maybe_checkpoint_turn_with_hooks(std::env::current_dir().ok().as_deref()).await;
+    }
+
+    /// C8: a run's first failed checkpoint takes the warn branch (and marks
+    /// the run), so later failures in the same run drop to debug.
+    #[tokio::test]
+    async fn a_failed_checkpoint_warns_once_per_run() {
+        let dir = tempfile::tempdir().expect("tempdir"); // no shadow repo
+        CHECKPOINT_WARNED
+            .scope(std::cell::Cell::new(false), async {
+                assert!(checkpoint_with_label("x", dir.path()).is_none());
+                assert!(
+                    CHECKPOINT_WARNED.with(std::cell::Cell::get),
+                    "first failure warned"
+                );
+                assert!(checkpoint_with_label("y", dir.path()).is_none());
+            })
+            .await;
     }
 
     /// WS-S: the per-tool checkpoint gate is OFF by default and INDEPENDENT of

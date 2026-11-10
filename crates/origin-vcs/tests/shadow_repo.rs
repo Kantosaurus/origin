@@ -61,6 +61,7 @@ impl Repo {
         for (hook, body) in [
             ("pre-commit", "#!/bin/sh\nexit 1\n".to_string()),
             ("reference-transaction", touch.clone()),
+            ("post-index-change", touch.clone()),
             ("post-checkout", touch),
         ] {
             let p = hooks.join(hook);
@@ -224,6 +225,47 @@ fn a_full_restore_to_a_legacy_checkpoint_that_recorded_the_shadow_keeps_it_worki
     r.shadow().restore(&a, &RestoreMode::Full).expect("restore");
     assert_eq!(r.read("a.txt").as_deref(), Some("A"));
     r.assert_intact(&a);
+}
+
+/// One old self-tracking checkpoint: `add -A` with nothing excluded.
+fn legacy_commit(r: &Repo, body: &str) -> String {
+    r.write("a.txt", body);
+    r.raw(&["add", "-A"]);
+    r.raw(&["commit", "-q", "-m", body]);
+    r.raw(&["rev-parse", "HEAD"]).trim().to_string()
+}
+
+#[test]
+fn a_snapshot_after_a_full_rewind_of_a_two_commit_legacy_shadow_succeeds() {
+    // The index still holds the newer commit's shadow entries while HEAD is
+    // the older one: they match neither HEAD nor the files.
+    let r = Repo::new("legacy-two");
+    let a = legacy_commit(&r, "A");
+    legacy_commit(&r, "B");
+    r.shadow().restore(&a, &RestoreMode::Full).expect("restore");
+    let next = r
+        .shadow()
+        .snapshot("after", 3)
+        .expect("snapshot after the rewind");
+    assert!(no_shadow_paths(&r.tree(&next.id)), "{:?}", r.tree(&next.id));
+    assert_eq!(r.read("a.txt").as_deref(), Some("A"));
+    assert!(!r.hook_ran(), "the user's hooks ran inside a shadow command");
+}
+
+#[test]
+fn a_snapshot_after_a_failed_legacy_commit_succeeds() {
+    // The old `add -A` ran, then its commit failed (signing, a hook): the
+    // index holds shadow files that have changed on disk since.
+    let r = Repo::new("legacy-failed");
+    legacy_commit(&r, "A");
+    r.write("a.txt", "B");
+    r.raw(&["add", "-A"]);
+    r.raw(&["update-ref", "refs/tags/moved", "HEAD"]);
+    let next = r
+        .shadow()
+        .snapshot("after", 3)
+        .expect("snapshot after the failed commit");
+    assert!(no_shadow_paths(&r.tree(&next.id)), "{:?}", r.tree(&next.id));
 }
 
 #[test]

@@ -91,7 +91,9 @@ pub enum RestoreMode {
     WorkingTree,
     /// Restore only the listed paths from the checkpoint.
     Files(Vec<String>),
-    /// Hard-reset HEAD and the working tree to the checkpoint (full rewind).
+    /// Make the index and working tree match the checkpoint (removing tracked
+    /// files it lacks), then move HEAD to it (full rewind). The shadow repo's
+    /// own directory is never touched. Needs git 2.23+ (`git restore`).
     Full,
 }
 
@@ -126,7 +128,8 @@ impl<'a> ShadowGit<'a> {
         self.runner.run(&full)
     }
 
-    /// [`Self::git`] for a command that writes commits, refs or the work tree:
+    /// [`Self::git`] for a command that writes the index, commits, refs or the
+    /// work tree:
     /// it runs self-contained — never the user's hooks (`core.hooksPath` points
     /// at the shadow's own sample-only hooks dir), never commit signing, and
     /// with a fixed identity — so the user's global git config cannot make it
@@ -164,10 +167,21 @@ impl<'a> ShadowGit<'a> {
     /// Returns [`VcsError::Git`] if any underlying git command fails.
     pub fn snapshot(&self, label: &str, now_ms: u64) -> Result<Checkpoint, VcsError> {
         // C8: never record the shadow repo itself; untrack it where an older
-        // checkpoint did.
-        self.git(&["rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", SHADOW_REL])?;
-        self.git(&["add", "-A", "--", ".", NOT_SHADOW])?;
-        let staged = self.git(&["diff", "--cached", "--name-only"])?;
+        // checkpoint did. `-f`: a legacy index can hold shadow entries that
+        // match neither HEAD nor the file, and plain `rm --cached` refuses
+        // those (with `--cached`, `-f` only edits the index).
+        self.git_isolated(&[
+            "rm",
+            "-r",
+            "-q",
+            "-f",
+            "--cached",
+            "--ignore-unmatch",
+            "--",
+            SHADOW_REL,
+        ])?;
+        self.git_isolated(&["add", "-A", "--", ".", NOT_SHADOW])?;
+        let staged = self.git_isolated(&["diff", "--cached", "--name-only"])?;
         let files = staged.lines().filter(|l| !l.trim().is_empty()).count();
         let files_changed = u32::try_from(files).unwrap_or(u32::MAX);
 
@@ -243,7 +257,7 @@ impl<'a> ShadowGit<'a> {
     /// Returns [`VcsError::Git`] if `git status` fails.
     pub fn unchanged_head(&self) -> Result<Option<String>, VcsError> {
         if !self
-            .git(&["status", "--porcelain", "--", ".", NOT_SHADOW])?
+            .git_isolated(&["status", "--porcelain", "--", ".", NOT_SHADOW])?
             .trim()
             .is_empty()
         {

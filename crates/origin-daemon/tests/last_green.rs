@@ -8,6 +8,7 @@
 use async_trait::async_trait;
 use origin_core::types::{Block, Message, Role};
 use origin_daemon::agent::{run_loop, scope_runtime_tools, LoopOptions};
+use origin_daemon::protocol::StreamEvent;
 use origin_daemon::session::Session;
 use origin_permission::prompt::AlwaysAllow;
 use origin_postedit::PostEditConfig;
@@ -127,17 +128,20 @@ fn test_gate(cmd: &str, repairs: u32) -> PostEditConfig {
 /// asks for commit signing with a gpg that does not exist, so a checkpoint
 /// commit that is not self-contained fails.
 fn run(ws: &Path, checkpoints: bool, cfg: PostEditConfig, turns: Vec<Block>) -> (String, Session) {
-    run_as(ws, checkpoints, cfg, turns, false)
+    let gate = checkpoints.then_some("ORIGIN_CHECKPOINTS");
+    run_as(ws, gate, cfg, turns, false, None)
 }
 
-/// [`run`], optionally as a swarm worker runs it: inside
-/// `scope_runtime_tools` (`swarm_worker.rs` always installs it).
+/// [`run`] with checkpoints enabled by the env var `gate` (if any),
+/// optionally as a swarm worker runs it (inside `scope_runtime_tools`, which
+/// `swarm_worker.rs` always installs), optionally with a UI event channel.
 fn run_as(
     ws: &Path,
-    checkpoints: bool,
+    gate: Option<&str>,
     cfg: PostEditConfig,
     turns: Vec<Block>,
     worker: bool,
+    events: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
 ) -> (String, Session) {
     let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let global = ws.join("hostile.gitconfig");
@@ -148,12 +152,12 @@ fn run_as(
     .expect("write gitconfig");
     std::env::set_var("GIT_CONFIG_GLOBAL", &global);
     std::env::set_var("ORIGIN_ENV_PASSTHROUGH", "GIT_CONFIG_GLOBAL");
-    std::env::remove_var("ORIGIN_CHECKPOINTS_PER_TOOL");
     std::env::remove_var("ORIGIN_CMD_GUARD");
-    if checkpoints {
-        std::env::set_var("ORIGIN_CHECKPOINTS", "1");
-    } else {
-        std::env::remove_var("ORIGIN_CHECKPOINTS");
+    for k in ["ORIGIN_CHECKPOINTS", "ORIGIN_CHECKPOINTS_PER_TOOL"] {
+        std::env::remove_var(k);
+    }
+    if let Some(k) = gate {
+        std::env::set_var(k, "1");
     }
     let provider = ScriptedProvider {
         responses: Mutex::new(
@@ -169,6 +173,7 @@ fn run_as(
     let opts = LoopOptions {
         cwd: Some(ws.to_path_buf()),
         post_edit: Some(Arc::new(cfg)),
+        event_tx: events,
         ..LoopOptions::default().without_streaming()
     };
     let mut session = Session::new("last-green", "scripted-model");
@@ -184,6 +189,7 @@ fn run_as(
     };
     for k in [
         "ORIGIN_CHECKPOINTS",
+        "ORIGIN_CHECKPOINTS_PER_TOOL",
         "GIT_CONFIG_GLOBAL",
         "ORIGIN_ENV_PASSTHROUGH",
     ] {
@@ -293,10 +299,57 @@ fn a_red_end_after_a_green_turn_tells_the_user_how_to_restore_once() {
 fn a_swarm_worker_run_tags_but_returns_no_note() {
     // A worker's final text is its parent model's tool result.
     let ws = workspace();
-    let (text, _) = run_as(ws.path(), true, test_gate(GATE, 1), green_then_red(), true);
+    let cp = Some("ORIGIN_CHECKPOINTS");
+    let (text, _) = run_as(ws.path(), cp, test_gate(GATE, 1), green_then_red(), true, None);
     assert!(!text.contains(NOTE), "{text}");
     let files = tree(ws.path(), TAG);
     assert!(files.iter().any(|l| l == "ok.txt"), "still tagged: {files:?}");
+}
+
+#[test]
+fn the_note_reaches_the_event_stream_once_after_the_final_response() {
+    let ws = workspace();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+    let cp = Some("ORIGIN_CHECKPOINTS");
+    run_as(
+        ws.path(),
+        cp,
+        test_gate(GATE, 1),
+        green_then_red(),
+        false,
+        Some(tx),
+    );
+    let events: Vec<StreamEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    let notes: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, StreamEvent::TextDelta { text } if text.contains(NOTE)))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(notes.len(), 1, "{events:?}");
+    // After the model's final response (its usage record follows each reply).
+    let last_reply = events
+        .iter()
+        .rposition(|e| matches!(e, StreamEvent::RequestUsage { .. }))
+        .expect("usage records");
+    assert!(notes[0] > last_reply, "{events:?}");
+}
+
+#[test]
+fn per_tool_checkpoints_alone_enable_tagging_and_the_note() {
+    let ws = workspace();
+    let per_tool = Some("ORIGIN_CHECKPOINTS_PER_TOOL");
+    let (text, _) = run_as(
+        ws.path(),
+        per_tool,
+        test_gate(GATE, 1),
+        green_then_red(),
+        false,
+        None,
+    );
+    let files = tree(ws.path(), TAG);
+    assert!(files.iter().any(|l| l == "ok.txt"), "tagged: {files:?}");
+    assert!(text.contains(NOTE), "{text}");
 }
 
 #[test]
