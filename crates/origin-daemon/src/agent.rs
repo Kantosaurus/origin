@@ -6538,6 +6538,10 @@ async fn run_loop_inner(
         // empty string ⇒ nothing appended ⇒ byte-identical turn. Draining
         // consumes the notices so each is shown exactly once.
         let swarm_notices_block = SWARM_COLLAB.try_with(drain_own_swarm_notices).unwrap_or_default();
+        // A2: a sibling worker has changed files the memo may hold.
+        if !swarm_notices_block.is_empty() {
+            cache.clear();
+        }
         // Non-blocking swarm delivery: drain any background sub-agents that have
         // FINISHED and add their results to the history as a
         // `<background-results>` block. Draining removes them (delivered once).
