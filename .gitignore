@@ -6,7 +6,6 @@
 /target-test/
 **/*.rs.bk
 *.pdb
-/bench/regression/out/
 
 # Local gaps analysis / planning docs — kept on disk, not tracked
 /Gaps.md
@@ -36,6 +35,9 @@ desktop.ini
 .env
 .env.*
 !.env.example
+
+# Regression-benchmark scratch results (bench/regression/baselines/ stays tracked)
+/bench/regression/out/
 
 # Logs / temp
 *.log

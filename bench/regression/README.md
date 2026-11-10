@@ -8,7 +8,9 @@ model and effort, on tasks drawn from origin's own past failures.
 > **Run it only inside a disposable container or VM.** The runner sets
 > `ORIGIN_ALLOW_ALL=1` for the `origin run` child, which auto-approves every tool
 > (shell commands included) in a headless run. Never point it at a machine or
-> checkout you care about.
+> checkout you care about. `BENCH_KILL_DAEMON=1` runs `pkill -f origin-daemon`,
+> which kills every origin daemon on the host, another reason to keep the run alone
+> in its container.
 
 ## Protocol
 
@@ -34,8 +36,11 @@ model and effort, on tasks drawn from origin's own past failures.
 
 With 20–50 tasks, a difference of 2–3 points between two single runs is noise.
 Treat a change as real only when it exceeds that and holds on pass^k as well as
-pass@1, or when it reproduces in a second run. Token and dollar differences are less
-noisy than pass rates, but check them across all trials, not one.
+pass@1, or when it reproduces in a second run. At this size one task flipping moves
+pass@1 by 2–5 points, so alongside the rates report how many tasks flipped in
+each direction between the paired runs (fail→pass and pass→fail, by task id and
+trial index). Token and dollar differences are less noisy than pass rates, but check
+them across all trials, not one.
 
 ## Task files
 
@@ -52,7 +57,7 @@ tasks/<id>/repo/...        # fixture tasks only
   "id": "fix-in-other-file",
   "repo": { "fixture": "repo" },
   "prompt": "test_slug.py fails: ... Find the root cause and fix it ...",
-  "verify": { "cmd": ["{python}", "-m", "unittest", "-q"], "expect_exit": 0 },
+  "verify": { "cmd": ["{python}", "-m", "unittest", "-q"], "expect_exit": 0, "restore": ["test_slug.py"] },
   "timeout_s": 900
 }
 ```
@@ -64,13 +69,16 @@ tasks/<id>/repo/...        # fixture tasks only
 | `repo.git` + `repo.commit` | Starting repo instead: a git URL and the commit to check out. Use exactly one of `fixture` / `git`. |
 | `prompt` | The text passed to `origin run`. |
 | `verify.cmd` | The check, as an argv list, run in the repo after origin finishes. `{python}` is replaced with the runner's own Python. |
-| `verify.expect_exit` | The trial passes iff the check exits with this status. |
-| `timeout_s` | Cap for `origin run` (and separately for the check). A timed-out run still gets checked. |
+| `verify.expect_exit` | The trial passes iff the check exits with this status (a timed-out check fails). |
+| `verify.restore` | Optional, but set it: files or directories (relative to the repo) put back exactly as in the untouched repo before the check runs, so the agent cannot pass by weakening or deleting the tests. A restored directory is replaced whole. If any of them differed from what the agent left, the trial row says `tests_modified: true`. |
+| `timeout_s` | Cap for `origin run` (and separately for the check). On timeout the whole process tree is killed. A timed-out run still gets checked. |
 
-Before any trial, the runner runs the check on the untouched repo and rejects the
-task if it already passes: a task the agent cannot fail measures nothing. `--dry-run`
-never touches the network, so it does this check for fixture tasks only; for a git
-task it validates the fields and prints the clone command it would run.
+Pre-flight: before the first trial of the run, every task is set up (fixture copied,
+or repo cloned) and its check is run on the untouched repo; a task whose check
+already passes, whose setup fails, or whose `verify.restore` names a missing path
+is rejected and nothing is run. A task the agent cannot fail measures nothing.
+`--dry-run` never touches the network, so it does this check for fixture tasks only;
+for a git task it validates the fields and prints the clone command it would run.
 
 The two examples are offline fixtures with the shapes of real failures this plan
 fixed:
@@ -118,21 +126,29 @@ the SWE-bench harness uses; a model missing from it costs `0`.
    container, and compare pass@1, pass^k, tokens and dollars against the baseline
    with the noise rule above.
 
-The results JSON:
+The results JSON is rewritten after every trial. If the run aborts (an error,
+Ctrl-C), it still holds every finished trial and says `"complete": false`; only a
+file with `"complete": true` is a baseline.
 
 ```
-{ model, effort, trials_per_task, origin_version, seed_note, host{platform,cpu_count}, finished_at,
+{ model, effort, trials_per_task, complete, origin_version, seed_note, host{platform,cpu_count}, finished_at,
   summary{tasks, trials, pass@1, pass^k, input_tokens, uncached_input_tokens, cache_read_tokens,
-          cache_write_tokens, output_tokens, cost_usd, wall_s},
+          cache_write_tokens, output_tokens, requests, cost_usd, wall_s},
   tasks[{id, pass@1, pass^k, passes,
-         trials[{trial, seed, passed, verify_exit, origin_exit, timed_out, wall_s,
+         trials[{trial, seed, passed, verify_exit, verify_timed_out, tests_modified,
+                 origin_exit, timed_out, origin_stderr_tail, wall_s,
                  input_tokens, uncached_input_tokens, cache_read_tokens, cache_write_tokens,
                  output_tokens, requests, prompt_prefix_approx_tokens, cost_usd}]}] }
 ```
+
+`origin_exit` is `null` when origin timed out; `origin_stderr_tail` holds the last
+500 bytes of its stderr whenever it did not exit 0.
 
 Token counts are the sums of the `request_usage` events in
 `origin run --output-format stream-json` (one per provider request; its
 `input_tokens` is uncached input). `input_tokens` in the results is uncached + cache
 read + cache write. `prompt_prefix_approx_tokens` is the system prompt plus tool
 schemas, from the `prompt_prefix` event (bytes / 4). An origin build without those
-events reports `requests: 0` and zero tokens.
+events reports `requests: 0` and zero tokens; the runner warns on stderr for every
+trial where origin exited 0 with no requests, and `summary.requests` makes a
+zero-token baseline obvious.

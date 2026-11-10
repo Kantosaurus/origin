@@ -71,7 +71,14 @@ git add bench/regression/baselines/ bench/regression/tasks/
 
 Statistical note: with 20–50 tasks, a difference of 2–3 points between two
 single runs is noise. Treat a change as real only when it is larger than that and
-holds on pass^k as well as pass@1, or reproduces in a second run.
+holds on pass^k as well as pass@1, or reproduces in a second run. One task flipping
+moves pass@1 by 2–5 points at this size, so also report how many tasks flipped in
+each direction (fail→pass, pass→fail) between the paired runs.
+
+Results are rewritten after every trial; an aborted run leaves `"complete": false`
+and is not a baseline. Each task lists the test files to restore before its check
+(`verify.restore`), so a trial cannot pass by editing or deleting the tests, and a
+trial that touched them is marked `tests_modified: true`.
 
 ## Perf gate
 

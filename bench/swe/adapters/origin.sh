@@ -6,7 +6,8 @@
 # Contract (shared by every adapter):
 #   $1 = repo_dir          a clean checkout of <repo>@<base_commit> (HEAD == base)
 #   $2 = issue_file        the SWE-bench problem_statement
-#   $3 = metrics_out_json  write {input_tokens,output_tokens,cache_read,cache_creation,wall_s,model}
+#   $3 = metrics_out_json  write {input_tokens,output_tokens,cache_read,cache_creation,wall_s,model,
+#                          token_source}  (token_source: "request_usage", or "usage" for an old origin)
 #   stdout                 the candidate patch (a `git diff` the scorer will apply)
 #
 # Env: ORIGIN_MODEL (default claude-opus-4-8), BENCH_TIMEOUT (s, default 1200),
