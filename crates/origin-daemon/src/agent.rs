@@ -5645,6 +5645,95 @@ async fn run_loop_inner(
                 apply_prose_edits(&text, &session.model, &mut turn_mutated);
             }
 
+            // C15: bundle the final turn's FAILURE-only gate blocks (syntax
+            // gate + test results) so the goal verifier sees them. Advisory
+            // blocks (LSP diagnostics, which may be warnings) are deliberately
+            // excluded — only hard failures should auto-block a "Met" claim.
+            //
+            // #1: the post-turn gate block (below the dispatch section) never
+            // runs on THIS tool-free terminal turn — we early-return before it.
+            // So when the repro/regression gate is armed we must run the test
+            // command HERE, on the final turn, to catch a still-RED suite. This
+            // both (a) fixes the ordering gap where the terminal branch reused a
+            // stale prior-turn `test_block`, and (b) lets the loop ENFORCE the
+            // fail→pass transition without a `/goal`: on RED we synthesize a
+            // continuation turn and re-enter the loop instead of returning.
+            let gate_armed = opts.post_edit.as_deref().is_some_and(origin_postedit::PostEditConfig::test_gate_armed);
+            if gate_armed && repro_gate_repairs < gate_repair_budget {
+                if let Some(cfg) = opts.post_edit.as_deref() {
+                    if let Some(cmd) = cfg.test_command.as_deref() {
+                        // #4: narrow the suite to the edit's blast radius when
+                        // test-selection is enabled; falls back to `cmd` verbatim.
+                        let cmd = effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
+                        // Run the oracle now (fresh, not the stale `test_block`).
+                        let fresh = run_post_edit_test(&cmd, opts.cwd.as_deref()).await;
+                        edit_unverified &= fresh.is_none();
+                        // C9: redact before it becomes a model-facing User message.
+                        let mut fresh = crate::redact::text(&fresh.unwrap_or_default()).into_owned();
+                        if !fresh.is_empty() {
+                            // Classify against the pre-edit baseline exactly like
+                            // the per-turn path (C9), so the model is told whether
+                            // it introduced a regression vs a pre-existing failure.
+                            match baseline_tests_passed {
+                                Some(true) => fresh.insert_str(
+                                    0,
+                                    "<regression>\nThese tests PASSED before your change — your edit \
+                                     introduced a regression. Fix it before finishing.\n</regression>\n",
+                                ),
+                                Some(false) => fresh.push_str(
+                                    "\n\n(note: the suite was already failing before your change — \
+                                     not all of these failures are necessarily caused by your edit.)",
+                                ),
+                                None => {}
+                            }
+                            // Keep the freshly-run failure as the terminal gate
+                            // signal too (so a downstream `/goal` verifier, if any,
+                            // sees the current state rather than a stale block).
+                            repro_gate_repairs += 1;
+                            let remaining = gate_repair_budget - repro_gate_repairs;
+                            tracing::info!(
+                                remaining, "repro-gate: tests RED at terminal turn; continuing the loop"
+                            );
+                            // Synthesize a continuation user turn and re-enter the
+                            // loop. This is the no-goal enforcement path. Build the
+                            // prompt (borrowing `fresh`) BEFORE moving `fresh` into
+                            // `test_block` so we neither clone nor re-borrow.
+                            let cont = format!(
+                                "[repro-gate] You indicated you were finished, but the test command is \
+                                 still failing. Do NOT stop yet. Read the failure below, fix the cause, \
+                                 and continue until the tests pass ({remaining} automatic attempt(s) \
+                                 left before the loop yields control to the user).\n\n{fresh}"
+                            );
+                            test_block = fresh;
+                            session.push(Message::new(Role::User).with_block(Block::text(&cont)));
+                            continue;
+                        }
+                        // GREEN (or unrunnable/fail-open) ⇒ fall through to return.
+                        test_block.clear();
+                    }
+                }
+            }
+            // B11: opt-in soft pre-completion check, after the gates above had
+            // their say. Files were edited and nothing ran since the last edit
+            // ⇒ ask once to verify or explain. A read-only run cannot arm it
+            // (the read-only overlay denies every edit). Never on the last
+            // allowed turn: there would be no turn left for the reply.
+            if edit_unverified
+                && !precomplete_nudged
+                && turn < opts.max_turns
+                && std::env::var("ORIGIN_PRECOMPLETE_CHECK").as_deref() == Ok("1")
+            {
+                precomplete_nudged = true;
+                session.push(Message::new(Role::User).with_block(Block::text(
+                    "[pre-complete-check] You edited files but nothing has run since your last edit. \
+                     Verify the change (run the relevant test or build), or say plainly why it cannot \
+                     be verified here.",
+                )));
+                continue;
+            }
+            // End-of-run effects. Placed below the repro-gate and B11 continuations
+            // so a run that continues does not fire them early: they run once, on
+            // the path that returns.
             // P6.7: optional proposer pass at turn end. Proposals are surfaced
             // as side-band StreamEvents for the CLI to render AND recorded in
             // the daemon-wide [`ProposalRegistry`] so a later `MemoryDecision`
@@ -5739,90 +5828,6 @@ async fn run_loop_inner(
                 turn,
             ));
 
-            // C15: bundle the final turn's FAILURE-only gate blocks (syntax
-            // gate + test results) so the goal verifier sees them. Advisory
-            // blocks (LSP diagnostics, which may be warnings) are deliberately
-            // excluded — only hard failures should auto-block a "Met" claim.
-            //
-            // #1: the post-turn gate block (below the dispatch section) never
-            // runs on THIS tool-free terminal turn — we early-return before it.
-            // So when the repro/regression gate is armed we must run the test
-            // command HERE, on the final turn, to catch a still-RED suite. This
-            // both (a) fixes the ordering gap where the terminal branch reused a
-            // stale prior-turn `test_block`, and (b) lets the loop ENFORCE the
-            // fail→pass transition without a `/goal`: on RED we synthesize a
-            // continuation turn and re-enter the loop instead of returning.
-            let gate_armed = opts.post_edit.as_deref().is_some_and(origin_postedit::PostEditConfig::test_gate_armed);
-            if gate_armed && repro_gate_repairs < gate_repair_budget {
-                if let Some(cfg) = opts.post_edit.as_deref() {
-                    if let Some(cmd) = cfg.test_command.as_deref() {
-                        // #4: narrow the suite to the edit's blast radius when
-                        // test-selection is enabled; falls back to `cmd` verbatim.
-                        let cmd = effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
-                        // Run the oracle now (fresh, not the stale `test_block`).
-                        let fresh = run_post_edit_test(&cmd, opts.cwd.as_deref()).await;
-                        edit_unverified &= fresh.is_none();
-                        // C9: redact before it becomes a model-facing User message.
-                        let mut fresh = crate::redact::text(&fresh.unwrap_or_default()).into_owned();
-                        if !fresh.is_empty() {
-                            // Classify against the pre-edit baseline exactly like
-                            // the per-turn path (C9), so the model is told whether
-                            // it introduced a regression vs a pre-existing failure.
-                            match baseline_tests_passed {
-                                Some(true) => fresh.insert_str(
-                                    0,
-                                    "<regression>\nThese tests PASSED before your change — your edit \
-                                     introduced a regression. Fix it before finishing.\n</regression>\n",
-                                ),
-                                Some(false) => fresh.push_str(
-                                    "\n\n(note: the suite was already failing before your change — \
-                                     not all of these failures are necessarily caused by your edit.)",
-                                ),
-                                None => {}
-                            }
-                            // Keep the freshly-run failure as the terminal gate
-                            // signal too (so a downstream `/goal` verifier, if any,
-                            // sees the current state rather than a stale block).
-                            repro_gate_repairs += 1;
-                            let remaining = gate_repair_budget - repro_gate_repairs;
-                            tracing::info!(
-                                remaining, "repro-gate: tests RED at terminal turn; continuing the loop"
-                            );
-                            // Synthesize a continuation user turn and re-enter the
-                            // loop. This is the no-goal enforcement path. Build the
-                            // prompt (borrowing `fresh`) BEFORE moving `fresh` into
-                            // `test_block` so we neither clone nor re-borrow.
-                            let cont = format!(
-                                "[repro-gate] You indicated you were finished, but the test command is \
-                                 still failing. Do NOT stop yet. Read the failure below, fix the cause, \
-                                 and continue until the tests pass ({remaining} automatic attempt(s) \
-                                 left before the loop yields control to the user).\n\n{fresh}"
-                            );
-                            test_block = fresh;
-                            session.push(Message::new(Role::User).with_block(Block::text(&cont)));
-                            continue;
-                        }
-                        // GREEN (or unrunnable/fail-open) ⇒ fall through to return.
-                        test_block.clear();
-                    }
-                }
-            }
-            // B11: opt-in soft pre-completion check, after the gates above had
-            // their say. Files were edited and nothing ran since the last edit
-            // ⇒ ask once to verify or explain. A read-only run cannot arm it
-            // (the read-only overlay denies every edit).
-            if edit_unverified
-                && !precomplete_nudged
-                && std::env::var("ORIGIN_PRECOMPLETE_CHECK").as_deref() == Ok("1")
-            {
-                precomplete_nudged = true;
-                session.push(Message::new(Role::User).with_block(Block::text(
-                    "[pre-complete-check] You edited files but nothing has run since your last edit. \
-                     Verify the change (run the relevant test or build), or say plainly why it cannot \
-                     be verified here.",
-                )));
-                continue;
-            }
             let gate_signals = {
                 let mut s = String::new();
                 for b in [&compile_check_block, &test_block] {
@@ -6813,10 +6818,10 @@ async fn run_loop_inner(
             stuck.record(&name, &preview, bash_failed, &result_bytes);
             // B11: a successful edit arms the pre-completion check; a Bash
             // call dispatched after it (any exit status) disarms it.
-            match name.as_str() {
-                "Edit" | "Write" | "MultiEdit" | "ApplyPatch" => edit_unverified = true,
-                "Bash" => edit_unverified = false,
-                _ => {}
+            if autoformats(&name) {
+                edit_unverified = true;
+            } else if name == "Bash" {
+                edit_unverified = false;
             }
 
             // SchemaCrush (headroom SmartCrusher port): compress a large,

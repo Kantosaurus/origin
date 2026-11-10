@@ -58,11 +58,26 @@ fn bash(id: &str) -> Block {
     tool(id, "Bash", &serde_json::json!({ "command": "echo verified" }))
 }
 
-/// Drive the real `run_loop` over `turns` with the flag set to `flag`.
-/// Returns the final text and how many nudges the session carries.
+/// Input tokens each scripted response reports, so the token counters show how
+/// often the end-of-run effects folded the run's totals in.
+const TOKENS_PER_TURN: u32 = 10;
+
+/// Drive the real `run_loop` over `turns`, one block per assistant turn, with
+/// the flag set to `flag`. Returns the final text and how many nudges the
+/// session carries.
 fn run(
     flag: Option<&str>,
     turns: Vec<Block>,
+    prompter: &dyn Prompter,
+    opts: &LoopOptions,
+) -> (String, usize) {
+    run_turns(flag, turns.into_iter().map(|b| vec![b]).collect(), prompter, opts)
+}
+
+/// [`run`] with any number of blocks per assistant turn.
+fn run_turns(
+    flag: Option<&str>,
+    turns: Vec<Vec<Block>>,
     prompter: &dyn Prompter,
     opts: &LoopOptions,
 ) -> (String, usize) {
@@ -76,9 +91,14 @@ fn run(
         responses: Mutex::new(
             turns
                 .into_iter()
-                .map(|b| ChatResponse {
-                    assistant: Message::new(Role::Assistant).with_block(b),
-                    usage: Usage::default(),
+                .map(|blocks| ChatResponse {
+                    assistant: blocks
+                        .into_iter()
+                        .fold(Message::new(Role::Assistant), Message::with_block),
+                    usage: Usage {
+                        input_tokens: TOKENS_PER_TURN,
+                        ..Usage::default()
+                    },
                 })
                 .collect(),
         ),
@@ -237,4 +257,89 @@ fn a_test_gate_that_did_not_run_is_not_verification() {
         &with_test_gate("echo .env curl"),
     );
     assert_eq!((text.as_str(), nudges), ("explained", 1));
+}
+
+#[test]
+fn a_lint_gate_that_ran_after_the_edit_counts_as_verification() {
+    // The lint gate runs only per turn (no terminal-turn twin), so this pins
+    // the per-turn disarm on its own.
+    let (_dir, p) = tmp_file();
+    let lint = LoopOptions {
+        post_edit: Some(Arc::new(PostEditConfig {
+            auto_lint: true,
+            lint_command: Some("echo lint-ok".into()),
+            ..PostEditConfig::default()
+        })),
+        ..opts()
+    };
+    let (text, nudges) = run(
+        Some("1"),
+        vec![write("w1", &p), Block::text("done")],
+        &AlwaysAllow,
+        &lint,
+    );
+    assert_eq!((text.as_str(), nudges), ("done", 0));
+}
+
+#[test]
+fn an_edit_after_a_command_in_the_same_batch_still_fires() {
+    let (_dir, p) = tmp_file();
+    let (text, nudges) = run_turns(
+        Some("1"),
+        vec![
+            vec![bash("b1"), write("w1", &p)],
+            vec![Block::text("done")],
+            vec![Block::text("explained")],
+        ],
+        &AlwaysAllow,
+        &opts(),
+    );
+    assert_eq!((text.as_str(), nudges), ("explained", 1));
+}
+
+#[test]
+fn does_not_fire_on_the_last_allowed_turn() {
+    // A nudge there would leave no turn for the reply and turn a finished run
+    // into a max-turns error.
+    let (_dir, p) = tmp_file();
+    let capped = LoopOptions {
+        max_turns: 2,
+        ..opts()
+    };
+    let (text, nudges) = run(
+        Some("1"),
+        vec![write("w1", &p), Block::text("done")],
+        &AlwaysAllow,
+        &capped,
+    );
+    assert_eq!((text.as_str(), nudges), ("done", 0));
+}
+
+#[test]
+fn a_nudged_run_folds_its_usage_into_the_metrics_once() {
+    let (_dir, p) = tmp_file();
+    let metrics = Arc::new(origin_metrics::Metrics::new());
+    let with_metrics = LoopOptions {
+        metrics: Some(Arc::clone(&metrics)),
+        ..opts()
+    };
+    let (text, nudges) = run(
+        Some("1"),
+        vec![write("w1", &p), Block::text("done"), Block::text("verified")],
+        &AlwaysAllow,
+        &with_metrics,
+    );
+    assert_eq!((text.as_str(), nudges), ("verified", 1));
+    let tokens_in: f64 = metrics
+        .snapshot()
+        .iter()
+        .filter(|r| r.name == "origin_tokens_in_total")
+        .map(|r| r.value)
+        .sum();
+    // Three model calls; end-of-run effects that ran on the nudged turn too
+    // would add the first two calls again.
+    assert!(
+        (tokens_in - f64::from(3 * TOKENS_PER_TURN)).abs() < f64::EPSILON,
+        "tokens_in_total = {tokens_in}"
+    );
 }
