@@ -104,6 +104,13 @@ async fn run_task(input: serde_json::Value, script: Script) -> (TaskOutput, u32)
     (out, provider.calls.load(Ordering::SeqCst))
 }
 
+/// A scratch directory inside the worker's workspace (the test's working
+/// directory, this crate): C2 workers run in mode `on` and can never write
+/// outside the workspace, so the files they edit must live inside it.
+fn workdir() -> TempDir {
+    TempDir::new_in(env!("CARGO_MANIFEST_DIR")).expect("dir")
+}
+
 /// `n` spelled in letters: the stuck-loop detector ignores digits, so calls
 /// that differ only by a number would read as the same action repeated.
 fn letters(n: u32) -> String {
@@ -129,7 +136,7 @@ fn runaway(dir: &Path) -> Script {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn edited_files_are_listed_once_in_first_touch_order() {
-    let dir = TempDir::new().expect("dir");
+    let dir = workdir();
     let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
     let (a2, b2) = (a.clone(), b.clone());
     let (out, _) = run_task(
@@ -148,7 +155,7 @@ async fn edited_files_are_listed_once_in_first_touch_order() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn denied_and_failed_edits_are_not_touches() {
-    let dir = TempDir::new().expect("dir");
+    let dir = workdir();
     let (denied, missing) = (dir.path().join("denied.txt"), dir.path().join("missing.txt"));
     let (d2, m2) = (denied.clone(), missing.clone());
     let (out, _) = run_task(
@@ -173,7 +180,7 @@ async fn denied_and_failed_edits_are_not_touches() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn over_long_final_message_is_capped_with_one_notice() {
-    let dir = TempDir::new().expect("dir");
+    let dir = workdir();
     let a = dir.path().join("a.txt");
     let a2 = a.clone();
     let (out, _) = run_task(
@@ -200,7 +207,7 @@ async fn over_long_final_message_is_capped_with_one_notice() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn runaway_worker_stops_at_the_default_cap_with_its_partial_work() {
-    let dir = TempDir::new().expect("dir");
+    let dir = workdir();
     let (out, calls) = run_task(
         serde_json::json!({ "goal": "loop forever", "allowed_tools": ["Write"] }),
         runaway(dir.path()),
@@ -222,7 +229,7 @@ async fn runaway_worker_stops_at_the_default_cap_with_its_partial_work() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_explicit_turn_cap_overrides_the_default_both_ways() {
     for cap in [10_u32, 60] {
-        let dir = TempDir::new().expect("dir");
+        let dir = workdir();
         let (out, calls) = run_task(
             serde_json::json!({
                 "goal": "loop forever",
@@ -240,7 +247,7 @@ async fn an_explicit_turn_cap_overrides_the_default_both_ways() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn patch_deletes_and_moves_are_touches() {
-    let dir = TempDir::new().expect("dir");
+    let dir = workdir();
     let (gone, old, new) = (
         dir.path().join("gone.txt"),
         dir.path().join("old.txt"),
@@ -272,7 +279,7 @@ async fn patch_deletes_and_moves_are_touches() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_denial_stop_reports_aborted_with_the_work_done_so_far() {
-    let dir = TempDir::new().expect("dir");
+    let dir = workdir();
     let edited = dir.path().join("edited.txt");
     std::fs::write(&edited, "old\n").expect("seed");
     let (e2, d) = (edited.clone(), dir.path().to_path_buf());

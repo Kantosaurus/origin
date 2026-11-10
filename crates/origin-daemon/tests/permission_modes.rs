@@ -296,6 +296,8 @@ async fn finished_worker(coord: &origin_swarm::Coordinator) -> origin_swarm::Wor
         parent_actor: origin_plan::ActorId::new(0),
         model: None,
         mcp_servers: Vec::new(),
+        effort: None,
+        ponytail: None,
     };
     let handle = coord.spawn(spec).await.expect("spawn");
     for _ in 0..500 {
