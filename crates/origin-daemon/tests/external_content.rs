@@ -698,6 +698,8 @@ async fn run_mcp_worker(
                 args: Vec::new(),
                 url: Some(mcp_url),
             }],
+            effort: None,
+            ponytail: None,
         })
         .await
         .unwrap();
