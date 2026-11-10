@@ -524,25 +524,47 @@ fn apply_governance_overlay(
 /// on. This is DEFAULT-ON; set `ORIGIN_CMD_GUARD=0` to opt out entirely. The
 /// broader `Suspicious` heuristics are never acted on here. `args` is the parsed
 /// JSON arguments; the command is read from the `command` field.
-fn apply_cmd_guard(
+///
+/// `Risk::NeedsApproval` (the program cannot be determined statically) goes
+/// through the normal permission prompt: an Allow the prompter already gave for
+/// this exact call stands, any other Allow (a permission rule) is re-asked, and a
+/// prompter that cannot ask (`AlwaysDeny`, a closed IPC channel) denies.
+async fn apply_cmd_guard(
     decision: origin_permission::Decision,
-    tool: &str,
+    meta: &ToolMeta,
     args: &Value,
+    args_preview: &str,
+    prompter: &dyn Prompter,
 ) -> origin_permission::Decision {
-    if tool != "Bash" || std::env::var("ORIGIN_CMD_GUARD").as_deref() == Ok("0") {
+    if meta.name != "Bash" || std::env::var("ORIGIN_CMD_GUARD").as_deref() == Ok("0") {
         return decision;
     }
     let Some(cmd) = args.get("command").and_then(Value::as_str) else {
         return decision;
     };
     let analysis = origin_cmdparse::analyze(cmd);
-    if let origin_cmdparse::Risk::Dangerous(reason) = origin_cmdparse::worst(&analysis) {
-        return origin_permission::Decision {
+    match origin_cmdparse::worst(&analysis) {
+        origin_cmdparse::Risk::Dangerous(reason) => origin_permission::Decision {
             outcome: Outcome::Deny,
             reason: format!("cmd-guard: dangerous bash command blocked: {reason}"),
-        };
+        },
+        // `decide_permission` already asked the prompter about this call.
+        origin_cmdparse::Risk::NeedsApproval(_) if decision.reason == "user-approved" => decision,
+        origin_cmdparse::Risk::NeedsApproval(reason) => {
+            if prompter.ask(meta, args_preview).await {
+                origin_permission::Decision {
+                    outcome: Outcome::Allow,
+                    reason: format!("user-approved: cmd-guard: {reason}"),
+                }
+            } else {
+                origin_permission::Decision {
+                    outcome: Outcome::Deny,
+                    reason: format!("cmd-guard: bash command needs approval: {reason}"),
+                }
+            }
+        }
+        _ => decision,
     }
-    decision
 }
 
 /// Run the configured `auto_test` command at turn end through the platform shell.
@@ -5090,10 +5112,11 @@ async fn run_loop_inner(
             }
 
             // cmdparse bash-safety overlay. Same deny-only contract; only fires
-            // for `Bash` and only when `ORIGIN_CMD_GUARD=1` (default off ⇒ no
-            // behavior change). It can downgrade an Allow to Deny but never widen.
+            // for `Bash` (default on; `ORIGIN_CMD_GUARD=0` opts out). It can
+            // downgrade an Allow to Deny, or route it through the prompter, but
+            // never widen.
             if decision.outcome == Outcome::Allow {
-                decision = apply_cmd_guard(decision, meta.name, &args);
+                decision = apply_cmd_guard(decision, meta, &args, &preview, prompter).await;
             }
 
             // Read-only "plan mode" overlay (gemini Plan Mode). Same deny-only
@@ -10575,6 +10598,26 @@ mod wiring_tests {
         ));
     }
 
+    /// Drive the async cmd-guard from a sync test (so the env lock is never
+    /// held across an `.await`).
+    fn run_cmd_guard(
+        decision: Decision,
+        tool: &'static str,
+        args: &Value,
+        prompter: &dyn Prompter,
+    ) -> Decision {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        rt.block_on(apply_cmd_guard(
+            decision,
+            &rp_meta(tool),
+            args,
+            &args.to_string(),
+            prompter,
+        ))
+    }
+
     /// cmdparse cmd-guard: a non-dangerous command is always left as Allow,
     /// regardless of the (now default-on) gate.
     #[test]
@@ -10586,7 +10629,8 @@ mod wiring_tests {
             reason: "base".into(),
         };
         let args = serde_json::json!({ "command": "cargo test" });
-        let out = apply_cmd_guard(allow, "Bash", &args);
+        let deny = origin_permission::prompt::AlwaysDeny;
+        let out = run_cmd_guard(allow, "Bash", &args, &deny);
         assert_eq!(
             out.outcome,
             Outcome::Allow,
@@ -10607,18 +10651,20 @@ mod wiring_tests {
         let dangerous = serde_json::json!({ "command": "rm -rf ~" });
         let safe = serde_json::json!({ "command": "ls -la" });
 
+        let p = origin_permission::prompt::AlwaysAllow;
+
         // Default (no env var): dangerous denied, safe allowed, non-Bash untouched.
         std::env::remove_var("ORIGIN_CMD_GUARD");
-        let denied = apply_cmd_guard(mk(), "Bash", &dangerous);
-        let allowed = apply_cmd_guard(mk(), "Bash", &safe);
-        let non_bash = apply_cmd_guard(mk(), "Read", &dangerous);
+        let denied = run_cmd_guard(mk(), "Bash", &dangerous, &p);
+        let allowed = run_cmd_guard(mk(), "Bash", &safe, &p);
+        let non_bash = run_cmd_guard(mk(), "Read", &dangerous, &p);
         assert_eq!(denied.outcome, Outcome::Deny, "dangerous bash denied by default");
         assert_eq!(allowed.outcome, Outcome::Allow, "safe bash stays Allow");
         assert_eq!(non_bash.outcome, Outcome::Allow, "cmd-guard only inspects Bash");
 
         // Explicit opt-out: dangerous passes through.
         std::env::set_var("ORIGIN_CMD_GUARD", "0");
-        let opted_out = apply_cmd_guard(mk(), "Bash", &dangerous);
+        let opted_out = run_cmd_guard(mk(), "Bash", &dangerous, &p);
         std::env::remove_var("ORIGIN_CMD_GUARD");
         assert_eq!(
             opted_out.outcome,
@@ -10642,6 +10688,37 @@ mod wiring_tests {
         let block = block.expect("a failing gate command must yield a feedback block");
         assert!(block.contains("leak="), "{block}");
         assert!(!block.contains("gate-secret-value"), "secret leaked: {block}");
+    }
+
+    /// C3: a command whose program is only known at run time (`eval "$CMD"`)
+    /// is never auto-approved by a permission rule — it goes to the prompter,
+    /// and a prompter that cannot ask denies. An Allow the prompter already
+    /// gave for this call (`user-approved`) is not asked again.
+    #[test]
+    fn cmd_guard_routes_needs_approval_through_the_prompter() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("ORIGIN_CMD_GUARD");
+        let decision = |reason: &str| Decision {
+            outcome: Outcome::Allow,
+            reason: reason.into(),
+        };
+        let args = serde_json::json!({ "command": "eval \"$CMD\"" });
+        let allow = origin_permission::prompt::AlwaysAllow;
+        let deny = origin_permission::prompt::AlwaysDeny;
+
+        let rule_allow = "rule:Bash@project:allow";
+        let no_prompter = run_cmd_guard(decision(rule_allow), "Bash", &args, &deny);
+        assert_eq!(no_prompter.outcome, Outcome::Deny, "cannot ask ⇒ denied");
+        assert!(
+            no_prompter.reason.contains("needs approval"),
+            "reason: {}",
+            no_prompter.reason
+        );
+        let approved = run_cmd_guard(decision(rule_allow), "Bash", &args, &allow);
+        assert_eq!(approved.outcome, Outcome::Allow, "prompter said yes ⇒ allowed");
+
+        let asked = run_cmd_guard(decision("user-approved"), "Bash", &args, &deny);
+        assert_eq!(asked.outcome, Outcome::Allow, "already prompted ⇒ not re-asked");
     }
 
     /// WS-D browser visual loop: the gate is OFF by default. With
