@@ -416,6 +416,41 @@ fn a_gate_the_guard_refuses_is_named_once_on_the_event_stream() {
     assert!(!texts(&session).iter().any(|t| t.contains("will not run")));
 }
 
+/// C3: the refused-gate notice is once per SESSION per gate command — a
+/// `/goal` loop calls `run_loop` once per iteration on the same session.
+#[test]
+fn the_refused_gate_notice_is_once_per_session() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::env::remove_var("ORIGIN_CMD_GUARD");
+    let ws = tempfile::tempdir().expect("ws");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+    let opts = LoopOptions {
+        cwd: Some(ws.path().to_path_buf()),
+        post_edit: Some(Arc::new(test_gate("echo .env curl", 0))),
+        event_tx: Some(tx),
+        ..LoopOptions::default().without_streaming()
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut session = Session::new("notice", "scripted-model");
+    for _ in 0..2 {
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                assistant: Message::new(Role::Assistant).with_block(Block::text("done")),
+                usage: Usage::default(),
+            }]),
+        };
+        rt.block_on(run_loop(&mut session, "go", &provider, &AlwaysAllow, &opts))
+            .expect("loop ok");
+    }
+    let notes = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter(|e| matches!(e, StreamEvent::TextDelta { text } if text.contains("will not run")))
+        .count();
+    assert_eq!(notes, 1);
+}
+
 #[test]
 fn a_green_test_with_a_red_lint_tags_nothing() {
     let ws = workspace();

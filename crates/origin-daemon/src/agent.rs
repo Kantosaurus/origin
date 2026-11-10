@@ -1565,11 +1565,15 @@ fn gate_guard_refusal(cmd: &str) -> Option<String> {
     }
 }
 
-/// C3: tell the user once, at the start of a run, about each armed turn-end
-/// gate whose command the guard refuses (it is then silently not run). Only
-/// through the event channel, never into the session; without one the
-/// per-run log line in [`run_gate_command`] is all there is.
-async fn announce_refused_gates(opts: &LoopOptions) {
+/// C3: tell the user once per session, at the start of a run, about each
+/// armed turn-end gate whose command the guard refuses (it is then silently
+/// not run). Only through the event channel, never into the session; without
+/// one the per-run log line in [`run_gate_command`] is all there is.
+async fn announce_refused_gates(opts: &LoopOptions, session_id: &str) {
+    // ponytail: one (session id, command) per refused gate ever announced,
+    // never evicted — like `first_bash_ask`.
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<(String, String)>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
     let (Some(cfg), Some(tx)) = (opts.post_edit.as_deref(), opts.event_tx.as_ref()) else {
         return;
     };
@@ -1586,6 +1590,13 @@ async fn announce_refused_gates(opts: &LoopOptions) {
             continue;
         };
         if let Some(why) = gate_guard_refusal(cmd) {
+            let first = SEEN
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert((session_id.to_owned(), cmd.to_owned()));
+            if !first {
+                continue;
+            }
             let text = format!(
                 "[origin] The {gate} gate command `{cmd}` will not run: the command guard refuses \
                  it ({why}). Configure a different command, or set ORIGIN_CMD_GUARD=0 \
@@ -5939,7 +5950,7 @@ async fn run_loop_inner(
     // C9: regression baseline. With auto_test on, run the suite ONCE before any
     // edit, so a post-edit failure can be classified as a true regression
     // (green→red) vs a pre-existing failure. Opt-in ⇒ no default cost.
-    announce_refused_gates(opts).await;
+    announce_refused_gates(opts, &session.id).await;
     let baseline_tests_passed: Option<bool> = match opts.post_edit.as_deref() {
         Some(cfg) if cfg.auto_test => match cfg.test_command.as_deref() {
             Some(cmd) => Some(run_test_passed(cmd, opts.cwd.as_deref()).await),
