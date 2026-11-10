@@ -3090,6 +3090,12 @@ impl SpeculativeRegistry {
         if !matches!(meta.side_effects, SideEffects::Pure) {
             return;
         }
+        // A3: only `AutoAllowed` tools speculate. A `RequiresPermission` tool
+        // (`WebFetch`, `WebSearch`, `gmail`, …) must not run before its
+        // permission/rule/domain decision, which happens after the stream ends.
+        if !matches!(meta.tier, origin_tools::Tier::AutoAllowed) {
+            return;
+        }
         // Handle-dependent tools opt out — see `NEEDS_SUBSYSTEM_HANDLE`.
         if Self::NEEDS_SUBSYSTEM_HANDLE.contains(&meta.name) {
             return;
@@ -9154,6 +9160,49 @@ mod dispatch_table_tests {
         assert!(
             reg.take("id-read").await.is_some(),
             "handle-free Pure tools must still speculate"
+        );
+    }
+
+    /// A3: mid-stream speculation must never run a tool ahead of its
+    /// permission decision. `WebFetch` is `Pure` but `RequiresPermission`, so
+    /// a stream carrying it must not spawn it; an `AutoAllowed` `Read` in the
+    /// same stream still speculates.
+    #[tokio::test]
+    async fn speculative_stream_skips_permission_gated_tools() {
+        use origin_stream::{Ring, TokenEvent, TokenKind};
+        let start = |idx: u32, id: &str, name: &str| {
+            let mut p = idx.to_le_bytes().to_vec();
+            p.extend_from_slice(id.as_bytes());
+            p.push(0);
+            p.extend_from_slice(name.as_bytes());
+            TokenEvent::new(TokenKind::ToolUseStart, p)
+        };
+        let delta = |idx: u32, json: &str| {
+            let mut p = idx.to_le_bytes().to_vec();
+            p.extend_from_slice(json.as_bytes());
+            TokenEvent::new(TokenKind::ToolUseDelta, p)
+        };
+        let ring = Ring::with_capacity(64 * 1024);
+        let sub = ring.subscribe();
+        for ev in [
+            // Loopback port 1: if it were (wrongly) dispatched it fails locally.
+            start(0, "wf", "WebFetch"),
+            delta(0, r#"{"url":"http://127.0.0.1:1/"}"#),
+            start(1, "rd", "Read"),
+            delta(1, r#"{"file_path":"Cargo.toml"}"#),
+            TokenEvent::new(TokenKind::TurnEnd, Vec::new()),
+        ] {
+            ring.publish(&ev).expect("publish");
+        }
+        ring.close();
+        let turn = drain_subscriber_into_response(sub, None).await.expect("drain");
+        assert!(
+            !turn.speculative.in_flight.contains_key("wf"),
+            "a RequiresPermission tool must not run before its permission decision"
+        );
+        assert!(
+            turn.speculative.in_flight.contains_key("rd"),
+            "an AutoAllowed Pure tool must still speculate"
         );
     }
 
