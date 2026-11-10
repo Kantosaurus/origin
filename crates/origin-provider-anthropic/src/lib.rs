@@ -229,7 +229,8 @@ impl Anthropic {
         } else {
             req.system.clone()
         };
-        let wire_messages = build_wire_messages(&expanded, plan, message_marker_budget(&system_text));
+        let system = wire_system(&system_text);
+        let wire_messages = build_wire_messages(&expanded, plan, message_marker_budget(system.as_ref()));
 
         let body = wire::WireRequest {
             model: &req.model,
@@ -237,7 +238,7 @@ impl Anthropic {
             // (Anthropic requires `max_tokens` > `budget_tokens`); otherwise
             // unchanged at `DEFAULT_MAX_TOKENS` ⇒ byte-identical default.
             max_tokens: resolve_max_tokens(req.thinking_tokens),
-            system: wire_system(&system_text),
+            system,
             messages: wire_messages,
             tools: wire_tools,
             metadata: self.oauth_metadata.as_ref().map(|m| wire::WireMetadata {
@@ -341,7 +342,8 @@ impl Provider for Anthropic {
         } else {
             req.system.clone()
         };
-        let wire_messages = build_wire_messages(&expanded, plan, message_marker_budget(&system_text));
+        let system = wire_system(&system_text);
+        let wire_messages = build_wire_messages(&expanded, plan, message_marker_budget(system.as_ref()));
 
         let mut body_json = serde_json::json!({
             "model": req.model,
@@ -349,7 +351,7 @@ impl Provider for Anthropic {
             // (Anthropic requires `max_tokens` > `budget_tokens`); otherwise
             // unchanged at `DEFAULT_MAX_TOKENS` ⇒ byte-identical default.
             "max_tokens": resolve_max_tokens(req.thinking_tokens),
-            "system": wire_system(&system_text),
+            "system": system,
             "messages": wire_messages,
             "tools": wire_tools,
             "stream": true,
@@ -593,26 +595,38 @@ const WIRE_MAX_CACHE_MARKERS: usize = 4;
 /// yet). The daemon keeps that text session-stable, so later requests read it.
 /// Under `ORIGIN_CACHE_TTL_1H=1` it takes the 1h TTL: it is the earliest
 /// breakpoint, and a longer-TTL breakpoint must not follow a shorter one.
-fn wire_system(text: &str) -> Option<Vec<wire::WireBlock<'_>>> {
-    (!text.is_empty()).then(|| {
-        vec![wire::WireBlock::Text {
-            text,
-            cache_control: Some(if ttl_1h_enabled() {
-                wire::WireCacheControl::ephemeral_1h()
-            } else {
-                wire::WireCacheControl::ephemeral()
-            }),
-        }]
-    })
+/// Escape hatch: `ORIGIN_SYSTEM_CACHE=0` sends the pre-B2 plain string with no
+/// marker, for Anthropic-compatible endpoints that reject the array form.
+fn wire_system(text: &str) -> Option<wire::WireSystem<'_>> {
+    if text.is_empty() {
+        return None;
+    }
+    if !system_cache_enabled() {
+        return Some(wire::WireSystem::Text(text));
+    }
+    Some(wire::WireSystem::Blocks(vec![wire::WireBlock::Text {
+        text,
+        cache_control: Some(if ttl_1h_enabled() {
+            wire::WireCacheControl::ephemeral_1h()
+        } else {
+            wire::WireCacheControl::ephemeral()
+        }),
+    }]))
+}
+
+/// `ORIGIN_SYSTEM_CACHE=0` disables the system-prompt cache marker. Read per
+/// request (one env lookup) so it can be flipped without a restart.
+fn system_cache_enabled() -> bool {
+    std::env::var("ORIGIN_SYSTEM_CACHE").as_deref() != Ok("0")
 }
 
 /// How many `cache_control` markers the messages may carry: the request-wide
-/// ceiling minus the one [`wire_system`] spends on a non-empty system prompt.
-const fn message_marker_budget(system_text: &str) -> usize {
-    if system_text.is_empty() {
-        WIRE_MAX_CACHE_MARKERS
-    } else {
-        WIRE_MAX_CACHE_MARKERS - 1
+/// ceiling minus the one a marked (block-form) `system` spends. Takes the
+/// encoded `system` so the two can never disagree.
+const fn message_marker_budget(system: Option<&wire::WireSystem<'_>>) -> usize {
+    match system {
+        Some(wire::WireSystem::Blocks(_)) => WIRE_MAX_CACHE_MARKERS - 1,
+        Some(wire::WireSystem::Text(_)) | None => WIRE_MAX_CACHE_MARKERS,
     }
 }
 
@@ -1029,7 +1043,8 @@ fn encode_request_body_for_test(req: &ChatRequest, plan: Option<&Plan>) -> serde
     // places cache markers on — including any index shift from a dropped turn.
     let expanded = origin_provider::inflate_tool_result_handles(&req.messages, None)
         .expect("test requests carry no CAS handles, so expansion cannot fail");
-    let wire_messages = build_wire_messages(&expanded, plan, message_marker_budget(&req.system));
+    let system = wire_system(&req.system);
+    let wire_messages = build_wire_messages(&expanded, plan, message_marker_budget(system.as_ref()));
     let wire_tools = req
         .tools
         .iter()
@@ -1042,7 +1057,7 @@ fn encode_request_body_for_test(req: &ChatRequest, plan: Option<&Plan>) -> serde
     let body = wire::WireRequest {
         model: &req.model,
         max_tokens: resolve_max_tokens(req.thinking_tokens),
-        system: wire_system(&req.system),
+        system,
         messages: wire_messages,
         tools: wire_tools,
         metadata: None,

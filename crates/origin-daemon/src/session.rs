@@ -3,8 +3,36 @@
 //!
 //! Persistence (P1.12) wraps this with `SQLite` writes per turn.
 
-use origin_core::types::{Message, MessageId};
+use origin_core::types::{Block, Message, MessageId};
 use std::path::PathBuf;
+
+/// B2: whether a stored text block is context the agent loop injected.
+///
+/// That is `<origin-recall>` memories or `<repo-map-focus>` entries, not words
+/// the user typed. Those blocks stay in the transcript so the cached history
+/// bytes never change, but anything that shows, exports or mines user text
+/// must skip them.
+#[must_use]
+pub fn is_injected_context(text: &str) -> bool {
+    text.starts_with("<origin-recall>") || text.starts_with("<repo-map-focus>")
+}
+
+/// `messages` with every injected-context text block removed.
+#[must_use]
+pub fn without_injected_context(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|m| Message {
+            role: m.role,
+            blocks: m
+                .blocks
+                .iter()
+                .filter(|b| !matches!(b, Block::Text { text, .. } if is_injected_context(text)))
+                .cloned()
+                .collect(),
+        })
+        .collect()
+}
 
 #[derive(Debug)]
 pub struct Session {

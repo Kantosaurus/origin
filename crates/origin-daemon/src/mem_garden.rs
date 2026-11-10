@@ -197,7 +197,12 @@ fn split_roles(messages: &[Message]) -> (String, String) {
             Role::Tool | Role::System => continue,
         };
         for block in &m.blocks {
+            // B2: skip injected recall / repo-map context — feeding recalled
+            // memories back in would re-propose them as new memories.
             if let Block::Text { text, .. } = block {
+                if crate::session::is_injected_context(text) {
+                    continue;
+                }
                 if !target.is_empty() {
                     target.push('\n');
                 }
@@ -401,6 +406,25 @@ mod tests {
         assert!(assistant.contains("I'll note that"));
         assert!(!user.contains("tool output"));
         assert!(!assistant.contains("tool output"));
+    }
+
+    /// B2: recalled memories and repo-map entries stored on a prompt's message
+    /// are not the user's words; feeding them to the proposer would re-propose
+    /// recalled memories as new ones.
+    #[test]
+    fn split_roles_skips_injected_context_blocks() {
+        let messages = vec![Message::new(Role::User)
+            .with_block(Block::text("remember: i prefer tabs"))
+            .with_block(Block::text(
+                "<origin-recall>\nremember: use spaces everywhere\n</origin-recall>",
+            ))
+            .with_block(Block::text(
+                "<repo-map-focus>\n- src/a.rs: alpha\n</repo-map-focus>",
+            ))];
+        let (user, _) = split_roles(&messages);
+        assert!(user.contains("i prefer tabs"));
+        assert!(!user.contains("use spaces everywhere"), "{user}");
+        assert!(!user.contains("src/a.rs"), "{user}");
     }
 
     #[test]

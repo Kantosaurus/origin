@@ -52,9 +52,10 @@ impl WireCacheControl {
 pub struct WireRequest<'a> {
     pub model: &'a str,
     pub max_tokens: u32,
-    /// System prompt as a block array, so it can carry a `cache_control` marker.
+    /// System prompt: a marked block array by default, a plain string under
+    /// `ORIGIN_SYSTEM_CACHE=0`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<Vec<WireBlock<'a>>>,
+    pub system: Option<WireSystem<'a>>,
     pub messages: Vec<WireMessage<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<WireTool<'a>>,
@@ -70,6 +71,16 @@ pub struct WireRequest<'a> {
     /// (byte-identical to the pre-thinking behavior). See [`WireThinking`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<WireThinking>,
+}
+
+/// The two accepted shapes of the Messages API `system` field.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum WireSystem<'a> {
+    /// `"system": "<text>"` — no cache marker possible.
+    Text(&'a str),
+    /// `"system": [{"type":"text", ...}]` — blocks may carry `cache_control`.
+    Blocks(Vec<WireBlock<'a>>),
 }
 
 /// Anthropic `output_config` block (Messages API). Reasoning effort lives here,

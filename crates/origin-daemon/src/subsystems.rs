@@ -160,31 +160,37 @@ pub fn repo_map_block(roots: &[std::path::PathBuf], focus: &[String]) -> Option<
     Some(out)
 }
 
-/// B2: the session's unfocused `<repo-map>` block, scanned once per session id.
+/// B2: the session's unfocused `<repo-map>` block, scanned once per
+/// (session id, roots).
 ///
 /// Reused byte-for-byte afterwards, so edits made during the session never
-/// change the cached system prefix. Empty when nothing ranks. A new session
-/// (or a daemon restart) rescans.
+/// change the cached system prefix. Keyed on the roots too: they are reset
+/// from each prompt request and a client may reuse a session id in another
+/// workspace. Empty when nothing ranks; an empty scan is not cached, so a
+/// session started in an empty directory gets a map once files exist. A new
+/// session (or a daemon restart) rescans.
 #[must_use]
 pub fn session_repo_map_block(session_id: &str, roots: &[std::path::PathBuf]) -> String {
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock, PoisonError};
+    type Key = (String, Vec<PathBuf>);
     // ponytail: process-wide and never evicted (one ≤1k-token string per
-    // session id); evict on session removal if a daemon ever hosts thousands.
-    static MAPS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    // session id + roots); evict on session removal if a daemon ever hosts thousands.
+    static MAPS: OnceLock<Mutex<HashMap<Key, String>>> = OnceLock::new();
     let maps = MAPS.get_or_init(Mutex::default);
-    if let Some(map) = maps
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(session_id)
-    {
+    let key: Key = (session_id.to_string(), roots.to_vec());
+    if let Some(map) = maps.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
         return map.clone();
     }
     // Scan outside the lock; if two prompts race, the first insert wins.
     let map = repo_map_block(roots, &[]).unwrap_or_default();
+    if map.is_empty() {
+        return map;
+    }
     maps.lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .entry(session_id.to_string())
+        .entry(key)
         .or_insert(map)
         .clone()
 }
@@ -384,6 +390,45 @@ fn push_identifier(out: &mut Vec<String>, cur: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rust_workspace(file: &str, body: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(file), body).expect("write");
+        dir
+    }
+
+    /// B2: the session map is keyed on (session id, roots). A reused or resumed
+    /// id pointed at another workspace gets that workspace's map; the same id
+    /// and roots get the identical bytes back.
+    #[test]
+    fn session_repo_map_is_keyed_on_id_and_roots() {
+        let a = rust_workspace("alpha.rs", "pub fn alpha_fn() {}\n");
+        let b = rust_workspace("beta.rs", "pub fn beta_fn() {}\n");
+        let roots_a = vec![a.path().to_path_buf()];
+        let roots_b = vec![b.path().to_path_buf()];
+        let id = "b2-3-session";
+        let first = session_repo_map_block(id, &roots_a);
+        assert!(first.contains("alpha.rs"), "{first}");
+        let other = session_repo_map_block(id, &roots_b);
+        assert!(
+            other.contains("beta.rs") && !other.contains("alpha.rs"),
+            "{other}"
+        );
+        // Edit A: the cached bytes for (id, A) must not change.
+        std::fs::write(a.path().join("gamma.rs"), "pub fn gamma_fn() {}\n").expect("write");
+        assert_eq!(session_repo_map_block(id, &roots_a), first);
+    }
+
+    /// An empty first scan (a session started in an empty directory) is not
+    /// cached, so the map appears once source files exist.
+    #[test]
+    fn empty_session_repo_map_is_not_cached() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = vec![dir.path().to_path_buf()];
+        assert_eq!(session_repo_map_block("b2-empty", &roots), "");
+        std::fs::write(dir.path().join("late.rs"), "pub fn late_fn() {}\n").expect("write");
+        assert!(session_repo_map_block("b2-empty", &roots).contains("late.rs"));
+    }
 
     #[test]
     fn group_paths_by_language_detects_per_file_and_skips_unknown() {

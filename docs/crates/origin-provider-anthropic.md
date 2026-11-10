@@ -67,7 +67,9 @@ block. A `Frozen` boundary can opt into the 1-hour TTL via `ORIGIN_CACHE_TTL_1H=
 `system` is sent as a one-block array carrying its own marker (1-hour TTL under the
 same flag), so the tools + system prefix is cached from a session's first request;
 that marker counts against Anthropic's 4-marker-per-request ceiling, leaving the
-messages three. Markers past the ceiling are dropped (earliest first) with a warning.
+messages three. `ORIGIN_SYSTEM_CACHE=0` restores the plain-string `system` with no
+marker (and four message markers) for Anthropic-compatible endpoints that reject the
+array form. Markers past the ceiling are dropped (earliest first) with a warning.
 
 **Thinking.** `thinking_tokens` enables extended thinking; models tagged
 `-4-6`/`-4-7`/`-4-8` use `{"type":"adaptive"}` (manual `budget_tokens` 400s on

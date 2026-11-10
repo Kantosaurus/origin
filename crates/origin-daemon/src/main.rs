@@ -3453,6 +3453,8 @@ fn export_session_event(session_store: &SessionStore, session_id: &str, format: 
             let mut tools = Vec::new();
             for b in &m.blocks {
                 match b {
+                    // B2: injected recall / repo-map context is not the user's words.
+                    Block::Text { text: t, .. } if origin_daemon::session::is_injected_context(t) => {}
                     Block::Text { text: t, .. } => {
                         if !text.is_empty() {
                             text.push('\n');
@@ -4374,16 +4376,25 @@ fn submit_summarize_jobs(sidecar: &Sidecar, session_store: &Arc<SessionStore>, s
         // tool results before the next user turn), not the entire transcript.
         // Sending the whole transcript made every turn's summary collapse to the
         // latest-turn text, which compaction then baked into the *oldest* turns.
-        let (start, end) = turn_window(messages, i);
         let session_id = session.id.clone();
         let deliverer = SessionStoreSummaryDeliverer(Arc::clone(session_store));
         let _ = sidecar.submit(SidecarJob::Summarize {
             session_id,
             turn_index,
-            transcript: messages[start..end].to_vec(),
+            transcript: summary_transcript(messages, i),
             deliver_to: Box::new(deliverer),
         });
     }
+}
+
+/// The messages a turn's summary is built from: its [`turn_window`], minus
+/// B2's injected per-prompt context (recalled memories, repo-map entries).
+fn summary_transcript(
+    messages: &[origin_core::types::Message],
+    assistant_idx: usize,
+) -> Vec<origin_core::types::Message> {
+    let (start, end) = turn_window(messages, assistant_idx);
+    origin_daemon::session::without_injected_context(&messages[start..end])
 }
 
 /// The message-index window `[start, end)` covering the conversation turn whose
@@ -4728,6 +4739,53 @@ mod tests {
         // Crucially the two windows are disjoint — distinct turns get distinct
         // slices, so their summaries cannot collapse to the same text.
         assert_ne!(turn_window(&msgs, 1), turn_window(&msgs, 4));
+    }
+
+    /// A stored prompt message carrying B2's injected per-prompt context.
+    fn prompt_with_injected_context() -> Message {
+        Message::new(Role::User)
+            .with_block(Block::text("fix the build"))
+            .with_block(Block::text(
+                "<origin-recall>\nprivate memory from another project\n</origin-recall>\n\n\
+                 <repo-map-focus>\n- src/a.rs: alpha\n</repo-map-focus>",
+            ))
+    }
+
+    /// B2: session export shows only what the user typed, never the recalled
+    /// memories / repo-map entries stored alongside it.
+    #[test]
+    #[allow(clippy::panic)] // asserts the StreamEvent variant via a panicking else-arm
+    fn export_skips_injected_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(dir.path().join("sessions.db")).expect("open store");
+        let mut s = Session::new("test", "m");
+        s.push(prompt_with_injected_context());
+        s.push(Message::new(Role::Assistant).with_block(Block::text("done")));
+        store.persist_session(&s).expect("persist");
+        store
+            .persist_transcript(&s.id, &s.messages)
+            .expect("persist transcript");
+        for format in ["markdown", "json"] {
+            let StreamEvent::SessionExport { content } = super::export_session_event(&store, &s.id, format)
+            else {
+                panic!("expected an export");
+            };
+            // The assistant turn proves the transcript (not just the title) was exported.
+            assert!(content.contains("done"), "{content}");
+            assert!(content.contains("fix the build"), "{content}");
+            assert!(!content.contains("private memory"), "{format}: {content}");
+            assert!(!content.contains("src/a.rs"), "{format}: {content}");
+        }
+    }
+
+    /// B2: a turn's summary transcript leaves out the injected context.
+    #[test]
+    fn summary_transcript_skips_injected_context() {
+        let msgs = vec![prompt_with_injected_context(), msg(Role::Assistant, "done")];
+        let transcript = super::summary_transcript(&msgs, 1);
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[0].blocks.len(), 1, "only the typed prompt remains");
+        assert!(matches!(&transcript[0].blocks[0], Block::Text { text, .. } if text == "fix the build"));
     }
 
     #[test]
