@@ -49,17 +49,42 @@ const MAX_ERROR_LINES: usize = 5;
 ///
 /// Returns `(program, args including the path)`, or `None` when there is no
 /// cheap check for this file type (fail-open).
+///
+/// The path is passed absolute (resolved against the process cwd, as the edit
+/// tools resolve an unanchored path), so a file name is never read as an
+/// option. Python runs isolated (`-I`: no cwd or script dir on `sys.path`, no
+/// `PYTHON*` variables, no user site), so a `py_compile.py` in the workspace is
+/// never imported. `node --check` only parses (no `--require`/preload comes
+/// from anywhere but `NODE_OPTIONS`, which the env scrub drops); the nearest
+/// `package.json` is read for the module type only.
 fn checker_for(path: &str) -> Option<(&'static str, Vec<String>)> {
     let ext = std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())?
         .to_ascii_lowercase();
+    let abs = || {
+        std::path::absolute(path)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    };
     match ext.as_str() {
-        "py" => Some(("python", vec!["-m".into(), "py_compile".into(), path.into()])),
+        "py" => Some((
+            "python",
+            vec!["-I".into(), "-m".into(), "py_compile".into(), abs()?],
+        )),
         // Not `.jsx`: `node --check` rejects JSX (B7).
-        "js" | "mjs" | "cjs" => Some(("node", vec!["--check".into(), path.into()])),
+        "js" | "mjs" | "cjs" => Some(("node", vec!["--check".into(), abs()?])),
         _ => None,
     }
+}
+
+/// The checker's process: scrubbed env (A6), run from the temp directory so
+/// nothing in the workspace is on the interpreter's module path (S1).
+fn checker_command<S: AsRef<std::ffi::OsStr>>(prog: S, args: &[String]) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(prog);
+    origin_tools::scrub_env(cmd.as_std_mut()); // A6
+    cmd.args(args).current_dir(std::env::temp_dir());
+    cmd
 }
 
 /// B7: pre-edit tree-sitter problem-line count per edited path (see
@@ -127,9 +152,7 @@ async fn check_file<S: AsRef<std::ffi::OsStr>>(
     before: usize,
 ) -> Option<Finding> {
     if let Some((prog, args)) = checker {
-        let mut cmd = tokio::process::Command::new(prog);
-        origin_tools::scrub_env(cmd.as_std_mut()); // A6
-        let run = cmd.args(&args).output();
+        let run = checker_command(prog, &args).output();
         if let Ok(Ok(out)) = tokio::time::timeout(PER_FILE_TIMEOUT, run).await {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if !interpreter_missing(out.status.code(), &stderr) {
@@ -155,9 +178,13 @@ async fn check_file<S: AsRef<std::ffi::OsStr>>(
 /// B7: the run produced no check at all. The Windows Store `python` "App
 /// Execution Alias" (installed by default) runs, exits 9009 and prints
 /// `Python was not found; run without arguments to install from the Microsoft
-/// Store, …` — no interpreter, not a syntax error.
+/// Store, …` — no interpreter, not a syntax error. S1: an interpreter that
+/// rejects the isolation flag (`Unknown option: -I`) did not check either.
 fn interpreter_missing(code: Option<i32>, stderr: &str) -> bool {
-    code == Some(9009) || stderr.trim_start().starts_with("Python was not found")
+    let first = stderr.trim_start();
+    code == Some(9009)
+        || first.starts_with("Python was not found")
+        || (code != Some(0) && first.to_ascii_lowercase().starts_with("unknown option"))
 }
 
 /// B7: record `path`'s pre-edit tree-sitter problem-line count in `baseline`.
@@ -260,6 +287,44 @@ mod tests {
         assert!(checker_for("a.go").is_none(), "go vet is project-wide");
         assert!(checker_for("README.md").is_none());
         assert!(checker_for("noext").is_none());
+    }
+
+    /// S1: every checker gets an absolute path and runs from the temp
+    /// directory; Python runs isolated (`-I` before `-m`).
+    #[test]
+    fn checkers_run_isolated_from_the_workspace() {
+        for (file, prog) in [
+            ("x.py", "python"),
+            ("-x.js", "node"),
+            ("x.mjs", "node"),
+            ("x.cjs", "node"),
+        ] {
+            let (got, args) = checker_for(file).expect("checker");
+            assert_eq!(got, prog);
+            let path = args.last().expect("path");
+            assert!(std::path::Path::new(path).is_absolute(), "{file}: {path}");
+            let cmd = checker_command(got, &args);
+            assert_eq!(
+                cmd.as_std().get_current_dir(),
+                Some(std::env::temp_dir().as_path()),
+                "{file}"
+            );
+        }
+        let (_, args) = checker_for("x.py").expect("python");
+        let at = |a: &str| args.iter().position(|x| x == a);
+        assert!(at("-I").expect("-I") < at("-m").expect("-m"), "{args:?}");
+    }
+
+    /// S1: an interpreter that rejects `-I` counts as missing (tree-sitter
+    /// covers), never as a syntax error.
+    #[test]
+    fn a_rejected_isolation_flag_counts_as_a_missing_interpreter() {
+        assert!(interpreter_missing(
+            Some(2),
+            "Unknown option: -I\nusage: python [option] ...\n"
+        ));
+        assert!(interpreter_missing(Some(2), "unknown option -I\n"));
+        assert!(!interpreter_missing(Some(0), "unknown option -I\n"));
     }
 
     #[tokio::test]
