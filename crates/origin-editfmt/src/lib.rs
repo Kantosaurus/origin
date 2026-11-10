@@ -401,11 +401,18 @@ fn parse_whole_file(text: &str) -> Result<Vec<Hunk>, EditFmtError> {
 }
 
 /// A conservative relative path: ASCII letters/digits and `.` `_` `-` `/`
-/// only, with a `.` or `/` (so `Example`, `Run` are not paths), not absolute
+/// only; a `/`, or a file name with a stem and an extension holding a letter
+/// (so `Example`, `Done.`, `v1.2.3` are not paths, `a.rs` is); not absolute
 /// and no `..` component. Containment is the applier's job; this is defence
 /// in depth.
 fn looks_like_path(s: &str) -> bool {
-    s.contains(['.', '/'])
+    let named = s.contains('/')
+        || s.rsplit_once('.').is_some_and(|(stem, ext)| {
+            !stem.is_empty()
+                && ext.chars().any(|c| c.is_ascii_alphabetic())
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        });
+    named
         && !s.starts_with('/')
         && !s.split('/').any(|c| c == "..")
         && s.chars()
@@ -597,6 +604,18 @@ mod tests {
         let hunks = parse(EditFormat::WholeFile, "README.md\n```\n# hi\n```\n").unwrap();
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].file, "README.md");
+    }
+
+    #[test]
+    fn whole_file_path_needs_a_slash_or_a_lettered_extension() {
+        for word in ["Done.", "v1.2.3", "..."] {
+            let text = format!("{word}\n```\nx\n```\n");
+            assert!(parse(EditFormat::WholeFile, &text).is_err(), "{word}");
+        }
+        for path in ["README.md", "Cargo.toml", "src/a"] {
+            let hunks = parse(EditFormat::WholeFile, &format!("{path}\n```\nx\n```\n")).unwrap();
+            assert_eq!(hunks[0].file, path);
+        }
     }
 
     #[test]
