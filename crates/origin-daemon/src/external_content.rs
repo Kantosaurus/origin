@@ -55,6 +55,14 @@ pub fn external_source(tool: &str, args: &Value) -> Option<(String, Option<Strin
     }
 }
 
+/// Whether `tool`'s results carry external content: the one list behind the
+/// provenance markers (C4), the network tools `workspace` mode asks for and
+/// the tools whose successful result taints a session (C2).
+#[must_use]
+pub fn is_external_tool(tool: &str) -> bool {
+    external_source(tool, &Value::Null).is_some()
+}
+
 /// `body` wrapped in a provenance marker when `tool` carries external content;
 /// `None` otherwise (the caller keeps `body` as is).
 #[must_use]

@@ -481,7 +481,8 @@ async fn decide_permission(
     }
     // (4) AutoAllowed tools never prompt (a network tool still asks in workspace).
     if matches!(meta.tier, origin_tools::Tier::AutoAllowed)
-        && !(opts.permission_mode == PermissionMode::Workspace && is_external_tool(meta.name))
+        && !(opts.permission_mode == PermissionMode::Workspace
+            && crate::external_content::is_external_tool(meta.name))
     {
         return decision(true, "tier=AutoAllowed".into());
     }
@@ -579,16 +580,9 @@ fn cannot_ask_reason(tool: &str, why: &str) -> String {
     )
 }
 
-/// C2: tools whose successful result brings outside content into the context.
-/// They are the network tools `workspace` mode asks for, and the ones that taint
-/// a session. Kept as one list so the provenance wrapper's can be unified with it.
-pub(crate) fn is_external_tool(name: &str) -> bool {
-    matches!(name, "WebFetch" | "WebSearch" | "Browser" | "gmail") || name.starts_with("mcp__")
-}
-
 /// C2: whether `messages` would taint the session.
 ///
-/// True for a successful result of an [`is_external_tool`] call, or a
+/// True for a successful result of an [`crate::external_content::is_external_tool`] call, or a
 /// sub-agent result (`Task`, `CollectTasks`, `RunWorkflow`) from a tainted
 /// worker. Used per turn and on resume.
 #[must_use]
@@ -608,7 +602,7 @@ pub fn external_result_in(messages: &[Message]) -> bool {
             inline,
             ..
         } => calls.get(tool_use_id.as_str()).is_some_and(|name| {
-            is_external_tool(name)
+            crate::external_content::is_external_tool(name)
                 || (matches!(*name, "Task" | "CollectTasks" | "RunWorkflow")
                     && inline.as_deref().is_some_and(worker_result_tainted))
         }),
@@ -669,7 +663,7 @@ fn workspace_need(
 ) -> Need {
     const AFTER_TAINT: &str = "after external content entered this session";
     let name = meta.name;
-    if is_external_tool(name) {
+    if crate::external_content::is_external_tool(name) {
         return if tainted {
             Need::Person(format!("network tool {AFTER_TAINT}"))
         } else {
@@ -878,10 +872,8 @@ fn apply_governance_overlay(
 /// grant) is re-asked with `args_preview`, and a prompter that cannot ask
 /// (headless, sub-agent) denies with [`cannot_ask_reason`].
 ///
-/// C6: a command that installs a package the project does not declare
-/// ([`crate::dep_gate`]; the manifests from the call's `cwd` up to `run_cwd`,
-/// the run's working directory — `None` ⇒ the process cwd) is raised to
-/// `NeedsApproval` with the package named.
+/// C6: a command that installs a package the project does not declare is
+/// raised to `NeedsApproval` with the package named ([`cmd_guard_verdict`]).
 async fn apply_cmd_guard(
     decision: origin_permission::Decision,
     meta: &ToolMeta,
@@ -893,27 +885,9 @@ async fn apply_cmd_guard(
     if meta.name != "Bash" || std::env::var("ORIGIN_CMD_GUARD").as_deref() == Ok("0") {
         return decision;
     }
-    let Some(cmd) = args.get("command").and_then(Value::as_str) else {
+    let Some(verdict) = cmd_guard_verdict(args, run_cwd) else {
         return decision;
     };
-    let analysis = origin_cmdparse::analyze(cmd);
-    let mut verdict = origin_cmdparse::worst(&analysis);
-    // C6: installing a package the project does not declare needs approval.
-    // Only ever raises the verdict (a Dangerous one is left as it is).
-    if !matches!(verdict, origin_cmdparse::Risk::Dangerous(_)) {
-        // A12: a best-of-N candidate's manifests live in its own worktree.
-        let root = run_cwd.map_or_else(
-            || std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-            std::path::Path::to_path_buf,
-        );
-        let cwd = args.get("cwd").and_then(Value::as_str);
-        if let Some(why) = crate::dep_gate::reason(cmd, cwd, &root) {
-            verdict = origin_cmdparse::Risk::NeedsApproval(match verdict {
-                origin_cmdparse::Risk::NeedsApproval(prev) => format!("{prev}; {why}"),
-                _ => why,
-            });
-        }
-    }
     match verdict {
         origin_cmdparse::Risk::Dangerous(reason) => origin_permission::Decision {
             outcome: Outcome::Deny,
@@ -952,6 +926,32 @@ async fn apply_cmd_guard(
     }
 }
 
+/// The command guard's verdict on a `Bash` call's `command` (`None` when it
+/// has none): cmdparse's worst risk, raised to `NeedsApproval` when the command
+/// installs a package the project does not declare (C6, [`crate::dep_gate`];
+/// the manifests from the call's `cwd` up to `run_cwd`, the run's working
+/// directory — `None` ⇒ the process cwd). Only ever raises the verdict.
+fn cmd_guard_verdict(args: &Value, run_cwd: Option<&std::path::Path>) -> Option<origin_cmdparse::Risk> {
+    let cmd = args.get("command").and_then(Value::as_str)?;
+    let verdict = origin_cmdparse::worst(&origin_cmdparse::analyze(cmd));
+    if matches!(verdict, origin_cmdparse::Risk::Dangerous(_)) {
+        return Some(verdict);
+    }
+    // A12: a best-of-N candidate's manifests live in its own worktree.
+    let root = run_cwd.map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        std::path::Path::to_path_buf,
+    );
+    let cwd = args.get("cwd").and_then(Value::as_str);
+    Some(match crate::dep_gate::reason(cmd, cwd, &root) {
+        None => verdict,
+        Some(why) => origin_cmdparse::Risk::NeedsApproval(match verdict {
+            origin_cmdparse::Risk::NeedsApproval(prev) => format!("{prev}; {why}"),
+            _ => why,
+        }),
+    })
+}
+
 /// C2: a `Bash` call the command guard rates `Dangerous`, denied before any
 /// permission ask so the user is never asked to approve what cannot run.
 fn cmd_guard_dangerous(tool: &str, args: &Value) -> Option<origin_permission::Decision> {
@@ -969,14 +969,19 @@ fn cmd_guard_dangerous(tool: &str, args: &Value) -> Option<origin_permission::De
 }
 
 /// C2: the ask text for a `Bash` call the command guard rates
-/// `NeedsApproval`: the guard's reason first, then the call. `None` for any
-/// other call (or with the guard off).
-fn cmd_guard_ask_preview(tool: &str, args: &Value, preview: &str) -> Option<String> {
+/// `NeedsApproval` (C6: an undeclared package install included): the guard's
+/// reason first, then the call. `None` for any other call (or with the guard
+/// off).
+fn cmd_guard_ask_preview(
+    tool: &str,
+    args: &Value,
+    preview: &str,
+    run_cwd: Option<&std::path::Path>,
+) -> Option<String> {
     if tool != "Bash" || std::env::var("ORIGIN_CMD_GUARD").as_deref() == Ok("0") {
         return None;
     }
-    let cmd = args.get("command").and_then(Value::as_str)?;
-    match origin_cmdparse::worst(&origin_cmdparse::analyze(cmd)) {
+    match cmd_guard_verdict(args, run_cwd)? {
         origin_cmdparse::Risk::NeedsApproval(reason) => {
             Some(format!("cmd-guard: needs approval: {reason} | {preview}"))
         }
@@ -6851,7 +6856,7 @@ async fn run_loop_inner(
             // C2: a `NeedsApproval` Bash prompt leads with the guard's reason.
             let special_preview = (meta.name == "Task")
                 .then(|| task_permission_preview(&args))
-                .or_else(|| cmd_guard_ask_preview(meta.name, &args, &preview));
+                .or_else(|| cmd_guard_ask_preview(meta.name, &args, &preview, opts.cwd.as_deref()));
             let ask_preview = special_preview.as_deref().unwrap_or(&preview);
             // C2: a `Dangerous` command is denied before anyone is asked.
             let mut decision = match cmd_guard_dangerous(meta.name, &args) {
@@ -13748,6 +13753,7 @@ mod wiring_tests {
         };
         assert!(external_result_in(&msgs(false)));
         assert!(!external_result_in(&msgs(true)));
+        use crate::external_content::is_external_tool;
         assert!(is_external_tool("mcp__gh__get") && is_external_tool("gmail") && !is_external_tool("Read"));
     }
 
@@ -13759,7 +13765,7 @@ mod wiring_tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("ORIGIN_CMD_GUARD");
         let args = serde_json::json!({ "command": "eval \"$CMD\"" });
-        let preview = cmd_guard_ask_preview("Bash", &args, &args.to_string()).expect("guard preview");
+        let preview = cmd_guard_ask_preview("Bash", &args, &args.to_string(), None).expect("guard preview");
         assert!(preview.starts_with("cmd-guard: needs approval: "), "{preview}");
         let rule_allow = || Decision {
             outcome: Outcome::Allow,
@@ -13773,6 +13779,7 @@ mod wiring_tests {
             &args,
             &preview,
             &human,
+            None,
         ));
         assert_eq!(asked.outcome, Outcome::Allow);
         assert_eq!(
@@ -13788,6 +13795,7 @@ mod wiring_tests {
             &args,
             &preview,
             &headless,
+            None,
         ));
         assert_eq!(denied.outcome, Outcome::Deny);
         assert!(
@@ -13806,7 +13814,7 @@ mod wiring_tests {
             &Session::new("p", "m"),
         ));
         assert_eq!(base.reason, STANDING_ALLOW);
-        let guarded = rt.block_on(apply_cmd_guard(base, builtin("Bash"), &args, &preview, &standing));
+        let guarded = rt.block_on(apply_cmd_guard(base, builtin("Bash"), &args, &preview, &standing, None));
         assert_eq!(guarded.outcome, Outcome::Allow);
         assert_eq!(
             standing.asks(),
@@ -13824,18 +13832,83 @@ mod wiring_tests {
             &Session::new("p", "m"),
         ));
         assert_eq!(granted.outcome, Outcome::Allow, "the grant covers Bash itself");
-        let in_worker = rt.block_on(apply_cmd_guard(granted, builtin("Bash"), &args, &preview, &grant));
+        let in_worker = rt.block_on(apply_cmd_guard(granted, builtin("Bash"), &args, &preview, &grant, None));
         assert_eq!(in_worker.outcome, Outcome::Deny, "{}", in_worker.reason);
         let off = Decision {
             outcome: Outcome::Allow,
             reason: MODE_OFF.into(),
         };
-        let through = rt.block_on(apply_cmd_guard(off, builtin("Bash"), &args, &preview, &headless));
+        let through = rt.block_on(apply_cmd_guard(off, builtin("Bash"), &args, &preview, &headless, None));
         assert_eq!(
             through.outcome,
             Outcome::Allow,
             "mode off approves without asking"
         );
+    }
+
+    /// C2 + C6: an undeclared package install is a `NeedsApproval` verdict
+    /// like any other: one ask naming the package, even with a standing allow
+    /// for Bash; denied with the cannot-ask text headless; mode off runs it.
+    #[test]
+    fn c2_dependency_gate_asks_once_with_the_package() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("ORIGIN_CMD_GUARD");
+        let run = tempfile::tempdir().expect("tmp");
+        std::fs::write(run.path().join("package.json"), "{}").expect("write");
+        let args = serde_json::json!({ "command": "npm install left-pad", "cwd": run.path() });
+        let preview =
+            cmd_guard_ask_preview("Bash", &args, &args.to_string(), Some(run.path())).expect("guard preview");
+        assert!(preview.contains("left-pad"), "{preview}");
+        let rt = tokio::runtime::Builder::new_current_thread().build().expect("rt");
+        let standing = Rec::standing();
+        let opts = LoopOptions {
+            cwd: Some(run.path().to_path_buf()),
+            ..LoopOptions::default()
+        };
+        let base = rt.block_on(decide_c2("Bash", &args, &standing, &opts, &Session::new("p", "m")));
+        assert_eq!(base.reason, STANDING_ALLOW);
+        let guarded = rt.block_on(apply_cmd_guard(
+            base,
+            builtin("Bash"),
+            &args,
+            &preview,
+            &standing,
+            Some(run.path()),
+        ));
+        assert_eq!(guarded.outcome, Outcome::Allow);
+        assert_eq!(standing.asks(), vec![preview.clone()], "asked once, naming the package");
+        let headless = origin_permission::prompt::NoPrompter;
+        let allow = Decision {
+            outcome: Outcome::Allow,
+            reason: "rule:Bash@*:allow".into(),
+        };
+        let denied = rt.block_on(apply_cmd_guard(
+            allow,
+            builtin("Bash"),
+            &args,
+            &preview,
+            &headless,
+            Some(run.path()),
+        ));
+        assert_eq!(denied.outcome, Outcome::Deny);
+        assert!(
+            denied.reason.contains("left-pad") && denied.reason.contains("ORIGIN_ALLOW_ALL=1"),
+            "{}",
+            denied.reason
+        );
+        let off = Decision {
+            outcome: Outcome::Allow,
+            reason: MODE_OFF.into(),
+        };
+        let through = rt.block_on(apply_cmd_guard(
+            off,
+            builtin("Bash"),
+            &args,
+            &preview,
+            &headless,
+            Some(run.path()),
+        ));
+        assert_eq!(through.outcome, Outcome::Allow);
     }
 
     /// A `RequiresPermission` `ToolMeta` for the named tool, used to exercise the
