@@ -6034,6 +6034,11 @@ async fn run_loop_inner(
                 }
             };
 
+            // C9: redact known secret values where the result is first captured,
+            // so the CAS blob, TUI preview, transcript and model all see the same
+            // redacted bytes.
+            let result_bytes = crate::redact::bytes(result_bytes);
+
             // C2: fingerprint this successful tool outcome for the stuck-loop
             // detector. A Bash command that exited non-zero counts as an error
             // (`bash_failed`); all other success-path results are not errors.
@@ -6295,6 +6300,12 @@ async fn run_loop_inner(
             crate::stuck::StuckLevel::Ok => stuck_block.clear(),
         }
 
+        // C9: error-path and sub-agent results never pass the capture point above.
+        for b in &mut tool_results {
+            if let Block::ToolResult { inline: Some(v), .. } = b {
+                *v = crate::redact::bytes(std::mem::take(v));
+            }
+        }
         // Append tool results as a single Role::Tool message (provider crates
         // will translate this to the right wire shape per provider).
         let mut tool_msg = Message::new(Role::Tool);
@@ -8393,7 +8404,8 @@ async fn run_bash_streaming(
         while let Some(nl) = pending.find('\n') {
             let line: String = pending.drain(..=nl).collect();
             // Drop the trailing '\n' for display; ToolChunk is per-line.
-            let line = line.trim_end_matches('\n').to_string();
+            // C9: the TUI sees each line before the full body is captured.
+            let line = crate::redact::text(line.trim_end_matches('\n')).into_owned();
             *chunk_count += 1;
             lines.push(line);
         }
@@ -8471,7 +8483,7 @@ async fn run_bash_streaming(
     // Flush any trailing partial line (output without a terminating newline).
     if !pending.is_empty() {
         chunk_count += 1;
-        let trailing = std::mem::take(&mut pending);
+        let trailing = crate::redact::text(&pending).into_owned();
         if let Some(tx) = event_tx {
             let _ = tx
                 .send(StreamEvent::ToolChunk {

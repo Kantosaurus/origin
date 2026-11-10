@@ -368,6 +368,10 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
         .with_plan(wire_plan.clone());
 
     let initial_account = env::var("ORIGIN_ACCOUNT").unwrap_or_else(|_| "default".into());
+    // C9: build the by-value secret redactor once, before any tool can run.
+    origin_daemon::redact::install(
+        origin_daemon::redact::collect(&vault, factory.catalog(), &initial_account).await,
+    );
     // Register the factory process-wide so the agent loop can rebuild a provider
     // mid-loop for a CROSS-PROVIDER router pick (foundation L84 / kilo L265). This
     // is inert unless `ORIGIN_ROUTER` is set and a pick lands on a different
@@ -407,6 +411,16 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     let db_path = env::var("ORIGIN_DB").unwrap_or_else(|_| default_db_path());
     let session_store = Arc::new(SessionStore::open(&db_path)?);
     info!(db = %db_path, "session store ready");
+    // C9: session retention. ORIGIN_SESSION_RETENTION_DAYS (default 30; 0 = keep forever).
+    let retention_days = env::var("ORIGIN_SESSION_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(30);
+    match session_store.prune_older_than(retention_days) {
+        Ok(0) => {}
+        Ok(n) => info!(pruned = n, retention_days, "pruned sessions past retention"),
+        Err(e) => warn!(error = %e, "session retention prune failed"),
+    }
 
     // Code-graph subsystem (P7.8 Subsystem A). Opens its own CAS root and
     // SQL connection so the index never contends with the session store or
@@ -2146,7 +2160,8 @@ async fn handle_request(
             PromptOutcome::Succeeded
         }
         TurnEnd::Normal(Err(e)) => {
-            let message = format!("loop error: {e}");
+            // C9: a provider error body could echo a credential.
+            let message = origin_daemon::redact::text(&format!("loop error: {e}")).into_owned();
             let _ = conn
                 .lock()
                 .await

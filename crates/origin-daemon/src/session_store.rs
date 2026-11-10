@@ -46,10 +46,63 @@ impl SessionStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SessionStoreError> {
         let p = path.as_ref();
         let db_dir = p.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        // C9: transcripts are a secrets store — user-only on Unix. Pre-create
+        // the file 0600 so SQLite never creates it wider (its -wal/-shm copy the
+        // db's mode), and tighten an existing one. Windows: no chmod; the db
+        // lives under the user profile, whose ACL is already user-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(p);
+            for suffix in ["", "-wal", "-shm"] {
+                let mut f = p.as_os_str().to_owned();
+                f.push(suffix);
+                let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
+            }
+        }
         Ok(Self {
             inner: Store::open(p)?,
             db_dir,
         })
+    }
+
+    /// C9 retention: delete every session whose last activity (newest message
+    /// row, else its creation) is older than `days`, with its rows and resume
+    /// token. `0` keeps everything. Returns how many sessions were removed.
+    ///
+    /// # Errors
+    /// Propagates sqlite errors.
+    pub fn prune_older_than(&self, days: u64) -> Result<usize, SessionStoreError> {
+        if days == 0 {
+            return Ok(0);
+        }
+        let age_ms = i64::try_from(days.saturating_mul(86_400_000)).unwrap_or(i64::MAX);
+        let cutoff = now_ms().saturating_sub(age_ms);
+        let ids: Vec<String> = self.inner.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT s.id FROM sessions s WHERE COALESCE( \
+                     (SELECT MAX(m.created_at) FROM messages m WHERE m.session_id = s.id), \
+                     s.created_at) < ?1",
+            )?;
+            let rows = stmt.query_map([cutoff], |r| r.get(0))?;
+            rows.collect()
+        })?;
+        for id in &ids {
+            self.inner.with_conn(|c| {
+                c.execute("DELETE FROM message_snapshots WHERE session_id = ?1", [id])?;
+                Ok(())
+            })?;
+            self.delete(id)?;
+            // Ids come from our own rows; still never let one escape the dir.
+            if !id.contains(['/', '\\', '.']) {
+                let _ = std::fs::remove_file(self.resume_dir().join(format!("{id}.json")));
+            }
+        }
+        Ok(ids.len())
     }
 
     /// Directory under which P12.12 persists per-session resume tokens.
@@ -89,7 +142,7 @@ impl SessionStore {
         // the `sessions.title` column — surfaced by `origin sessions ls` — is
         // actually populated. `None` until a user turn exists (a brand-new
         // session persisted before its first prompt keeps `title = NULL`).
-        let title = derive_session_title(s);
+        let title = derive_session_title(s).map(|t| crate::redact::text(&t).into_owned());
         let now = now_ms();
         self.inner.with_conn(|c| {
             // UPSERT rather than INSERT OR REPLACE: REPLACE deletes the existing
@@ -128,7 +181,9 @@ impl SessionStore {
         turn_index: u32,
         m: &Message,
     ) -> Result<(), SessionStoreError> {
-        let bytes = rkyv::to_bytes::<_, 4096>(m)
+        // C9: the persistence choke point — no known secret value is written.
+        let m = crate::redact::message(m);
+        let bytes = rkyv::to_bytes::<_, 4096>(&*m)
             .map_err(|e| SessionStoreError::Rkyv(e.to_string()))?
             .to_vec();
         let role: i64 = match m.role {
@@ -198,10 +253,11 @@ impl SessionStore {
         turn_index: u32,
         summary: &str,
     ) -> Result<(), SessionStoreError> {
+        let summary = crate::redact::text(summary);
         self.inner.with_conn(|c| {
             c.execute(
                 "UPDATE messages SET summary = ?1 WHERE session_id = ?2 AND turn_index = ?3",
-                rusqlite::params![summary, session_id, turn_index],
+                rusqlite::params![summary.as_ref(), session_id, turn_index],
             )?;
             Ok(())
         })?;
@@ -380,7 +436,7 @@ impl SessionStore {
         turn_index: u32,
         original: &Message,
     ) -> Result<(), SessionStoreError> {
-        let bytes = rkyv::to_bytes::<_, 4096>(original)
+        let bytes = rkyv::to_bytes::<_, 4096>(&*crate::redact::message(original))
             .map_err(|e| SessionStoreError::Rkyv(e.to_string()))?
             .to_vec();
         let now = now_ms();
@@ -683,6 +739,56 @@ mod tests {
             None,
             "a reused-and-shortened session must never load an orphaned tool_result",
         );
+    }
+
+    /// C9: retention prunes only sessions whose LAST activity is past the limit
+    /// (rows + resume token); `0` keeps everything.
+    #[test]
+    fn prune_removes_only_sessions_older_than_the_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(dir.path().join("sessions.db")).expect("open");
+        std::fs::create_dir_all(store.resume_dir()).expect("resume dir");
+        let day_ms: i64 = 86_400_000;
+        let old = super::now_ms() - 40 * day_ms;
+        for sid in ["old", "fresh", "old-but-active"] {
+            store
+                .persist_session(&Session::new_with_id(sid.to_string(), "m".to_string()))
+                .expect("persist session");
+            store
+                .persist_message(sid, 0, &Message::new(Role::User).with_block(Block::text("hi")))
+                .expect("persist message");
+            std::fs::write(store.resume_dir().join(format!("{sid}.json")), "{}").expect("token");
+        }
+        store
+            .inner
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE sessions SET created_at = ?1 WHERE id IN ('old', 'old-but-active')",
+                    [old],
+                )?;
+                c.execute(
+                    "UPDATE messages SET created_at = ?1 WHERE session_id = 'old'",
+                    [old],
+                )?;
+                Ok(())
+            })
+            .expect("backdate");
+
+        assert_eq!(store.prune_older_than(0).expect("keep forever"), 0);
+        assert_eq!(store.prune_older_than(30).expect("prune"), 1);
+
+        let left: Vec<String> = store
+            .list_summaries()
+            .expect("list")
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert!(!left.contains(&"old".to_string()), "{left:?}");
+        assert!(left.contains(&"fresh".to_string()) && left.contains(&"old-but-active".to_string()));
+        assert!(store.load_messages("old").expect("load").is_empty());
+        assert!(!store.resume_dir().join("old.json").exists());
+        assert!(store.resume_dir().join("fresh.json").exists());
+        assert!(store.resume_dir().join("old-but-active.json").exists());
     }
 
     #[test]

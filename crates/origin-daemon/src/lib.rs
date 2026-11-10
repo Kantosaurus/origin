@@ -26,6 +26,7 @@ pub mod proposal_registry;
 pub mod protocol;
 pub mod provider_factory;
 pub mod ra_impl;
+pub mod redact;
 pub mod remote_quic;
 pub mod stuck;
 pub mod runtime_launch;
