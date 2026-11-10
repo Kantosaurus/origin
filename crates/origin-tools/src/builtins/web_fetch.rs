@@ -82,11 +82,11 @@ pub async fn web_fetch_args(args: &Value) -> Result<String, String> {
 
 crate::origin_tool! {
     name: "WebFetch",
-    description: "Fetch one or more URLs and return reader-mode markdown. Pass a single `url` string, or a `urls` array (up to 20) to fetch several at once; multi-URL output is sectioned under `## <url>` headers.",
+    description: "Fetch one or more URLs and answer `prompt` about their content. Pass a single `url` string, or a `urls` array (up to 20) to fetch several at once. Where available, the page is read by a separate tool-less model and only its answer is returned; the result is wrapped in an <external> marker.",
     tier: Tier::RequiresPermission,
     urgency: Urgency::Low,
     side_effects: SideEffects::Pure,
-    input_schema: r#"{"type":"object","properties":{"url":{"type":"string","description":"A single URL to fetch."},"urls":{"type":"array","items":{"type":"string"},"maxItems":20,"description":"Up to 20 URLs to fetch in one call; takes precedence over `url` when present."}}}"#,
+    input_schema: r#"{"type":"object","properties":{"url":{"type":"string","description":"A single URL to fetch."},"urls":{"type":"array","items":{"type":"string"},"maxItems":20,"description":"Up to 20 URLs to fetch in one call; takes precedence over `url` when present."},"prompt":{"type":"string","description":"What you want to know from the page(s); answered from the fetched content."}},"required":["prompt"]}"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
     hot: false,
 }

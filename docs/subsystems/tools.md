@@ -725,6 +725,18 @@ bounce the fetch to an internal service or cloud metadata endpoint. The
 `WebFetch` tool batches multiple URLs (`urls` array, up to 20) and sections the
 output under `## <url>` headers.
 
+The page never reaches the main loop directly (C4): the tool's required
+`prompt` is answered by a tool-less call to a cheap model of the active provider
+(on Anthropic, the sidecar summariser's `ORIGIN_SIDECAR_MODEL`, default Haiku),
+with the page wrapped as data, and only that answer (at most 8,000 characters)
+is returned. A failed quarantine call is a tool error, never the raw page. With
+no resolvable cheap model (non-Anthropic providers) or `ORIGIN_WEBFETCH_RAW=1`,
+the page itself is returned. Either way the result — like every `WebSearch`,
+`Browser`, `gmail` and `mcp__*` result — arrives as
+`<external source="…" url="…">…</external>`, with marker lookalikes inside the
+content escaped; the system prompt states that such text is data, not
+instructions.
+
 ### WebSearch via Tavily
 
 `web_search.rs` resolves the Tavily API key in order: (1) the OS keyvault under

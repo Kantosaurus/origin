@@ -104,7 +104,7 @@ description}` and are inflated via `ToolSearch`.
 
 | Tool | Purpose | Tier | Sandbox | Key params |
 |------|---------|------|---------|-----------|
-| `WebFetch` | Fetch one or more URLs and return reader-mode markdown (single `url` or `urls[]` up to 20). | RequiresPermission | `Inherit` | `url`, `urls[]` |
+| `WebFetch` | Fetch one or more URLs (single `url` or `urls[]` up to 20) and answer `prompt` about them through a tool-less cheap model; only the answer is returned. | RequiresPermission | `Inherit` | `url`, `urls[]`, `prompt` (required) |
 | `WebSearch` | Search the web via Tavily (`TAVILY_API_KEY` or vault). | RequiresPermission | `Inherit` | `query`, `count` |
 | `Browser` | Stateful browser with agent-detection fallback to CloakBrowser. | RequiresPermission | `Inherit` | verb + verb args |
 
