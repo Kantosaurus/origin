@@ -121,7 +121,7 @@ const COMPACT_WINDOW_DEN: usize = 5;
 /// Bytes-per-token used to convert a token window into the byte heuristic the
 /// live cap check operates on (matches the ~4 implicit in
 /// [`crate::compactor::estimate_transcript_bytes`]).
-const BYTES_PER_TOKEN: usize = 4;
+pub(crate) const BYTES_PER_TOKEN: usize = 4;
 
 /// The transcript-byte soft cap above which the live in-loop compactor folds the
 /// oldest summarized turns into their summaries (firing `PreCompress`).
@@ -6007,14 +6007,24 @@ async fn run_loop_inner(
                         match tool.invoke(args.clone()).await {
                             Ok(v) => {
                                 let body = serde_json::to_vec(&v).unwrap_or_else(|_| b"null".to_vec());
-                                // C4: MCP output is external content.
+                                // C4: MCP output is external content, bounded then
+                                // wrapped so the note sits inside the marker.
+                                let body = crate::external_content::bound_mcp_result(body);
                                 (
                                     crate::external_content::wrap_tool_result(&name, &args, &body)
                                         .unwrap_or(body),
                                     false,
                                 )
                             }
-                            Err(e) => (format!("Error: {e}").into_bytes(), true),
+                            // C4: an MCP error body is server-controlled text too.
+                            Err(e) => {
+                                let body = format!("Error: {e}").into_bytes();
+                                (
+                                    crate::external_content::wrap_tool_result(&name, &args, &body)
+                                        .unwrap_or(body),
+                                    true,
+                                )
+                            }
                         }
                     } else {
                         (
@@ -6761,6 +6771,11 @@ async fn run_loop_inner(
                     .await
                     .filter(|_| !batch_mutated && opts.cwd.is_none());
                 if let Some(pre) = pre {
+                    // C4: WebFetch never reaches this branch — only `AutoAllowed`
+                    // tools are pre-run (A3) and WebFetch is `RequiresPermission`.
+                    // The quarantine call lives on the dispatch path below and
+                    // depends on this.
+                    debug_assert_ne!(meta.name, "WebFetch", "WebFetch must not be speculated (C4)");
                     match pre {
                         Ok(bytes) => {
                             // #5: the speculative dispatch path runs Read with no
@@ -8533,7 +8548,11 @@ async fn dispatch_tool(
         // ── Web tools (stateless) ──
         "WebFetch" => {
             // C4: `prompt` is what the quarantine model answers about the page.
-            if args.get("prompt").and_then(Value::as_str).is_none() {
+            if args
+                .get("prompt")
+                .and_then(Value::as_str)
+                .is_none_or(|p| p.trim().is_empty())
+            {
                 return Err(LoopError::BadArgs("WebFetch: missing `prompt`".into()));
             }
             // Accepts either a single `url` or a `urls` array (up to 20);

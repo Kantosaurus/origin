@@ -251,7 +251,7 @@ each module's registration.
 | `Glob` | Find files matching a glob, mtime-sorted, gitignore-aware | AutoAllowed | Pure | `Inherit` | yes | (`glob_tool.rs`). |
 | `LspNavigate` | Semantic nav: definition/references/incoming/outgoing calls | AutoAllowed | Pure | `Inherit` | **no** | Backed by the warm LSP fleet (`lsp_nav.rs`). |
 | `Diagnostics` | LSP diagnostics for a path or workspace | AutoAllowed | Pure | `Inherit` | yes | Severity filter error/warning/hint/any (`diagnostics.rs`). |
-| `WebFetch` | GET a URL, return reader-mode markdown; multi-URL batching | RequiresPermission | Pure | `Inherit` | **no** | Pure-Rust readability path (`web_fetch.rs`). |
+| `WebFetch` | GET one or more URLs and answer the required `prompt` about them; the page is read by a tool-less quarantine model and only its answer is returned, wrapped in `<external>` (`ORIGIN_WEBFETCH_RAW=1` returns the wrapped page instead) | RequiresPermission | Pure | `Inherit` | **no** | Pure-Rust readability path (`web_fetch.rs`); quarantine in `origin-daemon/src/external_content.rs` (C4). |
 | `WebSearch` | Tavily web search | RequiresPermission | Pure | `Inherit` | **no** | Requires `TAVILY_API_KEY` / vault key (`web_search.rs`). |
 | `Browser` | Stateful dual-backend browser (agent-browser + Cloak fallback) | RequiresPermission | Mutating | `Inherit` | **no** | (`browser.rs`). |
 | `Recall` | Inflate a CAS handle into the response; optional region slice | AutoAllowed | Pure | `Inherit` | **yes** | Hot on purpose: SchemaCrush offloads behind a `recall` handle (`recall.rs`). |

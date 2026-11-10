@@ -58,14 +58,13 @@ async fn handshake_and_list(
 /// the worker's allow-list. Best-effort: a server that fails to spawn, handshake,
 /// or list its tools is logged and skipped (the worker still runs without it).
 ///
-/// Each proxy is wired with (a) the server's declared JSON Schema, so model args
-/// are validated before each `tools/call`, and (b) the daemon CAS store, so a
-/// large tool result is offloaded to content-addressed storage instead of being
-/// inlined into the transcript. HTTP servers get a best-effort OAuth bearer from
+/// Each proxy is wired with the server's declared JSON Schema, so model args
+/// are validated before each `tools/call`. Results stay inline (C4: the agent
+/// loop bounds and wraps them). HTTP servers get a best-effort OAuth bearer from
 /// the vault before the handshake so authenticated endpoints are reachable.
 async fn build_runtime_tools(
     specs: &[McpServerSpec],
-    cas: &Arc<CasStore>,
+    _cas: &Arc<CasStore>,
     vault: &KeyVault,
 ) -> (HashMap<String, Arc<dyn DynTool>>, Vec<String>) {
     let mut map: HashMap<String, Arc<dyn DynTool>> = HashMap::new();
@@ -132,12 +131,11 @@ async fn build_runtime_tools(
                 sandbox_profile: SandboxProfile::Inherit,
                 hot: false,
             };
-            // Wire schema validation (validate model args pre-call) and CAS hand-off
-            // (offload large results) — both previously left at their `None` defaults,
-            // so neither protection was active for any shipped inline-MCP tool.
+            // Wire schema validation (validate model args pre-call).
+            // C4: no CAS hand-off — its handle would let `Recall` return the raw,
+            // unwrapped result; the loop bounds and wraps the inline result instead.
             let proxy = origin_mcp::proxy::McpToolProxy::new(Arc::clone(&client), meta, tool.name.clone())
-                .with_schemas(Arc::clone(&schemas))
-                .with_cas(Arc::clone(cas), 16 * 1024);
+                .with_schemas(Arc::clone(&schemas));
             map.insert(full.clone(), Arc::new(proxy) as Arc<dyn DynTool>);
             names.push(full);
         }

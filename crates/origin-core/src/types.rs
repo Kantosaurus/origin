@@ -212,19 +212,21 @@ pub fn strip_trailing_orphan_tool_use(mut messages: Vec<Message>) -> Vec<Message
 // escape instead of strip if that matters.
 #[must_use]
 pub fn strip_hidden_unicode(s: &str) -> String {
-    s.chars()
-        .filter(|c| {
-            !matches!(
-                c,
-                '\u{200B}'..='\u{200F}'
-                    | '\u{2060}'..='\u{2064}'
-                    | '\u{FEFF}'
-                    | '\u{202A}'..='\u{202E}'
-                    | '\u{2066}'..='\u{2069}'
-                    | '\u{E0000}'..='\u{E007F}'
-            )
-        })
-        .collect()
+    s.chars().filter(|&c| !is_hidden_unicode(c)).collect()
+}
+
+/// Whether `c` is one of the invisible characters [`strip_hidden_unicode`] removes.
+#[must_use]
+pub const fn is_hidden_unicode(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{FEFF}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
 }
 
 #[cfg(test)]
