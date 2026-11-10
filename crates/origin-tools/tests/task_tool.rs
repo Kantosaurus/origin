@@ -65,6 +65,7 @@ async fn task_tool_dispatches_worker_and_inlines_report() {
             mcp_servers: vec![],
             background: false,
         },
+        &[],
     )
     .await
     .expect("task ok");
@@ -116,6 +117,7 @@ async fn task_tool_filters_disallowed_tools_into_decision_record() {
             mcp_servers: vec![],
             background: false,
         },
+        &[],
     )
     .await
     .expect("task ok");

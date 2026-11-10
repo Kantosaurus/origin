@@ -5604,8 +5604,14 @@ async fn run_loop_inner(
                             } else {
                                 (None, None)
                             };
+                            // A5: inline-MCP entries are admitted only by name
+                            // against user-scope config; a refusal is an is_error
+                            // result (the `Err` arm below), nothing is spawned.
                             match origin_tools::builtins::task::task_spawn_with_progress(
-                                coord, input, progress_tx,
+                                coord,
+                                input,
+                                progress_tx,
+                                &crate::subagents_md::user_mcp_servers(),
                             )
                             .await
                             {
@@ -7649,9 +7655,13 @@ async fn dispatch_tool(
                 coordinator.ok_or_else(|| LoopError::ToolFailure("Task subsystem not configured".into()))?;
             let input: origin_tools::builtins::task::TaskInput =
                 serde_json::from_value(args.clone()).map_err(|e| LoopError::BadArgs(format!("Task: {e}")))?;
-            let output = origin_tools::builtins::task::task_tool(coord, input)
-                .await
-                .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
+            let output = origin_tools::builtins::task::task_tool(
+                coord,
+                input,
+                &crate::subagents_md::user_mcp_servers(),
+            )
+            .await
+            .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
             serde_json::to_string(&output).map_err(|e| LoopError::ToolFailure(format!("Task: json: {e}")))
         }
         // ── CollectTasks (gather background sub-agents) ──

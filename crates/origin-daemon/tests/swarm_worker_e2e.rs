@@ -192,3 +192,65 @@ async fn worker_inherits_parent_deny_rule() {
         target.display()
     );
 }
+
+/// A5: a model-supplied inline-MCP `command` that matches no user-scope server
+/// is refused with an error naming the literal command line, and is never
+/// spawned (the command would create a marker file).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn model_supplied_mcp_command_is_refused_and_not_spawned() {
+    let tmp = TempDir::new().expect("tmp");
+    let store = Arc::new(origin_store::Store::open(tmp.path().join("origin.db")).expect("store"));
+    let cas = Arc::new(open_cas(tmp.path().join("cas")));
+    let plan_store = Arc::new(PlanStore::open(Arc::clone(&store), Arc::clone(&cas)).expect("plan store"));
+    let plan = PlanHandle::new(Arc::new(AsyncMutex::new(Plan::default())), plan_store);
+    let done = ChatResponse {
+        assistant: Message::new(Role::Assistant).with_block(Block::text("done")),
+        usage: ProviderUsage::default(),
+    };
+    let active: Arc<RwLock<Arc<dyn Provider>>> = Arc::new(RwLock::new(Arc::new(ScriptedProvider {
+        responses: Mutex::new(vec![done]),
+    })));
+    let mut coord = Coordinator::new(plan, format!("origin-worker-mcp-{}", std::process::id()));
+    coord.set_default_worker(origin_daemon::swarm_worker::real_worker(
+        active,
+        Arc::clone(&cas),
+        origin_keyvault::KeyVault::in_memory(),
+        origin_planner::Plan::default(),
+        origin_daemon::config::Governance::default(),
+    ));
+
+    let marker = tmp.path().join("spawned.txt");
+    let (command, args) = if cfg!(windows) {
+        (
+            "cmd",
+            vec!["/C".to_string(), format!("echo x> {}", marker.display())],
+        )
+    } else {
+        (
+            "sh",
+            vec!["-c".to_string(), format!("touch {}", marker.display())],
+        )
+    };
+    let input: origin_tools::builtins::task::TaskInput = serde_json::from_value(serde_json::json!({
+        "goal": "use the evil server",
+        "allowed_tools": ["mcp__evil__*"],
+        "background": false,
+        "mcp_servers": [{"name": "evil", "command": command, "args": args}],
+    }))
+    .expect("task input");
+
+    // No user-scope servers configured ⇒ nothing the model names is admitted.
+    let result = origin_tools::builtins::task::task_tool(&coord, input, &[]).await;
+
+    assert!(
+        !marker.exists(),
+        "a model-supplied MCP command must never be spawned"
+    );
+    let err = result
+        .expect_err("an unregistered MCP server must refuse the Task")
+        .to_string();
+    assert!(
+        err.contains(&format!("{command} {}", args.join(" "))),
+        "the refusal must show the literal command line: {err}"
+    );
+}
