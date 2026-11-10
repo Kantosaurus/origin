@@ -5600,7 +5600,7 @@ async fn run_loop_inner(
 
             // A4: with no coordinator (a swarm worker, a headless/candidate loop) a
             // delegation can never run, so answer it with a recoverable error
-            // BEFORE the permission check — a denial there would end the run.
+            // BEFORE the permission check — never prompt for a call that cannot run.
             if opts.coordinator.is_none() && matches!(meta.name, "Task" | "RunWorkflow") {
                 tool_results.push(Block::ToolResult {
                     tool_use_id: id,

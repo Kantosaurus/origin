@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use origin_cas::{Store as CasStore, StoreConfig};
 use origin_core::types::{Block, Message, Role};
-use origin_daemon::agent::{run_loop, LoopError, LoopOptions};
+use origin_daemon::agent::{run_loop, LoopOptions};
 use origin_daemon::session::Session;
 use origin_permission::prompt::{AlwaysAllow, AlwaysDeny};
 use origin_plan::{Plan, PlanStore};
@@ -122,13 +122,11 @@ async fn task_is_permission_gated_by_the_parent_prompter() {
     opts.coordinator = Some(coord);
     let provider = scripted(vec![reply(task_call(&["Write"])), reply(Block::text("done"))]);
     let mut session = Session::new("deny", "scripted-model");
-    let err = run_loop(&mut session, "go", &provider, &AlwaysDeny, &opts)
+    // A8: a denial comes back to the model as an is_error result; the run goes on.
+    run_loop(&mut session, "go", &provider, &AlwaysDeny, &opts)
         .await
-        .expect_err("a denied delegation must not run");
-    match err {
-        LoopError::Denied(name) => assert_eq!(name, "Task"),
-        other => panic!("expected Denied(Task), got {other:?}"),
-    }
+        .expect("a single denial must not end the run");
+    assert!(task_denied(&session), "the Task must come back as a permission denial");
     assert_eq!(
         spawned.load(Ordering::SeqCst),
         0,
@@ -161,11 +159,19 @@ async fn plan_mode_parent_still_cannot_delegate() {
     opts.read_only = true;
     let provider = scripted(vec![reply(task_call(&["Read"])), reply(Block::text("done"))]);
     let mut session = Session::new("plan", "scripted-model");
-    let err = run_loop(&mut session, "go", &provider, &AlwaysAllow, &opts)
+    run_loop(&mut session, "go", &provider, &AlwaysAllow, &opts)
         .await
-        .expect_err("plan mode must deny Task");
-    assert!(matches!(err, LoopError::Denied(ref n) if n == "Task"), "{err:?}");
+        .expect("a single denial must not end the run");
+    assert!(task_denied(&session), "plan mode must deny Task");
     assert_eq!(spawned.load(Ordering::SeqCst), 0);
+}
+
+/// A8: the Task call came back through the shared deny branch as an is_error result.
+fn task_denied(session: &Session) -> bool {
+    session.messages.iter().flat_map(|m| m.blocks.iter()).any(|b| {
+        matches!(b, Block::ToolResult { is_error: true, inline: Some(body), .. }
+            if String::from_utf8_lossy(body).contains("permission denied for `Task`"))
+    })
 }
 
 fn read_task_mask() -> Arc<SkillRegistry> {
