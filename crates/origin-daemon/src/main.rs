@@ -4289,7 +4289,9 @@ async fn handle_run_workflow(
     // swarm panel. Live per-worker panel events are wired on the agent-loop
     // `RunWorkflow` tool path; add a connection bridge here only if a future
     // `workflow run` UI needs the live readout.
-    let ev = match origin_daemon::workflow_runner::run_workflow(wf, coordinator, skill_catalog, None).await {
+    // No parent loop: each step's worker resolves its own effort and ponytail.
+    let run = origin_daemon::workflow_runner::run_workflow(wf, coordinator, skill_catalog, None, None, None);
+    let ev = match run.await {
         Ok(report) => StreamEvent::WorkflowRunComplete {
             name: report.name,
             layers: u32::try_from(report.layers).unwrap_or(u32::MAX),

@@ -202,6 +202,10 @@ pub fn step_worker_spec(step: &WorkflowStep, catalog: &SkillCatalog) -> WorkerSp
 /// `"failed"` because the TUI only treats `"completed"`/`"failed"` as terminal —
 /// any other token reads as still-running and would wedge the panel's row open.
 ///
+/// B3/B5: `effort` and `ponytail` are what a parent loop hands its workers
+/// (its explicit `/effort`, its ponytail level), as `Task` does; `None` (no
+/// parent loop, e.g. the `/workflow` command) lets each worker resolve its own.
+///
 /// # Errors
 /// - [`RunError::Layering`] if the workflow's dependency graph is invalid.
 /// - [`RunError::Swarm`] if a worker spawn or await fails at the swarm layer.
@@ -210,6 +214,8 @@ pub async fn run_workflow(
     coordinator: &Coordinator,
     catalog: &SkillCatalog,
     event_tx: Option<&Sender<StreamEvent>>,
+    effort: Option<&str>,
+    ponytail: Option<&str>,
 ) -> Result<RunReport, RunError> {
     let layers = compute_layers(workflow)?;
     let mut steps_out: Vec<StepReport> = Vec::with_capacity(workflow.steps.len());
@@ -222,7 +228,11 @@ pub async fn run_workflow(
         let mut handles = Vec::with_capacity(layer.len());
         for &pos in layer {
             let step = &workflow.steps[pos];
-            let spec = step_worker_spec(step, catalog);
+            let spec = WorkerSpec {
+                effort: effort.map(str::to_owned),
+                ponytail: ponytail.map(str::to_owned),
+                ..step_worker_spec(step, catalog)
+            };
             let goal_preview = swarm_goal_preview(&spec.goal);
             let handle = coordinator.spawn(spec).await?;
             if let Some(tx) = event_tx {

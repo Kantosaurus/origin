@@ -111,7 +111,7 @@ async fn workflow_fans_out_per_layer_in_dependency_order() {
         ],
     };
 
-    let report = run_workflow(&wf, &coord, &catalog, None)
+    let report = run_workflow(&wf, &coord, &catalog, None, None, None)
         .await
         .expect("run_workflow");
 
@@ -200,7 +200,7 @@ async fn workflow_emits_swarm_panel_spawn_and_finish_events() {
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
-    let report = run_workflow(&wf, &coord, &catalog, Some(&tx))
+    let report = run_workflow(&wf, &coord, &catalog, Some(&tx), None, None)
         .await
         .expect("run_workflow");
     drop(tx); // close the channel so the drain below terminates.

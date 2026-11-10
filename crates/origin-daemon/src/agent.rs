@@ -7873,6 +7873,7 @@ async fn run_loop_inner(
                         coord,
                         opts.skill_catalog.as_deref(),
                         opts.event_tx.as_ref(),
+                        Some(opts),
                     )
                     .await
                     {
@@ -10037,7 +10038,7 @@ async fn dispatch_tool(
             let coord = coordinator.ok_or_else(|| {
                 LoopError::ToolFailure("RunWorkflow: swarm coordinator not configured".into())
             })?;
-            run_workflow_tool(args, coord, skill_catalog, None)
+            run_workflow_tool(args, coord, skill_catalog, None, None)
                 .await
                 .map(|(json, _)| json)
         }
@@ -10075,6 +10076,7 @@ async fn run_workflow_tool(
     coordinator: &origin_swarm::Coordinator,
     skill_catalog: Option<&SkillCatalog>,
     event_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    parent: Option<&LoopOptions>,
 ) -> Result<(String, bool), LoopError> {
     let name = args
         .get("name")
@@ -10098,9 +10100,16 @@ async fn run_workflow_tool(
     let empty_catalog = SkillCatalog::default();
     let catalog = skill_catalog.unwrap_or(&empty_catalog);
 
-    let report = crate::workflow_runner::run_workflow(workflow, coordinator, catalog, event_tx)
-        .await
-        .map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: {e}")))?;
+    // B3/B5: step workers inherit what a `Task` worker would: the parent's
+    // explicit effort (a default does not pass) and its ponytail level.
+    let effort = parent
+        .and_then(|o| o.explicit_effort)
+        .map(origin_provider::ReasoningEffort::as_wire_str);
+    let ponytail = parent.map(|o| o.ponytail.as_str());
+    let report =
+        crate::workflow_runner::run_workflow(workflow, coordinator, catalog, event_tx, effort, ponytail)
+            .await
+            .map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: {e}")))?;
     // C2: the run report's structured taint travels with its JSON.
     serde_json::to_string(&report)
         .map(|json| (json, report.tainted))

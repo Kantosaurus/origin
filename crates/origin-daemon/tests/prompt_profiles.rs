@@ -261,6 +261,80 @@ async fn explicit_parent_effort_reaches_workers() {
     }
 }
 
+/// Serialises the tests that set `ORIGIN_HOME` in this binary.
+static ORIGIN_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A parent loop on Anthropic whose model runs a one-step `RunWorkflow`;
+/// returns the requests its step's real worker sent.
+async fn worker_requests_via_workflow(parent: LoopOptions) -> Vec<ChatRequest> {
+    let _env = ORIGIN_HOME_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(home.join(".origin")).unwrap();
+    std::fs::write(
+        home.join(".origin").join("workflows.toml"),
+        "[[workflows]]\nname = \"wf\"\n[[workflows.steps]]\nid = 0\nskill = \"x\"\nargs = \"look around\"\n",
+    )
+    .unwrap();
+    std::env::set_var("ORIGIN_HOME", &home);
+    let provider = recording("anthropic");
+    provider
+        .script
+        .lock()
+        .unwrap()
+        .push(Message::new(Role::Assistant).with_block(Block::ToolUse {
+            id: "tu_1".into(),
+            name: "RunWorkflow".into(),
+            input_json: serde_json::to_vec(&serde_json::json!({ "name": "wf" })).unwrap(),
+            cache_marker: None,
+        }));
+    let opts = LoopOptions {
+        coordinator: Some(Arc::new(coordinator(&provider, &tmp))),
+        ..parent
+    };
+    let mut session = Session::new("anthropic", "claude-test");
+    let outcome = run_loop(&mut session, "run it", provider.as_ref(), &AlwaysAllow, &opts).await;
+    std::env::remove_var("ORIGIN_HOME");
+    outcome.unwrap();
+    let reqs = provider.requests.lock().unwrap().clone();
+    let worker: Vec<_> = reqs
+        .into_iter()
+        .filter(|r| r.system.contains("<origin-worker>"))
+        .collect();
+    assert!(!worker.is_empty(), "the workflow must have run a worker");
+    worker
+}
+
+/// B3/B5: a `RunWorkflow` step's worker inherits the parent's EXPLICIT effort
+/// (a default leaves it on `medium`) and its ponytail level, like `Task`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workflow_step_workers_inherit_effort_and_ponytail() {
+    use origin_ponytail::PonytailMode;
+    use origin_provider::ReasoningEffort::{High, Max, Medium};
+    clean_env();
+    for (effort, explicit, want) in [(Some(Max), Some(Max), Max), (Some(High), None, Medium)] {
+        let parent = LoopOptions {
+            effort,
+            explicit_effort: explicit,
+            ..opts()
+        };
+        let worker = worker_requests_via_workflow(parent).await;
+        assert_eq!(worker[0].effort, Some(want), "parent explicit {explicit:?}");
+    }
+    for (mode, present) in [(PonytailMode::Off, false), (PonytailMode::Full, true)] {
+        let parent = LoopOptions {
+            ponytail: mode,
+            ..opts()
+        };
+        let worker = worker_requests_via_workflow(parent).await;
+        assert_eq!(
+            worker[0].system.contains("<origin-ponytail"),
+            present,
+            "parent {mode:?}"
+        );
+    }
+}
+
 /// B5: a worker carries the ponytail ruleset exactly when its parent does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_inherits_the_parents_ponytail() {
