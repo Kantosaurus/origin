@@ -237,3 +237,67 @@ async fn an_explicit_turn_cap_overrides_the_default_both_ways() {
         assert_eq!(out.files_touched.len(), cap as usize);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn patch_deletes_and_moves_are_touches() {
+    let dir = TempDir::new().expect("dir");
+    let (gone, old, new) = (
+        dir.path().join("gone.txt"),
+        dir.path().join("old.txt"),
+        dir.path().join("new.txt"),
+    );
+    std::fs::write(&gone, "bye\n").expect("seed");
+    std::fs::write(&old, "a\n").expect("seed");
+    let patch = format!(
+        "*** Begin Patch\n*** Delete File: {}\n*** Update File: {}\n*** Move to: {}\n@@\n-a\n+b\n*** End Patch\n",
+        s(&gone),
+        s(&old),
+        s(&new)
+    );
+    let (out, _) = run_task(
+        serde_json::json!({ "goal": "reshuffle", "allowed_tools": ["ApplyPatch"] }),
+        Box::new(move |n| match n {
+            0 => reply(vec![call(
+                "ApplyPatch",
+                n,
+                &serde_json::json!({ "patch": patch }),
+            )]),
+            _ => reply(vec![Block::text("done")]),
+        }),
+    )
+    .await;
+    assert!(!gone.exists() && !old.exists() && new.exists(), "{}", out.summary);
+    assert_eq!(out.files_touched, vec![s(&gone), s(&new)], "{}", out.summary);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_denial_stop_reports_aborted_with_the_work_done_so_far() {
+    let dir = TempDir::new().expect("dir");
+    let edited = dir.path().join("edited.txt");
+    std::fs::write(&edited, "old\n").expect("seed");
+    let (e2, d) = (edited.clone(), dir.path().to_path_buf());
+    let (out, _) = run_task(
+        // `Edit` is granted; every later `Write` is denied until the A8 cap.
+        serde_json::json!({ "goal": "edit then write", "allowed_tools": ["Edit"] }),
+        Box::new(move |n| match n {
+            0 => reply(vec![call(
+                "Edit",
+                n,
+                &serde_json::json!({ "file_path": e2.to_string_lossy(), "old_string": "old", "new_string": "new" }),
+            )]),
+            _ => reply(vec![
+                Block::text("trying to write"),
+                write(n, &d.join(format!("{}.txt", letters(n))), "x"),
+            ]),
+        }),
+    )
+    .await;
+    assert_eq!(std::fs::read_to_string(&edited).expect("read"), "new\n");
+    assert_eq!(out.status, "aborted", "{}", out.summary);
+    assert_eq!(out.files_touched, vec![s(&edited)]);
+    assert!(
+        out.summary.contains("Stopped after repeated permission denials"),
+        "{}",
+        out.summary
+    );
+}

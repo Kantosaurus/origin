@@ -40,8 +40,9 @@ use crate::protocol::StreamEvent;
 /// opts it in; `Task` is always stripped by the worker substrate.
 const DEFAULT_TEAMMATE_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
 
-/// Default per-teammate budget. Mirrors the `Task` sub-agent default tool-call
-/// cap; the wall/token ceilings are generous since a teammate is a full turn.
+/// Default per-teammate budget: a 32-turn cap (below the `Task` sub-agent
+/// default of 50); the wall/token ceilings are generous since a teammate is a
+/// full turn.
 const TEAMMATE_BUDGET: Budget = Budget::new(
     /* max_wall_ms */ 300_000, /* max_input_tokens */ 1_000_000,
     /* max_output_tokens */ 256_000, /* max_tool_calls */ 32,

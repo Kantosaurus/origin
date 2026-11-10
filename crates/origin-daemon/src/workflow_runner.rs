@@ -38,7 +38,7 @@ use crate::workflows::{Workflow, WorkflowStep};
 const DEFAULT_STEP_TOOLS: &[&str] = &["Read", "Grep", "Glob", "Edit", "Write"];
 
 /// Per-step worker budget. Generous wall/token ceilings (a step is a full
-/// sub-agent turn) with the same tool-call cap the `Task` default uses.
+/// sub-agent turn) with a 32-turn cap (below the `Task` default of 50).
 const STEP_BUDGET: Budget = Budget::new(
     /* max_wall_ms */ 300_000, /* max_input_tokens */ 1_000_000,
     /* max_output_tokens */ 256_000, /* max_tool_calls */ 32,

@@ -108,7 +108,8 @@ const fn default_background() -> bool {
 pub struct TaskOutput {
     /// Terminal status, lower-snake-cased: `completed`, `budget_exhausted`
     /// (stopped at its turn cap), `aborted` (stopped by repeated permission
-    /// denials), or `goal_unreachable` (failed with an error).
+    /// denials, or the worker was lost / hit a swarm-layer error), or
+    /// `goal_unreachable` (failed with an error).
     pub status: String,
     /// Paths the worker's successful edits changed, first-touch order. Files
     /// changed by shell commands are not listed; the summary says when any ran.
@@ -393,7 +394,7 @@ crate::origin_tool! {
     tier: crate::Tier::RequiresPermission,
     urgency: crate::Urgency::Medium,
     side_effects: crate::SideEffects::Mutating,
-    input_schema: r#"{"type":"object","required":["goal","allowed_tools"],"properties":{"goal":{"type":"string"},"allowed_tools":{"type":"array","items":{"type":"string"}},"budget":{"type":"object"},"model":{"type":"string"},"background":{"type":"boolean","description":"Run non-blocking in the background (default true). Set false to await the result in this turn."},"mcp_servers":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"url":{"type":"string"}},"required":["name"]}}}}"#,
+    input_schema: r#"{"type":"object","required":["goal","allowed_tools"],"properties":{"goal":{"type":"string"},"allowed_tools":{"type":"array","items":{"type":"string"}},"budget":{"type":"object","properties":{"max_tool_calls":{"type":"integer","description":"Turn cap for the sub-agent; omitted or 0 = 50."}}},"model":{"type":"string"},"background":{"type":"boolean","description":"Run non-blocking in the background (default true). Set false to await the result in this turn."},"mcp_servers":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"url":{"type":"string"}},"required":["name"]}}}}"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
     // hot: the full schema is always advertised to the model (no ToolSearch
     // round-trip first). Task being deferred was why swarm was never invoked.

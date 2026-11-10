@@ -80,11 +80,15 @@ enum Finding {
 /// interpreter failures (the model must fix them) and a `<syntax-advisory>`
 /// block of tree-sitter notes (may be a parser limitation); each is empty when
 /// it has nothing to say. Fail-open: missing interpreter / timeout / unknown
-/// type are skipped.
+/// type / a file that no longer exists (deleted or moved by `ApplyPatch`) are
+/// skipped.
 pub async fn check_block(paths: &BTreeSet<String>, baseline: &ParseBaseline) -> (String, String) {
     let mut failures: Vec<String> = Vec::new();
     let mut advisories: Vec<String> = Vec::new();
     for p in paths {
+        if !std::path::Path::new(p).exists() {
+            continue; // B8: deleted or moved away by ApplyPatch
+        }
         let before = baseline.get(p).copied().unwrap_or(0);
         match check_file(p, checker_for(p), before).await {
             Some(Finding::Failure(msg)) => failures.push(format!("{p}:\n{msg}")),
@@ -407,5 +411,18 @@ mod tests {
             assert!(block.contains("broken.py"));
             assert_eq!(advisory, "", "one diagnostic per problem");
         }
+    }
+
+    /// B8: an `ApplyPatch` delete puts a path that no longer exists in the
+    /// edited set; it must not read as a syntax failure.
+    #[tokio::test]
+    async fn a_deleted_file_is_skipped() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut set = BTreeSet::new();
+        set.insert(dir.path().join("gone.py").to_string_lossy().into_owned());
+        assert_eq!(
+            check_block(&set, &ParseBaseline::new()).await,
+            (String::new(), String::new())
+        );
     }
 }

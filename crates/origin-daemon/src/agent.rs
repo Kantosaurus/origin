@@ -2369,22 +2369,39 @@ fn post_mutation_autoformat(
 
 /// Extract candidate target file paths from a patch body for auto-formatting.
 ///
-/// Recognizes both unified-diff `+++ b/<path>` headers and the apply-patch
-/// `*** Update File: <path>` / `*** Add File: <path>` markers. Best-effort and
-/// lossy — anything not matched is simply skipped; the caller only uses the
-/// result to *offer* formatting under the `ORIGIN_AUTOFORMAT` gate.
+/// Recognizes both unified-diff `+++ b/<path>` headers (a `+++ /dev/null`
+/// delete yields its `--- a/<path>` side) and the apply-patch `*** Update
+/// File:` / `*** Add File:` / `*** Delete File:` markers; a `*** Move to:`
+/// replaces its `Update File` path with the destination (B8). Best-effort and
+/// lossy — anything not matched is simply skipped. A deleted path no longer
+/// exists, so callers that read the file skip missing ones.
 fn patch_target_paths(patch: &str) -> Vec<String> {
     let mut out = Vec::new();
+    let mut minus: Option<&str> = None;
     for line in patch.lines() {
         let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("+++ ") {
-            let p = rest.trim().trim_start_matches("b/");
+        if let Some(rest) = trimmed.strip_prefix("--- ") {
+            minus = Some(rest.trim().trim_start_matches("a/"));
+        } else if let Some(rest) = trimmed.strip_prefix("+++ ") {
+            let mut p = rest.trim().trim_start_matches("b/");
+            if p == "/dev/null" {
+                p = minus.take().unwrap_or_default();
+            }
             if !p.is_empty() && p != "/dev/null" {
                 out.push(p.to_string());
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("*** Move to: ") {
+            // `Move to` follows its `Update File` line: the file now lives at
+            // the destination.
+            match (out.last_mut(), rest.trim()) {
+                (_, "") => {}
+                (Some(last), dest) => dest.clone_into(last),
+                (None, dest) => out.push(dest.to_string()),
             }
         } else if let Some(rest) = trimmed
             .strip_prefix("*** Update File: ")
             .or_else(|| trimmed.strip_prefix("*** Add File: "))
+            .or_else(|| trimmed.strip_prefix("*** Delete File: "))
         {
             let p = rest.trim();
             if !p.is_empty() {
@@ -8126,6 +8143,13 @@ async fn dispatch_tool(
                 .map_err(|e| LoopError::ToolFailure(e.display_message()));
             if res.is_ok() {
                 for p in &fmt_paths {
+                    // B8: a deleted file has nothing to note, format or lint.
+                    if !cwd
+                        .map_or_else(|| std::path::PathBuf::from(p), |c| c.join(p))
+                        .exists()
+                    {
+                        continue;
+                    }
                     // #5: a successful ApplyPatch means the model has seen each
                     // target file, so a later `Write{force:false}` is permitted.
                     if let Some(guard) = write_guard {
@@ -11367,6 +11391,17 @@ mod wiring_tests {
         assert!(paths.contains(&"src/a.rs".to_string()));
         assert!(paths.contains(&"src/b.rs".to_string()));
         assert!(!paths.iter().any(|p| p == "/dev/null"));
+    }
+
+    /// B8: deletes and renames are touches too — a marker `Delete File`, a
+    /// `Move to` (by its destination) and a unified `+++ /dev/null` delete.
+    #[test]
+    fn patch_target_paths_include_deletes_and_move_destinations() {
+        let marker = "*** Begin Patch\n*** Delete File: gone.py\n*** Update File: old.py\n\
+                      *** Move to: new.py\n@@\n-a\n+b\n*** End Patch\n";
+        assert_eq!(patch_target_paths(marker), vec!["gone.py", "new.py"]);
+        let unified = "--- a/dead.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n--- a/kept.rs\n+++ b/kept.rs\n";
+        assert_eq!(patch_target_paths(unified), vec!["dead.rs", "kept.rs"]);
     }
 
     /// WS-J: `edited_paths_from_tool` pulls `file_path` from Edit/Write/MultiEdit
