@@ -237,17 +237,56 @@ struct Word {
     group: bool,
 }
 
+/// Where a simple command's stdin comes from.
+#[derive(Debug, Default)]
+struct Stdin {
+    /// Piped from the previous command.
+    piped: bool,
+    /// Redirected (`<`, `<<`, `<<<`).
+    redirected: bool,
+    /// The literal text of a here-document or here-string.
+    text: Option<String>,
+}
+
+/// One simple command.
+#[derive(Debug, Default)]
+struct Cmd {
+    words: Vec<Word>,
+    stdin: Stdin,
+}
+
+/// A pending Posix here-document.
+struct HereDoc {
+    delim: String,
+    /// Any quoting in the delimiter makes the body literal.
+    quoted: bool,
+    /// `<<-` strips leading tabs.
+    strip: bool,
+    /// Index in [`Lexed::cmds`] of the command it feeds.
+    cmd: usize,
+}
+
 /// A tokenized line.
 #[derive(Default)]
 struct Lexed {
-    /// Simple commands, each flagged with whether its stdin is piped in.
-    cmds: Vec<(Vec<Word>, bool)>,
+    cmds: Vec<Cmd>,
     /// Bodies of groups and substitutions, analysed recursively.
     nested: Vec<String>,
 }
 
 fn needs(reason: impl Into<String>) -> Risk {
     Risk::NeedsApproval(reason.into())
+}
+
+/// PowerShell's tokenizer reads typographic quotes and dashes as their ASCII
+/// forms (`'x’` is a complete string, `–Force` a parameter).
+const fn ps_ascii(c: char) -> char {
+    match c {
+        '\u{2018}'..='\u{201B}' => '\'',
+        '\u{201C}'..='\u{201E}' => '"',
+        '\u{2013}'..='\u{2015}' => '-',
+        _ => c,
+    }
 }
 
 /// Parse `src` under `sh`, analyse every nested body and check every simple
@@ -259,7 +298,11 @@ fn scan(src: &str, sh: Shell, depth: usize, risks: &mut Vec<Risk>) {
         ));
         return;
     }
-    let cs: Vec<char> = src.chars().collect();
+    let cs: Vec<char> = if sh == Shell::Power {
+        src.chars().map(ps_ascii).collect()
+    } else {
+        src.chars().collect()
+    };
     let Some(lexed) = Lexer::new(&cs, sh).run() else {
         risks.push(needs(
             "the command line could not be parsed (unbalanced quote, bracket or substitution)",
@@ -270,8 +313,8 @@ fn scan(src: &str, sh: Shell, depth: usize, risks: &mut Vec<Risk>) {
         scan(body, sh, depth + 1, risks);
     }
     let multi = lexed.cmds.len() > 1;
-    for (words, piped_in) in &lexed.cmds {
-        check_cmd(words, *piped_in, multi, sh, depth, risks, false);
+    for c in &lexed.cmds {
+        check_cmd(&c.words, &c.stdin, multi, sh, depth, risks, false);
     }
 }
 
@@ -281,15 +324,14 @@ struct Lexer<'a> {
     i: usize,
     sh: Shell,
     out: Lexed,
-    cmd: Vec<Word>,
-    piped: bool,
+    cmd: Cmd,
     w: Word,
     /// The current word has begun (an empty `''` is still a word).
     started: bool,
-    /// The next finished word is a redirection target, not an argument.
-    redirect: bool,
-    /// Here-document `(delimiter, quoted, strip tabs)` awaiting the next line.
-    heredocs: Vec<(String, bool, bool)>,
+    /// The next finished word is the operand of this redirection operator.
+    redirect: Option<String>,
+    /// Here-documents awaiting the next line.
+    heredocs: Vec<HereDoc>,
 }
 
 impl<'a> Lexer<'a> {
@@ -299,11 +341,10 @@ impl<'a> Lexer<'a> {
             i: 0,
             sh,
             out: Lexed::default(),
-            cmd: Vec::new(),
-            piped: false,
+            cmd: Cmd::default(),
             w: Word::default(),
             started: false,
-            redirect: false,
+            redirect: None,
             heredocs: Vec::new(),
         }
     }
@@ -344,8 +385,11 @@ impl<'a> Lexer<'a> {
             if matches!(w.text.as_str(), "[" | "[[" | "?") {
                 w.dynamic = false;
             }
-            if !std::mem::take(&mut self.redirect) {
-                self.cmd.push(w);
+            match self.redirect.take().as_deref() {
+                None => self.cmd.words.push(w),
+                // A here-string's operand is the command's stdin.
+                Some("<<<") => self.cmd.stdin.text = Some(w.text),
+                Some(_) => {}
             }
         }
         self.started = false;
@@ -353,12 +397,17 @@ impl<'a> Lexer<'a> {
 
     fn end_cmd(&mut self, next_piped: bool) {
         self.end_word();
-        self.redirect = false;
-        if !self.cmd.is_empty() {
-            let words = std::mem::take(&mut self.cmd);
-            self.out.cmds.push((words, self.piped));
+        self.redirect = None;
+        if self.cmd.words.is_empty() {
+            // Nothing to run yet (`a |` + newline, PowerShell `| & pwsh`): the
+            // pipe still feeds whatever command comes next.
+            let piped = self.cmd.stdin.piped || next_piped;
+            self.cmd = Cmd::default();
+            self.cmd.stdin.piped = piped;
+        } else {
+            self.out.cmds.push(std::mem::take(&mut self.cmd));
+            self.cmd.stdin.piped = next_piped;
         }
-        self.piped = next_piped;
     }
 
     /// Tokenize the whole input; `None` when it cannot be parsed.
@@ -384,11 +433,19 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 '"' => self.quoted(Some('"'))?,
-                '$' if self.sh != Shell::Cmd => self.dollar()?,
+                '$' if self.sh != Shell::Cmd => self.dollar(false)?,
                 '`' if self.sh == Shell::Posix => self.backtick()?,
                 '%' if self.sh == Shell::Cmd => {
                     self.push(c);
                     self.w.dynamic = true;
+                }
+                '@' if self.sh == Shell::Power && self.opens_here_string() => self.here_string()?,
+                '<' if self.sh == Shell::Power && next == Some('#') => {
+                    // `<# … #>` block comment; unclosed ⇒ unparseable.
+                    let rest = self.cs.get(self.i + 1..)?;
+                    let end = rest.windows(2).position(|p| p == ['#', '>'])?;
+                    self.i += 1 + end + 2;
+                    self.end_word();
                 }
                 '#' if !self.started && self.sh != Shell::Cmd => {
                     while self.peek().is_some_and(|x| x != '\n') {
@@ -467,7 +524,7 @@ impl<'a> Lexer<'a> {
                     let n = self.bump()?;
                     self.push(n);
                 }
-                '$' if self.sh != Shell::Cmd => self.dollar()?,
+                '$' if self.sh != Shell::Cmd => self.dollar(true)?,
                 '`' if self.sh == Shell::Posix => self.backtick()?,
                 '%' if self.sh == Shell::Cmd => {
                     self.push(c);
@@ -478,8 +535,45 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// A `$` expansion; `self.i` is just past the `$`.
-    fn dollar(&mut self) -> Option<()> {
+    /// Whether the `@` just consumed opens a PowerShell here-string: `@'` or
+    /// `@"` followed by nothing but blanks up to the end of its line.
+    fn opens_here_string(&self) -> bool {
+        if !matches!(self.peek(), Some('\'' | '"')) {
+            return false;
+        }
+        let rest = self.cs.get(self.i + 1..).unwrap_or_default();
+        rest.iter()
+            .position(|&c| c == '\n')
+            .is_some_and(|nl| rest[..nl].iter().all(|c| c.is_whitespace()))
+    }
+
+    /// A PowerShell here-string, closed by `'@`/`"@` at the start of a line;
+    /// `self.i` is at its opening quote. A `@"…"@` body keeps `$(…)` live.
+    fn here_string(&mut self) -> Option<()> {
+        let q = self.cs[self.i];
+        let start = self.i + self.cs[self.i..].iter().position(|&c| c == '\n')? + 1;
+        let close = (start..self.cs.len()).find(|&k| {
+            (k == start || self.cs[k - 1] == '\n') && self.cs.get(k..k + 2) == Some(&[q, '@'][..])
+        })?;
+        let body: String = self.cs[start..close.saturating_sub(1).max(start)]
+            .iter()
+            .collect();
+        self.i = close + 2;
+        self.started = true;
+        if q == '"' {
+            let cs: Vec<char> = body.chars().collect();
+            let mut sub = Lexer::new(&cs, Shell::Power);
+            sub.quoted(None)?;
+            self.w.dynamic |= sub.w.dynamic;
+            self.out.nested.append(&mut sub.out.nested);
+        }
+        body.chars().for_each(|c| self.push(c));
+        Some(())
+    }
+
+    /// A `$` expansion; `self.i` is just past the `$`. Inside double quotes
+    /// (or a here-document) `$'` is literal, not ANSI-C quoting.
+    fn dollar(&mut self, in_quotes: bool) -> Option<()> {
         self.push('$');
         match self.peek() {
             Some('(') => {
@@ -490,7 +584,7 @@ impl<'a> Lexer<'a> {
                 self.i += 1;
                 self.group('{', '}')?;
             }
-            Some('\'') if self.sh == Shell::Posix => {
+            Some('\'') if self.sh == Shell::Posix && !in_quotes => {
                 // ANSI-C `$'…'`: `\` escapes inside, including `\'`.
                 self.i += 1;
                 loop {
@@ -541,6 +635,10 @@ impl<'a> Lexer<'a> {
         self.push(open);
         body.chars().for_each(|c| self.push(c));
         self.push(close);
+        if open == '{' && body.is_empty() {
+            // `{}` is a literal word (`find -exec … {}`, `xargs -I {}`).
+            return Some(());
+        }
         // Posix `{` opens a block only when a blank follows; `{a,b}` is brace
         // expansion.
         let block = open == '(' || self.sh != Shell::Posix || body.starts_with(char::is_whitespace);
@@ -598,6 +696,9 @@ impl<'a> Lexer<'a> {
             op.push(n);
             self.i += 1;
         }
+        if op.starts_with('<') {
+            self.cmd.stdin.redirected = true;
+        }
         let fd = |n: char| n.is_ascii_digit() || n == '-';
         if op.ends_with('&') && self.peek().is_some_and(fd) {
             // `>&2`, `<&-`: duplicates a descriptor, no file operand.
@@ -614,7 +715,7 @@ impl<'a> Lexer<'a> {
             self.heredoc_delim(strip);
             return;
         }
-        self.redirect = true;
+        self.redirect = Some(op);
     }
 
     /// Read a here-document delimiter word; any quoting makes the body literal.
@@ -639,14 +740,26 @@ impl<'a> Lexer<'a> {
                 _ => delim.push(c),
             }
         }
-        self.heredocs.push((delim, quoted, strip));
+        self.heredocs.push(HereDoc {
+            delim,
+            quoted,
+            strip,
+            cmd: self.out.cmds.len(),
+        });
     }
 
     /// After a newline, consume pending here-document bodies up to their
-    /// delimiters. An unquoted delimiter keeps `$(…)`/backticks live, so that
-    /// body is scanned for substitutions.
+    /// delimiters and attach each to the command it feeds. An unquoted
+    /// delimiter keeps `$(…)`/backticks live, so that body is scanned for
+    /// substitutions.
     fn heredoc_bodies(&mut self) -> Option<()> {
-        for (delim, quoted, strip) in std::mem::take(&mut self.heredocs) {
+        for HereDoc {
+            delim,
+            quoted,
+            strip,
+            cmd,
+        } in std::mem::take(&mut self.heredocs)
+        {
             let mut body = String::new();
             while let Some(rest) = self.cs.get(self.i..).filter(|r| !r.is_empty()) {
                 let len = rest.iter().position(|&c| c == '\n').unwrap_or(rest.len());
@@ -669,6 +782,9 @@ impl<'a> Lexer<'a> {
                 sub.quoted(None)?;
                 self.out.nested.append(&mut sub.out.nested);
             }
+            if let Some(c) = self.out.cmds.get_mut(cmd) {
+                c.stdin.text = Some(body);
+            }
         }
         Some(())
     }
@@ -687,7 +803,7 @@ fn join(ws: &[Word]) -> String {
 /// `invoked`: reached through the PowerShell call operator (`&`, `.`).
 fn check_cmd(
     ws: &[Word],
-    piped_in: bool,
+    stdin: &Stdin,
     multi: bool,
     sh: Shell,
     depth: usize,
@@ -732,8 +848,16 @@ fn check_cmd(
         // Group and substitution bodies were already analysed as nested
         // commands. A PowerShell expression statement (`$x`, `($a -gt 1)`) runs
         // no program unless the call operator invokes it; a bare Posix subshell
-        // or block just runs its (analysed) body.
+        // or block just runs its (analysed) body. A method that invokes script
+        // (`[scriptblock]::Create($s).Invoke()`,
+        // `$ExecutionContext.InvokeCommand.InvokeScript($s)`) runs code anyway.
         if sh == Shell::Power && !invoked {
+            if cmd.text.to_ascii_lowercase().contains("invoke") {
+                risks.push(needs(format!(
+                    "`{}` invokes a script built at run time",
+                    cmd.text
+                )));
+            }
             return;
         }
         if cmd.dynamic || sh == Shell::Power || !args.is_empty() {
@@ -752,20 +876,10 @@ fn check_cmd(
             scan(&join(args), sh, depth + 1, risks);
         }
         "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash" | "mksh" => {
-            // `-c SCRIPT`, also bundled (`-lc`, `-ec`).
-            let c = args
-                .iter()
-                .position(|a| a.text.starts_with('-') && !a.text.starts_with("--") && a.text.contains('c'));
-            if let Some(k) = c {
-                if let Some(script) = args.get(k + 1) {
-                    scan(&script.text, Shell::Posix, depth + 1, risks);
-                }
-            } else if piped_in && args.iter().all(|a| a.text.starts_with('-')) {
-                risks.push(needs(format!("piped input is executed by `{name}`")));
-            }
+            check_posix_shell(&name, args, stdin, depth, risks);
         }
-        "&" | "." if sh == Shell::Power => check_cmd(args, piped_in, multi, sh, depth + 1, risks, true),
-        "pwsh" | "powershell" => check_powershell(args, piped_in, depth, risks),
+        "&" | "." if sh == Shell::Power => check_cmd(args, stdin, multi, sh, depth + 1, risks, true),
+        "pwsh" | "powershell" => check_powershell(args, stdin, depth, risks),
         "cmd" => {
             // `cmd /c SCRIPT` (or `/k`, `/r`, even glued: `/crm`) runs the rest.
             let k = args.iter().position(|a| {
@@ -775,8 +889,8 @@ fn check_cmd(
             if let Some(k) = k {
                 let script = format!("{} {}", &args[k].text[2..], join(&args[k + 1..]));
                 scan(&script, Shell::Cmd, depth + 1, risks);
-            } else if piped_in {
-                risks.push(needs("piped input is executed by `cmd`"));
+            } else {
+                shell_stdin(&name, stdin, Shell::Cmd, depth, risks);
             }
         }
         n if is_command_wrapper(n) => {
@@ -788,12 +902,13 @@ fn check_cmd(
             let Some(j) = args.iter().position(|a| !a.text.starts_with('-')) else {
                 return;
             };
-            check_cmd(&args[j..], piped_in, multi, sh, depth + 1, risks, false);
+            check_cmd(&args[j..], stdin, multi, sh, depth + 1, risks, false);
             if j > 0 && !args[j - 1].text.contains('=') && j + 1 < args.len() {
-                check_cmd(&args[j + 1..], piped_in, multi, sh, depth + 1, risks, false);
+                check_cmd(&args[j + 1..], stdin, multi, sh, depth + 1, risks, false);
             }
         }
-        "rm" => detect_rm_rf_home(args, risks),
+        // `rm` plus the PowerShell (`Remove-Item` and aliases) and cmd forms.
+        "rm" | "remove-item" | "ri" | "del" | "erase" | "rd" | "rmdir" => detect_rm_rf_home(args, risks),
         // `cd` only matters as a *prefix to* a following command.
         "cd" if multi => {
             let target = args.first().map_or("~", |w| w.text.as_str());
@@ -809,37 +924,34 @@ fn check_cmd(
 /// `pwsh`/`powershell` arguments: `-EncodedCommand` (any accepted
 /// abbreviation) needs approval, `-Command` runs the rest of the line, and
 /// with neither Windows PowerShell runs the bare arguments as a command.
-fn check_powershell(args: &[Word], piped_in: bool, depth: usize, risks: &mut Vec<Risk>) {
+/// Parameters may start with `-`, `/` or a typographic dash.
+fn check_powershell(args: &[Word], stdin: &Stdin, depth: usize, risks: &mut Vec<Risk>) {
     let param = |w: &Word| {
         w.text
-            .strip_prefix('-')
-            .filter(|p| !p.is_empty())
+            .strip_prefix(['-', '/', '\u{2013}', '\u{2014}', '\u{2015}'])
+            .filter(|p| !p.is_empty() && !p.contains('/'))
             .map(str::to_ascii_lowercase)
     };
+    let from_stdin = |script: &str| matches!(script, "-" | "/dev/stdin");
     for (k, a) in args.iter().enumerate() {
         let Some(p) = param(a) else { continue };
         if p == "ec" || "encodedcommand".starts_with(&p) {
             risks.push(needs("PowerShell `-EncodedCommand` runs an encoded payload"));
             return;
         }
-        if "command".starts_with(&p) {
-            let script = join(&args[k + 1..]);
-            if script == "-" {
-                risks.push(needs("PowerShell runs a script read from piped input"));
-            } else {
-                scan(&script, Shell::Power, depth + 1, risks);
+        let rest = join(&args[k + 1..]);
+        if "command".starts_with(&p) || "file".starts_with(&p) {
+            if from_stdin(&rest) {
+                risks.push(needs("PowerShell runs a script read from its input"));
+            } else if "command".starts_with(&p) {
+                scan(&rest, Shell::Power, depth + 1, risks);
             }
-            return;
-        }
-        if "file".starts_with(&p) {
             return;
         }
     }
     let bare: Vec<&Word> = args.iter().filter(|a| param(a).is_none()).collect();
-    if bare.is_empty() {
-        if piped_in {
-            risks.push(needs("piped input is executed by PowerShell"));
-        }
+    if bare.is_empty() || (bare.len() == 1 && from_stdin(&bare[0].text)) {
+        shell_stdin("pwsh", stdin, Shell::Power, depth, risks);
         return;
     }
     let joined = bare.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
@@ -850,6 +962,38 @@ fn check_powershell(args: &[Word], piped_in: bool, depth: usize, risks: &mut Vec
         for w in bare {
             scan(&w.text, Shell::Power, depth + 1, risks);
         }
+    }
+}
+
+/// `sh`/`bash`/… arguments: `-c SCRIPT` (also bundled: `-lc`, `-ec`) runs
+/// SCRIPT; with no script operand (or `-`, `/dev/stdin`, `-s`) the script is
+/// read from stdin.
+fn check_posix_shell(name: &str, args: &[Word], stdin: &Stdin, depth: usize, risks: &mut Vec<Risk>) {
+    let c = args
+        .iter()
+        .position(|a| a.text.starts_with('-') && !a.text.starts_with("--") && a.text.contains('c'));
+    if let Some(k) = c {
+        if let Some(script) = args.get(k + 1) {
+            scan(&script.text, Shell::Posix, depth + 1, risks);
+        }
+    } else if args.iter().any(|a| a.text == "-s")
+        || args
+            .iter()
+            .find(|a| a.text == "-" || !a.text.starts_with('-'))
+            .is_none_or(|a| matches!(a.text.as_str(), "-" | "/dev/stdin"))
+    {
+        shell_stdin(name, stdin, Shell::Posix, depth, risks);
+    }
+}
+
+/// A shell with no script operand reads its script from stdin: a literal
+/// here-document or here-string is analysed as that script; any other piped or
+/// redirected input needs approval.
+fn shell_stdin(name: &str, stdin: &Stdin, sh: Shell, depth: usize, risks: &mut Vec<Risk>) {
+    if let Some(text) = &stdin.text {
+        scan(text, sh, depth + 1, risks);
+    } else if stdin.piped || stdin.redirected {
+        risks.push(needs(format!("`{name}` executes a script read from its input")));
     }
 }
 
@@ -938,7 +1082,9 @@ fn detect_rm_rf_home(args: &[Word], risks: &mut Vec<Risk>) {
 /// (`--recursive`/`--force`) forms, so the caller can OR the intents across all
 /// tokens regardless of flag order or grouping. `--no-preserve-root` is the
 /// safety override only ever paired with a destructive recursive force, so it
-/// implies both.
+/// implies both. PowerShell parameters match case-insensitively by prefix
+/// (`-r`/`-Recurse`, `-fo`/`-Force`, also `-Recurse:$true`), and cmd's
+/// `rd`/`del` switches `/s` and `/q` count as recursive and force.
 fn rf_intent(w: &str) -> (bool, bool) {
     if let Some(long) = w.strip_prefix("--") {
         return match long {
@@ -948,7 +1094,23 @@ fn rf_intent(w: &str) -> (bool, bool) {
             _ => (false, false),
         };
     }
+    if let Some(switch) = w.strip_prefix('/') {
+        return match switch.to_ascii_lowercase().as_str() {
+            "s" => (true, false),
+            "q" => (false, true),
+            _ => (false, false),
+        };
+    }
     if let Some(bundle) = w.strip_prefix('-') {
+        let (name, value) = bundle.split_once(':').unwrap_or((bundle, "$true"));
+        let name = name.to_ascii_lowercase();
+        if name.len() >= 2 && ("recurse".starts_with(&name) || "force".starts_with(&name)) {
+            let on = value.eq_ignore_ascii_case("$true");
+            return (
+                on && "recurse".starts_with(&name),
+                on && "force".starts_with(&name),
+            );
+        }
         let has_r = bundle.contains('r') || bundle.contains('R');
         let has_f = bundle.contains('f');
         return (has_r, has_f);
@@ -956,23 +1118,25 @@ fn rf_intent(w: &str) -> (bool, bool) {
     (false, false)
 }
 
-/// Targets that mean "the home directory or the filesystem root".
+/// Targets that mean "the home directory or the filesystem root": a home
+/// spelling (`~`, `$HOME`, `${HOME}`, `$env:USERPROFILE`, `%USERPROFILE%`,
+/// any case) or nothing at all, followed only by `/` or `\` separators.
 fn is_home_or_root_target(target: &str) -> bool {
-    let t = target.trim();
-    if t == "/" || t == "~" || t == "$HOME" || t == "${HOME}" {
+    let t = target.trim().to_ascii_lowercase();
+    let only_separators = |rest: &str| rest.chars().all(|c| c == '/' || c == '\\');
+    if !t.is_empty() && only_separators(&t) {
         return true;
     }
-    // `~/` or `$HOME/` with a trailing slash and nothing else (or just a
-    // dot-segment) is still effectively the whole home tree.
-    let stripped = t
-        .strip_prefix("$HOME")
-        .or_else(|| t.strip_prefix("${HOME}"))
-        .or_else(|| t.strip_prefix('~'));
-    if let Some(rest) = stripped {
-        // "$HOME/" -> rest == "/"; treat a bare-slash tail as the home root.
-        return rest == "/" || rest.is_empty();
-    }
-    false
+    [
+        "~",
+        "$home",
+        "${home}",
+        "$env:userprofile",
+        "${env:userprofile}",
+        "%userprofile%",
+    ]
+    .iter()
+    .any(|home| t.strip_prefix(home).is_some_and(only_separators))
 }
 
 /// `curl`/`wget` whose output is piped into a shell interpreter.
@@ -1452,6 +1616,135 @@ mod tests {
     }
 
     #[test]
+    fn quote_and_comment_model_matches_the_shell() {
+        // `$'` inside double quotes is literal in sh/bash, not ANSI-C quoting.
+        expect(
+            Shell::Posix,
+            &["echo \"$'\" ; rm -rf ~ ; echo \"'\""],
+            dangerous,
+            "Dangerous",
+        );
+        // PowerShell block comments, and typographic quotes and dashes.
+        let ps = [
+            "<# x #> rm -r -fo ~",
+            "echo 'x\u{2019}; rm -r -fo ~; echo \u{2018}y'",
+            "echo \u{201C}x\"; rm -r -fo ~; echo \"y\u{201D}",
+            "Remove-Item \u{2013}Recurse \u{2014}Force ~",
+        ];
+        expect(Shell::Power, &ps, dangerous, "Dangerous");
+        expect(
+            Shell::Power,
+            &["<# #> iex $s", "<# never closed\nrm -rf ~"],
+            needs_approval,
+            "NeedsApproval",
+        );
+    }
+
+    #[test]
+    fn script_fed_to_a_shell_on_stdin() {
+        expect(
+            Shell::Posix,
+            &["bash <<'EOF'\nrm -rf ~\nEOF"],
+            dangerous,
+            "Dangerous",
+        );
+        let posix = [
+            "sh < x.sh",
+            "bash <<< \"$(echo cm0gLXJmIH4K | base64 -d)\"",
+            "echo cm0gLXJmIH4K | bash /dev/stdin",
+            "cat x | pwsh -",
+            "cat x | pwsh -File -",
+            "echo x |\nbash",
+            "cmd < x.bat",
+        ];
+        expect(Shell::Posix, &posix, needs_approval, "NeedsApproval");
+        expect(
+            Shell::Power,
+            &["Get-Content x | & pwsh", "Get-Content x | powershell -"],
+            needs_approval,
+            "NeedsApproval",
+        );
+    }
+
+    #[test]
+    fn powershell_native_deletes_are_on_the_blocklist() {
+        let ps = [
+            "Remove-Item -Recurse -Force ~",
+            "ri -Recurse -Force ~",
+            "del -Recurse -Force ~",
+            "erase -r -fo ~",
+            "rd -r -fo ~",
+            "rmdir -Recurse -Force $HOME",
+            "rm -Recurse -Force ~",
+            "rm -r -fo $env:USERPROFILE",
+            "rm -r -fo ~\\",
+            "Remove-Item -Recurse:$true -Force ~",
+            "cmd /c rd /s /q %USERPROFILE%",
+        ];
+        expect(Shell::Power, &ps, dangerous, "Dangerous");
+        expect(
+            Shell::Power,
+            &[
+                "Remove-Item -Recurse -Force .\\target",
+                "cmd /c rd /s /q build",
+                "Remove-Item -Force ~\\x.txt",
+            ],
+            allowed,
+            "Safe/Suspicious",
+        );
+        expect(Shell::Cmd, &["rd /s /q build"], allowed, "Safe/Suspicious");
+    }
+
+    #[test]
+    fn powershell_here_strings() {
+        let ok = [
+            "git commit -m @'\nfix: it's done (really\n'@",
+            "$m = @\"\nit's $env:USERNAME\n\"@\nWrite-Host $m",
+        ];
+        expect(Shell::Power, &ok, allowed, "Safe/Suspicious");
+        expect(
+            Shell::Power,
+            &["$m = @\"\nsee $(rm -rf ~)\n\"@"],
+            dangerous,
+            "Dangerous",
+        );
+        expect(
+            Shell::Power,
+            &["git commit -m @'\nnever closed"],
+            needs_approval,
+            "NeedsApproval",
+        );
+    }
+
+    #[test]
+    fn optional_powershell_and_xargs_forms() {
+        expect(
+            Shell::Posix,
+            &["find . | xargs -I {} echo {}"],
+            allowed,
+            "Safe/Suspicious",
+        );
+        expect(
+            Shell::Posix,
+            &[
+                "powershell.exe /enc cgBtACAALQByAGYAIAB+AA==",
+                "powershell /EncodedCommand cgB=",
+            ],
+            needs_approval,
+            "NeedsApproval",
+        );
+        expect(
+            Shell::Power,
+            &[
+                "$ExecutionContext.InvokeCommand.InvokeScript($s)",
+                "[scriptblock]::Create($s).Invoke()",
+            ],
+            needs_approval,
+            "NeedsApproval",
+        );
+    }
+
+    #[test]
     fn unparseable_line_needs_approval() {
         expect(
             Shell::Posix,
@@ -1478,6 +1771,13 @@ mod tests {
             "rm -rf ./build # don't touch ~",
             "bash scripts/test.sh",
             "sudo apt-get install -y jq",
+            "cat < input.txt",
+            "sort < a > b",
+            "python script.py < data.json",
+            "bash scripts/test.sh < input.txt",
+            "git commit -m \"it's fine\"",
+            "wc -l <<< \"$HOME\"",
+            "cat <<'EOF' | grep x\nrm -rf ~\nEOF",
         ];
         expect(Shell::Posix, &posix, allowed, "Safe/Suspicious");
         let ps = [

@@ -470,12 +470,16 @@ async fn decide_permission(
     origin_permission::Decision {
         outcome: if allowed { Outcome::Allow } else { Outcome::Deny },
         reason: if allowed {
-            "user-approved".into()
+            USER_APPROVED.into()
         } else {
             "user-denied".into()
         },
     }
 }
+
+/// `Decision::reason` of an Allow the prompter gave in [`decide_permission`];
+/// [`apply_cmd_guard`] relies on it to avoid asking twice about one call.
+const USER_APPROVED: &str = "user-approved";
 
 /// DENY-ONLY governance overlay (Task 3).
 ///
@@ -529,6 +533,9 @@ fn apply_governance_overlay(
 /// through the normal permission prompt: an Allow the prompter already gave for
 /// this exact call stands, any other Allow (a permission rule) is re-asked, and a
 /// prompter that cannot ask (`AlwaysDeny`, a closed IPC channel) denies.
+/// NOTE: an always-allow prompter (the daemon default when the client did not
+/// request permission prompts) therefore ALLOWS a `NeedsApproval` command
+/// today — the `Prompter` trait cannot tell it apart from a human saying yes.
 async fn apply_cmd_guard(
     decision: origin_permission::Decision,
     meta: &ToolMeta,
@@ -549,7 +556,7 @@ async fn apply_cmd_guard(
             reason: format!("cmd-guard: dangerous bash command blocked: {reason}"),
         },
         // `decide_permission` already asked the prompter about this call.
-        origin_cmdparse::Risk::NeedsApproval(_) if decision.reason == "user-approved" => decision,
+        origin_cmdparse::Risk::NeedsApproval(_) if decision.reason == USER_APPROVED => decision,
         origin_cmdparse::Risk::NeedsApproval(reason) => {
             if prompter.ask(meta, args_preview).await {
                 origin_permission::Decision {
@@ -10717,7 +10724,7 @@ mod wiring_tests {
         let approved = run_cmd_guard(decision(rule_allow), "Bash", &args, &allow);
         assert_eq!(approved.outcome, Outcome::Allow, "prompter said yes ⇒ allowed");
 
-        let asked = run_cmd_guard(decision("user-approved"), "Bash", &args, &deny);
+        let asked = run_cmd_guard(decision(USER_APPROVED), "Bash", &args, &deny);
         assert_eq!(asked.outcome, Outcome::Allow, "already prompted ⇒ not re-asked");
     }
 
