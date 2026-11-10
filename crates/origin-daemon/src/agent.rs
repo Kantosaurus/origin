@@ -4953,6 +4953,10 @@ async fn run_loop_inner(
     // ponytail: candidates get no turn-end LSP diagnostics; upgrade path is a
     // per-candidate pool rooted at the run cwd.
     let lsp_diag_enabled = crate::lsp_diagnostics::enabled() && opts.cwd.is_none();
+    // The cwd guard above is for the pooled server only: edited paths are still
+    // collected under the feature flag, since the per-turn test gate and test
+    // selection read them too.
+    let lsp_collect = crate::lsp_diagnostics::enabled();
     let lsp_pool = opts.lsp_pool.clone().unwrap_or_default();
     if lsp_diag_enabled {
         // Files may have changed since the last prompt (the user's editor, git)
@@ -6417,7 +6421,7 @@ async fn run_loop_inner(
                 // feed diagnostics back to the model. Collected when EITHER the
                 // LSP-diagnostics path (`ORIGIN_LSP_DIAGNOSTICS=1`) or the
                 // default-on fast post-edit syntax gate needs them.
-                if lsp_diag_enabled || compile_check_enabled {
+                if lsp_collect || compile_check_enabled {
                     let paths = edited_paths_from_tool(&name, &args);
                     lsp_unlisted_mutation |= paths.is_empty();
                     lsp_edited_paths.extend(paths);
