@@ -118,6 +118,7 @@ async fn accept_persists_via_proposal_registry() {
         post_edit: None,
         notify: None,
         lsp_pool: None,
+        cwd: None,
         ponytail: origin_ponytail::PonytailMode::Full,
     };
     let _summary = run_loop(

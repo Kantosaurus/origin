@@ -156,8 +156,7 @@ pub fn run_best_of_n(
 ///
 /// This is the production path: each candidate runs a full async `run_loop` in
 /// its worktree, which cannot be expressed through the sync [`CandidateArena`]
-/// trait. The batch is still serialized by the caller (best-of-N holds the
-/// process-wide cwd lock), so awaiting candidates sequentially is correct. The
+/// trait. Candidates are awaited sequentially. The
 /// *decision* logic is shared verbatim with the sync path via [`select_best`] /
 /// [`has_verified_winner`], so both are covered by the same policy tests.
 ///
@@ -214,19 +213,11 @@ where
     BestOfNOutcome::Applied { winner, passed }
 }
 
-/// Process-wide guard held for the duration of a best-of-N batch.
-////// The candidate agent runs edit files relative to the process **current
-/// directory** (the tool builtins use cwd-relative paths), so a candidate must
-/// run with cwd pointed at its worktree. `set_current_dir` is process-global, so
-/// we serialize best-of-N against every other turn in the daemon while a batch
-/// is in flight. Best-of-N is an opt-in, heavy, hard-instance path, so briefly
-/// serializing the daemon is an acceptable trade for correctness.
-static BESTOFN_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// The signature of the per-candidate agent runner the daemon supplies.
 ///
-/// Given the candidate index and the worktree path (already the process cwd for
-/// the duration of the call), it runs the goal to completion in that checkout.
+/// Given the candidate index and the worktree path, it runs the goal to
+/// completion in that checkout (A12: by passing the path as the run's working
+/// directory, never by changing the process-wide cwd).
 /// It returns `Ok(())` on any terminal outcome (the *diff* is what we score, not
 /// the loop's own success signal) or `Err` when the attempt could not run at all.
 pub type CandidateRunner<'a> = dyn FnMut(usize, &std::path::Path) -> Result<(), String> + 'a;
@@ -234,8 +225,8 @@ pub type CandidateRunner<'a> = dyn FnMut(usize, &std::path::Path) -> Result<(), 
 /// Production [`CandidateArena`] backed by real `git worktree` lanes.
 ///
 /// For each candidate it: adds a detached worktree at `base_commit` under a
-/// temp root, swaps the process cwd into it (under [`BESTOFN_CWD_LOCK`]), invokes
-/// the supplied [`CandidateRunner`], captures `git diff` of the result, runs the
+/// temp root, invokes the supplied [`CandidateRunner`] with the worktree path,
+/// captures `git diff` of the result, runs the
 /// test command, then tears the worktree down. The winning diff is applied to
 /// the user's real tree with `git apply`.
 pub struct WorktreeArena<'a> {
@@ -248,7 +239,7 @@ pub struct WorktreeArena<'a> {
     /// The test command scored per candidate; `None` ⇒ every candidate is
     /// `Unknown` (no oracle) and best-of-N will find no verified winner.
     test_command: Option<String>,
-    /// The user's real workspace dir (cwd is restored to it after each candidate).
+    /// The user's real workspace dir (the winning diff is applied here).
     workspace: std::path::PathBuf,
     /// The per-candidate agent runner supplied by the daemon.
     runner: Box<CandidateRunner<'a>>,
@@ -310,30 +301,20 @@ impl CandidateArena for WorktreeArena<'_> {
             .map_err(|e| format!("worktree add: {e}"))?;
         self.created.push(wt_path.clone());
 
-        // Run the candidate with cwd pointed at the worktree. `set_current_dir`
-        // is process-global ⇒ serialize the whole batch against other turns.
-        let outcome;
-        let diff;
-        {
-            let _cwd_guard = BESTOFN_CWD_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let prev = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
-            std::env::set_current_dir(&wt_path).map_err(|e| format!("chdir worktree: {e}"))?;
-            // Always restore cwd, even if the runner or scoring panics/early-returns.
-            let restore = scopeguard_chdir(prev);
-            (self.runner)(index, &wt_path)?;
-            // Capture the candidate's change as a patch against the base commit.
-            let wt_git = origin_daemon_git_at(&wt_path);
-            // Stage everything so new files are included, then diff vs base.
-            let _ = wt_git.run(&["add", "-A"]);
-            diff = wt_git
-                .run(&["diff", "--cached", &self.base_commit])
-                .unwrap_or_default();
-            outcome = self
-                .test_command
-                .as_deref()
-                .map_or(TestOutcome::Unknown, |cmd| Self::score(&wt_path, cmd));
-            drop(restore);
-        }
+        // A12: the runner gets the worktree path and works there; the process
+        // cwd is never moved (it is shared by every session in the daemon).
+        (self.runner)(index, &wt_path)?;
+        // Capture the candidate's change as a patch against the base commit.
+        let wt_git = origin_daemon_git_at(&wt_path);
+        // Stage everything so new files are included, then diff vs base.
+        let _ = wt_git.run(&["add", "-A"]);
+        let diff = wt_git
+            .run(&["diff", "--cached", &self.base_commit])
+            .unwrap_or_default();
+        let outcome = self
+            .test_command
+            .as_deref()
+            .map_or(TestOutcome::Unknown, |cmd| Self::score(&wt_path, cmd));
         Ok(CandidateResult { diff, outcome })
     }
 
@@ -367,19 +348,6 @@ impl Drop for WorktreeArena<'_> {
             let _ = wt.remove(path, true);
         }
         let _ = wt.prune();
-    }
-}
-
-/// A tiny cwd-restoring guard (avoids pulling in the `scopeguard` crate).
-struct ChdirRestore(Option<std::path::PathBuf>);
-const fn scopeguard_chdir(prev: std::path::PathBuf) -> ChdirRestore {
-    ChdirRestore(Some(prev))
-}
-impl Drop for ChdirRestore {
-    fn drop(&mut self) {
-        if let Some(prev) = self.0.take() {
-            let _ = std::env::set_current_dir(prev);
-        }
     }
 }
 
@@ -512,6 +480,51 @@ mod tests {
         a.apply_fails = true;
         let out = run_best_of_n(&mut a, 2, hard());
         assert_eq!(out, BestOfNOutcome::NoWinner { attempted: 2 });
+    }
+
+    /// A12: a candidate runs in its own worktree (passed to the runner) without
+    /// moving the process-wide cwd, which every other session in the daemon
+    /// resolves relative paths against.
+    #[test]
+    fn running_a_candidate_leaves_the_process_cwd_unchanged() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = crate::selfdev::ProcessGitRunner::new(repo.path());
+        git.run(&["init", "-q"]).unwrap();
+        git.run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "base",
+        ])
+        .unwrap();
+        let base = git.run(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let scratch = tempfile::tempdir().unwrap();
+        let before = std::env::current_dir().unwrap();
+        let seen = std::cell::RefCell::new(None);
+        let runner = |_i: usize, wt: &std::path::Path| -> Result<(), String> {
+            *seen.borrow_mut() = Some(std::env::current_dir().unwrap());
+            std::fs::write(wt.join("new.txt"), "hi\n").map_err(|e| e.to_string())
+        };
+        let mut arena = WorktreeArena::new(&git, base, scratch.path(), repo.path(), None, Box::new(runner));
+        let res = arena.run_candidate(0).unwrap();
+        drop(arena);
+        assert_eq!(
+            seen.into_inner(),
+            Some(before),
+            "the candidate must run without changing the process cwd"
+        );
+        assert!(
+            res.diff.contains("new.txt"),
+            "the worktree edit is captured: {}",
+            res.diff
+        );
     }
 
     #[test]

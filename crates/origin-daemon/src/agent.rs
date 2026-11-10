@@ -948,15 +948,15 @@ mod task_preview_tests {
 /// is tail-truncated since test failures surface at the end. Only ever called
 /// when the user opted into `[post_edit] auto_test=true`, so it adds no default
 /// latency.
-async fn run_post_edit_test(cmd: &str) -> Option<String> {
-    run_turn_end_command(cmd, "test-results", "test command").await
+async fn run_post_edit_test(cmd: &str, cwd: Option<&std::path::Path>) -> Option<String> {
+    run_turn_end_command(cmd, "test-results", "test command", cwd).await
 }
 
 /// C9: run the test command and report whether it PASSED, for the pre-edit
 /// regression baseline. Fail-open: a spawn error or timeout returns `true`
 /// (assume green) so we never cry "regression" over a failure we couldn't run.
-async fn run_test_passed(cmd: &str) -> bool {
-    run_gate_command(cmd).await.is_none_or(|(code, _)| code == 0)
+async fn run_test_passed(cmd: &str, cwd: Option<&std::path::Path>) -> bool {
+    run_gate_command(cmd, cwd).await.is_none_or(|(code, _)| code == 0)
 }
 
 /// A6: run a turn-end gate command (`auto_test` / `auto_lint` / repro gate /
@@ -965,9 +965,10 @@ async fn run_test_passed(cmd: &str) -> bool {
 /// `(exit_code, output)` when the command ran to exit; `None` when the guard
 /// denied it, the spawn failed, or it hit the 600s bound (callers fail open).
 /// There is no one to ask, so a `NeedsApproval` verdict is not run either.
+/// `cwd` (A12) is the directory it runs in; `None` ⇒ the process cwd.
 // ponytail: the skip note goes to the log only — a non-empty gate block reads as
 // RED to every caller, so carrying it there needs a skipped/failed split.
-async fn run_gate_command(cmd: &str) -> Option<(i32, String)> {
+async fn run_gate_command(cmd: &str, cwd: Option<&std::path::Path>) -> Option<(i32, String)> {
     if std::env::var("ORIGIN_CMD_GUARD").as_deref() != Ok("0") {
         match origin_cmdparse::worst(&origin_cmdparse::analyze(cmd)) {
             origin_cmdparse::Risk::Dangerous(reason) => {
@@ -988,7 +989,7 @@ async fn run_gate_command(cmd: &str) -> Option<(i32, String)> {
     let args = origin_tools::builtins::bash::BashArgs {
         command: cmd.to_string(),
         timeout: Some(600),
-        cwd: None,
+        cwd: cwd.map(|p| p.to_string_lossy().into_owned()),
         env: Vec::new(),
         run_in_background: false,
     };
@@ -1008,16 +1009,21 @@ async fn run_gate_command(cmd: &str) -> Option<(i32, String)> {
 /// and proceeded as if clean. Emits a `<lint-results>` feedback block only on a
 /// non-zero exit; fail-open otherwise. Only called when the user opted into
 /// `[post_edit] auto_lint`, so it adds no default latency.
-async fn run_post_edit_lint_block(cmd: &str) -> Option<String> {
-    run_turn_end_command(cmd, "lint-results", "lint command").await
+async fn run_post_edit_lint_block(cmd: &str, cwd: Option<&std::path::Path>) -> Option<String> {
+    run_turn_end_command(cmd, "lint-results", "lint command", cwd).await
 }
 
 /// Run a turn-end check command via [`run_gate_command`] and, ONLY when it
 /// exits non-zero, return a tail-truncated `<{tag}>` feedback block the model
 /// sees next turn. None on success / spawn failure / timeout — fail-open, so a
 /// misconfigured command never blocks the turn. Bounded to 600s.
-async fn run_turn_end_command(cmd: &str, tag: &str, label: &str) -> Option<String> {
-    match run_gate_command(cmd).await {
+async fn run_turn_end_command(
+    cmd: &str,
+    tag: &str,
+    label: &str,
+    cwd: Option<&std::path::Path>,
+) -> Option<String> {
+    match run_gate_command(cmd, cwd).await {
         Some((code, msg)) if code != 0 => {
             let chars: Vec<char> = msg.chars().collect();
             let start = chars.len().saturating_sub(4_000);
@@ -1083,6 +1089,81 @@ async fn effective_test_command(
         }
         origin_postedit::Selection::Full => base.to_string(),
     }
+}
+
+/// A12: the run's working directory — [`LoopOptions::cwd`] when set (a
+/// best-of-N candidate's worktree), else the process cwd.
+fn loop_cwd(opts: &LoopOptions) -> Option<std::path::PathBuf> {
+    opts.cwd.clone().or_else(|| std::env::current_dir().ok())
+}
+
+/// A12: resolve a tool call's relative paths against `cwd`, the run's working
+/// directory, so a run whose directory is not the process cwd reads and edits
+/// its own tree. Absolute paths pass through (`Path::join` keeps them). A
+/// `Bash`/`Glob`/`Grep` call naming no directory gets `cwd`; `ApplyPatch` file
+/// paths are anchored by [`anchor_patch_paths`].
+fn anchor_tool_args(name: &str, mut args: Value, cwd: &std::path::Path) -> Value {
+    let anchor = |p: &str| cwd.join(p).to_string_lossy().into_owned();
+    let Some(obj) = args.as_object_mut() else {
+        return args;
+    };
+    for key in ["file_path", "path", "cwd"] {
+        if let Some(Value::String(p)) = obj.get_mut(key) {
+            *p = anchor(p);
+        }
+    }
+    if let Some(Value::Array(paths)) = obj.get_mut("paths") {
+        for p in paths.iter_mut() {
+            if let Value::String(s) = p {
+                *s = anchor(s);
+            }
+        }
+    }
+    let dir_key = match name {
+        "Bash" => Some("cwd"),
+        "Glob" | "Grep" => Some("path"),
+        _ => None,
+    };
+    if let Some(key) = dir_key {
+        obj.entry(key)
+            .or_insert_with(|| Value::String(cwd.to_string_lossy().into_owned()));
+    }
+    if name == "ApplyPatch" {
+        if let Some(Value::String(patch)) = obj.get_mut("patch") {
+            *patch = anchor_patch_paths(patch, cwd);
+        }
+    }
+    args
+}
+
+/// A12: anchor an `ApplyPatch` body's file paths against `cwd`: the `+++ b/`
+/// header of a unified diff and the `*** Add/Delete/Update File:` / `*** Move
+/// to:` directives of a marker patch — the lines `apply_patch` reads paths from.
+// ponytail: mirrors apply_patch's header grammar; pass a base dir into
+// origin_tools::apply_patch if that grammar grows.
+fn anchor_patch_paths(patch: &str, cwd: &std::path::Path) -> String {
+    const DIRECTIVES: [&str; 4] = [
+        "*** Add File:",
+        "*** Delete File:",
+        "*** Update File:",
+        "*** Move to:",
+    ];
+    let anchor = |p: &str| cwd.join(p.trim()).to_string_lossy().into_owned();
+    patch
+        .split_inclusive('\n')
+        .map(|line| {
+            let body = line.trim_end_matches(['\r', '\n']);
+            let eol = &line[body.len()..];
+            if let Some(p) = body.strip_prefix("+++ b/") {
+                return format!("+++ b/{}{eol}", anchor(p));
+            }
+            let t = body.trim_start();
+            DIRECTIVES
+                .iter()
+                .find_map(|d| t.strip_prefix(d).map(|p| format!("{d} {}{eol}", anchor(p))))
+                .unwrap_or_else(|| line.to_string())
+        })
+        .collect()
 }
 
 /// Render a `<workspace-roots>` system-prompt block listing the additional
@@ -3269,6 +3350,12 @@ pub struct LoopOptions {
     /// warm across its turns. `None` ⇒ the run uses its own pool, dropped
     /// when it ends.
     pub lsp_pool: Option<Arc<origin_lsp_client::LspPool>>,
+    /// A12: working directory for this run's tools and turn-end gate commands.
+    /// Relative tool paths resolve against it and `Bash`/`Glob`/`Grep` default
+    /// to it. `None` (the default everywhere but best-of-N candidates) ⇒ the
+    /// process cwd, byte-identical. Lets a candidate work in its own worktree
+    /// without `std::env::set_current_dir`, which is process-wide.
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 impl Default for LoopOptions {
@@ -3318,6 +3405,7 @@ impl Default for LoopOptions {
             post_edit: None,
             notify: None,
             lsp_pool: None,
+            cwd: None,
         }
     }
 }
@@ -4295,10 +4383,10 @@ async fn run_loop_inner(
             (String::new(), String::new()) // explicit opt-out
         } else {
             // Map spans every session root (multi-root cross-references are honoured
-            // by the ranker); default to the current dir when the session opened
+            // by the ranker); default to the run's cwd (A12) when the session opened
             // with no explicit roots.
             let roots: Vec<std::path::PathBuf> = if session.roots.is_empty() {
-                std::env::current_dir().ok().into_iter().collect()
+                loop_cwd(opts).into_iter().collect()
             } else {
                 session.roots.clone()
             };
@@ -4374,7 +4462,7 @@ async fn run_loop_inner(
     let env_block = render_env_block(
         std::env::consts::OS,
         cfg!(windows),
-        &std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string()),
+        &loop_cwd(opts).map_or_else(|| ".".to_string(), |p| p.display().to_string()),
     );
     // B2 seam — the SESSION-STABLE system prompt. It must be byte-identical for
     // every request of a session: Anthropic caches tools + system behind one
@@ -4542,7 +4630,7 @@ async fn run_loop_inner(
     // (green→red) vs a pre-existing failure. Opt-in ⇒ no default cost.
     let baseline_tests_passed: Option<bool> = match opts.post_edit.as_deref() {
         Some(cfg) if cfg.auto_test => match cfg.test_command.as_deref() {
-            Some(cmd) => Some(run_test_passed(cmd).await),
+            Some(cmd) => Some(run_test_passed(cmd, opts.cwd.as_deref()).await),
             None => None,
         },
         _ => None,
@@ -5437,9 +5525,12 @@ async fn run_loop_inner(
                         let cmd = effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
                         // Run the oracle now (fresh, not the stale `test_block`).
                         // C9: redact before it becomes a model-facing User message.
-                        let mut fresh =
-                            crate::redact::text(&run_post_edit_test(&cmd).await.unwrap_or_default())
-                                .into_owned();
+                        let mut fresh = crate::redact::text(
+                            &run_post_edit_test(&cmd, opts.cwd.as_deref())
+                                .await
+                                .unwrap_or_default(),
+                        )
+                        .into_owned();
                         if !fresh.is_empty() {
                             // Classify against the pre-edit baseline exactly like
                             // the per-turn path (C9), so the model is told whether
@@ -5596,6 +5687,12 @@ async fn run_loop_inner(
             // schema before dispatch. Fail-open + idempotent: returns `args`
             // unchanged when nothing matches, so correct calls are untouched.
             let args = origin_tools::coerce::coerce(meta.input_schema, &args);
+            // A12: a run with its own working directory resolves relative paths
+            // there, before any permission / path overlay looks at them.
+            let args = match opts.cwd.as_deref() {
+                Some(cwd) => anchor_tool_args(meta.name, args, cwd),
+                None => args,
+            };
             let preview = args.to_string();
 
             // A4: with no coordinator (a swarm worker, a headless/candidate loop) a
@@ -6270,8 +6367,13 @@ async fn run_loop_inner(
                 // synchronous dispatch if the registry has no entry. After a
                 // mutation in this batch the pre-run is drained but discarded
                 // (A2): it may predate the mutation, and consuming it would
-                // record stale bytes in the memo and `note_read` them.
-                let pre = speculative.take(&id).await.filter(|_| !batch_mutated);
+                // record stale bytes in the memo and `note_read` them. A run with
+                // its own cwd (A12) discards it too: the pre-run resolved the
+                // model's raw relative paths against the process cwd.
+                let pre = speculative
+                    .take(&id)
+                    .await
+                    .filter(|_| !batch_mutated && opts.cwd.is_none());
                 if let Some(pre) = pre {
                     match pre {
                         Ok(bytes) => {
@@ -6764,7 +6866,7 @@ async fn run_loop_inner(
         // note in the block, never a loop error. Default-off ⇒ this whole
         // block is skipped and the prompt stays byte-identical.
         if lsp_diag_enabled {
-            let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let root = loop_cwd(opts).unwrap_or_else(|| std::path::PathBuf::from("."));
             // C9: gate blocks carry child-process output; redact at the source
             // so every consumer (model, goal verifier, re-localize) sees it redacted.
             lsp_diag_block = crate::redact::string(
@@ -6798,8 +6900,11 @@ async fn run_loop_inner(
                         // #4: narrow the suite to the edit's blast radius when
                         // test-selection is enabled; falls back to `cmd` verbatim.
                         let cmd = effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
-                        test_block =
-                            crate::redact::string(run_post_edit_test(&cmd).await.unwrap_or_default());
+                        test_block = crate::redact::string(
+                            run_post_edit_test(&cmd, opts.cwd.as_deref())
+                                .await
+                                .unwrap_or_default(),
+                        );
                         // C9: classify a post-edit failure against the pre-edit
                         // baseline — a true regression (was green) vs failures
                         // that were already red before this change.
@@ -6824,8 +6929,11 @@ async fn run_loop_inner(
                 // per-edit lint only logged its result; surface it to the model.
                 if cfg.auto_lint {
                     if let Some(cmd) = cfg.lint_command.as_deref() {
-                        lint_block =
-                            crate::redact::string(run_post_edit_lint_block(cmd).await.unwrap_or_default());
+                        lint_block = crate::redact::string(
+                            run_post_edit_lint_block(cmd, opts.cwd.as_deref())
+                                .await
+                                .unwrap_or_default(),
+                        );
                     }
                 }
             }
@@ -11340,7 +11448,7 @@ mod wiring_tests {
         let cmd = r#"echo "leak=$A6_GATE_PROBE_API_KEY"; exit 1"#;
         #[cfg(windows)]
         let cmd = "'leak=' + $env:A6_GATE_PROBE_API_KEY; exit 1";
-        let block = run_turn_end_command(cmd, "test-results", "test command").await;
+        let block = run_turn_end_command(cmd, "test-results", "test command", None).await;
         std::env::remove_var("A6_GATE_PROBE_API_KEY");
         let block = block.expect("a failing gate command must yield a feedback block");
         assert!(block.contains("leak="), "{block}");

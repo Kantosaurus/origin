@@ -2045,6 +2045,9 @@ async fn handle_request(
             // byte-identical to before.
             lsp_pool: Some(lsp_pool),
             // ^ C10: the connection's language servers.
+            cwd: None,
+            // ^ A12: the live turn uses the process cwd; only best-of-N
+            // candidates run in their own worktree.
         };
         // Opt-in interactive prompting: when the turn requested it, route
         // RequiresPermission tools through the IPC prompter (asks the client and
@@ -2206,11 +2209,9 @@ async fn handle_request(
 /// [`origin_daemon::bestofn_runner::run_best_of_n`] policy.
 ///
 /// The whole batch runs on a blocking thread ([`tokio::task::spawn_blocking`]):
-/// the [`WorktreeArena`] changes the *process* cwd into each worktree (the tool
-/// builtins edit cwd-relative paths), which it serializes with a process-wide
-/// lock, and each candidate drives the async agent loop via a dedicated
-/// current-thread runtime. This keeps cwd correct for the entire
-/// run→capture→score sequence and never blocks the main async worker.
+/// each candidate drives the async agent loop via a dedicated current-thread
+/// runtime, with its worktree as the run's working directory (A12), so it
+/// never blocks the main async worker or moves the process cwd.
 #[allow(clippy::too_many_arguments)]
 async fn maybe_run_best_of_n(
     n: u32,
@@ -2254,7 +2255,7 @@ async fn maybe_run_best_of_n(
     let workspace = selfdev_workspace_root();
     let goal_text = user_text.to_string();
 
-    // Everything below is blocking (git worktree, chdir, subprocess tests, plus
+    // Everything below is blocking (git worktree, subprocess tests, plus
     // a nested current-thread runtime per candidate), so it runs off the async
     // worker on a blocking thread. Values captured must be owned/`Send`.
     let join = tokio::task::spawn_blocking(move || {
@@ -2271,9 +2272,9 @@ async fn maybe_run_best_of_n(
         let _ = std::fs::create_dir_all(&scratch);
 
         // Per-candidate runner: fresh session + fresh run_loop on the ORIGINAL
-        // prompt. cwd is already the worktree (the arena set it under the
-        // process-wide lock right before calling us), so edits land there. We
-        // drive the async loop with a dedicated current-thread runtime.
+        // prompt, with the worktree as the run's working directory (A12: passed
+        // in `LoopOptions::cwd`, never set process-wide), so edits land there.
+        // We drive the async loop with a dedicated current-thread runtime.
         //
         // A candidate is an ISOLATED, SILENT attempt: it gets only the handles a
         // fresh run genuinely needs (the test gate, CAS, code graph) — no event/
@@ -2281,7 +2282,7 @@ async fn maybe_run_best_of_n(
         // user's stream or mutates shared per-connection state. This deliberately
         // builds a MINIMAL `LoopOptions` rather than cloning the live one.
         let prompter = AlwaysAllow;
-        let runner = move |_idx: usize, _wt: &std::path::Path| -> Result<(), String> {
+        let runner = move |_idx: usize, wt: &std::path::Path| -> Result<(), String> {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -2296,6 +2297,7 @@ async fn maybe_run_best_of_n(
                 post_edit: post_edit.clone(),
                 // Match the orchestrator's effort so candidates aren't downgraded.
                 effort: resolve_turn_effort(None, provider.name()),
+                cwd: Some(wt.to_path_buf()),
                 ..LoopOptions::default()
             };
             let res = rt.block_on(origin_daemon::agent::run_loop(

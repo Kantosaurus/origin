@@ -304,6 +304,67 @@ async fn dispatch_registers_pure_tool_handle_as_sticky_in_shared_plan() {
     );
 }
 
+/// A12: a run given its own working directory (a best-of-N candidate's
+/// worktree) resolves the model's relative paths there, for `Write` and for
+/// `ApplyPatch`, without the process cwd ever pointing at it.
+#[tokio::test]
+async fn relative_tool_paths_resolve_against_loop_cwd() {
+    let ws = tempdir().expect("tempdir");
+    let name = format!("a12-{}.txt", ulid::Ulid::new());
+    let patched = format!("a12-patch-{}.txt", ulid::Ulid::new());
+    let write = Block::ToolUse {
+        id: "tu_w".into(),
+        name: "Write".into(),
+        input_json: serde_json::to_vec(&serde_json::json!({"file_path": name, "content": "hi\n"}))
+            .expect("json"),
+        cache_marker: None,
+    };
+    let patch = format!("*** Begin Patch\n*** Add File: {patched}\n+patched\n*** End Patch\n");
+    let apply = Block::ToolUse {
+        id: "tu_p".into(),
+        name: "ApplyPatch".into(),
+        input_json: serde_json::to_vec(&serde_json::json!({ "patch": patch })).expect("json"),
+        cache_marker: None,
+    };
+    let provider = ScriptedProvider::new(vec![
+        ChatResponse {
+            assistant: Message::new(Role::Assistant).with_block(write).with_block(apply),
+            usage: Usage::default(),
+        },
+        ChatResponse {
+            assistant: Message::new(Role::Assistant).with_block(Block::text("done")),
+            usage: Usage::default(),
+        },
+    ]);
+    let opts = LoopOptions {
+        cwd: Some(ws.path().to_path_buf()),
+        ..LoopOptions::default().without_streaming()
+    };
+    let mut session = Session::new("test", "claude-opus-4-7");
+    run_loop(&mut session, "write files", &provider, &AlwaysAllow, &opts)
+        .await
+        .expect("loop ok");
+
+    let here = std::env::current_dir().expect("cwd");
+    let stray = [here.join(&name), here.join(&patched)];
+    let leaked: Vec<_> = stray.iter().filter(|p| p.exists()).collect();
+    for p in &leaked {
+        let _ = std::fs::remove_file(p);
+    }
+    assert!(
+        leaked.is_empty(),
+        "written relative to the process cwd: {leaked:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join(&name)).ok().as_deref(),
+        Some("hi\n")
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join(&patched)).ok().as_deref(),
+        Some("patched\n")
+    );
+}
+
 /// A1 regression: a fresh >2 KiB result from a Mutating tool (Bash) must reach
 /// the model verbatim on the very next request. Drives the production wiring
 /// end to end — real `run_loop`, real Bash, CAS, the shared `Plan` the daemon
