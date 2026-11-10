@@ -488,10 +488,11 @@ impl<'a> WorktreeArena<'a> {
         for p in &added {
             ok &= std::fs::remove_file(wt.join(p)).is_ok();
         }
-        let outcome = if ok {
-            Self::score(wt, cmd)
-        } else {
-            TestOutcome::Unknown
+        // C5: run from the worktree's copy of the workspace directory, as the
+        // re-test on the real tree does.
+        let outcome = match (ok, self.prefix()) {
+            (true, Ok(prefix)) => Self::score(&wt.join(prefix), cmd),
+            _ => TestOutcome::Unknown,
         };
         // Put the candidate's versions back: the index holds its modified and
         // added files; a test it deleted is not in the index, so delete it again.
@@ -1237,6 +1238,54 @@ mod tests {
             std::fs::read_to_string(sub.join("in.txt")).unwrap().trim_end(),
             "candidate"
         );
+    }
+
+    /// C5 (FF2): with the workspace at `sub/`, a candidate is scored from the
+    /// worktree's `sub/` — where the re-test on the real tree runs too.
+    #[test]
+    fn a_candidate_is_scored_from_the_workspace_sub_directory() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = crate::selfdev::ProcessGitRunner::new(repo.path());
+        root.run(&["init", "-q"]).unwrap();
+        std::fs::create_dir_all(repo.path().join("sub")).unwrap();
+        std::fs::write(repo.path().join("sub").join("marker"), "m\n").unwrap();
+        root.run(&["add", "-A"]).unwrap();
+        root.run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ])
+        .unwrap();
+        let base = root.run(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let sub = repo.path().join("sub");
+        let git = crate::selfdev::ProcessGitRunner::new(&sub);
+        let scratch = tempfile::tempdir().unwrap();
+        // Passes only when run from `sub/` (where `marker` lives).
+        #[cfg(unix)]
+        let cmd = "test -f marker";
+        #[cfg(windows)]
+        let cmd = "if (-not (Test-Path marker)) { exit 1 }";
+        let runner = |_i: usize, wt: &std::path::Path| -> Result<(), String> {
+            std::fs::write(wt.join("sub").join("fix.txt"), "fix\n").map_err(|e| e.to_string())
+        };
+        let mut arena = WorktreeArena::new(
+            &git,
+            base,
+            scratch.path(),
+            &sub,
+            Some(cmd.into()),
+            Box::new(runner),
+        );
+        let res = arena.run_candidate(0).unwrap();
+        drop(arena);
+        assert_eq!(res.outcome, TestOutcome::Passed);
     }
 
     /// C5 case (c): the winner touches only clean files, but other files carry
