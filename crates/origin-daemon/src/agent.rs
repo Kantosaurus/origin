@@ -3582,7 +3582,7 @@ async fn run_loop_inner(
         opts.injector
             .as_ref()
             .map_or_else(String::new, |injector| match injector.for_prompt(user_text, 5) {
-                Ok(Some(ctx)) => ctx.block,
+                Ok(Some(ctx)) => origin_core::types::strip_hidden_unicode(&ctx.block),
                 Ok(None) => String::new(),
                 Err(e) => {
                     tracing::warn!(error = %e, "injector.for_prompt failed; running without recall");

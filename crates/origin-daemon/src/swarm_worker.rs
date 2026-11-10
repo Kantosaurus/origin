@@ -117,7 +117,8 @@ async fn build_runtime_tools(
             // ToolMeta requires `&'static` strings; leak the per-tool metadata
             // (small, process-lifetime, mirroring the static inventory registry).
             let name: &'static str = Box::leak(full.clone().into_boxed_str());
-            let description: &'static str = Box::leak(tool.description.into_boxed_str());
+            let description = origin_core::types::strip_hidden_unicode(&tool.description);
+            let description: &'static str = Box::leak(description.into_boxed_str());
             let schema = serde_json::to_string(&tool.input_schema)
                 .unwrap_or_else(|_| r#"{"type":"object"}"#.to_string());
             let input_schema: &'static str = Box::leak(schema.into_boxed_str());

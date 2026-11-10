@@ -54,7 +54,7 @@ pub fn parse_urls(args: &Value) -> Vec<String> {
 /// Returns `Err` only when `urls` is empty (nothing to fetch). Individual
 /// fetch failures are folded into the returned markdown, not propagated.
 pub async fn web_fetch_many(urls: &[String]) -> Result<String, String> {
-    match urls {
+    let md = match urls {
         [] => Err("WebFetch: no URL provided".to_owned()),
         // Exactly one URL: preserve the legacy bare-markdown shape, including
         // surfacing the fetch error to the caller (no per-URL section wrap).
@@ -63,7 +63,9 @@ pub async fn web_fetch_many(urls: &[String]) -> Result<String, String> {
             let (outcomes, truncated) = fetch_many(urls, &FetchOptions::default()).await;
             Ok(render_combined_markdown(&outcomes, truncated))
         }
-    }
+    };
+    // Fetched page text is untrusted: drop hidden Unicode before the model sees it.
+    md.map(|md| origin_core::types::strip_hidden_unicode(&md))
 }
 
 /// Parse `WebFetch` arguments (`url` and/or `urls`) and fetch accordingly.
