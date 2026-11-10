@@ -12,6 +12,7 @@ pub mod config;
 pub mod daemon_memory_handle;
 pub mod default_workflow;
 pub mod dep_gate;
+pub mod diff_review;
 pub mod external_content;
 pub mod goal_checkpoint;
 pub mod goal_clear_all;

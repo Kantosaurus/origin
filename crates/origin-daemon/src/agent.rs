@@ -5097,6 +5097,12 @@ async fn run_loop_inner(
         .post_edit
         .as_deref()
         .map_or(0, |c| c.max_repair_iters);
+    // C6 (`ORIGIN_DIFF_REVIEW=1`): each file's content before this run first
+    // edited it (tripwires + the one end-of-run review), and whether it ran.
+    let diff_review = crate::diff_review::enabled();
+    let mut review_before: std::collections::BTreeMap<String, Option<String>> =
+        std::collections::BTreeMap::new();
+    let mut diff_reviewed = false;
     // C9: regression baseline. With auto_test on, run the suite ONCE before any
     // edit, so a post-edit failure can be classified as a true regression
     // (green→red) vs a pre-existing failure. Opt-in ⇒ no default cost.
@@ -5970,6 +5976,44 @@ async fn run_loop_inner(
                 )));
                 continue;
             }
+            // C6: one fresh-context, tool-less review of this run's diff. Its
+            // findings come back as one trailing message (one more round); a
+            // failed call is logged and the run ends normally.
+            if diff_review && !diff_reviewed {
+                diff_reviewed = true;
+                if let Some(diff) = crate::diff_review::run_diff(&review_before) {
+                    match turn_provider
+                        .chat(crate::diff_review::request(&diff, &turn_model))
+                        .await
+                    {
+                        Ok(r) => {
+                            let u = &r.usage;
+                            total_input_tokens = total_input_tokens.saturating_add(u64::from(u.input_tokens));
+                            total_output_tokens =
+                                total_output_tokens.saturating_add(u64::from(u.output_tokens));
+                            total_cache_read_tokens =
+                                total_cache_read_tokens.saturating_add(u64::from(u.cache_read_input_tokens));
+                            total_cache_write_tokens = total_cache_write_tokens
+                                .saturating_add(u64::from(u.cache_creation_input_tokens));
+                            if let Some(tx) = &opts.event_tx {
+                                let _ = tx
+                                    .send(StreamEvent::RequestUsage {
+                                        input_tokens: u.input_tokens,
+                                        output_tokens: u.output_tokens,
+                                        cache_read_input_tokens: u.cache_read_input_tokens,
+                                        cache_creation_input_tokens: u.cache_creation_input_tokens,
+                                    })
+                                    .await;
+                            }
+                            if let Some(cont) = crate::diff_review::continuation(&r.assistant) {
+                                session.push(Message::new(Role::User).with_block(Block::text(&cont)));
+                                continue;
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "diff review call failed; finishing without it"),
+                    }
+                }
+            }
             // End-of-run effects. Placed below the repro-gate and B11 continuations
             // so a run that continues does not fire them early: they run once, on
             // the path that returns.
@@ -6499,6 +6543,13 @@ async fn run_loop_inner(
                     }
                 }
             }
+
+            // C6: pre-edit content for the tripwires and the end-of-run review.
+            let call_before = if diff_review {
+                crate::diff_review::snapshot(edited_paths_from_tool(&name, &args), &mut review_before)
+            } else {
+                Vec::new()
+            };
 
             // Track mutations for the optional end-of-turn checkpoint (Task 1).
             // Only mutating tools flip the flag; pure tools leave it untouched.
@@ -7098,6 +7149,8 @@ async fn run_loop_inner(
             // so the CAS blob, TUI preview, transcript and model all see the same
             // redacted bytes.
             let result_bytes = crate::redact::bytes(result_bytes);
+            // C6: note tripwire hits in the lines this edit added (never blocks).
+            let result_bytes = crate::diff_review::with_tripwire_notes(result_bytes, &call_before);
 
             // C2: fingerprint this successful tool outcome for the stuck-loop
             // detector. A Bash command that exited non-zero counts as an error
