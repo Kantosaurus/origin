@@ -983,24 +983,7 @@ fn check_cmd(
         "&" | "." if sh == Shell::Power => check_cmd(args, stdin, multi, sh, depth + 1, risks, true),
         "pwsh" | "powershell" => check_powershell(args, stdin, depth, risks),
         "cmd" => check_cmd_exe(args, stdin, depth, risks),
-        n if is_command_wrapper(n) => {
-            // Skip the wrapper's options to the program it runs. The word right
-            // after an option may be that option's value (`sudo -u root rm`), so
-            // the following word is tried as the program too.
-            // ponytail: no per-wrapper option table, so `sudo -E foo rm -rf ~`
-            // over-matches; add one if that false positive ever matters.
-            let Some(j) = args.iter().position(|a| !a.text.starts_with('-')) else {
-                return;
-            };
-            let maybe_value = j > 0 && !args[j - 1].text.contains('=') && j + 1 < args.len();
-            // `xargs -I {} cp {} dest/`: that `{}` is `-I`'s value, not the program.
-            if !(maybe_value && args[j].text == "{}") {
-                check_cmd(&args[j..], stdin, multi, sh, depth + 1, risks, false);
-            }
-            if maybe_value {
-                check_cmd(&args[j + 1..], stdin, multi, sh, depth + 1, risks, false);
-            }
-        }
+        n if is_command_wrapper(n) => check_wrapped(n, args, stdin, multi, sh, depth, risks),
         // `rm` plus the PowerShell (`Remove-Item` and aliases) and cmd forms.
         "rm" | "remove-item" | "ri" | "del" | "erase" | "rd" | "rmdir" => detect_rm_rf_home(args, risks),
         // `cd` only matters as a *prefix to* a following command.
@@ -1013,6 +996,46 @@ fn check_cmd(
         }
         // Package installs (`npm install x`, `cargo add y`, ...).
         _ => detect_install(&name, args, risks),
+    }
+}
+
+/// Check the command a prefix command (`sudo`, `timeout`, `xargs`, ...) runs.
+///
+/// The wrapper's options are skipped. The word right after an option may be
+/// that option's value (`sudo -u root rm`), so the following word is tried as
+/// the program too; `timeout`/`chrt` also take a positional DURATION/PRIORITY
+/// first. Every candidate start is analysed (checks only add risks), so an
+/// unknown option shape errs toward analysing more, never less.
+// ponytail: no per-wrapper option table, so `sudo -E foo rm -rf ~` over-matches;
+// add one if that false positive ever matters.
+fn check_wrapped(
+    name: &str,
+    args: &[Word],
+    stdin: &Stdin,
+    multi: bool,
+    sh: Shell,
+    depth: usize,
+    risks: &mut Sink,
+) {
+    let Some(j) = args.iter().position(|a| !a.text.starts_with('-')) else {
+        return;
+    };
+    let maybe_value = j > 0 && !args[j - 1].text.contains('=') && j + 1 < args.len();
+    let mut starts = Vec::new();
+    // `xargs -I {} cp {} dest/`: that `{}` is `-I`'s value, not the program.
+    if !(maybe_value && args[j].text == "{}") {
+        starts.push(j);
+    }
+    if maybe_value {
+        starts.push(j + 1);
+    }
+    if matches!(name, "timeout" | "chrt") {
+        starts.extend([j + 1, j + 1 + usize::from(maybe_value)]);
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    for s in starts.into_iter().filter(|&s| s < args.len()) {
+        check_cmd(&args[s..], stdin, multi, sh, depth + 1, risks, false);
     }
 }
 
@@ -1235,6 +1258,8 @@ fn is_command_wrapper(name: &str) -> bool {
             | "setsid"
             | "stdbuf"
             | "xargs"
+            | "timeout"
+            | "chrt"
     )
 }
 
@@ -2396,6 +2421,32 @@ mod tests {
         // The reserved error variant exists and renders.
         let e = CmdParseError::Empty;
         assert_eq!(e.to_string(), "empty command line");
+    }
+
+    /// Standard prefix commands, each with its argument shape: the `rm -rf ~`
+    /// detector fires through every one (`timeout`/`chrt` take a positional
+    /// DURATION/PRIORITY before the command).
+    #[test]
+    fn rm_rf_home_is_dangerous_through_every_prefix_command() {
+        for line in [
+            "timeout 5 rm -rf ~",
+            "timeout -s KILL 5 rm -rf ~",
+            "timeout --signal=KILL -k 2 5 rm -rf ~",
+            "chrt 10 rm -rf ~",
+            "chrt -f 10 rm -rf ~",
+            "nohup rm -rf ~",
+            "nice -n 10 rm -rf ~",
+            "ionice -c 3 rm -rf ~",
+            "time rm -rf ~",
+            "stdbuf -oL rm -rf ~",
+            "setsid rm -rf ~",
+            "command rm -rf ~",
+            "exec rm -rf ~",
+            "doas -u root rm -rf ~",
+        ] {
+            let r = worst(&analyze(line));
+            assert!(matches!(r, Risk::Dangerous(_)), "{line:?}: {r:?}");
+        }
     }
 
     /// C6: installs are found through prefixes, chains and `bash -c`, with
