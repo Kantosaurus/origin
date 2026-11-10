@@ -1145,15 +1145,16 @@ fn loop_cwd(opts: &LoopOptions) -> Option<std::path::PathBuf> {
 /// A12: resolve a tool call's relative paths against `cwd`, the run's working
 /// directory, so a run whose directory is not the process cwd reads and edits
 /// its own tree. Only the builtins whose local-path arguments were checked
-/// against their schemas are touched; any other tool (MCP, runtime tools,
-/// `Browser`) passes through unchanged — its `path` may not be local at all.
-/// Absolute paths pass through (`Path::join` keeps them). A `Bash`/`Glob`/
-/// `Grep` call naming no directory gets `cwd`; `ApplyPatch` file paths are
+/// against their schemas are touched; any other tool (MCP, runtime tools)
+/// passes through unchanged — its `path` may not be local at all. Absolute
+/// paths pass through (`Path::join` keeps them). A `Bash`/`Glob`/`Grep` call
+/// naming no directory (absent or `null`) gets `cwd`; `ApplyPatch` file paths are
 /// anchored by [`anchor_patch_paths`].
 fn anchor_tool_args(name: &str, mut args: Value, cwd: &std::path::Path) -> Value {
     let key = match name {
         "Read" | "Write" | "Edit" | "MultiEdit" => "file_path",
-        "Glob" | "Grep" | "Diagnostics" | "LspNavigate" => "path",
+        // `Browser`'s `path` is the Screenshot verb's local output file.
+        "Glob" | "Grep" | "Diagnostics" | "LspNavigate" | "Browser" => "path",
         "Bash" => "cwd",
         "graph_rebuild" => "paths",
         "ApplyPatch" => "patch",
@@ -1173,8 +1174,9 @@ fn anchor_tool_args(name: &str, mut args: Value, cwd: &std::path::Path) -> Value
                 }
             }
         }
-        // A `Bash`/`Glob`/`Grep` call that names no directory runs in `cwd`.
-        None if matches!(name, "Bash" | "Glob" | "Grep") => {
+        // A `Bash`/`Glob`/`Grep` call that names no directory (absent or JSON
+        // `null`) runs in `cwd`.
+        None | Some(Value::Null) if matches!(name, "Bash" | "Glob" | "Grep") => {
             obj.insert(key.to_string(), Value::String(cwd.to_string_lossy().into_owned()));
         }
         _ => {}
@@ -1222,7 +1224,7 @@ fn anchor_patch_paths(patch: &str, cwd: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod anchor_tests {
-    use super::anchor_tool_args;
+    use super::{anchor_tool_args, run_streaming_turn, LoopOptions};
 
     /// A12: a non-builtin tool (MCP / runtime) keeps its arguments verbatim —
     /// its `path` may name something remote, not a local file.
@@ -1254,6 +1256,109 @@ mod anchor_tests {
         assert_eq!(
             std::fs::read_to_string(ws.path().join("doc.txt")).expect("read"),
             "a\n++ b/x\n"
+        );
+    }
+
+    /// A12: an explicit JSON `null` directory is treated like an absent one —
+    /// the call runs in the run's cwd, never the daemon's process cwd.
+    #[test]
+    fn null_directory_defaults_to_the_run_cwd() {
+        let cwd = std::env::temp_dir().join("a12-run-cwd");
+        let want = serde_json::Value::String(cwd.to_string_lossy().into_owned());
+        let cases = [
+            ("Bash", serde_json::json!({ "command": "ls", "cwd": null }), "cwd"),
+            (
+                "Glob",
+                serde_json::json!({ "pattern": "*", "path": null }),
+                "path",
+            ),
+            (
+                "Grep",
+                serde_json::json!({ "pattern": "x", "path": null }),
+                "path",
+            ),
+        ];
+        for (tool, args, key) in cases {
+            let out = anchor_tool_args(tool, args, &cwd);
+            assert_eq!(out[key], want, "{tool}");
+        }
+    }
+
+    /// A12: `Browser`'s screenshot `path` (a local output file) is anchored when
+    /// relative and left alone when absolute.
+    #[test]
+    fn browser_screenshot_path_is_anchored() {
+        let cwd = std::env::temp_dir().join("a12-run-cwd");
+        let abs = cwd
+            .join("elsewhere")
+            .join("abs.png")
+            .to_string_lossy()
+            .into_owned();
+        let shot = |path: &str| serde_json::json!({ "v": "screenshot", "session": "s", "path": path });
+        let rel = anchor_tool_args("Browser", shot("shot.png"), &cwd);
+        assert_eq!(rel["path"], cwd.join("shot.png").to_string_lossy().as_ref());
+        assert_eq!(
+            anchor_tool_args("Browser", shot(&abs), &cwd)["path"],
+            abs.as_str()
+        );
+    }
+
+    /// A12: a run with its own cwd gets no speculative pre-dispatch (a pre-run
+    /// would resolve against the daemon's process cwd); without one, a Pure
+    /// tool in the stream is still pre-dispatched exactly as before.
+    #[tokio::test]
+    async fn no_speculative_pre_dispatch_with_a_run_cwd() {
+        struct OneRead;
+        #[async_trait::async_trait]
+        impl origin_provider::Provider for OneRead {
+            fn name(&self) -> &'static str {
+                "stream"
+            }
+            async fn chat(
+                &self,
+                _req: origin_provider::ChatRequest,
+            ) -> Result<origin_provider::ChatResponse, origin_provider::ProviderError> {
+                Err(origin_provider::ProviderError::Api("stream only".into()))
+            }
+            async fn chat_stream(
+                &self,
+                _req: origin_provider::ChatRequest,
+                ring: &origin_stream::Ring,
+            ) -> Result<(), origin_provider::ProviderError> {
+                let publish = |kind, payload: Vec<u8>| {
+                    ring.publish(&origin_stream::TokenEvent::new(kind, payload))
+                        .map_err(|e| origin_provider::ProviderError::Api(e.to_string()))
+                };
+                let mut start = 0u32.to_le_bytes().to_vec();
+                start.extend_from_slice(b"id-0\0Read");
+                publish(origin_stream::TokenKind::ToolUseStart, start)?;
+                let mut delta = 0u32.to_le_bytes().to_vec();
+                delta.extend_from_slice(br#"{"file_path":"Cargo.toml"}"#);
+                publish(origin_stream::TokenKind::ToolUseDelta, delta)?;
+                publish(origin_stream::TokenKind::TurnEnd, Vec::new())?;
+                ring.close();
+                Ok(())
+            }
+        }
+        let req = origin_provider::ChatRequest::default();
+        let with_cwd = LoopOptions {
+            cwd: Some(std::env::temp_dir()),
+            ..LoopOptions::default()
+        };
+        let turn = run_streaming_turn(&OneRead, req.clone(), &with_cwd)
+            .await
+            .expect("turn");
+        assert!(
+            turn.speculative.in_flight.is_empty(),
+            "no pre-dispatch with a run cwd"
+        );
+        let turn = run_streaming_turn(&OneRead, req, &LoopOptions::default())
+            .await
+            .expect("turn");
+        assert_eq!(
+            turn.speculative.in_flight.len(),
+            1,
+            "pre-dispatch unchanged without one"
         );
     }
 }
@@ -7538,8 +7643,10 @@ async fn dispatch_tool(
     // `RepairDecision` consulted.
     post_edit: Option<&Arc<origin_postedit::PostEditConfig>>,
     // A12: the run's working directory ([`LoopOptions::cwd`]). The post-edit
-    // formatter/linter spawns and the rust-analyzer root follow it. `None`
-    // (every caller but a run with a cwd override) ⇒ the process cwd.
+    // formatter/linter spawns and the rust-analyzer root follow it; `None` ⇒
+    // the process cwd. The main-loop dispatch passes `opts.cwd`; the
+    // speculative pre-dispatch passes `None`, which is correct because
+    // speculation never runs for a run with its own cwd (`run_streaming_turn`).
     cwd: Option<&std::path::Path>,
 ) -> Result<String, LoopError> {
     // C9: the model only ever sees `[REDACTED:<NAME>]` in place of a real secret.
