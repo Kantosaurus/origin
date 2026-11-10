@@ -227,7 +227,7 @@ enum Shell {
 const MAX_DEPTH: usize = 8;
 
 /// One shell word after quote removal.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Word {
     /// Unquoted text; expansions (`$X`, `$(…)`) are kept verbatim.
     text: String,
@@ -272,6 +272,8 @@ struct Lexed {
     cmds: Vec<Cmd>,
     /// Bodies of groups and substitutions, analysed recursively.
     nested: Vec<String>,
+    /// The lexer had to guess at a token boundary; the line needs approval.
+    ambiguous: bool,
 }
 
 fn needs(reason: impl Into<String>) -> Risk {
@@ -309,6 +311,12 @@ fn scan(src: &str, sh: Shell, depth: usize, risks: &mut Vec<Risk>) {
         ));
         return;
     };
+    if lexed.ambiguous {
+        risks.push(needs(
+            "a PowerShell here-string opener (`@'`/`@\"`) is glued to other text; \
+             where the statement ends is ambiguous",
+        ));
+    }
     for body in &lexed.nested {
         scan(body, sh, depth + 1, risks);
     }
@@ -441,8 +449,15 @@ impl<'a> Lexer<'a> {
                 }
                 // A here-string starts only at the start of a token; mid-word
                 // `@` is literal (`git@host`).
-                '@' if self.sh == Shell::Power && !self.started && self.opens_here_string() => {
-                    self.here_string()?;
+                '@' if self.sh == Shell::Power && self.opens_here_string() => {
+                    if self.started {
+                        // Mid-word opener shape (`$a=@'`, `1,@'`): PowerShell may
+                        // start a token here. Lex `@` literally, fail closed.
+                        self.out.ambiguous = true;
+                        self.push('@');
+                    } else {
+                        self.here_string()?;
+                    }
                 }
                 '<' if self.sh == Shell::Power && next == Some('#') => {
                     // `<# … #>` block comment; unclosed ⇒ unparseable.
@@ -827,14 +842,21 @@ fn check_cmd(
         } else if is_env_assignment(t) {
             assigned = Some(t);
             i += 1;
-        } else if sh == Shell::Power && t.starts_with('$') && t.contains('=') {
-            i += 1;
-        } else if sh == Shell::Power
-            && t.starts_with('$')
-            && ws.get(i + 1).is_some_and(|n| n.text.ends_with('='))
-        {
-            // `$x = <pipeline>`: the right-hand side is the command.
-            i += 2;
+        } else if let Some((rhs, used)) = (sh == Shell::Power).then(|| ps_assignment(ws, i)).flatten() {
+            // `$x = <pipeline>`: the right-hand side is a command that runs.
+            if rhs.is_empty() {
+                i += used;
+                continue;
+            }
+            // Glued (`$x=rm …`): the text after the operator is the command word.
+            let mut rest = vec![Word {
+                text: rhs.to_string(),
+                dynamic: rhs.contains(['$', '(', '[', '{', '@', '*', '?']),
+                group: false,
+            }];
+            rest.extend(ws[i + used..].iter().cloned());
+            check_cmd(&rest, stdin, multi, sh, depth + 1, risks, false);
+            return;
         } else {
             break;
         }
@@ -856,7 +878,8 @@ fn check_cmd(
         // (`[scriptblock]::Create($s).Invoke()`,
         // `$ExecutionContext.InvokeCommand.InvokeScript($s)`) runs code anyway.
         if sh == Shell::Power && !invoked {
-            if cmd.text.to_ascii_lowercase().contains(".invoke") {
+            let lower = cmd.text.to_ascii_lowercase();
+            if lower.contains(".invoke") || lower.contains("invoke(") {
                 risks.push(needs(format!(
                     "`{}` invokes a script built at run time",
                     cmd.text
@@ -888,19 +911,7 @@ fn check_cmd(
         }
         "&" | "." if sh == Shell::Power => check_cmd(args, stdin, multi, sh, depth + 1, risks, true),
         "pwsh" | "powershell" => check_powershell(args, stdin, depth, risks),
-        "cmd" => {
-            // `cmd /c SCRIPT` (or `/k`, `/r`, even glued: `/crm`) runs the rest.
-            let k = args.iter().position(|a| {
-                let t = a.text.to_ascii_lowercase();
-                t.starts_with("/c") || t.starts_with("/k") || t.starts_with("/r")
-            });
-            if let Some(k) = k {
-                let script = format!("{} {}", &args[k].text[2..], join(&args[k + 1..]));
-                scan(&script, Shell::Cmd, depth + 1, risks);
-            } else {
-                shell_stdin(&name, stdin, Shell::Cmd, depth, risks);
-            }
-        }
+        "cmd" => check_cmd_exe(args, stdin, depth, risks),
         n if is_command_wrapper(n) => {
             // Skip the wrapper's options to the program it runs. The word right
             // after an option may be that option's value (`sudo -u root rm`), so
@@ -931,6 +942,45 @@ fn check_cmd(
         }
         _ => {}
     }
+}
+
+/// `cmd` arguments: `cmd /c SCRIPT` (or `/k`, `/r`, even glued: `/crm`) runs
+/// the rest of the line; with none of those the script is read from stdin.
+fn check_cmd_exe(args: &[Word], stdin: &Stdin, depth: usize, risks: &mut Vec<Risk>) {
+    let k = args.iter().position(|a| {
+        let t = a.text.to_ascii_lowercase();
+        t.starts_with("/c") || t.starts_with("/k") || t.starts_with("/r")
+    });
+    if let Some(k) = k {
+        let script = format!("{} {}", &args[k].text[2..], join(&args[k + 1..]));
+        scan(&script, Shell::Cmd, depth + 1, risks);
+    } else {
+        shell_stdin("cmd", stdin, Shell::Cmd, depth, risks);
+    }
+}
+
+/// A PowerShell assignment starting at `ws[i]`: a target (`$x`, `$env:X`,
+/// `$script:x`, `[int]$x`) and an operator (`=`, `+=`, `-=`, `*=`, `/=`,
+/// `%=`, `??=`), glued or spaced. Returns the right-hand-side text glued to
+/// the operator (possibly empty) and how many words target and operator use.
+fn ps_assignment(ws: &[Word], i: usize) -> Option<(&str, usize)> {
+    fn is_target(mut s: &str) -> bool {
+        while let Some(rest) = s.strip_prefix('[') {
+            s = rest.split_once(']').map_or("", |(_, r)| r);
+        }
+        s.len() > 1 && s.starts_with('$')
+    }
+    fn after_op(s: &str) -> Option<&str> {
+        ["??=", "+=", "-=", "*=", "/=", "%=", "="]
+            .iter()
+            .find_map(|op| s.strip_prefix(op))
+    }
+    let t = ws.get(i)?.text.as_str();
+    if is_target(t) && !t.contains('=') {
+        return after_op(&ws.get(i + 1)?.text).map(|rhs| (rhs, 2));
+    }
+    let (lhs, rhs) = t.split_once('=')?;
+    is_target(lhs.trim_end_matches(['+', '-', '*', '/', '%', '?'])).then_some((rhs, 1))
 }
 
 /// `pwsh`/`powershell` arguments: `-EncodedCommand` (any accepted
@@ -993,18 +1043,23 @@ fn check_posix_shell(name: &str, args: &[Word], stdin: &Stdin, depth: usize, ris
         }
         return;
     }
+    // Index of the script operand; words after it are the script's arguments.
     let mut operand = None;
-    let mut it = args.iter().map(|a| a.text.as_str());
-    while let Some(t) = it.next() {
+    let mut k = 0;
+    while let Some(t) = args.get(k).map(|a| a.text.as_str()) {
         if matches!(t, "-o" | "+o" | "-O" | "+O") {
-            it.next();
-        } else if t == "-" || !(t.starts_with('-') || t.starts_with('+')) {
-            operand = Some(t);
+            k += 2;
+            continue;
+        }
+        if t == "-" || !(t.starts_with('-') || t.starts_with('+')) {
+            operand = Some(k);
             break;
         }
+        k += 1;
     }
-    if args.iter().any(|a| bundle(&a.text) && a.text.contains('s'))
-        || operand.is_none_or(|t| matches!(t, "-" | "/dev/stdin"))
+    let options = &args[..operand.unwrap_or(args.len())];
+    if options.iter().any(|a| bundle(&a.text) && a.text.contains('s'))
+        || operand.is_none_or(|k| matches!(args[k].text.as_str(), "-" | "/dev/stdin"))
     {
         shell_stdin(name, stdin, Shell::Posix, depth, risks);
     }
@@ -1843,6 +1898,89 @@ mod tests {
         expect(
             Shell::Posix,
             &["bash -o errexit < x.sh", "bash -es foo < x.sh"],
+            needs_approval,
+            "NeedsApproval",
+        );
+    }
+
+    /// Not Safe/Suspicious: blocked or sent for approval.
+    fn not_allowed(r: &Risk) -> bool {
+        !allowed(r)
+    }
+
+    #[test]
+    fn glued_here_string_opener_fails_closed() {
+        let ps = [
+            "$a=@'\nit's\n'@; rm -r -fo ~ #'",
+            "$a=@\"\nit\"s\n\"@; rm -r -fo ~ #\"",
+            "echo 1,@'\nit's\n'@; rm -r -fo ~ #'",
+            "$a+=@'\nit's\n'@; rm -r -fo ~ #'",
+        ];
+        expect(Shell::Power, &ps, not_allowed, "NeedsApproval/Dangerous");
+        let new1 = [
+            "echo x@'\nit's; rm -r -fo ~\n'@ #'",
+            "echo x@\"\nit\"s; rm -r -fo ~\n\"@ #\"",
+        ];
+        expect(Shell::Power, &new1, dangerous, "Dangerous");
+    }
+
+    #[test]
+    fn dynamic_invoke_methods_need_approval() {
+        expect(
+            Shell::Power,
+            &[
+                "[powershell]::Create().AddScript($s).BeginInvoke()",
+                "$d.DynamicInvoke()",
+            ],
+            needs_approval,
+            "NeedsApproval",
+        );
+    }
+
+    #[test]
+    fn powershell_assignment_right_hand_side_runs() {
+        expect(
+            Shell::Power,
+            &[
+                "$x=rm -r -fo ~",
+                "$x = rm -r -fo ~",
+                "$x += rm -r -fo ~",
+                "$env:X=rm -r -fo ~",
+                "[int]$x = rm -r -fo ~",
+            ],
+            dangerous,
+            "Dangerous",
+        );
+        expect(
+            Shell::Power,
+            &["$x=iex $s", "$x = iex $s", "$script:x ??= iex $s"],
+            needs_approval,
+            "NeedsApproval",
+        );
+        expect(Shell::Posix, &["X=1 rm -rf ~"], dangerous, "Dangerous");
+        let ok = [
+            "$x = 5",
+            "$x=5",
+            "$x = \"text\"",
+            "$x = Get-ChildItem -Recurse",
+            "$env:PATH = \"x;$env:PATH\"; cargo build",
+            "$r = (Invoke-RestMethod $u).data",
+            "$m = @'\nit's fine\n'@",
+        ];
+        expect(Shell::Power, &ok, allowed, "Safe/Suspicious");
+    }
+
+    #[test]
+    fn shell_options_after_the_script_operand_are_script_args() {
+        expect(
+            Shell::Posix,
+            &["bash t.sh -vs < in.txt"],
+            allowed,
+            "Safe/Suspicious",
+        );
+        expect(
+            Shell::Posix,
+            &["bash -es foo < x.sh"],
             needs_approval,
             "NeedsApproval",
         );
