@@ -469,7 +469,7 @@ async fn background_results_are_kept_in_the_session() {
             _ => false,
         })
     };
-    let seen = provider.seen.lock().expect("lock");
+    let seen = std::mem::take(&mut *provider.seen.lock().expect("lock"));
     assert_eq!(seen.len(), 3);
     for (i, req) in seen.iter().enumerate() {
         assert!(

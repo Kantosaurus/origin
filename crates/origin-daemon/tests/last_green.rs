@@ -405,7 +405,7 @@ fn a_failed_edit_does_not_arm_the_turn_end_checks() {
         );
         let ran = std::fs::read(ws.path().join("ran.txt")).expect("baseline ran");
         assert_eq!(
-            ran.iter().filter(|&&b| b == b'x').count(),
+            String::from_utf8_lossy(&ran).matches('x').count(),
             runs,
             "old_string {old:?}: gate runs"
         );

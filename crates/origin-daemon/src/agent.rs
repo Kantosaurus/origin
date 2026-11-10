@@ -3973,7 +3973,7 @@ mod runtime_tools_tests {
     }
 
     /// A11: the empty `graph_query` that starts the session's background build
-    /// says the index is building (retry shortly), not "run graph_rebuild"; a
+    /// says the index is building (retry shortly), not "run `graph_rebuild`"; a
     /// later empty query keeps the usual note.
     #[tokio::test]
     async fn the_graph_query_that_starts_the_build_says_the_index_is_building() {

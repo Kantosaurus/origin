@@ -332,22 +332,26 @@ impl Provider for BatchProvider {
     }
     async fn chat(&self, _req: ChatRequest) -> Result<ChatResponse, ProviderError> {
         let t = self.turn.fetch_add(1, Ordering::SeqCst);
-        let blocks = match self.turns.get(t as usize) {
-            Some(calls) => calls
-                .iter()
-                .enumerate()
-                .map(|(i, (name, input))| Block::ToolUse {
-                    id: format!("id-{t}-{i}"),
-                    name: (*name).into(),
-                    input_json: serde_json::to_vec(input).expect("json"),
+        let blocks = self.turns.get(t as usize).map_or_else(
+            || {
+                vec![Block::Text {
+                    text: "done".into(),
                     cache_marker: None,
-                })
-                .collect(),
-            None => vec![Block::Text {
-                text: "done".into(),
-                cache_marker: None,
-            }],
-        };
+                }]
+            },
+            |calls| {
+                calls
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, input))| Block::ToolUse {
+                        id: format!("id-{t}-{i}"),
+                        name: (*name).into(),
+                        input_json: serde_json::to_vec(input).expect("json"),
+                        cache_marker: None,
+                    })
+                    .collect()
+            },
+        );
         Ok(ChatResponse {
             assistant: Message {
                 role: Role::Assistant,
