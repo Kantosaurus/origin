@@ -846,7 +846,7 @@ fn check_cmd(
         if sh == Shell::Power && !invoked && i + 1 < ws.len() && ps_target_prefix(t) {
             // Additive only: also check the command as if this word were
             // absent; the analysis below still runs unchanged.
-            check_cmd(&ws[i + 1..], stdin, multi, sh, depth, risks, false);
+            check_cmd(&ws[i + 1..], stdin, multi, sh, depth + 1, risks, false);
         }
         if sh == Shell::Posix && POSIX_KEYWORDS.contains(&t) {
             i += 1;
@@ -2124,6 +2124,9 @@ mod tests {
                 "bash --rcfile /dev/null -s < x.sh",
                 "bash --init-file /dev/null -s < x.sh",
                 "bash --rcfile x.sh < evil.sh",
+                "bash --init-file=x.sh < evil.sh",
+                "bash foo --rcfile /dev/stdin < x.sh",
+                "cat x.sh | bash --rcfile my.rc",
             ],
             needs_approval,
             "NeedsApproval",
@@ -2164,6 +2167,15 @@ mod tests {
             allowed,
             "Safe/Suspicious",
         );
+    }
+
+    /// The additive leading-word skip counts toward the nesting cap, so a long
+    /// run of prefix words yields a verdict instead of overflowing the stack.
+    #[test]
+    fn many_leading_prefix_words_return_a_verdict() {
+        let casts = "[a] ".repeat(10_000) + "x";
+        let lists = "$a, ".repeat(10_000) + "x";
+        expect(Shell::Power, &[&casts, &lists], needs_approval, "NeedsApproval");
     }
 
     #[test]
