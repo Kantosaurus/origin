@@ -9636,7 +9636,7 @@ pub fn rebuild_codegraph(
 
 #[tracing::instrument(
     level = "info",
-    skip(args, cas, code_graph, mem_router, memory, coordinator, grep_exposure),
+    skip(args, cas, code_graph, mem_router, memory, _coordinator, grep_exposure),
     fields(kind = "tool", tool = meta.name)
 )]
 // dispatch arm-per-tool registry; splitting would obscure tool->arm mapping.
@@ -9648,7 +9648,8 @@ async fn dispatch_tool(
     code_graph: Option<&Arc<tokio::sync::Mutex<origin_codegraph::index::CodeGraphIndex>>>,
     mem_router: Option<&dyn origin_codegraph::ask::MemRouter>,
     memory: Option<&dyn MemoryHandle>,
-    coordinator: Option<&origin_swarm::Coordinator>,
+    // Unused since A4: the `Task` and `RunWorkflow` arms never delegate.
+    _coordinator: Option<&origin_swarm::Coordinator>,
     // Task 1 (agentgrep exposure-truncation): already-seen `(file, line)`
     // regions to elide from a `content`-mode `Grep`. `None` (every caller but
     // the gated main-loop site) ⇒ the Grep arm passes `exposure: None`, so the
@@ -10438,23 +10439,12 @@ async fn dispatch_tool(
             serde_json::to_string(&resp).map_err(|e| LoopError::ToolFailure(format!("Browser: json: {e}")))
         }
         // ── Task ──
-        // Requires an `origin_swarm::Coordinator` threaded through `LoopOptions`.
-        // No skill-mask narrowing here: `run_loop` intercepts every Task when a
-        // coordinator exists, so this arm is only reached by direct callers.
-        "Task" => {
-            let coord =
-                coordinator.ok_or_else(|| LoopError::ToolFailure("Task subsystem not configured".into()))?;
-            let input: origin_tools::builtins::task::TaskInput =
-                serde_json::from_value(args.clone()).map_err(|e| LoopError::BadArgs(format!("Task: {e}")))?;
-            let output = origin_tools::builtins::task::task_tool(
-                coord,
-                input,
-                &crate::subagents_md::user_mcp_servers(),
-            )
-            .await
-            .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
-            serde_json::to_string(&output).map_err(|e| LoopError::ToolFailure(format!("Task: json: {e}")))
-        }
+        // A4: `run_loop` answers a `Task` with no coordinator, and intercepts it
+        // (with governance) when there is one, before reaching here; delegating
+        // from this arm would skip that governance.
+        "Task" => Err(LoopError::ToolFailure(
+            "`Task`: sub-agents cannot delegate here (swarm subsystem not configured)".into(),
+        )),
         // ── CollectTasks (gather background sub-agents) ──
         // The real handling lives in `run_loop` (it needs the live background-job
         // registry + coordinator + session id). Reaching `dispatch_tool` means no
@@ -12867,12 +12857,11 @@ mod dispatch_table_tests {
         }
     }
 
-    /// When a real `Coordinator` (backed by an in-memory `Plan` + `PlanStore`
-    /// over in-memory `CasStore` + `SqlStore`) is threaded through, `Task` must
-    /// return a valid `TaskOutput` JSON. The default noop worker always completes
-    /// successfully, so the round-trip asserts shape, not semantic content.
+    /// A4: `run_loop` answers or intercepts every `Task` before
+    /// `dispatch_tool`, so its arm never delegates (it would run with no
+    /// governance): even with a real `Coordinator` it is the recoverable error.
     #[tokio::test]
-    async fn task_with_coordinator_spawns_noop_worker() {
+    async fn task_arm_never_delegates() {
         use std::sync::Arc;
 
         // Build in-memory backing stores.
@@ -12906,7 +12895,7 @@ mod dispatch_table_tests {
             "allowed_tools": []
         });
 
-        let out = dispatch_tool(
+        let err = dispatch_tool(
             meta,
             &args,
             None,
@@ -12922,17 +12911,11 @@ mod dispatch_table_tests {
             None,
         )
         .await
-        .expect("Task with coordinator must succeed");
-
-        // Assert the output is valid JSON with the expected shape.
-        let v: serde_json::Value = serde_json::from_str(&out).expect("TaskOutput must be valid JSON");
-        assert!(v.get("status").is_some(), "TaskOutput must have `status`");
-        assert!(v.get("summary").is_some(), "TaskOutput must have `summary`");
+        .expect_err("never delegates");
         assert!(
-            v.get("files_touched").is_some(),
-            "TaskOutput must have `files_touched`"
+            matches!(&err, LoopError::ToolFailure(m) if m.contains("cannot delegate here")),
+            "{err:?}"
         );
-        assert!(v.get("follow_ups").is_some(), "TaskOutput must have `follow_ups`");
     }
 
     /// A4: `run_loop` answers or intercepts every `RunWorkflow` before
