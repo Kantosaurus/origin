@@ -6960,75 +6960,22 @@ async fn run_loop_inner(
         let mut repro_turn_rejection: Option<String> = None;
         let mut repro_turn_charged = false;
         for (id, name, input_bytes) in tool_uses {
-            let Some(meta) = registry_iter().find(|m| m.name == name) else {
-                // gap 9b: a name absent from the compile-time registry may be a
-                // worker's inline-MCP tool in the task-local runtime registry.
-                // Permission-checked against the worker's allow-list (so a glob
-                // like `mcp__github__*` must permit it) then invoked via DynTool.
-                if let Some(tool) = runtime_tool(&name) {
-                    let args: Value = serde_json::from_slice(&input_bytes).unwrap_or(Value::Null);
-                    // C2: the same decision as a builtin (deny rules, taint, the
-                    // allow-list answering only what needs no person).
-                    let skills: &SkillRegistry = opts.skills.as_deref().unwrap_or(&EMPTY_SKILLS);
-                    let decision = decide_permission(
-                        tool.meta(),
-                        &args,
-                        &args.to_string(),
-                        prompter,
-                        skills,
-                        opts,
-                        session,
-                    )
-                    .await;
-                    let allowed = decision.outcome == Outcome::Allow;
-                    if allowed {
-                        turn_allowed = true;
-                    } else {
-                        total_denials += 1;
-                        turn_denied = Some(name.clone());
-                    }
-                    let (inline, errored) = if allowed {
-                        match tool.invoke(args.clone()).await {
-                            Ok(v) => {
-                                let body = serde_json::to_vec(&v).unwrap_or_else(|_| b"null".to_vec());
-                                // C4: MCP output is external content, bounded then
-                                // wrapped so the note sits inside the marker.
-                                let body = crate::external_content::bound_mcp_result(body);
-                                (
-                                    crate::external_content::wrap_tool_result(&name, &args, &body)
-                                        .unwrap_or(body),
-                                    false,
-                                )
-                            }
-                            // C4: an MCP error body is server-controlled text too.
-                            Err(e) => {
-                                let body = format!("Error: {e}").into_bytes();
-                                (
-                                    crate::external_content::wrap_tool_result(&name, &args, &body)
-                                        .unwrap_or(body),
-                                    true,
-                                )
-                            }
-                        }
-                    } else {
-                        (
-                            format!("Error: permission denied for `{name}`: {}", decision.reason)
-                                .into_bytes(),
-                            true,
-                        )
-                    };
-                    tool_results.push(Block::ToolResult {
-                        tool_use_id: id,
-                        handle: None,
-                        inline: Some(inline),
-                        cache_marker: None,
-                        is_error: errored,
-                    });
-                    continue;
-                }
+            let registry_meta = registry_iter().find(|m| m.name == name);
+            // gap 9b: a name absent from the compile-time registry may be a
+            // worker's inline-MCP tool in the task-local runtime registry. A4: it
+            // takes the same path as a registry tool (permission, overlays,
+            // PreTool hook, denial, redaction) and is invoked via DynTool at the
+            // dispatch step below.
+            let runtime = if registry_meta.is_none() {
+                runtime_tool(&name)
+            } else {
+                None
+            };
+            let Some(meta) = registry_meta.or_else(|| runtime.as_deref().map(origin_tools::DynTool::meta))
+            else {
                 tracing::warn!(tool = %name, "unknown tool; returning error to model");
-                let suggestion = suggest_tool_name(&name)
-                    .map_or_else(String::new, |s| format!("; did you mean `{s}`?"));
+                let suggestion =
+                    suggest_tool_name(&name).map_or_else(String::new, |s| format!("; did you mean `{s}`?"));
                 tool_results.push(Block::ToolResult {
                     tool_use_id: id,
                     handle: None,
@@ -7164,7 +7111,14 @@ async fn run_loop_inner(
             // downgraded Allow→Deny so the design phase cannot mutate the
             // workspace. `false` (the default) ⇒ no effect.
             if decision.outcome == Outcome::Allow {
-                decision = apply_read_only_overlay(decision, opts.read_only, meta.side_effects, meta.name);
+                // A4: an MCP tool's side effects are unknown, so it counts as
+                // mutating whatever it declares.
+                let side_effects = if runtime.is_some() {
+                    SideEffects::Mutating
+                } else {
+                    meta.side_effects
+                };
+                decision = apply_read_only_overlay(decision, opts.read_only, side_effects, meta.name);
             }
 
             // Browser-security (A) — conseca domain-allowlist overlay. Same
@@ -7933,6 +7887,48 @@ async fn run_loop_inner(
                         }
                         Err(e) => return Err(e),
                     }
+                } else if let Some(tool) = runtime.as_deref() {
+                    // C4: MCP output is external content: bounded here, wrapped
+                    // below so the truncation note sits inside the marker.
+                    match tool.invoke(args.clone()).await {
+                        Ok(v) => crate::external_content::bound_mcp_result(
+                            serde_json::to_vec(&v).unwrap_or_else(|_| b"null".to_vec()),
+                        ),
+                        // An MCP error body is server-controlled text too:
+                        // bounded, wrapped and redacted, and still an error.
+                        Err(e) => {
+                            let body =
+                                crate::external_content::bound_mcp_result(format!("Error: {e}").into_bytes());
+                            let body = crate::redact::bytes(
+                                crate::external_content::wrap_tool_result(&name, &args, &body)
+                                    .unwrap_or(body),
+                            );
+                            tracing::warn!(tool = %name, "MCP tool call failed; returning error to model");
+                            stuck.record(&name, &preview, true, &body);
+                            if let Some(m) = opts.metrics.as_deref() {
+                                m.tool_call_total(provider.name(), &name, "err").inc();
+                            }
+                            if let Some(tx) = &opts.event_tx {
+                                let (preview, elided) = build_tool_result_preview(&body);
+                                let _ = tx
+                                    .send(StreamEvent::ToolResult {
+                                        tool: name.clone(),
+                                        ok: false,
+                                        preview,
+                                        elided_bytes: elided,
+                                    })
+                                    .await;
+                            }
+                            tool_results.push(Block::ToolResult {
+                                tool_use_id: id,
+                                handle: None,
+                                inline: Some(body),
+                                cache_marker: None,
+                                is_error: true,
+                            });
+                            continue;
+                        }
+                    }
                 } else if let Some((choice_tx, choice_reg)) = ask_user_interactive_channel(meta, opts) {
                     // Interactive pause-await path: emit a `ChoiceAsk` and block
                     // on the matching `ChoiceDecision` (mirrors the permission
@@ -8238,7 +8234,8 @@ async fn run_loop_inner(
                 result_bytes.extend_from_slice(diag.as_bytes());
             }
 
-            let block = if let Some(cas) = opts.cas.as_ref() {
+            // C4: an inline-MCP result stays inline, with no handle `Recall` could resolve.
+            let block = if let Some(cas) = opts.cas.as_ref().filter(|_| runtime.is_none()) {
                 let h: Hash = cas
                     .put(&result_bytes)
                     .map_err(|e| LoopError::ToolFailure(e.to_string()))?;
