@@ -15443,20 +15443,25 @@ mod wiring_tests {
             "#!/bin/sh\n[ -z \"$A6_LINT_PROBE_TOKEN\" ]\n",
         );
         std::fs::write(&script, body).expect("write probe");
+        // Unix: run the script through `sh`, never exec the file just written
+        // (a multi-threaded test binary can hit ETXTBSY).
+        #[cfg(windows)]
+        let (mut control, lint_command) = (
+            std::process::Command::new(&script),
+            script.to_string_lossy().into_owned(),
+        );
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod probe");
-        }
+        let (mut control, lint_command) = {
+            let mut c = std::process::Command::new("sh");
+            c.arg(&script);
+            (c, format!("sh {}", script.to_string_lossy()))
+        };
         std::env::set_var("A6_LINT_PROBE_TOKEN", "lint-secret-value");
         // Control: with the daemon's env inherited, the probe does see it.
-        let inherited = std::process::Command::new(&script)
-            .args(["--", "src/main.rs"])
-            .status()
-            .expect("run probe");
+        let inherited = control.args(["--", "src/main.rs"]).status().expect("run probe");
         let cfg = origin_postedit::PostEditConfig {
             auto_lint: true,
-            lint_command: Some(script.to_string_lossy().into_owned()),
+            lint_command: Some(lint_command),
             ..origin_postedit::PostEditConfig::default()
         };
         let decision = run_post_edit_lint(&cfg, "src/main.rs", None);
