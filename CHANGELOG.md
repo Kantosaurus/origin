@@ -229,7 +229,9 @@ Defaults that changed, each with its escape hatch:
   delegation.
 - **C3**: the command guard also refuses `rm -rf` of every entry of home or root (`~/*`, `/*`, `~/.`, `~/.*`,
   `$HOME/*`) and of a Windows drive root (`C:`, `C:\`, `C:/`, `C:\*`, via `rm`, `Remove-Item`, `rd`, `rmdir`) and
-  remote content piped into a grouped shell (`curl … | (sh)`, `| { sh; }`); asks for `env -S`/`--split-string` and
+  remote content piped into a grouped shell (`curl … | (sh)`, `| { sh; }`); asks for any group that is a non-first
+  pipeline segment (`curl … | (cd /tmp && sh)`; also `cat f | (grep x)`, an accepted over-ask); asks for
+  `env -S`/`--split-string` and
   for a shell or `source`/`.` run on a process substitution (`bash <(curl …)`); treats `nc`, `ncat`, `scp`,
   `Invoke-WebRequest`/`iwr` and `Invoke-RestMethod`/`irm` as network commands for the secret-exfiltration check; and
   treats `npm install-ci-test` as an install. Known false positive: `rm -rf C:` in a POSIX shell (a directory named
