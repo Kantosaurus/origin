@@ -172,21 +172,26 @@ impl AllowList {
             if p == "Task" {
                 continue;
             }
-            match globset::GlobBuilder::new(p).literal_separator(false).build() {
-                Ok(g) => {
-                    builder.add(g);
-                }
-                Err(_) => {
-                    if let Ok(g) = globset::Glob::new(&globset::escape(p)) {
-                        builder.add(g);
-                    }
-                }
+            if let Some(g) = allow_entry_glob(p) {
+                builder.add(g);
             }
         }
         Self {
             set: builder.build().unwrap_or_else(|_| globset::GlobSet::empty()),
         }
     }
+}
+
+/// How a worker matches one `allowed_tools` entry: as a glob, or, if it does not
+/// compile, as the literal name (so a malformed entry never widens access).
+/// Shared by `AllowList` and the `Task` permission preview
+/// (`agent::task_permission_preview`), so the human is shown what the worker matches.
+pub(crate) fn allow_entry_glob(p: &str) -> Option<globset::Glob> {
+    globset::GlobBuilder::new(p)
+        .literal_separator(false)
+        .build()
+        .or_else(|_| globset::Glob::new(&globset::escape(p)))
+        .ok()
 }
 
 #[async_trait]
@@ -576,6 +581,36 @@ mod tests {
     async fn empty_allow_list_denies_all() {
         let al = AllowList::from_patterns(&[]);
         assert!(!al.ask(meta("Read"), "").await);
+    }
+
+    /// The Task permission preview lists an entry under `grants:` exactly when
+    /// this worker's `AllowList` would let it reach a gated tool (A4).
+    #[tokio::test]
+    async fn task_preview_grants_agree_with_allow_list() {
+        use origin_tools::{SideEffects, Tier};
+        for (entry, expected) in [
+            ("*", true),
+            ("Bash", true),
+            ("Read", false),
+            ("Bas?", true),
+            ("mcp__*", true),
+            ("nonexistent", false),
+        ] {
+            let al = AllowList::from_patterns(&[entry.to_string()]);
+            let mut worker = al.set.is_match("mcp__x__y");
+            for m in registry_iter() {
+                let read_only =
+                    matches!(m.tier, Tier::AutoAllowed) && matches!(m.side_effects, SideEffects::Pure);
+                worker |= !read_only && al.ask(m, "").await;
+            }
+            let p = crate::agent::task_permission_preview(&serde_json::json!({ "allowed_tools": [entry] }));
+            let grants = p
+                .split(" | ")
+                .find_map(|s| s.strip_prefix("grants: "))
+                .unwrap_or("");
+            let preview = grants.contains(&format!("\"{entry}\""));
+            assert_eq!((worker, preview), (expected, expected), "{entry}: {p}");
+        }
     }
 
     #[tokio::test]
