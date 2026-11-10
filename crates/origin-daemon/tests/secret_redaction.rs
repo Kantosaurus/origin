@@ -209,6 +209,96 @@ async fn file_writes_carrying_an_installed_marker_are_refused() {
         .contains("[REDACTED:SOMETHING_ELSE]"));
 }
 
+/// C9: a recalled memory carrying a key value rides in the prompt's user
+/// message (the per-prompt volatile context, next to the repo-map focus
+/// block); the provider never sees the value.
+#[tokio::test]
+async fn a_recalled_memory_carrying_a_key_is_redacted_for_the_model() {
+    use origin_mem::EMBED_DIM;
+    setup();
+    let dir = tempfile::tempdir().unwrap();
+    let cas = Arc::new(
+        Store::open(StoreConfig {
+            root: dir.path().join("cas"),
+            hot_capacity: 32,
+            warm_pack_target_bytes: 1024 * 1024,
+            cold_zstd_level: 3,
+        })
+        .unwrap(),
+    );
+    let sql = Arc::new(origin_store::Store::open(dir.path().join("origin.db")).unwrap());
+    let store = Arc::new(origin_mem::MemoryStore::new(sql, Arc::clone(&cas)));
+    // The stub model embeds every text along the all-ones direction; with
+    // this sibling tokenizer (every word id 1) that direction is non-zero.
+    let model = dir.path().join("stub.onnx");
+    std::fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../origin-mem/tests/fixtures/stub_minilm.onnx"
+        ),
+        &model,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("stub.tokenizer.json"),
+        r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,
+            "pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,
+            "model":{"type":"WordLevel","vocab":{"[UNK]":1},"unk_token":"[UNK]"}}"#,
+    )
+    .unwrap();
+    let embedder = Arc::new(origin_mem::Embedder::from_path(&model).unwrap());
+    // The memory, indexed slightly off that direction: an exactly parallel
+    // pair has a float dot just over 1, which the HNSW metric rejects.
+    let training: Vec<[f32; EMBED_DIM]> = (0..origin_mem::NUM_CENTROIDS)
+        .map(|i| {
+            let mut v = [0_f32; EMBED_DIM];
+            v[i % EMBED_DIM] = 1.0;
+            v
+        })
+        .collect();
+    store
+        .install_quantizer(&origin_mem::Quantizer::fit(&training, 0).unwrap())
+        .unwrap();
+    let mut vec = [1_f32; EMBED_DIM];
+    vec[0] = 2.0;
+    let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+    for x in &mut vec {
+        *x /= norm;
+    }
+    let id = store.save(&format!("deploy key is {KEY}"), &vec, &[]).unwrap();
+    let index = Arc::new(parking_lot::RwLock::new(origin_mem::MemIndex::new()));
+    index
+        .write()
+        .insert(origin_mem::memory_id_to_u64(&id), &vec)
+        .unwrap();
+    let memory = origin_daemon::memory_wiring::MemoryWiring::new(store, Some(embedder), index);
+
+    let provider = Recording::new(vec![Block::text("done")]);
+    let opts = LoopOptions {
+        streaming_disabled: true,
+        injector: memory.injector.clone(),
+        ..LoopOptions::default()
+    };
+    let mut session = Session::new("test", "claude-opus-4-7");
+    run_loop(
+        &mut session,
+        "what is the deploy key",
+        &provider,
+        &AlwaysAllow,
+        &opts,
+    )
+    .await
+    .expect("loop ok");
+
+    let seen = format!("{:?}", provider.seen.lock().unwrap()[0]);
+    assert!(seen.contains("origin-recall"), "the memory was recalled: {seen}");
+    assert!(
+        !seen.contains(KEY),
+        "raw key reached the model via recall: {seen}"
+    );
+    assert!(seen.contains(MARKER), "{seen}");
+}
+
 /// Finding 3: turn-end gate output (child-process stdout) is redacted before it
 /// rides to the model as volatile context or as the repro-gate continuation.
 #[tokio::test]

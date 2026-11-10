@@ -5776,11 +5776,14 @@ async fn run_loop_inner(
     // (memory recall, the repo-map entries its named paths pull in). It is
     // appended to this prompt's user message and persisted there, so every
     // later request re-sends identical history bytes and the cache holds.
-    let prompt_volatile_block = [recall_block_wrapped.as_str(), repo_map_focus_block.as_str()]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    // C9: recalled memories and file-derived map text can carry a key value.
+    let prompt_volatile_block = crate::redact::string(
+        [recall_block_wrapped.as_str(), repo_map_focus_block.as_str()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    );
     if !prompt_volatile_block.is_empty() {
         if let Some(prompt_msg) = session.messages.get_mut(prompt_msg_idx) {
             prompt_msg.blocks.push(Block::text(prompt_volatile_block));
