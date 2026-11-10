@@ -473,6 +473,60 @@ impl<'a> WorktreeArena<'a> {
         }
     }
 
+    /// C5: `Err` when a file the patch at `patch` touches has uncommitted
+    /// changes (or is untracked) in the user's workspace, or that cannot be
+    /// determined.
+    fn refuse_dirty_overlap(&self, patch: &std::path::Path) -> Result<(), String> {
+        let patch = patch.to_string_lossy();
+        // `-z`: `added\tdeleted\tpath\0`, or for a rename an empty path field
+        // followed by `old\0new\0`.
+        let stat = self
+            .git
+            .run(&["apply", "--numstat", "-z", &patch])
+            .map_err(|e| format!("could not list the winning diff's files: {e}"))?;
+        let paths: Vec<&str> = stat
+            .split('\0')
+            .map(|f| f.rsplit('\t').next().unwrap_or(f))
+            .filter(|p| !p.is_empty())
+            .collect();
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec![
+            "--literal-pathspecs",
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=all",
+            "--",
+        ];
+        args.extend(paths.iter().copied());
+        let status = self
+            .git
+            .run(&args)
+            .map_err(|e| format!("could not check the working tree: {e}"))?;
+        // `XY path\0` (a rename adds `orig\0`): the path after the status.
+        let dirty: Vec<&str> = status
+            .split('\0')
+            .filter_map(|e| e.get(3..))
+            .filter(|p| !p.is_empty())
+            .collect();
+        if dirty.is_empty() {
+            return Ok(());
+        }
+        let more = dirty.len().saturating_sub(5);
+        let more = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
+        Err(format!(
+            "the working tree has uncommitted changes to {}{more}, which the winning diff also \
+             changes; it was made against HEAD, so it was not applied",
+            dirty.iter().take(5).copied().collect::<Vec<_>>().join(", ")
+        ))
+    }
+
     /// Run the test command with `dir` as cwd; map the exit status to a verdict.
     /// A6: spawned exactly like the turn-end gates (cmd guard, scrubbed child
     /// env, PowerShell fallback when `pwsh` is absent); a guard denial, spawn
@@ -539,6 +593,17 @@ impl CandidateArena for WorktreeArena<'_> {
         // patch from stdin; route it through a temp file to avoid stdin plumbing.
         let tmp = self.root.join("origin-bestofn-winner.patch");
         std::fs::write(&tmp, diff).map_err(|e| format!("write patch: {e}"))?;
+        // C5: the diff is against the base commit, but the first attempt's
+        // edits are still uncommitted in the user's tree. Refuse a diff that
+        // touches any of those files (git would fail on the same lines, or
+        // silently mix both edits in one file); fail closed if unsure.
+        // ponytail: a diff touching only OTHER files still lands on top of
+        // the first attempt's edits elsewhere — an untested mix; deciding
+        // whether to discard those edits first is a product decision.
+        if let Err(e) = self.refuse_dirty_overlap(&tmp) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         let mut git = std::process::Command::new("git");
         origin_tools::scrub_env(&mut git); // A6
         let out = git
@@ -893,6 +958,61 @@ mod tests {
             "the worktree edit is captured: {}",
             res.diff
         );
+    }
+
+    /// C5: the winner's diff is against HEAD, but the first attempt's edits
+    /// are still uncommitted in the user's tree. A diff touching a file the
+    /// first attempt changed is refused with a clear reason — git would fail
+    /// on the same lines, or silently mix the two edits in one file — and the
+    /// file is left as it was.
+    #[test]
+    fn a_winner_touching_a_file_the_first_attempt_changed_is_not_applied() {
+        let lines = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12\n";
+        for (cand_from, cand_to) in [("line2", "CAND2"), ("line11", "CAND11")] {
+            let repo = tempfile::tempdir().unwrap();
+            let git = crate::selfdev::ProcessGitRunner::new(repo.path());
+            git.run(&["init", "-q"]).unwrap();
+            std::fs::write(repo.path().join("a.txt"), lines).unwrap();
+            git.run(&["add", "-A"]).unwrap();
+            git.run(&[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ])
+            .unwrap();
+            let base = git.run(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+            // The first attempt's uncommitted edit.
+            let dirty = lines.replace("line2", "SINGLE2");
+            std::fs::write(repo.path().join("a.txt"), &dirty).unwrap();
+            let scratch = tempfile::tempdir().unwrap();
+            let runner = move |_i: usize, wt: &std::path::Path| -> Result<(), String> {
+                let p = wt.join("a.txt");
+                let s = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
+                std::fs::write(&p, s.replace(cand_from, cand_to)).map_err(|e| e.to_string())
+            };
+            let mut arena =
+                WorktreeArena::new(&git, base, scratch.path(), repo.path(), None, Box::new(runner));
+            let res = arena.run_candidate(0).unwrap();
+            let applied = arena.apply_winner(&res.diff);
+            drop(arena);
+            let err = applied.expect_err(cand_to);
+            assert!(
+                err.contains("uncommitted changes") && err.contains("a.txt"),
+                "{cand_to}: {err}"
+            );
+            let now = std::fs::read_to_string(repo.path().join("a.txt")).unwrap();
+            assert_eq!(
+                now, dirty,
+                "{cand_to}: the file is left as the first attempt left it"
+            );
+        }
     }
 
     /// A6: the test oracle is spawned like the turn-end gates — in the given
