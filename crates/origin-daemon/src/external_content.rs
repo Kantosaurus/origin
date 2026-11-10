@@ -142,11 +142,18 @@ fn neutralise_markers(s: &str) -> String {
 // CAS hand-off that stores the WRAPPED bytes plus a CAS the worker can recall from.
 #[must_use]
 pub fn bound_mcp_result(body: Vec<u8>) -> Vec<u8> {
-    if body.len() <= MCP_RESULT_MAX_BYTES {
+    bound_result(body, MCP_RESULT_MAX_BYTES)
+}
+
+/// `body` cut to `max` bytes on a char boundary, with a note of how much was
+/// shown; unchanged when it fits.
+#[must_use]
+pub fn bound_result(body: Vec<u8>, max: usize) -> Vec<u8> {
+    if body.len() <= max {
         return body;
     }
     let s = String::from_utf8_lossy(&body);
-    let cut = cut_on_char_boundary(&s, MCP_RESULT_MAX_BYTES);
+    let cut = cut_on_char_boundary(&s, max);
     format!("{}\n[truncated: {cut} of {} bytes shown]", &s[..cut], s.len()).into_bytes()
 }
 

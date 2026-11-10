@@ -8358,6 +8358,16 @@ async fn run_loop_inner(
             // so the CAS blob, TUI preview, transcript and model all see the same
             // redacted bytes.
             let result_bytes = crate::redact::bytes(result_bytes);
+            // A7: one hard cap on any single result, so one huge result cannot
+            // overflow the window (the overflow retry cannot elide the last
+            // turns). Above `Read`'s and Bash's own caps; a memo hit was capped
+            // when first stored.
+            // ponytail: fixed 200 KB cap; make it window-relative and CAS-paged if small-window models matter
+            let result_bytes = if cache_hit.is_none() {
+                crate::external_content::bound_result(result_bytes, 200_000)
+            } else {
+                result_bytes
+            };
             // C6: note tripwire hits in the lines this edit added (never blocks).
             let result_bytes = crate::diff_review::with_tripwire_notes(result_bytes, &call_before);
 
