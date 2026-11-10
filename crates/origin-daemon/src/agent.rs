@@ -6634,10 +6634,12 @@ async fn run_loop_inner(
             // Default/unset ⇒ this is skipped entirely and the turn is
             // byte-identical. A best-effort apply: any parse/apply failure is
             // logged and the file is left untouched, never failing the turn.
-            if std::env::var("ORIGIN_EDITFMT").as_deref() == Ok("1") {
+            let prose_not_applied = if std::env::var("ORIGIN_EDITFMT").as_deref() == Ok("1") {
                 let skills = opts.skills.as_deref().unwrap_or(&EMPTY_SKILLS);
-                apply_prose_edits(&text, opts, session, skills, &mut turn_mutated).await;
-            }
+                apply_prose_edits(&text, opts, session, skills, hooks.as_deref(), &mut turn_mutated).await
+            } else {
+                Vec::new()
+            };
 
             // C15: bundle the final turn's FAILURE-only gate blocks (syntax
             // gate + test results) so the goal verifier sees them. Advisory
@@ -6905,6 +6907,16 @@ async fn run_loop_inner(
             let text = match (&last_green, loop_cwd(opts)) {
                 (Some((id, green_turn)), Some(root)) if red && !worker => {
                     let note = last_green_note(id, *green_turn, &root);
+                    if let Some(tx) = &opts.event_tx {
+                        let _ = tx.send(StreamEvent::TextDelta { text: note.clone() }).await;
+                    }
+                    text + &note
+                }
+                _ => text,
+            };
+            // C2: prose edits that did not land, said once (the model gets no further turn).
+            let text = match prose_edit_note(&prose_not_applied) {
+                Some(note) if !worker => {
                     if let Some(tx) = &opts.event_tx {
                         let _ = tx.send(StreamEvent::TextDelta { text: note.clone() }).await;
                     }
@@ -8876,53 +8888,85 @@ fn harvest_grep_exposure(
 /// would for a structured Edit. Every failure (no parseable block, an empty or
 /// flag-like path, a path a `Write` could not take without asking, a
 /// missing/ambiguous match, or an I/O error) is logged and skipped — a
-/// malformed prose edit must never fail the turn.
+/// malformed prose edit must never fail the turn. Returns the hunks that were
+/// not applied as `(path, short reason)`, for [`prose_edit_note`].
 async fn apply_prose_edits(
     text: &str,
     opts: &LoopOptions,
     session: &Session,
     skills: &SkillRegistry,
+    hooks: Option<&crate::hooks_runtime::HooksState>,
     turn_mutated: &mut bool,
-) {
+) -> Vec<(String, String)> {
     let hunks = match origin_editfmt::extract_all_hunks(text, &session.model) {
         Ok(h) => h,
         Err(e) => {
             // The common case (no edit block in the prose) lands here; keep it
             // at debug so a chatty model doesn't spam warnings every turn.
             tracing::debug!(error = %e, "editfmt: no applicable edit block in assistant prose");
-            return;
+            return Vec::new();
         }
     };
+    let mut not_applied = Vec::new();
     for hunk in hunks {
-        if apply_one_prose_hunk(&hunk, opts, session, skills).await {
-            *turn_mutated = true;
+        match apply_one_prose_hunk(&hunk, opts, session, skills, hooks).await {
+            Ok(()) => *turn_mutated = true,
+            Err(reason) => not_applied.push((hunk.file, reason)),
         }
     }
+    not_applied
+}
+
+/// C2: the one user-visible line naming prose edits that were not applied
+/// (the terminal turn gives the model no chance to say so), or `None`.
+fn prose_edit_note(not_applied: &[(String, String)]) -> Option<String> {
+    const SHOWN: usize = 5;
+    if not_applied.is_empty() {
+        return None;
+    }
+    let shown: Vec<String> = not_applied
+        .iter()
+        .take(SHOWN)
+        .map(|(path, why)| {
+            format!(
+                "{}: {}",
+                quoted_tail(path),
+                why.chars().take(160).collect::<String>()
+            )
+        })
+        .collect();
+    let more = match not_applied.len().saturating_sub(SHOWN) {
+        0 => String::new(),
+        k => format!("; +{k} more"),
+    };
+    Some(format!(
+        "\n\n[editfmt] {} prose edit(s) not applied: {}{more}",
+        not_applied.len(),
+        shown.join("; ")
+    ))
 }
 
 /// Apply a single normalized [`origin_editfmt::Hunk`] to disk (Task 2 helper).
 ///
-/// Returns `true` only when the file was successfully written. Every guard or
-/// failure (empty/flag-like path, unreadable target, no/ambiguous match, or a
-/// write error) is logged once and yields `false`, so a malformed prose edit
-/// can never fail the turn. The fallible work is funneled through
-/// [`try_apply_one_prose_hunk`] so this wrapper has a single log/return site.
+/// `Ok` only when the file was successfully written. Every guard or failure
+/// (empty/flag-like path, refused permission, unreadable target,
+/// no/ambiguous match, or a write error) is logged once and returned as a
+/// short reason, so a malformed prose edit can never fail the turn. The
+/// fallible work is funneled through [`try_apply_one_prose_hunk`] so this
+/// wrapper has a single log site.
 async fn apply_one_prose_hunk(
     hunk: &origin_editfmt::Hunk,
     opts: &LoopOptions,
     session: &Session,
     skills: &SkillRegistry,
-) -> bool {
-    match try_apply_one_prose_hunk(hunk, opts, session, skills).await {
-        Ok(()) => {
-            tracing::info!(file = %hunk.file, "editfmt: applied prose edit");
-            true
-        }
-        Err(reason) => {
-            tracing::warn!(file = %hunk.file, %reason, "editfmt: skipped prose edit");
-            false
-        }
+    hooks: Option<&crate::hooks_runtime::HooksState>,
+) -> Result<(), String> {
+    let result = try_apply_one_prose_hunk(hunk, opts, session, skills, hooks).await;
+    match &result {
+        Ok(()) => tracing::info!(file = %hunk.file, "editfmt: applied prose edit"),
+        Err(reason) => tracing::warn!(file = %hunk.file, %reason, "editfmt: skipped prose edit"),
     }
+    result
 }
 
 /// Fallible core of [`apply_one_prose_hunk`]: validate, apply, and write.
@@ -8935,6 +8979,7 @@ async fn try_apply_one_prose_hunk(
     opts: &LoopOptions,
     session: &Session,
     skills: &SkillRegistry,
+    hooks: Option<&crate::hooks_runtime::HooksState>,
 ) -> Result<(), String> {
     if hunk.file.is_empty() {
         return Err("no file path".to_string());
@@ -8955,6 +9000,19 @@ async fn try_apply_one_prose_hunk(
         std::fs::read_to_string(&path).map_err(|e| format!("cannot read target: {e}"))?
     };
     let updated = origin_editfmt::apply(hunk, &original).map_err(|e| e.to_string())?;
+    // C2: the PreTool hook a `Write` of this content to `path` would fire.
+    let write = origin_tools::registry_iter().find(|m| m.name == "Write");
+    if let (Some(h), Some(meta)) = (hooks, write) {
+        let args = serde_json::json!({ "file_path": path.to_string_lossy(), "content": updated });
+        let ev = origin_hooks::LifecycleEvent::PreTool {
+            tool: meta.name.to_string(),
+            args_preview: args.to_string(),
+            sandbox_ordinal: meta.sandbox_profile.ordinal(),
+        };
+        if let origin_hooks::HookOverride::Deny { reason } = h.fire(&ev).await {
+            return Err(format!("hook denied: {reason}"));
+        }
+    }
     std::fs::write(&path, updated).map_err(|e| format!("write failed: {e}"))?;
     Ok(())
 }
@@ -8991,10 +9049,8 @@ async fn prose_write_allowed(
     if d.outcome == Outcome::Allow {
         Ok(())
     } else {
-        Err(format!(
-            "not permitted without asking ({}); use the edit tools",
-            d.reason
-        ))
+        tracing::warn!(path = %path.display(), reason = %d.reason, "editfmt: prose edit not permitted");
+        Err("not permitted without asking; use the edit tools".to_string())
     }
 }
 
@@ -12942,7 +12998,13 @@ mod wiring_tests {
         );
 
         let mut mutated = false;
-        apply_prose_edits(&prose, &opts, &session, &skills, &mut mutated).await;
+        let not_applied = apply_prose_edits(&prose, &opts, &session, &skills, None, &mut mutated).await;
+        assert!(not_applied.is_empty(), "{not_applied:?}");
+        assert_eq!(
+            prose_edit_note(&not_applied),
+            None,
+            "an applied edit gets no note"
+        );
         assert!(mutated, "a successful prose edit flags the turn as mutated");
         let after = std::fs::read_to_string(&file).expect("read back");
         assert_eq!(after, "let x = 2;\n", "the edit was applied to disk");
@@ -12954,10 +13016,64 @@ mod wiring_tests {
             &opts,
             &session,
             &skills,
+            None,
             &mut mutated2,
         )
         .await;
         assert!(!mutated2, "prose without an edit block changes nothing");
+    }
+
+    /// C2: an explicit deny rule for `Write` refuses a prose edit even inside
+    /// the workspace.
+    #[tokio::test]
+    async fn prose_edit_obeys_an_explicit_write_deny_rule() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (mut opts, session, skills) = prose_edit_ctx(tmp.path());
+        opts.permission_rules = Some(rules_bundle(&[("Write", false)]));
+        let mut mutated = false;
+        let prose = "in.txt\n```\nx\n```\n";
+        let not_applied = apply_prose_edits(prose, &opts, &session, &skills, None, &mut mutated).await;
+        assert_eq!(not_applied.len(), 1, "{not_applied:?}");
+        assert!(!mutated && !tmp.path().join("in.txt").exists());
+    }
+
+    /// C2: a symlink inside the workspace pointing outside it does not carry a
+    /// prose edit out (skipped where the host cannot create symlinks).
+    #[tokio::test]
+    async fn prose_edit_does_not_follow_a_symlink_out_of_the_workspace() {
+        let ws = tempfile::tempdir().expect("ws");
+        let outside = tempfile::tempdir().expect("outside");
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(outside.path(), ws.path().join("link"));
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(outside.path(), ws.path().join("link"));
+        if let Err(e) = made {
+            eprintln!("skipping prose_edit_does_not_follow_a_symlink_out_of_the_workspace: {e}");
+            return;
+        }
+        let (opts, session, skills) = prose_edit_ctx(ws.path());
+        let mut mutated = false;
+        let prose = "link/x.txt\n```\nx\n```\n";
+        let not_applied = apply_prose_edits(prose, &opts, &session, &skills, None, &mut mutated).await;
+        assert_eq!(not_applied.len(), 1, "{not_applied:?}");
+        assert!(!mutated && !outside.path().join("x.txt").exists());
+    }
+
+    /// C2: the not-applied note quotes and escapes paths and caps at five.
+    #[test]
+    fn prose_edit_note_quotes_paths_and_caps_at_five() {
+        let many: Vec<(String, String)> = (0..7).map(|i| (format!("f{i}.rs"), "why".into())).collect();
+        let note = prose_edit_note(&many).expect("note");
+        assert!(
+            note.starts_with("\n\n[editfmt] 7 prose edit(s) not applied: \"f0.rs\": why; "),
+            "{note}"
+        );
+        assert!(
+            note.contains("\"f4.rs\": why; +2 more") && !note.contains("f5.rs"),
+            "{note}"
+        );
+        let odd = prose_edit_note(&[("a\"\nb".into(), "x".into())]).expect("note");
+        assert!(odd.contains(r#""a\"\nb": x"#), "{odd}");
     }
 
     /// C2: a run anchored at `cwd` (its workspace), default permission mode.
@@ -12990,7 +13106,8 @@ mod wiring_tests {
             file.display()
         );
         let mut mutated = false;
-        apply_prose_edits(&prose, &opts, &session, &skills, &mut mutated).await;
+        let not_applied = apply_prose_edits(&prose, &opts, &session, &skills, None, &mut mutated).await;
+        assert_eq!(not_applied.len(), 1, "{not_applied:?}");
         assert!(!mutated, "a no-match apply must not flag a mutation");
         assert_eq!(
             std::fs::read_to_string(&file).expect("read back"),

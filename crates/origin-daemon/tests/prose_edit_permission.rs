@@ -35,8 +35,8 @@ impl Provider for Reply {
 }
 
 /// Run one turn whose reply is `reply`, in `cwd`, under `mode`. The prompter
-/// would allow anything: the applier must not ask it.
-async fn run(reply: String, cwd: &Path, mode: PermissionMode) {
+/// would allow anything: the applier must not ask it. Returns the final text.
+async fn run(reply: String, cwd: &Path, mode: PermissionMode) -> String {
     let provider = Reply(Mutex::new(Some(reply)));
     let opts = LoopOptions {
         cwd: Some(cwd.to_path_buf()),
@@ -47,7 +47,30 @@ async fn run(reply: String, cwd: &Path, mode: PermissionMode) {
     std::env::set_var("ORIGIN_EDITFMT", "1");
     let out = run_loop(&mut session, "edit", &provider, &AlwaysAllow, &opts).await;
     std::env::remove_var("ORIGIN_EDITFMT");
-    out.unwrap();
+    out.unwrap().assistant_text
+}
+
+/// C2: a refused prose edit is named in the run's final text (the model gets
+/// no further turn to say so); an applied one adds nothing.
+#[tokio::test]
+async fn a_refused_prose_edit_is_named_in_the_final_text() {
+    let _g = ENV_LOCK.lock().await;
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(ws.path().join(".git/hooks")).unwrap();
+    std::fs::create_dir_all(ws.path().join("c2_prose")).unwrap();
+    let refused = whole_file(".git/hooks/pre-commit", "#!/bin/sh");
+    let text = run(refused.clone(), ws.path(), PermissionMode::Workspace).await;
+    assert!(
+        text.starts_with(&refused)
+            && text.ends_with(
+                "\n\n[editfmt] 1 prose edit(s) not applied: \".git/hooks/pre-commit\": not permitted \
+                 without asking; use the edit tools"
+            ),
+        "{text}"
+    );
+    let applied = whole_file("c2_prose/ok.txt", "x");
+    let text = run(applied.clone(), ws.path(), PermissionMode::Workspace).await;
+    assert_eq!(text, applied, "no note for an applied edit");
 }
 
 fn whole_file(path: &str, body: &str) -> String {
