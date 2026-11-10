@@ -747,8 +747,6 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     }
 }
 
-/// Spawn the idle-heartbeat consolidator if memory + consolidator are wired.
-/// Runs one bounded pass every 30s after a 30s warmup tick.
 /// A4: the governance the daemon starts with. A missing file is no
 /// governance; a file that exists but cannot be read or parsed stops the
 /// start (its organisation deny rules, conseca policy and caps must not
@@ -762,6 +760,8 @@ fn startup_governance(path: &std::path::Path) -> Result<Governance> {
     })
 }
 
+/// Spawn the idle-heartbeat consolidator if memory + consolidator are wired.
+/// Runs one bounded pass every 30s after a 30s warmup tick.
 fn spawn_idle_consolidator(memory: Option<&MemoryWiring>) {
     let Some(m) = memory else { return };
     let Some(consolidator) = m.consolidator.as_ref() else {

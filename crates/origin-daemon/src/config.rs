@@ -317,16 +317,19 @@ pub fn governance_path() -> PathBuf {
 ///
 /// # Errors
 ///
-/// Returns [`GovernanceError`] when the file exists but cannot be read, is not
-/// valid TOML/schema, or carries an invalid `max_spend_usd`.
+/// Returns [`GovernanceError`] when the file exists (or its existence cannot
+/// be checked) but cannot be read, is not valid TOML/schema, or carries an
+/// invalid `max_spend_usd`.
 pub fn load_governance(path: &Path) -> Result<Governance, GovernanceError> {
-    if !path.exists() {
-        return Ok(Governance::default());
-    }
-    let raw = std::fs::read_to_string(path).map_err(|source| GovernanceError::Read {
+    let read_err = |source| GovernanceError::Read {
         path: path.to_path_buf(),
         source,
-    })?;
+    };
+    // A4: a file whose existence cannot be checked is not "missing".
+    if !path.try_exists().map_err(read_err)? {
+        return Ok(Governance::default());
+    }
+    let raw = std::fs::read_to_string(path).map_err(read_err)?;
     let cfg: GovernanceConfig = toml::from_str(&raw).map_err(|source| GovernanceError::Parse {
         path: path.to_path_buf(),
         source: Box::new(source),
@@ -755,6 +758,14 @@ mod tests {
         .unwrap();
         let err = load_governance(&path).unwrap_err();
         assert!(matches!(err, GovernanceError::InvalidSpend { value, .. } if value == -1.0));
+    }
+
+    /// A4: a path whose existence cannot be checked is a load failure, not
+    /// "missing" (= no governance). A NUL byte fails the check on every OS.
+    #[test]
+    fn an_uninspectable_path_is_a_read_error() {
+        let err = load_governance(Path::new("governance\0.toml")).unwrap_err();
+        assert!(matches!(err, GovernanceError::Read { .. }), "{err}");
     }
 
     #[test]
