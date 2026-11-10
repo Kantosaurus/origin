@@ -223,22 +223,23 @@ fn ensure_binary(program: &str, server: &origin_lspfleet::LspServer) -> bool {
 
 /// Run a registry install command through the platform shell. The command
 /// string originates from the builtin [`origin_lspfleet`] registry, never from
-/// model/user input.
+/// model/user input. The installer (and any package postinstall script it runs)
+/// gets the allow-listed environment (A6), never the daemon's provider keys.
 fn run_install(install_cmd: &str) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(windows)]
-    {
-        std::process::Command::new("cmd")
-            .arg("/C")
-            .arg(install_cmd)
-            .status()
-    }
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C");
+        c
+    };
     #[cfg(not(windows))]
-    {
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(install_cmd)
-            .status()
-    }
+    let mut cmd = {
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c");
+        c
+    };
+    origin_tools::scrub_env(&mut cmd);
+    cmd.arg(install_cmd).status()
 }
 
 /// Probe one edited file through the session's pooled server for its language,
@@ -375,6 +376,26 @@ mod tests {
             let block = super::lsp_diagnostics_block(&pool, Path::new("."), &edited).await;
             assert!(block.is_none(), "disabled gate must yield no block");
         }
+    }
+
+    /// A6: the `ORIGIN_LSP_AUTO` installer (and any package postinstall script
+    /// it runs) gets the allow-listed environment, not the daemon's secrets.
+    #[test]
+    fn install_command_does_not_see_daemon_secrets() {
+        // Secret-shaped and unique to this test, so setting it disturbs no other test.
+        std::env::set_var("A6_INSTALL_PROBE_TOKEN", "sk-install-secret");
+        let out = std::env::temp_dir().join(format!("a6-install-probe-{}.txt", std::process::id()));
+        #[cfg(windows)]
+        let cmd = format!("echo %A6_INSTALL_PROBE_TOKEN%>{}", out.display());
+        #[cfg(not(windows))]
+        let cmd = format!("echo \"$A6_INSTALL_PROBE_TOKEN\" > '{}'", out.display());
+        assert!(super::run_install(&cmd).unwrap().success());
+        let seen = std::fs::read_to_string(&out).unwrap();
+        let _ = std::fs::remove_file(&out);
+        assert!(
+            !seen.contains("sk-install-secret"),
+            "secret leaked to installer: {seen:?}"
+        );
     }
 
     #[test]
