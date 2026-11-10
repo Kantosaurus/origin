@@ -141,7 +141,22 @@ impl<'a> ShadowGit<'a> {
         let files_changed = u32::try_from(files).unwrap_or(u32::MAX);
 
         let body = format!("origin-checkpoint ms={now_ms} files={files_changed}");
-        self.git(&["commit", "--allow-empty", "--message", label, "--message", &body])?;
+        // C8: self-contained — the user's global signing config or a missing
+        // identity must not make every checkpoint fail silently.
+        self.git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "user.name=origin",
+            "-c",
+            "user.email=origin@localhost",
+            "commit",
+            "--allow-empty",
+            "--message",
+            label,
+            "--message",
+            &body,
+        ])?;
         let id = self.git(&["rev-parse", "HEAD"])?.trim().to_string();
 
         Ok(Checkpoint {

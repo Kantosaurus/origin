@@ -103,6 +103,48 @@ async fn maybe_checkpoint_turn_with_hooks(root: Option<&std::path::Path>) {
     }
 }
 
+/// C8: remember the run's current tree as the last state in which the gate
+/// passed: reuse the newest checkpoint when it already holds this tree, else
+/// take one, then point `refs/tags/last-green` in `root`'s shadow repo at it.
+/// Returns the checkpoint id. No git is spawned unless checkpoints are on
+/// (`ORIGIN_CHECKPOINTS=1` or `ORIGIN_CHECKPOINTS_PER_TOOL=1`); fail-open.
+async fn tag_last_green(root: Option<&std::path::Path>) -> Option<String> {
+    use origin_vcs::GitRunner as _;
+    let on = std::env::var("ORIGIN_CHECKPOINTS").as_deref() == Ok("1") || per_tool_checkpoints_enabled();
+    let root = root.filter(|_| on)?;
+    let shadow = root
+        .join(".origin")
+        .join("shadow.git")
+        .to_string_lossy()
+        .into_owned();
+    let runner = crate::selfdev::ProcessGitRunner::new(root);
+    let git = |args: &[&str]| runner.run(&[&["--git-dir", shadow.as_str()][..], args].concat());
+    // Nothing to stage ⇒ HEAD already holds this tree.
+    let head = match git(&["status", "--porcelain"]) {
+        Ok(s) if s.trim().is_empty() => git(&["rev-parse", "HEAD"]).ok().map(|h| h.trim().to_string()),
+        _ => None,
+    };
+    let id = match head {
+        Some(id) => id,
+        None => checkpoint_with_commit_hooks("green", root).await?,
+    };
+    if let Err(e) = git(&["update-ref", "refs/tags/last-green", &id]) {
+        tracing::warn!(error = %e, "could not tag the last green checkpoint (ignored)");
+        return None;
+    }
+    Some(id)
+}
+
+/// C8: appended to a run that ends with a failing gate after it passed at
+/// `turn` of the same run. `origin rewind <id>` is the CLI restore command.
+fn last_green_note(id: &str, turn: u32) -> String {
+    format!(
+        "\n\n[origin] The gate is failing now, but it passed at turn {turn} of this run. That state is \
+         checkpoint {id} (shadow ref `last-green`); nothing was restored. To go back to it, run \
+         `origin rewind {id}`."
+    )
+}
+
 /// Whether the per-tool-use checkpoint feature is enabled.
 ///
 /// Reads the `ORIGIN_CHECKPOINTS_PER_TOOL` env gate (set to `1` to enable).
@@ -5618,6 +5660,8 @@ async fn run_loop_inner(
     // (the goal-driver path enforces the same signal via the verifier). Counts
     // only the gate-driven continuations, so a normal run never touches it.
     let mut repro_gate_repairs: u32 = 0;
+    // C8: the checkpoint id and turn of this run's last passing gate.
+    let mut last_green: Option<(String, u32)> = None;
     // The number of terminal-branch RED→continue attempts allowed before the
     // loop yields control (surfacing the still-failing suite to the user/goal
     // verifier). Reuses the post-edit `max_repair_iters` budget; 0 when no gate
@@ -6446,6 +6490,7 @@ async fn run_loop_inner(
                         // Run the oracle now (fresh, not the stale `test_block`).
                         let fresh = run_post_edit_test(&cmd, opts.cwd.as_deref()).await;
                         edit_unverified &= fresh.is_none();
+                        let fresh_ran = fresh.is_some();
                         // C9: redact before it becomes a model-facing User message.
                         let mut fresh = crate::redact::text(&fresh.unwrap_or_default()).into_owned();
                         if !fresh.is_empty() {
@@ -6488,6 +6533,11 @@ async fn run_loop_inner(
                         }
                         // GREEN (or unrunnable/fail-open) ⇒ fall through to return.
                         test_block.clear();
+                        if fresh_ran && lint_block.is_empty() {
+                            if let Some(id) = tag_last_green(loop_cwd(opts).as_deref()).await {
+                                last_green = Some((id, turn));
+                            }
+                        }
                     }
                 }
             }
@@ -6646,6 +6696,22 @@ async fn run_loop_inner(
                 turn,
             ));
 
+            // C8: ending red after a green turn of this run ⇒ say how to get
+            // back there, once, on the final result (user stream, summary, and
+            // the final assistant message the model sees next). Never restores.
+            let text = match &last_green {
+                Some((id, green_turn)) if !(test_block.is_empty() && lint_block.is_empty()) => {
+                    let note = last_green_note(id, *green_turn);
+                    if let Some(m) = session.messages.last_mut() {
+                        m.blocks.push(Block::text(note.clone()));
+                    }
+                    if let Some(tx) = &opts.event_tx {
+                        let _ = tx.send(StreamEvent::TextDelta { text: note.clone() }).await;
+                    }
+                    text + &note
+                }
+                _ => text,
+            };
             let gate_signals = {
                 let mut s = String::new();
                 for b in [&compile_check_block, &test_block] {
@@ -8109,6 +8175,7 @@ async fn run_loop_inner(
         // Opt-in post-edit test run. Default-off (auto_test defaults false), so it
         // adds NO latency unless the user explicitly configured it — they then
         // accept their suite's cost. Failures are fed back like the other gates.
+        let mut gate_ran = false;
         if !lsp_edited_paths.is_empty() {
             if let Some(cfg) = opts.post_edit.as_deref() {
                 // C8: the repro gate also runs the test command at turn-end, so
@@ -8120,6 +8187,7 @@ async fn run_loop_inner(
                         let cmd = effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
                         let ran = run_post_edit_test(&cmd, opts.cwd.as_deref()).await;
                         edit_unverified &= ran.is_none();
+                        gate_ran |= ran.is_some();
                         test_block = crate::redact::string(ran.unwrap_or_default());
                         // C9: classify a post-edit failure against the pre-edit
                         // baseline — a true regression (was green) vs failures
@@ -8147,9 +8215,16 @@ async fn run_loop_inner(
                     if let Some(cmd) = cfg.lint_command.as_deref() {
                         let ran = run_post_edit_lint_block(cmd, opts.cwd.as_deref()).await;
                         edit_unverified &= ran.is_none();
+                        gate_ran |= ran.is_some();
                         lint_block = crate::redact::string(ran.unwrap_or_default());
                     }
                 }
+            }
+        }
+        // C8: a gate ran this turn and every gate is green ⇒ tag this tree.
+        if gate_ran && test_block.is_empty() && lint_block.is_empty() {
+            if let Some(id) = tag_last_green(loop_cwd(opts).as_deref()).await {
+                last_green = Some((id, turn));
             }
         }
         // C10: track consecutive turns where post-edit validation still failed.
