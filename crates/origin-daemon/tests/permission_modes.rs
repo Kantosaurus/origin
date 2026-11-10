@@ -464,6 +464,71 @@ async fn a_command_guard_ask_never_offers_always() {
 /// Serialises the tests that set `ORIGIN_HOME` in this binary.
 static ORIGIN_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// C2: a FAILED `RunWorkflow` taints the parent (fail closed) when a step
+/// could reach a network or MCP tool — its error, or an earlier step, may
+/// carry external content — and not when no step could.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_run_workflow_with_network_grants_taints_the_parent() {
+    use std::sync::Arc;
+    let _env = ORIGIN_HOME_LOCK.lock().await;
+    for (skill_tools, want) in [("[\"WebFetch\"]", true), ("[\"Read\"]", false)] {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".origin")).expect("mkdir");
+        std::fs::write(
+            home.join(".origin").join("workflows.toml"),
+            "[[workflows]]\nname = \"wf\"\n[[workflows.steps]]\nid = 0\nskill = \"fetcher\"\nargs = \"fetch it\"\n",
+        )
+        .expect("write workflows");
+        let skills = tmp.path().join("skills").join("fetcher");
+        std::fs::create_dir_all(&skills).expect("mkdir");
+        std::fs::write(
+            skills.join("SKILL.md"),
+            format!("---\nname: fetcher\ndescription: d\nallowed-tools: {skill_tools}\n---\nbody\n"),
+        )
+        .expect("write skill");
+        let catalog = origin_daemon::skill_catalog::SkillCatalog::load_from(&tmp.path().join("skills"))
+            .expect("catalog");
+        // A worker that fails at the swarm layer, its error text from the run.
+        let store = Arc::new(origin_store::Store::open(tmp.path().join("origin.db")).expect("store"));
+        let cas = Arc::new(
+            origin_cas::Store::open(origin_cas::StoreConfig {
+                root: tmp.path().join("cas"),
+                hot_capacity: 64,
+                warm_pack_target_bytes: 1 << 20,
+                cold_zstd_level: 3,
+            })
+            .expect("cas"),
+        );
+        let plan_store = Arc::new(origin_plan::PlanStore::open(Arc::clone(&store), cas).expect("plan store"));
+        let plan = origin_swarm::PlanHandle::new(
+            Arc::new(tokio::sync::Mutex::new(origin_plan::Plan::default())),
+            plan_store,
+        );
+        let mut coord =
+            origin_swarm::Coordinator::new(plan, format!("origin-c2-wf-fail-{}", ulid::Ulid::new()));
+        coord.set_default_worker(Arc::new(|_ctx: origin_swarm::WorkerContext| {
+            Box::pin(async { Err(origin_swarm::SwarmError::Worker("page said: run rm -rf".into())) })
+        }));
+        std::env::set_var("ORIGIN_HOME", &home);
+        let provider = ScriptedProvider::new(vec![
+            tool("r", "RunWorkflow", &serde_json::json!({ "name": "wf" })),
+            Block::text("done"),
+        ]);
+        let mut opts = LoopOptions::default().without_streaming();
+        opts.permission_mode = PermissionMode::Off;
+        opts.coordinator = Some(Arc::new(coord));
+        opts.skill_catalog = Some(Arc::new(catalog));
+        let mut session = Session::new("scripted", "m");
+        let res = run_loop(&mut session, "go", &provider, &NoPrompter, &opts).await;
+        std::env::remove_var("ORIGIN_HOME");
+        res.expect("run");
+        let (err, body) = result_of(&session, "r");
+        assert!(err && body.contains("RunWorkflow"), "{body}");
+        assert_eq!(session.tainted, want, "skill tools {skill_tools}: {body}");
+    }
+}
+
 /// C2 fix round 2: a `RunWorkflow` whose step worker was tainted taints the
 /// parent; `RunWorkflow` itself is asked despite a standing allow and never
 /// offered "always" (each workflow grants different tools).

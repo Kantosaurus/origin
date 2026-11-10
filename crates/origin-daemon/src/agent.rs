@@ -7882,7 +7882,7 @@ async fn run_loop_inner(
                     .await
                     {
                         Ok((s, tainted)) => (s.into_bytes(), false, tainted),
-                        Err(e) => (format!("Error: {e}").into_bytes(), true, false),
+                        Err((e, tainted)) => (format!("Error: {e}").into_bytes(), true, tainted),
                     };
                     // C2: a tainted step worker's result taints this session.
                     absorb_worker_taint(session, opts, worker_tainted);
@@ -10047,6 +10047,7 @@ async fn dispatch_tool(
             run_workflow_tool(args, coord, skill_catalog, None, None)
                 .await
                 .map(|(json, _)| json)
+                .map_err(|(e, _)| e)
         }
         // ── ask_user (interactive choice) — backward-compat path ──
         // The INTERACTIVE pause-await (emit `ChoiceAsk` → block on
@@ -10076,30 +10077,34 @@ async fn dispatch_tool(
 /// [`RunReport`](crate::workflow_runner::RunReport) serialized as JSON.
 ///
 /// Errors map to `BadArgs` (missing/empty `name`) or `ToolFailure` (no such
-/// workflow, load I/O, layering failure, or a swarm-layer error).
+/// workflow, load I/O, layering failure, or a swarm-layer error). C2: both
+/// arms carry whether the result taints the caller; a failed run is treated
+/// as tainted (fail closed) when any step could reach a network or MCP tool,
+/// since its error text or an earlier step may carry external content.
 async fn run_workflow_tool(
     args: &Value,
     coordinator: &origin_swarm::Coordinator,
     skill_catalog: Option<&SkillCatalog>,
     event_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
     parent: Option<&LoopOptions>,
-) -> Result<(String, bool), LoopError> {
+) -> Result<(String, bool), (LoopError, bool)> {
+    let untainted = |e: LoopError| (e, false);
     let name = args
         .get("name")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|n| !n.is_empty())
-        .ok_or_else(|| LoopError::BadArgs("RunWorkflow: missing `name`".into()))?;
+        .ok_or_else(|| untainted(LoopError::BadArgs("RunWorkflow: missing `name`".into())))?;
 
     let path = crate::workflows::path()
-        .map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: resolve path: {e}")))?;
+        .map_err(|e| untainted(LoopError::ToolFailure(format!("RunWorkflow: resolve path: {e}"))))?;
     let file = crate::workflows::load_from(&path)
-        .map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: load: {e}")))?;
-    let workflow = file
-        .workflows
-        .iter()
-        .find(|w| w.name == name)
-        .ok_or_else(|| LoopError::ToolFailure(format!("RunWorkflow: no such workflow `{name}`")))?;
+        .map_err(|e| untainted(LoopError::ToolFailure(format!("RunWorkflow: load: {e}"))))?;
+    let workflow = file.workflows.iter().find(|w| w.name == name).ok_or_else(|| {
+        untainted(LoopError::ToolFailure(format!(
+            "RunWorkflow: no such workflow `{name}`"
+        )))
+    })?;
 
     // An empty/missing catalog still runs: the runner falls back to each step's
     // `args` as the worker goal and a default read+edit tool set.
@@ -10115,11 +10120,35 @@ async fn run_workflow_tool(
     let report =
         crate::workflow_runner::run_workflow(workflow, coordinator, catalog, event_tx, effort, ponytail)
             .await
-            .map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: {e}")))?;
+            .map_err(|e| {
+                let tainted = workflow.steps.iter().any(|s| {
+                    grants_external(&crate::workflow_runner::step_worker_spec(s, catalog).allowed_tools)
+                });
+                (LoopError::ToolFailure(format!("RunWorkflow: {e}")), tainted)
+            })?;
     // C2: the run report's structured taint travels with its JSON.
     serde_json::to_string(&report)
         .map(|json| (json, report.tainted))
-        .map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: json: {e}")))
+        .map_err(|e| {
+            (
+                LoopError::ToolFailure(format!("RunWorkflow: json: {e}")),
+                report.tainted,
+            )
+        })
+}
+
+/// C2: whether a worker allowed `allowed_tools` (its own glob matcher; an
+/// entry that does not compile matches everything, failing closed) could
+/// call a network tool or an MCP tool.
+fn grants_external(allowed_tools: &[String]) -> bool {
+    allowed_tools.iter().any(|t| {
+        let m = crate::swarm_worker::allow_entry_glob(t).map(|g| g.compile_matcher());
+        let hit = |n: &str| m.as_ref().is_none_or(|m| m.is_match(n));
+        hit("mcp__x__y")
+            || registry_iter()
+                .filter(|r| crate::external_content::is_external_tool(r.name))
+                .any(|r| hit(r.name))
+    })
 }
 
 /// Execute the `AuthorWorkflow` tool.
