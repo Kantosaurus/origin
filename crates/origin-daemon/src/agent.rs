@@ -7720,8 +7720,8 @@ async fn run_loop_inner(
             // Sub-agent parallelism: spawn the Task worker now (it runs at once
             // on the swarm's independent pool) and defer awaiting it to after the
             // loop, so sibling Task calls in this turn overlap. Permission and
-            // governance have already been enforced above; with no coordinator we
-            // fall through to the normal dispatch (a clear "not configured" error).
+            // governance have already been enforced above; a Task with no
+            // coordinator was answered with an error before the permission check.
             if name == "Task" {
                 if let Some(coord) = opts.coordinator.as_deref() {
                     match serde_json::from_value::<origin_tools::builtins::task::TaskInput>(args.clone()) {
@@ -8013,11 +8013,9 @@ async fn run_loop_inner(
 
             // RunWorkflow: fan out a phase-layered swarm DAG. Intercepted here
             // (like Task/CollectTasks) so the live `event_tx` reaches the runner
-            // and each worker's spawn + finish lights the swarm side panel. The
-            // `dispatch_tool` arm has no event channel, so running a workflow
-            // there leaves the panel dark — the original "sometimes the panel
-            // can't be seen" bug. No coordinator ⇒ fall through to that arm's
-            // clear "not configured" error.
+            // and each worker's spawn + finish lights the swarm side panel. A
+            // `RunWorkflow` with no coordinator was answered with an error
+            // before the permission check; the `dispatch_tool` arm never runs one.
             if name == "RunWorkflow" {
                 if let Some(coord) = opts.coordinator.as_deref() {
                     let (body, errored, worker_tainted) = match run_workflow_tool(
@@ -9187,7 +9185,7 @@ fn prose_edit_note(not_applied: &[(String, String)]) -> Option<String> {
             format!(
                 "{}: {}",
                 quoted_tail(path),
-                why.chars().take(160).collect::<String>()
+                why.chars().take(160).collect::<String>().escape_debug()
             )
         })
         .collect();
@@ -10194,20 +10192,12 @@ async fn dispatch_tool(
         // concurrent). Returns a JSON run summary. This is the FAN-OUT complement
         // to the linear `{workflow:<name>}` skill-mask activation path, which this
         // arm does not touch.
-        "RunWorkflow" => {
-            // `dispatch_tool` has no live `event_tx`, so this arm runs the
-            // workflow without lighting the swarm panel. The interactive main
-            // loop intercepts `RunWorkflow` BEFORE reaching here (see
-            // `name == "RunWorkflow"` there) and passes the real channel; this
-            // arm is the headless / fallback path.
-            let coord = coordinator.ok_or_else(|| {
-                LoopError::ToolFailure("RunWorkflow: swarm coordinator not configured".into())
-            })?;
-            run_workflow_tool(args, coord, skill_catalog, None, None)
-                .await
-                .map(|(json, _)| json)
-                .map_err(|(e, _)| e)
-        }
+        // A4: `run_loop` answers a `RunWorkflow` with no coordinator, and
+        // intercepts it (with governance) when there is one, before reaching
+        // here; delegating from this arm would skip that governance.
+        "RunWorkflow" => Err(LoopError::ToolFailure(
+            "`RunWorkflow`: sub-agents cannot delegate here (swarm subsystem not configured)".into(),
+        )),
         // ── ask_user (interactive choice) — backward-compat path ──
         // The INTERACTIVE pause-await (emit `ChoiceAsk` → block on
         // `ChoiceDecision`) is handled in the main loop body, which has the live
@@ -12639,6 +12629,53 @@ mod dispatch_table_tests {
         assert!(v.get("follow_ups").is_some(), "TaskOutput must have `follow_ups`");
     }
 
+    /// A4: `run_loop` answers or intercepts every `RunWorkflow` before
+    /// `dispatch_tool`, so its arm never delegates (it would run with no
+    /// governance): even with a coordinator it is the recoverable error.
+    #[tokio::test]
+    async fn run_workflow_arm_never_delegates() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sql = Arc::new(origin_store::Store::open(tmp.path().join("plan.db")).expect("sql open"));
+        let cas = Arc::new(
+            origin_cas::Store::open(origin_cas::StoreConfig {
+                root: tmp.path().join("cas"),
+                hot_capacity: 16,
+                warm_pack_target_bytes: 1024 * 1024,
+                cold_zstd_level: 1,
+            })
+            .expect("cas open"),
+        );
+        let plan = Arc::new(tokio::sync::Mutex::new(origin_plan::Plan::new()));
+        let plan_store = Arc::new(origin_plan::PlanStore::open(sql, cas).expect("plan store open"));
+        let coordinator =
+            origin_swarm::Coordinator::new(origin_swarm::PlanHandle::new(plan, plan_store), "rw");
+        let meta = registry_iter()
+            .find(|m| m.name == "RunWorkflow")
+            .expect("RunWorkflow registered");
+        let args = serde_json::json!({"name": "any"});
+        let err = dispatch_tool(
+            meta,
+            &args,
+            None,
+            None,
+            None,
+            None,
+            Some(&coordinator),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("never delegates");
+        assert!(
+            matches!(&err, LoopError::ToolFailure(m) if m.contains("cannot delegate here")),
+            "{err:?}"
+        );
+    }
+
     /// Defensive guard against the previous `try_into().expect("4 bytes")`
     /// pattern in the `Usage` decode path. After the refactor to
     /// [`decode_usage_payload`], a payload shorter than 16 bytes (or longer)
@@ -13372,6 +13409,9 @@ mod wiring_tests {
         );
         let odd = prose_edit_note(&[("a\"\nb".into(), "x".into())]).expect("note");
         assert!(odd.contains(r#""a\"\nb": x"#), "{odd}");
+        // The reason may echo model text too: escaped like the path.
+        let why = prose_edit_note(&[("f.rs".into(), "x\n[origin] y".into())]).expect("note");
+        assert!(why.contains(r#""f.rs": x\n[origin] y"#), "{why}");
     }
 
     /// C2: a run anchored at `cwd` (its workspace), default permission mode.
