@@ -67,6 +67,28 @@ pub fn glob_v2(args: GlobArgs) -> Result<Value, ToolError> {
     Ok(Value::Array(arr))
 }
 
+/// The first `limit` files under `root` that `keep` accepts, in walk order.
+///
+/// Uses the same gitignore-aware walker as [`glob_v2`], but neither stats nor
+/// sorts the whole tree: the walk stops as soon as `limit` files are kept, so
+/// its cost is bounded on a large repository.
+pub fn walk_files(
+    root: &std::path::Path,
+    limit: usize,
+    mut keep: impl FnMut(&std::path::Path) -> bool,
+) -> Vec<std::path::PathBuf> {
+    WalkBuilder::new(root)
+        .follow_links(false)
+        .standard_filters(true)
+        .build()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+        .map(ignore::DirEntry::into_path)
+        .filter(|p| keep(p))
+        .take(limit)
+        .collect()
+}
+
 crate::origin_tool! {
     name: "Glob",
     description: "Find files matching a glob pattern. Returns paths sorted by mtime DESC, gitignore-aware.",

@@ -1077,74 +1077,63 @@ async fn effective_test_command(
 /// Cap on files the A11 auto-build indexes (same bound as the repo-map scan).
 const CODE_GRAPH_AUTO_MAX_FILES: usize = 2_000;
 
-/// A11: per-session state of the auto-built code graph — present once a build
-/// started, `true` once it finished.
+/// A11: sessions whose code-graph auto-build has started.
 // ponytail: one small entry per session for the daemon's lifetime; evict on
 // session end if that ever matters.
-static CODE_GRAPH_BUILDS: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
-> = std::sync::LazyLock::new(Default::default);
+static CODE_GRAPH_BUILDS: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
 
-/// A11: build the code graph over the run's workspace in the background, once
-/// per session. Nothing else builds it (only the deferred `graph_rebuild`
-/// tool), so test selection and `graph_query by_name` silently fell back.
-/// Called when a consumer is enabled: test selection at run start, or the first
-/// `graph_query`. Locks the graph per file so consumers interleave with the
-/// build. Fail-open: an unparsable file is skipped; a fatal index error ends
-/// the build with the session left "not ready", so consumers keep falling back.
-fn start_code_graph_build(opts: &LoopOptions, session_id: &str) {
-    let (Some(graph), Some(root)) = (opts.code_graph.as_ref(), loop_cwd(opts)) else {
+/// A11: build the code graph over the session's workspace roots (or the process
+/// cwd when it has none) in the background, once per session, on its first
+/// `graph_query`. Nothing else builds it (only the deferred `graph_rebuild`
+/// tool), so `graph_query by_name` silently came back empty; the call that
+/// triggers the build answers from whatever is indexed so far.
+///
+/// Never runs for a run with its own cwd (a best-of-N candidate): its throwaway
+/// worktree would land in the shared, persistent graph. `ORIGIN_CODEGRAPH_
+/// AUTOBUILD=0` disables it (`graph_rebuild` is unaffected). The gitignore-aware
+/// walk stops after [`CODE_GRAPH_AUTO_MAX_FILES`] indexable files across all
+/// roots, and the graph is locked per file so queries interleave with the build.
+/// Fail-open: an unparsable file is skipped; a fatal index error ends the build.
+fn start_code_graph_build(opts: &LoopOptions, session_id: &str, session_roots: &[std::path::PathBuf]) {
+    if opts.cwd.is_some() || std::env::var("ORIGIN_CODEGRAPH_AUTOBUILD").as_deref() == Ok("0") {
+        return;
+    }
+    let Some(graph) = opts.code_graph.as_ref() else {
         return;
     };
-    let done = {
-        let mut builds = CODE_GRAPH_BUILDS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if builds.contains_key(session_id) {
-            return;
-        }
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        builds.insert(session_id.to_string(), Arc::clone(&done));
-        done
+    let roots: Vec<std::path::PathBuf> = if session_roots.is_empty() {
+        std::env::current_dir().ok().into_iter().collect()
+    } else {
+        session_roots.to_vec()
     };
-    let graph = Arc::clone(graph);
-    tokio::task::spawn_blocking(move || {
-        use origin_tools::builtins::{glob_tool, graph_rebuild};
-        // Gitignore-aware walk (the `Glob` tool's), then the supported grammars.
-        let Ok(found) = glob_tool::glob_v2(glob_tool::GlobArgs {
-            pattern: "**/*".into(),
-            path: Some(root.to_string_lossy().into_owned()),
-            head_limit: Some(u32::MAX),
-        }) else {
-            return;
-        };
-        let files = found
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(std::path::PathBuf::from)
-            .filter_map(|p| origin_codegraph::Language::from_path(&p).map(|lang| (lang, p)))
-            .take(CODE_GRAPH_AUTO_MAX_FILES);
-        for (lang, path) in files {
-            let mut idx = graph.blocking_lock();
-            if let Err(e) = graph_rebuild::graph_rebuild_tool(&mut idx, vec![path], lang) {
-                tracing::debug!(error = %e, "code-graph auto-build stopped; consumers keep their fallback");
-                return;
-            }
-        }
-        done.store(true, std::sync::atomic::Ordering::Release);
-    });
-}
-
-/// A11: whether this session's code-graph auto-build has finished. Until then
-/// test selection runs the full suite.
-fn code_graph_ready(session_id: &str) -> bool {
-    CODE_GRAPH_BUILDS
+    let first = CODE_GRAPH_BUILDS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(session_id)
-        .is_some_and(|done| done.load(std::sync::atomic::Ordering::Acquire))
+        .insert(session_id.to_string());
+    if !first {
+        return;
+    }
+    let graph = Arc::clone(graph);
+    tokio::task::spawn_blocking(move || {
+        use origin_codegraph::Language;
+        use origin_tools::builtins::{glob_tool, graph_rebuild};
+        let mut budget = CODE_GRAPH_AUTO_MAX_FILES;
+        for root in &roots {
+            let files = glob_tool::walk_files(root, budget, |p| Language::from_path(p).is_some());
+            budget -= files.len();
+            for path in files {
+                let Some(lang) = Language::from_path(&path) else {
+                    continue;
+                };
+                let mut idx = graph.blocking_lock();
+                if let Err(e) = graph_rebuild::graph_rebuild_tool(&mut idx, vec![path], lang) {
+                    tracing::debug!(error = %e, "code-graph auto-build stopped");
+                    return;
+                }
+            }
+        }
+    });
 }
 
 /// A12: the run's working directory — [`LoopOptions::cwd`] when set (a
@@ -4759,12 +4748,6 @@ async fn run_loop_inner(
         },
         _ => None,
     };
-    // A11: test selection reads the code graph, so start building it now (in
-    // the background, once per session); selection runs the full suite until
-    // the build finishes.
-    if matches!(std::env::var("ORIGIN_TEST_SELECT").as_deref(), Ok("1")) {
-        start_code_graph_build(opts, &session.id);
-    }
     // C8: reproduction-gate contract (opt-in). A standing instruction to write a
     // failing test FIRST for a reported bug, so a fix is verified against a real
     // fail→pass transition (execution-checked by the turn-end test run below).
@@ -5652,9 +5635,7 @@ async fn run_loop_inner(
                     if let Some(cmd) = cfg.test_command.as_deref() {
                         // #4: narrow the suite to the edit's blast radius when
                         // test-selection is enabled; falls back to `cmd` verbatim.
-                        // A11: only once this session's graph build finished.
-                        let graph = opts.code_graph.as_ref().filter(|_| code_graph_ready(&session.id));
-                        let cmd = effective_test_command(cmd, &lsp_edited_paths, graph).await;
+                        let cmd = effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
                         // Run the oracle now (fresh, not the stale `test_block`).
                         // C9: redact before it becomes a model-facing User message.
                         let mut fresh = crate::redact::text(
@@ -6623,7 +6604,7 @@ async fn run_loop_inner(
                     // is indexed so far (the result's note points at
                     // `graph_rebuild` when it is empty).
                     if meta.name == "graph_query" {
-                        start_code_graph_build(opts, &session.id);
+                        start_code_graph_build(opts, &session.id, &session.roots);
                     }
                     match dispatch_tool(
                         meta,
@@ -7039,9 +7020,7 @@ async fn run_loop_inner(
                     if let Some(cmd) = cfg.test_command.as_deref() {
                         // #4: narrow the suite to the edit's blast radius when
                         // test-selection is enabled; falls back to `cmd` verbatim.
-                        // A11: only once this session's graph build finished.
-                        let graph = opts.code_graph.as_ref().filter(|_| code_graph_ready(&session.id));
-                        let cmd = effective_test_command(cmd, &lsp_edited_paths, graph).await;
+                        let cmd = effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
                         test_block = crate::redact::string(
                             run_post_edit_test(&cmd, opts.cwd.as_deref())
                                 .await
@@ -10052,6 +10031,51 @@ mod dispatch_table_tests {
         let sql = origin_store::Store::open(&db_path).expect("open sqlite");
         let idx = origin_codegraph::index::CodeGraphIndex::new(cas, sql);
         (Arc::new(tokio::sync::Mutex::new(idx)), tmp)
+    }
+
+    /// A11-4: what test selection selects for a cross-file caller, with the
+    /// code graph FULLY built. `pkg/calc.py` defines `add`; the test in
+    /// `tests/test_calc.py` calls it. Editing `calc.py` should select that test
+    /// — it does not: graph edges are file-local only (`rebuild_one` drops any
+    /// endpoint defined in another file, and nothing else inserts edges), so
+    /// the reverse-dep expansion can only ever return the edited file itself.
+    /// Cross-file edges are the missing piece. Pinned as a characterisation of
+    /// that limit: if this starts failing, selection has learned to follow
+    /// callers — update the test to assert the caller's test IS selected.
+    #[tokio::test]
+    async fn test_selection_does_not_follow_cross_file_callers() {
+        let (graph, _g) = make_empty_code_graph();
+        let ws = tempfile::tempdir().expect("tempdir");
+        let root = ws.path().to_string_lossy().replace('\\', "/");
+        let calc = format!("{root}/pkg/calc.py");
+        let test = format!("{root}/tests/test_calc.py");
+        std::fs::create_dir_all(ws.path().join("pkg")).expect("mkdir");
+        std::fs::create_dir_all(ws.path().join("tests")).expect("mkdir");
+        std::fs::write(&calc, "def add(a, b):\n    return a + b\n").expect("write");
+        std::fs::write(
+            &test,
+            "from pkg.calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
+        )
+        .expect("write");
+        let groups = vec![(
+            origin_codegraph::Language::Python,
+            vec![std::path::PathBuf::from(&calc), std::path::PathBuf::from(&test)],
+        )];
+        rebuild_groups(&mut *graph.lock().await, groups).expect("rebuild");
+        // Exactly the two steps `effective_test_command` takes.
+        let idx = graph.lock().await;
+        assert!(!idx.nodes_in_file(&calc).expect("q").is_empty(), "graph built");
+        assert!(!idx.nodes_in_file(&test).expect("q").is_empty(), "graph built");
+        let impacted =
+            origin_codegraph::query::reverse_dep_files(&idx, std::slice::from_ref(&calc)).expect("deps");
+        drop(idx);
+        assert_eq!(impacted, vec![calc.clone()], "only the edited file comes back");
+        let selection = origin_postedit::select_tests("pytest", &impacted);
+        assert_eq!(
+            selection,
+            origin_postedit::Selection::Narrowed(format!("pytest {root}/pkg")),
+            "the caller's test in tests/ is not selected"
+        );
     }
 
     /// Every tool advertised to the model via `tools_schema = registry_iter().map(...)`

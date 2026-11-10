@@ -423,13 +423,61 @@ async fn checkpoints_follow_the_loop_cwd() {
     );
 }
 
-/// A11: with test selection enabled and no `graph_rebuild` call, the code
-/// graph is built in the background for the run's workspace.
+/// A11: one fresh session whose model calls `graph_query` once, then stops.
+async fn run_graph_query_session(opts: &LoopOptions, roots: Vec<std::path::PathBuf>) {
+    let query = Block::ToolUse {
+        id: "tu_q".into(),
+        name: "graph_query".into(),
+        input_json: serde_json::to_vec(&serde_json::json!({"kind": "by_name", "args": {"name": "add"}}))
+            .expect("json"),
+        cache_marker: None,
+    };
+    let provider = ScriptedProvider::new(vec![
+        ChatResponse {
+            assistant: Message::new(Role::Assistant).with_block(query),
+            usage: Usage::default(),
+        },
+        ChatResponse {
+            assistant: Message::new(Role::Assistant).with_block(Block::text("done")),
+            usage: Usage::default(),
+        },
+    ]);
+    let mut session = Session::new("test", "claude-opus-4-7");
+    session.roots = roots;
+    run_loop(&mut session, "find add", &provider, &AlwaysAllow, opts)
+        .await
+        .expect("loop ok");
+}
+
+/// A11: whether `file` has graph nodes within `wait`.
+async fn indexed_within(
+    graph: &tokio::sync::Mutex<origin_codegraph::index::CodeGraphIndex>,
+    file: &str,
+    wait: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if !graph.lock().await.nodes_in_file(file).expect("query").is_empty() {
+            return true;
+        }
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// A11: the first `graph_query` of a session builds the code graph over the
+/// session's workspace roots in the background (no `graph_rebuild` call) —
+/// except for a run with its own cwd (a best-of-N candidate: its throwaway
+/// worktree must not land in the shared, persistent graph) and when
+/// `ORIGIN_CODEGRAPH_AUTOBUILD=0`.
 #[tokio::test]
-async fn test_selection_builds_the_code_graph_in_the_background() {
+async fn first_graph_query_builds_the_code_graph_in_the_background() {
     let ws = tempdir().expect("tempdir");
     let src = ws.path().join("calc.py");
     std::fs::write(&src, "def add(a, b):\n    return a + b\n").expect("write");
+    let file = src.display().to_string();
     let db = tempdir().expect("tempdir");
     let cas = Store::open(StoreConfig {
         root: db.path().join("cas"),
@@ -442,29 +490,39 @@ async fn test_selection_builds_the_code_graph_in_the_background() {
     let graph = Arc::new(tokio::sync::Mutex::new(
         origin_codegraph::index::CodeGraphIndex::new(cas, sql),
     ));
-    let provider = ScriptedProvider::new(vec![ChatResponse {
-        assistant: Message::new(Role::Assistant).with_block(Block::text("done")),
-        usage: Usage::default(),
-    }]);
-    let opts = LoopOptions {
+    let short = std::time::Duration::from_millis(1500);
+
+    // A run with a cwd override never auto-builds.
+    let candidate = LoopOptions {
         code_graph: Some(Arc::clone(&graph)),
         cwd: Some(ws.path().to_path_buf()),
         ..LoopOptions::default().without_streaming()
     };
-    let mut session = Session::new("test", "claude-opus-4-7");
-    std::env::set_var("ORIGIN_TEST_SELECT", "1");
-    let res = run_loop(&mut session, "hi", &provider, &AlwaysAllow, &opts).await;
-    std::env::remove_var("ORIGIN_TEST_SELECT");
-    res.expect("loop ok");
+    run_graph_query_session(&candidate, vec![ws.path().to_path_buf()]).await;
+    assert!(
+        !indexed_within(&graph, &file, short).await,
+        "cwd override must not build"
+    );
 
-    let file = src.display().to_string();
-    for _ in 0..100 {
-        if !graph.lock().await.nodes_in_file(&file).expect("query").is_empty() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    panic!("code graph never indexed {file}");
+    let opts = LoopOptions {
+        code_graph: Some(Arc::clone(&graph)),
+        ..LoopOptions::default().without_streaming()
+    };
+    // The escape hatch disables it.
+    std::env::set_var("ORIGIN_CODEGRAPH_AUTOBUILD", "0");
+    run_graph_query_session(&opts, vec![ws.path().to_path_buf()]).await;
+    std::env::remove_var("ORIGIN_CODEGRAPH_AUTOBUILD");
+    assert!(
+        !indexed_within(&graph, &file, short).await,
+        "ORIGIN_CODEGRAPH_AUTOBUILD=0 must not build"
+    );
+
+    // Default: the first graph_query indexes the session's roots.
+    run_graph_query_session(&opts, vec![ws.path().to_path_buf()]).await;
+    assert!(
+        indexed_within(&graph, &file, std::time::Duration::from_secs(10)).await,
+        "code graph never indexed {file}"
+    );
 }
 
 /// A1 regression: a fresh >2 KiB result from a Mutating tool (Bash) must reach
