@@ -6289,7 +6289,7 @@ async fn run_loop_inner(
         // consumes the notices so each is shown exactly once.
         let swarm_notices_block = SWARM_COLLAB.try_with(drain_own_swarm_notices).unwrap_or_default();
         // Non-blocking swarm delivery: drain any background sub-agents that have
-        // FINISHED and fold their results into this turn's trailing context as a
+        // FINISHED and add their results to the history as a
         // `<background-results>` block. Draining removes them (delivered once).
         // Empty (none finished, or no registry) ⇒ empty string ⇒ byte-identical.
         // Skipped for self-dispatch sessions (their ids never hold user jobs).
@@ -6310,6 +6310,19 @@ async fn run_loop_inner(
             }
             _ => String::new(),
         };
+        // B8: the finished workers' reports are persisted on the last message
+        // (like `prompt_volatile_block`), not sent as volatile context: they
+        // then survive later turns, resume, compaction and a failed request.
+        if !bg_results_block.is_empty() {
+            let block = Block::text(crate::redact::string(bg_results_block));
+            match session.messages.last_mut() {
+                Some(last) if !matches!(last.role, Role::Assistant) => last.blocks.push(block),
+                _ => session.push(Message {
+                    role: Role::User,
+                    blocks: vec![block],
+                }),
+            }
+        }
         // Per-turn system prompt. When the optional post-edit LSP-diagnostics
         // feature produced a block on the previous turn, append it here so the
         // model sees the feedback its edit generated. The swarm-notices block (if
@@ -6338,7 +6351,6 @@ async fn run_loop_inner(
                 &repro_gate_block,
                 &relocalize_block,
                 &swarm_notices_block,
-                &bg_results_block,
             ] {
                 if !b.is_empty() {
                     blocks.push(b);

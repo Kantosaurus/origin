@@ -396,6 +396,93 @@ async fn background_results_drain_taints_the_parent() {
     assert_bash_asked_after_taint(&human);
 }
 
+/// Replies (or fails) from a queue and records every request it is sent.
+struct RecordingProvider {
+    replies: Mutex<Vec<Result<Block, String>>>,
+    seen: Mutex<Vec<ChatRequest>>,
+}
+
+#[async_trait]
+impl Provider for RecordingProvider {
+    fn name(&self) -> &'static str {
+        "scripted"
+    }
+    async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError> {
+        self.seen.lock().expect("lock").push(req);
+        let mut q = self.replies.lock().expect("lock");
+        match (!q.is_empty()).then(|| q.remove(0)) {
+            Some(Ok(b)) => Ok(ChatResponse {
+                assistant: Message::new(Role::Assistant).with_block(b),
+                usage: Usage::default(),
+            }),
+            Some(Err(e)) => Err(ProviderError::Api(e)),
+            None => Err(ProviderError::Api("no more scripted responses".into())),
+        }
+    }
+}
+
+/// B8: a finished background worker's report is kept in the session, not
+/// shown in one request only: a provider error on the request that first
+/// carries it does not lose it, and every later request (and the stored
+/// session) still has it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn background_results_are_kept_in_the_session() {
+    let tmp = tempfile::TempDir::new().expect("tmp");
+    let coord = coordinator_reporting(&tmp, false);
+    let handle = finished_worker(&coord).await;
+    let bg = std::sync::Arc::new(origin_daemon::bg_jobs::BackgroundJobs::new());
+    let mut session = Session::new("scripted", "m");
+    bg.register(
+        &session.id,
+        origin_daemon::bg_jobs::BgJob {
+            id_hex: "w1".into(),
+            goal: "fetch the page".into(),
+            handle,
+            dispatched_at: std::time::Instant::now(),
+        },
+    )
+    .await
+    .expect("register");
+    let provider = RecordingProvider {
+        replies: Mutex::new(vec![
+            Err("overloaded".into()),
+            Ok(tool("t", "TodoWrite", &serde_json::json!({ "todos": [] }))),
+            Ok(Block::text("done")),
+        ]),
+        seen: Mutex::new(Vec::new()),
+    };
+    let mut opts = LoopOptions::default().without_streaming();
+    opts.coordinator = Some(coord);
+    opts.background_jobs = Some(bg);
+    let allow = origin_permission::prompt::AlwaysAllow;
+    assert!(run_loop(&mut session, "go", &provider, &allow, &opts)
+        .await
+        .is_err());
+    run_loop(&mut session, "go on", &provider, &allow, &opts)
+        .await
+        .expect("second run");
+    let has_block = |msgs: &[Message]| {
+        msgs.iter().flat_map(|m| &m.blocks).any(|b| match b {
+            Block::Text { text, .. } => {
+                text.contains("<background-results>") && text.contains("fetch the page")
+            }
+            _ => false,
+        })
+    };
+    let seen = provider.seen.lock().expect("lock");
+    assert_eq!(seen.len(), 3);
+    for (i, req) in seen.iter().enumerate() {
+        assert!(
+            has_block(&req.messages),
+            "request {i} lacks the background results"
+        );
+    }
+    assert!(
+        has_block(&session.messages),
+        "the session keeps the background results"
+    );
+}
+
 /// A person who denies every command-guard ask (so no flagged command ever
 /// runs) and approves every other ask, choosing "always" whenever it is
 /// offered (which records a standing allow, as the IPC prompter does).
