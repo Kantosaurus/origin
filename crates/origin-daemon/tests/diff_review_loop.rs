@@ -53,6 +53,15 @@ fn write(path: &str, content: &str) -> Vec<Block> {
 
 /// Run one loop over `turns` with the flag set to `flag`.
 fn run(flag: bool, turns: Vec<Vec<Block>>) -> (Result<LoopSummary, LoopError>, Vec<ChatRequest>) {
+    run_capped(flag, None, turns)
+}
+
+/// [`run`] with an optional `max_turns`.
+fn run_capped(
+    flag: bool,
+    max_turns: Option<u32>,
+    turns: Vec<Vec<Block>>,
+) -> (Result<LoopSummary, LoopError>, Vec<ChatRequest>) {
     let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if flag {
         std::env::set_var("ORIGIN_DIFF_REVIEW", "1");
@@ -78,7 +87,10 @@ fn run(flag: bool, turns: Vec<Vec<Block>>) -> (Result<LoopSummary, LoopError>, V
         .build()
         .expect("runtime");
     let mut session = Session::new("diff-review", "scripted-model");
-    let opts = LoopOptions::default().without_streaming();
+    let mut opts = LoopOptions::default().without_streaming();
+    if let Some(m) = max_turns {
+        opts.max_turns = m;
+    }
     let out = rt.block_on(run_loop(&mut session, PROMPT, &provider, &AlwaysAllow, &opts));
     std::env::remove_var("ORIGIN_DIFF_REVIEW");
     let requests = std::mem::take(&mut *provider.requests.lock().expect("lock"));
@@ -188,4 +200,45 @@ fn failed_review_is_not_fatal_and_the_flag_is_opt_in() {
     assert_eq!(out.expect("run ok").assistant_text, "done");
     assert_eq!(requests.len(), 2);
     assert!(!write_result(&requests[1]).0.contains("[tripwire]"));
+}
+
+/// I1: no review on the last allowed turn — its findings could only turn a
+/// finished run into `MaxTurns`.
+#[test]
+fn no_review_on_the_last_allowed_turn() {
+    let d = tempfile::tempdir().expect("tempdir");
+    let path = d.path().join("c.txt").to_string_lossy().into_owned();
+    let (out, requests) = run_capped(
+        true,
+        Some(2),
+        vec![write(&path, "x\n"), text("done"), text("1. a finding")],
+    );
+    assert_eq!(out.expect("finished run stays Ok").assistant_text, "done");
+    assert_eq!(requests.len(), 2, "no review request on the last turn");
+}
+
+/// M8: an `ApplyPatch` touching two files puts both in the review diff.
+#[test]
+fn apply_patch_touching_two_files_is_reviewed_whole() {
+    let d = tempfile::tempdir().expect("tempdir");
+    let a = d.path().join("one.txt").to_string_lossy().into_owned();
+    let b = d.path().join("two.txt").to_string_lossy().into_owned();
+    let patch =
+        format!("*** Begin Patch\n*** Add File: {a}\n+alpha\n*** Add File: {b}\n+beta\n*** End Patch\n");
+    let call = vec![Block::ToolUse {
+        id: "tu_p".into(),
+        name: "ApplyPatch".into(),
+        input_json: serde_json::to_vec(&serde_json::json!({ "patch": patch })).expect("json"),
+        cache_marker: None,
+    }];
+    let (out, requests) = run(true, vec![call, text("done"), text("NO FINDINGS")]);
+    assert_eq!(out.expect("run ok").assistant_text, "done");
+    assert_eq!(std::fs::read_to_string(&b).expect("patched").trim(), "beta");
+    let input = all_text(&requests.last().expect("review").messages[0]);
+    for (p, line) in [(&a, "+alpha"), (&b, "+beta")] {
+        assert!(
+            input.contains(&format!("+++ b/{p}")) && input.contains(line),
+            "{input}"
+        );
+    }
 }

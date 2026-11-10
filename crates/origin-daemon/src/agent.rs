@@ -5100,8 +5100,7 @@ async fn run_loop_inner(
     // C6 (`ORIGIN_DIFF_REVIEW=1`): each file's content before this run first
     // edited it (tripwires + the one end-of-run review), and whether it ran.
     let diff_review = crate::diff_review::enabled();
-    let mut review_before: std::collections::BTreeMap<String, Option<String>> =
-        std::collections::BTreeMap::new();
+    let mut review_before = crate::diff_review::Run::new();
     let mut diff_reviewed = false;
     // C9: regression baseline. With auto_test on, run the suite ONCE before any
     // edit, so a post-edit failure can be classified as a true regression
@@ -5979,7 +5978,8 @@ async fn run_loop_inner(
             // C6: one fresh-context, tool-less review of this run's diff. Its
             // findings come back as one trailing message (one more round); a
             // failed call is logged and the run ends normally.
-            if diff_review && !diff_reviewed {
+            // I1: never on the last allowed turn (findings could only end in MaxTurns).
+            if diff_review && !diff_reviewed && turn < opts.max_turns {
                 diff_reviewed = true;
                 if let Some(diff) = crate::diff_review::run_diff(&review_before) {
                     match turn_provider
