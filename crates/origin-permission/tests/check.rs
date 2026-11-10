@@ -12,7 +12,6 @@ const fn meta(name: &'static str, tier: Tier) -> ToolMeta {
         side_effects: SideEffects::Pure,
         input_schema: "{}",
         sandbox_profile: SandboxProfile::Inherit,
-        token_budget: origin_tools::DEFAULT_TOKEN_BUDGET,
         hot: true,
     }
 }

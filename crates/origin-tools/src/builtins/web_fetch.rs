@@ -86,7 +86,6 @@ crate::origin_tool! {
     side_effects: SideEffects::Pure,
     input_schema: r#"{"type":"object","properties":{"url":{"type":"string","description":"A single URL to fetch."},"urls":{"type":"array","items":{"type":"string"},"maxItems":20,"description":"Up to 20 URLs to fetch in one call; takes precedence over `url` when present."}}}"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
-    token_budget: crate::DEFAULT_TOKEN_BUDGET,
     hot: false,
 }
 

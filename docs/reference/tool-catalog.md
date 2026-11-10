@@ -24,7 +24,6 @@ Every builtin carries this metadata (`crates/origin-tools/src/registry.rs`):
 | `side_effects` | `SideEffects` | `Pure` (read-only) or `Mutating`. |
 | `input_schema` | `&str` | JSON Schema string for the arguments. |
 | `sandbox_profile` | `SandboxProfile` | Confinement applied to child processes (see below). |
-| `token_budget` | `u32` | Advisory result-size cap (default `25_000`). |
 | `hot` | `bool` | `true` ⇒ full schema in the system prompt; `false` ⇒ deferred behind `ToolSearch`. |
 
 ### Permission tiers (`Tier`)
@@ -162,8 +161,8 @@ dispatched through the same permission/sandbox path as builtins. See
 Large results are content-addressed: a tool may return a **CAS handle** that the
 model inflates with `Recall`. Array-heavy JSON is compacted by `SchemaCrush`
 (`array_crush`), and the dispatch layer memoizes pure-tool results (see
-`MEMOIZATION_SKIPLIST` in `dispatch.rs`). The `token_budget` field is advisory
-metadata only — live bounds come from each builtin's own `head_limit` plus
+`MEMOIZATION_SKIPLIST` in `dispatch.rs`). Live bounds come from each builtin's
+own caps (`head_limit`, `Read`'s 100,000-byte page, `Bash`'s stdout budget) plus
 `SchemaCrush` and the dispatch result cache.
 
 ---

@@ -28,7 +28,7 @@ use origin_keyvault::KeyVault;
 use origin_permission::prompt::Prompter;
 use origin_provider::Provider;
 use origin_swarm::{CompletionReport, McpServerSpec, ReportStatus, Usage, WorkerContext, WorkerFn};
-use origin_tools::{DynTool, SandboxProfile, SideEffects, Tier, ToolMeta, Urgency, DEFAULT_TOKEN_BUDGET};
+use origin_tools::{DynTool, SandboxProfile, SideEffects, Tier, ToolMeta, Urgency};
 use tokio::sync::RwLock;
 
 use crate::agent::{run_loop, scope_runtime_tools, scope_swarm_collab, LoopOptions, SwarmCollab};
@@ -129,7 +129,6 @@ async fn build_runtime_tools(
                 side_effects: SideEffects::Mutating,
                 input_schema,
                 sandbox_profile: SandboxProfile::Inherit,
-                token_budget: DEFAULT_TOKEN_BUDGET,
                 hot: false,
             };
             // Wire schema validation (validate model args pre-call) and CAS hand-off

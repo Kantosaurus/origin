@@ -285,7 +285,6 @@ crate::origin_tool! {
     side_effects: crate::SideEffects::Mutating,
     input_schema: r#"{"type":"object","required":["goal","allowed_tools"],"properties":{"goal":{"type":"string"},"allowed_tools":{"type":"array","items":{"type":"string"}},"budget":{"type":"object"},"model":{"type":"string"},"background":{"type":"boolean","description":"Run non-blocking in the background (default true). Set false to await the result in this turn."},"mcp_servers":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"url":{"type":"string"}},"required":["name"]}}}}"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
-    token_budget: crate::DEFAULT_TOKEN_BUDGET,
     // hot: the full schema is always advertised to the model (no ToolSearch
     // round-trip first). Task being deferred was why swarm was never invoked.
     hot: true,
@@ -299,7 +298,6 @@ crate::origin_tool! {
     side_effects: crate::SideEffects::Pure,
     input_schema: r#"{"type":"object","properties":{"ids":{"type":"array","items":{"type":"string"},"description":"Optional worker ids to gather; omit to gather all background jobs for this session."}}}"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
-    token_budget: crate::DEFAULT_TOKEN_BUDGET,
     // hot so the model can gather background results in-turn without a ToolSearch.
     hot: true,
 }

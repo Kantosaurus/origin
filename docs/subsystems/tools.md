@@ -83,8 +83,6 @@ pub struct ToolMeta {
     pub input_schema: &'static str,
     /// Per-tool sandbox profile applied to child processes this tool spawns.
     pub sandbox_profile: SandboxProfile,
-    /// Approximate token budget for this tool's serialised result (default 25k).
-    pub token_budget: u32,
     /// "Hot" tools have their full schema embedded in the system prompt.
     /// "Deferred" tools advertise only {name, description}; their schemas
     /// are fetched on demand via `ToolSearch`.
@@ -118,14 +116,12 @@ pub enum SideEffects { Pure, Mutating }
 - **`SandboxProfile`** (re-exported from `origin-sandbox`) is the per-tool
   confinement applied to any child process the tool spawns.
 
-`DEFAULT_TOKEN_BUDGET` is `25_000` (`lib.rs`).
-
 ### The registration macro
 
 Tools register their metadata with the `origin_tool!` macro
-(`crates/origin-tools/src/macros.rs`). It is a declarative macro with four
-arms, from "everything specified" down to "defaults for sandbox, token_budget,
-and hot". The fullest form:
+(`crates/origin-tools/src/macros.rs`). It is a declarative macro with three
+arms, from "everything specified" down to "defaults for sandbox and hot". The
+fullest form:
 
 ```rust
 #[macro_export]
@@ -138,7 +134,6 @@ macro_rules! origin_tool {
         side_effects: $sfx:expr,
         input_schema: $schema:expr,
         sandbox: $sandbox:expr,
-        token_budget: $budget:expr,
         hot: $hot:expr
         $(,)?
     ) => {
@@ -151,18 +146,15 @@ macro_rules! origin_tool {
                 side_effects: $sfx,
                 input_schema: $schema,
                 sandbox_profile: $sandbox,
-                token_budget: $budget,
                 hot: $hot,
             }
         }
     };
-    // … shorter arms default `sandbox: SandboxProfile::Inherit`,
-    //    `token_budget: DEFAULT_TOKEN_BUDGET`, and `hot: true`.
+    // … shorter arms default `sandbox: SandboxProfile::Inherit` and `hot: true`.
 }
 ```
 
 The shorter arms apply, in order: default `hot: true`; default
-`token_budget: DEFAULT_TOKEN_BUDGET`; default
 `sandbox_profile: SandboxProfile::Inherit`. So a minimal registration only needs
 `name`, `description`, `tier`, `urgency`, `side_effects`, and `input_schema` —
 everything else defaults. A representative real registration, the `Read` tool
@@ -248,7 +240,7 @@ each module's registration.
 
 | Tool | Purpose | Tier | Side-effects | Sandbox | Hot | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| `Read` | Line-numbered file read; `as: text\|image\|pdf` | AutoAllowed | Pure | `ReadFs` | yes | Refuses symlinks; default limit 1000 lines, max 50000; images report dims, PDFs extract text (`read.rs`). |
+| `Read` | Line-numbered file read; `as: text\|image\|pdf` | AutoAllowed | Pure | `ReadFs` | yes | Refuses symlinks; default limit 1000 lines, max 50000; output capped at 100,000 bytes and 2,000 chars per line, with a `[N more lines — call Read with offset=<next>]` footer; images report dims, PDFs extract text (`read.rs`). |
 | `Write` | Create/overwrite a UTF-8 file (atomic) | RequiresPermission | Mutating | `WriteCwd` | yes | Refuses to clobber an unread existing file unless `force` (`write.rs`). |
 | `Edit` | Find-and-replace a unique string in a file | RequiresPermission | Mutating | `WriteCwd` | yes | CRLF-safe; `replace_all` for multi-match; returns `{ok, diff}`, a 3-line-context unified diff (`edit.rs`). |
 | `MultiEdit` | Apply a sequence of edits to one file atomically | RequiresPermission | Mutating | `WriteCwd` | yes | Single read + single write per call (`multi_edit.rs`). |
@@ -956,8 +948,6 @@ A checklist for adding a builtin tool to `origin-tools`:
      in lock-step with the args struct.
    - `sandbox`: `ReadFs` for read-only file tools, `WriteCwd` for mutators,
      `Shell` for exec, `Network` for outbound HTTPS, else `Inherit`.
-   - `token_budget`: usually `DEFAULT_TOKEN_BUDGET` (25k); raise/lower for chatty
-     tools and self-cap output in the tool body.
    - `hot`: `true` only for tools the model needs in the base loop; default cold
      tools to `false` so they cost just `{name, description}` until `ToolSearch`.
 4. **Wire dispatch** in the daemon: map `ToolMeta.name` to the behaviour function

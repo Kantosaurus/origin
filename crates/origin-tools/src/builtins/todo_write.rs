@@ -33,7 +33,6 @@ crate::origin_tool! {
         "required":["todos"]
     }"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
-    token_budget: crate::DEFAULT_TOKEN_BUDGET,
     hot: true,
 }
 

@@ -51,15 +51,41 @@ pub fn read_v2(args: ReadArgs) -> Result<String, ToolError> {
     }
 }
 
+/// Byte cap on one text `Read` result, footer included.
+const MAX_READ_BYTES: usize = 100_000;
+/// Lines longer than this many characters are cut and marked.
+const MAX_LINE_CHARS: usize = 2_000;
+/// Room kept under [`MAX_READ_BYTES`] for the continuation footer.
+const FOOTER_RESERVE: usize = 128;
+
 fn read_text(bytes: &[u8], args: &ReadArgs) -> Result<String, ToolError> {
     let det = text_fmt::detect(bytes);
     let text = text_fmt::normalise_to_lf(bytes, &det)?;
     let offset = args.offset.unwrap_or(0) as usize;
     let limit = args.limit.unwrap_or(1000) as usize;
-    let mut out = String::with_capacity(text.len());
+    let mut out = String::new();
+    // 0-based index of the first line NOT returned: the offset to resume at.
+    let mut next = offset;
     for (idx, line) in text.lines().enumerate().skip(offset).take(limit) {
         let line_no = idx + 1;
-        let _ = writeln!(out, "{line_no:>6}\t{line}");
+        let row = match line.char_indices().nth(MAX_LINE_CHARS) {
+            Some((cut, _)) => format!(
+                "{line_no:>6}\t{}\u{2026} [line truncated: {} chars]\n",
+                &line[..cut],
+                line.chars().count()
+            ),
+            None => format!("{line_no:>6}\t{line}\n"),
+        };
+        // A capped row is ≤ ~8 KB, so the first row always fits: paging always advances.
+        if out.len() + row.len() > MAX_READ_BYTES - FOOTER_RESERVE {
+            break;
+        }
+        out.push_str(&row);
+        next = idx + 1;
+    }
+    let more = text.lines().count().saturating_sub(next);
+    if more > 0 {
+        let _ = writeln!(out, "[{more} more lines \u{2014} call Read with offset={next}]");
     }
     Ok(out)
 }

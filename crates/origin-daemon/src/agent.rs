@@ -2156,7 +2156,6 @@ mod runtime_tools_tests {
             side_effects: SideEffects::Mutating,
             input_schema: r#"{"type":"object"}"#,
             sandbox_profile: SandboxProfile::Inherit,
-            token_budget: 1024,
             hot: false,
         }))
     }
@@ -10588,7 +10587,6 @@ mod wiring_tests {
             side_effects: SideEffects::Mutating,
             input_schema: r#"{"type":"object"}"#,
             sandbox_profile: origin_tools::SandboxProfile::Inherit,
-            token_budget: 1024,
             hot: false,
         }
     }

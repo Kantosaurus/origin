@@ -10,7 +10,6 @@ origin_tools::origin_tool! {
     side_effects: SideEffects::Pure,
     input_schema: r#"{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
-    token_budget: origin_tools::DEFAULT_TOKEN_BUDGET,
     hot: false,
 }
 
@@ -32,13 +31,6 @@ fn tool_meta_fields_present() {
     assert_eq!(meta.urgency, Urgency::Low);
     assert_eq!(meta.side_effects, SideEffects::Pure);
     assert!(!meta.input_schema.is_empty());
-}
-
-#[test]
-fn every_tool_has_nonzero_token_budget() {
-    for meta in origin_tools::registry_iter() {
-        assert!(meta.token_budget > 0, "tool {} has zero token_budget", meta.name);
-    }
 }
 
 #[test]

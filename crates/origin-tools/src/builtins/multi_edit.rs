@@ -210,5 +210,4 @@ crate::origin_tool! {
         "required": ["file_path", "edits"]
     }"#,
     sandbox: ::origin_sandbox::SandboxProfile::WriteCwd,
-    token_budget: 4_000,
 }
