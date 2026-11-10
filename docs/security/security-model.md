@@ -431,6 +431,9 @@ unless listed in `ORIGIN_ENV_PASSTHROUGH`. For them the allow-list includes
 `XDG_RUNTIME_DIR`; being on the allow-list, these reach every child process,
 Bash included. The ssh agent socket (`SSH_AUTH_SOCK`, a path, not a key) and
 `PKG_CONFIG_PATH`, `TZ`, `SDKROOT`, `DEVELOPER_DIR` are on the allow-list too.
+Because `SSH_AUTH_SOCK` is passed to child processes, a command the model runs
+can use your ssh agent (for example to push over ssh), as it could before the
+allow-list existed.
 `ORIGIN_ENV_PASSTHROUGH` adds names (for example
 `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, or
 registry URLs such as `GOPROXY`, `PIP_INDEX_URL`, `NPM_CONFIG_REGISTRY`,
@@ -701,8 +704,16 @@ inside; a Bash command writes wherever the user can, so protected paths and
 `.git/hooks` or `~/.ssh` under a standing "Always allow Bash" is not asked
 again); the workflows file is read when the user is asked about a `RunWorkflow`
 and again when it runs, so a workflow replaced in between runs with grants the
-user did not see; Unix symlink resolution and a live TUI session were not
-exercised when this was built.
+user did not see; best-of-N with a workspace that is a sub-directory of the
+repository runs its candidates at the repository root of their worktrees, so
+their changes usually fall outside the workspace and the winner is refused; the
+token counters miss a run the user interrupts (the interrupted turn is dropped
+before it records its totals, so none of that run's tokens are counted); while a
+background sub-agent is still running, a repeated identical `Read` in the parent
+can be served from the memo (marked as cached) even though the sub-agent has
+changed the file — the memo is cleared when the sub-agent's result is collected;
+Unix symlink resolution and a live TUI session were not exercised when this was
+built.
 
 ## Sub-agents (`Task`)
 
