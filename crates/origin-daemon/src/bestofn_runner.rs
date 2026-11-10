@@ -523,6 +523,20 @@ impl<'a> WorktreeArena<'a> {
             .map_err(|e| format!("could not find the repository root: {}", one_line(&e.to_string())))
     }
 
+    /// C5: the workspace's root-relative directory inside the repository
+    /// (`sub/`), or empty when the workspace is the repository root.
+    fn prefix(&self) -> Result<String, String> {
+        self.git
+            .run(&["rev-parse", "--show-prefix"])
+            .map(|p| p.trim_end_matches(['\r', '\n']).to_owned())
+            .map_err(|e| {
+                format!(
+                    "could not find the workspace in the repository: {}",
+                    one_line(&e.to_string())
+                )
+            })
+    }
+
     /// C5: the root-relative paths the patch at `patch` touches.
     fn patch_paths(top: &std::path::Path, patch: &std::path::Path) -> Result<Vec<String>, String> {
         // `-z`: `added\tdeleted\tpath\0`, or for a rename an empty path field
@@ -649,16 +663,27 @@ impl CandidateArena for WorktreeArena<'_> {
         // or reverted): the applied tree is re-tested below instead.
         let checked = self.toplevel().and_then(|top| {
             let touched = Self::patch_paths(&top, &tmp)?;
+            let prefix = self.prefix()?;
             let dirty = Self::dirty_paths(&top)?;
-            Ok((top, touched, dirty))
+            Ok((top, touched, prefix, dirty))
         });
-        let (top, touched, dirty) = match checked {
+        let (top, touched, prefix, dirty) = match checked {
             Ok(v) => v,
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e);
             }
         };
+        // C5: the patch applies from the repository top level, so a workspace
+        // in a sub-directory must not have files outside it changed unasked.
+        let outside: Vec<&String> = touched.iter().filter(|p| !p.starts_with(&prefix)).collect();
+        if !outside.is_empty() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "the winning diff changes {}, outside the session workspace, so it was not applied",
+                quoted_list(&outside)
+            ));
+        }
         let (overlap, others): (Vec<String>, Vec<String>) =
             dirty.into_iter().partition(|d| touched.contains(d));
         if !overlap.is_empty() {
@@ -1143,18 +1168,75 @@ mod tests {
         ])
         .unwrap();
         let base = root.run(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
-        std::fs::write(repo.path().join("a.txt"), "first attempt\n").unwrap();
+        std::fs::write(repo.path().join("sub").join("keep.txt"), "first attempt\n").unwrap();
         let sub = repo.path().join("sub");
         let git = crate::selfdev::ProcessGitRunner::new(&sub);
         let scratch = tempfile::tempdir().unwrap();
         let runner = |_i: usize, wt: &std::path::Path| -> Result<(), String> {
-            std::fs::write(wt.join("a.txt"), "candidate\n").map_err(|e| e.to_string())
+            std::fs::write(wt.join("sub").join("keep.txt"), "candidate\n").map_err(|e| e.to_string())
         };
         let mut arena = WorktreeArena::new(&git, base, scratch.path(), &sub, None, Box::new(runner));
         let res = arena.run_candidate(0).unwrap();
         let err = arena.apply_winner(&res.diff).expect_err("refused");
         drop(arena);
-        assert!(err.contains("\"a.txt\""), "{err}");
+        assert!(
+            err.contains("uncommitted changes") && err.contains("\"sub/keep.txt\""),
+            "{err}"
+        );
+    }
+
+    /// C5 (FF1): with the workspace at `sub/`, a winner that changes a file
+    /// outside `sub/` is refused (named in the reason) and that file is left
+    /// as it was; a winner that changes only files under `sub/` is applied.
+    #[test]
+    fn a_winner_touching_files_outside_a_sub_directory_workspace_is_not_applied() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = crate::selfdev::ProcessGitRunner::new(repo.path());
+        root.run(&["init", "-q"]).unwrap();
+        std::fs::create_dir_all(repo.path().join("sub")).unwrap();
+        std::fs::write(repo.path().join("root.txt"), "root\n").unwrap();
+        std::fs::write(repo.path().join("sub").join("in.txt"), "in\n").unwrap();
+        root.run(&["add", "-A"]).unwrap();
+        root.run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ])
+        .unwrap();
+        let base = root.run(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let sub = repo.path().join("sub");
+        let git = crate::selfdev::ProcessGitRunner::new(&sub);
+        let scratch = tempfile::tempdir().unwrap();
+        let runner = |i: usize, wt: &std::path::Path| -> Result<(), String> {
+            let target = if i == 0 {
+                wt.join("root.txt")
+            } else {
+                wt.join("sub").join("in.txt")
+            };
+            std::fs::write(target, "candidate\n").map_err(|e| e.to_string())
+        };
+        let mut arena = WorktreeArena::new(&git, base, scratch.path(), &sub, None, Box::new(runner));
+        let outside = arena.run_candidate(0).unwrap();
+        let err = arena.apply_winner(&outside.diff).expect_err("refused");
+        assert!(err.contains("\"root.txt\"") && err.contains("outside"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("root.txt")).unwrap(),
+            "root\n"
+        );
+        let inside = arena.run_candidate(1).unwrap();
+        arena.apply_winner(&inside.diff).expect("applied");
+        drop(arena);
+        assert_eq!(
+            std::fs::read_to_string(sub.join("in.txt")).unwrap().trim_end(),
+            "candidate"
+        );
     }
 
     /// C5 case (c): the winner touches only clean files, but other files carry
