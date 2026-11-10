@@ -365,6 +365,64 @@ async fn relative_tool_paths_resolve_against_loop_cwd() {
     );
 }
 
+/// A12: with `ORIGIN_CHECKPOINTS=1`, a run with its own working directory
+/// snapshots THAT tree into ITS shadow history (`<cwd>/.origin/shadow.git`),
+/// not the daemon's process cwd — the user's real checkout.
+#[tokio::test]
+async fn checkpoints_follow_the_loop_cwd() {
+    let ws = tempdir().expect("tempdir");
+    let shadow = ws.path().join(".origin").join("shadow.git");
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&shadow)
+            .args(args)
+            .current_dir(ws.path())
+            .output()
+            .expect("spawn git");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    // Initialised the way `origin checkpoint` (origin-cli vcs.rs) does it.
+    let ws_s = ws.path().to_string_lossy().into_owned();
+    std::fs::create_dir_all(ws.path().join(".origin")).expect("mkdir");
+    git(&["--work-tree", &ws_s, "init", "-q"]);
+    git(&["config", "core.worktree", &ws_s]);
+    git(&["config", "user.name", "t"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    let write = Block::ToolUse {
+        id: "tu_w".into(),
+        name: "Write".into(),
+        input_json: serde_json::to_vec(&serde_json::json!({"file_path": "snap.txt", "content": "x\n"}))
+            .expect("json"),
+        cache_marker: None,
+    };
+    let provider = ScriptedProvider::new(vec![
+        ChatResponse {
+            assistant: Message::new(Role::Assistant).with_block(write),
+            usage: Usage::default(),
+        },
+        ChatResponse {
+            assistant: Message::new(Role::Assistant).with_block(Block::text("done")),
+            usage: Usage::default(),
+        },
+    ]);
+    let opts = LoopOptions {
+        cwd: Some(ws.path().to_path_buf()),
+        ..LoopOptions::default().without_streaming()
+    };
+    let mut session = Session::new("test", "claude-opus-4-7");
+    std::env::set_var("ORIGIN_CHECKPOINTS", "1");
+    let res = run_loop(&mut session, "write", &provider, &AlwaysAllow, &opts).await;
+    std::env::remove_var("ORIGIN_CHECKPOINTS");
+    res.expect("loop ok");
+    let snapshot = git(&["show", "--name-only", "--format=", "HEAD"]);
+    assert!(
+        snapshot.lines().any(|l| l == "snap.txt"),
+        "the run's own shadow history holds a snapshot of the run's tree: {snapshot:?}"
+    );
+}
+
 /// A11: with test selection enabled and no `graph_rebuild` call, the code
 /// graph is built in the background for the run's workspace.
 #[tokio::test]

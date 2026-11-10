@@ -25,32 +25,6 @@ use thiserror::Error;
 use tokio::task::spawn_blocking as sb;
 use tokio::task::JoinHandle;
 
-/// `GitRunner` implementation that shells out to the system `git` binary.
-///
-/// Used by the optional per-turn shadow-git checkpoint feature (Task 1). It is
-/// the only place in the daemon that drives [`origin_vcs::ShadowGit`]; all of
-/// its effects are best-effort and gated behind `ORIGIN_CHECKPOINTS=1`, so the
-/// default code path never constructs or invokes it.
-struct CmdGit;
-
-impl origin_vcs::GitRunner for CmdGit {
-    fn run(&self, args: &[&str]) -> Result<String, origin_vcs::VcsError> {
-        let mut git = std::process::Command::new("git");
-        origin_tools::scrub_env(&mut git); // A6
-        let output = git
-            .args(args)
-            .output()
-            .map_err(|e| origin_vcs::VcsError::Git(e.to_string()))?;
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        } else {
-            Err(origin_vcs::VcsError::Git(
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            ))
-        }
-    }
-}
-
 /// Best-effort shadow-git checkpoint with the given `label`, shared by the
 /// per-turn and per-tool callers.
 ///
@@ -62,15 +36,19 @@ impl origin_vcs::GitRunner for CmdGit {
 ///
 /// Returns the created checkpoint's commit `id` (the shadow-git SHA) on success
 /// so the caller can fire a `PostCommit` hook with it; `None` when the snapshot
-/// could not be taken (no cwd / git failure — both already logged + swallowed).
-fn checkpoint_with_label(label: &str) -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    let shadow_dir = cwd.join(".origin").join("shadow.git");
+/// could not be taken (git failure — already logged + swallowed).
+///
+/// A12: `root` is the run's working directory ([`loop_cwd`]): both the shadow
+/// repo (`<root>/.origin/shadow.git`) and the snapshotted work tree. git runs
+/// in `root`, so a best-of-N candidate snapshots its worktree, never the
+/// user's checkout.
+fn checkpoint_with_label(label: &str, root: &std::path::Path) -> Option<String> {
+    let shadow_dir = root.join(".origin").join("shadow.git");
     let shadow = shadow_dir.to_string_lossy().into_owned();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-    let runner = CmdGit;
+    let runner = crate::selfdev::ProcessGitRunner::new(root);
     let sg = origin_vcs::ShadowGit::new(&runner, shadow);
     match sg.snapshot(label, now_ms) {
         Ok(checkpoint) => Some(checkpoint.id),
@@ -95,12 +73,12 @@ fn checkpoint_with_label(label: &str) -> Option<String> {
 /// The shadow-git checkpoint is a standalone repo with no user-facing branch;
 /// `PreCommit.branch` carries the checkpoint `label` as the closest available
 /// "what is being committed" string.
-async fn checkpoint_with_commit_hooks(label: &str) -> Option<String> {
+async fn checkpoint_with_commit_hooks(label: &str, root: &std::path::Path) -> Option<String> {
     crate::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::PreCommit {
         branch: label.to_string(),
     })
     .await;
-    let sha = checkpoint_with_label(label);
+    let sha = checkpoint_with_label(label, root);
     if let Some(sha) = sha.as_ref() {
         crate::hooks_runtime::fire_global(&origin_hooks::LifecycleEvent::PostCommit { sha: sha.clone() })
             .await;
@@ -114,12 +92,15 @@ async fn checkpoint_with_commit_hooks(label: &str) -> Option<String> {
 /// No-op unless `ORIGIN_CHECKPOINTS=1` — the per-turn checkpoint gate. This is
 /// the hook-firing async counterpart used by the live loop. The
 /// commit hooks fire only inside the gated branch, so when checkpoints are off
-/// (the default) no hook fires and behavior is byte-identical.
-async fn maybe_checkpoint_turn_with_hooks() {
+/// (the default) no hook fires and behavior is byte-identical. `root` is the
+/// run's working directory ([`loop_cwd`]); `None` ⇒ no snapshot.
+async fn maybe_checkpoint_turn_with_hooks(root: Option<&std::path::Path>) {
     if std::env::var("ORIGIN_CHECKPOINTS").as_deref() != Ok("1") {
         return;
     }
-    let _ = checkpoint_with_commit_hooks("turn").await;
+    if let Some(root) = root {
+        let _ = checkpoint_with_commit_hooks("turn", root).await;
+    }
 }
 
 /// Whether the per-tool-use checkpoint feature is enabled.
@@ -420,13 +401,14 @@ fn per_tool_checkpoint_label(tool: &str, edited: &[String]) -> String {
 /// workspace via the [`checkpoint_with_commit_hooks`] machinery the per-turn
 /// path also uses, labelled by [`per_tool_checkpoint_label`] so the entries are
 /// distinguishable. Every failure is swallowed and the gate is default-off, so
-/// the default code path — and the commit hooks — are byte-identical.
-async fn maybe_checkpoint_per_tool_with_hooks(tool: &str, args: &Value) {
-    if !per_tool_checkpoints_enabled() {
+/// the default code path — and the commit hooks — are byte-identical. `root`
+/// is the run's working directory ([`loop_cwd`]); `None` ⇒ no snapshot.
+async fn maybe_checkpoint_per_tool_with_hooks(tool: &str, args: &Value, root: Option<&std::path::Path>) {
+    let (true, Some(root)) = (per_tool_checkpoints_enabled(), root) else {
         return;
-    }
+    };
     let edited = edited_paths_from_tool(tool, args);
-    let _ = checkpoint_with_commit_hooks(&per_tool_checkpoint_label(tool, &edited)).await;
+    let _ = checkpoint_with_commit_hooks(&per_tool_checkpoint_label(tool, &edited), root).await;
 }
 
 /// Resolve the base permission decision for one tool call (P10.12 wiring).
@@ -1173,48 +1155,51 @@ fn loop_cwd(opts: &LoopOptions) -> Option<std::path::PathBuf> {
 
 /// A12: resolve a tool call's relative paths against `cwd`, the run's working
 /// directory, so a run whose directory is not the process cwd reads and edits
-/// its own tree. Absolute paths pass through (`Path::join` keeps them). A
-/// `Bash`/`Glob`/`Grep` call naming no directory gets `cwd`; `ApplyPatch` file
-/// paths are anchored by [`anchor_patch_paths`].
+/// its own tree. Only the builtins whose local-path arguments were checked
+/// against their schemas are touched; any other tool (MCP, runtime tools,
+/// `Browser`) passes through unchanged — its `path` may not be local at all.
+/// Absolute paths pass through (`Path::join` keeps them). A `Bash`/`Glob`/
+/// `Grep` call naming no directory gets `cwd`; `ApplyPatch` file paths are
+/// anchored by [`anchor_patch_paths`].
 fn anchor_tool_args(name: &str, mut args: Value, cwd: &std::path::Path) -> Value {
+    let key = match name {
+        "Read" | "Write" | "Edit" | "MultiEdit" => "file_path",
+        "Glob" | "Grep" | "Diagnostics" | "LspNavigate" => "path",
+        "Bash" => "cwd",
+        "graph_rebuild" => "paths",
+        "ApplyPatch" => "patch",
+        _ => return args,
+    };
     let anchor = |p: &str| cwd.join(p).to_string_lossy().into_owned();
     let Some(obj) = args.as_object_mut() else {
         return args;
     };
-    for key in ["file_path", "path", "cwd"] {
-        if let Some(Value::String(p)) = obj.get_mut(key) {
-            *p = anchor(p);
-        }
-    }
-    if let Some(Value::Array(paths)) = obj.get_mut("paths") {
-        for p in paths.iter_mut() {
-            if let Value::String(s) = p {
-                *s = anchor(s);
+    match obj.get_mut(key) {
+        Some(Value::String(patch)) if key == "patch" => *patch = anchor_patch_paths(patch, cwd),
+        Some(Value::String(p)) => *p = anchor(p),
+        Some(Value::Array(paths)) => {
+            for p in paths.iter_mut() {
+                if let Value::String(s) = p {
+                    *s = anchor(s);
+                }
             }
         }
-    }
-    let dir_key = match name {
-        "Bash" => Some("cwd"),
-        "Glob" | "Grep" => Some("path"),
-        _ => None,
-    };
-    if let Some(key) = dir_key {
-        obj.entry(key)
-            .or_insert_with(|| Value::String(cwd.to_string_lossy().into_owned()));
-    }
-    if name == "ApplyPatch" {
-        if let Some(Value::String(patch)) = obj.get_mut("patch") {
-            *patch = anchor_patch_paths(patch, cwd);
+        // A `Bash`/`Glob`/`Grep` call that names no directory runs in `cwd`.
+        None if matches!(name, "Bash" | "Glob" | "Grep") => {
+            obj.insert(key.to_string(), Value::String(cwd.to_string_lossy().into_owned()));
         }
+        _ => {}
     }
     args
 }
 
-/// A12: anchor an `ApplyPatch` body's file paths against `cwd`: the `+++ b/`
-/// header of a unified diff and the `*** Add/Delete/Update File:` / `*** Move
-/// to:` directives of a marker patch — the lines `apply_patch` reads paths from.
-// ponytail: mirrors apply_patch's header grammar; pass a base dir into
-// origin_tools::apply_patch if that grammar grows.
+/// A12: anchor an `ApplyPatch` body's file paths against `cwd`. A marker patch
+/// (`*** Begin Patch` / `*** … File:` directives) has its directive paths
+/// anchored; a unified diff has its `+++ b/` headers anchored. Each mode only
+/// touches its own header lines, so an added line that merely looks like the
+/// other mode's header (e.g. `+++ b/x` inside a marker hunk) is kept intact.
+// ponytail: mirrors apply_patch's header grammar (`is_marker_patch`,
+// `parse_patch`); pass a base dir into origin_tools::apply_patch if it grows.
 fn anchor_patch_paths(patch: &str, cwd: &std::path::Path) -> String {
     const DIRECTIVES: [&str; 4] = [
         "*** Add File:",
@@ -1222,22 +1207,66 @@ fn anchor_patch_paths(patch: &str, cwd: &std::path::Path) -> String {
         "*** Update File:",
         "*** Move to:",
     ];
+    let marker = patch.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("*** Begin Patch") || DIRECTIVES[..3].iter().any(|d| t.starts_with(d))
+    });
     let anchor = |p: &str| cwd.join(p.trim()).to_string_lossy().into_owned();
     patch
         .split_inclusive('\n')
         .map(|line| {
             let body = line.trim_end_matches(['\r', '\n']);
             let eol = &line[body.len()..];
-            if let Some(p) = body.strip_prefix("+++ b/") {
-                return format!("+++ b/{}{eol}", anchor(p));
-            }
-            let t = body.trim_start();
-            DIRECTIVES
-                .iter()
-                .find_map(|d| t.strip_prefix(d).map(|p| format!("{d} {}{eol}", anchor(p))))
-                .unwrap_or_else(|| line.to_string())
+            let rewritten = if marker {
+                let t = body.trim_start();
+                DIRECTIVES
+                    .iter()
+                    .find_map(|d| t.strip_prefix(d).map(|p| format!("{d} {}{eol}", anchor(p))))
+            } else {
+                body.strip_prefix("+++ b/")
+                    .map(|p| format!("+++ b/{}{eol}", anchor(p)))
+            };
+            rewritten.unwrap_or_else(|| line.to_string())
         })
         .collect()
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::anchor_tool_args;
+
+    /// A12: a non-builtin tool (MCP / runtime) keeps its arguments verbatim —
+    /// its `path` may name something remote, not a local file.
+    #[test]
+    fn non_builtin_tool_args_pass_through() {
+        let args = serde_json::json!({ "path": "src/lib.rs", "file_path": "a", "cwd": "b", "paths": ["c"] });
+        let out = anchor_tool_args(
+            "mcp__github__get_file_contents",
+            args.clone(),
+            std::path::Path::new("/wt"),
+        );
+        assert_eq!(out, args);
+    }
+
+    /// A12: a marker-mode patch whose ADDED line starts `++ b/` (raw line
+    /// `+++ b/x`) applies with that line intact; only the directive is anchored.
+    #[test]
+    fn marker_patch_added_line_that_looks_like_a_header_is_kept() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        std::fs::write(ws.path().join("doc.txt"), "a\n").expect("write");
+        let patch =
+            "*** Begin Patch\n*** Update File: doc.txt\n@@ -1,1 +1,2 @@\n a\n+++ b/x\n*** End Patch\n";
+        let args = anchor_tool_args("ApplyPatch", serde_json::json!({ "patch": patch }), ws.path());
+        let anchored = args["patch"].as_str().expect("patch").to_string();
+        origin_tools::builtins::apply_patch::apply_patch(
+            &origin_tools::builtins::apply_patch::ApplyPatchArgs { patch: anchored },
+        )
+        .expect("applies");
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("doc.txt")).expect("read"),
+            "a\n++ b/x\n"
+        );
+    }
 }
 
 /// Render a `<workspace-roots>` system-prompt block listing the additional
@@ -2086,8 +2115,13 @@ fn resolve_formatter(cfg: Option<&origin_postedit::PostEditConfig>, path: &str) 
 /// binary must never fail the edit tool). The formatter is resolved via
 /// [`resolve_formatter`], so a wired `[post_edit]` config's `format_overrides`
 /// take precedence; with no config the builtin table is used, byte-identical.
-/// Default-off ⇒ no spawn, behavior unchanged.
-fn maybe_autoformat(cfg: Option<&origin_postedit::PostEditConfig>, path: &str) {
+/// Default-off ⇒ no spawn, behavior unchanged. `cwd` (A12) is the directory the
+/// formatter runs in (the run's working directory); `None` ⇒ the process cwd.
+fn maybe_autoformat(
+    cfg: Option<&origin_postedit::PostEditConfig>,
+    path: &str,
+    cwd: Option<&std::path::Path>,
+) {
     if std::env::var("ORIGIN_AUTOFORMAT").as_deref() != Ok("1") {
         return;
     }
@@ -2107,13 +2141,16 @@ fn maybe_autoformat(cfg: Option<&origin_postedit::PostEditConfig>, path: &str) {
     let Some((program, flags)) = tokens.split_first() else {
         return;
     };
-    let mut fmt = std::process::Command::new(program);
-    origin_tools::scrub_env(&mut fmt); // A6
-    let _ = fmt
+    let mut command = std::process::Command::new(program);
+    origin_tools::scrub_env(&mut command); // A6
+    command
         .args(flags)
         .arg("--") // end-of-options sentinel: everything after is a positional path
-        .arg(path)
-        .spawn();
+        .arg(path);
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    let _ = command.spawn();
 }
 
 /// Run the configured post-edit lint and fold its outcome through
@@ -2130,10 +2167,12 @@ fn maybe_autoformat(cfg: Option<&origin_postedit::PostEditConfig>, path: &str) {
 ///
 /// `prev_iters` is `0` here: each successful edit starts a fresh post-edit
 /// round. Best-effort throughout — a missing linter or a spawn failure never
-/// fails the edit tool.
+/// fails the edit tool. `cwd` (A12) is the directory the linter runs in;
+/// `None` ⇒ the process cwd.
 fn run_post_edit_lint(
     cfg: &origin_postedit::PostEditConfig,
     path: &str,
+    cwd: Option<&std::path::Path>,
 ) -> Option<origin_postedit::RepairDecision> {
     if !cfg.auto_lint {
         return None;
@@ -2145,9 +2184,13 @@ fn run_post_edit_lint(
     }
     let tokens: Vec<&str> = lint_cmd.split_whitespace().collect();
     let (program, flags) = tokens.split_first()?;
-    let mut lint = std::process::Command::new(program);
-    origin_tools::scrub_env(&mut lint); // A6: repo-configurable linter gets no secrets
-    let status = lint.args(flags).arg("--").arg(path).status();
+    let mut command = std::process::Command::new(program);
+    origin_tools::scrub_env(&mut command); // A6: repo-configurable linter gets no secrets
+    command.args(flags).arg("--").arg(path);
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    let status = command.status();
     // A lint that could not even be launched (missing binary) is treated as
     // "no failures observed" so a misconfigured linter never blocks edits.
     let failures = match status {
@@ -2187,14 +2230,20 @@ fn autoformats(name: &str) -> bool {
 /// when a `[post_edit]` config with `auto_lint` is wired, the configured lint
 /// via [`run_post_edit_lint`] whose [`RepairDecision`](origin_postedit::RepairDecision)
 /// is consulted. `cfg = None` (the default everywhere, including tests) ⇒ the
-/// builtin-table formatter only and no lint — byte-identical to before.
-fn post_mutation_autoformat(cfg: Option<&origin_postedit::PostEditConfig>, name: &str, path: &str) {
+/// builtin-table formatter only and no lint — byte-identical to before. Both
+/// spawns run in `cwd` (A12: the run's working directory; `None` ⇒ process cwd).
+fn post_mutation_autoformat(
+    cfg: Option<&origin_postedit::PostEditConfig>,
+    name: &str,
+    path: &str,
+    cwd: Option<&std::path::Path>,
+) {
     if !autoformats(name) {
         return;
     }
-    maybe_autoformat(cfg, path);
+    maybe_autoformat(cfg, path, cwd);
     if let Some(c) = cfg {
-        let _ = run_post_edit_lint(c, path);
+        let _ = run_post_edit_lint(c, path, cwd);
     }
 }
 
@@ -3767,6 +3816,7 @@ impl SpeculativeRegistry {
                 meta,
                 &args,
                 cas.as_deref(),
+                None,
                 None,
                 None,
                 None,
@@ -5556,7 +5606,7 @@ async fn run_loop_inner(
             // `ORIGIN_CHECKPOINTS=1`; with the gate unset (the default) it — and
             // the commit hooks — are a no-op, so behavior is byte-identical.
             if turn_mutated {
-                maybe_checkpoint_turn_with_hooks().await;
+                maybe_checkpoint_turn_with_hooks(loop_cwd(opts).as_deref()).await;
             }
             run_turn_end_effects(
                 provider.name(),
@@ -6588,6 +6638,7 @@ async fn run_loop_inner(
                         opts.proc_supervisor.as_ref(),
                         opts.write_guard.as_ref(),
                         opts.post_edit.as_ref(),
+                        opts.cwd.as_deref(),
                     )
                     .await
                     {
@@ -6716,7 +6767,7 @@ async fn run_loop_inner(
             // is bracketed by the PreCommit/PostCommit lifecycle hooks, which
             // also no-op without a configured hooks.json.
             if matches!(meta.side_effects, SideEffects::Mutating) {
-                maybe_checkpoint_per_tool_with_hooks(&name, &args).await;
+                maybe_checkpoint_per_tool_with_hooks(&name, &args, loop_cwd(opts).as_deref()).await;
             }
 
             // Stream a truncated preview of the result back to the CLI so the
@@ -7507,6 +7558,10 @@ async fn dispatch_tool(
     // `format_overrides` win and the configured `auto_lint` runs with its
     // `RepairDecision` consulted.
     post_edit: Option<&Arc<origin_postedit::PostEditConfig>>,
+    // A12: the run's working directory ([`LoopOptions::cwd`]). The post-edit
+    // formatter/linter spawns and the rust-analyzer root follow it. `None`
+    // (every caller but a run with a cwd override) ⇒ the process cwd.
+    cwd: Option<&std::path::Path>,
 ) -> Result<String, LoopError> {
     // C9: the model only ever sees `[REDACTED:<NAME>]` in place of a real secret.
     // Writing that marker back would silently replace the user's value on disk.
@@ -7642,7 +7697,7 @@ async fn dispatch_tool(
                 if let Some(guard) = write_guard {
                     guard.note_read(&fmt_path);
                 }
-                post_mutation_autoformat(post_edit.map(AsRef::as_ref), "Edit", &fmt_path);
+                post_mutation_autoformat(post_edit.map(AsRef::as_ref), "Edit", &fmt_path, cwd);
             }
             res
         }
@@ -7680,7 +7735,7 @@ async fn dispatch_tool(
                 if let Some(guard) = write_guard {
                     guard.note_read(&margs.file_path);
                 }
-                post_mutation_autoformat(post_edit.map(AsRef::as_ref), "MultiEdit", &margs.file_path);
+                post_mutation_autoformat(post_edit.map(AsRef::as_ref), "MultiEdit", &margs.file_path, cwd);
             }
             res
         }
@@ -7703,7 +7758,7 @@ async fn dispatch_tool(
                     if let Some(guard) = write_guard {
                         guard.note_read(p);
                     }
-                    post_mutation_autoformat(post_edit.map(AsRef::as_ref), "ApplyPatch", p);
+                    post_mutation_autoformat(post_edit.map(AsRef::as_ref), "ApplyPatch", p, cwd);
                 }
             }
             res
@@ -7740,7 +7795,7 @@ async fn dispatch_tool(
                 if let Some(g) = write_guard {
                     g.note_read(&fmt_path);
                 }
-                post_mutation_autoformat(post_edit.map(AsRef::as_ref), "Write", &fmt_path);
+                post_mutation_autoformat(post_edit.map(AsRef::as_ref), "Write", &fmt_path, cwd);
             }
             res
         }
@@ -7829,7 +7884,9 @@ async fn dispatch_tool(
                 severity: sev,
             };
             let ra = crate::ra_impl::DaemonRa::new(
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                cwd.map(std::path::Path::to_path_buf)
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from(".")),
             );
             origin_tools::builtins::diagnostics::diagnostics(dargs, &ra)
                 .await
@@ -7871,7 +7928,9 @@ async fn dispatch_tool(
                 include_declaration,
             };
             let ra = crate::ra_impl::DaemonRa::new(
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                cwd.map(std::path::Path::to_path_buf)
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from(".")),
             );
             origin_tools::builtins::lsp_nav::lsp_navigate(nav_args, &ra)
                 .await
@@ -10006,7 +10065,7 @@ mod dispatch_table_tests {
         let mut unrecognized: Vec<String> = Vec::new();
         for meta in registry_iter() {
             let result = dispatch_tool(
-                meta, &empty, None, None, None, None, None, None, None, None, None, None,
+                meta, &empty, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await;
             if let Err(LoopError::UnknownTool(name)) = &result {
@@ -10046,6 +10105,7 @@ mod dispatch_table_tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("ask_user backward-compat path is infallible for valid args");
@@ -10064,6 +10124,7 @@ mod dispatch_table_tests {
         let err = dispatch_tool(
             ask_user_meta(),
             &args,
+            None,
             None,
             None,
             None,
@@ -10236,7 +10297,7 @@ mod dispatch_table_tests {
             .expect("graph_explain registered");
         let args = serde_json::json!({"kind": "communities"});
         let out = dispatch_tool(
-            meta, &args, None, None, None, None, None, None, None, None, None, None,
+            meta, &args, None, None, None, None, None, None, None, None, None, None, None,
         )
         .await
         .expect("communities dispatch");
@@ -10247,7 +10308,7 @@ mod dispatch_table_tests {
             "args": {"since_ms": 1_700_000_000_000_i64}
         });
         let out = dispatch_tool(
-            meta, &args, None, None, None, None, None, None, None, None, None, None,
+            meta, &args, None, None, None, None, None, None, None, None, None, None, None,
         )
         .await
         .expect("recent_changes dispatch");
@@ -10256,7 +10317,7 @@ mod dispatch_table_tests {
         // Unknown kind surfaces as BadArgs, not ToolFailure or UnknownTool.
         let args = serde_json::json!({"kind": "bogus"});
         let err = dispatch_tool(
-            meta, &args, None, None, None, None, None, None, None, None, None, None,
+            meta, &args, None, None, None, None, None, None, None, None, None, None, None,
         )
         .await
         .expect_err("bogus must fail");
@@ -10283,7 +10344,7 @@ mod dispatch_table_tests {
                 .find(|m| m.name == name)
                 .unwrap_or_else(|| panic!("{name} not registered"));
             let err = dispatch_tool(
-                meta, &args, None, None, None, None, None, None, None, None, None, None,
+                meta, &args, None, None, None, None, None, None, None, None, None, None, None,
             )
             .await
             .expect_err(name);
@@ -10326,6 +10387,7 @@ mod dispatch_table_tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("graph_query dispatch");
@@ -10358,6 +10420,7 @@ mod dispatch_table_tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("ask dispatch");
@@ -10380,6 +10443,7 @@ mod dispatch_table_tests {
             &args,
             None,
             Some(&code_graph),
+            None,
             None,
             None,
             None,
@@ -10467,7 +10531,7 @@ mod dispatch_table_tests {
             .expect("mem_search registered");
         let args = serde_json::json!({"query": "anything"});
         let err = dispatch_tool(
-            meta, &args, None, None, None, None, None, None, None, None, None, None,
+            meta, &args, None, None, None, None, None, None, None, None, None, None, None,
         )
         .await
         .expect_err("must fail without handle");
@@ -10508,6 +10572,7 @@ mod dispatch_table_tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("mem_save must succeed");
@@ -10529,6 +10594,7 @@ mod dispatch_table_tests {
             None,
             None,
             Some(&handle),
+            None,
             None,
             None,
             None,
@@ -10569,7 +10635,7 @@ mod dispatch_table_tests {
             "allowed_tools": []
         });
         let err = dispatch_tool(
-            meta, &args, None, None, None, None, None, None, None, None, None, None,
+            meta, &args, None, None, None, None, None, None, None, None, None, None, None,
         )
         .await
         .expect_err("Task without coordinator must fail");
@@ -10632,6 +10698,7 @@ mod dispatch_table_tests {
             None,
             None,
             Some(coordinator.as_ref()),
+            None,
             None,
             None,
             None,
@@ -10728,6 +10795,7 @@ mod dispatch_table_tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -10750,6 +10818,7 @@ mod dispatch_table_tests {
             None,
             Some(&guard),
             None,
+            None,
         )
         .await
         .expect("Read through shared guard must succeed");
@@ -10767,6 +10836,7 @@ mod dispatch_table_tests {
             None,
             None,
             Some(&guard),
+            None,
             None,
         )
         .await
@@ -10799,7 +10869,7 @@ mod wiring_tests {
     async fn checkpoint_gate_off_by_default() {
         let enabled = std::env::var("ORIGIN_CHECKPOINTS").as_deref() == Ok("1");
         assert!(!enabled, "checkpoints must be opt-in via ORIGIN_CHECKPOINTS=1");
-        maybe_checkpoint_turn_with_hooks().await;
+        maybe_checkpoint_turn_with_hooks(std::env::current_dir().ok().as_deref()).await;
     }
 
     /// WS-S: the per-tool checkpoint gate is OFF by default and INDEPENDENT of
@@ -10843,9 +10913,9 @@ mod wiring_tests {
         assert_eq!(origin_postedit::formatter_for("README"), None);
         // No-op with the gate off (no panic, no spawn). Both the no-config
         // (`None`) and config-present spellings must be inert with the gate off.
-        maybe_autoformat(None, "src/main.rs");
+        maybe_autoformat(None, "src/main.rs", None);
         let cfg = origin_postedit::PostEditConfig::default();
-        maybe_autoformat(Some(&cfg), "src/main.rs");
+        maybe_autoformat(Some(&cfg), "src/main.rs", None);
     }
 
     /// Task 2 (Edit fix): every file-mutating builtin must trigger post-edit
@@ -12292,7 +12362,7 @@ mod wiring_tests {
     fn run_post_edit_lint_is_noop_without_auto_lint() {
         let cfg = origin_postedit::PostEditConfig::default();
         assert!(
-            run_post_edit_lint(&cfg, "src/main.rs").is_none(),
+            run_post_edit_lint(&cfg, "src/main.rs", None).is_none(),
             "auto_lint disabled ⇒ no decision, no lint spawn"
         );
         // auto_lint without a lint_command ⇒ also None (nothing to run).
@@ -12301,7 +12371,7 @@ mod wiring_tests {
             ..origin_postedit::PostEditConfig::default()
         };
         assert!(
-            run_post_edit_lint(&cfg2, "src/main.rs").is_none(),
+            run_post_edit_lint(&cfg2, "src/main.rs", None).is_none(),
             "auto_lint with no lint_command ⇒ no decision"
         );
     }
@@ -12360,11 +12430,35 @@ mod wiring_tests {
         let enabled = std::env::var("ORIGIN_AUTOFORMAT").as_deref() == Ok("1");
         assert!(!enabled, "autoformat must be opt-in via ORIGIN_AUTOFORMAT=1");
         for tool in ["Edit", "Write", "MultiEdit", "ApplyPatch"] {
-            post_mutation_autoformat(None, tool, "src/main.rs");
+            post_mutation_autoformat(None, tool, "src/main.rs", None);
         }
         // A non-mutating tool never autoformats, even with a config present.
         let cfg = origin_postedit::PostEditConfig::default();
-        post_mutation_autoformat(Some(&cfg), "Read", "src/main.rs");
+        post_mutation_autoformat(Some(&cfg), "Read", "src/main.rs", None);
+    }
+
+    /// A12: the per-edit linter runs in the run's working directory, not the
+    /// process cwd — a project-scoped linter (`--fix .`) must rewrite the
+    /// candidate worktree, never the user's checkout. `git init -q -- <dir>`
+    /// is a portable stand-in that writes relative to its cwd.
+    #[test]
+    fn post_edit_lint_runs_in_the_run_cwd() {
+        let run_cwd = tempfile::tempdir().expect("tempdir");
+        let probe = format!("a12-lint-probe-{}", ulid::Ulid::new());
+        let cfg = origin_postedit::PostEditConfig {
+            auto_lint: true,
+            lint_command: Some("git init -q".into()),
+            ..origin_postedit::PostEditConfig::default()
+        };
+        post_mutation_autoformat(Some(&cfg), "Write", &probe, Some(run_cwd.path()));
+        let stray = std::env::current_dir().expect("cwd").join(&probe);
+        let leaked = stray.exists();
+        let _ = std::fs::remove_dir_all(&stray);
+        assert!(!leaked, "linter ran in the process cwd: {}", stray.display());
+        assert!(
+            run_cwd.path().join(&probe).join(".git").exists(),
+            "linter ran in the run cwd"
+        );
     }
 }
 
