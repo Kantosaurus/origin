@@ -45,6 +45,8 @@ struct Worker {
 impl Worker {
     fn spawn(spec: &ShellSpec) -> Result<Self, PoolError> {
         let mut cmd = Command::new(&spec.program);
+        // A6: hooks get the allow-listed env, not the daemon's credentials.
+        origin_sandbox::scrub_env(cmd.as_std_mut());
         cmd.args(&spec.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

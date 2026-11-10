@@ -12,6 +12,7 @@
 
 pub mod backend_noop;
 pub mod caps;
+pub mod env;
 pub mod profile;
 
 #[cfg(all(target_os = "linux", feature = "linux", not(feature = "no-sandbox")))]
@@ -21,6 +22,7 @@ pub mod backend_macos;
 #[cfg(all(target_os = "windows", feature = "windows", not(feature = "no-sandbox")))]
 pub mod backend_windows;
 
+pub use env::{is_secret_env_name, scrub_env};
 pub use profile::{ProfileOrdinal, SandboxProfile};
 
 use thiserror::Error;

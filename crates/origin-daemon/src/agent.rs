@@ -505,17 +505,39 @@ async fn run_post_edit_test(cmd: &str) -> Option<String> {
 /// regression baseline. Fail-open: a spawn error or timeout returns `true`
 /// (assume green) so we never cry "regression" over a failure we couldn't run.
 async fn run_test_passed(cmd: &str) -> bool {
-    let run = if cfg!(windows) {
-        tokio::process::Command::new("pwsh")
-            .args(["-NoProfile", "-Command", cmd])
-            .output()
-    } else {
-        tokio::process::Command::new("sh").args(["-c", cmd]).output()
+    run_gate_command(cmd).await.is_none_or(|(code, _)| code == 0)
+}
+
+/// A6: run a turn-end gate command (`auto_test` / `auto_lint` / repro gate /
+/// test-select) through the supervised Bash spawn, so it gets the scrubbed
+/// child env and the cmd-guard like a model-issued `Bash` call. Returns
+/// `(exit_code, output)` when the command ran to exit; `None` when the guard
+/// denied it, the spawn failed, or it hit the 600s bound (callers fail open).
+async fn run_gate_command(cmd: &str) -> Option<(i32, String)> {
+    let allow = origin_permission::Decision {
+        outcome: Outcome::Allow,
+        reason: String::new(),
     };
-    match tokio::time::timeout(std::time::Duration::from_secs(600), run).await {
-        Ok(Ok(out)) => out.status.success(),
-        _ => true,
+    let guarded = apply_cmd_guard(allow, "Bash", &serde_json::json!({ "command": cmd }));
+    if guarded.outcome != Outcome::Allow {
+        tracing::warn!(cmd, reason = %guarded.reason, "turn-end gate command not run");
+        return None;
     }
+    let args = origin_tools::builtins::bash::BashArgs {
+        command: cmd.to_string(),
+        timeout: Some(600),
+        cwd: None,
+        env: Vec::new(),
+        run_in_background: false,
+    };
+    let out = origin_tools::builtins::bash::bash_v2(args, &origin_tools::proc_supervisor::Supervisor::new())
+        .await
+        .ok()?;
+    if out["status"] != "exited" {
+        return None;
+    }
+    let code = i32::try_from(out["exit_code"].as_i64()?).ok()?;
+    Some((code, out["stdout"].as_str()?.to_string()))
 }
 
 /// Turn-end `auto_lint` twin of [`run_post_edit_test`]. Without this the
@@ -528,22 +550,13 @@ async fn run_post_edit_lint_block(cmd: &str) -> Option<String> {
     run_turn_end_command(cmd, "lint-results", "lint command").await
 }
 
-/// Run a turn-end check command through the platform shell and, ONLY when it
+/// Run a turn-end check command via [`run_gate_command`] and, ONLY when it
 /// exits non-zero, return a tail-truncated `<{tag}>` feedback block the model
 /// sees next turn. None on success / spawn failure / timeout — fail-open, so a
 /// misconfigured command never blocks the turn. Bounded to 600s.
 async fn run_turn_end_command(cmd: &str, tag: &str, label: &str) -> Option<String> {
-    let run = if cfg!(windows) {
-        tokio::process::Command::new("pwsh")
-            .args(["-NoProfile", "-Command", cmd])
-            .output()
-    } else {
-        tokio::process::Command::new("sh").args(["-c", cmd]).output()
-    };
-    match tokio::time::timeout(std::time::Duration::from_secs(600), run).await {
-        Ok(Ok(out)) if !out.status.success() => {
-            let mut msg = String::from_utf8_lossy(&out.stdout).into_owned();
-            msg.push_str(&String::from_utf8_lossy(&out.stderr));
+    match run_gate_command(cmd).await {
+        Some((code, msg)) if code != 0 => {
             let chars: Vec<char> = msg.chars().collect();
             let start = chars.len().saturating_sub(4_000);
             let tail: String = chars[start..].iter().collect();
@@ -10338,6 +10351,23 @@ mod wiring_tests {
             Outcome::Allow,
             "ORIGIN_CMD_GUARD=0 opts out of the guard entirely"
         );
+    }
+
+    /// A6: a turn-end gate command runs through the supervised spawn, so it
+    /// actually runs (the supervisor's PowerShell fallback) and its child env
+    /// is scrubbed of credentials set in the daemon.
+    #[tokio::test]
+    async fn turn_end_gate_command_gets_scrubbed_env() {
+        std::env::set_var("A6_GATE_PROBE_API_KEY", "gate-secret-value");
+        #[cfg(unix)]
+        let cmd = r#"echo "leak=$A6_GATE_PROBE_API_KEY"; exit 1"#;
+        #[cfg(windows)]
+        let cmd = "'leak=' + $env:A6_GATE_PROBE_API_KEY; exit 1";
+        let block = run_turn_end_command(cmd, "test-results", "test command").await;
+        std::env::remove_var("A6_GATE_PROBE_API_KEY");
+        let block = block.expect("a failing gate command must yield a feedback block");
+        assert!(block.contains("leak="), "{block}");
+        assert!(!block.contains("gate-secret-value"), "secret leaked: {block}");
     }
 
     /// WS-D browser visual loop: the gate is OFF by default. With
