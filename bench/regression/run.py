@@ -191,30 +191,60 @@ def run_verify(t: dict, repo: str, logdir: str) -> tuple[int | None, bool]:
 
 
 def snapshot(path: str) -> dict | None:
-    """{relative path: bytes} of a file or directory tree; None if absent."""
+    """{relative path: bytes} of a file or directory tree; None if absent.
+    Bytecode caches (__pycache__/, *.pyc) are left out, so a trial that merely
+    ran the tests is not flagged as having modified them."""
     if os.path.isfile(path):
         with open(path, "rb") as f:
             return {"": f.read()}
     if not os.path.isdir(path):
         return None
     snap = {}
-    for root, _dirs, files in os.walk(path):
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
         for name in files:
+            if name.endswith(".pyc"):
+                continue
             p = os.path.join(root, name)
             with open(p, "rb") as f:
                 snap[os.path.relpath(p, path)] = f.read()
     return snap
 
 
+def is_link(path: str) -> bool:
+    # A Windows junction needs no privilege to create, so treat it like a symlink.
+    return os.path.islink(path) or getattr(os.path, "isjunction", lambda _p: False)(path)
+
+
+def unlink_links(repo: str, rel: str) -> bool:
+    """Remove (never follow) any symlink/junction at `rel` or at one of its
+    parent components inside `repo`. Returns True if one was removed."""
+    removed = False
+    cur = repo
+    for part in rel.replace("\\", "/").split("/"):
+        if not part:
+            continue
+        cur = os.path.join(cur, part)
+        if is_link(cur):
+            try:
+                os.unlink(cur)
+            except OSError:  # a directory link on Windows
+                os.rmdir(cur)
+            removed = True
+    return removed
+
+
 def restore_protected(t: dict, pristine: str, repo: str) -> bool:
     """Put `verify.restore` paths back exactly as in the pristine repo, so the
     agent cannot pass by editing or deleting the tests. Returns True if any of
     them differed from what the agent left (a restored directory is replaced
-    whole: files the agent added inside it are dropped and count as a change)."""
+    whole: files the agent added inside it are dropped and count as a change).
+    A symlink at the path or at a parent is removed first, never followed, so
+    the restore cannot land outside the trial repo; it counts as a change."""
     modified = False
     for rel in t["verify"]["restore"]:
         src, dst = os.path.join(pristine, rel), os.path.join(repo, rel)
-        if snapshot(src) == snapshot(dst):
+        if not unlink_links(repo, rel) and snapshot(src) == snapshot(dst):
             continue
         modified = True
         if os.path.isdir(dst):
@@ -347,6 +377,22 @@ def write_results(doc: dict, results: list[dict], path: str) -> None:
     os.replace(path + ".tmp", path)
 
 
+def dir_link(target: str, link: str) -> bool:
+    """Self-test helper: a directory symlink, else a Windows junction (no privilege needed)."""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return True
+    except OSError:
+        if os.name != "nt":
+            return False
+    try:
+        import _winapi
+        _winapi.CreateJunction(target, link)
+        return True
+    except (ImportError, OSError, AttributeError):
+        return False
+
+
 def self_test() -> int:
     def tr(passed: bool) -> dict:
         return {"passed": passed, "cost_usd": 0.5, "wall_s": 1.0, **{k: 10 for k in TOKEN_KEYS}}
@@ -378,11 +424,13 @@ def self_test() -> int:
     try:
         pristine, repo = os.path.join(tmp, "p"), os.path.join(tmp, "r")
         os.makedirs(os.path.join(pristine, "tests"))
-        for rel, body in (("test_a.py", "assert 1 == 2\n"), ("test_b.py", "B\n"), ("tests/t.py", "T\n")):
+        os.makedirs(os.path.join(pristine, "sub"))
+        for rel, body in (("test_a.py", "assert 1 == 2\n"), ("test_b.py", "B\n"), ("tests/t.py", "T\n"),
+                          ("sub/s.py", "S\n")):
             with open(os.path.join(pristine, rel), "w") as f:
                 f.write(body)
         shutil.copytree(pristine, repo)
-        t = {"verify": {"restore": ["test_a.py", "test_b.py", "tests"]}}
+        t = {"verify": {"restore": ["test_a.py", "test_b.py", "tests", "sub/s.py"]}}
         assert restore_protected(t, pristine, repo) is False
         with open(os.path.join(repo, "test_a.py"), "w") as f:
             f.write("assert True\n")  # weakened
@@ -391,6 +439,35 @@ def self_test() -> int:
             f.write("x\n")  # added inside a restored dir
         assert restore_protected(t, pristine, repo) is True
         assert snapshot(repo) == snapshot(pristine), "restore did not put the files back"
+
+        # Running the tests leaves bytecode caches: not a modification.
+        os.makedirs(os.path.join(repo, "tests", "__pycache__"))
+        for rel in ("tests/__pycache__/t.cpython-313.pyc", "tests/old.pyc"):
+            with open(os.path.join(repo, rel), "wb") as f:
+                f.write(b"\0")
+        assert restore_protected(t, pristine, repo) is False
+
+        # Links (symlink, or a junction on Windows without symlink privilege):
+        # a protected dir, a protected file and the parent of a protected file
+        # each replaced by a link to a directory outside the repo.
+        outside = os.path.join(tmp, "outside")
+        os.makedirs(outside)
+        if dir_link(outside, os.path.join(tmp, "probe")):
+            assert unlink_links(tmp, "probe") is True
+            rmtree(os.path.join(repo, "tests"))
+            dir_link(outside, os.path.join(repo, "tests"))
+            os.remove(os.path.join(repo, "test_a.py"))
+            dir_link(outside, os.path.join(repo, "test_a.py"))
+            rmtree(os.path.join(repo, "sub"))
+            dir_link(outside, os.path.join(repo, "sub"))
+            assert unlink_links(repo, "sub/s.py") is True and not os.path.lexists(os.path.join(repo, "sub"))
+            assert restore_protected(t, pristine, repo) is True
+            assert os.listdir(outside) == [], f"restore wrote outside the repo: {os.listdir(outside)}"
+            assert not any(is_link(os.path.join(repo, p)) for p in ("tests", "test_a.py", "sub"))
+            assert snapshot(repo) == snapshot(pristine), "restore through links did not put the files back"
+            print("self-test: link cases checked")
+        else:
+            print("self-test: link cases SKIPPED (this host cannot create directory links)")
     finally:
         rmtree(tmp)
     print("self-test ok")

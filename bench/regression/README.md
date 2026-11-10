@@ -70,8 +70,13 @@ tasks/<id>/repo/...        # fixture tasks only
 | `prompt` | The text passed to `origin run`. |
 | `verify.cmd` | The check, as an argv list, run in the repo after origin finishes. `{python}` is replaced with the runner's own Python. |
 | `verify.expect_exit` | The trial passes iff the check exits with this status (a timed-out check fails). |
-| `verify.restore` | Optional, but set it: files or directories (relative to the repo) put back exactly as in the untouched repo before the check runs, so the agent cannot pass by weakening or deleting the tests. A restored directory is replaced whole. If any of them differed from what the agent left, the trial row says `tests_modified: true`. |
+| `verify.restore` | Optional, but set it: files or directories (relative to the repo) put back exactly as in the untouched repo before the check runs, so weakening or deleting those files does not count as a pass. A restored directory is replaced whole (`__pycache__`/`*.pyc` are ignored when comparing). A symlink at the path or a parent is removed, never followed. If anything differed from what the agent left, the trial row says `tests_modified: true`. |
 | `timeout_s` | Cap for `origin run` (and separately for the check). On timeout the whole process tree is killed. A timed-out run still gets checked. |
+
+`verify.restore` protects the listed paths only. An agent can still fake a pass by
+shadowing a module the check imports (for example a repo-level `unittest/` package)
+or by hard-coding the expected outputs in the code under test. Run checks that matter
+from outside the repo or protect more of it, and review suspicious passes by diff.
 
 Pre-flight: before the first trial of the run, every task is set up (fixture copied,
 or repo cloned) and its check is run on the untouched repo; a task whose check

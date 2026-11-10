@@ -77,8 +77,12 @@ each direction (fail→pass, pass→fail) between the paired runs.
 
 Results are rewritten after every trial; an aborted run leaves `"complete": false`
 and is not a baseline. Each task lists the test files to restore before its check
-(`verify.restore`), so a trial cannot pass by editing or deleting the tests, and a
-trial that touched them is marked `tests_modified: true`.
+(`verify.restore`), so editing or deleting those files does not count as a pass, and
+a trial that touched them is marked `tests_modified: true`. That protects the listed
+files only: an agent can still fake a pass by shadowing a module the check imports
+(e.g. a repo-level `unittest/` package) or by hard-coding outputs in the code under
+test, so run checks that matter from outside the repo or protect more broadly, and
+review suspicious passes by diff.
 
 ## Perf gate
 
