@@ -201,18 +201,21 @@ const PROBED_TOOLS: [&str; 26] = [
     "pytest",
 ];
 
-/// B6: total budget for the once-per-session `PATH` probe.
-const TOOL_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+/// B6: budget for the `PATH` probe. A healthy listing takes ~50 ms; a dead
+/// network entry must not stall the first prompt.
+const TOOL_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// B6: `Tools on PATH: python, node, …` for the [`PROBED_TOOLS`] that resolve
 /// on `path` (a `PATH`-style list), or empty when none do.
 ///
 /// A pure lookup — nothing is spawned. Windows honours `PATHEXT`
-/// (case-insensitively); Unix needs the execute bit. Zero-length hits are
-/// ignored: the Microsoft Store "App Execution Alias" stubs for
+/// (case-insensitively); Unix needs the execute bit. Each tool is decided at
+/// its FIRST name match in `PATH` order (within one directory, the earliest
+/// `PATHEXT` extension) — what the shell would run. A zero-length first match
+/// means "not found": the Microsoft Store "App Execution Alias" stubs for
 /// `python`/`python3` are not an interpreter. Lists each `PATH` directory once
 /// rather than `which`-ing every tool: that is ~26 × dirs × `PATHEXT` stats,
-/// hundreds of milliseconds on the first prompt of a Windows session.
+/// hundreds of milliseconds on Windows.
 #[must_use]
 pub fn tools_on_path_line(path: &std::ffi::OsStr) -> String {
     let exts: Vec<String> = if cfg!(windows) {
@@ -225,12 +228,21 @@ pub fn tools_on_path_line(path: &std::ffi::OsStr) -> String {
     } else {
         vec![String::new()]
     };
-    let mut hit = [false; PROBED_TOOLS.len()];
+    // `Some(real)` once a tool's first match is seen.
+    let mut decided: [Option<bool>; PROBED_TOOLS.len()] = [None; PROBED_TOOLS.len()];
     for dir in std::env::split_paths(path) {
+        if decided.iter().all(Option::is_some) {
+            break;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
+        // This directory's best match per tool: (PATHEXT index, path).
+        let mut first: [Option<(usize, std::path::PathBuf)>; PROBED_TOOLS.len()] = Default::default();
         for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             let name = if cfg!(windows) {
@@ -238,21 +250,28 @@ pub fn tools_on_path_line(path: &std::ffi::OsStr) -> String {
             } else {
                 name.to_string()
             };
-            let Some(i) = PROBED_TOOLS.iter().position(|tool| {
-                exts.iter()
-                    .any(|ext| name.strip_prefix(tool).is_some_and(|rest| rest == ext))
-            }) else {
-                continue;
-            };
-            if !hit[i] && is_real_executable(&entry.path()) {
-                hit[i] = true;
+            for (i, tool) in PROBED_TOOLS.iter().enumerate() {
+                let Some(x) = name
+                    .strip_prefix(tool)
+                    .and_then(|rest| exts.iter().position(|ext| ext == rest))
+                else {
+                    continue;
+                };
+                if decided[i].is_none() && first[i].as_ref().is_none_or(|(best, _)| x < *best) {
+                    first[i] = Some((x, entry.path()));
+                }
+            }
+        }
+        for (slot, hit) in decided.iter_mut().zip(first) {
+            if let Some((_, p)) = hit {
+                *slot = Some(is_real_executable(&p));
             }
         }
     }
     let found: Vec<&str> = PROBED_TOOLS
         .iter()
-        .zip(hit)
-        .filter_map(|(tool, hit)| hit.then_some(*tool))
+        .zip(decided)
+        .filter_map(|(tool, d)| (d == Some(true)).then_some(*tool))
         .collect();
     if found.is_empty() {
         String::new()
@@ -275,27 +294,28 @@ fn is_real_executable(p: &std::path::Path) -> bool {
     })
 }
 
-/// B6: the session's [`tools_on_path_line`], probed once per session id.
+/// B6: the daemon's [`tools_on_path_line`], probed once per PROCESS.
 ///
-/// Reused byte-for-byte afterwards (it sits in the cached system prefix, so a
-/// `PATH` change mid-session must not alter it). The probe runs off the async
-/// runtime under [`TOOL_PROBE_BUDGET`]; a timeout or error yields (and caches)
-/// an empty line.
-pub async fn session_tools_line(session_id: &str, path: Option<std::ffi::OsString>) -> String {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock, PoisonError};
-    // ponytail: process-wide and never evicted, like the session repo map.
-    static LINES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    let lines = LINES.get_or_init(Mutex::default);
-    if let Some(line) = lines
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(session_id)
-    {
-        return line.clone();
-    }
+/// The daemon's `PATH` never changes, so one value serves every session and
+/// sits byte-for-byte in each cached system prefix. Empty when
+/// `ORIGIN_TOOL_PROBE=0` (read once) or the probe failed or timed out.
+pub async fn tools_line() -> String {
+    static LINE: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+    LINE.get_or_init(|| async {
+        if matches!(std::env::var("ORIGIN_TOOL_PROBE").as_deref(), Ok("0")) {
+            return String::new();
+        }
+        probe_tools_line(std::env::var_os("PATH")).await
+    })
+    .await
+    .clone()
+}
+
+/// B6: [`tools_on_path_line`] off the async runtime under
+/// [`TOOL_PROBE_BUDGET`]; empty (logged at debug) on timeout or error.
+async fn probe_tools_line(path: Option<std::ffi::OsString>) -> String {
     let probe = tokio::task::spawn_blocking(move || path.map(|p| tools_on_path_line(&p)).unwrap_or_default());
-    let line = match tokio::time::timeout(TOOL_PROBE_BUDGET, probe).await {
+    match tokio::time::timeout(TOOL_PROBE_BUDGET, probe).await {
         Ok(Ok(line)) => line,
         Ok(Err(e)) => {
             tracing::debug!(error = %e, "PATH tool probe failed (ignored)");
@@ -305,13 +325,7 @@ pub async fn session_tools_line(session_id: &str, path: Option<std::ffi::OsStrin
             tracing::debug!("PATH tool probe timed out (ignored)");
             String::new()
         }
-    };
-    lines
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .entry(session_id.to_string())
-        .or_insert(line)
-        .clone()
+    }
 }
 
 /// The roots as one workspace identity: sorted, de-duplicated and lexically
@@ -576,20 +590,36 @@ mod tests {
         assert_eq!(tools_on_path_line(empty.path().as_os_str()), "");
     }
 
-    /// B6: the line is probed once per session; a PATH change mid-session does
-    /// not change its bytes.
+    /// B6: a tool is decided at its first match in PATH order — a zero-length
+    /// stub ahead of a real binary is what the shell runs, so "not found".
+    #[test]
+    fn tools_line_decides_each_tool_at_its_first_path_match() {
+        let stub_first = tempfile::tempdir().expect("tempdir");
+        let real_later = tempfile::tempdir().expect("tempdir");
+        let exe = if cfg!(windows) { ".exe" } else { "" };
+        fake_exe(stub_first.path(), &format!("python{exe}"), 0);
+        fake_exe(real_later.path(), &format!("python{exe}"), 4);
+        fake_exe(stub_first.path(), &format!("go{exe}"), 4);
+        fake_exe(real_later.path(), &format!("go{exe}"), 0);
+        let path = std::env::join_paths([stub_first.path(), real_later.path()]).expect("join");
+        assert_eq!(tools_on_path_line(&path), "Tools on PATH: go");
+        // Within one directory the earliest PATHEXT extension wins.
+        if cfg!(windows) {
+            let d = tempfile::tempdir().expect("tempdir");
+            fake_exe(d.path(), "node.com", 0);
+            fake_exe(d.path(), "node.exe", 4);
+            assert_eq!(tools_on_path_line(d.path().as_os_str()), "");
+        }
+    }
+
+    /// B6: the probe runs off the runtime on the injected PATH; no PATH, no line.
     #[tokio::test]
-    async fn session_tools_line_is_frozen_per_session() {
+    async fn probe_tools_line_uses_the_given_path() {
         let a = tempfile::tempdir().expect("tempdir");
         fake_exe(a.path(), if cfg!(windows) { "git.exe" } else { "git" }, 4);
-        let path_a = a.path().as_os_str().to_owned();
-        let empty = tempfile::tempdir().expect("tempdir");
-        let first = session_tools_line("b6-frozen", Some(path_a)).await;
-        assert_eq!(first, "Tools on PATH: git");
-        let again = session_tools_line("b6-frozen", Some(empty.path().as_os_str().to_owned())).await;
-        assert_eq!(again, first);
-        let other = session_tools_line("b6-other", Some(empty.path().as_os_str().to_owned())).await;
-        assert_eq!(other, "");
+        let line = probe_tools_line(Some(a.path().as_os_str().to_owned())).await;
+        assert_eq!(line, "Tools on PATH: git");
+        assert_eq!(probe_tools_line(None).await, "");
     }
 
     /// B2: the session map is keyed on (session id, roots). A reused or resumed

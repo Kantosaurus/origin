@@ -4832,13 +4832,9 @@ async fn run_loop_inner(
     // Static per-host environment (OS / shell / cwd). Fixed for the whole run,
     // so it sits in the cached system prefix at zero per-turn token cost. Stops
     // the model emitting POSIX-isms + relative paths that fail on this host.
-    // B6: which toolchains resolve on PATH — probed once per session (frozen,
-    // like the repo map); `ORIGIN_TOOL_PROBE=0` omits the line.
-    let tools_line = if matches!(std::env::var("ORIGIN_TOOL_PROBE").as_deref(), Ok("0")) {
-        String::new()
-    } else {
-        crate::subsystems::session_tools_line(&session.id, std::env::var_os("PATH")).await
-    };
+    // B6: which toolchains resolve on PATH — probed once per process, so the
+    // bytes are frozen for every session; `ORIGIN_TOOL_PROBE=0` omits the line.
+    let tools_line = crate::subsystems::tools_line().await;
     let env_block = render_env_block(
         std::env::consts::OS,
         cfg!(windows),
