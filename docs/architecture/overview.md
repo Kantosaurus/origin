@@ -231,7 +231,7 @@ sequenceDiagram
         opt model emits ToolUse
             D->>G: check tier + cmdparse + governance
             G-->>D: allow / deny / ask
-            D->>D: execute tool (sandboxed)
+            D->>D: execute tool (no OS sandbox; allow-listed child env)
             D->>C: write result bytes -> [u8;32] handle
             C-->>D: ToolResult{handle} appended to transcript
         end
@@ -407,7 +407,7 @@ CI runs `cargo clippy -D warnings` with `pedantic`/`nursery` enabled and `unwrap
 
 ### `Secret<T>` redaction
 
-`origin-keyvault` provides `Secret<T: Zeroize>` — a guard wrapper that **zeroizes on drop** and **redacts in `Debug`** (its `fmt::Debug` writes the literal `Secret<redacted>`). Provider credentials live only in the daemon's `KeyVault`, which fronts OS-native credential stores with an age-encrypted fallback and an audit ring that records `(provider, account, action, timestamp)` tuples — **never the secret bytes** — to a rotating JSONL log. A CI lint additionally rejects raw secret bytes flowing through `tracing`.
+`origin-keyvault` provides `Secret<T: Zeroize>` — a guard wrapper that **zeroizes on drop** and **redacts in `Debug`** (its `fmt::Debug` writes the literal `Secret<redacted>`). Provider credentials live only in the daemon's `KeyVault`, which fronts OS-native credential stores with an age-encrypted fallback and an audit ring that records `(provider, account, action, timestamp)` tuples — **never the secret bytes** — to a rotating JSONL log. `cargo run -p xtask -- lint-secrets` flags `Debug` structs with secret-named fields that are not `Secret<…>`/`#[redact]`; it is not run in CI and currently reports 11 violations (secret-named string fields in `Debug` structs, all older than the `[Unreleased]` changes).
 
 ### Deterministic replay
 

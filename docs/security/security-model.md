@@ -137,7 +137,7 @@ pub trait Prompter: Send + Sync {
 The trait ships with `AlwaysAllow` and `AlwaysDeny` test prompters; the
 production prompter is the daemon's IPC prompter, answered in the TUI. Which
 calls reach it, and what happens when nobody can answer, is decided by the
-daemon's permission mode (next section but one). This indirection means the
+daemon's permission mode (see [Permission modes](#permission-modes-workspace--on--off)). This indirection means the
 *enforcement point* is the daemon, never the model — the model can request a
 `RequiresPermission` tool but cannot answer the prompt on the human's behalf.
 
@@ -253,7 +253,8 @@ How the daemon acts on the verdict (`apply_cmd_guard` in
 `crates/origin-daemon/src/agent.rs`, on unless `ORIGIN_CMD_GUARD=0`):
 `Dangerous` is refused without an ask; `NeedsApproval` (the program cannot be
 determined statically, or the line cannot be parsed) goes through the
-permission prompt and is denied when nobody can be asked; `Suspicious` is
+permission prompt, which never offers "Always allow" for it, and is denied when
+nobody can be asked; `Suspicious` is
 advisory only. The crate calls itself **an intent filter, not a security
 boundary**: a shell is Turing-complete, so a determined adversary can always
 build a command it does not understand (a script written earlier, an alias, a
@@ -261,10 +262,13 @@ binary that deletes files).
 
 **Turn-end gate commands** (`auto_test`, `auto_lint`, the repro gate, test
 selection, best-of-N's oracle) go through the same analysis with nobody to ask:
-a command rated `Dangerous` or `NeedsApproval` is **not run**, and the only trace
-is a daemon log line (`gate command skipped by the command guard: …`). A
-configured test command that uses shell substitution therefore stops running
-silently until it is simplified or `ORIGIN_CMD_GUARD=0` is set.
+a command rated `Dangerous` or `NeedsApproval` is **not run**. Each run logs it
+(`gate command skipped by the command guard: …`), and the user is told once per
+session per gate with one `[origin]` line naming the gate, the command, the
+guard's reason and the way out (a different command, or `ORIGIN_CMD_GUARD=0`).
+A configured test command whose program is a substitution or variable (only
+known at run time) therefore stops running
+until it is simplified or the guard is turned off.
 
 ### How it analyzes a line
 
@@ -391,11 +395,15 @@ credential (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `ANTHROPIC_*`,
 `ORIGIN_*KEY*`). It covers Bash, turn-end gate commands, hooks, MCP stdio
 servers, language servers and the LSP auto-installer, post-edit
 formatters/linters and syntax checks, notification commands and webhooks,
-shadow-git checkpoints and self-dev git (desktop toasts excepted). The
-`Browser` tool's backends do **not** scrub their environment: the
-`agent-browser` process (`crates/origin-browser/src/agent_browser.rs`) and the
-CloakBrowser sidecar (`cloak.rs`; spawned only with `ORIGIN_STEALTH_FALLBACK=1`
-since D11) inherit the daemon's environment, provider keys included. `ORIGIN_ENV_PASSTHROUGH` adds names (for example
+shadow-git checkpoints, self-dev git (desktop toasts excepted) and the
+`Browser` tool's sidecars: the `agent-browser` process
+(`crates/origin-browser/src/agent_browser.rs`) and the CloakBrowser sidecar
+(`cloak.rs`; spawned only with `ORIGIN_STEALTH_FALLBACK=1` since D11). For the
+sidecars this means `AGENT_BROWSER_*` configuration variables are dropped
+unless listed in `ORIGIN_ENV_PASSTHROUGH`. For them the allow-list includes
+`PLAYWRIGHT_BROWSERS_PATH`, `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY` and
+`XDG_RUNTIME_DIR`; being on the allow-list, these reach every child process,
+Bash included. `ORIGIN_ENV_PASSTHROUGH` adds names (for example
 `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, `SSH_AUTH_SOCK`, or
 registry URLs such as `GOPROXY`, `PIP_INDEX_URL`, `NPM_CONFIG_REGISTRY`,
 `UV_INDEX_URL`, kept off the default list because they can embed
@@ -498,7 +506,7 @@ for every `set`/`get`/`delete`/`list`. It records *what* key was touched, **neve
 the secret bytes** — enforced by the test `ring_never_records_secret_bytes`
 (`crates/origin-keyvault/tests/audit.rs`).
 
-### CI lint that rejects raw secret bytes
+### The `lint-secrets` check (not in CI)
 
 The `Secret<T>` discipline is enforced mechanically by `xtask lint-secrets`
 (`xtask/src/lint_secrets.rs`). It walks the workspace AST and flags any
@@ -512,7 +520,7 @@ The `Secret<T>` discipline is enforced mechanically by `xtask lint-secrets`
 reports 11 violations (in `origin-browser`, `origin-cli`, `origin-daemon`,
 `origin-oidc`, `origin-provider-github` and `origin-provider-openai-compat`;
 some are real credentials held as `String`, some are false positives such as a
-`token_type` field). It becomes a CI gate once those are fixed or annotated.
+`token_type` field; all 11 are older than the `[Unreleased]` changes). It becomes a CI gate once those are fixed or annotated.
 
 ### Redaction of known credentials in tool output (C9)
 
@@ -520,9 +528,10 @@ Separately from `Secret<T>`, the daemon redacts its own provider credentials **b
 value**: the values (8+ characters) of environment variables named like
 credentials (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `PGPASSWORD`,
 `GITHUB_TOKEN`/`GH_TOKEN`, `ORIGIN_*_KEY`, `AWS_SECRET_ACCESS_KEY`) and keyvault
-credentials read at startup are replaced by `[REDACTED:<NAME>]` in tool output,
-turn-end gate output (including what the goal verifier sees) and persisted
-sessions, and the file-writing tools refuse to write such a marker back to
+credentials read at startup are replaced by `[REDACTED:<NAME>]` in tool output
+(sub-agent inline-MCP results included), turn-end gate output (including what
+the goal verifier sees), recalled memory and the repo-map focus block added to a
+prompt, and persisted sessions, and the file-writing tools refuse to write such a marker back to
 disk. It is **best-effort**: keys added or rotated after startup, other
 accounts' secrets, and multi-line, escaped or truncated secrets are not caught.
 The session DB is created `0600` on Unix; this does **not** make the whole
@@ -569,6 +578,17 @@ into code execution.
 **Explicit deny rules win.** A `[[permission_rules]]` deny rule for a tool binds
 every context, including auto-allowed tools and the allow-all flag.
 
+**Prose edits obey the same checks.** With `ORIGIN_EDITFMT=1` the daemon can
+apply edit blocks written in the model's reply text (not tool calls). Each one
+is resolved against the run's working directory and applied only where a
+`Write` to that path would be allowed without asking: nothing in mode `on`,
+nothing outside the workspace or on a protected path, nothing a deny rule, the
+governance policy, the read-only overlay, the conseca path policy or a
+`pre_tool` hook (fired as for a `Write`) refuses. The applier never asks. Edits
+that were not applied are named in one `[editfmt] … not applied: …` line at the
+end of the reply (not in a sub-agent's). Before the `[Unreleased]` changes,
+prose edits bypassed every permission check.
+
 **Session-scoped "Always allow".** An "Always allow <tool>" answer lasts for the
 session, in memory only (lost when the daemon restarts). It is never offered or
 honoured for `Task`, `RunWorkflow`, person-asks (outside/protected/home-root
@@ -609,9 +629,13 @@ allow rules are not inherited), except a `NeedsApproval` command.
 | `Dangerous` command | deny, no ask | deny | deny | deny | deny | deny |
 | `Task` with grants | person (every delegation) | person | deny | allow | n/a (no coordinator) | n/a |
 | `Task` read-only (`0/<T> gated tools, 0 mcp servers`) | allow | allow | allow | allow | n/a | n/a |
-| other gated tool (mem_save, graph_rebuild, AuthorWorkflow, RunWorkflow, …) | ask\* | ask\* | deny | allow | grant | grant |
+| `RunWorkflow` | ask (every time, no "Always allow") | ask (every time) | deny | allow | n/a (error: no nested delegation) | n/a |
+| other gated tool (mem_save, graph_rebuild, AuthorWorkflow, …) | ask\* | ask\* | deny | allow | grant | grant |
 
-Best-of-N (`ORIGIN_BESTOFN`) does not start in mode `on`. Known limits: any
+Best-of-N (`ORIGIN_BESTOFN`) does not start in mode `on`. Its candidates run
+under the session's `[[permission_rules]]` (allow and deny rules, as in the main
+loop), policy layers and conseca. It refuses to apply a winning diff that
+changes a file with uncommitted changes in the working tree. Known limits: any
 client that can reach the daemon socket can send mode `off` (the local IPC
 trust boundary); hard links inside the workspace to files outside it count as
 inside; Unix symlink resolution and a live TUI session were not exercised when
@@ -620,23 +644,29 @@ this was built.
 ## Sub-agents (`Task`)
 
 - **Delegation asks.** `Task` is `RequiresPermission`. Its preview starts with
-  `<G>/<T> gated tools, <D> mcp servers` — `G` distinct permission-gated
-  registry tools the requested `allowed_tools` entries match, out of `T`, and `D`
-  distinct MCP servers — followed by the MCP names, the granting entries and the
-  goal (names escaped, quoted and capped). In mode `workspace` a delegation
-  granting nothing gated (`0/<T> gated tools, 0 mcp servers`) runs without an
-  ask. The header counts the gated tools but names them only through the
-  model-chosen entries, so with a small count the model can push *which* ones
-  past a narrow terminal's cut.
+  `<G>/<T> gated tools (<names>), <D> mcp servers` — `G` distinct
+  permission-gated registry tools the requested `allowed_tools` entries match,
+  out of `T`, named right after the count from the tool registry (up to eight
+  names, then `+K`; `(all)` when every gated tool is granted), and `D` distinct
+  MCP servers, for example `2/14 gated tools (Bash, Edit), 1 mcp servers | …` —
+  followed by the MCP names, the granting entries and the goal (names escaped,
+  quoted and capped). In mode `workspace` a delegation granting nothing gated
+  (`0/<T> gated tools, 0 mcp servers`) runs without an ask.
 - **Workers run on the approved allow-list and cannot ask.** A worker
   auto-approves only what its grant names; anything that would need a person
   (a `NeedsApproval` command, a write outside the workspace, a protected path)
   is denied. Taint inside a worker does not revoke its grant (the approved
   preview is the consent for that combination), and a tainted worker result
-  taints the parent session.
+  taints the parent session. A `RunWorkflow` whose run fails reports no taint,
+  so it taints the session whenever any of its steps could reach a network or
+  MCP tool (fail closed; a workflow that could not be found or loaded does not).
 - **Governance follows the worker.** Workers inherit the daemon's
-  `governance.toml` overlays (policy layers, conseca lists, `[[permission_rules]]`,
-  the browser action cap) (A4). Under a parent skill mask, `allowed_tools` is
+  `governance.toml` overlays (policy layers, conseca lists, `[[permission_rules]]`
+  deny rules (never allow rules), the browser action cap) (A4). Inline-MCP tools
+  a worker runs go through the same checks as built-in tools: the governance
+  policy, read-only mode, the PreTool hook, the standard denial result and
+  secret redaction of their output; their error bodies are bounded (16 KiB) like
+  their results. Under a parent skill mask, `allowed_tools` is
   narrowed to the mask and a `Task` naming any `mcp_servers` is refused; a
   parent mask does not narrow the worker's AutoAllowed tools. Inside a worker,
   `Task` and `RunWorkflow` return an error (no nested delegation).
@@ -661,9 +691,12 @@ this was built.
   `<external source="…" url="…">…</external>`, with marker look-alikes in the
   content escaped, and the system prompt says such text is data, not
   instructions.
-- **Quarantined `WebFetch`.** `WebFetch` takes a required `prompt`; the fetched
-  page (redacted first) goes to a tool-less call to a cheap model, and only its
-  answer (capped at 8,000 characters, itself wrapped) reaches the main loop.
+- **Quarantined `WebFetch`.** `WebFetch` takes a `prompt` (its description names
+  `prompt` and `url`/`urls` as required); the fetched page (redacted first) goes
+  to a tool-less call to a cheap model, and only its answer (capped at 8,000
+  characters, itself wrapped) reaches the main loop. A missing `prompt` is an
+  error only when that quarantine call will run (not under
+  `ORIGIN_WEBFETCH_RAW=1`, not when no cheap model resolves).
   This works on the **Anthropic provider only** (model: `ORIGIN_SIDECAR_MODEL`,
   default `claude-haiku-4-5-20251001`); other providers get the wrapped raw
   page. A failed quarantine call is a tool error, **never** the raw page (fail
@@ -688,15 +721,17 @@ this was built.
 With checkpoints on (`ORIGIN_CHECKPOINTS=1` or `ORIGIN_CHECKPOINTS_PER_TOOL=1`),
 the run's shadow repository is `<run dir>/.origin/shadow.git`. A turn-end gate
 (`auto_test`, `auto_lint`, repro gate) that runs and passes moves the shadow ref
-`refs/tags/last-green` to a checkpoint of the passing tree. If the run then ends
+`refs/tags/last-green` to a checkpoint of the passing tree, provided every armed
+gate ran and none was red (a gate the command guard refused, or that could not
+run, blocks the tag). If the run then ends
 red, the final output (never the conversation, and not a sub-agent's result)
 names that checkpoint and lists, to run in the run's directory:
 `origin checkpoint-diff <id>` to inspect, `origin rewind <id> --files-only` to
 restore the checkpoint's files (files added since stay), and `origin rewind <id>`
 to restore the whole tree and move the checkpoint history back. Nothing is
 restored automatically. **Restoring overwrites the current files and discards
-later changes, hand edits included.** Restoring needs git 2.23 or newer
-(`git restore`). Checkpoints no longer record the shadow repository itself, a
+later changes, hand edits included.** A full `origin rewind` requires git 2.23
+or newer (`git restore`). Checkpoints no longer record the shadow repository itself, a
 full rewind no longer corrupts it, and shadow commands ignore the user's
 commit-signing config and git hooks.
 

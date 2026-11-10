@@ -251,12 +251,12 @@ each module's registration.
 | `Glob` | Find files matching a glob, mtime-sorted, gitignore-aware | AutoAllowed | Pure | `Inherit` | yes | (`glob_tool.rs`). |
 | `LspNavigate` | Semantic nav: definition/references/incoming/outgoing calls | AutoAllowed | Pure | `Inherit` | **no** | Backed by the warm LSP fleet (`lsp_nav.rs`). |
 | `Diagnostics` | LSP diagnostics for a path or workspace | AutoAllowed | Pure | `Inherit` | yes | Severity filter error/warning/hint/any (`diagnostics.rs`). |
-| `WebFetch` | GET one or more URLs and answer the required `prompt` about them; the page is read by a tool-less quarantine model and only its answer is returned, wrapped in `<external>` (`ORIGIN_WEBFETCH_RAW=1` returns the wrapped page instead) | RequiresPermission | Pure | `Inherit` | **no** | Pure-Rust readability path (`web_fetch.rs`); quarantine in `origin-daemon/src/external_content.rs` (C4). |
+| `WebFetch` | GET one or more URLs and answer `prompt` about them (required whenever the quarantine call runs; the description names `prompt` and `url`/`urls` as required); the page is read by a tool-less quarantine model and only its answer is returned, wrapped in `<external>` (`ORIGIN_WEBFETCH_RAW=1` returns the wrapped page instead) | RequiresPermission | Pure | `Inherit` | **no** | Pure-Rust readability path (`web_fetch.rs`); quarantine in `origin-daemon/src/external_content.rs` (C4). |
 | `WebSearch` | Tavily web search | RequiresPermission | Pure | `Inherit` | **no** | Requires `TAVILY_API_KEY` / vault key (`web_search.rs`). |
 | `Browser` | Stateful browser (agent-browser; Cloak fallback only with `ORIGIN_STEALTH_FALLBACK=1`) | RequiresPermission | Mutating | `Inherit` | **no** | (`browser.rs`). |
 | `Recall` | Inflate a CAS handle into the response; optional region slice | AutoAllowed | Pure | `Inherit` | **yes** | Hot on purpose: SchemaCrush offloads behind a `recall` handle (`recall.rs`). |
 | `ToolSearch` | Fetch full schemas for deferred tools | AutoAllowed | Pure | `Inherit` | yes | `select:Name,Name` or keyword rank (`tool_search.rs`). |
-| `Task` | Dispatch a sub-agent (swarm worker) | AutoAllowed | Mutating | `Inherit` | **yes** | No prompt; child confined to `allowed_tools` (`task.rs`). |
+| `Task` | Dispatch a sub-agent (swarm worker) | RequiresPermission | Mutating | `Inherit` | **yes** | Asks with a `<G>/<T> gated tools, <D> mcp servers` preview; in mode `workspace` a read-only delegation runs without an ask (A4, C2); child confined to `allowed_tools` (`task.rs`). |
 | `ask` | Free-text question routed to code-graph / memory | AutoAllowed | Pure | `Inherit` | **no** | No LLM in the router (`ask.rs`). |
 | `ask_user` | Structured single/multi-select question to the human | AutoAllowed | Pure | `Inherit` | **no** | High urgency; `allow_custom` free-text (`ask_user.rs`). |
 | `AuthorWorkflow` | Author a runnable workflow from an NL goal | RequiresPermission | Mutating | `Inherit` | **no** | Persists to the user's workflows file (`author_workflow.rs`). |
@@ -325,14 +325,13 @@ pub async fn check(meta: &ToolMeta, args_preview: &str, prompter: &dyn Prompter)
 ```
 
 - **`AutoAllowed`** tools (`Read`, `Grep`, `Glob`, `Diagnostics`, `LspNavigate`,
-  `Recall`, `ToolSearch`, `Task`, the `graph_*`/`mem_search`/`ask` read paths)
-  bypass the prompter entirely. Notably `Task` is `AutoAllowed` *despite* being
-  `Mutating`: spawning a swarm worker never prompts, because the child is
-  confined to the `allowed_tools` allow-list the parent grants and any
-  governance/conseca deny overlay still applies (`task.rs` comment).
+  `Recall`, `ToolSearch`, `CollectTasks`, the `graph_*`/`mem_search`/`ask` read
+  paths) bypass the prompter entirely.
 - **`RequiresPermission`** tools ask the user. This covers every file mutator,
   `Bash`, `WebFetch`/`WebSearch`/`Browser`, `mem_save`/`mem_forget`,
-  `graph_rebuild`, `gmail`, and the workflow authors.
+  `graph_rebuild`, `gmail`, `Task`, and the workflow authors. `Task` asks with a
+  `<G>/<T> gated tools, <D> mcp servers` preview; in mode `workspace` a
+  read-only delegation runs without an ask (A4, C2).
 
 A second entry point, `check_with_rules`, consults a bloom-filter pre-check plus
 a user-configured wildcard rule list *before* the tier check, keyed on
@@ -510,7 +509,13 @@ markers (`<<<<<<<`, a ```` ``` ```` fence, an `@@` hunk header), and
 `extract_all_hunks(text, model)` auto-detects, falling back to the model's best
 format. `apply` replaces the unique occurrence of `before` with `after`,
 returning `EditFmtError::NoMatch` / `EditFmtError::Ambiguous` exactly like the
-`Edit` tool. Whole-file hunks have an empty `before` and replace wholesale.
+`Edit` tool. Whole-file hunks have an empty `before` and replace wholesale; a
+whole-file edit is only recognised as a path line standing alone (relative, no
+`..`, containing a `/` or a file name with an extension that has a letter)
+directly above a closed fenced block. The daemon applies prose edits only with
+`ORIGIN_EDITFMT=1`, and only where a `Write` to the resolved path would be
+allowed without asking (see the
+[security model](../security/security-model.md#permission-modes-workspace--on--off)).
 
 ### Post-edit lint/test/format policy (`origin-postedit`)
 

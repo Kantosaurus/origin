@@ -104,7 +104,7 @@ description}` and are inflated via `ToolSearch`.
 
 | Tool | Purpose | Tier | Sandbox | Key params |
 |------|---------|------|---------|-----------|
-| `WebFetch` | Fetch one or more URLs (single `url` or `urls[]` up to 20) and answer `prompt` about them through a tool-less cheap model; only the answer is returned. | RequiresPermission | `Inherit` | `url`, `urls[]`, `prompt` (required) |
+| `WebFetch` | Fetch one or more URLs (single `url` or `urls[]` up to 20) and answer `prompt` about them through a tool-less cheap model; only the answer is returned. | RequiresPermission | `Inherit` | `url`, `urls[]`, `prompt` (required when the quarantine call runs: not under `ORIGIN_WEBFETCH_RAW=1` or with no cheap model) |
 | `WebSearch` | Search the web via Tavily (`TAVILY_API_KEY` or vault). | RequiresPermission | `Inherit` | `query`, `count` |
 | `Browser` | Stateful browser (agent-browser backend). CloakBrowser fallback on bot detection only with `ORIGIN_STEALTH_FALLBACK=1`. | RequiresPermission | `Inherit` | verb + verb args |
 
@@ -118,7 +118,7 @@ description}` and are inflated via `ToolSearch`.
 
 | Tool | Purpose | Tier | Sandbox | Key params |
 |------|---------|------|---------|-----------|
-| `Task` | Dispatch a concurrent sub-agent (swarm worker) confined to `allowed_tools`; returns a `CompletionReport`. | AutoAllowed | `Inherit` | `goal`, `allowed_tools[]`, `budget`, `model`, `mcp_servers[]` |
+| `Task` | Dispatch a concurrent sub-agent (swarm worker) confined to `allowed_tools`; returns a `CompletionReport`. Asks with a `<G>/<T> gated tools, <D> mcp servers` preview; in mode `workspace` a read-only delegation runs without an ask (A4, C2). | RequiresPermission | `Inherit` | `goal`, `allowed_tools[]`, `budget`, `model`, `mcp_servers[]` |
 | `AuthorWorkflow` | Author a runnable workflow from an NL `goal`; persists TOML to the user's workflows file. | RequiresPermission | `Inherit` | `goal`, `name` |
 | `RunWorkflow` | Run a named workflow; groups steps into dependency layers and fans out one sub-agent per step. | RequiresPermission | `Inherit` | `name` |
 

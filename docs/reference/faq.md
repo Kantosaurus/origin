@@ -73,12 +73,14 @@ Two layers:
 1. **Permission tiers** — every tool is `AutoAllowed` (read-only/low-risk, runs
    silently) or `RequiresPermission`. In interactive mode the daemon emits a
    `PermissionAsk` and blocks for your `PermissionDecision` (Allow once / Always
-   / Deny). In headless/swarm runs the policy/governance engine decides
-   (`ORIGIN_GOVERNANCE_PATH`).
-2. **Sandbox profiles** — each tool runs child processes under a confinement
-   profile: `Inherit`, `ReadFs` (read-only), `WriteCwd` (writes confined to the
-   workspace), or `Shell` (full). Editing tools use `WriteCwd`; `Bash` uses
-   `Shell`; `Read` uses `ReadFs`.
+   / Deny). Headless runs cannot ask, so they deny what would ask (unless
+   `--dangerously-allow-all`, `ORIGIN_ALLOW_ALL=1` or an allow rule covers it),
+   and sub-agents run only what their `Task` grant names; the
+   governance policy (`ORIGIN_GOVERNANCE_PATH`) can deny on top in every case.
+2. **Sandbox profiles** — tools declare a sandbox profile (`Inherit`, `ReadFs`,
+   `WriteCwd`, `Shell`), but no OS backend is enabled on shipped builds, so
+   child processes run unconfined with an allow-listed environment; see the
+   [security model](../security/security-model.md).
 
 Secrets are wrapped in `Secret<T>` and redacted from logs/telemetry. See
 [tool-catalog.md](tool-catalog.md), [`../crates/origin-permission.md`](../crates/origin-permission.md)

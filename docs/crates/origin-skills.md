@@ -8,8 +8,8 @@
 stack**. A *skill* is a `SKILL.md` file — YAML frontmatter plus a Markdown body —
 that extends the agent with a reusable workflow without anyone writing Rust. This
 crate parses skills, ships a vendored catalog of "superpowers" skills embedded in
-the binary, content-addresses each body, upserts skill text into the shared
-embedding index for lazy per-turn injection, and computes the `allowed-tools`
+the binary, content-addresses each body (an embedding upsert for per-turn
+injection exists but is not wired, D6), and computes the `allowed-tools`
 intersection mask that narrows the permission surface while skills are active.
 
 It sits between the filesystem / embedded assets and two consumers: the daemon

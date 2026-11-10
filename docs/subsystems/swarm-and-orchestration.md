@@ -627,14 +627,11 @@ schema (`task.rs:245`):
 ```
 
 - **When to use**: parallelize independent units of work — spawn several at
-  once. No permission prompt is required; the sub-agent is confined to the
-  `allowed_tools` allow-list the parent grants.
-- **Budget scoping**: `TaskBudget` defaults are **unlimited**
-  (`max_wall_ms`/`max_input_tokens`/`max_output_tokens = u64::MAX`,
-  `max_tool_calls = u32::MAX`) — a sub-agent runs to natural completion unless
-  the caller passes an explicit smaller `budget` (omitted fields deserialize to
-  the unlimited default). The internal real-worker default turn cap is 32 only
-  when no cap is given via the swarm `Budget` path.
+  once. `Task` asks unless it grants nothing gated (A4/C2); the sub-agent is
+  confined to the `allowed_tools` allow-list the parent grants.
+- **Budget scoping**: `max_wall_ms`/`max_input_tokens`/`max_output_tokens`
+  default to unlimited (`u64::MAX`). A worker stops after 50 turns unless
+  `budget.max_tool_calls` is set (B8; `0` or omitted = 50).
 - **Tool scoping**: the parent's grant is glob-matched against the registry; the
   child can never see `Task` (recursion forbidden) even under `*`.
 - **Output**: the tool inlines the actionable view — `status`, `summary`,

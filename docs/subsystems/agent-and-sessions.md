@@ -552,7 +552,7 @@ the `BudgetExhausted` cap reason wins over a tentative `Met`.
 ```text
 loop {
     goal_cap_clear(...)            // top-of-iteration cap_check; Bug #7 first-iter handling
-    summary = run_loop(session, next_text, provider, &AlwaysAllow, opts)   // main.rs:2714
+    summary = run_loop(session, next_text, provider, prompter, opts)   // the mode's prompter (C2): AlwaysAllow in mode off, IPC when a client can answer, else NoPrompter
     if goal slot is now None  -> return Ok(summary)
     decision = run_verifier_dispatch(...)   // parse_tag, record_iteration, drive_decision off-lock
     checkpoint(session)            // persist a goal-aware ResumeToken
@@ -797,8 +797,8 @@ read and switch it. Every variable is in the
 - The system prompt is ordered static-first and stays **byte-identical for a
   session**: the repo map is scanned once per session and workspace (opt out
   with `ORIGIN_REPOMAP=0`), and per-prompt material (repo-map entries for files
-  the prompt names, recalled memories) goes into that prompt's user message.
-  The tool list is decided once per session at its first prompt (C7).
+  the prompt names, recalled memories) goes into that prompt's user message,
+  secret-redacted (C9). The tool list is decided once per session at its first prompt (C7).
 - On Anthropic, `system` is sent as one block with its own `cache_control`
   marker, so tools + system are cached from a session's first request; three
   rolling message markers make four in total (Anthropic's ceiling).
@@ -836,12 +836,14 @@ read and switch it. Every variable is in the
   dispatch in two of its steps.
 - System-prompt bytes as measured when this landed (scripted provider, a
   two-file Rust workspace, no skill catalog): interactive 11,257 → 10,499;
-  headless 11,257 → 6,797; swarm worker 14,136 → 2,282. Later changes add the
-  user's ponytail ruleset and an external-content line to worker prompts.
+  headless 11,257 → 6,797; swarm worker 14,136 → 6,334 (2,282 with the
+  ponytail ruleset off; the 14,136 baseline included that ruleset at its
+  default level). Later changes add an external-content line to worker prompts.
 - Reasoning effort with no `/effort`, `/fast` or `--effort`: `high` for the main
   loop and `medium` for sub-agents on Anthropic (was `max` for both); other
-  providers send none. An explicit parent effort is handed down to workers and
-  best-of-N candidates. `ORIGIN_DEFAULT_EFFORT=max` restores the old main-loop
+  providers send none. An explicit parent effort is handed down to workers
+  (`Task` workers and the step workers of an in-session `RunWorkflow`, which
+  also get the parent's ponytail level) and to best-of-N candidates. `ORIGIN_DEFAULT_EFFORT=max` restores the old main-loop
   default. Whether `high` versus `max` changes task success was **not
   measured**.
 
@@ -854,19 +856,25 @@ runtime tools unaffected): 5,510 versus 14,708 tool-definition bytes (10 versus
 `ORIGIN_EDITFMT` decides the edit tools: by default the per-model table removes
 `Edit`/`MultiEdit`/`ApplyPatch` for models it maps to whole-file (`gpt-3.5*`,
 `*turbo-instruct`); `0`/`off`/`false` or another format name keeps the full
-list, `whole-file` removes them for every model.
+list, `whole-file` removes them for every model. Exactly `1` also applies edit
+blocks the model writes in its reply text; such prose edits obey the permission
+mode like a `Write` (see the
+[security model](../security/security-model.md#permission-modes-workspace--on--off)).
 
 ### Environment line and post-edit checks (B6, B7, B11, C10)
 
 - **Toolchain line (B6).** `<origin-env>` carries one `Tools on PATH: …` line —
   a PATH lookup (no process spawned) done once per daemon process with a 2 s
   budget; a zero-length or non-executable first match (such as the Windows
-  Store `python` alias) counts as absent. `ORIGIN_TOOL_PROBE=0` omits it.
+  Store `python` alias) counts as absent, and on Unix a symlink to a directory
+  is ignored. `ORIGIN_TOOL_PROBE=0` omits it.
 - **Tree-sitter advisory (B7).** The post-edit syntax gate also parses edited
   files with tree-sitter for the grammars `origin-codegraph` links (Python only
   when no real interpreter ran). It reports only parse errors an edit **added**,
   as a separate `<syntax-advisory>` ("may be a parser limitation"), never as a
-  must-fix; files over 1 MB, `.tsx` and `.h` are skipped. The pinned grammars
+  must-fix; files over 1 MB, `.tsx` and `.h` are skipped. `.jsx` files get no
+  check from this gate (`node --check` rejects JSX, and no JavaScript grammar is
+  linked). The pinned grammars
   lag current languages: a characterisation test in `origin-codegraph` records
   that the pinned Rust grammar flags `use<>` precise capturing, `&raw const` and
   `gen {}` as errors (the TypeScript samples it checks parse clean).
@@ -882,7 +890,9 @@ list, `whole-file` removes them for every model.
   slow-starting server (rust-analyzer, Java servers) may never return
   diagnostics; the model gets "timed out" / "still starting" notes instead.
   Best-of-N candidates get no diagnostics. No real language server was run when
-  this was built.
+  this was built. The per-turn test and lint gates (`auto_test`, repro gate,
+  `auto_lint`) run whether or not the syntax gate and LSP diagnostics are on
+  (A12).
 
 ## Diagrams
 
