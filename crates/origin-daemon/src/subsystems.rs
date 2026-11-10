@@ -194,6 +194,126 @@ pub fn session_repo_map_block(session_id: &str, roots: &[std::path::PathBuf]) ->
         .clone()
 }
 
+/// B6: toolchains and package managers probed on `PATH`, in the order listed.
+const PROBED_TOOLS: [&str; 26] = [
+    "python", "python3", "node", "npm", "pnpm", "yarn", "bun", "deno", "cargo", "rustc", "go", "java", "mvn",
+    "gradle", "dotnet", "ruby", "php", "gcc", "clang", "make", "cmake", "git", "docker", "uv", "pip",
+    "pytest",
+];
+
+/// B6: total budget for the once-per-session `PATH` probe.
+const TOOL_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// B6: `Tools on PATH: python, node, …` for the [`PROBED_TOOLS`] that resolve
+/// on `path` (a `PATH`-style list), or empty when none do.
+///
+/// A pure lookup — nothing is spawned. Windows honours `PATHEXT`
+/// (case-insensitively); Unix needs the execute bit. Zero-length hits are
+/// ignored: the Microsoft Store "App Execution Alias" stubs for
+/// `python`/`python3` are not an interpreter. Lists each `PATH` directory once
+/// rather than `which`-ing every tool: that is ~26 × dirs × `PATHEXT` stats,
+/// hundreds of milliseconds on the first prompt of a Windows session.
+#[must_use]
+pub fn tools_on_path_line(path: &std::ffi::OsStr) -> String {
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    let mut hit = [false; PROBED_TOOLS.len()];
+    for dir in std::env::split_paths(path) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let name = if cfg!(windows) {
+                name.to_ascii_lowercase()
+            } else {
+                name.to_string()
+            };
+            let Some(i) = PROBED_TOOLS.iter().position(|tool| {
+                exts.iter()
+                    .any(|ext| name.strip_prefix(tool).is_some_and(|rest| rest == ext))
+            }) else {
+                continue;
+            };
+            if !hit[i] && is_real_executable(&entry.path()) {
+                hit[i] = true;
+            }
+        }
+    }
+    let found: Vec<&str> = PROBED_TOOLS
+        .iter()
+        .zip(hit)
+        .filter_map(|(tool, hit)| hit.then_some(*tool))
+        .collect();
+    if found.is_empty() {
+        String::new()
+    } else {
+        format!("Tools on PATH: {}", found.join(", "))
+    }
+}
+
+/// B6: a non-empty regular file (links followed) that, on Unix, is executable.
+fn is_real_executable(p: &std::path::Path) -> bool {
+    std::fs::metadata(p).is_ok_and(|m| {
+        #[cfg(unix)]
+        let exec = {
+            use std::os::unix::fs::PermissionsExt;
+            m.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let exec = true;
+        m.is_file() && m.len() > 0 && exec
+    })
+}
+
+/// B6: the session's [`tools_on_path_line`], probed once per session id.
+///
+/// Reused byte-for-byte afterwards (it sits in the cached system prefix, so a
+/// `PATH` change mid-session must not alter it). The probe runs off the async
+/// runtime under [`TOOL_PROBE_BUDGET`]; a timeout or error yields (and caches)
+/// an empty line.
+pub async fn session_tools_line(session_id: &str, path: Option<std::ffi::OsString>) -> String {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+    // ponytail: process-wide and never evicted, like the session repo map.
+    static LINES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let lines = LINES.get_or_init(Mutex::default);
+    if let Some(line) = lines
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(session_id)
+    {
+        return line.clone();
+    }
+    let probe = tokio::task::spawn_blocking(move || path.map(|p| tools_on_path_line(&p)).unwrap_or_default());
+    let line = match tokio::time::timeout(TOOL_PROBE_BUDGET, probe).await {
+        Ok(Ok(line)) => line,
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "PATH tool probe failed (ignored)");
+            String::new()
+        }
+        Err(_) => {
+            tracing::debug!("PATH tool probe timed out (ignored)");
+            String::new()
+        }
+    };
+    lines
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(session_id.to_string())
+        .or_insert(line)
+        .clone()
+}
+
 /// The roots as one workspace identity: sorted, de-duplicated and lexically
 /// normalised (trailing separators dropped; on Windows `\`→`/` and
 /// case-folded, as its paths compare case-insensitively). Purely lexical — no
@@ -421,6 +541,55 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(file), body).expect("write");
         dir
+    }
+
+    /// Writes a fake executable `name` into `dir`: `len` bytes, execute bit set on Unix.
+    fn fake_exe(dir: &std::path::Path, name: &str, len: usize) {
+        let p = dir.join(name);
+        std::fs::write(&p, vec![b'x'; len]).expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+    }
+
+    /// B6: only real (non-empty, executable) hits on the given PATH are listed,
+    /// in the probe order, on one line.
+    #[test]
+    fn tools_line_lists_found_tools_in_probe_order() {
+        let a = tempfile::tempdir().expect("tempdir");
+        let b = tempfile::tempdir().expect("tempdir");
+        let (exe, cmd) = if cfg!(windows) { (".exe", ".CMD") } else { ("", "") };
+        fake_exe(a.path(), &format!("git{exe}"), 4);
+        fake_exe(a.path(), &format!("npm{cmd}"), 4);
+        fake_exe(b.path(), &format!("python{exe}"), 4);
+        // A zero-length stub (the Windows Store python alias) is not a tool.
+        fake_exe(a.path(), &format!("python3{exe}"), 0);
+        fake_exe(a.path(), "not-a-tool", 4);
+        // Not executable: no `PATHEXT` extension on Windows, no execute bit on Unix.
+        let node = if cfg!(windows) { "node.txt" } else { "node" };
+        std::fs::write(a.path().join(node), "x").expect("write");
+        let path = std::env::join_paths([a.path(), b.path()]).expect("join");
+        assert_eq!(tools_on_path_line(&path), "Tools on PATH: python, npm, git");
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(tools_on_path_line(empty.path().as_os_str()), "");
+    }
+
+    /// B6: the line is probed once per session; a PATH change mid-session does
+    /// not change its bytes.
+    #[tokio::test]
+    async fn session_tools_line_is_frozen_per_session() {
+        let a = tempfile::tempdir().expect("tempdir");
+        fake_exe(a.path(), if cfg!(windows) { "git.exe" } else { "git" }, 4);
+        let path_a = a.path().as_os_str().to_owned();
+        let empty = tempfile::tempdir().expect("tempdir");
+        let first = session_tools_line("b6-frozen", Some(path_a)).await;
+        assert_eq!(first, "Tools on PATH: git");
+        let again = session_tools_line("b6-frozen", Some(empty.path().as_os_str().to_owned())).await;
+        assert_eq!(again, first);
+        let other = session_tools_line("b6-other", Some(empty.path().as_os_str().to_owned())).await;
+        assert_eq!(other, "");
     }
 
     /// B2: the session map is keyed on (session id, roots). A reused or resumed

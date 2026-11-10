@@ -121,6 +121,13 @@ async fn tools_and_system_bytes_identical_across_two_prompts() {
         "fixture must exercise the repo map:\n{}",
         reqs[0].system
     );
+    // B6: the session's PATH probe rides in the stable prefix (this test runs
+    // under cargo, so at least one probed toolchain resolves on PATH).
+    assert!(
+        reqs[0].system.contains("\nTools on PATH: "),
+        "fixture must exercise the tools line:\n{}",
+        reqs[0].system
+    );
     assert!(reqs[1].messages.len() > reqs[0].messages.len());
     let (tools0, system0) = anthropic_prefix(&reqs[0]);
     let (tools1, system1) = anthropic_prefix(&reqs[1]);

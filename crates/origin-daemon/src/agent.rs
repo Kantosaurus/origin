@@ -1390,8 +1390,15 @@ fn workspace_roots_block(roots: &[std::path::PathBuf]) -> String {    if roots.i
 /// commands through, and the working directory. Without it the model assumes
 /// POSIX `sh` and a relative cwd, emitting `rm -rf`, `2>/dev/null`, `&&` chains
 /// and relative paths that fail on a Windows/PowerShell host. Static per host
-/// ⇒ sits in the cached system prefix at zero per-turn token cost.
-fn render_env_block(os: &str, windows: bool, cwd: &str) -> String {
+/// ⇒ sits in the cached system prefix at zero per-turn token cost. B6:
+/// `tools` is the session's `Tools on PATH: …` line (empty ⇒ omitted), so the
+/// model does not spend shell calls probing for toolchains.
+fn render_env_block(os: &str, windows: bool, cwd: &str, tools: &str) -> String {
+    let tools = if tools.is_empty() {
+        String::new()
+    } else {
+        format!("{tools}\n")
+    };
     let shell = if windows {
         "PowerShell — commands run via `pwsh -Command`. Use PowerShell syntax, NOT POSIX sh: \
          `Remove-Item` not `rm -rf`, `2>$null` not `2>/dev/null`, `;` (or `-and`) not `&&` to \
@@ -1404,6 +1411,7 @@ fn render_env_block(os: &str, windows: bool, cwd: &str) -> String {
          Operating system: {os}\n\
          Shell: {shell}\n\
          Working directory: {cwd}\n\
+         {tools}\
          Prefer absolute paths for file tools; relative paths resolve against the working \
          directory above.\n\
          </origin-env>"
@@ -1416,7 +1424,7 @@ mod env_block_tests {
 
     #[test]
     fn windows_block_steers_to_powershell_and_names_cwd() {
-        let b = render_env_block("windows", true, "C:\\work\\proj");
+        let b = render_env_block("windows", true, "C:\\work\\proj", "");
         assert!(b.contains("<origin-env>"), "wrapped: {b}");
         assert!(b.contains("Operating system: windows"), "names OS: {b}");
         assert!(b.contains("PowerShell"), "names the shell: {b}");
@@ -1426,10 +1434,24 @@ mod env_block_tests {
 
     #[test]
     fn unix_block_describes_posix_sh() {
-        let b = render_env_block("linux", false, "/home/u/proj");
+        let b = render_env_block("linux", false, "/home/u/proj", "");
         assert!(b.contains("Operating system: linux"));
         assert!(b.contains("POSIX sh"), "names POSIX sh on unix: {b}");
         assert!(b.contains("/home/u/proj"));
+        assert!(
+            !b.contains("Tools on PATH"),
+            "no probe line when nothing was found: {b}"
+        );
+    }
+
+    /// B6: the session's tools line sits on its own line inside the block.
+    #[test]
+    fn tools_line_rides_in_the_env_block() {
+        let b = render_env_block("linux", false, "/p", "Tools on PATH: git");
+        assert!(
+            b.contains("Working directory: /p\nTools on PATH: git\nPrefer absolute"),
+            "{b}"
+        );
     }
 }
 
@@ -4810,10 +4832,18 @@ async fn run_loop_inner(
     // Static per-host environment (OS / shell / cwd). Fixed for the whole run,
     // so it sits in the cached system prefix at zero per-turn token cost. Stops
     // the model emitting POSIX-isms + relative paths that fail on this host.
+    // B6: which toolchains resolve on PATH — probed once per session (frozen,
+    // like the repo map); `ORIGIN_TOOL_PROBE=0` omits the line.
+    let tools_line = if matches!(std::env::var("ORIGIN_TOOL_PROBE").as_deref(), Ok("0")) {
+        String::new()
+    } else {
+        crate::subsystems::session_tools_line(&session.id, std::env::var_os("PATH")).await
+    };
     let env_block = render_env_block(
         std::env::consts::OS,
         cfg!(windows),
         &loop_cwd(opts).map_or_else(|| ".".to_string(), |p| p.display().to_string()),
+        &tools_line,
     );
     // B2 seam — the SESSION-STABLE system prompt. It must be byte-identical for
     // every request of a session: Anthropic caches tools + system behind one
