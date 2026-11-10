@@ -104,6 +104,9 @@ impl LspClient {
         workspace_root: &Path,
     ) -> Result<Self, LspError> {
         let mut cmd = Command::new(binary);
+        // A6: the server gets the allow-listed environment (PATH, CARGO_HOME,
+        // RUSTUP_HOME, … stay), never the daemon's provider keys.
+        origin_sandbox::scrub_env(cmd.as_std_mut());
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

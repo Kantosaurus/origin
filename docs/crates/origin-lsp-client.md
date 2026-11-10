@@ -46,9 +46,10 @@ pub struct Diagnostic {
 
 ## How it works
 
-Each frame is `Content-Length: N\r\n\r\n<json>`. `spawn_with_args` pipes the
-child's stdin/stdout, sets `kill_on_drop` (so a short diagnostics probe never
-leaks a server), then sends `initialize` (id 0) and `initialized`. A background
+Each frame is `Content-Length: N\r\n\r\n<json>`. `spawn_with_args` gives the
+child the allow-listed environment (`origin_sandbox::scrub_env`, A6: no provider
+keys; `ORIGIN_ENV_SCRUB=0` restores full inheritance), pipes its stdin/stdout,
+sets `kill_on_drop` (so dropping the client never leaks a server), then sends `initialize` (id 0) and `initialized`. A background
 `reader_loop` parses frames: `textDocument/publishDiagnostics` updates the
 shared `diags` map; any frame carrying an `id` plus a `result`/`error` is routed
 to the matching `oneshot` in `pending`; server→client request frames are

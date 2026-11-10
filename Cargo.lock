@@ -4395,6 +4395,7 @@ dependencies = [
 name = "origin-lsp-client"
 version = "0.9.14"
 dependencies = [
+ "origin-sandbox",
  "serde",
  "serde_json",
  "tempfile",
