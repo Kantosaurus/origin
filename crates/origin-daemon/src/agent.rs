@@ -550,14 +550,16 @@ fn apply_governance_overlay(
 /// today — the `Prompter` trait cannot tell it apart from a human saying yes.
 ///
 /// C6: a command that installs a package the project does not declare
-/// ([`crate::dep_gate`]; the manifests from the call's `cwd` up to the daemon's
-/// working directory) is raised to `NeedsApproval` with the package named.
+/// ([`crate::dep_gate`]; the manifests from the call's `cwd` up to `run_cwd`,
+/// the run's working directory — `None` ⇒ the process cwd) is raised to
+/// `NeedsApproval` with the package named.
 async fn apply_cmd_guard(
     decision: origin_permission::Decision,
     meta: &ToolMeta,
     args: &Value,
     args_preview: &str,
     prompter: &dyn Prompter,
+    run_cwd: Option<&std::path::Path>,
 ) -> origin_permission::Decision {
     if meta.name != "Bash" || std::env::var("ORIGIN_CMD_GUARD").as_deref() == Ok("0") {
         return decision;
@@ -570,7 +572,11 @@ async fn apply_cmd_guard(
     // C6: installing a package the project does not declare needs approval.
     // Only ever raises the verdict (a Dangerous one is left as it is).
     if !matches!(verdict, origin_cmdparse::Risk::Dangerous(_)) {
-        let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        // A12: a best-of-N candidate's manifests live in its own worktree.
+        let root = run_cwd.map_or_else(
+            || std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            std::path::Path::to_path_buf,
+        );
         let cwd = args.get("cwd").and_then(Value::as_str);
         if let Some(why) = crate::dep_gate::reason(cmd, cwd, &root) {
             verdict = origin_cmdparse::Risk::NeedsApproval(match verdict {
@@ -6014,9 +6020,10 @@ async fn run_loop_inner(
                     }
                 }
             }
-            // End-of-run effects. Placed below the repro-gate and B11 continuations
-            // so a run that continues does not fire them early: they run once, on
-            // the path that returns.
+            // End-of-run effects. Placed below the repro-gate, B11 and C6 review
+            // continuations so a run that continues does not fire them early: they
+            // run once, on the path that returns, and flush totals that include
+            // the review call's usage.
             // P6.7: optional proposer pass at turn end. Proposals are surfaced
             // as side-band StreamEvents for the CLI to render AND recorded in
             // the daemon-wide [`ProposalRegistry`] so a later `MemoryDecision`
@@ -6322,7 +6329,7 @@ async fn run_loop_inner(
             // downgrade an Allow to Deny, or route it through the prompter, but
             // never widen.
             if decision.outcome == Outcome::Allow {
-                decision = apply_cmd_guard(decision, meta, &args, &preview, prompter).await;
+                decision = apply_cmd_guard(decision, meta, &args, &preview, prompter, opts.cwd.as_deref()).await;
             }
 
             // Read-only "plan mode" overlay (gemini Plan Mode). Same deny-only
@@ -12101,6 +12108,7 @@ mod wiring_tests {
             args,
             &args.to_string(),
             prompter,
+            None,
         ))
     }
 
@@ -12302,6 +12310,31 @@ mod wiring_tests {
             run_cmd_guard(allow(), "Bash", &declared, &deny).outcome,
             Outcome::Allow
         );
+    }
+
+    /// C6 + A12: in a run with its own working directory (a best-of-N
+    /// candidate), the manifests are read from that directory, with the Bash
+    /// call's anchored `cwd`.
+    #[test]
+    fn cmd_guard_reads_manifests_from_the_run_cwd() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("ORIGIN_CMD_GUARD");
+        let run = tempfile::tempdir().expect("tmp");
+        std::fs::write(run.path().join("package.json"), r#"{"dependencies":{"left-pad":"1"}}"#).expect("write");
+        let args = anchor_tool_args("Bash", serde_json::json!({ "command": "npm install left-pad" }), run.path());
+        let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+        let out = rt.block_on(apply_cmd_guard(
+            Decision {
+                outcome: Outcome::Allow,
+                reason: "rule:Bash@project:allow".into(),
+            },
+            &rp_meta("Bash"),
+            &args,
+            &args.to_string(),
+            &origin_permission::prompt::AlwaysDeny,
+            Some(run.path()),
+        ));
+        assert_eq!(out.outcome, Outcome::Allow, "declared in the run cwd: {}", out.reason);
     }
 
     /// WS-D browser visual loop: the gate is OFF by default. With

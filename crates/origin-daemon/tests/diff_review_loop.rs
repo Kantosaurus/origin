@@ -163,6 +163,58 @@ fn tripwire_annotates_without_blocking_and_no_findings_ends_the_run() {
     assert_eq!(review.model, "scripted-model");
 }
 
+/// The review runs before the end-of-run effects: its usage is in the run's
+/// totals and gets one `RequestUsage` event, exactly once.
+#[test]
+fn review_usage_is_counted_once() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::env::set_var("ORIGIN_DIFF_REVIEW", "1");
+    let d = tempfile::tempdir().expect("tempdir");
+    let path = d.path().join("u.txt").to_string_lossy().into_owned();
+    let usage = |input_tokens, output_tokens| Usage {
+        input_tokens,
+        output_tokens,
+        ..Usage::default()
+    };
+    let provider = ScriptedProvider {
+        responses: Mutex::new(vec![
+            ChatResponse {
+                assistant: write(&path, "x\n").into_iter().fold(Message::new(Role::Assistant), Message::with_block),
+                usage: usage(1, 10),
+            },
+            ChatResponse {
+                assistant: Message::new(Role::Assistant).with_block(Block::text("done")),
+                usage: usage(2, 20),
+            },
+            ChatResponse {
+                assistant: Message::new(Role::Assistant).with_block(Block::text("NO FINDINGS")),
+                usage: usage(400, 4000),
+            },
+        ]),
+        requests: Mutex::new(Vec::new()),
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+    let mut opts = LoopOptions::default().without_streaming();
+    opts.event_tx = Some(tx);
+    let mut session = Session::new("diff-review-usage", "scripted-model");
+    let out = rt.block_on(run_loop(&mut session, PROMPT, &provider, &AlwaysAllow, &opts));
+    std::env::remove_var("ORIGIN_DIFF_REVIEW");
+    drop(opts);
+    let summary = out.expect("run ok");
+    assert_eq!((summary.input_tokens, summary.output_tokens), (403, 4030));
+    let mut review_events = 0;
+    while let Ok(ev) = rx.try_recv() {
+        if let origin_daemon::protocol::StreamEvent::RequestUsage { input_tokens: 400, .. } = ev {
+            review_events += 1;
+        }
+    }
+    assert_eq!(review_events, 1);
+}
+
 #[test]
 fn findings_get_one_extra_round_and_only_one_review() {
     let d = tempfile::tempdir().expect("tempdir");
