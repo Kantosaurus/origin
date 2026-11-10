@@ -21,12 +21,12 @@ use origin_cmdparse::{Ecosystem, Form};
 /// Manifests larger than this are treated as unparsable.
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
-/// Why `cmd`, run in `cwd` (relative to `root`, the workspace root) needs
-/// approval as an install or run of undeclared packages; `None` when it
-/// installs nothing new.
+/// Why `cmd`, run in `cwd` (relative to `root`, the workspace root) with the
+/// variables named in `env` set, needs approval as an install or run of
+/// undeclared packages; `None` when it installs nothing new.
 #[must_use]
-pub fn reason(cmd: &str, cwd: Option<&str>, root: &Path) -> Option<String> {
-    let installs = origin_cmdparse::installs(cmd);
+pub fn reason(cmd: &str, env: &[&str], cwd: Option<&str>, root: &Path) -> Option<String> {
+    let installs = origin_cmdparse::installs_with_env(cmd, env);
     if installs.is_empty() {
         return None;
     }
@@ -335,7 +335,7 @@ mod tests {
     }
 
     fn gate(root: &Path, cmd: &str) -> Option<String> {
-        reason(cmd, None, root)
+        reason(cmd, &[], None, root)
     }
 
     #[test]
@@ -421,11 +421,11 @@ mod tests {
             "bash -c \"cargo add tokio\"",
             "cargo add --dev proptest",
         ] {
-            assert_eq!(reason(declared, member, d.path()), None, "{declared}");
+            assert_eq!(reason(declared, &[], member, d.path()), None, "{declared}");
         }
-        let r = reason("bash -c \"cargo add anyhow\"", member, d.path()).expect("absent");
+        let r = reason("bash -c \"cargo add anyhow\"", &[], member, d.path()).expect("absent");
         assert!(r.contains("anyhow"), "{r}");
-        assert!(reason("cargo add --git https://x/y y", member, d.path()).is_some());
+        assert!(reason("cargo add --git https://x/y y", &[], member, d.path()).is_some());
 
         std::fs::write(d.path().join("Cargo.toml"), "[dependencies\nserde = ").expect("write");
         let r = gate(d.path(), "cargo add serde").expect("unparsable manifest ⇒ fail closed");
@@ -434,7 +434,7 @@ mod tests {
         let r = gate(empty.path(), "cargo add serde").expect("missing manifest ⇒ fail closed");
         assert!(r.contains("no Cargo.toml"), "{r}");
         assert!(
-            reason("cargo add serde", Some(".."), d.path()).is_some(),
+            reason("cargo add serde", &[], Some(".."), d.path()).is_some(),
             "cwd outside root"
         );
         // M2: an oversized manifest is treated as unparsable.
@@ -503,7 +503,7 @@ mod tests {
             ("app/.keep", ""),
         ]);
         assert_eq!(
-            reason("npx tsc --noEmit", Some("app"), d.path()),
+            reason("npx tsc --noEmit", &[], Some("app"), d.path()),
             None,
             "local bin, walked up"
         );
@@ -587,10 +587,10 @@ mod tests {
     fn working_directory_must_resolve_inside_the_workspace() {
         let outside = project(&[("package.json", r#"{"dependencies":{"left-pad":"1"}}"#)]);
         let d = project(&[("package.json", PKG)]);
-        let r = reason("npm install react", Some("missing"), d.path()).expect("unresolvable");
+        let r = reason("npm install react", &[], Some("missing"), d.path()).expect("unresolvable");
         assert!(r.contains("cannot be resolved"), "{r}");
         let abs = outside.path().to_string_lossy().into_owned();
-        let r = reason("npm install left-pad", Some(&abs), d.path()).expect("outside");
+        let r = reason("npm install left-pad", &[], Some(&abs), d.path()).expect("outside");
         assert!(r.contains("outside the workspace"), "{r}");
         // A symlinked cwd pointing outside (when this host lets us create one).
         let link = d.path().join("link");
@@ -599,7 +599,7 @@ mod tests {
         #[cfg(windows)]
         let made = std::os::windows::fs::symlink_dir(outside.path(), &link).is_ok();
         if made {
-            let r = reason("npm install left-pad", Some("link"), d.path()).expect("symlink outside");
+            let r = reason("npm install left-pad", &[], Some("link"), d.path()).expect("symlink outside");
             assert!(r.contains("outside the workspace"), "{r}");
         }
     }
