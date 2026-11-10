@@ -249,24 +249,28 @@ fn installs_in(line: &str, sh: Shell) -> Vec<Install> {
 struct Sink {
     risks: Vec<Risk>,
     installs: Vec<Install>,
-    /// Simple commands checked so far in this scan (see [`MAX_CHECKS`]).
+    /// Simple commands checked so far in this scan (read by the tests).
+    #[cfg_attr(not(test), allow(dead_code))]
     checks: usize,
+    /// Extra wrapper-window starts added so far (see [`MAX_EXTRA_STARTS`]).
+    extra_starts: usize,
 }
 
-/// Per-scan budget of simple-command checks. Wrappers analyse several
-/// suffixes each, so nested wrappers branch; past this the line needs approval.
-const MAX_CHECKS: usize = 4096;
+/// Per-scan budget of extra wrapper-window starts. Each wrapper adds up to
+/// three, so nested wrappers branch; past this no more are added and the line
+/// needs approval. Every `check_cmd` call itself still runs.
+const MAX_EXTRA_STARTS: usize = 4096;
 
 impl Sink {
-    /// Count one simple-command check; `false` once the budget is spent (the
+    /// Count one extra window start; `false` once the budget is spent (the
     /// first time, the line is marked as needing approval: fail closed).
-    fn spend_check(&mut self) -> bool {
-        self.checks += 1;
-        if self.checks == MAX_CHECKS + 1 {
+    fn spend_extra_start(&mut self) -> bool {
+        self.extra_starts += 1;
+        if self.extra_starts == MAX_EXTRA_STARTS + 1 {
             self.risks
                 .push(needs("the command is too deeply nested to analyse"));
         }
-        self.checks <= MAX_CHECKS
+        self.extra_starts <= MAX_EXTRA_STARTS
     }
 }
 
@@ -948,9 +952,7 @@ fn check_cmd(
         risks.push(needs("the command nests wrappers too deeply to analyse"));
         return;
     }
-    if !risks.spend_check() {
-        return;
-    }
+    risks.checks += 1;
     let mut i = 0;
     let mut assigned = None;
     while let Some(w) = ws.get(i) {
@@ -1078,14 +1080,10 @@ fn check_wrapped(
     let Some(&j) = window.first() else {
         return;
     };
-    // The first non-option word always starts a suffix; the later window words
-    // only when they are literal (`sudo cp $SRC $DST`: `$SRC` is an argument,
-    // and a variable/glob/group in program position would need approval).
-    let mut starts: Vec<usize> = window
-        .into_iter()
-        .filter(|&k| k == j || !(args[k].dynamic || args[k].group))
-        .collect();
+    // Original starts: the first non-option word, the word after an option's
+    // value, and for `timeout`/`chrt` the word after the DURATION/PRIORITY.
     let maybe_value = j > 0 && !args[j - 1].text.contains('=') && j + 1 < args.len();
+    let mut starts = vec![j];
     if maybe_value {
         starts.push(j + 1);
     }
@@ -1097,6 +1095,20 @@ fn check_wrapped(
     let program_at = if maybe_value { j + 1 } else { j };
     let placeholder = |s: usize| args[s].text == "{}" && s != program_at;
     starts.retain(|&s| s < args.len() && !placeholder(s));
+    // Extra window starts: a literal word, or a variable/glob/group that only
+    // options and their values precede (`sudo -u user -H $RM -rf ~`: `$RM` is
+    // the program; in `sudo cp $SRC $DST` the literal `cp` comes first). They
+    // are budgeted per scan; once spent no more are added (fail closed).
+    for &k in &window[1..] {
+        let positional = usize::from(matches!(name, "timeout" | "chrt"));
+        let candidate = !(args[k].dynamic || args[k].group) || only_options_and(&args[..k], positional);
+        if candidate && !placeholder(k) && !starts.contains(&k) {
+            if !risks.spend_extra_start() {
+                break;
+            }
+            starts.push(k);
+        }
+    }
     starts.sort_unstable();
     starts.dedup();
     let seen = risks.installs.len();
@@ -1459,15 +1471,25 @@ fn find_verb(ws: &[Word], is_verb: impl Fn(&str) -> bool) -> Option<usize> {
 
 /// `ws` holds only options and the words right after them (their values).
 fn only_options(ws: &[Word]) -> bool {
+    only_options_and(ws, 0)
+}
+
+/// [`only_options`], allowing up to `positionals` other words (`timeout`'s
+/// DURATION).
+fn only_options_and(ws: &[Word], mut positionals: usize) -> bool {
     let mut after_option = false;
     ws.iter().all(|w| {
         let t = w.text.as_str();
         if t.len() > 1 && t.starts_with('-') {
             after_option = !t.contains('=');
-            true
-        } else {
-            std::mem::take(&mut after_option)
+            return true;
         }
+        if std::mem::take(&mut after_option) {
+            return true; // the option's value
+        }
+        let ok = positionals > 0;
+        positionals = positionals.saturating_sub(1);
+        ok
     })
 }
 
@@ -2849,8 +2871,9 @@ mod tests {
         }
     }
 
-    /// The wrapper window never starts at a variable, glob or group argument:
-    /// ordinary wrapped commands stay Safe, a wrapped `$CMD` still needs
+    /// The wrapper window starts at a variable, glob or group argument only
+    /// when options and their values alone precede it: ordinary wrapped
+    /// commands stay Safe, a run-time program behind options still needs
     /// approval, and the hidden `rm -rf ~` shapes stay Dangerous.
     #[test]
     fn wrapper_window_skips_dynamic_arguments() {
@@ -2872,41 +2895,58 @@ mod tests {
             let r = worst(&analyze_in(line, Shell::Posix));
             assert!(matches!(r, Risk::Dangerous(_)), "{line}: {r:?}");
         }
-        let r = worst(&analyze_in("sudo $CMD", Shell::Posix));
-        assert!(matches!(r, Risk::NeedsApproval(_)), "{r:?}");
+        for line in [
+            "sudo $CMD",
+            "sudo -u user -H $RM -rf ~",
+            "timeout -k 5 -s KILL 10 $CMD",
+        ] {
+            let r = worst(&analyze_in(line, Shell::Posix));
+            assert!(matches!(r, Risk::NeedsApproval(_)), "{line}: {r:?}");
+        }
     }
 
-    /// Nested wrappers branch; a per-scan budget stops the analysis promptly
-    /// and fails closed.
+    /// Scan `line` (Posix) and return its sink.
+    fn scan_sink(line: &str) -> Sink {
+        let mut sink = Sink::default();
+        scan(line, Shell::Posix, 0, &mut sink);
+        sink
+    }
+
+    /// Nested wrappers branch; a per-scan budget on the EXTRA window starts
+    /// bounds the work and fails closed, while every original start and every
+    /// command of a chain is still checked.
     #[test]
     fn nested_wrapper_explosion_is_bounded_and_fails_closed() {
-        let line = format!("{}true", "nice ".repeat(10));
-        let started = std::time::Instant::now();
-        let a = analyze(&line);
+        let ten = format!("{}true", "nice ".repeat(10));
+        let s = scan_sink(&ten);
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
+            s.extra_starts <= MAX_EXTRA_STARTS && s.checks < 2_000,
+            "{} checks",
+            s.checks
         );
-        let r = worst(&a);
-        assert!(matches!(r, Risk::NeedsApproval(_)), "{r:?}");
-        assert!(installs(&line).is_empty());
-        // Ten levels stay under the budget (~800 checks; the depth cap stops
-        // them); twenty would branch into ~46,000 and hit it.
-        let line = format!("{}true", "nice ".repeat(20));
-        let started = std::time::Instant::now();
-        let a = analyze(&line);
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
-        );
-        assert!(a
+        assert!(matches!(worst(&analyze(&ten)), Risk::NeedsApproval(_)));
+        assert!(installs(&ten).is_empty());
+
+        let twenty = format!("{}true", "nice ".repeat(20));
+        let s = scan_sink(&twenty);
+        assert!(s.extra_starts > MAX_EXTRA_STARTS, "budget spent");
+        assert!(s.checks < 20_000, "{} checks", s.checks);
+        assert!(s
             .risks
             .contains(&needs("the command is too deeply nested to analyse")));
+
+        // The budget never skips a check: a later command of the chain, and the
+        // command at the end of the wrappers, are still found.
+        let chained = format!("{twenty}; rm -rf ~");
+        assert!(matches!(
+            worst(&analyze_in(&chained, Shell::Posix)),
+            Risk::Dangerous(_)
+        ));
+        let wrapped = format!("{}rm -rf ~", "nice ".repeat(20));
+        let r = worst(&analyze_in(&wrapped, Shell::Posix));
+        assert!(matches!(r, Risk::Dangerous(_)), "{r:?}");
         assert_eq!(worst(&analyze("nice -n 10 cargo test")), Risk::Safe);
     }
-
     /// C6: installs are found through prefixes, chains and `bash -c`, with
     /// their package arguments; installs that name no package are not listed.
     #[test]
