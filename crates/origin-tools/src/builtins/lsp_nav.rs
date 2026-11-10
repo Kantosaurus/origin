@@ -74,7 +74,9 @@ pub async fn lsp_navigate(args: LspNavArgs, h: &dyn NavigationHandle) -> Result<
 crate::origin_tool! {
     name: "LspNavigate",
     description: "Navigate code semantically via the warm language server. op: definition (go-to-definition), references (find-references), incoming_calls / outgoing_calls (call hierarchy). path + 1-based line/col point at the symbol. Returns [{file,line,col}] (definition/references) or [{name,file,line,col}] (calls).",
-    tier: Tier::AutoAllowed,
+    // C2: starting rust-analyzer runs `cargo metadata`, build scripts and
+    // proc-macros of the workspace, so the call is gated.
+    tier: Tier::RequiresPermission,
     urgency: Urgency::Low,
     side_effects: SideEffects::Pure,
     input_schema: r#"{

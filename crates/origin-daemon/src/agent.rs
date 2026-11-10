@@ -1308,6 +1308,17 @@ mod task_preview_tests {
         );
     }
 
+    /// C2 (final fix S2): the language-server tools start a server on the
+    /// workspace, so a delegation granting one is not read-only.
+    #[test]
+    fn task_preview_counts_the_language_server_tools_as_gated() {
+        let t = gated_total();
+        for tool in ["LspNavigate", "Diagnostics"] {
+            let p = preview(&[tool], &[]);
+            assert!(p.starts_with(&format!("1/{t} gated tools ({tool})")), "{p}");
+        }
+    }
+
     fn docs_patterns() -> Vec<String> {
         (1..=9)
             .map(|n| format!("mcp__docs__get_page_{n}_summary_*"))
