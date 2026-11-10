@@ -42,7 +42,10 @@ Every builtin carries this metadata (`crates/origin-tools/src/registry.rs`):
 | `WriteCwd` | Writes confined to the workspace / current working tree. |
 | `Shell` | Full shell exec profile (network + write), most permissive. |
 
-See [`../crates/origin-sandbox.md`](../crates/origin-sandbox.md) and
+These are the levels the profiles are written to enforce; no OS backend is
+enabled on shipped builds, so none is enforced today and children run
+unconfined with an allow-listed environment. See
+[`../crates/origin-sandbox.md`](../crates/origin-sandbox.md) and
 [`../security/security-model.md`](../security/security-model.md).
 
 ---
@@ -77,8 +80,8 @@ description}` and are inflated via `ToolSearch`.
 
 | Tool | Purpose | Tier | Sandbox | Key params |
 |------|---------|------|---------|-----------|
-| `LspNavigate` | Semantic navigation via the warm LSP: `definition`, `references`, `incoming_calls`, `outgoing_calls`. | AutoAllowed | `Inherit` | `op`, `path`, `line`, `col` |
-| `Diagnostics` | LSP diagnostics from warm rust-analyzer; severity filter. | AutoAllowed | `Inherit` | `path`, `severity` |
+| `LspNavigate` | Semantic navigation via the warm LSP: `definition`, `references`, `incoming_calls`, `outgoing_calls`. | RequiresPermission | `Inherit` | `op`, `path`, `line`, `col` |
+| `Diagnostics` | LSP diagnostics from warm rust-analyzer; severity filter. | RequiresPermission | `Inherit` | `path`, `severity` |
 
 ### Code graph
 

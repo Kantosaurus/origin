@@ -54,7 +54,7 @@ See also: [`../guides/configuration.md`](../guides/configuration.md) ·
 | `ORIGIN_DATA` | cli (knowledge) | Data dir for knowledge/model assets. | Platform default. |
 | `ORIGIN_CACHE` | daemon | Cache dir override. | Falls back to `LOCALAPPDATA` / `XDG_CACHE_HOME`. |
 | `ORIGIN_WORKSPACE` | daemon | Explicit workspace root. | Inferred from cwd otherwise. |
-| `ORIGIN_GOVERNANCE_PATH` | daemon (config) | Explicit governance/policy file path. | Else `ORIGIN_HOME`-relative. |
+| `ORIGIN_GOVERNANCE_PATH` | daemon (config) | Explicit governance/policy file path. A missing file means no governance; a file that exists but cannot be read or parsed stops the daemon from starting (the reason is in `~/.origin/daemon.log`). | Else `ORIGIN_HOME`-relative. |
 | `ORIGIN_MEM_MODEL_DIR` | cli, daemon | Directory holding the embedding model (MiniLM). | Required for local memory embeddings. |
 | `LOCALAPPDATA` | daemon | Windows cache base. | OS-provided. |
 | `XDG_CACHE_HOME` | daemon | Unix cache base. | OS-provided. |

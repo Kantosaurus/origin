@@ -379,6 +379,9 @@ The semantics matter and are carefully chosen:
 - **`Some(set)`** ⇒ the *intersection* of every restricting skill's list. Two
   active skills only allow what they *both* allow — narrowing is monotonic:
   activating another restricting skill can only ever shrink the surface.
+  (Not so in `RunWorkflow`: there a step's skill `allowed-tools`, or the default
+  `Read, Grep, Glob, Edit, Write`, is what the step's worker is *granted*; the
+  `RunWorkflow` ask shows the total reach of its steps.)
 - **`Some(empty set)`** ⇒ no tool is allowed (a genuine deny-all if two skills'
   lists are disjoint).
 

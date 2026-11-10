@@ -32,6 +32,14 @@ Defaults that changed, each with its escape hatch:
   `ORIGIN_CODEGRAPH_AUTOBUILD=0`.
 - **Per-turn test and lint gates** (`auto_test`, `auto_lint`, the repro gate) now run even with `ORIGIN_EDIT_CHECK=0`
   and LSP diagnostics off (A12).
+- **`Diagnostics` and `LspNavigate` now ask** before starting a language server, and are denied where nobody can
+  answer (C2). Escape: "Always allow", `/permissions off`, or a `[[permission_rules]]` allow rule.
+- **`AuthorWorkflow` asks every time** (no "Always allow") (A4). No switch beyond `/permissions off`.
+- **An unreadable or unparseable `governance.toml` stops the daemon from starting** (A4); it used to run with no
+  governance. Escape: fix the file, or remove it to run without governance.
+- **`[[permission_rules]]` deny rules match tool names in any case and ignore `scope`** (C2): a deny with another
+  scope applies everywhere, an allow with another scope is ignored (both logged), and a deny beats an allow for the
+  same tool.
 - **Child processes no longer inherit the daemon's environment** (A6): they get an allow-list without provider keys,
   so proxy variables (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) and version-manager variables (for example
   `PYENV_ROOT`, `ASDF_DIR`; `NVM_DIR` is kept) no longer reach them. The ssh agent socket (`SSH_AUTH_SOCK`) is
@@ -127,7 +135,9 @@ Defaults that changed, each with its escape hatch:
   tools (WebFetch, WebSearch, Browser, gmail, MCP), writes outside the workspace, commands the command guard cannot
   classify, and `Task` delegations that grant permission-gated tools or MCP servers ask first; dangerous commands are
   refused without an ask. "Always allow <tool>" now lasts for the session (in memory, until the daemon restarts) and
-  never covers `Task`, `RunWorkflow`, writes outside the workspace or protected paths, or guard-flagged commands.
+  never covers `Task`, `RunWorkflow`, `AuthorWorkflow`, file-tool writes outside the workspace or to protected paths,
+  or guard-flagged commands (a Bash command can still write anywhere the user can: there is no OS sandbox, and the
+  guard does not inspect redirect targets).
   `/permissions workspace|on|off` switches modes (`off` restores the old auto-allow). Headless runs (`origin run`,
   scheduled prompts, ambient work) cannot ask, so such calls are denied and returned to the model as errors unless
   `origin run --dangerously-allow-all` or `ORIGIN_ALLOW_ALL=1` is given (the CLI strips `ORIGIN_ALLOW_ALL` from a
@@ -205,6 +215,42 @@ Defaults that changed, each with its escape hatch:
   (`ORIGIN_STEALTH_FALLBACK=1`). Without it the router never spawns the Cloak sidecar and returns the primary
   backend's bot-detected response as is. `playwright-core` in `vendor/cloak-browser/package.json` is pinned to
   `1.45.0` (there is no lockfile; this is the minimum of the old `^1.45.0` range).
+- **B7**: the post-edit syntax check no longer runs code from the workspace: Python is run as
+  `python -I -m py_compile <absolute path>`, and both checkers (`python`, `node --check`) run from the system temp
+  directory on an absolute file path. A Python that rejects `-I` counts as no interpreter (the tree-sitter check
+  covers the file). Previously a `py_compile.py` written to the workspace was imported and run at turn end without
+  an ask. `ORIGIN_EDIT_CHECK=0` still turns the check off.
+- **C2**: `Diagnostics` and `LspNavigate` are `RequiresPermission` (they start rust-analyzer, which runs
+  `cargo metadata`, build scripts and proc-macros of the workspace). In mode `workspace` it is an ordinary ask that
+  "Always allow" covers; headless runs and sub-agents without the tool in their grant are denied; mode `off` or a
+  `[[permission_rules]]` allow rule runs them unasked. A `Task` granting either tool is no longer a read-only
+  delegation.
+- **C3**: the command guard also refuses `rm -rf` of every entry of home or root (`~/*`, `/*`, `~/.`, `~/.*`,
+  `$HOME/*`) and of a Windows drive root (`C:`, `C:\`, `C:/`, `C:\*`, via `rm`, `Remove-Item`, `rd`, `rmdir`) and
+  remote content piped into a grouped shell (`curl … | (sh)`, `| { sh; }`); asks for `env -S`/`--split-string` and
+  for a shell or `source`/`.` run on a process substitution (`bash <(curl …)`); treats `nc`, `ncat`, `scp`,
+  `Invoke-WebRequest`/`iwr` and `Invoke-RestMethod`/`irm` as network commands for the secret-exfiltration check; and
+  treats `npm install-ci-test` as an install. Known false positive: `rm -rf C:` in a POSIX shell (a directory named
+  `C:`) is refused.
+- **C6**: the dependency gate also reads registry variables (`PIP_INDEX_URL`, `NPM_CONFIG_REGISTRY`, `GOPROXY`, …)
+  from the `Bash` tool's `env` argument: an install run with one needs approval, as with `NAME=value` on the command.
+- **A4**: `AuthorWorkflow` is asked every time and never offers "Always allow" (it writes `~/.origin/workflows.toml`,
+  which later grants tools). The `RunWorkflow` prompt starts with what its steps can reach
+  (`<G>/<T> gated tools (…), <D> mcp servers | … | workflow: "<name>"`), or names the workflow with
+  `(workflow not found)`. Known limit: the workflows file is read again when the workflow runs, so one replaced
+  after the ask runs with grants the user did not see.
+- **A4**: a `governance.toml` that exists but cannot be read or parsed stops the daemon from starting; the reason
+  (`failed to parse governance config at <path>: …; origin-daemon does not start without the governance this file
+  configures (fix the file, or remove it to run without governance)`) is in `~/.origin/daemon.log`, which the CLI
+  points to. Previously it ran with no governance at all. A missing file still means no governance. Known limit: the
+  supervisor keeps restarting the daemon, logging the same error each time.
+- **C2**: `[[permission_rules]]` tool names match in any case (`tool = "bash"` binds `Bash`). A deny rule with a
+  `scope` other than `"*"` applies everywhere (logged: `scope '<s>' is not supported; this deny rule applies
+  everywhere`); an allow rule with such a scope is ignored (logged: `…; this allow rule is ignored`). When a deny and
+  an allow rule name the same tool, the deny wins.
+- **C2**: a `Browser` screenshot to a path outside the workspace or on a protected path (`.git`, `.origin`, the
+  governance directory, `ORIGIN_HOME`) asks the person every time, like a `Write` there; "Always allow Browser" no
+  longer covers it and runs that cannot ask deny it.
 
 ### Added
 

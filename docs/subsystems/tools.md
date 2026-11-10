@@ -249,8 +249,8 @@ each module's registration.
 | `Monitor` | Tail output of a background `Bash` process by `pid` | AutoAllowed | Pure | `Inherit` | yes | Byte-offset ring buffer; `since_byte` to resume (`monitor.rs`). |
 | `Grep` | Recursive regex search + `agentgrep:` DSL | AutoAllowed | Pure | `Inherit` | yes | Modes `files_with_matches`/`content`/`count`; `agentgrep:outline:<path>` and `agentgrep:refs:<symbol>` (`grep_tool.rs`). |
 | `Glob` | Find files matching a glob, mtime-sorted, gitignore-aware | AutoAllowed | Pure | `Inherit` | yes | (`glob_tool.rs`). |
-| `LspNavigate` | Semantic nav: definition/references/incoming/outgoing calls | AutoAllowed | Pure | `Inherit` | **no** | Backed by the warm LSP fleet (`lsp_nav.rs`). |
-| `Diagnostics` | LSP diagnostics for a path or workspace | AutoAllowed | Pure | `Inherit` | yes | Severity filter error/warning/hint/any (`diagnostics.rs`). |
+| `LspNavigate` | Semantic nav: definition/references/incoming/outgoing calls | RequiresPermission | Pure | `Inherit` | **no** | Backed by the warm LSP fleet (`lsp_nav.rs`). |
+| `Diagnostics` | LSP diagnostics for a path or workspace | RequiresPermission | Pure | `Inherit` | yes | Severity filter error/warning/hint/any (`diagnostics.rs`). |
 | `WebFetch` | GET one or more URLs and answer `prompt` about them (required whenever the quarantine call runs; the description names `prompt` and `url`/`urls` as required); the page is read by a tool-less quarantine model and only its answer is returned, wrapped in `<external>` (`ORIGIN_WEBFETCH_RAW=1` returns the wrapped page instead) | RequiresPermission | Pure | `Inherit` | **no** | Pure-Rust readability path (`web_fetch.rs`); quarantine in `origin-daemon/src/external_content.rs` (C4). |
 | `WebSearch` | Tavily web search | RequiresPermission | Pure | `Inherit` | **no** | Requires `TAVILY_API_KEY` / vault key (`web_search.rs`). |
 | `Browser` | Stateful browser (agent-browser; Cloak fallback only with `ORIGIN_STEALTH_FALLBACK=1`) | RequiresPermission | Mutating | `Inherit` | **no** | (`browser.rs`). |
@@ -324,12 +324,14 @@ pub async fn check(meta: &ToolMeta, args_preview: &str, prompter: &dyn Prompter)
 }
 ```
 
-- **`AutoAllowed`** tools (`Read`, `Grep`, `Glob`, `Diagnostics`, `LspNavigate`,
+- **`AutoAllowed`** tools (`Read`, `Grep`, `Glob`,
   `Recall`, `ToolSearch`, `CollectTasks`, the `graph_*`/`mem_search`/`ask` read
   paths) bypass the prompter entirely.
 - **`RequiresPermission`** tools ask the user. This covers every file mutator,
   `Bash`, `WebFetch`/`WebSearch`/`Browser`, `mem_save`/`mem_forget`,
-  `graph_rebuild`, `gmail`, `Task`, and the workflow authors. `Task` asks with a
+  `graph_rebuild`, `gmail`, `Task`, the workflow authors, and `Diagnostics`/
+  `LspNavigate` (starting a language server runs project code: rust-analyzer
+  runs `cargo metadata`, build scripts and proc-macros). `Task` asks with a
   `<G>/<T> gated tools, <D> mcp servers` preview; in mode `workspace` a
   read-only delegation runs without an ask (A4, C2).
 

