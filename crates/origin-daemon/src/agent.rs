@@ -2406,7 +2406,7 @@ fn apply_path_overlay(
 /// `model` selects the price row via [`origin_cost::price_for`]; the three
 /// running token totals are the loop's cumulative counters. `input_total` is
 /// UNCACHED input (see `origin_provider::Usage`), billed at the full input
-/// rate; cache reads are billed on top at the cache-read rate.
+/// rate; cache reads and cache writes are billed on top at their own rates.
 ///
 /// Returns `None` when the model has no known price (unknown/local model): the
 /// caller then cannot meaningfully enforce a dollar cap and leaves the turn
@@ -2416,9 +2416,10 @@ fn estimate_spend_usd(
     input_total: u64,
     output_total: u64,
     cache_read_total: u64,
+    cache_write_total: u64,
 ) -> Option<f64> {
     let price = origin_cost::price_for(model)?;
-    let usage = origin_cost::TokenUsage::new(input_total, output_total, cache_read_total, 0);
+    let usage = origin_cost::TokenUsage::new(input_total, output_total, cache_read_total, cache_write_total);
     Some(origin_cost::cost_of(&price, &usage).total())
 }
 
@@ -6260,6 +6261,7 @@ async fn run_loop_inner(
                     total_input_tokens,
                     total_output_tokens,
                     total_cache_read_tokens,
+                    total_cache_write_tokens,
                 ) {
                     if spent > cap {
                         return Err(LoopError::GovernanceDenied(format!(
@@ -15269,13 +15271,13 @@ mod wiring_tests {
         assert_eq!(engine.spend_cap_usd(), None, "no max_spend_usd ⇒ no cap");
 
         // A known model prices a positive cost that grows with tokens.
-        let lo = estimate_spend_usd("claude-sonnet-4-6", 1_000, 1_000, 0).expect("known model prices");
-        let hi =
-            estimate_spend_usd("claude-sonnet-4-6", 10_000_000, 10_000_000, 0).expect("known model prices");
+        let lo = estimate_spend_usd("claude-sonnet-4-6", 1_000, 1_000, 0, 0).expect("known model prices");
+        let hi = estimate_spend_usd("claude-sonnet-4-6", 10_000_000, 10_000_000, 0, 0)
+            .expect("known model prices");
         assert!(hi > lo && lo >= 0.0, "cost grows with tokens: {lo} < {hi}");
         // An unknown/local model can't be priced ⇒ None ⇒ left unconstrained.
         assert!(
-            estimate_spend_usd("some-unknown-local-model-xyz", 1_000_000, 1_000_000, 0).is_none(),
+            estimate_spend_usd("some-unknown-local-model-xyz", 1_000_000, 1_000_000, 0, 0).is_none(),
             "unknown model ⇒ no price ⇒ unconstrained"
         );
     }
@@ -15287,8 +15289,16 @@ mod wiring_tests {
         let price = origin_cost::price_for("claude-sonnet-4-6").expect("priced");
         let expected =
             origin_cost::cost_of(&price, &origin_cost::TokenUsage::new(1_000, 0, 1_000_000, 0)).total();
-        let got = estimate_spend_usd("claude-sonnet-4-6", 1_000, 0, 1_000_000).expect("priced");
+        let got = estimate_spend_usd("claude-sonnet-4-6", 1_000, 0, 1_000_000, 0).expect("priced");
         assert!((got - expected).abs() < 1e-12, "got {got}, expected {expected}");
+    }
+
+    /// B1: cache writes are billed too, so a run that only wrote the cache
+    /// has a non-zero spend.
+    #[test]
+    fn spend_estimate_bills_cache_writes() {
+        let got = estimate_spend_usd("claude-sonnet-4-6", 0, 0, 0, 1_000_000).expect("priced");
+        assert!(got > 0.0, "cache writes cost money: {got}");
     }
 
     /// CONFIGURED: a spend cap is the MIN across layers, and `estimate_spend_usd`
@@ -15305,10 +15315,10 @@ mod wiring_tests {
         assert!((cap - 0.01).abs() < f64::EPSILON, "cap is the min (0.01)");
 
         // A large token total on a priced model exceeds the tiny cap.
-        let big = estimate_spend_usd("claude-sonnet-4-6", 50_000_000, 50_000_000, 0).expect("priced");
+        let big = estimate_spend_usd("claude-sonnet-4-6", 50_000_000, 50_000_000, 0, 0).expect("priced");
         assert!(big > cap, "big spend ${big} exceeds cap ${cap} ⇒ turn refused");
         // A tiny total stays within the cap.
-        let small = estimate_spend_usd("claude-sonnet-4-6", 10, 10, 0).expect("priced");
+        let small = estimate_spend_usd("claude-sonnet-4-6", 10, 10, 0, 0).expect("priced");
         assert!(
             small <= cap,
             "tiny spend ${small} within cap ${cap} ⇒ turn proceeds"
