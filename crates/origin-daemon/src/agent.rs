@@ -6707,8 +6707,12 @@ async fn run_loop_inner(
             // to get back there, once, on the final result (event stream and
             // summary). Kept out of the conversation: the model would read the
             // destructive restore command as its own advice. Never restores.
+            // Not for a swarm worker (runtime tools installed): its text is the
+            // parent model's tool result.
+            let red = !(test_block.is_empty() && lint_block.is_empty());
+            let worker = RUNTIME_TOOLS.try_with(|_| ()).is_ok();
             let text = match (&last_green, loop_cwd(opts)) {
-                (Some((id, green_turn)), Some(root)) if !(test_block.is_empty() && lint_block.is_empty()) => {
+                (Some((id, green_turn)), Some(root)) if red && !worker => {
                     let note = last_green_note(id, *green_turn, &root);
                     if let Some(tx) = &opts.event_tx {
                         let _ = tx.send(StreamEvent::TextDelta { text: note.clone() }).await;

@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use origin_core::types::{Block, Message, Role};
-use origin_daemon::agent::{run_loop, LoopOptions};
+use origin_daemon::agent::{run_loop, scope_runtime_tools, LoopOptions};
 use origin_daemon::session::Session;
 use origin_permission::prompt::AlwaysAllow;
 use origin_postedit::PostEditConfig;
@@ -127,6 +127,18 @@ fn test_gate(cmd: &str, repairs: u32) -> PostEditConfig {
 /// asks for commit signing with a gpg that does not exist, so a checkpoint
 /// commit that is not self-contained fails.
 fn run(ws: &Path, checkpoints: bool, cfg: PostEditConfig, turns: Vec<Block>) -> (String, Session) {
+    run_as(ws, checkpoints, cfg, turns, false)
+}
+
+/// [`run`], optionally as a swarm worker runs it: inside
+/// `scope_runtime_tools` (`swarm_worker.rs` always installs it).
+fn run_as(
+    ws: &Path,
+    checkpoints: bool,
+    cfg: PostEditConfig,
+    turns: Vec<Block>,
+    worker: bool,
+) -> (String, Session) {
     let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let global = ws.join("hostile.gitconfig");
     std::fs::write(
@@ -164,7 +176,12 @@ fn run(ws: &Path, checkpoints: bool, cfg: PostEditConfig, turns: Vec<Block>) -> 
         .enable_all()
         .build()
         .expect("runtime");
-    let result = rt.block_on(run_loop(&mut session, "go", &provider, &AlwaysAllow, &opts));
+    let fut = run_loop(&mut session, "go", &provider, &AlwaysAllow, &opts);
+    let result = if worker {
+        rt.block_on(scope_runtime_tools(Arc::default(), fut))
+    } else {
+        rt.block_on(fut)
+    };
     for k in [
         "ORIGIN_CHECKPOINTS",
         "GIT_CONFIG_GLOBAL",
@@ -270,6 +287,16 @@ fn a_red_end_after_a_green_turn_tells_the_user_how_to_restore_once() {
     // Not in the conversation: neither the model's messages nor a
     // repro-gate continuation carry it.
     assert!(!texts(&session).iter().any(|t| t.contains(NOTE)));
+}
+
+#[test]
+fn a_swarm_worker_run_tags_but_returns_no_note() {
+    // A worker's final text is its parent model's tool result.
+    let ws = workspace();
+    let (text, _) = run_as(ws.path(), true, test_gate(GATE, 1), green_then_red(), true);
+    assert!(!text.contains(NOTE), "{text}");
+    let files = tree(ws.path(), TAG);
+    assert!(files.iter().any(|l| l == "ok.txt"), "still tagged: {files:?}");
 }
 
 #[test]
