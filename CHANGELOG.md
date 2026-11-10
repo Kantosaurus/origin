@@ -220,8 +220,9 @@ Defaults that changed, each with its escape hatch:
   directory on an absolute file path. A Python that rejects `-I` counts as no interpreter (the tree-sitter check
   covers the file). An interpreter located inside the workspace (e.g. an activated `.venv`) is never run: the
   checker is resolved on `PATH` first and, when it lies under a workspace root or the run's directory, the
-  tree-sitter check covers the file instead; otherwise that resolved absolute path is what runs. Previously a `py_compile.py` written to the workspace was imported and run at turn end without
-  an ask. `ORIGIN_EDIT_CHECK=0` still turns the check off.
+  tree-sitter check covers the file instead; otherwise that resolved absolute path is what runs. Previously a
+  `py_compile.py` written to the workspace was imported and run at turn end without an ask. `ORIGIN_EDIT_CHECK=0`
+  still turns the check off.
 - **C2**: `Diagnostics` and `LspNavigate` are `RequiresPermission` (they start rust-analyzer, which runs
   `cargo metadata`, build scripts and proc-macros of the workspace). In mode `workspace` it is an ordinary ask that
   "Always allow" covers; headless runs and sub-agents without the tool in their grant are denied; mode `off` or a
@@ -231,11 +232,10 @@ Defaults that changed, each with its escape hatch:
   `$HOME/*`) and of a Windows drive root (`C:`, `C:\`, `C:/`, `C:\*`, via `rm`, `Remove-Item`, `rd`, `rmdir`) and
   remote content piped into a grouped shell (`curl … | (sh)`, `| { sh; }`); asks for any group that is a non-first
   pipeline segment (`curl … | (cd /tmp && sh)`; also `cat f | (grep x)`, an accepted over-ask); asks for
-  `env -S`/`--split-string` and
-  for a shell or `source`/`.` run on a process substitution (`bash <(curl …)`); treats `nc`, `ncat`, `scp`,
-  `Invoke-WebRequest`/`iwr` and `Invoke-RestMethod`/`irm` as network commands for the secret-exfiltration check; and
-  treats `npm install-ci-test` as an install. Known false positive: `rm -rf C:` in a POSIX shell (a directory named
-  `C:`) is refused.
+  `env -S`/`--split-string` and for a shell or `source`/`.` run on a process substitution (`bash <(curl …)`);
+  treats `nc`, `ncat`, `scp`, `Invoke-WebRequest`/`iwr` and `Invoke-RestMethod`/`irm` as network commands for the
+  secret-exfiltration check; and treats `npm install-ci-test` as an install. Known false positive: `rm -rf C:` in a
+  POSIX shell (a directory named `C:`) is refused.
 - **C6**: the dependency gate also reads registry variables (`PIP_INDEX_URL`, `NPM_CONFIG_REGISTRY`, `GOPROXY`, …)
   from the `Bash` tool's `env` argument: an install run with one needs approval, as with `NAME=value` on the command.
 - **A4**: `AuthorWorkflow` is asked every time and never offers "Always allow" (it writes `~/.origin/workflows.toml`,
