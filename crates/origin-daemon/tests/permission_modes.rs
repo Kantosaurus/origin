@@ -396,6 +396,71 @@ async fn background_results_drain_taints_the_parent() {
     assert_bash_asked_after_taint(&human);
 }
 
+/// A person who answers yes to every ask, choosing "always" whenever it is
+/// offered (which records a standing allow, as the IPC prompter does).
+#[derive(Default)]
+struct AlwaysWhenOffered {
+    asks: Mutex<Vec<(String, String, bool)>>,
+    standing: Mutex<std::collections::HashSet<String>>,
+}
+
+#[async_trait]
+impl origin_permission::prompt::Prompter for AlwaysWhenOffered {
+    async fn ask(&self, meta: &origin_tools::ToolMeta, preview: &str) -> bool {
+        self.ask_offering(meta, preview, false).await
+    }
+    async fn ask_offering(&self, meta: &origin_tools::ToolMeta, preview: &str, offer_always: bool) -> bool {
+        self.asks
+            .lock()
+            .expect("lock")
+            .push((meta.name.to_owned(), preview.to_owned(), offer_always));
+        if offer_always {
+            self.standing.lock().expect("lock").insert(meta.name.to_owned());
+        }
+        true
+    }
+    fn standing_allow(&self, tool: &str) -> bool {
+        self.standing.lock().expect("lock").contains(tool)
+    }
+}
+
+/// C2: an ask the command guard raised (here an undeclared package install)
+/// is about that one command: it never offers "always", so answering it
+/// leaves no standing allow and the next plain Bash call is still asked.
+#[tokio::test]
+async fn a_command_guard_ask_never_offers_always() {
+    if origin_tools::sandbox_status() == origin_tools::SandboxStatus::Active {
+        return; // Bash would run unasked under the sandbox.
+    }
+    let ws = tempfile::tempdir().expect("ws");
+    let provider = ScriptedProvider::new(vec![
+        tool(
+            "i",
+            "Bash",
+            &serde_json::json!({ "command": "npm install --offline --no-audit --no-fund left-pad" }),
+        ),
+        tool("b", "Bash", &serde_json::json!({ "command": "echo hi" })),
+        Block::text("done"),
+    ]);
+    let opts = LoopOptions {
+        cwd: Some(ws.path().to_path_buf()),
+        ..LoopOptions::default().without_streaming()
+    };
+    let mut session = Session::new("scripted", "m");
+    let human = AlwaysWhenOffered::default();
+    run_loop(&mut session, "go", &provider, &human, &opts)
+        .await
+        .expect("run");
+    let asks = human.asks.lock().expect("lock").clone();
+    let bash: Vec<_> = asks.iter().filter(|(t, ..)| t == "Bash").collect();
+    assert_eq!(bash.len(), 2, "the plain Bash call is asked too: {asks:?}");
+    assert!(
+        bash[0].1.contains("cmd-guard") && bash[0].1.contains("left-pad"),
+        "{asks:?}"
+    );
+    assert!(!bash[0].2, "a command-guard ask never offers always: {asks:?}");
+}
+
 /// Serialises the tests that set `ORIGIN_HOME` in this binary.
 static ORIGIN_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 

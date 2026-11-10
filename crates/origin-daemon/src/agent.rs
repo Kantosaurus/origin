@@ -578,8 +578,11 @@ async fn decide_permission(
     }
     // An "always allow" answer covers later ordinary asks for the tool in this
     // session; never a `Task` or `RunWorkflow` (each delegation or workflow
-    // grants something different) and never an ask that needs a person.
-    let offer_always = !person && !matches!(meta.name, "Task" | "RunWorkflow");
+    // grants something different), never an ask that needs a person, and never
+    // a command-guard ask (it is about that one flagged command).
+    let offer_always = !person
+        && !matches!(meta.name, "Task" | "RunWorkflow")
+        && cmd_guard_ask_preview(meta.name, args, args_preview, opts.cwd.as_deref()).is_none();
     if offer_always && prompter.standing_allow(meta.name) {
         return decision(true, STANDING_ALLOW.into());
     }
@@ -14491,23 +14494,27 @@ mod wiring_tests {
             denied.reason
         );
         // Fix round 1: a standing "always allow Bash" does not cover it either;
-        // the guard asks once, showing its reason.
+        // it is asked once, showing the guard's reason, and (C2) the ask never
+        // offers "always", so answering it leaves no standing allow.
         let standing = Rec::standing();
-        let base = rt.block_on(decide_c2(
-            "Bash",
+        let base = rt.block_on(decide_permission(
+            builtin("Bash"),
             &args,
+            &preview,
             &standing,
+            &SkillRegistry::new(),
             &LoopOptions::default(),
             &Session::new("p", "m"),
         ));
-        assert_eq!(base.reason, STANDING_ALLOW);
+        assert_eq!(base.reason, USER_APPROVED);
         let guarded = rt.block_on(apply_cmd_guard(base, builtin("Bash"), &args, &preview, &standing, None));
         assert_eq!(guarded.outcome, Outcome::Allow);
-        assert_eq!(
-            standing.asks(),
-            vec![preview.clone()],
-            "asked once, with the reason"
+        let asks = standing.asks();
+        assert!(
+            asks.len() == 1 && asks[0].starts_with(&preview),
+            "asked once, with the reason: {asks:?}"
         );
+        assert_eq!(standing.offers(), vec![false], "never offering always");
         // Rule 11: inside a sub-agent, delegated `Bash` (a grant) does not
         // approve a `NeedsApproval` command.
         let grant = Rec::new(true, false);
@@ -14552,8 +14559,16 @@ mod wiring_tests {
             cwd: Some(run.path().to_path_buf()),
             ..LoopOptions::default()
         };
-        let base = rt.block_on(decide_c2("Bash", &args, &standing, &opts, &Session::new("p", "m")));
-        assert_eq!(base.reason, STANDING_ALLOW);
+        let base = rt.block_on(decide_permission(
+            builtin("Bash"),
+            &args,
+            &preview,
+            &standing,
+            &SkillRegistry::new(),
+            &opts,
+            &Session::new("p", "m"),
+        ));
+        assert_eq!(base.reason, USER_APPROVED);
         let guarded = rt.block_on(apply_cmd_guard(
             base,
             builtin("Bash"),
@@ -14563,7 +14578,12 @@ mod wiring_tests {
             Some(run.path()),
         ));
         assert_eq!(guarded.outcome, Outcome::Allow);
-        assert_eq!(standing.asks(), vec![preview.clone()], "asked once, naming the package");
+        let asks = standing.asks();
+        assert!(
+            asks.len() == 1 && asks[0].starts_with(&preview),
+            "asked once, naming the package: {asks:?}"
+        );
+        assert_eq!(standing.offers(), vec![false], "never offering always");
         let headless = origin_permission::prompt::NoPrompter;
         let allow = Decision {
             outcome: Outcome::Allow,
