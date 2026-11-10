@@ -361,21 +361,40 @@ fn governance_from_config(cfg: GovernanceConfig, path: &Path) -> Result<Governan
     // Build the permission-rule bundle once at load time (rules + bloom). An
     // empty `[[permission_rules]]` ⇒ `None` ⇒ dispatch never consults the rule
     // path, byte-identical to before this wiring.
-    let permission_rules = if cfg.permission_rules.is_empty() {
-        None
-    } else {
-        let rules: Vec<Rule> = cfg
-            .permission_rules
-            .into_iter()
-            .map(|r| Rule {
+    // C2: only scope `*` is looked up, so a rule with another scope must not be
+    // silently inert in the unsafe direction: a deny applies everywhere, an
+    // allow is dropped. Tool names match case-insensitively at lookup.
+    let rules: Vec<Rule> = cfg
+        .permission_rules
+        .into_iter()
+        .filter_map(|r| {
+            if r.scope != PERMISSION_RULE_SCOPE {
+                let what = if r.allow {
+                    "this allow rule is ignored"
+                } else {
+                    "this deny rule applies everywhere"
+                };
+                tracing::warn!(
+                    tool = %r.tool,
+                    path = %path.display(),
+                    "permission rule: scope '{}' is not supported; {what}",
+                    r.scope
+                );
+                if r.allow {
+                    return None;
+                }
+            }
+            Some(Rule {
                 tool_name: r.tool,
-                scope: r.scope,
+                scope: PERMISSION_RULE_SCOPE.to_owned(),
                 allow: r.allow,
             })
-            .collect();
+        })
+        .collect();
+    let permission_rules = (!rules.is_empty()).then(|| {
         let bloom = BloomPreCheck::build(&rules);
-        Some(Arc::new(PermissionRules { rules, bloom }))
-    };
+        Arc::new(PermissionRules { rules, bloom })
+    });
     // `[post_edit]`: map the config-surface struct onto the crate's
     // `PostEditConfig`. Absent ⇒ `None` ⇒ the post-edit path uses only the
     // builtin formatter table, byte-identical to before this wiring.

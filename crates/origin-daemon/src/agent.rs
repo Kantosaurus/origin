@@ -491,9 +491,10 @@ async fn maybe_checkpoint_per_tool_with_hooks(tool: &str, args: &Value, root: Op
 /// 3. **Mode `off`** (C2): allow.
 /// 4. **`AutoAllowed` tier**: allow, except a network tool in `workspace` mode.
 /// 5. **Explicit allow rule**: auto-approves *without prompting* (also after
-///    session taint). Rules are an exact `meta.name@scope` match at the single
-///    canonical [`crate::config::PERMISSION_RULE_SCOPE`]; they carry no argument
-///    pattern.
+///    session taint). Rules match `meta.name` case-insensitively at the single
+///    canonical [`crate::config::PERMISSION_RULE_SCOPE`] (a deny rule with any
+///    other scope is loaded at it; such an allow rule is dropped); they carry no
+///    argument pattern.
 /// 6. **Mode** (C2): `workspace` runs [`workspace_need`]; `on` asks for every
 ///    call that reaches here.
 /// 7. **Prompter**: a prompter that cannot ask (headless [`NoPrompter`], a
@@ -521,12 +522,16 @@ async fn decide_permission(
             return decision(false, "skill-narrowed".into());
         }
     }
+    // C2: tool names match case-insensitively (a mis-cased deny rule must not
+    // be inert), so the exact-key bloom is not consulted here; a deny wins over
+    // an allow for the same tool.
     let rule = opts.permission_rules.as_ref().and_then(|pr| {
-        let key = format!("{}@{}", meta.name, crate::config::PERMISSION_RULE_SCOPE);
-        pr.bloom
-            .maybe_contains(&key)
-            .then(|| pr.rules.iter().find(|r| r.key() == key))
-            .flatten()
+        pr.rules
+            .iter()
+            .filter(|r| {
+                r.scope == crate::config::PERMISSION_RULE_SCOPE && r.tool_name.eq_ignore_ascii_case(meta.name)
+            })
+            .min_by_key(|r| r.allow)
     });
     let rule_reason = |allow: bool| {
         format!(
@@ -14414,6 +14419,44 @@ mod wiring_tests {
             ..LoopOptions::default()
         };
         assert!(!speculation_allowed(&opts, false));
+    }
+
+    /// C2 (final fix S7): a deny rule is never silently inert — a mis-cased
+    /// tool name matches, and a deny with an unsupported scope applies
+    /// everywhere — while an allow with an unsupported scope allows nothing.
+    #[tokio::test]
+    async fn c2_deny_rules_match_any_case_and_any_scope() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let rules = |toml: &str| {
+            let path = dir.path().join("governance.toml");
+            std::fs::write(&path, toml).expect("write");
+            crate::config::load_governance(&path)
+                .expect("load")
+                .permission_rules
+        };
+        let session = Session::new("p", "m");
+        let bash = serde_json::json!({"command": "echo hi"});
+        for toml in [
+            "[[permission_rules]]\ntool = \"bash\"\nallow = false\n",
+            "[[permission_rules]]\ntool = \"Bash\"\nscope = \"project\"\nallow = false\n",
+        ] {
+            let opts = LoopOptions {
+                permission_rules: rules(toml),
+                permission_mode: crate::protocol::PermissionMode::Off,
+                ..LoopOptions::default()
+            };
+            let d = decide_c2("Bash", &bash, &Rec::new(true, true), &opts, &session).await;
+            assert_eq!(d.outcome, Outcome::Deny, "{toml}: {}", d.reason);
+        }
+        let opts = LoopOptions {
+            permission_rules: rules(
+                "[[permission_rules]]\ntool = \"Bash\"\nscope = \"project\"\nallow = true\n",
+            ),
+            permission_mode: crate::protocol::PermissionMode::On,
+            ..LoopOptions::default()
+        };
+        let d = decide_c2("Bash", &bash, &Rec::new(false, true), &opts, &session).await;
+        assert_eq!(d.reason, "user-denied", "the scoped allow did not answer");
     }
 
     /// C2 rules 2-3: in workspace mode an edit inside the workspace runs without
