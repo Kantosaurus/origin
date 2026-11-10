@@ -710,12 +710,18 @@ struct Workspace {
 
 impl Workspace {
     fn of(opts: &LoopOptions, session: &Session) -> Self {
-        let cwd = loop_cwd(opts).unwrap_or_default();
         let home = dirs::home_dir().and_then(|h| origin_conseca::resolve_real(&h));
+        Self::with_home(opts, session, home.as_deref())
+    }
+
+    /// [`Self::of`] with the resolved home directory given; `None` (unknown or
+    /// unresolvable) fails closed — no root auto-allows edits.
+    fn with_home(opts: &LoopOptions, session: &Session, home: Option<&std::path::Path>) -> Self {
+        let cwd = loop_cwd(opts).unwrap_or_default();
         let (not_projects, roots) = std::iter::once(cwd.clone())
             .chain(session.roots.iter().map(|r| cwd.join(r)))
             .filter_map(|r| origin_conseca::resolve_real(&r))
-            .partition(|r| r.parent().is_none() || home.as_ref().is_some_and(|h| h.starts_with(r)));
+            .partition(|r| r.parent().is_none() || home.is_none_or(|h| h.starts_with(r)));
         Self {
             cwd,
             roots,
@@ -783,29 +789,38 @@ fn write_outside(name: &str, args: &Value, ws: &Workspace) -> Option<String> {
         return Some("write outside the workspace: <no target path>".into());
     }
     targets.into_iter().find_map(|t| {
-        // The path is model-chosen: quoted, escaped and capped in the reason so
-        // it can never read as part of the reason (or a separator) in the ask.
-        let shown = {
-            let esc: String = t.escape_debug().collect();
-            let mut s: String = esc.chars().take(200).collect();
-            if esc.chars().nth(200).is_some() {
-                s.push('…');
-            }
-            format!("\"{s}\"")
-        };
+        // The reason shows where the write really goes: the resolved target
+        // (short, no `..`), or, when it cannot be resolved, the END of the
+        // model-chosen path. Quoted, escaped and capped, so it can never read as
+        // part of the reason (or a separator) in the ask.
         let Some(p) = origin_conseca::resolve_real(&ws.cwd.join(&t)) else {
-            return Some(format!("write outside the workspace: {shown}"));
+            return Some(format!("write outside the workspace: {}", quoted_tail(&t)));
         };
+        let shown = quoted_tail(&p.to_string_lossy());
         if ws.roots.iter().any(|r| p.starts_with(r)) {
             protected_path(&p).then(|| format!("protected path: {shown}"))
         } else if ws.not_projects.iter().any(|r| p.starts_with(r)) {
             Some(format!(
-                "workspace root is or contains the home directory, or is a drive root: {shown}"
+                "workspace root is or contains the home directory (or the home directory is \
+                 unknown), or is a drive root: {shown}"
             ))
         } else {
             Some(format!("write outside the workspace: {shown}"))
         }
     })
+}
+
+/// C2: `s` escaped (`escape_debug`) and quoted, keeping its last 200 characters
+/// with `…` in front when longer — the end of a path names its real target.
+fn quoted_tail(s: &str) -> String {
+    const CAP: usize = 200;
+    let esc: Vec<char> = s.escape_debug().collect();
+    let tail: String = esc[esc.len().saturating_sub(CAP)..].iter().collect();
+    if esc.len() > CAP {
+        format!("\"…{tail}\"")
+    } else {
+        format!("\"{tail}\"")
+    }
 }
 
 /// DENY-ONLY governance overlay (Task 3).
@@ -7433,7 +7448,7 @@ async fn run_loop_inner(
             // clear "not configured" error.
             if name == "RunWorkflow" {
                 if let Some(coord) = opts.coordinator.as_deref() {
-                    let (body, errored) = match run_workflow_tool(
+                    let (body, errored, worker_tainted) = match run_workflow_tool(
                         &args,
                         coord,
                         opts.skill_catalog.as_deref(),
@@ -7441,12 +7456,11 @@ async fn run_loop_inner(
                     )
                     .await
                     {
-                        Ok(s) => (s.into_bytes(), false),
-                        Err(e) => (format!("Error: {e}").into_bytes(), true),
+                        Ok((s, tainted)) => (s.into_bytes(), false, tainted),
+                        Err(e) => (format!("Error: {e}").into_bytes(), true, false),
                     };
-                    // C2: a tainted step worker's result taints this session
-                    // (the run report carries `"tainted":true`).
-                    absorb_worker_taint(session, opts, !errored && worker_result_tainted(&body));
+                    // C2: a tainted step worker's result taints this session.
+                    absorb_worker_taint(session, opts, worker_tainted);
                     tool_results.push(Block::ToolResult {
                         tool_use_id: id,
                         handle: None,
@@ -9443,7 +9457,9 @@ async fn dispatch_tool(
             let coord = coordinator.ok_or_else(|| {
                 LoopError::ToolFailure("RunWorkflow: swarm coordinator not configured".into())
             })?;
-            run_workflow_tool(args, coord, skill_catalog, None).await
+            run_workflow_tool(args, coord, skill_catalog, None)
+                .await
+                .map(|(json, _)| json)
         }
         // ── ask_user (interactive choice) — backward-compat path ──
         // The INTERACTIVE pause-await (emit `ChoiceAsk` → block on
@@ -9479,7 +9495,7 @@ async fn run_workflow_tool(
     coordinator: &origin_swarm::Coordinator,
     skill_catalog: Option<&SkillCatalog>,
     event_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
-) -> Result<String, LoopError> {
+) -> Result<(String, bool), LoopError> {
     let name = args
         .get("name")
         .and_then(Value::as_str)
@@ -9505,7 +9521,10 @@ async fn run_workflow_tool(
     let report = crate::workflow_runner::run_workflow(workflow, coordinator, catalog, event_tx)
         .await
         .map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: {e}")))?;
-    serde_json::to_string(&report).map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: json: {e}")))
+    // C2: the run report's structured taint travels with its JSON.
+    serde_json::to_string(&report)
+        .map(|json| (json, report.tainted))
+        .map_err(|e| LoopError::ToolFailure(format!("RunWorkflow: json: {e}")))
 }
 
 /// Execute the `AuthorWorkflow` tool.
@@ -13574,8 +13593,9 @@ mod wiring_tests {
         );
     }
 
-    /// C2 fix round 2: the model-chosen path in a person-ask reason is quoted,
-    /// escaped and capped, so a newline or ` | ` cannot fake another field.
+    /// C2 fix rounds 2-3: the path in a person-ask reason is quoted, escaped and
+    /// capped, keeping its END (where the write goes), so a newline or ` | `
+    /// cannot fake another field.
     #[tokio::test]
     async fn c2_person_ask_reason_escapes_the_path() {
         let ws = tempfile::tempdir().expect("ws");
@@ -13584,7 +13604,7 @@ mod wiring_tests {
             ..LoopOptions::default()
         };
         let human = Rec::new(false, true);
-        let crafted = format!("{}\n | approved by user | {}", "../x", "y".repeat(300));
+        let crafted = format!("../{}\n | approved by user | x", "y".repeat(300));
         let d = decide_c2(
             "Write",
             &serde_json::json!({"file_path": crafted, "content": "x"}),
@@ -13595,19 +13615,75 @@ mod wiring_tests {
         .await;
         assert_eq!(d.outcome, Outcome::Deny);
         let ask = &human.asks()[0];
-        // The whole crafted path sits inside one quoted, escaped, capped string.
         assert!(
-            ask.starts_with("write outside the workspace: \"../x\\n | approved by user | yyy"),
-            "{ask}"
+            ask.starts_with("write outside the workspace: \"…"),
+            "capped at the front: {ask}"
         );
-        let quoted_end = ask.find("…\" | ").expect("capped quote, then the call");
-        assert!(quoted_end < 260, "path capped at 200 chars: {ask}");
+        let end = ask
+            .find("approved by user | x\" | ")
+            .expect("quoted tail, then the call");
         assert!(
-            !ask[..quoted_end].contains('\n'),
-            "no raw newline in the reason: {ask}"
+            ask[..end].ends_with("\\n | "),
+            "newline escaped inside the quotes: {ask}"
+        );
+        assert!(!ask[..end].contains('\n'), "no raw newline in the reason: {ask}");
+        assert!(end < 300, "capped: {ask}");
+    }
+
+    /// C2 fix round 3: a long path that really writes `<home>/.bashrc` shows that
+    /// resolved target in the reason, not its harmless-looking start.
+    #[tokio::test]
+    async fn c2_person_ask_reason_shows_the_resolved_target() {
+        let ws = tempfile::tempdir().expect("ws");
+        let opts = LoopOptions {
+            cwd: Some(ws.path().to_path_buf()),
+            ..LoopOptions::default()
+        };
+        let raw_home = dirs::home_dir().expect("home");
+        let home = origin_conseca::resolve_real(&raw_home).expect("resolvable home");
+        let detour = "d/".repeat(190);
+        let crafted = format!("{}/{detour}{}.bashrc", raw_home.display(), "../".repeat(190));
+        assert!(crafted.len() > 400, "{}", crafted.len());
+        let human = Rec::new(false, true);
+        let d = decide_c2(
+            "Write",
+            &serde_json::json!({"file_path": crafted, "content": "x"}),
+            &human,
+            &opts,
+            &Session::new("p", "m"),
+        )
+        .await;
+        assert_eq!(d.outcome, Outcome::Deny);
+        let target: String = home.join(".bashrc").to_string_lossy().escape_debug().collect();
+        let ask = &human.asks()[0];
+        assert!(
+            ask.starts_with(&format!("write outside the workspace: \"{target}\"")),
+            "{ask}"
         );
     }
 
+    /// C2 fix round 3: when the home directory is unknown, no root auto-allows
+    /// edits (fail closed).
+    #[test]
+    fn c2_unknown_home_fails_closed() {
+        let ws = tempfile::tempdir().expect("ws");
+        let opts = LoopOptions {
+            cwd: Some(ws.path().to_path_buf()),
+            ..LoopOptions::default()
+        };
+        let session = Session::new("p", "m");
+        let edit = serde_json::json!({"file_path": "src/lib.rs"});
+        let home = dirs::home_dir().and_then(|h| origin_conseca::resolve_real(&h));
+        let known = Workspace::with_home(&opts, &session, home.as_deref());
+        assert_eq!(
+            write_outside("Edit", &edit, &known),
+            None,
+            "known home: auto-allowed"
+        );
+        let unknown = Workspace::with_home(&opts, &session, None);
+        let why = write_outside("Edit", &edit, &unknown).expect("asks");
+        assert!(why.contains("home directory is unknown"), "{why}");
+    }
     /// C2 fix round 1: a client that went away mid-ask yields the "cannot ask"
     /// denial, not "user-denied".
     #[tokio::test]
