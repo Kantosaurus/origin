@@ -1825,12 +1825,17 @@ static CODE_GRAPH_BUILDS: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>>
 /// walk stops after [`CODE_GRAPH_AUTO_MAX_FILES`] indexable files across all
 /// roots, and the graph is locked per file so queries interleave with the build.
 /// Fail-open: an unparsable file is skipped; a fatal index error ends the build.
-fn start_code_graph_build(opts: &LoopOptions, session_id: &str, session_roots: &[std::path::PathBuf]) {
+/// Returns whether THIS call started the build.
+fn start_code_graph_build(
+    opts: &LoopOptions,
+    session_id: &str,
+    session_roots: &[std::path::PathBuf],
+) -> bool {
     if opts.cwd.is_some() || std::env::var("ORIGIN_CODEGRAPH_AUTOBUILD").as_deref() == Ok("0") {
-        return;
+        return false;
     }
     let Some(graph) = opts.code_graph.as_ref() else {
-        return;
+        return false;
     };
     let roots: Vec<std::path::PathBuf> = if session_roots.is_empty() {
         std::env::current_dir().ok().into_iter().collect()
@@ -1842,7 +1847,7 @@ fn start_code_graph_build(opts: &LoopOptions, session_id: &str, session_roots: &
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(session_id.to_string());
     if !first {
-        return;
+        return false;
     }
     let graph = Arc::clone(graph);
     tokio::task::spawn_blocking(move || {
@@ -1864,6 +1869,22 @@ fn start_code_graph_build(opts: &LoopOptions, session_id: &str, session_roots: &
             }
         }
     });
+    true
+}
+
+/// A11: `result`'s empty-answer note replaced by one saying the graph has just
+/// started building, for the `graph_query` that started it.
+fn graph_building_note(result: String) -> String {
+    match serde_json::from_str::<Value>(&result) {
+        Ok(mut v) if v.get("note").is_some() => {
+            v["note"] = Value::from(
+                "no results yet — the code graph index has just started building in the background; \
+                 retry this query shortly",
+            );
+            v.to_string()
+        }
+        _ => result,
+    }
 }
 
 /// A12: the run's working directory — [`LoopOptions::cwd`] when set (a
@@ -3912,6 +3933,65 @@ mod runtime_tools_tests {
         assert!(session.tainted);
         assert!(store.is_tainted(&session.id), "taint is persisted for resume");
         assert!(crate::agent::external_result_in(&session.messages));
+    }
+
+    /// A11: the empty `graph_query` that starts the session's background build
+    /// says the index is building (retry shortly), not "run graph_rebuild"; a
+    /// later empty query keeps the usual note.
+    #[tokio::test]
+    async fn the_graph_query_that_starts_the_build_says_the_index_is_building() {
+        use origin_core::types::{Block, Message, Role};
+        let db = tempfile::tempdir().expect("tempdir");
+        let cas = origin_cas::Store::open(origin_cas::StoreConfig {
+            root: db.path().join("cas"),
+            hot_capacity: 32,
+            warm_pack_target_bytes: 1 << 20,
+            cold_zstd_level: 3,
+        })
+        .expect("cas");
+        let sql = origin_store::Store::open(db.path().join("origin.db")).expect("sql");
+        let graph = Arc::new(tokio::sync::Mutex::new(
+            origin_codegraph::index::CodeGraphIndex::new(cas, sql),
+        ));
+        let query = |id: &str| {
+            Message::new(Role::Assistant).with_block(Block::ToolUse {
+                id: id.into(),
+                name: "graph_query".into(),
+                input_json: br#"{"kind":"by_name","args":{"name":"no_such_symbol"}}"#.to_vec(),
+                cache_marker: None,
+            })
+        };
+        let provider = Turns(std::sync::Mutex::new(vec![
+            query("q1"),
+            query("q2"),
+            Message::new(Role::Assistant).with_block(Block::text("done")),
+        ]));
+        let opts = crate::agent::LoopOptions {
+            code_graph: Some(graph),
+            ..crate::agent::LoopOptions::default().without_streaming()
+        };
+        let ws = tempfile::tempdir().expect("ws");
+        let mut session = crate::session::Session::new("scripted", "m");
+        session.roots = vec![ws.path().to_path_buf()];
+        crate::agent::run_loop(&mut session, "go", &provider, &Grant, &opts)
+            .await
+            .expect("run completes");
+        let notes: Vec<String> = session
+            .messages
+            .iter()
+            .flat_map(|m| &m.blocks)
+            .filter_map(|b| match b {
+                Block::ToolResult { inline: Some(v), .. } => Some(String::from_utf8_lossy(v).into_owned()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(
+            notes[0].contains("building") && !notes[0].contains("graph_rebuild"),
+            "{}",
+            notes[0]
+        );
+        assert!(notes[1].contains("graph_rebuild"), "{}", notes[1]);
     }
 
     /// B1: tool schemas reach the wire in a deterministic order. The runtime
@@ -8172,11 +8252,10 @@ async fn run_loop_inner(
                         };
                     // A11: the first `graph_query` starts the session's
                     // background graph build; this call answers from whatever
-                    // is indexed so far (the result's note points at
-                    // `graph_rebuild` when it is empty).
-                    if meta.name == "graph_query" {
-                        start_code_graph_build(opts, &session.id, &session.roots);
-                    }
+                    // is indexed so far (an empty result's note says the
+                    // index is building; later ones point at `graph_rebuild`).
+                    let graph_build_started = meta.name == "graph_query"
+                        && start_code_graph_build(opts, &session.id, &session.roots);
                     // C4: `prompt` is required only when the quarantine call
                     // (its one consumer) will be made; checked before the fetch.
                     let missing_prompt = (meta.name == "WebFetch")
@@ -8210,6 +8289,7 @@ async fn run_loop_inner(
                                 .await
                                 .map_err(LoopError::ToolFailure)
                         }
+                        Ok(s) if graph_build_started => Ok(graph_building_note(s)),
                         other => other,
                     };
                     match dispatched {
