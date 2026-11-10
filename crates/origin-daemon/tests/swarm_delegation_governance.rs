@@ -166,7 +166,7 @@ async fn plan_mode_parent_still_cannot_delegate() {
     assert_eq!(spawned.load(Ordering::SeqCst), 0);
 }
 
-/// A8: the Task call came back through the shared deny branch as an is_error result.
+/// A8: the Task call came back through the shared deny branch as an `is_error` result.
 fn task_denied(session: &Session) -> bool {
     session.messages.iter().flat_map(|m| m.blocks.iter()).any(|b| {
         matches!(b, Block::ToolResult { is_error: true, inline: Some(body), .. }
