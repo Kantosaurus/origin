@@ -12,6 +12,10 @@
 # Env: ORIGIN_MODEL (default claude-opus-4-8), BENCH_TIMEOUT (s, default 1200),
 #      BENCH_KILL_DAEMON=1 to kill leftover origin-daemons between tasks
 #      (recommended on a dedicated bench host). Run on Linux for the Docker scorer.
+#
+# ORIGIN_ALLOW_ALL=1 is set for the `origin run` child only: it auto-approves
+# every tool in a headless run (origin binaries that predate it ignore it).
+# Run this adapter only inside a disposable container or VM.
 set -uo pipefail
 repo="$1"; issue_file="$2"; metrics_out="$3"
 model="${ORIGIN_MODEL:-claude-opus-4-8}"
@@ -22,7 +26,7 @@ run="$(mktemp)"
 
 start=$(date +%s.%N)
 # Headless, no supervisor (per-cwd daemon = isolated per task), no self-update.
-ORIGIN_MODEL="$model" ORIGIN_NO_SUPERVISOR=1 ORIGIN_NO_UPDATE=1 \
+ORIGIN_MODEL="$model" ORIGIN_NO_SUPERVISOR=1 ORIGIN_NO_UPDATE=1 ORIGIN_ALLOW_ALL=1 \
   timeout "$timeout_s" origin run "$(cat "$issue_file")" \
     --json --output-format stream-json >"$run" 2>/dev/null || true
 end=$(date +%s.%N)
