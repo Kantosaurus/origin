@@ -49,6 +49,9 @@ impl Provider for StreamFailsImmediately {
 async fn run_loop_terminates_when_chat_stream_errors_before_closing_ring() {
     let provider = StreamFailsImmediately;
     let mut session = Session::new("test", "claude-opus-4-7");
+    // B6: the first run_loop in a process also pays the one-time PATH probe
+    // for the env block; warm that memo so the deadline measures the loop.
+    let _ = origin_daemon::subsystems::tools_line().await;
     // Hard deadline: if the bug is unfixed, the drain hangs forever and the
     // outer `timeout` will fire. With the fix the loop returns within ms.
     let res = tokio::time::timeout(
