@@ -270,8 +270,15 @@ fn encode_message_into<'a>(m: &'a Message, out: &mut Vec<WireContent<'a>>) {
         }
         Role::Tool => {
             // Each tool_result becomes a `user` content with a functionResponse
-            // part. Gemini doesn't have a dedicated tool role.
-            for b in &m.blocks {
+            // part. Gemini doesn't have a dedicated tool role. B8: the
+            // message's text is added to the LAST response as
+            // `harness_context` (no extra content: Gemini's turn rules).
+            let text = collect_text(&m.blocks);
+            let last = m
+                .blocks
+                .iter()
+                .rposition(|b| matches!(b, Block::ToolResult { .. }));
+            for (i, b) in m.blocks.iter().enumerate() {
                 if let Block::ToolResult {
                     tool_use_id, inline, ..
                 } = b
@@ -300,7 +307,7 @@ fn encode_message_into<'a>(m: &'a Message, out: &mut Vec<WireContent<'a>>) {
                             (None, name)
                         }
                     };
-                    let response: Value = inline
+                    let mut response: Value = inline
                         .as_deref()
                         .and_then(|v| serde_json::from_slice::<Value>(v).ok())
                         .unwrap_or_else(|| {
@@ -310,6 +317,12 @@ fn encode_message_into<'a>(m: &'a Message, out: &mut Vec<WireContent<'a>>) {
                                 .unwrap_or("");
                             json!({ "content": s })
                         });
+                    if Some(i) == last && !text.is_empty() {
+                        if !response.is_object() {
+                            response = json!({ "content": response });
+                        }
+                        response["harness_context"] = Value::String(text.clone());
+                    }
                     out.push(WireContent {
                         role: "user",
                         parts: vec![WirePartOut::FunctionResponse {
@@ -464,6 +477,51 @@ mod tests {
         let fr = &body["contents"][0]["parts"][0]["functionResponse"];
         assert_eq!(fr["id"], "abc123", "the real Gemini call id must be echoed");
         assert_eq!(fr["name"], "get_weather");
+    }
+
+    /// B8: text on a tool-result message reaches the model in the last
+    /// `functionResponse` (`harness_context`); nothing else on the wire changes.
+    #[test]
+    fn tool_message_text_is_added_to_the_last_function_response() {
+        let result = |id: &str, body: &[u8]| Block::ToolResult {
+            tool_use_id: id.into(),
+            handle: None,
+            inline: Some(body.to_vec()),
+            cache_marker: None,
+            is_error: false,
+        };
+        let encode = |blocks: Vec<Block>| {
+            let r = req(
+                vec![Message {
+                    role: Role::Tool,
+                    blocks,
+                }],
+                vec![],
+            );
+            serde_json::to_value(encode_request(&r)).unwrap()["contents"].clone()
+        };
+        let plain = encode(vec![
+            result("call_a", br#"{"n":1}"#),
+            result("call_b", b"plain text"),
+        ]);
+        let with = encode(vec![
+            result("call_a", br#"{"n":1}"#),
+            result("call_b", b"plain text"),
+            Block::text("<edit-check>x</edit-check>"),
+        ]);
+        let roles = |v: &Value| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["role"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(roles(&with), roles(&plain));
+        assert_eq!(with[0], plain[0], "first response untouched");
+        let resp = &with[1]["parts"][0]["functionResponse"]["response"];
+        assert_eq!(resp["content"], "plain text", "the wrapper keeps the result");
+        assert_eq!(resp["harness_context"], "<edit-check>x</edit-check>");
+        assert_eq!(with[1]["parts"].as_array().unwrap().len(), 1);
     }
 
     #[test]

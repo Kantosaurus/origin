@@ -236,17 +236,27 @@ fn encode_message_into(m: &Message, out: &mut Vec<Value>) {
         }
         Role::Tool => {
             // Each tool result becomes a `function_call_output` item keyed by the
-            // originating call id.
-            for b in &m.blocks {
+            // originating call id. B8: the message's text is folded into the
+            // LAST output, as the Ollama encoder does (no extra item).
+            let text = collect_text(&m.blocks);
+            let last = m
+                .blocks
+                .iter()
+                .rposition(|b| matches!(b, Block::ToolResult { .. }));
+            for (i, b) in m.blocks.iter().enumerate() {
                 if let Block::ToolResult {
                     tool_use_id, inline, ..
                 } = b
                 {
-                    let output = inline
+                    let mut output = inline
                         .as_deref()
                         .and_then(|v| std::str::from_utf8(v).ok())
                         .unwrap_or("")
                         .to_string();
+                    if Some(i) == last && !text.is_empty() {
+                        output.push_str("\n\n");
+                        output.push_str(&text);
+                    }
                     out.push(json!({
                         "type": "function_call_output",
                         "call_id": tool_use_id,
@@ -491,6 +501,47 @@ mod tests {
         assert_eq!(input[1]["name"], json!("search"));
         assert_eq!(input[2]["call_id"], json!("call_1"));
         assert_eq!(input[2]["output"], json!("42 results"));
+    }
+
+    /// B8: text on a tool-result message reaches the model in the last
+    /// `function_call_output`; nothing else on the wire changes.
+    #[test]
+    fn tool_message_text_is_folded_into_the_last_output() {
+        let result = |id: &str, body: &str| Block::ToolResult {
+            tool_use_id: id.into(),
+            handle: None,
+            inline: Some(body.as_bytes().to_vec()),
+            cache_marker: None,
+            is_error: false,
+        };
+        let encode = |blocks: Vec<Block>| {
+            let req = ChatRequest {
+                messages: vec![Message {
+                    role: Role::Tool,
+                    blocks,
+                }],
+                model: "gpt-5-codex".to_string(),
+                ..ChatRequest::default()
+            };
+            serde_json::to_value(encode_request(&req)).unwrap()["input"].clone()
+        };
+        let plain = encode(vec![result("a", "r1"), result("b", "r2")]);
+        let with = encode(vec![
+            result("a", "r1"),
+            result("b", "r2"),
+            Block::text("<todos>t</todos>"),
+        ]);
+        let kinds = |v: &serde_json::Value| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["type"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kinds(&with), kinds(&plain));
+        assert_eq!(with[0], plain[0], "first output untouched");
+        assert_eq!(with[1]["output"], json!("r2\n\n<todos>t</todos>"));
+        assert_eq!(with[1]["call_id"], json!("b"));
     }
 
     #[test]

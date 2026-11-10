@@ -254,16 +254,28 @@ fn encode_message_into(m: &Message, out: &mut Vec<WireMessage>) {
         }
         Role::Tool => {
             // OpenAI requires one `{role:"tool"}` message per tool_call_id.
-            for b in &m.blocks {
+            // B8: the message's text (turn-end checks, background results) is
+            // folded into the LAST tool result, as the Ollama encoder does; a
+            // separate message after `tool` messages is rejected by some servers.
+            let text = collect_text(&m.blocks);
+            let last = m
+                .blocks
+                .iter()
+                .rposition(|b| matches!(b, Block::ToolResult { .. }));
+            for (i, b) in m.blocks.iter().enumerate() {
                 if let Block::ToolResult {
                     tool_use_id, inline, ..
                 } = b
                 {
-                    let content_str = inline
+                    let mut content_str = inline
                         .as_deref()
                         .and_then(|v| std::str::from_utf8(v).ok())
                         .unwrap_or("")
                         .to_string();
+                    if Some(i) == last && !text.is_empty() {
+                        content_str.push_str("\n\n");
+                        content_str.push_str(&text);
+                    }
                     out.push(WireMessage {
                         role: "tool",
                         content: Some(content_str),
@@ -287,4 +299,53 @@ fn collect_text(blocks: &[Block]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(id: &str, body: &str) -> Block {
+        Block::ToolResult {
+            tool_use_id: id.into(),
+            handle: None,
+            inline: Some(body.as_bytes().to_vec()),
+            cache_marker: None,
+            is_error: false,
+        }
+    }
+
+    /// B8: text on a tool-result message reaches the model in the last tool
+    /// result; nothing else on the wire changes.
+    #[test]
+    fn tool_message_text_is_folded_into_the_last_tool_result() {
+        let encode = |blocks: Vec<Block>| {
+            let req = ChatRequest {
+                messages: vec![Message {
+                    role: Role::Tool,
+                    blocks,
+                }],
+                model: "m".into(),
+                ..ChatRequest::default()
+            };
+            serde_json::to_value(encode_request(&req, false)).expect("json")["messages"].clone()
+        };
+        let plain = encode(vec![result("a", "r1"), result("b", "r2")]);
+        let with = encode(vec![
+            result("a", "r1"),
+            result("b", "r2"),
+            Block::text("<edit-check>x</edit-check>"),
+        ]);
+        let roles = |v: &Value| {
+            v.as_array()
+                .expect("array")
+                .iter()
+                .map(|m| m["role"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(roles(&with), roles(&plain));
+        assert_eq!(with[0], plain[0], "first tool result untouched");
+        assert_eq!(with[1]["content"], "r2\n\n<edit-check>x</edit-check>");
+        assert_eq!(with[1]["tool_call_id"], "b");
+    }
 }
