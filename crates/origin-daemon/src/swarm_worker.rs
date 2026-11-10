@@ -360,8 +360,7 @@ async fn run_worker(
         // old `SectionId`→band `PrefixLedger` inheritance seam, which the live
         // wire path never consumed and which has now been removed.)
         plan: Some(plan.fork_shared_handle_bands()),
-        // Match the orchestrator's reasoning effort so the workers that do the
-        // actual editing are not silently downgraded (anthropic ⇒ Ultracode).
+        // B3: sub-agents default to medium effort (anthropic only).
         effort: worker_effort(provider.name()),
         // #3: sub-agents that EDIT get the same regression enforcement as the
         // top-level loop — a worker must not report "Completed" while the test
@@ -547,13 +546,12 @@ fn deny_rules_only(rules: &crate::config::PermissionRules) -> Option<Arc<crate::
     })
 }
 
-/// Reasoning effort for a sub-agent turn. Workers do the actual editing, so a
-/// silent downgrade tanks their accuracy: match the orchestrator's default
-/// (anthropic ⇒ Ultracode = max reasoning + always-on swarm). Mirrors the main
-/// loop's `resolve_turn_effort` for the no-explicit-effort case; non-anthropic
-/// providers stay `None` (wire byte-identical).
+/// Reasoning effort for a sub-agent's turns, fixed for its whole run. B3:
+/// anthropic ⇒ `Medium` (a delegated sub-task needs less deliberation than the
+/// orchestrator's `High`); non-anthropic providers stay `None` (wire
+/// byte-identical).
 fn worker_effort(provider_name: &str) -> Option<origin_provider::ReasoningEffort> {
-    (provider_name == "anthropic").then_some(origin_provider::ReasoningEffort::Ultracode)
+    (provider_name == "anthropic").then_some(origin_provider::ReasoningEffort::Medium)
 }
 
 /// Resolve the post-edit policy for a sub-agent (#3).
@@ -623,13 +621,13 @@ mod tests {
     }
 
     #[test]
-    fn sub_agents_inherit_ultracode_effort_on_anthropic() {
+    fn sub_agents_default_to_medium_effort_on_anthropic() {
+        assert_eq!(worker_effort("anthropic"), Some(ReasoningEffort::Medium), "B3");
         assert_eq!(
-            worker_effort("anthropic"),
-            Some(ReasoningEffort::Ultracode),
-            "workers must not be silently downgraded below the orchestrator's effort"
+            worker_effort("openai"),
+            None,
+            "non-anthropic stays wire byte-identical"
         );
-        assert_eq!(worker_effort("openai"), None, "non-anthropic stays wire byte-identical");
     }
 
     /// Serializes the `ORIGIN_REPRO_GATE` mutations in THIS module's tests.

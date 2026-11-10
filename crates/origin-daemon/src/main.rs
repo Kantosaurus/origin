@@ -1714,18 +1714,45 @@ const fn choice_registry_enabled(interactive: bool, permission_ask: bool) -> boo
 
 /// Resolve the effective reasoning effort for a turn.
 ///
-/// An explicit per-request effort (the CLI's `/effort` / `/fast`) always wins.
-/// When the client sent no effort, Anthropic models default to
-/// [`ReasoningEffort::Ultracode`] — maximum reasoning plus the always-on swarm
-/// surface — so Claude models run at full depth out of the box. Every other
-/// provider stays unset (`None`), which leaves its wire byte-identical.
+/// An explicit per-request effort (the CLI's `/effort` / `/fast` / `--effort`)
+/// always wins, then `ORIGIN_DEFAULT_EFFORT` (`env_default`). With neither,
+/// Anthropic models default to [`ReasoningEffort::High`] (B3; was `max`). Every
+/// other provider stays unset (`None`), which leaves its wire byte-identical.
 fn resolve_turn_effort(
     requested: Option<origin_provider::ReasoningEffort>,
+    env_default: Option<origin_provider::ReasoningEffort>,
     provider_name: &str,
 ) -> Option<origin_provider::ReasoningEffort> {
-    requested.or_else(|| {
-        (provider_name == "anthropic").then_some(origin_provider::ReasoningEffort::Ultracode)
+    requested
+        .or(env_default)
+        .or_else(|| (provider_name == "anthropic").then_some(origin_provider::ReasoningEffort::High))
+}
+
+/// B3 escape hatch: `ORIGIN_DEFAULT_EFFORT`, read once per daemon process so the
+/// default never changes under a running conversation. Main loop only.
+fn env_default_effort() -> Option<origin_provider::ReasoningEffort> {
+    static EFFORT: std::sync::OnceLock<Option<origin_provider::ReasoningEffort>> = std::sync::OnceLock::new();
+    *EFFORT.get_or_init(|| {
+        let raw = std::env::var("ORIGIN_DEFAULT_EFFORT").ok()?;
+        let parsed = parse_effort_name(&raw);
+        if parsed.is_none() {
+            tracing::warn!(value = %raw, "ORIGIN_DEFAULT_EFFORT: unknown effort level (ignored)");
+        }
+        parsed
     })
+}
+
+/// An effort name as `/effort` accepts it (its aliases included).
+fn parse_effort_name(name: &str) -> Option<origin_provider::ReasoningEffort> {
+    let name = name.trim().to_ascii_lowercase();
+    let canonical = match name.as_str() {
+        "min" => "low",
+        "mid" => "medium",
+        "maximum" | "ultra" => "max",
+        "ultra-code" => "ultracode",
+        other => other,
+    };
+    origin_provider::ReasoningEffort::from_wire_str(canonical)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1966,12 +1993,13 @@ async fn handle_request(
                 req.effort
                     .as_deref()
                     .and_then(origin_provider::ReasoningEffort::from_wire_str),
+                env_default_effort(),
                 provider.name(),
             ),
             // ^ claude-code `/effort`+`/fast`: the CLI sends a canonical token;
-            // an unknown token maps to `None`. With no explicit effort, Anthropic
-            // models default to `Ultracode` (max reasoning); other providers stay
-            // `None` ⇒ wire byte-identical. See `resolve_turn_effort`.
+            // an unknown token maps to `None`. With no explicit effort,
+            // `ORIGIN_DEFAULT_EFFORT`, else Anthropic models default to `High`;
+            // other providers stay `None` ⇒ wire byte-identical. See `resolve_turn_effort`.
             ponytail: origin_ponytail::resolve_mode(
                 req.ponytail
                     .as_deref()
@@ -2297,7 +2325,7 @@ async fn maybe_run_best_of_n(
                 // tests + terminal enforcement), so it MUST carry post_edit.
                 post_edit: post_edit.clone(),
                 // Match the orchestrator's effort so candidates aren't downgraded.
-                effort: resolve_turn_effort(None, provider.name()),
+                effort: resolve_turn_effort(None, env_default_effort(), provider.name()),
                 cwd: Some(wt.to_path_buf()),
                 ..LoopOptions::default()
             };
@@ -4647,35 +4675,68 @@ fn spawn_metrics_endpoint(metrics: Metrics, addr: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        choice_registry_enabled, detach_last_turn, resolve_turn_effort, resume_foreign_event,
-        resume_session_event, turn_window, Session, SessionStore, StreamEvent,
+        choice_registry_enabled, detach_last_turn, parse_effort_name, resolve_turn_effort,
+        resume_foreign_event, resume_session_event, turn_window, Session, SessionStore, StreamEvent,
     };
     use origin_core::types::{Block, Message, Role};
     use origin_provider::ReasoningEffort;
     use origin_resume_token::ResumeToken;
 
     #[test]
-    fn anthropic_defaults_to_ultracode_when_no_effort_requested() {
+    fn anthropic_defaults_to_high_when_no_effort_requested() {
         assert_eq!(
-            resolve_turn_effort(None, "anthropic"),
-            Some(ReasoningEffort::Ultracode),
-            "Anthropic models default to ultracode (max reasoning + always-on swarm)",
+            resolve_turn_effort(None, None, "anthropic"),
+            Some(ReasoningEffort::High),
+            "B3: the main loop defaults to high, not max",
         );
     }
 
     #[test]
-    fn explicit_effort_always_wins_over_the_anthropic_default() {
+    fn explicit_effort_always_wins_over_env_and_default() {
         assert_eq!(
-            resolve_turn_effort(Some(ReasoningEffort::Low), "anthropic"),
-            Some(ReasoningEffort::Low),
-            "a user-set /effort must never be overridden by the default",
+            resolve_turn_effort(
+                Some(ReasoningEffort::Ultracode),
+                Some(ReasoningEffort::Low),
+                "anthropic"
+            ),
+            Some(ReasoningEffort::Ultracode),
+            "a user-set /effort must never be overridden",
         );
+    }
+
+    #[test]
+    fn env_default_effort_beats_the_built_in_default() {
+        assert_eq!(
+            resolve_turn_effort(None, Some(ReasoningEffort::Max), "anthropic"),
+            Some(ReasoningEffort::Max)
+        );
+        assert_eq!(
+            resolve_turn_effort(None, Some(ReasoningEffort::Low), "openai"),
+            Some(ReasoningEffort::Low),
+            "an explicit env choice applies on any provider"
+        );
+    }
+
+    #[test]
+    fn default_effort_env_accepts_the_effort_command_names() {
+        for (name, want) in [
+            ("high", ReasoningEffort::High),
+            ("MID", ReasoningEffort::Medium),
+            ("min", ReasoningEffort::Low),
+            ("fast", ReasoningEffort::Fast),
+            ("ultra", ReasoningEffort::Max),
+            ("maximum", ReasoningEffort::Max),
+            ("ultra-code", ReasoningEffort::Ultracode),
+        ] {
+            assert_eq!(parse_effort_name(name), Some(want), "{name}");
+        }
+        assert_eq!(parse_effort_name("bogus"), None);
     }
 
     #[test]
     fn non_anthropic_providers_stay_unset_for_a_byte_identical_wire() {
-        assert_eq!(resolve_turn_effort(None, "openai"), None);
-        assert_eq!(resolve_turn_effort(None, "gemini"), None);
+        assert_eq!(resolve_turn_effort(None, None, "openai"), None);
+        assert_eq!(resolve_turn_effort(None, None, "gemini"), None);
     }
 
     #[test]

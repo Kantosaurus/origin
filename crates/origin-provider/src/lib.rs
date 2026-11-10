@@ -83,8 +83,8 @@ pub enum ReasoningEffort {
     /// `Ultracode`: the deepest tier — maximum reasoning *plus* always-on
     /// multi-agent swarm orchestration. On the provider wire it is the highest
     /// valid reasoning level (Anthropic `max`); the swarm-orchestration half is
-    /// realised by the always-on `Task` surface, not the wire. This is the
-    /// default effort for Anthropic models.
+    /// realised by the `Task` surface, not the wire. Opt-in; the Anthropic
+    /// default is [`Self::High`] (sub-agents [`Self::Medium`]).
     Ultracode,
 }
 

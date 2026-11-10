@@ -5376,11 +5376,10 @@ async fn run_loop_inner(
             tools: tools_schema.clone(),
             // R6: re-resolve effort against the ROUTED provider. When the session
             // resolved to None but this turn runs on Anthropic (e.g. a cross-
-            // provider router rebuild), mint Ultracode so the capable model isn't
-            // left at the API default. An explicit `/effort` (already in
-            // opts.effort) still wins.
+            // provider router rebuild), use the main loop's default (B3: High).
+            // An explicit `/effort` (already in opts.effort) still wins.
             effort: opts.effort.or_else(|| {
-                (turn_provider.name() == "anthropic").then_some(origin_provider::ReasoningEffort::Ultracode)
+                (turn_provider.name() == "anthropic").then_some(origin_provider::ReasoningEffort::High)
             }),
             thinking_tokens: opts.thinking_tokens,
             // Attach images/PDF only to the first turn's user message. On later
