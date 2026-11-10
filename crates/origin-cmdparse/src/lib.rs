@@ -229,13 +229,18 @@ pub fn installs(line: &str) -> Vec<Install> {
     installs_in(line, HOST_SHELL)
 }
 
-/// [installs] for an explicit shell dialect.
+/// [`installs`] for an explicit shell dialect.
 fn installs_in(line: &str, sh: Shell) -> Vec<Install> {
     let mut sink = Sink::default();
     scan(line, sh, 0, &mut sink);
-    sink.installs
-        .retain(|i| !i.packages.is_empty() || i.always_ask.is_some());
-    sink.installs
+    let mut unique: Vec<Install> = Vec::new();
+    for i in sink.installs {
+        // A wrapper analyses several suffixes, so one install can be seen twice.
+        if (!i.packages.is_empty() || i.always_ask.is_some()) && !unique.contains(&i) {
+            unique.push(i);
+        }
+    }
+    unique
 }
 
 /// Everything a scan observes. Derefs to the risk list so detectors that only
@@ -1026,11 +1031,13 @@ fn check_cmd(
 
 /// Check the command a prefix command (`sudo`, `timeout`, `xargs`, ...) runs.
 ///
-/// The wrapper's options are skipped. The word right after an option may be
-/// that option's value (`sudo -u root rm`), so the following word is tried as
-/// the program too; `timeout`/`chrt` also take a positional DURATION/PRIORITY
-/// first. Every candidate start is analysed (checks only add risks), so an
-/// unknown option shape errs toward analysing more, never less.
+/// The wrapper has no option table, so the suffix starting at EACH of the first
+/// four non-option words is analysed (an option's value read as a command only
+/// adds risks): `sudo -u user -H rm`, `timeout -k 5 -s KILL 10 rm`,
+/// `ionice -c 2 -n 7 rm`. The word right after an option (`sudo -u root rm`)
+/// and, for `timeout`/`chrt`, the word after the DURATION/PRIORITY are tried
+/// too. The bound of four keeps arguments deep inside the wrapped command from
+/// being read as commands.
 // ponytail: no per-wrapper option table, so `sudo -E foo rm -rf ~` over-matches;
 // add one if that false positive ever matters.
 fn check_wrapped(
@@ -1042,21 +1049,25 @@ fn check_wrapped(
     depth: usize,
     risks: &mut Sink,
 ) {
-    let Some(j) = args.iter().position(|a| !a.text.starts_with('-')) else {
+    let mut starts: Vec<usize> = (0..args.len())
+        .filter(|&k| !args[k].text.starts_with('-'))
+        .take(4)
+        .collect();
+    let Some(&j) = starts.first() else {
         return;
     };
     let maybe_value = j > 0 && !args[j - 1].text.contains('=') && j + 1 < args.len();
-    let mut starts = Vec::new();
-    // `xargs -I {} cp {} dest/`: that `{}` is `-I`'s value, not the program.
-    if !(maybe_value && args[j].text == "{}") {
-        starts.push(j);
-    }
     if maybe_value {
         starts.push(j + 1);
     }
     if matches!(name, "timeout" | "chrt") {
         starts.extend([j + 1, j + 1 + usize::from(maybe_value)]);
     }
+    // `xargs -I {} cp {} dest/`: `{}` is the program only in the program
+    // position (after `-I`'s value); elsewhere it is that value or an argument.
+    let program_at = if maybe_value { j + 1 } else { j };
+    let placeholder = |s: usize| args[s].text == "{}" && s != program_at;
+    starts.retain(|&s| s < args.len() && !placeholder(s));
     starts.sort_unstable();
     starts.dedup();
     let seen = risks.installs.len();
@@ -2709,6 +2720,32 @@ mod tests {
         ] {
             let r = worst(&analyze(line));
             assert!(matches!(r, Risk::Dangerous(_)), "{line:?}: {r:?}");
+        }
+    }
+
+    /// Wrapper option shapes the parser has no table for: the suffix at each of
+    /// the first four non-option words is analysed, so the wrapped command is
+    /// found; ordinary wrapped commands keep their verdict.
+    #[test]
+    fn unknown_wrapper_option_shapes_still_reach_the_command() {
+        for line in [
+            "sudo -u user -H rm -rf ~",
+            "timeout -k 5 -s KILL 10 rm -rf ~",
+            "ionice -c 2 -n 7 rm -rf ~",
+        ] {
+            let r = worst(&analyze(line));
+            assert!(matches!(r, Risk::Dangerous(_)), "{line:?}: {r:?}");
+        }
+        for line in [
+            "sudo -u ci -H npm install left-pad",
+            "timeout -k 5 -s KILL 10 npm install left-pad",
+        ] {
+            let i = installs(line);
+            assert_eq!(i.len(), 1, "{line:?}: {i:?}");
+            assert_eq!(i[0].packages, ["left-pad"], "{line:?}");
+        }
+        for line in ["timeout 10 echo hello", "sudo -u postgres psql -c \"select 1\""] {
+            assert_eq!(worst(&analyze(line)), Risk::Safe, "{line:?}");
         }
     }
 
