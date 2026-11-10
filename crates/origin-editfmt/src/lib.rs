@@ -365,8 +365,8 @@ fn trim_trailing_newline(mut s: String) -> String {
     s
 }
 
-/// Parses whole-file edits (C7): each is a path line (optionally ending in
-/// `:`) IMMEDIATELY followed by a closed fenced block holding the file's full
+/// Parses whole-file edits (C7): each is a path line ([`looks_like_path`],
+/// alone on its line) IMMEDIATELY followed by a closed fenced block holding the file's full
 /// contents. Anything else — prose, a fence after a sentence, an unclosed
 /// fence — is not an edit, so a plain reply never writes a file.
 fn parse_whole_file(text: &str) -> Result<Vec<Hunk>, EditFmtError> {
@@ -382,7 +382,7 @@ fn parse_whole_file(text: &str) -> Result<Vec<Hunk>, EditFmtError> {
         let Some(close) = lines[i + 1..].iter().position(is_fence).map(|k| i + 1 + k) else {
             break; // unclosed fence: not an edit
         };
-        let file = i.checked_sub(1).map(|p| lines[p].trim().trim_end_matches(':'));
+        let file = i.checked_sub(1).map(|p| lines[p].trim());
         if let Some(file) = file.filter(|f| looks_like_path(f)) {
             hunks.push(Hunk {
                 file: file.to_string(),
@@ -400,9 +400,14 @@ fn parse_whole_file(text: &str) -> Result<Vec<Hunk>, EditFmtError> {
     Ok(hunks)
 }
 
-/// A conservative path: non-empty, ASCII letters/digits and `.` `_` `-` `/` only.
+/// A conservative relative path: ASCII letters/digits and `.` `_` `-` `/`
+/// only, with a `.` or `/` (so `Example`, `Run` are not paths), not absolute
+/// and no `..` component. Containment is the applier's job; this is defence
+/// in depth.
 fn looks_like_path(s: &str) -> bool {
-    !s.is_empty()
+    s.contains(['.', '/'])
+        && !s.starts_with('/')
+        && !s.split('/').any(|c| c == "..")
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
 }
@@ -573,6 +578,25 @@ mod tests {
         assert!(parse(EditFormat::WholeFile, text).is_err());
         // A path separated from its fence by a blank line is not an edit either.
         assert!(parse(EditFormat::WholeFile, "src/a.rs\n\n```\nx\n```\n").is_err());
+    }
+
+    #[test]
+    fn whole_file_snippet_introducers_and_escaping_paths_are_not_edits() {
+        for text in [
+            "Example:\n```\nlet x = 1;\n```\n",
+            "Run:\n```\ncargo test\n```\n",
+            "Usage\n```\nfoo --bar\n```\n",
+            "src/a.rs:\n```\nx\n```\n",
+            "../x.rs\n```\nx\n```\n",
+            "src/../../x.rs\n```\nx\n```\n",
+            "/etc/x.conf\n```\nx\n```\n",
+            "C:/x.rs\n```\nx\n```\n",
+        ] {
+            assert!(parse(EditFormat::WholeFile, text).is_err(), "{text}");
+        }
+        let hunks = parse(EditFormat::WholeFile, "README.md\n```\n# hi\n```\n").unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].file, "README.md");
     }
 
     #[test]
