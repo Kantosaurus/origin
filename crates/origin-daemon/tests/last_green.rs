@@ -437,6 +437,39 @@ fn a_green_test_with_a_red_lint_tags_nothing() {
     assert_eq!(git(ws.path(), &["rev-parse", "--verify", "-q", TAG]), None);
 }
 
+/// C8: a green gate does not tag when another armed gate did not run (the
+/// command guard refuses `echo .env curl`) — per turn, and at the terminal
+/// test re-run (repair budget 1), which does not re-run the lint.
+#[test]
+fn a_green_gate_with_another_that_did_not_run_tags_nothing() {
+    for (test_cmd, lint_cmd, repairs) in [
+        ("echo .env curl", "echo lint-ok", 0),
+        ("echo test-ok", "echo .env curl", 1),
+    ] {
+        let ws = workspace();
+        let cfg = PostEditConfig {
+            auto_lint: true,
+            lint_command: Some(lint_cmd.into()),
+            ..test_gate(test_cmd, repairs)
+        };
+        run(
+            ws.path(),
+            true,
+            cfg,
+            vec![write("w1", "a.txt"), Block::text("done")],
+        );
+        assert!(
+            git(ws.path(), &["rev-parse", "HEAD"]).is_some(),
+            "checkpoints were on"
+        );
+        assert_eq!(
+            git(ws.path(), &["rev-parse", "--verify", "-q", TAG]),
+            None,
+            "test `{test_cmd}`, lint `{lint_cmd}`"
+        );
+    }
+}
+
 #[test]
 fn a_green_lint_alone_tags() {
     let ws = workspace();

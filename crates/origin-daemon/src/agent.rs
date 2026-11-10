@@ -5916,6 +5916,9 @@ async fn run_loop_inner(
     let mut repro_gate_repairs: u32 = 0;
     // C8: the checkpoint id and turn of this run's last passing gate.
     let mut last_green: Option<(String, u32)> = None;
+    // C8: the armed lint gate did not run on its latest turn (`lint_block` is
+    // then empty without meaning green).
+    let mut lint_unrun = false;
     // The number of terminal-branch RED→continue attempts allowed before the
     // loop yields control (surfacing the still-failing suite to the user/goal
     // verifier). Reuses the post-edit `max_repair_iters` budget; 0 when no gate
@@ -6769,8 +6772,9 @@ async fn run_loop_inner(
                         if fresh.is_empty() {
                             // GREEN (or unrunnable/fail-open) ⇒ fall through to return.
                             test_block.clear();
-                            // C8: only a gate that ran and passed tags the tree.
-                            if fresh_ran && lint_block.is_empty() {
+                            // C8: only a gate that ran and passed tags the tree,
+                            // and only when the latest lint (if armed) ran too.
+                            if fresh_ran && lint_block.is_empty() && !lint_unrun {
                                 if let Some(id) = tag_last_green(loop_cwd(opts).as_deref()).await {
                                     last_green = Some((id, turn));
                                 }
@@ -8585,6 +8589,9 @@ async fn run_loop_inner(
         // adds NO latency unless the user explicitly configured it — they then
         // accept their suite's cost. Failures are fed back like the other gates.
         let mut gate_ran = false;
+        // C8: an armed gate that did not run (guard refusal, timeout) leaves
+        // the tree unverified, so nothing is tagged this turn.
+        let mut gate_skipped = false;
         if !lsp_edited_paths.is_empty() {
             if let Some(cfg) = opts.post_edit.as_deref() {
                 // C8: the repro gate also runs the test command at turn-end, so
@@ -8597,6 +8604,7 @@ async fn run_loop_inner(
                         let ran = run_post_edit_test(&cmd, opts.cwd.as_deref()).await;
                         edit_unverified &= ran.is_none();
                         gate_ran |= ran.is_some();
+                        gate_skipped |= ran.is_none();
                         test_block = crate::redact::string(ran.unwrap_or_default());
                         // C9: classify a post-edit failure against the pre-edit
                         // baseline — a true regression (was green) vs failures
@@ -8625,13 +8633,15 @@ async fn run_loop_inner(
                         let ran = run_post_edit_lint_block(cmd, opts.cwd.as_deref()).await;
                         edit_unverified &= ran.is_none();
                         gate_ran |= ran.is_some();
+                        gate_skipped |= ran.is_none();
+                        lint_unrun = ran.is_none();
                         lint_block = crate::redact::string(ran.unwrap_or_default());
                     }
                 }
             }
         }
-        // C8: a gate ran this turn and every gate is green ⇒ tag this tree.
-        if gate_ran && test_block.is_empty() && lint_block.is_empty() {
+        // C8: every armed gate ran this turn and is green ⇒ tag this tree.
+        if gate_ran && !gate_skipped && test_block.is_empty() && lint_block.is_empty() {
             if let Some(id) = tag_last_green(loop_cwd(opts).as_deref()).await {
                 last_green = Some((id, turn));
             }
