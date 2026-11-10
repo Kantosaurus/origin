@@ -2926,6 +2926,11 @@ pub struct LoopOptions {
     /// unconditionally exactly as before, byte-identical. Sourced from
     /// `[notify]` in `governance.toml`.
     pub notify: Option<Arc<crate::config::NotifyPolicy>>,
+    /// Live language servers for the opt-in post-edit diagnostics
+    /// (`ORIGIN_LSP_DIAGNOSTICS=1`), shared across every run of this
+    /// connection (session) so servers stay warm; dropping the last clone
+    /// kills them. `None` ⇒ the run uses its own pool, dropped when it ends.
+    pub lsp_pool: Option<Arc<origin_lsp_client::LspPool>>,
 }
 
 impl Default for LoopOptions {
@@ -2974,6 +2979,7 @@ impl Default for LoopOptions {
             permission_rules: None,
             post_edit: None,
             notify: None,
+            lsp_pool: None,
         }
     }
 }
@@ -4135,6 +4141,7 @@ async fn run_loop_inner(
     // byte-identical to before when the feature is off.
     let mut lsp_diag_block = String::new();
     let lsp_diag_enabled = crate::lsp_diagnostics::enabled();
+    let lsp_pool = opts.lsp_pool.clone().unwrap_or_default();
     // Default-on, fail-open post-edit syntax gate (fast per-file checks). Like
     // `lsp_diag_block`, it is computed after dispatch and carried as a volatile
     // trailing block on the NEXT turn, so the model fixes a broken edit before
@@ -6319,18 +6326,18 @@ async fn run_loop_inner(
         );
 
         // Autonomous post-edit LSP diagnostics (opencode). When the feature is
-        // on and this turn mutated path-bearing files, spawn the resolved
+        // on and this turn mutated path-bearing files, ask the session's pooled
         // language server(s), collect diagnostics under a short timeout, and
         // stash the rendered `<lsp-diagnostics>` block for the NEXT turn's
-        // system prompt. Best-effort: any failure leaves `lsp_diag_block`
-        // empty, so the loop continues unaffected. Default-off ⇒ this whole
+        // system prompt. Best-effort: a timeout or server failure becomes a
+        // note in the block, never a loop error. Default-off ⇒ this whole
         // block is skipped and the prompt stays byte-identical.
         if lsp_diag_enabled {
             lsp_diag_block = if lsp_edited_paths.is_empty() {
                 String::new()
             } else {
                 let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                crate::lsp_diagnostics::lsp_diagnostics_block(&root, &lsp_edited_paths)
+                crate::lsp_diagnostics::lsp_diagnostics_block(&lsp_pool, &root, &lsp_edited_paths)
                     .await
                     .unwrap_or_default()
             };

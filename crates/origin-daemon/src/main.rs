@@ -914,6 +914,11 @@ fn spawn_handler_task(
         // `Write{force:false}` over a seen file is permitted. Uses interior
         // mutability, so a single `Arc<WriteGuard>` records reads across calls.
         let write_guard = Arc::new(origin_tools::builtins::write::WriteGuard::default());
+        // C10: per-connection (per-session) language servers for the opt-in
+        // post-edit diagnostics, kept warm across prompts. Empty unless
+        // `ORIGIN_LSP_DIAGNOSTICS=1`; dropped (servers killed) when the
+        // connection ends.
+        let lsp_pool = Arc::new(origin_lsp_client::LspPool::default());
 
         loop {
             // Step 1: drain any pushed-back message left by the goal driver
@@ -1001,6 +1006,7 @@ fn spawn_handler_task(
                         Arc::clone(&write_guard),
                         Arc::clone(&metrics),
                         verifier,
+                        Arc::clone(&lsp_pool),
                         req,
                     )
                     .await;
@@ -1746,6 +1752,8 @@ async fn handle_request(
     // the counters that back `/metrics`, `origin usage`, and the `?metrics` panel.
     metrics: Arc<Metrics>,
     verifier: Arc<dyn origin_goal::verifier::Verifier>,
+    // C10: per-connection pool of live language servers for post-edit diagnostics.
+    lsp_pool: Arc<origin_lsp_client::LspPool>,
     req: PromptRequest,
 ) -> PromptOutcome {
     let mut session = if let Some(sid) = &req.session_id {
@@ -2020,6 +2028,8 @@ async fn handle_request(
             // hours) and dispatched over the configured channel. Absent ⇒ `None`
             // ⇒ unconditional desktop toast under `ORIGIN_NOTIFY=1`,
             // byte-identical to before.
+            lsp_pool: Some(lsp_pool),
+            // ^ C10: the connection's language servers, reused across prompts.
         };
         // Opt-in interactive prompting: when the turn requested it, route
         // RequiresPermission tools through the IPC prompter (asks the client and

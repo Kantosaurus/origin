@@ -5,10 +5,14 @@
 //! on `textDocument/didOpen` publishes one diagnostic for the opened document
 //! whose `message` is the trimmed document text and whose `code` is this
 //! process's pid. Text `ENV:<NAME>` publishes the value of env var `<NAME>`
-//! instead (`<unset>` when absent).
+//! instead (`<unset>` when absent). Fault modes, by document text:
+//! `SLOW:<ms>` publishes after `<ms>` while still answering requests, `HANG`
+//! publishes then stops reading and answering anything, `EXIT` publishes then
+//! exits.
 #![allow(clippy::unwrap_used)]
 
 use std::io::{BufRead, BufReader, Write};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -63,7 +67,7 @@ fn main() {
             || text.clone(),
             |name| std::env::var(name).unwrap_or_else(|_| "<unset>".to_owned()),
         );
-        send(&json!({
+        let publish = json!({
             "jsonrpc": "2.0",
             "method": "textDocument/publishDiagnostics",
             "params": {
@@ -76,6 +80,20 @@ fn main() {
                     "code": std::process::id().to_string(),
                 }],
             },
-        }));
+        });
+        if let Some(ms) = text.strip_prefix("SLOW:") {
+            let delay = Duration::from_millis(ms.parse().unwrap());
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                send(&publish);
+            });
+            continue;
+        }
+        send(&publish);
+        match text.as_str() {
+            "HANG" => std::thread::sleep(Duration::from_secs(3600)),
+            "EXIT" => return,
+            _ => {}
+        }
     }
 }
