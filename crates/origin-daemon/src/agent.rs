@@ -608,40 +608,53 @@ async fn apply_cmd_guard(
 ///
 /// The prompt is often shown on one row cut at the terminal width, so the facts
 /// that decide the approval come first and their extent is visible even when cut:
-/// `<N> tools: <permission-gated tools…>, <read-only tools…> | mcp: <names> | goal: <goal>`.
-/// Gated/mutating tools (and unknown names or globs) sort before the auto-allowed
-/// pure ones, so truncation can never hide them; the model's order is kept within
-/// each group.
+/// `<N> tools: <tools> | mcp: <names> | goal: <goal>`.
+/// Every model-chosen value is escaped (`escape_debug`: no raw control chars)
+/// and quoted, so it can never fake a separator, and capped (names 32 chars, goal
+/// 200). Tools sort: known gated/mutating, then globs, then unknown names, then
+/// known read-only — a decoy cannot sit ahead of `Bash`. Stable within a group;
+/// `<N>` is the raw count.
 fn task_permission_preview(args: &Value) -> String {
-    let names = |key: &str, field: Option<&str>| -> Vec<String> {
+    let names = |key: &str, field: Option<&str>| -> Vec<&str> {
         args.get(key)
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(|v| field.map_or(Some(v), |f| v.get(f)).and_then(Value::as_str))
-            .map(str::to_owned)
             .collect()
     };
-    let mut tools = names("allowed_tools", None);
-    tools.sort_by_key(|t| {
-        registry_iter().find(|m| m.name == t.as_str()).is_some_and(|m| {
-            matches!(m.tier, origin_tools::Tier::AutoAllowed) && matches!(m.side_effects, SideEffects::Pure)
-        })
-    });
-    let mcp = names("mcp_servers", Some("name"));
-    let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
-    let list = |v: &[String]| {
+    let shown = |s: &str, cap: usize| {
+        let esc: String = s.escape_debug().collect();
+        let mut out: String = esc.chars().take(cap).collect();
+        if esc.chars().nth(cap).is_some() {
+            out.push('…');
+        }
+        format!("\"{out}\"")
+    };
+    let list = |v: &[&str]| {
         if v.is_empty() {
             "none".to_owned()
         } else {
-            v.join(", ")
+            v.iter().map(|s| shown(s, 32)).collect::<Vec<_>>().join(", ")
         }
     };
+    let mut tools = names("allowed_tools", None);
+    let read_only = |m: &ToolMeta| {
+        matches!(m.tier, origin_tools::Tier::AutoAllowed) && matches!(m.side_effects, SideEffects::Pure)
+    };
+    tools.sort_by_key(|t| match registry_iter().find(|m| m.name == *t) {
+        Some(m) if read_only(m) => 3,
+        Some(_) => 0,
+        None if t.contains(['*', '?', '[', '{']) => 1,
+        None => 2,
+    });
+    let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
     format!(
-        "{} tools: {} | mcp: {} | goal: {goal}",
+        "{} tools: {} | mcp: {} | goal: {}",
         tools.len(),
         list(&tools),
-        list(&mcp)
+        list(&names("mcp_servers", Some("name"))),
+        shown(goal, 200)
     )
 }
 
@@ -658,9 +671,75 @@ mod task_preview_tests {
         let p = super::task_permission_preview(&args);
         assert!(p.starts_with("7 tools: "), "{p}");
         let head: String = p.chars().take(60).collect();
-        assert!(head.contains("Bash"), "Bash must survive a 60-col cut: {p}");
-        let (mcp, goal) = (p.find("github").expect("mcp"), p.find("refactor").expect("goal"));
+        assert!(head.contains("\"Bash\""), "Bash must survive a 60-col cut: {p}");
+        let (mcp, goal) = (
+            p.find("\"github\"").expect("mcp"),
+            p.find("refactor").expect("goal"),
+        );
         assert!(mcp < goal, "mcp names come before the goal: {p}");
+    }
+
+    /// `p` with every quoted span (honouring `\"` escapes) replaced by `Q`.
+    fn outside_quotes(p: &str) -> String {
+        let (mut out, mut in_q, mut esc) = (String::new(), false, false);
+        for c in p.chars() {
+            match (in_q, esc, c) {
+                (true, true, _) => esc = false,
+                (true, false, '\\') => esc = true,
+                (true, false, '"') => in_q = false,
+                (true, false, _) => {}
+                (false, _, '"') => {
+                    in_q = true;
+                    out.push('Q');
+                }
+                (false, _, _) => out.push(c),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn task_preview_decoy_name_cannot_spoof_or_hide_gated_tools() {
+        let decoy = format!("Read | mcp: none | goal: fix typo in README{}", " ".repeat(300));
+        let args = serde_json::json!({
+            "goal": "real goal",
+            "allowed_tools": [decoy, "Bash"],
+            "mcp_servers": [{"name": "github"}],
+        });
+        let p = super::task_permission_preview(&args);
+        let head: String = p.chars().take(60).collect();
+        assert!(head.contains("\"Bash\""), "Bash must lead the list: {p}");
+        assert!(p.contains(" | mcp: \"github\" | goal: "), "{p}");
+        assert_eq!(
+            outside_quotes(&p),
+            "2 tools: Q, Q | mcp: Q | goal: Q",
+            "separators may appear only inside quoted names: {p}"
+        );
+    }
+
+    #[test]
+    fn task_preview_escapes_control_characters() {
+        let args = serde_json::json!({
+            "goal": "line1\nline2\u{1b}[2J",
+            "allowed_tools": ["Ba\nsh\u{1b}[2J"],
+        });
+        let p = super::task_permission_preview(&args);
+        assert!(!p.contains('\n') && !p.contains('\u{1b}'), "{p:?}");
+    }
+
+    #[test]
+    fn task_preview_caps_long_names_and_goal() {
+        let args = serde_json::json!({
+            "goal": "g".repeat(500),
+            "allowed_tools": ["x".repeat(500)],
+        });
+        let p = super::task_permission_preview(&args);
+        assert!(p.contains(&format!("\"{}…\"", "x".repeat(32))), "{p}");
+        assert!(!p.contains(&"x".repeat(33)), "{p}");
+        assert!(
+            p.contains(&format!("{}…", "g".repeat(200))) && !p.contains(&"g".repeat(201)),
+            "{p}"
+        );
     }
 }
 

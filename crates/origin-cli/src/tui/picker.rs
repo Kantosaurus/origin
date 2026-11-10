@@ -9,6 +9,7 @@
 //! `ChoiceDecision{selected,custom}`.
 
 use origin_tui::grid::Attr;
+use unicode_width::UnicodeWidthChar;
 
 use super::tokens::{glyph, RenderRow, RowSpan, Tokens};
 
@@ -236,20 +237,27 @@ pub fn layout_picker(state: &PickerState, width: u16, tok: &Tokens) -> Vec<Rende
 
     // Question header (bold, bright), wrapped so a long permission preview stays
     // readable; capped (last row ends in `…`) so the options stay on screen.
-    let chars: Vec<char> = state.question.chars().collect();
-    let mut lines: Vec<String> = chars
-        .chunks(usize::from(width.max(1)))
-        .map(String::from_iter)
-        .collect();
+    // Wrapped by display width (wide CJK/emoji take two cells).
+    let max = usize::from(width.max(1));
+    let mut lines: Vec<String> = vec![String::new()];
+    let mut cur_w = 0;
+    for c in state.question.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if cur_w > 0 && cur_w + w > max {
+            lines.push(String::new());
+            cur_w = 0;
+        }
+        if let Some(line) = lines.last_mut() {
+            line.push(c);
+        }
+        cur_w += w;
+    }
     if lines.len() > QUESTION_MAX_ROWS {
         lines.truncate(QUESTION_MAX_ROWS);
         if let Some(last) = lines.last_mut() {
             last.pop();
             last.push('…');
         }
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
     }
     for line in lines {
         rows.push(RenderRow::one(RowSpan::new(line, tok.bright, 0, Attr::BOLD)));
@@ -623,6 +631,17 @@ mod tests {
         // Capped at QUESTION_MAX_ROWS, last row marked as cut.
         assert_eq!(rows.len(), QUESTION_MAX_ROWS + 2);
         assert!(rows[QUESTION_MAX_ROWS - 1].spans[0].text.ends_with('…'));
+    }
+
+    #[test]
+    fn layout_question_wraps_by_display_width() {
+        let tok = Tokens::default_tokens();
+        let mut s = single(1);
+        // Six 2-cell CJK chars at width 5 ⇒ two chars (4 cells) per row, 3 rows.
+        s.question = "漢字漢字漢字".into();
+        let rows = layout_picker(&s, 5, &tok);
+        assert_eq!(rows[0].spans[0].text, "漢字");
+        assert_eq!(rows.len(), 3 + 1, "3 question rows + 1 option");
     }
 
     #[test]
