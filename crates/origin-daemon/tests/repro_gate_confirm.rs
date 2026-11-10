@@ -50,27 +50,43 @@ fn write(id: &str, path: &str, content: &str) -> Block {
     }
 }
 
-/// A pytest stand-in: exit 2 (collection error) when the reproduction test
-/// says `collect-error`, exit 1 (a failing test) when it says `fails` and the
-/// source is not `fixed` yet, else exit 0.
+/// A pytest stand-in (a full-suite command: it is not narrowed): exit 2
+/// (collection error) when the reproduction test says `collect-error`, exit 1
+/// (a failing test) when it says `fails` and the source is not `fixed` yet,
+/// else exit 0. Every run appends a line to `runs.log`.
 #[cfg(unix)]
-const FAKE_PYTEST: &str = "if grep -q collect-error tests/test_bug.py; then echo 'ERROR collecting pytest'; \
-     exit 2; fi; if grep -q fails tests/test_bug.py; then if grep -q fixed src.py; then echo 'passed pytest'; \
-     else echo 'FAILED test_bug pytest'; exit 1; fi; fi; echo 'passed pytest'";
+const FAKE_PYTEST: &str = "echo x >> runs.log; if grep -q collect-error tests/test_bug.py; then echo 'ERROR \
+     collecting pytest'; exit 2; fi; if grep -q fails tests/test_bug.py; then if grep -q fixed src.py; then \
+     echo 'passed pytest'; else echo 'FAILED test_bug pytest'; exit 1; fi; fi; echo 'passed pytest'";
 #[cfg(windows)]
 const FAKE_PYTEST: &str =
-    "if (Select-String -Quiet collect-error tests/test_bug.py) { echo 'ERROR collecting \
-     pytest'; exit 2 }; if ((Select-String -Quiet fails tests/test_bug.py) -and -not (Select-String -Quiet \
-     fixed src.py)) { echo 'FAILED test_bug pytest'; exit 1 }; echo 'passed pytest'";
+    "Add-Content runs.log x; if (Select-String -Quiet collect-error tests/test_bug.py) { \
+     echo 'ERROR collecting pytest'; exit 2 }; if ((Select-String -Quiet fails tests/test_bug.py) -and -not \
+     (Select-String -Quiet fixed src.py)) { echo 'FAILED test_bug pytest'; exit 1 }; echo 'passed pytest'";
 
 struct Run {
     result: Result<LoopSummary, LoopError>,
     /// `(is_error, body)` of every tool result, in order.
     tool_results: Vec<(bool, String)>,
+    /// Text of every user message after the prompt (continuations).
+    user_texts: Vec<String>,
     src: String,
+    /// How many times the test command ran.
+    runs: usize,
+}
+
+impl Run {
+    fn rejected(&self) -> usize {
+        self.tool_results.iter().filter(|(e, _)| *e).count()
+    }
 }
 
 fn run(cfg: PostEditConfig, max_turns: u32, turns: Vec<Block>) -> Run {
+    run_turns(cfg, max_turns, turns.into_iter().map(|b| vec![b]).collect())
+}
+
+/// [`run`] with any number of blocks per assistant turn.
+fn run_turns(cfg: PostEditConfig, max_turns: u32, turns: Vec<Vec<Block>>) -> Run {
     let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::remove_var("ORIGIN_CMD_GUARD");
     std::env::remove_var("ORIGIN_TEST_SELECT");
@@ -88,8 +104,10 @@ fn run(cfg: PostEditConfig, max_turns: u32, turns: Vec<Block>) -> Run {
         responses: Mutex::new(
             turns
                 .into_iter()
-                .map(|b| ChatResponse {
-                    assistant: Message::new(Role::Assistant).with_block(b),
+                .map(|blocks| ChatResponse {
+                    assistant: blocks
+                        .into_iter()
+                        .fold(Message::new(Role::Assistant), Message::with_block),
                     usage: Usage::default(),
                 })
                 .collect(),
@@ -121,11 +139,24 @@ fn run(cfg: PostEditConfig, max_turns: u32, turns: Vec<Block>) -> Run {
             _ => None,
         })
         .collect();
+    let user_texts = session
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .flat_map(|m| &m.blocks)
+        .filter_map(|b| match b {
+            Block::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
     let src = std::fs::read_to_string(dir.path().join("src.py")).expect("src");
+    let runs = std::fs::read_to_string(dir.path().join("runs.log")).map_or(0, |s| s.lines().count());
     Run {
         result,
         tool_results,
+        user_texts,
         src,
+        runs,
     }
 }
 
@@ -261,7 +292,154 @@ fn a_red_gate_on_the_last_allowed_turn_returns_the_answer() {
         vec![write("s1", "src.py", "attempt"), Block::text("done")],
     );
     let summary = r.result.expect("Ok, not MaxTurns");
-    assert_eq!(summary.assistant_text, "done");
+    assert!(
+        summary.assistant_text.starts_with("done"),
+        "{}",
+        summary.assistant_text
+    );
     let signals = summary.gate_signals.expect("the RED gate is reported");
     assert!(signals.contains("FAILED always"), "{signals}");
+}
+
+#[test]
+fn several_source_edits_in_one_turn_cost_one_run_and_one_charge() {
+    let r = run_turns(
+        repro_gate(FAKE_PYTEST, 2),
+        10,
+        vec![
+            vec![write("t1", "tests/test_bug.py", "passes-already")],
+            vec![
+                write("s1", "src.py", "fixed"),
+                write("s2", "src.py", "fixed"),
+                write("s3", "src.py", "fixed"),
+            ],
+            vec![write("s4", "src.py", "fixed")],
+            vec![write("s5", "src.py", "fixed")],
+            vec![Block::text("done")],
+        ],
+    );
+    let text = r.result.expect("loop ok").assistant_text;
+    // Per-edit charging would have spent the budget in turn 2 and applied s3.
+    let errs: Vec<bool> = r.tool_results.iter().map(|(e, _)| *e).collect();
+    assert_eq!(
+        errs,
+        [false, true, true, true, true, false],
+        "{:?}",
+        r.tool_results
+    );
+    assert_eq!(r.tool_results[2].1, r.tool_results[1].1, "same reason, no re-run");
+    assert!(text.contains("WITHOUT a confirmed reproduction"), "{text}");
+    // Turn 1's turn-end run, ONE confirmation in turn 2, one each in turns 3
+    // and 4, turn 4's turn-end run, and the terminal gate.
+    assert_eq!(r.runs, 6);
+}
+
+#[test]
+fn a_source_edit_before_any_reproduction_disarms_the_gate_and_says_so() {
+    let r = run(
+        repro_gate(FAKE_PYTEST, 2),
+        10,
+        vec![
+            write("s1", "src.py", "fixed"),
+            write("t1", "tests/test_bug.py", "passes-already"),
+            write("s2", "src.py", "fixed"),
+            Block::text("done"),
+        ],
+    );
+    assert_eq!(r.rejected(), 0, "{:?}", r.tool_results);
+    let text = r.result.expect("loop ok").assistant_text;
+    assert!(text.contains("no reproduction test was written"), "{text}");
+}
+
+#[test]
+fn a_test_and_source_patch_in_one_call_is_not_a_confirmed_reproduction() {
+    let patch = "*** Begin Patch\n*** Add File: tests/test_bug.py\n+fails\n*** Update File: src.py\n\
+                 @@ -1,1 +1,1 @@\n-buggy\n+fixed\n*** End Patch\n";
+    let r = run(
+        repro_gate(FAKE_PYTEST, 2),
+        10,
+        vec![
+            Block::ToolUse {
+                id: "p1".into(),
+                name: "ApplyPatch".into(),
+                input_json: serde_json::to_vec(&serde_json::json!({ "patch": patch })).expect("json"),
+                cache_marker: None,
+            },
+            Block::text("done"),
+        ],
+    );
+    assert_eq!(r.rejected(), 0, "{:?}", r.tool_results);
+    assert_eq!(r.src.trim_end(), "fixed");
+    let text = r.result.expect("loop ok").assistant_text;
+    assert!(text.contains("no reproduction test was written"), "{text}");
+}
+
+#[test]
+fn pre_edit_rejections_do_not_spend_the_terminal_gate_budget() {
+    let r = run(
+        repro_gate(FAKE_PYTEST, 2),
+        12,
+        vec![
+            write("t1", "tests/test_bug.py", "collect-error"),
+            write("s1", "src.py", "attempt"),
+            write("s2", "src.py", "attempt"),
+            write("s3", "src.py", "attempt"),
+            Block::text("done"),
+            Block::text("done again"),
+            Block::text("final"),
+        ],
+    );
+    assert_eq!(r.rejected(), 2, "{:?}", r.tool_results);
+    let cont = r
+        .user_texts
+        .iter()
+        .filter(|t| t.contains("You indicated you were finished"))
+        .count();
+    assert_eq!(cont, 2, "the terminal gate still has its full budget");
+    assert!(r.result.expect("loop ok").assistant_text.starts_with("final"));
+}
+
+#[test]
+fn an_unrelated_failure_in_a_full_suite_run_does_not_confirm() {
+    let r = run(
+        repro_gate("echo 'FAILED tests/test_old.py::test_legacy pytest'; exit 1", 2),
+        12,
+        vec![
+            write(
+                "t1",
+                "tests/test_bug.py",
+                "def test_reproduces():\n    assert False\n",
+            ),
+            write("s1", "src.py", "fixed"),
+            Block::text("done"),
+            Block::text("done"),
+            Block::text("done"),
+        ],
+    );
+    let (err, body) = &r.tool_results[1];
+    assert!(*err, "{body}");
+    assert!(body.contains("never names your reproduction test"), "{body}");
+}
+
+#[test]
+fn an_unclear_runner_failing_is_accepted_with_a_caution() {
+    let r = run(
+        repro_gate("echo 'npm ERR! test_bug failed'; exit 1", 2),
+        12,
+        vec![
+            write("t1", "tests/test_bug.py", "fails"),
+            write("s1", "src.py", "fixed"),
+            Block::text("done"),
+            Block::text("done"),
+            Block::text("done"),
+        ],
+    );
+    let (err, body) = &r.tool_results[1];
+    assert!(!err, "{body}");
+    assert!(body.contains("<repro-confirmed>"), "{body}");
+    assert!(
+        body.contains("cannot tell a failing test from one that never ran"),
+        "{body}"
+    );
+    assert_eq!(r.src, "fixed");
 }

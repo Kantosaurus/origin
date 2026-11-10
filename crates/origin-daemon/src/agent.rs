@@ -1420,23 +1420,26 @@ fn run_relative(path: &str, opts: &LoopOptions) -> String {
     rel.to_string_lossy().replace('\\', "/")
 }
 
-/// C5: run the reproduction `tests` (narrowed with
-/// [`origin_postedit::select_tests`] where the runner allows) before the fix.
+/// C5: run the reproduction `tests` before the fix, narrowed to them with
+/// [`origin_postedit::narrow_to_test_files`] where the runner allows.
 /// `Ok` carries the bounded, redacted failure to hand the model as the
 /// diagnosis; `Err` says why the reproduction is not confirmed. Which runners
 /// can tell a failure from a collection error: see
-/// [`origin_postedit::classify_repro_run`].
+/// [`origin_postedit::classify_repro_run`]; a non-zero exit it cannot place is
+/// accepted with a caution. A full-suite (un-narrowed) failure confirms only
+/// when its output names the reproduction and the suite was not already red
+/// (`baseline_passed`).
 async fn confirm_repro(
     cmd: &str,
     tests: &BTreeSet<String>,
     cwd: Option<&std::path::Path>,
+    baseline_passed: Option<bool>,
 ) -> Result<String, String> {
-    use origin_postedit::{classify_repro_run, select_tests, ReproRun, Selection};
+    use origin_postedit::{classify_repro_run, narrow_to_test_files, output_names_reproduction, ReproRun};
     let files: Vec<String> = tests.iter().cloned().collect();
-    let cmd = match select_tests(cmd, &files) {
-        Selection::Narrowed(c) => c,
-        Selection::Full => cmd.to_string(),
-    };
+    let narrowed = narrow_to_test_files(cmd, &files);
+    let full_suite = narrowed.is_none();
+    let cmd = narrowed.unwrap_or_else(|| cmd.to_string());
     let Some((code, out)) = run_gate_command(&cmd, cwd).await else {
         return Err(format!(
             "the test command `{cmd}` did not run (refused by the command guard, failed to spawn, or \
@@ -1446,10 +1449,40 @@ async fn confirm_repro(
     let out = crate::redact::text(&out).into_owned();
     let chars: Vec<char> = out.chars().collect();
     let tail: String = chars[chars.len().saturating_sub(4_000)..].iter().collect();
-    match classify_repro_run(&cmd, code, &out) {
+    let run = classify_repro_run(&cmd, code, &out);
+    if full_suite && matches!(run, ReproRun::Failed | ReproRun::Unclear) {
+        if baseline_passed == Some(false) {
+            return Err(format!(
+                "`{cmd}` runs the whole suite, which was already failing before your reproduction test \
+                 existed, so its failure cannot be attributed to your test. The reproduction is not \
+                 confirmed:\n\n{tail}"
+            ));
+        }
+        let named = tests.iter().any(|t| {
+            let stem = std::path::Path::new(t)
+                .file_stem()
+                .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+            let src =
+                std::fs::read_to_string(cwd.map_or_else(|| t.into(), |c| c.join(t))).unwrap_or_default();
+            output_names_reproduction(&out, &stem, &src)
+        });
+        if !named {
+            return Err(format!(
+                "`{cmd}` failed, but its output never names your reproduction test (its file or a test \
+                 defined in it), so the failure may be unrelated. Make sure your test runs and fails for \
+                 the reported reason, then retry this edit:\n\n{tail}"
+            ));
+        }
+    }
+    match run {
         ReproRun::Failed => Ok(format!(
             "\n\n<repro-confirmed>\nYour reproduction test fails on the current code, as it should. \
              This failure is the diagnosis to fix:\n\n{tail}\n</repro-confirmed>"
+        )),
+        ReproRun::Unclear => Ok(format!(
+            "\n\n<repro-confirmed>\n`{cmd}` exited {code}. This runner cannot tell a failing test from \
+             one that never ran — check the output shows your test failing. Use it as the diagnosis to \
+             fix:\n\n{tail}\n</repro-confirmed>"
         )),
         ReproRun::Passed => Err(format!(
             "your reproduction test PASSES on the current code, before any fix (`{cmd}` exited 0), so it \
@@ -1460,11 +1493,6 @@ async fn confirm_repro(
             "your reproduction test errored before running a test (import/compile/syntax error, or no \
              test collected; `{cmd}` exited {code}). Fix the test so it runs and fails for the reported \
              reason, then retry this edit:\n\n{tail}"
-        )),
-        ReproRun::Unclear => Err(format!(
-            "`{cmd}` exited {code}, but this runner's exit status cannot tell a failing test from a test \
-             that never ran, so the reproduction is not confirmed. Check the output below: if the test \
-             did not run, fix it; then retry this edit:\n\n{tail}"
         )),
     }
 }
@@ -1497,8 +1525,16 @@ pub(crate) async fn run_gate_command(cmd: &str, cwd: Option<&std::path::Path>) -
             _ => {}
         }
     }
+    // C5: `pwsh -Command` folds a failing native program's exit code to 1, so
+    // pytest's 2–5 (collection errors) would read as 1 (tests failed). Exit
+    // with the program's own code when the last statement failed. On its own
+    // line, so a trailing `#` comment in `cmd` cannot swallow it.
+    #[cfg(windows)]
+    let command = format!("{cmd}\nif (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}");
+    #[cfg(not(windows))]
+    let command = cmd.to_string();
     let args = origin_tools::builtins::bash::BashArgs {
-        command: cmd.to_string(),
+        command,
         timeout: Some(600),
         cwd: cwd.map(|p| p.to_string_lossy().into_owned()),
         env: Vec::new(),
@@ -1512,6 +1548,17 @@ pub(crate) async fn run_gate_command(cmd: &str, cwd: Option<&std::path::Path>) -
     }
     let code = i32::try_from(out["exit_code"].as_i64()?).ok()?;
     Some((code, out["stdout"].as_str()?.to_string()))
+}
+
+#[cfg(test)]
+mod gate_exit_code_tests {
+    /// C5: exit-code classification (pytest's 2–5 = collection error) needs
+    /// the native program's own code, not a shell's folded 0/1.
+    #[tokio::test]
+    async fn a_native_exit_code_other_than_one_reaches_the_gate() {
+        let got = super::run_gate_command("python -c \"import sys; sys.exit(2)\"", None).await;
+        assert_eq!(got.map(|(code, _)| code), Some(2));
+    }
 }
 
 /// Turn-end `auto_lint` twin of [`run_post_edit_test`]. Without this the
@@ -5788,7 +5835,9 @@ async fn run_loop_inner(
     // C5: before the first source edit after the model wrote its reproduction
     // test, run that test and require a real failure (see `confirm_repro`).
     // `repro_cmd` is `Some` only with the repro gate on; `repro_settled` once
-    // confirmed or once the repair budget ran out (`repro_unconfirmed`).
+    // confirmed, or once it no longer applies (`repro_unconfirmed` says why).
+    // Rejections count per TURN in their own `repro_rejections`, capped like
+    // the terminal gate's `repro_gate_repairs` but never spending it.
     let repro_cmd = opts
         .post_edit
         .as_deref()
@@ -5796,7 +5845,8 @@ async fn run_loop_inner(
         .and_then(|c| c.test_command.as_deref());
     let mut repro_tests: BTreeSet<String> = BTreeSet::new();
     let mut repro_settled = false;
-    let mut repro_unconfirmed = false;
+    let mut repro_unconfirmed: Option<&str> = None;
+    let mut repro_rejections: u32 = 0;
 
     // Task 1 (agentgrep exposure-truncation). Already-seen `(file, line)`
     // regions accumulated across this `run_loop` from prior `content`-mode
@@ -6618,29 +6668,36 @@ async fn run_loop_inner(
                                 ),
                                 None => {}
                             }
-                            // Keep the freshly-run failure as the terminal gate
-                            // signal too (so a downstream `/goal` verifier, if any,
-                            // sees the current state rather than a stale block).
-                            repro_gate_repairs += 1;
-                            let remaining = gate_repair_budget - repro_gate_repairs;
-                            tracing::info!(
-                                remaining, "repro-gate: tests RED at terminal turn; continuing the loop"
-                            );
-                            // Synthesize a continuation user turn and re-enter the
-                            // loop. This is the no-goal enforcement path. Build the
-                            // prompt (borrowing `fresh`) BEFORE moving `fresh` into
-                            // `test_block` so we neither clone nor re-borrow.
-                            let cont = format!(
-                                "[repro-gate] You indicated you were finished, but the test command is \
-                                 still failing. Do NOT stop yet. Read the failure below, fix the cause, \
-                                 and continue until the tests pass ({remaining} automatic attempt(s) \
-                                 left before the loop yields control to the user).\n\n{fresh}"
-                            );
-                            test_block = fresh;
                             // C5: on the last allowed turn there is no turn left to
                             // fix it in: return the answer with this RED signal in
                             // `gate_signals` instead of ending in `MaxTurns`.
-                            if turn < opts.max_turns {
+                            if turn >= opts.max_turns {
+                                tracing::info!(
+                                    "repro-gate: tests RED on the last allowed turn; returning the answer \
+                                     with the failure in gate_signals"
+                                );
+                                test_block = fresh;
+                            } else {
+                                // Keep the freshly-run failure as the terminal gate
+                                // signal too (so a downstream `/goal` verifier, if any,
+                                // sees the current state rather than a stale block).
+                                repro_gate_repairs += 1;
+                                let remaining = gate_repair_budget - repro_gate_repairs;
+                                tracing::info!(
+                                    remaining,
+                                    "repro-gate: tests RED at terminal turn; continuing the loop"
+                                );
+                                // Synthesize a continuation user turn and re-enter the
+                                // loop. This is the no-goal enforcement path. Build the
+                                // prompt (borrowing `fresh`) BEFORE moving `fresh` into
+                                // `test_block` so we neither clone nor re-borrow.
+                                let cont = format!(
+                                    "[repro-gate] You indicated you were finished, but the test command is \
+                                     still failing. Do NOT stop yet. Read the failure below, fix the cause, \
+                                     and continue until the tests pass ({remaining} automatic attempt(s) \
+                                     left before the loop yields control to the user).\n\n{fresh}"
+                                );
+                                test_block = fresh;
                                 session.push(Message::new(Role::User).with_block(Block::text(&cont)));
                                 continue;
                             }
@@ -6833,13 +6890,11 @@ async fn run_loop_inner(
                 }
                 _ => text,
             };
-            let assistant_text = if repro_unconfirmed {
-                format!(
-                    "{text}\n\n[repro-gate] Note: the fix went ahead WITHOUT a confirmed reproduction — \
-                     the reproduction test never failed for the right reason before the fix."
-                )
-            } else {
-                text
+            let assistant_text = match repro_unconfirmed {
+                Some(why) => format!(
+                    "{text}\n\n[repro-gate] Note: the fix went ahead WITHOUT a confirmed reproduction — {why}."
+                ),
+                None => text,
             };
             return Ok(LoopSummary {
                 assistant_text,
@@ -6865,6 +6920,9 @@ async fn run_loop_inner(
         // A8: per-turn denial bookkeeping; see `consecutive_denials`.
         let mut turn_allowed = false;
         let mut turn_denied: Option<String> = None;
+        // C5: why this turn's reproduction was not confirmed; the turn's later
+        // source edits are rejected with it, without another run or charge.
+        let mut repro_turn_rejection: Option<String> = None;
         for (id, name, input_bytes) in tool_uses {
             let Some(meta) = registry_iter().find(|m| m.name == name) else {
                 // gap 9b: a name absent from the compile-time registry may be a
@@ -7293,39 +7351,80 @@ async fn run_loop_inner(
             // C5: repro gate. Test-file edits are remembered as the reproduction;
             // the first SOURCE edit after one runs it first and is accepted only
             // when the test really fails (its output then rides on this edit's
-            // result as the diagnosis). Otherwise the edit is rejected, at most
-            // `gate_repair_budget` times in all, after which it proceeds and the
-            // final answer says the reproduction was never confirmed.
+            // result as the diagnosis). Otherwise this and the turn's later
+            // source edits are rejected, charging one per turn, at most
+            // `gate_repair_budget` turns; then it proceeds and the final answer
+            // says the reproduction was never confirmed. A source edit with no
+            // reproduction written yet means the gate does not apply to this run.
             let mut repro_diag: Option<String> = None;
+            let mut activity_sent = false;
             if let (Some(cmd), false) = (repro_cmd, repro_settled) {
                 let (tests, sources): (Vec<String>, Vec<String>) = edited_paths_from_tool(&name, &args)
                     .iter()
                     .map(|p| run_relative(p, opts))
                     .partition(|p| origin_postedit::is_test_file(p));
-                if !sources.is_empty() && !repro_tests.is_empty() {
-                    match confirm_repro(cmd, &repro_tests, opts.cwd.as_deref()).await {
+                if !sources.is_empty() && repro_tests.is_empty() {
+                    repro_settled = true;
+                    repro_unconfirmed = Some("no reproduction test was written before the first source edit");
+                } else if !sources.is_empty() {
+                    let verdict = if let Some(why) = &repro_turn_rejection {
+                        Err(why.clone())
+                    } else {
+                        // The test run can take a while: show the edit first.
+                        if let Some(tx) = &opts.event_tx {
+                            let _ = tx
+                                .send(StreamEvent::ToolActivity {
+                                    tool: name.clone(),
+                                    summary: tool_activity_summary(&name, &args),
+                                    diff_lines: tool_diff_lines(&name, &args),
+                                })
+                                .await;
+                            activity_sent = true;
+                        }
+                        match confirm_repro(cmd, &repro_tests, opts.cwd.as_deref(), baseline_tests_passed)
+                            .await
+                        {
+                            Err(why) if repro_rejections >= gate_repair_budget => {
+                                tracing::info!(%why, "repro-gate: rejection budget spent; proceeding unconfirmed");
+                                repro_unconfirmed = Some(
+                                    "the reproduction test never failed for the right reason before the fix",
+                                );
+                                Ok(String::new())
+                            }
+                            Err(why) => {
+                                repro_rejections += 1;
+                                repro_turn_rejection = Some(why.clone());
+                                Err(why)
+                            }
+                            ok => ok,
+                        }
+                    };
+                    match verdict {
                         Ok(diag) => {
                             repro_settled = true;
-                            repro_diag = Some(diag);
+                            repro_diag = (!diag.is_empty()).then_some(diag);
                         }
-                        Err(why) if repro_gate_repairs < gate_repair_budget => {
-                            repro_gate_repairs += 1;
+                        Err(why) => {
+                            let msg = format!("[repro-gate] edit NOT applied: {why}");
                             let _ = speculative.take(&id).await;
+                            if let Some(tx) = &opts.event_tx {
+                                let _ = tx
+                                    .send(StreamEvent::ToolResult {
+                                        tool: name.clone(),
+                                        ok: false,
+                                        preview: crate::redact::text(&msg).into_owned(),
+                                        elided_bytes: 0,
+                                    })
+                                    .await;
+                            }
                             tool_results.push(Block::ToolResult {
                                 tool_use_id: id,
                                 handle: None,
-                                inline: Some(
-                                    format!("Error: [repro-gate] edit NOT applied: {why}").into_bytes(),
-                                ),
+                                inline: Some(format!("Error: {msg}").into_bytes()),
                                 cache_marker: None,
                                 is_error: true,
                             });
                             continue;
-                        }
-                        Err(why) => {
-                            tracing::info!(%why, "repro-gate: budget spent; proceeding unconfirmed");
-                            repro_settled = true;
-                            repro_unconfirmed = true;
                         }
                     }
                 }
@@ -7348,7 +7447,7 @@ async fn run_loop_inner(
                 }
             }
 
-            if let Some(tx) = &opts.event_tx {
+            if let (Some(tx), false) = (&opts.event_tx, activity_sent) {
                 let summary = tool_activity_summary(&name, &args);
                 let diff_lines = tool_diff_lines(&name, &args);
                 let _ = tx

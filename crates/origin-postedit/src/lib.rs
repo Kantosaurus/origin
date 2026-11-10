@@ -476,8 +476,10 @@ pub enum ReproRun {
 /// only where the runner gives a signal: pytest by exit code (1 = tests failed;
 /// 2 interrupted/collection error, 3 internal, 4 usage, 5 nothing collected);
 /// `cargo test` by its `test result: FAILED` / `could not compile` lines;
-/// `go test` by `--- FAIL` vs `[build failed]` / `[setup failed]`. Any other
-/// runner, or neither marker, is [`ReproRun::Unclear`].
+/// `go test` by `--- FAIL` vs `[build failed]` / `[setup failed]`; for any
+/// runner, jest's `Test suite failed to run` vs `Tests: N failed` and Maven's
+/// `COMPILATION ERROR` vs `Failures: N` (N > 0). Anything else is
+/// [`ReproRun::Unclear`].
 #[must_use]
 pub fn classify_repro_run(command: &str, exit_code: i32, output: &str) -> ReproRun {
     if exit_code == 0 {
@@ -506,7 +508,81 @@ pub fn classify_repro_run(command: &str, exit_code: i32, output: &str) -> ReproR
             return ReproRun::Failed;
         }
     }
+    // jest / Maven, whatever wrapper (`npm test`, `mvn -q test`) ran them.
+    if output.contains("Test suite failed to run") || output.contains("COMPILATION ERROR") {
+        return ReproRun::CollectionError;
+    }
+    let jest_failed = output
+        .lines()
+        .any(|l| l.trim_start().starts_with("Tests:") && l.contains(" failed"));
+    let maven_failed = output
+        .match_indices("Failures: ")
+        .any(|(i, m)| output[i + m.len()..].starts_with(|c: char| ('1'..='9').contains(&c)));
+    if jest_failed || maven_failed {
+        return ReproRun::Failed;
+    }
     ReproRun::Unclear
+}
+
+/// C5: `base` narrowed to just the reproduction test `files`.
+///
+/// Only where the runner takes test files: pytest (also `python -m pytest`) gets the `.py` files
+/// themselves, so a file its default patterns would skip still runs;
+/// `cargo test` gets `--test <stem>` for each `tests/<stem>.rs`; `go test ./...`
+/// gets the packages, as in [`select_tests`]. `None` ⇒ run the full command.
+#[must_use]
+pub fn narrow_to_test_files(base: &str, files: &[String]) -> Option<String> {
+    let base = base.trim();
+    let is_pytest = ["pytest", "python -m pytest", "python3 -m pytest"]
+        .iter()
+        .any(|p| base == *p || base.starts_with(&format!("{p} ")));
+    if is_pytest {
+        let py: Vec<&str> = files
+            .iter()
+            .map(String::as_str)
+            .filter(|f| extension_of(f).as_deref() == Some("py"))
+            .collect();
+        return (!py.is_empty() && py.len() == files.len()).then(|| format!("{base} {}", py.join(" ")));
+    }
+    if (base == "cargo test" || base.starts_with("cargo test ")) && !base.contains(" -- ") {
+        let targets: Option<Vec<String>> = files
+            .iter()
+            .map(|f| {
+                let (dir, name) = f.rsplit_once('/')?;
+                let stem = name.strip_suffix(".rs")?;
+                (dir == "tests" || dir.ends_with("/tests")).then(|| format!("--test {stem}"))
+            })
+            .collect();
+        return targets
+            .filter(|t| !t.is_empty())
+            .map(|t| format!("{base} {}", t.join(" ")));
+    }
+    match select_tests(base, files) {
+        Selection::Narrowed(c) if base.starts_with("go test") => Some(c),
+        _ => None,
+    }
+}
+
+/// C5: does a full-suite failure `output` name the reproduction test?
+///
+/// It does when it contains the file stem `stem`, or a function `source`
+/// defines (`def`/`fn`/`func`/`void` names). Names shorter than 4 characters
+/// are ignored as too common.
+// ponytail: plain substring match — a test elsewhere sharing a name, or the
+// runner echoing the file name of a passing target, still matches; per-runner
+// result parsing (JUnit XML) is the upgrade path.
+#[must_use]
+pub fn output_names_reproduction(output: &str, stem: &str, source: &str) -> bool {
+    let mut tokens = source
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty());
+    let mut names = vec![stem];
+    while let Some(t) = tokens.next() {
+        if matches!(t, "def" | "fn" | "func" | "void") {
+            names.extend(tokens.next());
+        }
+    }
+    names.iter().any(|n| n.len() >= 4 && output.contains(n))
 }
 
 /// Errors that can arise when constructing or validating a [`PostEditConfig`].
@@ -950,5 +1026,64 @@ mod tests {
         );
         assert_eq!(classify_repro_run("npm test", 1, "1 failing"), Unclear);
         assert_eq!(classify_repro_run("cargo test", 101, "killed"), Unclear);
+        assert_eq!(
+            classify_repro_run("npm test", 1, "FAIL a.test.js\n  ● Test suite failed to run"),
+            CollectionError
+        );
+        assert_eq!(
+            classify_repro_run("npm test", 1, "Tests:       1 failed, 3 passed, 4 total"),
+            Failed
+        );
+        assert_eq!(
+            classify_repro_run("mvn -q test", 1, "[ERROR] COMPILATION ERROR :"),
+            CollectionError
+        );
+        assert_eq!(
+            classify_repro_run("mvn -q test", 1, "Tests run: 4, Failures: 1, Errors: 0"),
+            Failed
+        );
+        assert_eq!(
+            classify_repro_run("mvn -q test", 1, "Tests run: 4, Failures: 0, Errors: 1"),
+            Unclear
+        );
+    }
+
+    #[test]
+    fn narrow_to_test_files_per_runner() {
+        let f = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            narrow_to_test_files("pytest -q", &f(&["tests/repro_bug.py"])).as_deref(),
+            Some("pytest -q tests/repro_bug.py"),
+            "the file itself, even one pytest's default patterns skip"
+        );
+        assert_eq!(
+            narrow_to_test_files("python -m pytest", &f(&["t/x.py"])).as_deref(),
+            Some("python -m pytest t/x.py")
+        );
+        assert_eq!(
+            narrow_to_test_files("cargo test -p foo", &f(&["crates/foo/tests/repro.rs"])).as_deref(),
+            Some("cargo test -p foo --test repro")
+        );
+        assert_eq!(narrow_to_test_files("cargo test", &f(&["src/lib.rs"])), None);
+        assert_eq!(
+            narrow_to_test_files("cargo test -- --nocapture", &f(&["tests/r.rs"])),
+            None
+        );
+        assert_eq!(
+            narrow_to_test_files("go test ./...", &f(&["pkg/a_test.go"])).as_deref(),
+            Some("go test ./pkg")
+        );
+        assert_eq!(narrow_to_test_files("npm test", &f(&["a.test.js"])), None);
+    }
+
+    #[test]
+    fn output_names_reproduction_by_stem_or_defined_name() {
+        let src = "def test_slug_keeps_dashes():\n    assert slug('a-b') == 'a-b'\n";
+        let names = |out: &str| output_names_reproduction(out, "repro_slug", src);
+        assert!(names("FAILED x::test_slug_keeps_dashes"));
+        assert!(names("FAIL tests/repro_slug.py"));
+        assert!(!names("FAILED test_other.py::test_old"));
+        // Short names are too common to count.
+        assert!(!output_names_reproduction("fn ab failed", "ab", "fn ab() {}"));
     }
 }
