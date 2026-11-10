@@ -1409,6 +1409,66 @@ async fn run_test_passed(cmd: &str, cwd: Option<&std::path::Path>) -> bool {
     run_gate_command(cmd, cwd).await.is_none_or(|(code, _)| code == 0)
 }
 
+/// C5: `path` relative to the run's directory, `/`-separated — the form test
+/// classification and test narrowing expect (an absolute prefix such as
+/// `/home/u/test/` must not read as a test directory).
+fn run_relative(path: &str, opts: &LoopOptions) -> String {
+    let p = std::path::Path::new(path);
+    let rel = loop_cwd(opts)
+        .and_then(|root| p.strip_prefix(root).ok().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| p.to_path_buf());
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+/// C5: run the reproduction `tests` (narrowed with
+/// [`origin_postedit::select_tests`] where the runner allows) before the fix.
+/// `Ok` carries the bounded, redacted failure to hand the model as the
+/// diagnosis; `Err` says why the reproduction is not confirmed. Which runners
+/// can tell a failure from a collection error: see
+/// [`origin_postedit::classify_repro_run`].
+async fn confirm_repro(
+    cmd: &str,
+    tests: &BTreeSet<String>,
+    cwd: Option<&std::path::Path>,
+) -> Result<String, String> {
+    use origin_postedit::{classify_repro_run, select_tests, ReproRun, Selection};
+    let files: Vec<String> = tests.iter().cloned().collect();
+    let cmd = match select_tests(cmd, &files) {
+        Selection::Narrowed(c) => c,
+        Selection::Full => cmd.to_string(),
+    };
+    let Some((code, out)) = run_gate_command(&cmd, cwd).await else {
+        return Err(format!(
+            "the test command `{cmd}` did not run (refused by the command guard, failed to spawn, or \
+             timed out), so your reproduction test could not be confirmed failing. Make sure it can run."
+        ));
+    };
+    let out = crate::redact::text(&out).into_owned();
+    let chars: Vec<char> = out.chars().collect();
+    let tail: String = chars[chars.len().saturating_sub(4_000)..].iter().collect();
+    match classify_repro_run(&cmd, code, &out) {
+        ReproRun::Failed => Ok(format!(
+            "\n\n<repro-confirmed>\nYour reproduction test fails on the current code, as it should. \
+             This failure is the diagnosis to fix:\n\n{tail}\n</repro-confirmed>"
+        )),
+        ReproRun::Passed => Err(format!(
+            "your reproduction test PASSES on the current code, before any fix (`{cmd}` exited 0), so it \
+             does not reproduce the bug. Rewrite it so it fails for the reported reason, then retry \
+             this edit."
+        )),
+        ReproRun::CollectionError => Err(format!(
+            "your reproduction test errored before running a test (import/compile/syntax error, or no \
+             test collected; `{cmd}` exited {code}). Fix the test so it runs and fails for the reported \
+             reason, then retry this edit:\n\n{tail}"
+        )),
+        ReproRun::Unclear => Err(format!(
+            "`{cmd}` exited {code}, but this runner's exit status cannot tell a failing test from a test \
+             that never ran, so the reproduction is not confirmed. Check the output below: if the test \
+             did not run, fix it; then retry this edit:\n\n{tail}"
+        )),
+    }
+}
+
 /// A6: run a turn-end gate command (`auto_test` / `auto_lint` / repro gate /
 /// test-select, and best-of-N's test oracle) through the supervised Bash
 /// spawn, so it gets the scrubbed child env and the cmd-guard like a
@@ -5725,6 +5785,18 @@ async fn run_loop_inner(
     } else {
         String::new()
     };
+    // C5: before the first source edit after the model wrote its reproduction
+    // test, run that test and require a real failure (see `confirm_repro`).
+    // `repro_cmd` is `Some` only with the repro gate on; `repro_settled` once
+    // confirmed or once the repair budget ran out (`repro_unconfirmed`).
+    let repro_cmd = opts
+        .post_edit
+        .as_deref()
+        .filter(|c| c.repro_gate)
+        .and_then(|c| c.test_command.as_deref());
+    let mut repro_tests: BTreeSet<String> = BTreeSet::new();
+    let mut repro_settled = false;
+    let mut repro_unconfirmed = false;
 
     // Task 1 (agentgrep exposure-truncation). Already-seen `(file, line)`
     // regions accumulated across this `run_loop` from prior `content`-mode
@@ -6521,7 +6593,16 @@ async fn run_loop_inner(
                         let fresh_ran = fresh.is_some();
                         // C9: redact before it becomes a model-facing User message.
                         let mut fresh = crate::redact::text(&fresh.unwrap_or_default()).into_owned();
-                        if !fresh.is_empty() {
+                        if fresh.is_empty() {
+                            // GREEN (or unrunnable/fail-open) ⇒ fall through to return.
+                            test_block.clear();
+                            // C8: only a gate that ran and passed tags the tree.
+                            if fresh_ran && lint_block.is_empty() {
+                                if let Some(id) = tag_last_green(loop_cwd(opts).as_deref()).await {
+                                    last_green = Some((id, turn));
+                                }
+                            }
+                        } else {
                             // Classify against the pre-edit baseline exactly like
                             // the per-turn path (C9), so the model is told whether
                             // it introduced a regression vs a pre-existing failure.
@@ -6556,14 +6637,12 @@ async fn run_loop_inner(
                                  left before the loop yields control to the user).\n\n{fresh}"
                             );
                             test_block = fresh;
-                            session.push(Message::new(Role::User).with_block(Block::text(&cont)));
-                            continue;
-                        }
-                        // GREEN (or unrunnable/fail-open) ⇒ fall through to return.
-                        test_block.clear();
-                        if fresh_ran && lint_block.is_empty() {
-                            if let Some(id) = tag_last_green(loop_cwd(opts).as_deref()).await {
-                                last_green = Some((id, turn));
+                            // C5: on the last allowed turn there is no turn left to
+                            // fix it in: return the answer with this RED signal in
+                            // `gate_signals` instead of ending in `MaxTurns`.
+                            if turn < opts.max_turns {
+                                session.push(Message::new(Role::User).with_block(Block::text(&cont)));
+                                continue;
                             }
                         }
                     }
@@ -6754,8 +6833,16 @@ async fn run_loop_inner(
                 }
                 _ => text,
             };
+            let assistant_text = if repro_unconfirmed {
+                format!(
+                    "{text}\n\n[repro-gate] Note: the fix went ahead WITHOUT a confirmed reproduction — \
+                     the reproduction test never failed for the right reason before the fix."
+                )
+            } else {
+                text
+            };
             return Ok(LoopSummary {
-                assistant_text: text,
+                assistant_text,
                 turns: turn,
                 input_tokens: total_input_tokens,
                 output_tokens: total_output_tokens,
@@ -7203,6 +7290,47 @@ async fn run_loop_inner(
             } else {
                 Vec::new()
             };
+            // C5: repro gate. Test-file edits are remembered as the reproduction;
+            // the first SOURCE edit after one runs it first and is accepted only
+            // when the test really fails (its output then rides on this edit's
+            // result as the diagnosis). Otherwise the edit is rejected, at most
+            // `gate_repair_budget` times in all, after which it proceeds and the
+            // final answer says the reproduction was never confirmed.
+            let mut repro_diag: Option<String> = None;
+            if let (Some(cmd), false) = (repro_cmd, repro_settled) {
+                let (tests, sources): (Vec<String>, Vec<String>) = edited_paths_from_tool(&name, &args)
+                    .iter()
+                    .map(|p| run_relative(p, opts))
+                    .partition(|p| origin_postedit::is_test_file(p));
+                if !sources.is_empty() && !repro_tests.is_empty() {
+                    match confirm_repro(cmd, &repro_tests, opts.cwd.as_deref()).await {
+                        Ok(diag) => {
+                            repro_settled = true;
+                            repro_diag = Some(diag);
+                        }
+                        Err(why) if repro_gate_repairs < gate_repair_budget => {
+                            repro_gate_repairs += 1;
+                            let _ = speculative.take(&id).await;
+                            tool_results.push(Block::ToolResult {
+                                tool_use_id: id,
+                                handle: None,
+                                inline: Some(
+                                    format!("Error: [repro-gate] edit NOT applied: {why}").into_bytes(),
+                                ),
+                                cache_marker: None,
+                                is_error: true,
+                            });
+                            continue;
+                        }
+                        Err(why) => {
+                            tracing::info!(%why, "repro-gate: budget spent; proceeding unconfirmed");
+                            repro_settled = true;
+                            repro_unconfirmed = true;
+                        }
+                    }
+                }
+                repro_tests.extend(tests);
+            }
 
             // Track mutations for the optional end-of-turn checkpoint (Task 1).
             // Only mutating tools flip the flag; pure tools leave it untouched.
@@ -7954,6 +8082,9 @@ async fn run_loop_inner(
                 {
                     result_bytes = wrapped;
                 }
+            }
+            if let Some(diag) = repro_diag {
+                result_bytes.extend_from_slice(diag.as_bytes());
             }
 
             let block = if let Some(cas) = opts.cas.as_ref() {

@@ -389,8 +389,7 @@ pub fn select_tests(base_command: &str, files: &[String]) -> Selection {
                 continue;
             }
             let name = f.rsplit(['/', '\\']).next().unwrap_or(f);
-            let is_test = name.starts_with("test_") || name.ends_with("_test.py") || name == "tests.py";
-            if is_test {
+            if is_test_name(name) {
                 targets.push(f.clone());
             } else if let Some((dir, _)) = f.rsplit_once('/') {
                 // A non-test edit: hand pytest the directory so it discovers the
@@ -427,6 +426,87 @@ pub fn select_tests(base_command: &str, files: &[String]) -> Selection {
     // Everything else (cargo, npm, mvn, gradle, make, custom): don't risk a
     // path-based narrowing that could silently drop coverage.
     Selection::Full
+}
+
+/// Is the file name `name` a test by naming convention: `test_*`, `*_test`,
+/// `tests` (any extension: pytest, Go's `_test.go`), or `*.test.*` /
+/// `*.spec.*` (JS/TS)?
+fn is_test_name(name: &str) -> bool {
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+    stem.starts_with("test_")
+        || stem.ends_with("_test")
+        || stem == "tests"
+        || name.contains(".test.")
+        || name.contains(".spec.")
+}
+
+/// C5: is the repo-relative `path` a test file?
+///
+/// Its name follows a test convention, or it sits under a
+/// `tests`/`test`/`__tests__`/`spec` directory (Rust integration tests, JS
+/// suites). Pass a path RELATIVE to the repo: an absolute prefix such as
+/// `/home/u/test/` would read as a test directory.
+// ponytail: naming conventions only — a test helper with a plain name outside a
+// test dir (or an inline `#[cfg(test)]` module) reads as source; a per-runner
+// collection query (`pytest --collect-only`) is the upgrade path.
+#[must_use]
+pub fn is_test_file(path: &str) -> bool {
+    let mut parts = path.rsplit(['/', '\\']);
+    let name = parts.next().unwrap_or(path);
+    is_test_name(name) || parts.any(|d| matches!(d, "tests" | "test" | "__tests__" | "spec"))
+}
+
+/// C5: how a reproduction test behaved when run BEFORE the fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReproRun {
+    /// It ran and a test failed — a real reproduction (RED).
+    Failed,
+    /// It passed: the test does not reproduce the bug.
+    Passed,
+    /// It never got to run a test (import/compile/syntax error, nothing collected).
+    CollectionError,
+    /// It failed, but this runner's signals cannot tell a test failure from a
+    /// collection error.
+    Unclear,
+}
+
+/// C5: classify a run of `command` that exited `exit_code` with `output`.
+///
+/// Exit 0 is [`ReproRun::Passed`] for any runner. A non-zero exit is told apart
+/// only where the runner gives a signal: pytest by exit code (1 = tests failed;
+/// 2 interrupted/collection error, 3 internal, 4 usage, 5 nothing collected);
+/// `cargo test` by its `test result: FAILED` / `could not compile` lines;
+/// `go test` by `--- FAIL` vs `[build failed]` / `[setup failed]`. Any other
+/// runner, or neither marker, is [`ReproRun::Unclear`].
+#[must_use]
+pub fn classify_repro_run(command: &str, exit_code: i32, output: &str) -> ReproRun {
+    if exit_code == 0 {
+        return ReproRun::Passed;
+    }
+    if command.contains("pytest") {
+        return match exit_code {
+            1 => ReproRun::Failed,
+            2..=5 => ReproRun::CollectionError,
+            _ => ReproRun::Unclear,
+        };
+    }
+    if command.contains("cargo test") {
+        if output.contains("could not compile") {
+            return ReproRun::CollectionError;
+        }
+        if output.contains("test result: FAILED") {
+            return ReproRun::Failed;
+        }
+    }
+    if command.contains("go test") {
+        if output.contains("[build failed]") || output.contains("[setup failed]") {
+            return ReproRun::CollectionError;
+        }
+        if output.contains("--- FAIL") {
+            return ReproRun::Failed;
+        }
+    }
+    ReproRun::Unclear
 }
 
 /// Errors that can arise when constructing or validating a [`PostEditConfig`].
@@ -812,5 +892,63 @@ mod tests {
         assert_eq!(select_tests("cargo test", &files), Selection::Full);
         assert_eq!(select_tests("npm test", &files), Selection::Full);
         assert_eq!(select_tests("make test", &files), Selection::Full);
+    }
+
+    #[test]
+    fn is_test_file_by_name_and_directory() {
+        for t in [
+            "test_bug.py",
+            "pkg/bug_test.py",
+            "tests.py",
+            "x/foo_test.go",
+            "web/foo.test.ts",
+            "web/foo.spec.js",
+            "tests/repro.rs",
+            "src/__tests__/a.js",
+            "test/helper.rb",
+        ] {
+            assert!(is_test_file(t), "{t}");
+        }
+        for s in [
+            "src/lib.rs",
+            "pkg/mod.py",
+            "contest.py",
+            "latest.go",
+            "testing/util.py",
+        ] {
+            assert!(!is_test_file(s), "{s}");
+        }
+    }
+
+    #[test]
+    fn classify_repro_run_by_runner_signals() {
+        use ReproRun::{CollectionError, Failed, Passed, Unclear};
+        assert_eq!(classify_repro_run("npm test", 0, ""), Passed);
+        assert_eq!(classify_repro_run("pytest -q", 1, "1 failed"), Failed);
+        for code in 2..=5 {
+            assert_eq!(
+                classify_repro_run("python -m pytest", code, ""),
+                CollectionError,
+                "{code}"
+            );
+        }
+        assert_eq!(
+            classify_repro_run("cargo test", 101, "test result: FAILED. 0 passed; 1 failed"),
+            Failed
+        );
+        assert_eq!(
+            classify_repro_run("cargo test", 101, "error: could not compile `x`"),
+            CollectionError
+        );
+        assert_eq!(
+            classify_repro_run("go test ./...", 1, "--- FAIL: TestBug"),
+            Failed
+        );
+        assert_eq!(
+            classify_repro_run("go test ./...", 1, "FAIL\tx [build failed]"),
+            CollectionError
+        );
+        assert_eq!(classify_repro_run("npm test", 1, "1 failing"), Unclear);
+        assert_eq!(classify_repro_run("cargo test", 101, "killed"), Unclear);
     }
 }
