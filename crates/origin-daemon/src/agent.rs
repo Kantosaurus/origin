@@ -3057,6 +3057,18 @@ pub enum LoopError {
     },
 }
 
+/// A3: whether this run may pre-run tools mid-stream. Speculation runs a tool
+/// before the deny-only layers (skill mask, governance policy, conseca, the
+/// read-only flag, `PreTool` hooks) get their say, so it is off whenever any of
+/// them is configured. Computed once per run; fails closed.
+fn speculation_allowed(opts: &LoopOptions, hooks_configured: bool) -> bool {
+    !hooks_configured
+        && opts.policy.is_none()
+        && opts.conseca.is_none()
+        && !opts.read_only
+        && opts.skills.as_deref().is_none_or(|s| s.allowed_tools().is_none())
+}
+
 /// Tracks speculative tasks fired off mid-stream. Keyed by the assistant
 /// `tool_use.id` so the agent can `await` the precomputed handle once the
 /// `tool_use` block closes.
@@ -3513,6 +3525,7 @@ async fn run_loop_inner(
     // `None` (no config — the default) makes every fire below a no-op, so the
     // agent loop is byte-identical. A configured PreTool hook can Deny a tool.
     let hooks = crate::hooks_runtime::global().await;
+    let speculate = speculation_allowed(opts, hooks.is_some());
     if let Some(h) = &hooks {
         let _ = h
             .fire(&origin_hooks::LifecycleEvent::PrePrompt {
@@ -4353,7 +4366,7 @@ async fn run_loop_inner(
                         .map(|r| (r, SpeculativeRegistry::default(), None))
                         .map_err(LoopError::Provider)
                 } else {
-                    run_streaming_turn(turn_provider, req.clone(), opts)
+                    run_streaming_turn(turn_provider, req.clone(), opts, speculate)
                         .await
                         .map(|st| (st.response, st.speculative, st.first_token_ms))
                 };
@@ -4435,7 +4448,7 @@ async fn run_loop_inner(
                                     .map(|r| (r, SpeculativeRegistry::default(), None))
                                     .map_err(LoopError::Provider)
                             } else {
-                                run_streaming_turn(turn_provider, fb_req, opts)
+                                run_streaming_turn(turn_provider, fb_req, opts, speculate)
                                     .await
                                     .map(|st| (st.response, st.speculative, st.first_token_ms))
                             };
@@ -8728,6 +8741,7 @@ async fn run_streaming_turn(
     provider: &dyn Provider,
     req: ChatRequest,
     opts: &LoopOptions,
+    speculate: bool,
 ) -> Result<StreamingTurn, LoopError> {
     let ring = origin_stream::Ring::with_capacity(256 * 1024);
     let drain_sub = ring.subscribe();
@@ -8741,7 +8755,7 @@ async fn run_streaming_turn(
         ring_for_drive.close();
         outcome
     };
-    let drain = drain_subscriber_into_response(drain_sub, opts.cas.clone());
+    let drain = drain_subscriber_into_response(drain_sub, opts.cas.clone(), speculate);
     let (drive_res, turn_res) = tokio::join!(drive, drain);
     drive_res?;
     turn_res
@@ -8792,7 +8806,8 @@ fn decode_usage_payload(payload: &[u8]) -> Option<origin_provider::Usage> {
 }
 
 /// Try to speculatively spawn a pure tool when the first `Field` event fires.
-/// Called at most once per `tool_use_id`. Returns `true` if a task was spawned.
+/// Returns `true` once the args parse and the call has been handed to the
+/// registry (which may still decline it), so the caller stops retrying.
 fn try_speculative_spawn(
     tool_use_id: &str,
     tool_names: &HashMap<String, String>,
@@ -8829,6 +8844,7 @@ fn try_speculative_spawn(
 async fn drain_subscriber_into_response(
     mut sub: origin_stream::Subscriber,
     cas: Option<Arc<Store>>,
+    speculate: bool,
 ) -> Result<StreamingTurn, LoopError> {
     let mut text = String::new();
     let mut usage = origin_provider::Usage::default();
@@ -8916,7 +8932,8 @@ async fn drain_subscriber_into_response(
                     }
                     if let Some(parser) = parsers.get_mut(&id_owned) {
                         let events = parser.feed(json_bytes);
-                        if !speculative_spawned.contains(&id_owned)
+                        if speculate
+                            && !speculative_spawned.contains(&id_owned)
                             && events.iter().any(|e| matches!(e, ToolUseDelta::Field { .. }))
                             && try_speculative_spawn(
                                 &id_owned,
@@ -9203,12 +9220,8 @@ mod dispatch_table_tests {
         );
     }
 
-    /// A3: mid-stream speculation must never run a tool ahead of its
-    /// permission decision. `WebFetch` is `Pure` but `RequiresPermission`, so
-    /// a stream carrying it must not spawn it; an `AutoAllowed` `Read` in the
-    /// same stream still speculates.
-    #[tokio::test]
-    async fn speculative_stream_skips_permission_gated_tools() {
+    /// Drain a stream carrying a `WebFetch` call (`wf`) and a `Read` call (`rd`).
+    async fn drain_webfetch_read_stream(speculate: bool) -> StreamingTurn {
         use origin_stream::{Ring, TokenEvent, TokenKind};
         let start = |idx: u32, id: &str, name: &str| {
             let mut p = idx.to_le_bytes().to_vec();
@@ -9235,7 +9248,20 @@ mod dispatch_table_tests {
             ring.publish(&ev).expect("publish");
         }
         ring.close();
-        let turn = drain_subscriber_into_response(sub, None).await.expect("drain");
+        drain_subscriber_into_response(sub, None, speculate)
+            .await
+            .expect("drain")
+    }
+
+    /// A3: mid-stream speculation must never run a tool ahead of its
+    /// permission decision. `WebFetch` is `Pure` but `RequiresPermission`, so
+    /// a stream carrying it must not spawn it; an `AutoAllowed` `Read` in the
+    /// same stream still speculates when no deny-only layer is configured.
+    #[tokio::test]
+    async fn speculative_stream_skips_permission_gated_tools() {
+        let speculate = speculation_allowed(&LoopOptions::default(), false);
+        assert!(speculate, "no deny-only layer configured ⇒ speculation on");
+        let turn = drain_webfetch_read_stream(speculate).await;
         assert!(
             !turn.speculative.in_flight.contains_key("wf"),
             "a RequiresPermission tool must not run before its permission decision"
@@ -9243,6 +9269,51 @@ mod dispatch_table_tests {
         assert!(
             turn.speculative.in_flight.contains_key("rd"),
             "an AutoAllowed Pure tool must still speculate"
+        );
+    }
+
+    /// A3: with any deny-only layer configured (conseca, policy, skill mask,
+    /// read-only, `PreTool` hooks) nothing is pre-run, not even an auto-allowed
+    /// `Read`: the layer could still deny it after the stream.
+    #[tokio::test]
+    async fn speculation_off_when_a_deny_only_layer_is_configured() {
+        let conseca = LoopOptions {
+            conseca: Some(Arc::new(origin_conseca::SecurityPolicy {
+                deny_paths: vec!["Cargo.toml".to_string()],
+                ..origin_conseca::SecurityPolicy::default()
+            })),
+            ..LoopOptions::default()
+        };
+        let speculate = speculation_allowed(&conseca, false);
+        assert!(!speculate, "conseca configured ⇒ no speculation");
+        let turn = drain_webfetch_read_stream(speculate).await;
+        assert!(
+            turn.speculative.in_flight.is_empty(),
+            "a Read must not run before the conseca path overlay can deny it"
+        );
+
+        assert!(
+            !speculation_allowed(&LoopOptions::default(), true),
+            "PreTool hooks configured ⇒ no speculation"
+        );
+        let read_only = LoopOptions {
+            read_only: true,
+            ..LoopOptions::default()
+        };
+        assert!(
+            !speculation_allowed(&read_only, false),
+            "read-only ⇒ no speculation"
+        );
+        let mut skills = SkillRegistry::new();
+        skills.activate(origin_skills::frontmatter::SkillFrontmatter {
+            name: "narrow".into(),
+            description: "masks tools".into(),
+            allowed_tools: vec!["Glob".into()],
+        });
+        let masked = LoopOptions::default().with_skills(Arc::new(skills));
+        assert!(
+            !speculation_allowed(&masked, false),
+            "skill mask ⇒ no speculation"
         );
     }
 
