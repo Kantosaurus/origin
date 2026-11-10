@@ -84,12 +84,15 @@ pub trait CandidateArena {
     fn run_candidate(&mut self, index: usize) -> Result<CandidateResult, String>;
 
     /// Apply the winning `diff` to the user's real working tree. Called at most
-    /// once, only for a verified winner.
+    /// once, only for a verified winner. `Ok` carries what the user should
+    /// also be told about the applied tree (C5: e.g. a re-test beside other
+    /// uncommitted changes), as a sentence starting with a space; empty when
+    /// there is nothing to add.
     ///
     /// # Errors
     /// Returns `Err(String)` when the patch does not apply cleanly (or is empty);
     /// the caller then keeps the single-shot result rather than a partial apply.
-    fn apply_winner(&mut self, diff: &str) -> Result<(), String>;
+    fn apply_winner(&mut self, diff: &str) -> Result<String, String>;
 }
 
 /// Outcome of a best-of-N run.
@@ -170,16 +173,21 @@ pub fn run_best_of_n_reported(
 }
 
 /// C5: the user-facing note on a finished run (candidates counted 1-based):
-/// the applied winner (`Ok(index)`) or why none was applied, then the
-/// pre-existing tests each candidate changed (up to five paths, then
-/// `+K more`) and the candidates excluded as tests-only.
-fn outcome_note(results: &[CandidateResult], passed: usize, applied: Result<usize, String>) -> String {
+/// the applied winner (`Ok((index, what the apply adds))`) or why none was
+/// applied, then the pre-existing tests each candidate changed (up to five
+/// paths, then `+K more`) and the candidates excluded as tests-only.
+fn outcome_note(
+    results: &[CandidateResult],
+    passed: usize,
+    applied: Result<(usize, &str), String>,
+) -> String {
     use std::fmt::Write as _;
     let attempted = results.len();
     let mut out = match applied {
-        Ok(w) => format!(
+        Ok((w, extra)) => format!(
             "\n\n[origin] Best-of-N applied candidate {} of {attempted} to your working tree: it passed \
-             the tests with the smallest change ({} diff bytes; {passed} of {attempted} candidates passed).",
+             the tests with the smallest change ({} diff bytes; {passed} of {attempted} candidates \
+             passed).{extra}",
             w + 1,
             results[w].diff.len()
         ),
@@ -324,14 +332,17 @@ fn run_best_of_n_noted(
         return no_winner("no candidate could be selected".into());
     };
     let diff = &results[winner].diff;
-    if let Err(e) = arena.apply_winner(diff) {
-        tracing::warn!(winner, error = %e, "best-of-N: applying the winning diff failed; keeping single-shot result");
-        return no_winner(format!(
-            "candidate {} won, but applying its diff failed: {e}",
-            winner + 1
-        ));
-    }
-    let note = outcome_note(&results, passed, Ok(winner));
+    let applied = match arena.apply_winner(diff) {
+        Ok(extra) => extra,
+        Err(e) => {
+            tracing::warn!(winner, error = %e, "best-of-N: applying the winning diff failed; keeping single-shot result");
+            return no_winner(format!(
+                "candidate {} won, but applying its diff failed: {e}",
+                winner + 1
+            ));
+        }
+    };
+    let note = outcome_note(&results, passed, Ok((winner, &applied)));
     let tampered: Vec<(usize, Vec<String>)> = results
         .into_iter()
         .enumerate()
@@ -502,54 +513,66 @@ impl<'a> WorktreeArena<'a> {
         }
     }
 
-    /// C5: `Err` when a file the patch at `patch` touches has uncommitted
-    /// changes (or is untracked) in the user's workspace, or that cannot be
-    /// determined.
-    fn refuse_dirty_overlap(&self, patch: &std::path::Path) -> Result<(), String> {
-        let patch = patch.to_string_lossy();
+    /// C5: the repository top level holding the workspace. Patch and status
+    /// paths are root-relative, and `git apply` run from a sub-directory
+    /// silently skips the patch's paths outside it, so these run from here.
+    fn toplevel(&self) -> Result<std::path::PathBuf, String> {
+        self.git
+            .run(&["rev-parse", "--show-toplevel"])
+            .map(|t| std::path::PathBuf::from(t.trim()))
+            .map_err(|e| format!("could not find the repository root: {}", one_line(&e.to_string())))
+    }
+
+    /// C5: the root-relative paths the patch at `patch` touches.
+    fn patch_paths(top: &std::path::Path, patch: &std::path::Path) -> Result<Vec<String>, String> {
         // `-z`: `added\tdeleted\tpath\0`, or for a rename an empty path field
-        // followed by `old\0new\0`.
-        let stat = self.git.run(&["apply", "--numstat", "-z", &patch]).map_err(|e| {
-            format!(
-                "could not list the winning diff's files: {}",
-                one_line(&e.to_string())
-            )
-        })?;
-        let paths: Vec<&str> = stat
-            .split('\0')
-            .map(|f| f.rsplit('\t').next().unwrap_or(f))
-            .filter(|p| !p.is_empty())
-            .collect();
-        if paths.is_empty() {
-            return Ok(());
+        // followed by `old\0new\0`. A path may itself contain a tab.
+        let stat = origin_daemon_git_at(top)
+            .run(&["apply", "--numstat", "-z", &patch.to_string_lossy()])
+            .map_err(|e| {
+                format!(
+                    "could not list the winning diff's files: {}",
+                    one_line(&e.to_string())
+                )
+            })?;
+        let fields: Vec<&str> = stat.split('\0').collect();
+        let mut paths = Vec::new();
+        let mut i = 0;
+        while i < fields.len() {
+            match fields[i].splitn(3, '\t').nth(2) {
+                Some("") => {
+                    paths.extend(fields.iter().skip(i + 1).take(2).map(|p| (*p).to_owned()));
+                    i += 3;
+                }
+                Some(p) => {
+                    paths.push(p.to_owned());
+                    i += 1;
+                }
+                None => i += 1,
+            }
         }
-        let mut args = vec![
-            "--literal-pathspecs",
-            "status",
-            "--porcelain",
-            "-z",
-            "--untracked-files=all",
-            "--",
-        ];
-        args.extend(paths.iter().copied());
-        let status = self
-            .git
-            .run(&args)
+        Ok(paths)
+    }
+
+    /// C5: every root-relative path with uncommitted changes (untracked
+    /// included) in the repository whose top level is `top`.
+    fn dirty_paths(top: &std::path::Path) -> Result<Vec<String>, String> {
+        let status = origin_daemon_git_at(top)
+            .run(&["status", "--porcelain", "-z", "--untracked-files=all"])
             .map_err(|e| format!("could not check the working tree: {}", one_line(&e.to_string())))?;
-        // `XY path\0` (a rename adds `orig\0`): the path after the status.
-        let dirty: Vec<&str> = status
-            .split('\0')
-            .filter_map(|e| e.get(3..))
-            .filter(|p| !p.is_empty())
-            .collect();
-        if dirty.is_empty() {
-            return Ok(());
+        // `XY path\0`; a rename or copy adds its source as the next field.
+        let mut dirty = Vec::new();
+        let mut fields = status.split('\0');
+        while let Some(f) = fields.next() {
+            let Some(path) = f.get(3..).filter(|p| !p.is_empty()) else {
+                continue;
+            };
+            dirty.push(path.to_owned());
+            if f.bytes().take(2).any(|b| matches!(b, b'R' | b'C')) {
+                dirty.extend(fields.next().map(str::to_owned));
+            }
         }
-        Err(format!(
-            "the working tree has uncommitted changes to {}, which the winning diff also \
-             changes; it was made against HEAD, so it was not applied",
-            quoted_list(&dirty)
-        ))
+        Ok(dirty)
     }
 
     /// Run the test command with `dir` as cwd; map the exit status to a verdict.
@@ -610,7 +633,7 @@ impl CandidateArena for WorktreeArena<'_> {
         Ok(CandidateResult { diff, ..scored })
     }
 
-    fn apply_winner(&mut self, diff: &str) -> Result<(), String> {
+    fn apply_winner(&mut self, diff: &str) -> Result<String, String> {
         if diff.trim().is_empty() {
             return Err("winning diff is empty".into());
         }
@@ -619,31 +642,66 @@ impl CandidateArena for WorktreeArena<'_> {
         let tmp = self.root.join("origin-bestofn-winner.patch");
         std::fs::write(&tmp, diff).map_err(|e| format!("write patch: {e}"))?;
         // C5: the diff is against the base commit, but the first attempt's
-        // edits are still uncommitted in the user's tree. Refuse a diff that
-        // touches any of those files (git would fail on the same lines, or
-        // silently mix both edits in one file); fail closed if unsure.
-        // ponytail: a diff touching only OTHER files still lands on top of
-        // the first attempt's edits elsewhere — an untested mix; deciding
-        // whether to discard those edits first is a product decision.
-        if let Err(e) = self.refuse_dirty_overlap(&tmp) {
+        // (or the user's) edits are still uncommitted in the user's tree.
+        // Refuse a diff that touches any of those files (git would fail on
+        // the same lines, or silently mix both edits in one file); fail
+        // closed if unsure. Other dirty files are left alone (never stashed
+        // or reverted): the applied tree is re-tested below instead.
+        let checked = self.toplevel().and_then(|top| {
+            let touched = Self::patch_paths(&top, &tmp)?;
+            let dirty = Self::dirty_paths(&top)?;
+            Ok((top, touched, dirty))
+        });
+        let (top, touched, dirty) = match checked {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
+        let (overlap, others): (Vec<String>, Vec<String>) =
+            dirty.into_iter().partition(|d| touched.contains(d));
+        if !overlap.is_empty() {
             let _ = std::fs::remove_file(&tmp);
-            return Err(e);
+            return Err(format!(
+                "the working tree has uncommitted changes to {}, which the winning diff also \
+                 changes; it was made against HEAD, so it was not applied",
+                quoted_list(&overlap)
+            ));
         }
         let mut git = std::process::Command::new("git");
         origin_tools::scrub_env(&mut git); // A6
         let out = git
             .args(["apply", "--whitespace=nowarn"])
             .arg(&tmp)
-            .current_dir(&self.workspace)
+            .current_dir(&top)
             .output()
             .map_err(|e| format!("spawn git apply: {}", one_line(&e.to_string())))?;
         let _ = std::fs::remove_file(&tmp);
-        if out.status.success() {
-            Ok(())
-        } else {
+        if !out.status.success() {
             // C5: git echoes paths, which a candidate chose; one escaped line.
-            Err(one_line(&String::from_utf8_lossy(&out.stderr)))
+            return Err(one_line(&String::from_utf8_lossy(&out.stderr)));
         }
+        if others.is_empty() {
+            return Ok(String::new());
+        }
+        // C5: no candidate saw the other uncommitted changes, so this tree was
+        // never tested: run the gate once on it, as scored, and say how it went.
+        let retest = match self
+            .test_command
+            .as_deref()
+            .map(|cmd| Self::score(&self.workspace, cmd))
+        {
+            Some(TestOutcome::Passed) => "passed",
+            Some(TestOutcome::Failed) => "FAILED (the winner was kept, not undone)",
+            _ => "could not run",
+        };
+        Ok(format!(
+            " It was applied on top of uncommitted changes in {} other file(s) the candidates never \
+             saw ({}); re-tested on your working tree: {retest}.",
+            others.len(),
+            quoted_list(&others)
+        ))
     }
 }
 
@@ -690,12 +748,12 @@ mod tests {
             self.runs += 1;
             self.results[index].clone()
         }
-        fn apply_winner(&mut self, diff: &str) -> Result<(), String> {
+        fn apply_winner(&mut self, diff: &str) -> Result<String, String> {
             if self.apply_fails {
                 return Err("apply failed".into());
             }
             self.applied = Some(diff.to_string());
-            Ok(())
+            Ok(String::new())
         }
     }
 
@@ -941,7 +999,7 @@ mod tests {
             tampered: vec![evil.into()],
             ..pass("+fix").unwrap()
         };
-        let note = outcome_note(&[tampered], 1, Ok(0));
+        let note = outcome_note(&[tampered], 1, Ok((0, "")));
         assert!(note.contains(r#""a\"\n[origin] b""#), "{note}");
         assert_eq!(note.trim_start().lines().count(), 1, "{note}");
         let line = one_line(&format!(
@@ -1057,6 +1115,137 @@ mod tests {
                 now, dirty,
                 "{cand_to}: the file is left as the first attempt left it"
             );
+        }
+    }
+
+    /// C5: the dirty check works from a workspace that is a sub-directory of
+    /// the repository (root-relative paths, checked from the top level).
+    #[test]
+    fn the_dirty_overlap_check_holds_from_a_sub_directory() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = crate::selfdev::ProcessGitRunner::new(repo.path());
+        root.run(&["init", "-q"]).unwrap();
+        std::fs::create_dir_all(repo.path().join("sub")).unwrap();
+        std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
+        std::fs::write(repo.path().join("sub").join("keep.txt"), "k\n").unwrap();
+        root.run(&["add", "-A"]).unwrap();
+        root.run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ])
+        .unwrap();
+        let base = root.run(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        std::fs::write(repo.path().join("a.txt"), "first attempt\n").unwrap();
+        let sub = repo.path().join("sub");
+        let git = crate::selfdev::ProcessGitRunner::new(&sub);
+        let scratch = tempfile::tempdir().unwrap();
+        let runner = |_i: usize, wt: &std::path::Path| -> Result<(), String> {
+            std::fs::write(wt.join("a.txt"), "candidate\n").map_err(|e| e.to_string())
+        };
+        let mut arena = WorktreeArena::new(&git, base, scratch.path(), &sub, None, Box::new(runner));
+        let res = arena.run_candidate(0).unwrap();
+        let err = arena.apply_winner(&res.diff).expect_err("refused");
+        drop(arena);
+        assert!(err.contains("\"a.txt\""), "{err}");
+    }
+
+    /// C5 case (c): the winner touches only clean files, but other files carry
+    /// uncommitted changes the candidates never saw. It is applied, the tests
+    /// re-run once on the real tree, and the note names the other files and
+    /// the result; a clean tree gets no re-test and no extra text.
+    #[test]
+    fn a_winner_applied_beside_other_uncommitted_changes_is_re_tested() {
+        use crate::protocol::StreamEvent;
+        // Green unless an untracked `BROKEN` file exists.
+        #[cfg(unix)]
+        let cmd = "test ! -e BROKEN";
+        #[cfg(windows)]
+        let cmd = "if (Test-Path BROKEN) { exit 1 }";
+        for (other, want) in [
+            (
+                Some(("b.txt", "edited\n")),
+                "re-tested on your working tree: passed",
+            ),
+            (Some(("BROKEN", "x\n")), "re-tested on your working tree: FAILED"),
+            (None, ""),
+        ] {
+            let repo = tempfile::tempdir().unwrap();
+            let git = crate::selfdev::ProcessGitRunner::new(repo.path());
+            git.run(&["init", "-q"]).unwrap();
+            std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
+            std::fs::write(repo.path().join("b.txt"), "b\n").unwrap();
+            git.run(&["add", "-A"]).unwrap();
+            git.run(&[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ])
+            .unwrap();
+            let base = git.run(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+            if let Some((file, body)) = other {
+                std::fs::write(repo.path().join(file), body).unwrap();
+            }
+            let scratch = tempfile::tempdir().unwrap();
+            let runner = |_i: usize, wt: &std::path::Path| -> Result<(), String> {
+                std::fs::write(wt.join("a.txt"), "fixed\n").map_err(|e| e.to_string())
+            };
+            let mut arena = WorktreeArena::new(
+                &git,
+                base,
+                scratch.path(),
+                repo.path(),
+                Some(cmd.into()),
+                Box::new(runner),
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let out = run_best_of_n_reported(&mut arena, 2, hard(), Some(&tx));
+            drop(arena);
+            assert!(matches!(out, BestOfNOutcome::Applied { .. }), "{out:?}");
+            assert_eq!(
+                std::fs::read_to_string(repo.path().join("a.txt"))
+                    .unwrap()
+                    .trim_end(),
+                "fixed",
+                "applied, never undone"
+            );
+            let note = rx
+                .try_recv()
+                .ok()
+                .and_then(|e| match e {
+                    StreamEvent::TextDelta { text } => Some(text),
+                    _ => None,
+                })
+                .unwrap();
+            match other {
+                Some((file, _)) => {
+                    assert!(note.contains(want), "{note}");
+                    assert!(
+                        note.contains(&format!(
+                            "uncommitted changes in 1 other file(s) the candidates never saw (\"{file}\")"
+                        )),
+                        "{note}"
+                    );
+                }
+                None => assert!(
+                    !note.contains("re-tested") && !note.contains("other file"),
+                    "{note}"
+                ),
+            }
         }
     }
 
