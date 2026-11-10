@@ -209,9 +209,10 @@ const TOOL_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2)
 /// on `path` (a `PATH`-style list), or empty when none do.
 ///
 /// A pure lookup — nothing is spawned. Windows honours `PATHEXT`
-/// (case-insensitively); Unix needs the execute bit. Each tool is decided at
-/// its FIRST name match in `PATH` order (within one directory, the earliest
-/// `PATHEXT` extension) — what the shell would run. A zero-length first match
+/// (case-insensitively). Each tool is decided at its FIRST match the shell
+/// would run, in `PATH` order (within one directory, the earliest `PATHEXT`
+/// extension); on Unix a file without the execute bit is skipped, as the
+/// shell skips it. A zero-length first match
 /// means "not found": the Microsoft Store "App Execution Alias" stubs for
 /// `python`/`python3` are not an interpreter. Lists each `PATH` directory once
 /// rather than `which`-ing every tool: that is ~26 × dirs × `PATHEXT` stats,
@@ -257,7 +258,10 @@ pub fn tools_on_path_line(path: &std::ffi::OsStr) -> String {
                 else {
                     continue;
                 };
-                if decided[i].is_none() && first[i].as_ref().is_none_or(|(best, _)| x < *best) {
+                if decided[i].is_none()
+                    && first[i].as_ref().is_none_or(|(best, _)| x < *best)
+                    && shell_candidate(&entry.path())
+                {
                     first[i] = Some((x, entry.path()));
                 }
             }
@@ -280,18 +284,26 @@ pub fn tools_on_path_line(path: &std::ffi::OsStr) -> String {
     }
 }
 
-/// B6: a non-empty regular file (links followed) that, on Unix, is executable.
+/// B6: whether the shell would try to run `p`. On Unix it skips a file
+/// without the execute bit and keeps searching `PATH`; on Windows a `PATHEXT`
+/// name match is run, even a zero-length Store stub.
+#[cfg_attr(not(unix), allow(clippy::missing_const_for_fn))] // const only off Unix
+fn shell_candidate(p: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = p;
+        true
+    }
+}
+
+/// B6: a non-empty regular file (links followed).
 fn is_real_executable(p: &std::path::Path) -> bool {
-    std::fs::metadata(p).is_ok_and(|m| {
-        #[cfg(unix)]
-        let exec = {
-            use std::os::unix::fs::PermissionsExt;
-            m.permissions().mode() & 0o111 != 0
-        };
-        #[cfg(not(unix))]
-        let exec = true;
-        m.is_file() && m.len() > 0 && exec
-    })
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 0)
 }
 
 /// B6: the daemon's [`tools_on_path_line`], probed once per PROCESS.
@@ -609,6 +621,17 @@ mod tests {
             fake_exe(d.path(), "node.com", 0);
             fake_exe(d.path(), "node.exe", 4);
             assert_eq!(tools_on_path_line(d.path().as_os_str()), "");
+        }
+        // Unix: a file without the execute bit is skipped, as the shell skips
+        // it, so a later executable in PATH counts.
+        #[cfg(unix)]
+        {
+            let no_x = tempfile::tempdir().expect("tempdir");
+            let x = tempfile::tempdir().expect("tempdir");
+            std::fs::write(no_x.path().join("node"), "x").expect("write");
+            fake_exe(x.path(), "node", 4);
+            let path = std::env::join_paths([no_x.path(), x.path()]).expect("join");
+            assert_eq!(tools_on_path_line(&path), "Tools on PATH: node");
         }
     }
 
