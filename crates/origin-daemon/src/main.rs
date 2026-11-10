@@ -3451,10 +3451,11 @@ fn export_session_event(session_store: &SessionStore, session_id: &str, format: 
             .to_string();
             let mut text = String::new();
             let mut tools = Vec::new();
-            for b in &m.blocks {
+            for (i, b) in m.blocks.iter().enumerate() {
                 match b {
                     // B2: injected recall / repo-map context is not the user's words.
-                    Block::Text { text: t, .. } if origin_daemon::session::is_injected_context(t) => {}
+                    Block::Text { text: t, .. }
+                        if origin_daemon::session::is_injected_context(m.role, i, t) => {}
                     Block::Text { text: t, .. } => {
                         if !text.is_empty() {
                             text.push('\n');
@@ -4761,6 +4762,10 @@ mod tests {
         let mut s = Session::new("test", "m");
         s.push(prompt_with_injected_context());
         s.push(Message::new(Role::Assistant).with_block(Block::text("done")));
+        // Text the user TYPED (block 0) and assistant text are kept even when
+        // they happen to start with an injected-context tag.
+        s.push(msg(Role::User, "<origin-recall> pasted debug output"));
+        s.push(msg(Role::Assistant, "<repo-map-focus> echoed by the model"));
         store.persist_session(&s).expect("persist");
         store
             .persist_transcript(&s.id, &s.messages)
@@ -4775,6 +4780,8 @@ mod tests {
             assert!(content.contains("fix the build"), "{content}");
             assert!(!content.contains("private memory"), "{format}: {content}");
             assert!(!content.contains("src/a.rs"), "{format}: {content}");
+            assert!(content.contains("pasted debug output"), "{format}: {content}");
+            assert!(content.contains("echoed by the model"), "{format}: {content}");
         }
     }
 
@@ -4786,6 +4793,15 @@ mod tests {
         assert_eq!(transcript.len(), 2);
         assert_eq!(transcript[0].blocks.len(), 1, "only the typed prompt remains");
         assert!(matches!(&transcript[0].blocks[0], Block::Text { text, .. } if text == "fix the build"));
+
+        // A typed prompt (block 0) or assistant text starting with a tag stays.
+        let typed = vec![
+            msg(Role::User, "<origin-recall> pasted debug output"),
+            msg(Role::Assistant, "<repo-map-focus> echoed"),
+        ];
+        let transcript = super::summary_transcript(&typed, 1);
+        assert_eq!(transcript[0].blocks.len(), 1, "typed prompt kept");
+        assert_eq!(transcript[1].blocks.len(), 1, "assistant text kept");
     }
 
     #[test]

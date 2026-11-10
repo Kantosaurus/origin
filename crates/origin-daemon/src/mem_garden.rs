@@ -196,11 +196,11 @@ fn split_roles(messages: &[Message]) -> (String, String) {
             Role::Assistant => &mut assistant,
             Role::Tool | Role::System => continue,
         };
-        for block in &m.blocks {
+        for (i, block) in m.blocks.iter().enumerate() {
             // B2: skip injected recall / repo-map context — feeding recalled
             // memories back in would re-propose them as new memories.
             if let Block::Text { text, .. } = block {
-                if crate::session::is_injected_context(text) {
+                if crate::session::is_injected_context(m.role, i, text) {
                     continue;
                 }
                 if !target.is_empty() {
@@ -425,6 +425,15 @@ mod tests {
         assert!(user.contains("i prefer tabs"));
         assert!(!user.contains("use spaces everywhere"), "{user}");
         assert!(!user.contains("src/a.rs"), "{user}");
+
+        // Typed text (block 0) and assistant text starting with a tag are kept.
+        let typed = vec![
+            Message::new(Role::User).with_block(Block::text("<origin-recall> remember: tabs")),
+            Message::new(Role::Assistant).with_block(Block::text("<repo-map-focus> noted")),
+        ];
+        let (user, assistant) = split_roles(&typed);
+        assert!(user.contains("remember: tabs"), "{user}");
+        assert!(assistant.contains("noted"), "{assistant}");
     }
 
     #[test]

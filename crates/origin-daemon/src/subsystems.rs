@@ -172,14 +172,13 @@ pub fn repo_map_block(roots: &[std::path::PathBuf], focus: &[String]) -> Option<
 #[must_use]
 pub fn session_repo_map_block(session_id: &str, roots: &[std::path::PathBuf]) -> String {
     use std::collections::HashMap;
-    use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock, PoisonError};
-    type Key = (String, Vec<PathBuf>);
+    type Key = (String, Vec<String>);
     // ponytail: process-wide and never evicted (one ≤1k-token string per
     // session id + roots); evict on session removal if a daemon ever hosts thousands.
     static MAPS: OnceLock<Mutex<HashMap<Key, String>>> = OnceLock::new();
     let maps = MAPS.get_or_init(Mutex::default);
-    let key: Key = (session_id.to_string(), roots.to_vec());
+    let key: Key = (session_id.to_string(), roots_key(roots));
     if let Some(map) = maps.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
         return map.clone();
     }
@@ -193,6 +192,33 @@ pub fn session_repo_map_block(session_id: &str, roots: &[std::path::PathBuf]) ->
         .entry(key)
         .or_insert(map)
         .clone()
+}
+
+/// The roots as one workspace identity: sorted, de-duplicated and lexically
+/// normalised (trailing separators dropped; on Windows `\`→`/` and
+/// case-folded, as its paths compare case-insensitively). Purely lexical — no
+/// filesystem access per prompt — so `C:\x`, `c:/x/` and a re-ordered list all
+/// name the same session map.
+fn roots_key(roots: &[std::path::PathBuf]) -> Vec<String> {
+    let mut key: Vec<String> = roots
+        .iter()
+        .map(|r| {
+            let s = r.to_string_lossy();
+            let mut s = if cfg!(windows) {
+                s.replace('\\', "/").to_lowercase()
+            } else {
+                s.into_owned()
+            };
+            let kept = s.trim_end_matches('/').len();
+            if kept > 0 {
+                s.truncate(kept); // the filesystem root itself keeps its "/"
+            }
+            s
+        })
+        .collect();
+    key.sort();
+    key.dedup();
+    key
 }
 
 /// B2: the `<repo-map-focus>` block for the paths a prompt names.
@@ -417,6 +443,28 @@ mod tests {
         // Edit A: the cached bytes for (id, A) must not change.
         std::fs::write(a.path().join("gamma.rs"), "pub fn gamma_fn() {}\n").expect("write");
         assert_eq!(session_repo_map_block(id, &roots_a), first);
+    }
+
+    /// The same workspace spelled differently (order, trailing separator, and
+    /// on Windows case/separators) is the same cache entry — no rescan, so the
+    /// map bytes (and the cached prefix) survive a client re-spelling roots.
+    #[test]
+    fn session_repo_map_key_ignores_root_order_and_spelling() {
+        let a = rust_workspace("alpha.rs", "pub fn alpha_fn() {}\n");
+        let b = rust_workspace("beta.rs", "pub fn beta_fn() {}\n");
+        let id = "b2-spelling";
+        let first = session_repo_map_block(id, &[a.path().to_path_buf(), b.path().to_path_buf()]);
+        assert!(first.contains("alpha.rs") && first.contains("beta.rs"), "{first}");
+        // A fresh scan would now differ; the cached entry must be returned.
+        std::fs::write(a.path().join("gamma.rs"), "pub fn gamma_fn() {}\n").expect("write");
+        let mut a_spelled = format!("{}{}", a.path().display(), std::path::MAIN_SEPARATOR);
+        if cfg!(windows) {
+            a_spelled = a_spelled.to_uppercase();
+        }
+        let respelled = [b.path().to_path_buf(), std::path::PathBuf::from(a_spelled)];
+        assert_eq!(session_repo_map_block(id, &respelled), first);
+        // Genuinely different roots are a different entry.
+        assert_ne!(session_repo_map_block(id, &[b.path().to_path_buf()]), first);
     }
 
     /// An empty first scan (a session started in an empty directory) is not

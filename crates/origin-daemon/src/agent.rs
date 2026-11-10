@@ -170,10 +170,6 @@ const fn token_soft_cap(window: u32) -> usize {
     (window as usize).saturating_mul(COMPACT_WINDOW_NUM) / COMPACT_WINDOW_DEN
 }
 
-/// R1+R2: compact when EITHER the byte estimate crosses the cap OR the LAST
-/// turn's measured prefix tokens cross the window fraction. The measured gate
-/// catches token-dense transcripts (minified JS, base64, CJK ≈ 2 bytes/token)
-/// that the 4-bytes/token byte heuristic under-counts into an overflow 400.
 /// The prompt size of one request as the provider measured it: uncached input
 /// plus cache reads and writes (`Usage.input_tokens` is only the uncached
 /// share). With a warm prompt cache most of the prompt is a cache read.
@@ -183,6 +179,10 @@ const fn context_tokens(u: &origin_provider::Usage) -> u32 {
         .saturating_add(u.cache_creation_input_tokens)
 }
 
+/// R1+R2: compact when EITHER the byte estimate crosses the cap OR the LAST
+/// turn's measured prefix tokens cross the window fraction. The measured gate
+/// catches token-dense transcripts (minified JS, base64, CJK ≈ 2 bytes/token)
+/// that the 4-bytes/token byte heuristic under-counts into an overflow 400.
 const fn should_compact(bytes: usize, byte_cap: usize, last_input_tokens: u32, token_cap: usize) -> bool {
     bytes > byte_cap || (last_input_tokens > 0 && last_input_tokens as usize >= token_cap)
 }
@@ -4115,8 +4115,9 @@ async fn run_loop_inner(
     let mut last_input_tokens: u32;
     // R4: cumulative prompt-cache READ tokens this run_loop — fed into the
     // `origin_cache_hit_total{provider}` Prometheus counter at loop end. Zero
-    // unless the provider reported cache reads (Anthropic prompt-cache); stays
-    // unused when no `metrics` handle is wired.
+    // unless the provider reported cache reads (Anthropic, Bedrock,
+    // OpenAI-compatible and Gemini all do); stays unused when no `metrics`
+    // handle is wired.
     let mut total_cache_read_tokens: u64 = 0;
     // B1: cumulative prompt-cache WRITE tokens, fed into
     // `origin_cache_write_total{provider}` at loop end.
@@ -6312,7 +6313,11 @@ async fn run_loop_inner(
         // so the next iteration's `ChatRequest` (which re-sends the full
         // `session.snapshot()`) is billed against Anthropic's prompt cache
         // instead of as fresh input tokens. See [`apply_turn_cache_markers`].
-        apply_turn_cache_markers(&mut session.messages, opts.plan.as_ref());
+        apply_turn_cache_markers(
+            &mut session.messages,
+            opts.plan.as_ref(),
+            rolling_cache_marker_cap(origin_provider_anthropic::system_cache_enabled()),
+        );
 
         // Autonomous post-edit LSP diagnostics (opencode). When the feature is
         // on and this turn mutated path-bearing files, spawn the resolved
@@ -6421,8 +6426,18 @@ async fn run_loop_inner(
 
 /// Rolling message-level cache markers. Anthropic accepts at most 4
 /// `cache_control` markers per request; B2 spends one on the system prompt
-/// (see the Anthropic encoder's `wire_system`), leaving three for messages.
-const MAX_CACHE_MARKERS: usize = 3;
+/// when it is cached (the Anthropic encoder's `wire_system`), leaving three for
+/// messages. Under `ORIGIN_SYSTEM_CACHE=0` the system carries none, so the
+/// messages get all four. Callers pass
+/// `origin_provider_anthropic::system_cache_enabled()`, the same answer the
+/// encoder uses, so the two can never disagree.
+const fn rolling_cache_marker_cap(system_cached: bool) -> usize {
+    if system_cached {
+        3
+    } else {
+        4
+    }
+}
 
 /// Apply prompt-cache breakpoints after a completed agentic turn.
 ///
@@ -6447,9 +6462,9 @@ const MAX_CACHE_MARKERS: usize = 3;
 /// `session.messages`, but the wire encoder consumes it against the post-strip
 /// list, so a single dropped (orphaned) turn shifts every later index and path
 /// 3 marks blocks path 2 already covered elsewhere → "Found 5". The provider's
-/// wire encoder independently clamps the total to [`MAX_CACHE_MARKERS`] as
+/// wire encoder independently clamps the total to the request ceiling as
 /// defense in depth. The selection policy is "latest N turn boundaries", capped
-/// at [`MAX_CACHE_MARKERS`]: latest-N is cache-optimal because Anthropic's
+/// at `max_markers` ([`rolling_cache_marker_cap`]): latest-N is cache-optimal because Anthropic's
 /// prompt cache hits work on prefix-extension — newer marker positions amortize
 /// across more subsequent turns than older ones.
 ///
@@ -6457,7 +6472,11 @@ const MAX_CACHE_MARKERS: usize = 3;
 /// `session.snapshot()` at the un-cached rate. Anthropic's prompt cache
 /// charges 0.1× for cache reads, so engaging caching at stable turn
 /// boundaries collapses the dominant cost of long agentic sessions.
-fn apply_turn_cache_markers(messages: &mut [Message], plan: Option<&origin_planner::Plan>) {
+fn apply_turn_cache_markers(
+    messages: &mut [Message],
+    plan: Option<&origin_planner::Plan>,
+    max_markers: usize,
+) {
     use origin_core::types::CacheBoundary;
 
     // Turn boundaries are the last `ToolResult` blocks of `Role::Tool`
@@ -6477,10 +6496,10 @@ fn apply_turn_cache_markers(messages: &mut [Message], plan: Option<&origin_plann
         })
         .collect();
 
-    // Single source of truth: the latest `MAX_CACHE_MARKERS` turn boundaries.
+    // Single source of truth: the latest `max_markers` turn boundaries.
     // Empty session ⇒ no markers and the dynamic list is cleared so a previous
     // turn's stale state never leaks into the wire.
-    let start = turn_boundaries.len().saturating_sub(MAX_CACHE_MARKERS);
+    let start = turn_boundaries.len().saturating_sub(max_markers);
     let chosen: Vec<(usize, usize)> = turn_boundaries[start..].to_vec();
 
     // Clear every existing block-level cache_marker across the session before
@@ -6600,41 +6619,46 @@ mod cache_marker_tests {
     /// production 5-marker 400 once a turn got stripped).
     ///
     /// Invariant: after `apply_turn_cache_markers`, block-level markers number
-    /// at most `MAX_CACHE_MARKERS` and `dynamic_message_markers` is empty.
+    /// at most the rolling cap and `dynamic_message_markers` is empty. Checked
+    /// for both caps: 3 when the system block is cached (default), 4 under
+    /// `ORIGIN_SYSTEM_CACHE=0`.
     #[test]
     fn block_markers_stay_under_ceiling_and_dynamic_is_inert_after_20_turns() {
-        let plan = Plan::default();
-        let mut msgs: Vec<Message> = Vec::new();
-        for turn in 0..20 {
-            push_turn(&mut msgs, turn);
-            apply_turn_cache_markers(&mut msgs, Some(&plan));
+        for (system_cached, cap) in [(true, 3), (false, 4)] {
+            assert_eq!(rolling_cache_marker_cap(system_cached), cap);
+            let plan = Plan::default();
+            let mut msgs: Vec<Message> = Vec::new();
+            for turn in 0..20 {
+                push_turn(&mut msgs, turn);
+                apply_turn_cache_markers(&mut msgs, Some(&plan), cap);
+            }
+
+            let block_marked = block_marked_message_indices(&msgs);
+            let dyn_marked: HashSet<usize> = plan.dynamic_message_markers().into_iter().collect();
+
+            assert!(
+                dyn_marked.is_empty(),
+                "dynamic_message_markers (the drift-prone index-based path) must stay \
+                 empty; the block-level marker is the sole source of truth. got {dyn_marked:?}"
+            );
+            assert_eq!(
+                block_marked.len(),
+                cap,
+                "after >cap turns exactly cap latest boundaries carry block markers; got {block_marked:?}"
+            );
         }
-
-        let block_marked = block_marked_message_indices(&msgs);
-        let dyn_marked: HashSet<usize> = plan.dynamic_message_markers().into_iter().collect();
-
-        assert!(
-            dyn_marked.is_empty(),
-            "dynamic_message_markers (the drift-prone index-based path) must stay \
-             empty; the block-level marker is the sole source of truth. got {dyn_marked:?}"
-        );
-        assert_eq!(
-            block_marked.len(),
-            MAX_CACHE_MARKERS,
-            "after >MAX turns exactly MAX latest boundaries carry block markers; got {block_marked:?}"
-        );
     }
 
     /// Same invariant at the smaller scale where bands collapse — exercises the
     /// edge cases of the recency classifier.
     #[test]
     fn block_markers_stay_under_ceiling_for_small_sessions() {
-        for n_turns in 1..=6 {
+        for (n_turns, cap) in (1..=6).flat_map(|n| [(n, 3), (n, 4)]) {
             let plan = Plan::default();
             let mut msgs: Vec<Message> = Vec::new();
             for turn in 0..n_turns {
                 push_turn(&mut msgs, turn);
-                apply_turn_cache_markers(&mut msgs, Some(&plan));
+                apply_turn_cache_markers(&mut msgs, Some(&plan), cap);
             }
             let block_marked = block_marked_message_indices(&msgs);
             let dyn_marked: HashSet<usize> = plan.dynamic_message_markers().into_iter().collect();
@@ -6644,8 +6668,8 @@ mod cache_marker_tests {
             );
             assert_eq!(
                 block_marked.len(),
-                n_turns.min(MAX_CACHE_MARKERS),
-                "expected min(n_turns, MAX) block markers at n_turns={n_turns}: {block_marked:?}"
+                n_turns.min(cap),
+                "expected min(n_turns, cap) block markers at n_turns={n_turns}: {block_marked:?}"
             );
         }
     }

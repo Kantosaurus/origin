@@ -614,9 +614,14 @@ fn wire_system(text: &str) -> Option<wire::WireSystem<'_>> {
     }]))
 }
 
-/// `ORIGIN_SYSTEM_CACHE=0` disables the system-prompt cache marker. Read per
-/// request (one env lookup) so it can be flipped without a restart.
-fn system_cache_enabled() -> bool {
+/// Whether the `system` prompt is sent as a marked (cached) block.
+///
+/// The ONE answer both this encoder and the daemon's rolling-marker planner
+/// use, so together they never exceed Anthropic's four breakpoints: 1 system +
+/// 3 message markers by default, 0 + 4 under `ORIGIN_SYSTEM_CACHE=0`. Read per
+/// call (one env lookup) so it can be flipped without a restart.
+#[must_use]
+pub fn system_cache_enabled() -> bool {
     std::env::var("ORIGIN_SYSTEM_CACHE").as_deref() != Ok("0")
 }
 

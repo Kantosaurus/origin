@@ -131,6 +131,10 @@ async fn tools_and_system_bytes_identical_across_two_prompts() {
 
 #[tokio::test]
 async fn edit_between_prompts_leaves_system_bytes_and_marks_the_first_request() {
+    // This asserts the DEFAULT (marked system) wire; ignore an
+    // `ORIGIN_SYSTEM_CACHE=0` inherited from the tester's shell. Nothing else
+    // in this binary sets the variable.
+    std::env::remove_var("ORIGIN_SYSTEM_CACHE");
     let dir = workspace();
     let provider = recording();
     let mut session = session_in(&dir);

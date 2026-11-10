@@ -3,18 +3,23 @@
 //!
 //! Persistence (P1.12) wraps this with `SQLite` writes per turn.
 
-use origin_core::types::{Block, Message, MessageId};
+use origin_core::types::{Block, Message, MessageId, Role};
 use std::path::PathBuf;
 
-/// B2: whether a stored text block is context the agent loop injected.
+/// B2: whether text block `block_idx` of a stored `role` message is context
+/// the agent loop injected.
 ///
 /// That is `<origin-recall>` memories or `<repo-map-focus>` entries, not words
-/// the user typed. Those blocks stay in the transcript so the cached history
-/// bytes never change, but anything that shows, exports or mines user text
-/// must skip them.
+/// the user typed. The loop only ever appends them to a USER message after the
+/// typed prompt (block 0), so a typed prompt or assistant text that happens to
+/// start with one of those tags is never matched. Those blocks stay in the
+/// transcript so the cached history bytes never change, but anything that
+/// shows, exports or mines user text must skip them.
 #[must_use]
-pub fn is_injected_context(text: &str) -> bool {
-    text.starts_with("<origin-recall>") || text.starts_with("<repo-map-focus>")
+pub fn is_injected_context(role: Role, block_idx: usize, text: &str) -> bool {
+    role == Role::User
+        && block_idx >= 1
+        && (text.starts_with("<origin-recall>") || text.starts_with("<repo-map-focus>"))
 }
 
 /// `messages` with every injected-context text block removed.
@@ -27,8 +32,11 @@ pub fn without_injected_context(messages: &[Message]) -> Vec<Message> {
             blocks: m
                 .blocks
                 .iter()
-                .filter(|b| !matches!(b, Block::Text { text, .. } if is_injected_context(text)))
-                .cloned()
+                .enumerate()
+                .filter(
+                    |(i, b)| !matches!(b, Block::Text { text, .. } if is_injected_context(m.role, *i, text)),
+                )
+                .map(|(_, b)| b.clone())
                 .collect(),
         })
         .collect()
