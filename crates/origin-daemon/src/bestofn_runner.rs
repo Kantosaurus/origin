@@ -272,22 +272,17 @@ impl<'a> WorktreeArena<'a> {
     }
 
     /// Run the test command with `dir` as cwd; map the exit status to a verdict.
+    /// A6: spawned exactly like the turn-end gates (cmd guard, scrubbed child
+    /// env, PowerShell fallback when `pwsh` is absent); a guard denial, spawn
+    /// failure or the 600s bound scores `Unknown`.
     fn score(dir: &std::path::Path, cmd: &str) -> TestOutcome {
-        let run = if cfg!(windows) {
-            std::process::Command::new("pwsh")
-                .args(["-NoProfile", "-Command", cmd])
-                .current_dir(dir)
-                .output()
-        } else {
-            std::process::Command::new("sh")
-                .args(["-c", cmd])
-                .current_dir(dir)
-                .output()
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return TestOutcome::Unknown;
         };
-        match run {
-            Ok(out) if out.status.success() => TestOutcome::Passed,
-            Ok(_) => TestOutcome::Failed,
-            Err(_) => TestOutcome::Unknown,
+        match rt.block_on(crate::agent::run_gate_command(cmd, Some(dir))) {
+            Some((0, _)) => TestOutcome::Passed,
+            Some(_) => TestOutcome::Failed,
+            None => TestOutcome::Unknown,
         }
     }
 }
@@ -525,6 +520,23 @@ mod tests {
             "the worktree edit is captured: {}",
             res.diff
         );
+    }
+
+    /// A6: the test oracle is spawned like the turn-end gates — in the given
+    /// directory, with the daemon's credentials scrubbed from its env, and via
+    /// the PowerShell fallback on a Windows host without `pwsh`.
+    #[test]
+    fn score_runs_in_dir_with_a_scrubbed_env() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("marker"), "").unwrap();
+        #[cfg(unix)]
+        let cmd = r#"test -f marker && test -z "$A6_SCORE_PROBE_API_KEY""#;
+        #[cfg(windows)]
+        let cmd = "if (-not (Test-Path marker) -or $env:A6_SCORE_PROBE_API_KEY) { exit 1 }";
+        std::env::set_var("A6_SCORE_PROBE_API_KEY", "score-secret");
+        let outcome = WorktreeArena::score(dir.path(), cmd);
+        std::env::remove_var("A6_SCORE_PROBE_API_KEY");
+        assert_eq!(outcome, TestOutcome::Passed);
     }
 
     #[test]

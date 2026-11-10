@@ -960,15 +960,16 @@ async fn run_test_passed(cmd: &str, cwd: Option<&std::path::Path>) -> bool {
 }
 
 /// A6: run a turn-end gate command (`auto_test` / `auto_lint` / repro gate /
-/// test-select) through the supervised Bash spawn, so it gets the scrubbed
-/// child env and the cmd-guard like a model-issued `Bash` call. Returns
+/// test-select, and best-of-N's test oracle) through the supervised Bash
+/// spawn, so it gets the scrubbed child env and the cmd-guard like a
+/// model-issued `Bash` call. Returns
 /// `(exit_code, output)` when the command ran to exit; `None` when the guard
 /// denied it, the spawn failed, or it hit the 600s bound (callers fail open).
 /// There is no one to ask, so a `NeedsApproval` verdict is not run either.
 /// `cwd` (A12) is the directory it runs in; `None` ⇒ the process cwd.
 // ponytail: the skip note goes to the log only — a non-empty gate block reads as
 // RED to every caller, so carrying it there needs a skipped/failed split.
-async fn run_gate_command(cmd: &str, cwd: Option<&std::path::Path>) -> Option<(i32, String)> {
+pub(crate) async fn run_gate_command(cmd: &str, cwd: Option<&std::path::Path>) -> Option<(i32, String)> {
     if std::env::var("ORIGIN_CMD_GUARD").as_deref() != Ok("0") {
         match origin_cmdparse::worst(&origin_cmdparse::analyze(cmd)) {
             origin_cmdparse::Risk::Dangerous(reason) => {
