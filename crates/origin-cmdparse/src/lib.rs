@@ -249,6 +249,25 @@ fn installs_in(line: &str, sh: Shell) -> Vec<Install> {
 struct Sink {
     risks: Vec<Risk>,
     installs: Vec<Install>,
+    /// Simple commands checked so far in this scan (see [`MAX_CHECKS`]).
+    checks: usize,
+}
+
+/// Per-scan budget of simple-command checks. Wrappers analyse several
+/// suffixes each, so nested wrappers branch; past this the line needs approval.
+const MAX_CHECKS: usize = 4096;
+
+impl Sink {
+    /// Count one simple-command check; `false` once the budget is spent (the
+    /// first time, the line is marked as needing approval: fail closed).
+    fn spend_check(&mut self) -> bool {
+        self.checks += 1;
+        if self.checks == MAX_CHECKS + 1 {
+            self.risks
+                .push(needs("the command is too deeply nested to analyse"));
+        }
+        self.checks <= MAX_CHECKS
+    }
 }
 
 impl std::ops::Deref for Sink {
@@ -929,6 +948,9 @@ fn check_cmd(
         risks.push(needs("the command nests wrappers too deeply to analyse"));
         return;
     }
+    if !risks.spend_check() {
+        return;
+    }
     let mut i = 0;
     let mut assigned = None;
     while let Some(w) = ws.get(i) {
@@ -1049,13 +1071,20 @@ fn check_wrapped(
     depth: usize,
     risks: &mut Sink,
 ) {
-    let mut starts: Vec<usize> = (0..args.len())
+    let window: Vec<usize> = (0..args.len())
         .filter(|&k| !args[k].text.starts_with('-'))
         .take(4)
         .collect();
-    let Some(&j) = starts.first() else {
+    let Some(&j) = window.first() else {
         return;
     };
+    // The first non-option word always starts a suffix; the later window words
+    // only when they are literal (`sudo cp $SRC $DST`: `$SRC` is an argument,
+    // and a variable/glob/group in program position would need approval).
+    let mut starts: Vec<usize> = window
+        .into_iter()
+        .filter(|&k| k == j || !(args[k].dynamic || args[k].group))
+        .collect();
     let maybe_value = j > 0 && !args[j - 1].text.contains('=') && j + 1 < args.len();
     if maybe_value {
         starts.push(j + 1);
@@ -2792,6 +2821,64 @@ mod tests {
         for line in ["timeout 10 echo hello", "sudo -u postgres psql -c \"select 1\""] {
             assert_eq!(worst(&analyze(line)), Risk::Safe, "{line:?}");
         }
+    }
+
+    /// The wrapper window never starts at a variable, glob or group argument:
+    /// ordinary wrapped commands stay Safe, a wrapped `$CMD` still needs
+    /// approval, and the hidden `rm -rf ~` shapes stay Dangerous.
+    #[test]
+    fn wrapper_window_skips_dynamic_arguments() {
+        for line in [
+            "sudo cp $SRC $DST",
+            "time ls *.log",
+            "timeout 60 curl -s $URL",
+            "nice -n 10 rm *.tmp",
+            "sudo chown -R $USER:$USER dir",
+            "nice -n 10 find . -name *.tmp -delete",
+        ] {
+            assert_eq!(worst(&analyze_in(line, Shell::Posix)), Risk::Safe, "{line}");
+        }
+        for line in [
+            "sudo -u user -H rm -rf ~",
+            "timeout -k 5 -s KILL 10 rm -rf ~",
+            "ionice -c 2 -n 7 rm -rf ~",
+        ] {
+            let r = worst(&analyze_in(line, Shell::Posix));
+            assert!(matches!(r, Risk::Dangerous(_)), "{line}: {r:?}");
+        }
+        let r = worst(&analyze_in("sudo $CMD", Shell::Posix));
+        assert!(matches!(r, Risk::NeedsApproval(_)), "{r:?}");
+    }
+
+    /// Nested wrappers branch; a per-scan budget stops the analysis promptly
+    /// and fails closed.
+    #[test]
+    fn nested_wrapper_explosion_is_bounded_and_fails_closed() {
+        let line = format!("{}true", "nice ".repeat(10));
+        let started = std::time::Instant::now();
+        let a = analyze(&line);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let r = worst(&a);
+        assert!(matches!(r, Risk::NeedsApproval(_)), "{r:?}");
+        assert!(installs(&line).is_empty());
+        // Ten levels stay under the budget (~800 checks; the depth cap stops
+        // them); twenty would branch into ~46,000 and hit it.
+        let line = format!("{}true", "nice ".repeat(20));
+        let started = std::time::Instant::now();
+        let a = analyze(&line);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(a
+            .risks
+            .contains(&needs("the command is too deeply nested to analyse")));
+        assert_eq!(worst(&analyze("nice -n 10 cargo test")), Risk::Safe);
     }
 
     /// C6: installs are found through prefixes, chains and `bash -c`, with
