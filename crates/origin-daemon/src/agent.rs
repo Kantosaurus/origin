@@ -3789,6 +3789,9 @@ pub struct LoopOptions {
     /// changed here, so a swarm worker can report it to its parent. `None` (the
     /// default everywhere but swarm workers) ⇒ nothing is recorded.
     pub touches: Option<Arc<std::sync::Mutex<RunTouches>>>,
+    /// B5: which system prompt this run gets. Fixed for the run, so the cached
+    /// prefix stays byte-identical across its turns.
+    pub prompt_profile: PromptProfile,
 }
 
 /// B8: what a run's successful tool calls changed — the paths its file-editing
@@ -3797,6 +3800,19 @@ pub struct LoopOptions {
 pub struct RunTouches {
     pub paths: Vec<String>,
     pub ran_shell: bool,
+}
+
+/// B5: the system-prompt shape of a run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PromptProfile {
+    /// A human is in the loop (the TUI): the full prompt.
+    #[default]
+    Interactive,
+    /// Non-interactive `origin run` / self-dispatch: the full prompt minus the
+    /// default-workflow directive (unless `ORIGIN_DEFAULT_WORKFLOW=on`).
+    Headless,
+    /// A swarm sub-agent: the small fixed worker prompt; no repo-map scan.
+    Worker,
 }
 
 impl Default for LoopOptions {
@@ -3848,6 +3864,7 @@ impl Default for LoopOptions {
             lsp_pool: None,
             cwd: None,
             touches: None,
+            prompt_profile: PromptProfile::Interactive,
         }
     }
 }
@@ -4756,8 +4773,10 @@ async fn run_loop_inner(
         - A Bash result with \"failed\": true (or a non-zero exit_code) means the command FAILED — \
         do not treat it as success.\n\
         </origin-tool-use>";
+    // B5: a worker gets a small fixed prompt (see `session_stable_system`).
+    let worker = opts.prompt_profile == PromptProfile::Worker;
     let directive_block = {
-        let d = crate::default_workflow::directive();
+        let d = crate::default_workflow::directive(opts.prompt_profile == PromptProfile::Interactive);
         if d.is_empty() {
             String::new()
         } else {
@@ -4838,8 +4857,8 @@ async fn run_loop_inner(
     // (it sits in the cached system prefix); what this prompt's named paths add
     // goes to `repo_map_focus_block`, which rides in the prompt's user message.
     let (repo_map_block, repo_map_focus_block) =
-        if matches!(std::env::var("ORIGIN_REPOMAP").as_deref(), Ok("0")) {
-            (String::new(), String::new()) // explicit opt-out
+        if worker || matches!(std::env::var("ORIGIN_REPOMAP").as_deref(), Ok("0")) {
+            (String::new(), String::new()) // a worker never scans (B5); explicit opt-out
         } else {
             // Map spans every session root (multi-root cross-references are honoured
             // by the ranker); default to the run's cwd (A12) when the session opened
@@ -4957,6 +4976,16 @@ async fn run_loop_inner(
             &ponytail_block,
             &style_block,
         ];
+        // B5: a worker's prompt is its role/task contract plus only the rules it
+        // needs to operate its tools — no identity, directive, catalogs or map.
+        let worker_parts: [&str; 5] = [
+            crate::swarm_worker::WORKER_PROMPT,
+            tool_use_block,
+            &result_encoding_block,
+            &edit_format_block,
+            &env_block,
+        ];
+        let parts: &[&str] = if worker { &worker_parts } else { &parts };
         parts
             .iter()
             .filter(|s| !s.is_empty())

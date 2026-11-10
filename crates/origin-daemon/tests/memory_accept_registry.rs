@@ -120,6 +120,7 @@ async fn accept_persists_via_proposal_registry() {
         lsp_pool: None,
         cwd: None,
         touches: None,
+        prompt_profile: origin_daemon::agent::PromptProfile::Interactive,
         ponytail: origin_ponytail::PonytailMode::Full,
     };
     let _summary = run_loop(

@@ -128,6 +128,7 @@ async fn memory_e2e_proposer_to_store_via_wiremock() {
         lsp_pool: None,
         cwd: None,
         touches: None,
+        prompt_profile: origin_daemon::agent::PromptProfile::Interactive,
         ponytail: origin_ponytail::PonytailMode::Full,
     };
     let _summary = run_loop(

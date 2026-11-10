@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Default-workflow directive prepended to every system prompt.
+//! Default-workflow directive prepended to the system prompt of interactive runs.
 //!
 //! Origin tells the model to follow a brainstorm → plan → dispatch flow for
 //! anything non-trivial, instead of waiting for the user to invoke each skill
 //! by name. Trivial requests (single lookups, one-line edits) bypass the flow.
 //!
-//! Disable globally by setting the env var `ORIGIN_DEFAULT_WORKFLOW=off`.
+//! B5: headless runs (`origin run`, self-dispatch) omit it and swarm workers
+//! get their own fixed prompt. `ORIGIN_DEFAULT_WORKFLOW=off` disables it
+//! everywhere; `=on` forces it into headless runs too.
 
 pub const DEFAULT_WORKFLOW: &str = "\
 DEFAULT WORKFLOW
@@ -84,14 +86,22 @@ question; their results will arrive and you will fold them in.
 This is the default. Skip it only when the work is genuinely trivial.\
 ";
 
-/// Returns the workflow directive unless `ORIGIN_DEFAULT_WORKFLOW=off`.
+/// The workflow directive for a run, or `""` when it is omitted.
 ///
-/// Empty string disables the block; the caller concatenates unconditionally.
+/// `ORIGIN_DEFAULT_WORKFLOW=off|false|0` omits it, `=on|true|1` includes it
+/// even in a headless run (B5); unset (or any other value) includes it only
+/// when `interactive`. The caller concatenates unconditionally.
 #[must_use]
-pub fn directive() -> &'static str {
-    match std::env::var("ORIGIN_DEFAULT_WORKFLOW").as_deref() {
-        Ok("off" | "false" | "0") => "",
-        _ => DEFAULT_WORKFLOW,
+pub fn directive(interactive: bool) -> &'static str {
+    let on = match std::env::var("ORIGIN_DEFAULT_WORKFLOW").as_deref() {
+        Ok("off" | "false" | "0") => false,
+        Ok("on" | "true" | "1") => true,
+        _ => interactive,
+    };
+    if on {
+        DEFAULT_WORKFLOW
+    } else {
+        ""
     }
 }
 
@@ -123,12 +133,22 @@ mod tests {
         }
     }
 
+    /// Serializes this module's `ORIGIN_DEFAULT_WORKFLOW` mutations.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
-    fn env_override_disables_directive() {
-        // Use a temp env var so we don't leak into other tests.
+    fn env_switch_works_in_both_directions() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("ORIGIN_DEFAULT_WORKFLOW", "off");
-        assert_eq!(directive(), "");
+        assert_eq!(directive(true), "");
+        std::env::set_var("ORIGIN_DEFAULT_WORKFLOW", "on");
+        assert_eq!(
+            directive(false),
+            DEFAULT_WORKFLOW,
+            "on forces it into headless runs"
+        );
         std::env::remove_var("ORIGIN_DEFAULT_WORKFLOW");
-        assert_eq!(directive(), DEFAULT_WORKFLOW);
+        assert_eq!(directive(true), DEFAULT_WORKFLOW);
+        assert_eq!(directive(false), "", "headless omits it by default");
     }
 }

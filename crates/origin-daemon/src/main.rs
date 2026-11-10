@@ -2077,6 +2077,13 @@ async fn handle_request(
             // ^ A12: the live turn uses the process cwd; only best-of-N
             // candidates run in their own worktree.
             touches: None, // B8: only swarm workers report their touches
+            prompt_profile: if req.interactive {
+                origin_daemon::agent::PromptProfile::Interactive
+            } else {
+                origin_daemon::agent::PromptProfile::Headless
+            },
+            // ^ B5: `interactive` is false for headless `origin run` and the
+            // daemon's self-dispatch; those omit the default-workflow directive.
         };
         // Opt-in interactive prompting: when the turn requested it, route
         // RequiresPermission tools through the IPC prompter (asks the client and

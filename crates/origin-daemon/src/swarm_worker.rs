@@ -362,6 +362,8 @@ async fn run_worker(
         plan: Some(plan.fork_shared_handle_bands()),
         // B3: sub-agents default to medium effort (anthropic only).
         effort: worker_effort(provider.name()),
+        // B5: the small fixed worker prompt, with no repo-map scan.
+        prompt_profile: crate::agent::PromptProfile::Worker,
         // #3: sub-agents that EDIT get the same regression enforcement as the
         // top-level loop — a worker must not report "Completed" while the test
         // suite is RED. We arm `auto_test` (turn-end run + terminal-branch
@@ -545,6 +547,15 @@ fn deny_rules_only(rules: &crate::config::PermissionRules) -> Option<Arc<crate::
         })
     })
 }
+
+/// B5: a worker's fixed role + task contract, the head of its system prompt
+/// (`PromptProfile::Worker`). It names no tool a worker is never given.
+pub(crate) const WORKER_PROMPT: &str = "<origin-worker>\n\
+    You are a sub-agent of Origin, a CLI coding agent. The user message is the goal \
+    delegated to you; do it yourself with the tools you have. Verify your work before \
+    you call it done. Finish with a short report: what you did (files changed, commands \
+    run and their results) and what you could not do, and why.\n\
+    </origin-worker>";
 
 /// Reasoning effort for a sub-agent's turns, fixed for its whole run. B3:
 /// anthropic ⇒ `Medium` (a delegated sub-task needs less deliberation than the

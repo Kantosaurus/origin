@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use origin_cas::{Store as CasStore, StoreConfig};
 use origin_core::types::{Block, Message, Role};
-use origin_daemon::agent::{run_loop, LoopOptions};
+use origin_daemon::agent::{run_loop, LoopOptions, PromptProfile};
 use origin_daemon::session::Session;
 use origin_permission::prompt::AlwaysAllow;
 use origin_plan::{Plan, PlanStore};
@@ -175,14 +175,114 @@ async fn worker_defaults_to_medium_effort_on_anthropic() {
     );
 }
 
+fn headless() -> LoopOptions {
+    LoopOptions {
+        prompt_profile: PromptProfile::Headless,
+        ..opts()
+    }
+}
+
+/// B5: a headless run (`origin run`) gets no default-workflow directive.
+#[tokio::test]
+async fn headless_system_prompt_omits_the_directive() {
+    let interactive = main_loop_system(&opts()).await;
+    let headless = main_loop_system(&headless()).await;
+    assert!(interactive.contains("DEFAULT WORKFLOW"), "{interactive}");
+    assert!(!headless.contains("DEFAULT WORKFLOW"), "{headless}");
+    assert!(
+        headless.contains("<repo-map>"),
+        "headless keeps the rest: {headless}"
+    );
+}
+
+/// B5: a worker gets a small fixed prompt — no directive, catalogs, repo map,
+/// sub-agent section or swarm language, and no tool it can never use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_gets_the_fixed_prompt() {
+    let reqs = worker_requests(recording("anthropic")).await;
+    let system = &reqs[0].system;
+    for absent in [
+        "DEFAULT WORKFLOW",
+        "<origin-identity>",
+        "<repo-map>",
+        "<origin-skills>",
+        "<origin-workflows>",
+        "<origin-ponytail>",
+        "subagent",
+        "swarm",
+        "Swarm",
+        "SWARM",
+        "Task",
+        "CollectTasks",
+    ] {
+        assert!(
+            !system.contains(absent),
+            "worker prompt carries `{absent}`:\n{system}"
+        );
+    }
+    assert!(system.contains("<origin-worker>"), "{system}");
+    assert!(system.contains("<origin-tool-use>"), "{system}");
+}
+
+/// B5: the worker profile never even scans for the repo map. A scan caches the
+/// session map; deleting the sources afterwards exposes whether one happened.
+#[tokio::test]
+async fn worker_never_computes_the_repo_map() {
+    for (profile, scanned) in [(PromptProfile::Interactive, true), (PromptProfile::Worker, false)] {
+        let dir = workspace();
+        let provider = recording("recording");
+        let mut session = Session::new("recording", "claude-test");
+        session.roots = vec![dir.path().to_path_buf()];
+        let opts = LoopOptions {
+            prompt_profile: profile,
+            ..opts()
+        };
+        run_loop(&mut session, "hi", provider.as_ref(), &AlwaysAllow, &opts)
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(dir.path().join("src")).unwrap();
+        let cached = origin_daemon::subsystems::session_repo_map_block(&session.id, &session.roots);
+        assert_eq!(!cached.is_empty(), scanned, "{profile:?}: {cached}");
+    }
+}
+
+/// B2 still holds per profile: every prompt of a headless or worker session
+/// sends byte-identical system text.
+#[tokio::test]
+async fn prefix_is_stable_for_headless_and_worker_sessions() {
+    for profile in [PromptProfile::Headless, PromptProfile::Worker] {
+        let dir = workspace();
+        let provider = recording("anthropic");
+        let mut session = Session::new("anthropic", "claude-test");
+        session.roots = vec![dir.path().to_path_buf()];
+        let opts = LoopOptions {
+            prompt_profile: profile,
+            ..opts()
+        };
+        for prompt in ["hi", "now look at src/b.rs"] {
+            run_loop(&mut session, prompt, provider.as_ref(), &AlwaysAllow, &opts)
+                .await
+                .unwrap();
+        }
+        let reqs = provider.requests.lock().unwrap().clone();
+        let encoded: Vec<_> = reqs
+            .iter()
+            .map(|r| origin_provider_anthropic::encode_request_for_test(r)["system"].to_string())
+            .collect();
+        assert_eq!(encoded[0], encoded[1], "{profile:?}");
+    }
+}
+
 /// Prints the system-prompt sizes the report quotes (`--nocapture`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn measure_system_prompt_bytes() {
     let interactive = main_loop_system(&opts()).await;
+    let headless = main_loop_system(&headless()).await;
     let worker = worker_requests(recording("anthropic")).await;
     eprintln!(
-        "MEASURE interactive_system_bytes={} worker_system_bytes={} worker_effort={:?}",
+        "MEASURE interactive_system_bytes={} headless_system_bytes={} worker_system_bytes={} worker_effort={:?}",
         interactive.len(),
+        headless.len(),
         worker[0].system.len(),
         worker[0].effort
     );
