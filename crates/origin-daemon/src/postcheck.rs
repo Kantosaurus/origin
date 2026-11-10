@@ -172,9 +172,11 @@ pub async fn record_baseline(baseline: &mut ParseBaseline, path: &str) {
     baseline.insert(path.to_string(), count);
 }
 
-/// B8: record the baseline of `to`, the destination of a move, as `from`'s
-/// pre-edit count, so problems the file already had are not reported as new
-/// at its new path. Same first-call-wins rule as [`record_baseline`].
+/// B8: record a moved file's baseline at its destination `to`.
+///
+/// It is `from`'s pre-edit count, so problems the file already had are not
+/// reported as new at its new path. Same first-call-wins rule as
+/// [`record_baseline`].
 pub async fn record_moved_baseline(baseline: &mut ParseBaseline, from: &str, to: &str) {
     if baseline.contains_key(to) || parse_language(to).is_none() {
         return;
