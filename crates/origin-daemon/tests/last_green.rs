@@ -382,6 +382,36 @@ fn a_gate_that_did_not_run_tags_nothing() {
     assert_eq!(git(ws.path(), &["rev-parse", "--verify", "-q", TAG]), None);
 }
 
+/// B7: a turn whose only `Edit` failed (`old_string` not found) does not arm
+/// the turn-end checks: the test gate does not run. A successful edit does.
+/// (`auto_test` also runs the gate once at loop start, as a baseline.)
+#[test]
+fn a_failed_edit_does_not_arm_the_turn_end_checks() {
+    for (old, runs) in [("absent", 1), ("hello", 2)] {
+        let ws = tempfile::tempdir().expect("ws");
+        std::fs::write(ws.path().join("a.txt"), "hello\n").expect("write");
+        run(
+            ws.path(),
+            false,
+            test_gate("echo x >> ran.txt", 0),
+            vec![
+                tool(
+                    "e1",
+                    "Edit",
+                    &serde_json::json!({ "file_path": "a.txt", "old_string": old, "new_string": "bye" }),
+                ),
+                Block::text("done"),
+            ],
+        );
+        let ran = std::fs::read(ws.path().join("ran.txt")).expect("baseline ran");
+        assert_eq!(
+            ran.iter().filter(|&&b| b == b'x').count(),
+            runs,
+            "old_string {old:?}: gate runs"
+        );
+    }
+}
+
 /// C3: an armed gate the command guard refuses is named to the user once, at
 /// the start of the run, on the event stream — never in the conversation.
 #[test]

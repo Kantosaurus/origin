@@ -7794,11 +7794,10 @@ async fn run_loop_inner(
                 // distinct files this edit touched so the end-of-turn probes can
                 // feed diagnostics back to the model. Collected when EITHER the
                 // LSP-diagnostics path (`ORIGIN_LSP_DIAGNOSTICS=1`) or the
-                // default-on fast post-edit syntax gate needs them.
+                // default-on fast post-edit syntax gate needs them. B7: the
+                // paths are recorded only once the call succeeds (below).
                 if lsp_collect || compile_check_enabled {
-                    let paths = edited_paths_from_tool(&name, &args);
-                    lsp_unlisted_mutation |= paths.is_empty();
-                    lsp_edited_paths.extend(paths);
+                    lsp_unlisted_mutation |= edited_paths_from_tool(&name, &args).is_empty();
                 }
             }
 
@@ -8559,6 +8558,10 @@ async fn run_loop_inner(
                 let mut t = touches.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 t.ran_shell |= name == "Bash";
                 t.paths.extend(edited_paths_from_tool(&name, &args));
+            }
+            // B7: only a successful edit's files arm the turn-end checks.
+            if matches!(meta.side_effects, SideEffects::Mutating) && (lsp_collect || compile_check_enabled) {
+                lsp_edited_paths.extend(edited_paths_from_tool(&name, &args));
             }
 
             // Optional per-tool-use shadow-git checkpoint (WS-S, cline L163
