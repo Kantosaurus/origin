@@ -2,7 +2,7 @@
 //! Summary-backed compaction (P5.4).
 
 use origin_cas::{Hash, Store};
-use origin_core::types::{Block, Message};
+use origin_core::types::{Block, Message, Role};
 
 pub const DEFAULT_SOFT_CAP_BYTES: usize = 200 * 1024;
 pub const COMPACT_OLDEST_N_TURNS: usize = 4;
@@ -74,6 +74,86 @@ fn tool_result_payload_bytes(
     let Some(h) = handle else { return 0 };
     cas.and_then(|c| c.get(Hash::from_bytes(*h)).ok().flatten())
         .map_or(CAS_RESULT_FLOOR, |b| b.len())
+}
+
+/// A7: assistant turns whose tool results survive a high-water elision.
+pub const ELIDE_KEEP_TURNS: usize = 10;
+/// A7: the tighter window used after a provider context-length error.
+pub const ELIDE_KEEP_TURNS_AGGRESSIVE: usize = 3;
+const ELIDED_PREFIX: &[u8] = b"[tool result elided:";
+
+/// Summary-free elision (A7): stub out tool results older than the last `keep_turns` assistant turns.
+///
+/// Each body becomes the one-line placeholder `[tool result elided: <tool> <N> bytes]`,
+/// all in ONE batch — each rewrite invalidates the prompt cache from that point
+/// on, so everything eligible goes at once rather than one result per turn.
+///
+/// The block stays a `ToolResult` with its `tool_use_id`, so `tool_use` /
+/// `tool_result` pairing is untouched for every provider; the CAS handle is
+/// dropped so no provider re-inflates the old payload. Results already elided,
+/// or no larger than their placeholder, are skipped, so a repeat call returns 0
+/// and rewrites nothing. Returns the number of results elided.
+pub fn elide_old_tool_results(transcript: &mut [Message], keep_turns: usize, cas: Option<&Store>) -> usize {
+    let Some(cutoff) = transcript
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, m)| m.role == Role::Assistant)
+        .nth(keep_turns.saturating_sub(1))
+        .map(|(i, _)| i)
+    else {
+        return 0;
+    };
+    let names: std::collections::HashMap<String, String> = transcript[..cutoff]
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .filter_map(|b| match b {
+            Block::ToolUse { id, name, .. } => Some((id.clone(), name.clone())),
+            _ => None,
+        })
+        .collect();
+    let mut elided = 0;
+    for block in transcript[..cutoff].iter_mut().flat_map(|m| &mut m.blocks) {
+        let Block::ToolResult {
+            tool_use_id,
+            handle,
+            inline,
+            ..
+        } = block
+        else {
+            continue;
+        };
+        if inline.as_ref().is_some_and(|b| b.starts_with(ELIDED_PREFIX)) {
+            continue;
+        }
+        let bytes = tool_result_payload_bytes(handle.as_ref(), inline.as_ref(), cas);
+        let tool = names.get(tool_use_id.as_str()).map_or("unknown", String::as_str);
+        let placeholder = format!("[tool result elided: {tool} {bytes} bytes]").into_bytes();
+        if bytes <= placeholder.len() {
+            continue;
+        }
+        *handle = None;
+        *inline = Some(placeholder);
+        elided += 1;
+    }
+    elided
+}
+
+/// Whether a provider `Api` error body says the request overflowed the model's
+/// context window (Anthropic, OpenAI-compatible, Gemini, llama.cpp/Ollama).
+#[must_use]
+pub fn is_context_length_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    [
+        "prompt is too long",
+        "context_length_exceeded",
+        "context length",
+        "context window",
+        "context size",
+        "maximum number of tokens",
+    ]
+    .iter()
+    .any(|needle| m.contains(needle))
 }
 
 pub struct CompactionInput<'a> {
@@ -263,7 +343,6 @@ pub async fn maybe_compact_transcript_indexed(
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
-    use origin_core::types::Role;
 
     fn user(text: &str) -> Message {
         Message {
@@ -294,7 +373,7 @@ mod tests {
         }
     }
 
-    /// The `Role::Tool` message carrying the matching `tool_result`.
+    /// The `Role::Tool` message carrying the matching `tool_result` (13 bytes).
     fn tool_result(id: &str) -> Message {
         Message {
             role: Role::Tool,
@@ -412,6 +491,103 @@ mod tests {
             est >= 50_000,
             "handle-backed result must be charged its real CAS size (~50k), got {est}"
         );
+    }
+
+    /// A tool turn whose result carries `body_len` bytes.
+    fn big_tool_result(id: &str, body_len: usize) -> Message {
+        Message {
+            role: Role::Tool,
+            blocks: vec![Block::ToolResult {
+                tool_use_id: id.into(),
+                handle: Some([7; 32]),
+                inline: Some(vec![b'x'; body_len]),
+                cache_marker: None,
+                is_error: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn elision_rewrites_every_old_result_in_one_batch_and_keeps_pairing() {
+        // 14 tool turns; with keep=10 the 5 oldest results are eligible and must
+        // all go in ONE call (each rewrite invalidates the prompt cache).
+        let mut transcript = vec![user("task")];
+        for k in 0..14 {
+            transcript.push(assistant_tool_use(&format!("T{k}")));
+            transcript.push(big_tool_result(&format!("T{k}"), 5_000));
+        }
+        transcript.push(Message {
+            role: Role::Assistant,
+            blocks: vec![Block::text("done")],
+        });
+        let before = transcript.clone();
+
+        let elided = elide_old_tool_results(&mut transcript, ELIDE_KEEP_TURNS, None);
+
+        // The 10 most recent assistant turns are "done" + T13..T5, so the results
+        // of T0..T4 (indices 2,4,..,10) are older and all go at once.
+        assert_eq!(elided, 5, "every eligible result is elided in a single batch");
+        for k in 0..5 {
+            let Block::ToolResult {
+                tool_use_id,
+                handle,
+                inline,
+                ..
+            } = &transcript[2 + 2 * k].blocks[0]
+            else {
+                panic!("still a tool_result block");
+            };
+            assert_eq!(tool_use_id, &format!("T{k}"), "pairing id is preserved");
+            assert!(handle.is_none(), "handle dropped so no provider re-inflates it");
+            assert_eq!(
+                inline.as_deref(),
+                Some(&b"[tool result elided: read 5000 bytes]"[..])
+            );
+        }
+        // Recent turns (and every tool_use, and turn 0) are byte-identical.
+        assert_eq!(transcript[0], before[0]);
+        for i in 11..transcript.len() {
+            assert_eq!(transcript[i], before[i], "recent message {i} untouched");
+        }
+        assert_eq!(
+            first_orphan(&transcript),
+            None,
+            "tool_use/tool_result pairing stays valid"
+        );
+        // Idempotent: a second pass finds nothing new, so no extra cache rewrite.
+        assert_eq!(elide_old_tool_results(&mut transcript, ELIDE_KEEP_TURNS, None), 0);
+        // The aggressive window reaches further back (T5..T11).
+        assert_eq!(
+            elide_old_tool_results(&mut transcript, ELIDE_KEEP_TURNS_AGGRESSIVE, None),
+            7
+        );
+    }
+
+    #[test]
+    fn elision_skips_results_smaller_than_the_placeholder() {
+        let mut transcript = vec![user("task")];
+        for k in 0..4 {
+            transcript.push(assistant_tool_use(&format!("T{k}")));
+            transcript.push(tool_result(&format!("T{k}"))); // 13 bytes
+        }
+        let before = transcript.clone();
+        assert_eq!(elide_old_tool_results(&mut transcript, 1, None), 0);
+        assert_eq!(transcript, before);
+    }
+
+    #[test]
+    fn context_length_errors_are_recognised_across_providers() {
+        for msg in [
+            "status 400 Bad Request: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long: 210000 tokens > 200000 maximum\"}}",
+            "status 400 (https://api.openai.com/v1): {\"error\":{\"code\":\"context_length_exceeded\"}}",
+            "status 400: This model's maximum context length is 128000 tokens.",
+            "status 400: The input token count (1200000) exceeds the maximum number of tokens allowed (1048576).",
+            "status 400: the request exceeds the available context size",
+        ] {
+            assert!(is_context_length_error(msg), "{msg}");
+        }
+        assert!(!is_context_length_error("status 500: internal error"));
+        assert!(!is_context_length_error("status 400: invalid tool schema"));
     }
 
     #[test]

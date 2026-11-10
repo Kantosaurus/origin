@@ -45,9 +45,10 @@ fn over_cap_replaces_oldest_n_turns_with_summaries() {
         current_bytes: 1_000_000,
         soft_cap_bytes: 100_000,
     });
+    // Turn 0 (the task statement) is pinned, so the oldest N AFTER it fold.
     assert_eq!(
         out.compacted_indices,
-        (0..COMPACT_OLDEST_N_TURNS).collect::<Vec<_>>()
+        (1..=COMPACT_OLDEST_N_TURNS).collect::<Vec<_>>()
     );
     for &i in &out.compacted_indices {
         let Block::Text { text, .. } = &out.transcript[i].blocks[0] else {
@@ -56,7 +57,8 @@ fn over_cap_replaces_oldest_n_turns_with_summaries() {
         assert!(text.contains("sum-of-"));
         assert!(text.starts_with("[compacted turn"));
     }
-    for (i, original) in transcript.iter().enumerate().skip(COMPACT_OLDEST_N_TURNS) {
+    assert_eq!(out.transcript[0], transcript[0]);
+    for (i, original) in transcript.iter().enumerate().skip(COMPACT_OLDEST_N_TURNS + 1) {
         assert_eq!(out.transcript[i], *original);
     }
 }

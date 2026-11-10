@@ -2141,6 +2141,7 @@ async fn handle_request(
                 .await
                 .write_frame(FrameKind::ErrorFrame, message.as_bytes())
                 .await;
+            persist_failed_turn(session_store.as_ref(), Some(&cas), &mut session);
             PromptOutcome::Failed { message }
         }
         // Ctrl+C / mid-turn follow-up: the turn was aborted. Write a TERMINAL
@@ -4316,6 +4317,14 @@ fn persist(session_store: &SessionStore, cas: Option<&Arc<Store>>, session: &Ses
     }
 }
 
+/// A7: persist what a FAILED request already completed. The loop can error
+/// between an assistant `tool_use` and its `tool_result` (e.g. the stuck-loop
+/// halt), so the orphaned tail is dropped first, exactly as on interrupt.
+fn persist_failed_turn(session_store: &SessionStore, cas: Option<&Arc<Store>>, session: &mut Session) {
+    drop_orphan_tool_use_tail(&mut session.messages);
+    persist(session_store, cas, session);
+}
+
 /// Resolve the `last_turn` to stamp on a detach / goal-activation checkpoint
 /// token (#17).
 ///
@@ -4675,6 +4684,29 @@ mod tests {
         let before = balanced.len();
         super::drop_orphan_tool_use_tail(&mut balanced);
         assert_eq!(balanced.len(), before, "a balanced transcript is left intact");
+    }
+
+    #[test]
+    fn failed_turn_is_persisted_without_its_orphan_tool_use() {
+        // A7: the loop-error arm used to return without persisting, losing every
+        // turn the failed request had already completed.
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = SessionStore::open(dir.path().join("s.db")).expect("open store");
+        let mut session = Session::new_with_id("sess-err".into(), "m".into());
+        session.messages = vec![
+            msg(Role::User, "do it"),
+            tool_use_msg(),
+            msg(Role::Tool, "result"),
+            tool_use_msg(), // the loop errored before this tool_use got a result
+        ];
+        super::persist_failed_turn(&store, None, &mut session);
+        let saved = store.load_messages("sess-err").expect("load");
+        assert_eq!(
+            saved.len(),
+            3,
+            "completed turns persisted, orphan tool_use dropped"
+        );
+        assert_eq!(saved, session.messages);
     }
 
     #[test]

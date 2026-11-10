@@ -304,6 +304,56 @@ async fn maybe_compact_session(
     }
 }
 
+/// A7: percent of the context window past which old tool results are elided.
+const ELIDE_HIGH_WATER_PCT: usize = 70;
+
+/// A7 summary-free elision, run after [`maybe_compact_session`] each turn.
+///
+/// Summary compaction can only fold turns that already have a Haiku summary,
+/// and those are produced after the request returns — so inside one long
+/// autonomous prompt nothing is foldable. Once the context passes the
+/// high-water mark (bytes or last measured prefix tokens), every tool result
+/// older than the last [`crate::compactor::ELIDE_KEEP_TURNS`] assistant turns
+/// is replaced by a one-line placeholder in a single batch.
+/// `ORIGIN_ELIDE_HIGH_WATER` overrides the percent (1–100); `0` disables it.
+fn maybe_elide_session(session: &mut Session, opts: &LoopOptions, last_input_tokens: u32, turn_model: &str) {
+    let pct = std::env::var("ORIGIN_ELIDE_HIGH_WATER")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(ELIDE_HIGH_WATER_PCT)
+        .min(100);
+    if pct == 0 {
+        return;
+    }
+    let window = crate::model_window::model_context_window(&session.model)
+        .min(crate::model_window::model_context_window(turn_model));
+    let token_mark = usize::try_from(window).unwrap_or(usize::MAX).saturating_mul(pct) / 100;
+    let bytes = crate::compactor::estimate_transcript_bytes(&session.messages, opts.cas.as_deref());
+    if !should_compact(
+        bytes,
+        token_mark.saturating_mul(BYTES_PER_TOKEN),
+        last_input_tokens,
+        token_mark,
+    ) {
+        return;
+    }
+    // ponytail: a transcript whose last 10 turns alone exceed the mark elides
+    // one newly-aged result per turn; add a minimum-freed-bytes floor if the
+    // resulting cache churn shows up in cost.
+    let elided = crate::compactor::elide_old_tool_results(
+        &mut session.messages,
+        crate::compactor::ELIDE_KEEP_TURNS,
+        opts.cas.as_deref(),
+    );
+    if elided > 0 {
+        tracing::info!(
+            elided,
+            bytes,
+            "context past high-water mark; elided old tool results"
+        );
+    }
+}
+
 /// Whether first-occurrence array compression (`SchemaCrush`, the headroom
 /// `SmartCrusher` port) is active. Default-ON; set `ORIGIN_SCHEMA_CRUSH=0` (or
 /// `false`) to disable. Read at both the system-prompt explainer site and the
@@ -4266,6 +4316,7 @@ async fn run_loop_inner(
         }
         let (resp, mut speculative, stream_first_token_ms) = {
             let mut attempt: u32 = 0;
+            let mut overflow_retried = false;
             loop {
                 let result: Result<
                     (origin_provider::ChatResponse, SpeculativeRegistry, Option<u64>),
@@ -4437,6 +4488,21 @@ async fn run_loop_inner(
                         tracing::warn!(attempt, sleep_secs, "provider returned an empty response; backing off and retrying");
                         tokio::time::sleep(std::time::Duration::from_secs(sleep_secs.into())).await;
                         attempt += 1;
+                    }
+                    // A7: the request overflowed the model's context window. Elide
+                    // old tool results with the aggressive window (session AND the
+                    // built request, so the retry and later turns both shrink) and
+                    // retry exactly once; a second overflow falls through below.
+                    Err(LoopError::Provider(origin_provider::ProviderError::Api(msg)))
+                        if !overflow_retried && crate::compactor::is_context_length_error(&msg) =>
+                    {
+                        overflow_retried = true;
+                        let keep = crate::compactor::ELIDE_KEEP_TURNS_AGGRESSIVE;
+                        let cas = opts.cas.as_deref();
+                        let elided =
+                            crate::compactor::elide_old_tool_results(&mut session.messages, keep, cas);
+                        crate::compactor::elide_old_tool_results(&mut req.messages, keep, cas);
+                        tracing::warn!(elided, %msg, "provider context-length error; elided old tool results, retrying once");
                     }
                     // R7: a persistent Api/Auth failure must fold into the router
                     // health EMA — otherwise a model that keeps failing keeps a
@@ -5951,6 +6017,7 @@ async fn run_loop_inner(
         // post-compaction transcript. Below the cap (the default for short
         // sessions) this is a no-op ⇒ byte-identical.
         maybe_compact_session(session, opts, last_input_tokens, &turn_model).await;
+        maybe_elide_session(session, opts, last_input_tokens, &turn_model);
 
         // Place a prompt-cache breakpoint at the freshly closed turn boundary
         // so the next iteration's `ChatRequest` (which re-sends the full
