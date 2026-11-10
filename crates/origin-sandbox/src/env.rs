@@ -66,6 +66,13 @@ const ALLOW: &[&str] = &[
     "DYLD_LIBRARY_PATH",
     "DOTNET_ROOT",
     "NODE_PATH",
+    // Browser sidecars (agent-browser, CloakBrowser): where Playwright keeps
+    // its browsers, and the display a headed browser opens on.
+    "PLAYWRIGHT_BROWSERS_PATH",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
 ];
 
 /// True when `name` looks like a credential: `*_API_KEY`, `*_TOKEN`,
@@ -231,6 +238,15 @@ mod tests {
             "NODE_PATH",
         ] {
             assert!(keep(n, ""), "project resolution needs {n}");
+        }
+        for n in [
+            "PLAYWRIGHT_BROWSERS_PATH",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XAUTHORITY",
+            "XDG_RUNTIME_DIR",
+        ] {
+            assert!(keep(n, ""), "browser sidecars need {n}");
         }
         for n in [
             "GOPROXY",
