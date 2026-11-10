@@ -68,7 +68,9 @@ tasks/<id>/repo/...        # fixture tasks only
 | `timeout_s` | Cap for `origin run` (and separately for the check). A timed-out run still gets checked. |
 
 Before any trial, the runner runs the check on the untouched repo and rejects the
-task if it already passes: a task the agent cannot fail measures nothing.
+task if it already passes: a task the agent cannot fail measures nothing. `--dry-run`
+never touches the network, so it does this check for fixture tasks only; for a git
+task it validates the fields and prints the clone command it would run.
 
 The two examples are offline fixtures with the shapes of real failures this plan
 fixed:
@@ -85,7 +87,8 @@ Needs `origin` on PATH (or `--origin <path>`), `git`, Python 3.10+ (standard
 library only) and a provider key for the model, e.g. `ANTHROPIC_API_KEY`.
 
 ```bash
-# validate the task files, check each fails untouched, print the commands; no origin calls
+# validate the task files, check each fixture task fails untouched, print the commands;
+# no origin calls, no network (git tasks are not cloned)
 python bench/regression/run.py --model claude-opus-4-8 --effort high --dry-run
 
 # the run itself (inside the disposable container)

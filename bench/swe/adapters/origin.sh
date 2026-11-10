@@ -37,29 +37,37 @@ git add -A >/dev/null 2>&1 || true
 git diff --cached
 git reset -q >/dev/null 2>&1 || true
 
-# Metrics: sum the per-turn `{"kind":"usage",...}` stream events.
+# Metrics: sum the `request_usage` stream events (exactly one per provider
+# request; `input_tokens` is uncached input). Raw `usage` events relay each
+# provider usage report as it streams, and Anthropic reports one request in two
+# parts, so summing them double-counts. An origin binary that predates
+# `request_usage` emits none: then fall back to summing `usage` and say so.
 python3 - "$run" "$metrics_out" "$model" "$start" "$end" <<'PY'
 import json, sys
 run, out, model, start, end = sys.argv[1:6]
-ti = to = cr = cc = 0
+keys = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+sums = {"request_usage": [0, 0, 0, 0], "usage": [0, 0, 0, 0]}
+requests = 0
 try:
     for line in open(run, encoding="utf-8", errors="ignore"):
-        line = line.strip()
-        if not line:
-            continue
         try:
             ev = json.loads(line)
         except Exception:
             continue
-        if ev.get("kind") == "usage":
-            ti += ev.get("input_tokens", 0)
-            to += ev.get("output_tokens", 0)
-            cr += ev.get("cache_read_input_tokens", 0)
-            cc += ev.get("cache_creation_input_tokens", 0)
+        kind = ev.get("kind") if isinstance(ev, dict) else None
+        if kind in sums:
+            requests += kind == "request_usage"
+            sums[kind] = [s + ev.get(k, 0) for s, k in zip(sums[kind], keys)]
 except FileNotFoundError:
     pass
+source = "request_usage" if requests else "usage"
+if not requests:
+    print("origin.sh: no request_usage events (origin predates them); "
+          "token counts summed from raw usage events and may double-count", file=sys.stderr)
+ti, to, cr, cc = sums[source]
 json.dump({"input_tokens": ti, "output_tokens": to, "cache_read": cr,
-           "cache_creation": cc, "wall_s": float(end) - float(start), "model": model},
+           "cache_creation": cc, "wall_s": float(end) - float(start), "model": model,
+           "token_source": source},
           open(out, "w"))
 PY
 rm -f "$run"

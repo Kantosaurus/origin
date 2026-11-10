@@ -133,8 +133,14 @@ def prepare_pristine(t: dict, dest: str) -> None:
     else:
         # ponytail: one clone per task per run, add a bare-clone cache (as in
         # bench/swe/run.py) if git tasks get large or many.
-        git("clone", "--quiet", t["repo"]["git"], dest, cwd=os.path.dirname(dest))
-        git("checkout", "--quiet", "--force", t["repo"]["commit"], cwd=dest)
+        for argv in git_setup_cmds(t, dest):
+            subprocess.run(argv, check=True, capture_output=True, text=True)
+
+
+def git_setup_cmds(t: dict, dest: str) -> list[list[str]]:
+    """The commands that lay a git task's repo down at `dest`."""
+    return [["git", "clone", "--quiet", t["repo"]["git"], dest],
+            ["git", "-C", dest, "checkout", "--quiet", "--force", t["repo"]["commit"]]]
 
 
 def verify_argv(t: dict) -> list[str]:
@@ -288,7 +294,8 @@ def main() -> int:
     ap.add_argument("--origin", default="origin", help="origin binary")
     ap.add_argument("--out", default=os.path.join(HERE, "out", "results.json"))
     ap.add_argument("--dry-run", action="store_true",
-                    help="validate tasks, check each fails before a fix, print commands; never calls origin")
+                    help="validate tasks, check each fixture task fails before a fix, print commands; "
+                         "never calls origin or the network")
     args = ap.parse_args()
     sys.stdout.reconfigure(line_buffering=True)  # keep stdout/stderr lines in order when piped
 
@@ -318,37 +325,43 @@ def main() -> int:
     print(f"{len(tasks)} task(s) x {args.trials} trial(s), model={args.model} effort={args.effort}", file=sys.stderr)
     results = []
     for t in tasks:
-        scratch = tempfile.mkdtemp(prefix=f"regr_{t['id']}_")
-        pristine = os.path.join(scratch, "pristine")
-        try:
-            prepare_pristine(t, pristine)
-            # A task that passes before the agent touches it measures nothing.
-            # Checked on a copy so the verify run's build output (__pycache__,
-            # target/, ...) never leaks into the trials' starting repo.
-            shutil.copytree(pristine, os.path.join(scratch, "precheck"))
-            pre = run_verify(t, os.path.join(scratch, "precheck"))
-            if pre == t["verify"]["expect_exit"]:
-                print(f"invalid task: {t['id']}: verify already passes on the untouched repo", file=sys.stderr)
-                return 2
-            print(f"[{t['id']}] pre-fix verify exit={pre} (expected {t['verify']['expect_exit']} after the fix)",
-                  file=sys.stderr)
-            if args.dry_run:
-                print(f"[{t['id']}] cwd=<copy of pristine repo> timeout={t['timeout_s']}s")
-                print(f"  {env_prefix} {shlex.join(origin_argv(args.origin, t, args.model, args.effort))}")
-                print(f"  {shlex.join(verify_argv(t))}  # pass iff exit == {t['verify']['expect_exit']}")
-                continue
-            trials = []
-            for i in range(args.trials):
-                r = run_trial(t, pristine, i, args)
-                trials.append(r)
-                print(f"  {t['id']} trial {i}: {'PASS' if r['passed'] else 'FAIL'} "
-                      f"{r['wall_s']:.0f}s ${r['cost_usd']:.4f}", file=sys.stderr)
-            results.append({"id": t["id"], "trials": trials})
-        finally:
-            rmtree(scratch)
+        if args.dry_run and "_fixture" not in t:
+            # No network in a dry run: show the clone, skip the pre-fix check.
+            print(f"[{t['id']}] git task: not cloned in a dry run, pre-fix check skipped", file=sys.stderr)
+            for argv in git_setup_cmds(t, "<pristine>"):
+                print(f"  {shlex.join(argv)}")
+        else:
+            scratch = tempfile.mkdtemp(prefix=f"regr_{t['id']}_")
+            pristine = os.path.join(scratch, "pristine")
+            try:
+                prepare_pristine(t, pristine)
+                # A task that passes before the agent touches it measures nothing.
+                # Checked on a copy so the verify run's build output (__pycache__,
+                # target/, ...) never leaks into the trials' starting repo.
+                shutil.copytree(pristine, os.path.join(scratch, "precheck"))
+                pre = run_verify(t, os.path.join(scratch, "precheck"))
+                if pre == t["verify"]["expect_exit"]:
+                    print(f"invalid task: {t['id']}: verify already passes on the untouched repo", file=sys.stderr)
+                    return 2
+                print(f"[{t['id']}] pre-fix verify exit={pre} (expected {t['verify']['expect_exit']} after the fix)",
+                      file=sys.stderr)
+                if not args.dry_run:
+                    trials = []
+                    for i in range(args.trials):
+                        r = run_trial(t, pristine, i, args)
+                        trials.append(r)
+                        print(f"  {t['id']} trial {i}: {'PASS' if r['passed'] else 'FAIL'} "
+                              f"{r['wall_s']:.0f}s ${r['cost_usd']:.4f}", file=sys.stderr)
+                    results.append({"id": t["id"], "trials": trials})
+            finally:
+                rmtree(scratch)
+        if args.dry_run:
+            print(f"[{t['id']}] cwd=<copy of pristine repo> timeout={t['timeout_s']}s")
+            print(f"  {env_prefix} {shlex.join(origin_argv(args.origin, t, args.model, args.effort))}")
+            print(f"  {shlex.join(verify_argv(t))}  # pass iff exit == {t['verify']['expect_exit']}")
 
     if args.dry_run:
-        print("dry run ok: no origin calls made", file=sys.stderr)
+        print("dry run ok: no origin calls, no network", file=sys.stderr)
         return 0
 
     try:

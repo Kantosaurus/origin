@@ -6,6 +6,7 @@
 /target-test/
 **/*.rs.bk
 *.pdb
+/bench/regression/out/
 
 # Local gaps analysis / planning docs — kept on disk, not tracked
 /Gaps.md
