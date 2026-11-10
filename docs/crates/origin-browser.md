@@ -5,8 +5,9 @@
 ## Purpose
 
 `origin-browser` provides the agent's web access in three shapes: a stateful
-browsing router that runs verbs against a primary "agent-browser" CLI and falls
-back to a stealthier "cloak" backend on bot detection; a pure-Rust one-shot
+browsing router that runs verbs against a primary "agent-browser" CLI and, only
+when `ORIGIN_STEALTH_FALLBACK=1` (opt-in since D11), falls back to a stealthier
+"cloak" backend on bot detection; a pure-Rust one-shot
 `WebFetch` that GETs a URL and returns reader-mode markdown; and a `WebSearch`
 helper. An opt-in `VisualCapture` adds a screenshot + console "visual loop".
 
@@ -30,7 +31,7 @@ client), `detectors` (`classify` → `Verdict`), `protocol`, `router`, `visual`.
 ```rust
 pub struct BrowserRouter {
     primary: AgentBrowserClient,
-    cloak: CloakClient,
+    cloak: Option<CloakClient>, // None unless ORIGIN_STEALTH_FALLBACK=1
     state: HashMap<String, SessionState>,
 }
 
@@ -46,8 +47,10 @@ pub struct FetchResult { pub final_url: String, pub content_type: String, pub ma
 ## How it works
 
 The router's policy is fixed: try `agent-browser` first; if `detectors::classify`
-returns a bot-detected `Verdict`, replay the **same** verb against `CloakBrowser`
-and emit the cloak response instead. After two consecutive cloak fallbacks in a
+returns a bot-detected `Verdict` and the stealth fallback is enabled
+(`ORIGIN_STEALTH_FALLBACK=1`; otherwise the Cloak sidecar is never spawned and
+the bot-detected response is returned as is), replay the **same** verb against
+`CloakBrowser` and emit the cloak response instead. After two consecutive cloak fallbacks in a
 session the router marks that session `sticky` so future verbs skip the primary
 entirely. `WebFetch` is a separate, subprocess-free path: `reqwest` GET →
 `readability` extraction → `html2md`, bounded by `FetchOptions::max_bytes`

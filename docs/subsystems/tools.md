@@ -253,7 +253,7 @@ each module's registration.
 | `Diagnostics` | LSP diagnostics for a path or workspace | AutoAllowed | Pure | `Inherit` | yes | Severity filter error/warning/hint/any (`diagnostics.rs`). |
 | `WebFetch` | GET one or more URLs and answer the required `prompt` about them; the page is read by a tool-less quarantine model and only its answer is returned, wrapped in `<external>` (`ORIGIN_WEBFETCH_RAW=1` returns the wrapped page instead) | RequiresPermission | Pure | `Inherit` | **no** | Pure-Rust readability path (`web_fetch.rs`); quarantine in `origin-daemon/src/external_content.rs` (C4). |
 | `WebSearch` | Tavily web search | RequiresPermission | Pure | `Inherit` | **no** | Requires `TAVILY_API_KEY` / vault key (`web_search.rs`). |
-| `Browser` | Stateful dual-backend browser (agent-browser + Cloak fallback) | RequiresPermission | Mutating | `Inherit` | **no** | (`browser.rs`). |
+| `Browser` | Stateful browser (agent-browser; Cloak fallback only with `ORIGIN_STEALTH_FALLBACK=1`) | RequiresPermission | Mutating | `Inherit` | **no** | (`browser.rs`). |
 | `Recall` | Inflate a CAS handle into the response; optional region slice | AutoAllowed | Pure | `Inherit` | **yes** | Hot on purpose: SchemaCrush offloads behind a `recall` handle (`recall.rs`). |
 | `ToolSearch` | Fetch full schemas for deferred tools | AutoAllowed | Pure | `Inherit` | yes | `select:Name,Name` or keyword rank (`tool_search.rs`). |
 | `Task` | Dispatch a sub-agent (swarm worker) | AutoAllowed | Mutating | `Inherit` | **yes** | No prompt; child confined to `allowed_tools` (`task.rs`). |
@@ -673,15 +673,19 @@ pub use visual::VisualCapture;
 ### Dual-backend router (agent-browser primary, CloakBrowser fallback)
 
 `router.rs` policy: try **`agent-browser`** first; if the classifier flags the
-response as bot-detected, replay the *same* verb against **`CloakBrowser`** and
-emit that instead. After two consecutive Cloak fallbacks in a session, mark the
-session **sticky** so future verbs skip primary entirely:
+response as bot-detected **and the stealth fallback is enabled**
+(`ORIGIN_STEALTH_FALLBACK=1`, opt-in since D11), replay the *same* verb against
+**`CloakBrowser`** and emit that instead. After two consecutive Cloak fallbacks
+in a session, mark the session **sticky** so future verbs skip primary entirely.
+Without the opt-in the Cloak sidecar is never spawned and a bot-detected
+response is returned as is:
 
 ```rust
 match classify(&primary) {
     Verdict::Clean => { st.cloak_streak = 0; Ok(primary) }
     Verdict::BotDetected(_reason) => {
-        let cloak_resp = self.cloak.send(verb).await?;
+        let Some(cloak) = self.cloak.as_mut() else { return Ok(primary) };
+        let cloak_resp = cloak.send(verb).await?;
         if cloak_resp.ok {
             st.cloak_streak = st.cloak_streak.saturating_add(1);
             if st.cloak_streak >= 2 { st.sticky = true; }
@@ -697,7 +701,7 @@ client for the `agent-browser` CLI (`agent-browser --stdio`, or
 stdio-JSON. `Verb` covers `Open`/`Click`/`Fill`/`Extract`/`Snapshot`/
 `Screenshot`/`Close`, each carrying a `session`. `CloakClient` (`cloak.rs`) is the
 matching stealth backend — same verb protocol, an anti-detection browser used
-only on fallback.
+only on fallback, and only when `ORIGIN_STEALTH_FALLBACK=1`.
 
 ### Bot detection
 

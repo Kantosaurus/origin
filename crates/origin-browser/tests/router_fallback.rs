@@ -22,7 +22,7 @@ async fn falls_back_to_cloak_when_primary_signals_bot() {
     }
     let mut router = BrowserRouter::with_commands(
         ("node", vec![fake("agent_browser_bot.mjs")]),
-        ("node", vec![fake("cloak_fake.mjs")]),
+        Some(("node", vec![fake("cloak_fake.mjs")])),
     )
     .await
     .unwrap();
@@ -42,6 +42,29 @@ async fn falls_back_to_cloak_when_primary_signals_bot() {
 }
 
 #[tokio::test]
+async fn bot_detection_without_stealth_opt_in_returns_primary_response() {
+    if !common::node_available() {
+        eprintln!(
+            "skipping bot_detection_without_stealth_opt_in_returns_primary_response: `node` unavailable"
+        );
+        return;
+    }
+    // D11: no stealth backend configured ⇒ no replay, no sticky switch.
+    let mut router = BrowserRouter::with_commands(("node", vec![fake("agent_browser_bot.mjs")]), None)
+        .await
+        .unwrap();
+    let resp = router
+        .run(&Verb::Open {
+            url: "u".into(),
+            session: "s1".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp.title.as_deref(), Some("Just a moment..."));
+    assert!(!router.sticky_cloak("s1"));
+}
+
+#[tokio::test]
 async fn primary_used_when_clean() {
     if !common::node_available() {
         eprintln!("skipping primary_used_when_clean: `node` unavailable");
@@ -49,7 +72,7 @@ async fn primary_used_when_clean() {
     }
     let mut router = BrowserRouter::with_commands(
         ("node", vec![fake("agent_browser_fake.mjs")]),
-        ("node", vec![fake("cloak_fake.mjs")]),
+        Some(("node", vec![fake("cloak_fake.mjs")])),
     )
     .await
     .unwrap();
@@ -71,7 +94,7 @@ async fn sticks_to_cloak_after_two_successful_fallbacks() {
     }
     let mut router = BrowserRouter::with_commands(
         ("node", vec![fake("agent_browser_bot.mjs")]),
-        ("node", vec![fake("cloak_fake.mjs")]),
+        Some(("node", vec![fake("cloak_fake.mjs")])),
     )
     .await
     .unwrap();

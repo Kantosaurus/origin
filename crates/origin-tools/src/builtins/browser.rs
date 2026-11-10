@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `Browser` tool — dual-backend browser with transparent agent-detection fallback.
+//! `Browser` tool — `agent-browser`, with an opt-in `CloakBrowser` fallback on bot detection (`ORIGIN_STEALTH_FALLBACK=1`, D11).
 
 use crate::{SideEffects, Tier, Urgency};
 use origin_browser::{BrowserRouter, SnapshotResp, Verb};
@@ -18,7 +18,7 @@ pub async fn browser(router: &mut BrowserRouter, verb: Verb) -> Result<SnapshotR
 
 crate::origin_tool! {
     name: "Browser",
-    description: "Stateful browser with agent-detection fallback to CloakBrowser.",
+    description: "Stateful browser (agent-browser backend).",
     tier: Tier::RequiresPermission,
     urgency: Urgency::Medium,
     side_effects: SideEffects::Mutating,
