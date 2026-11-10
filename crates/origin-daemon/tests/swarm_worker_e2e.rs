@@ -100,6 +100,7 @@ async fn real_worker_runs_a_subagent_to_completion() {
         parent_actor: origin_plan::ActorId::new(0),
         model: None,
         mcp_servers: Vec::new(),
+        effort: None,
     };
 
     let handle = coord.spawn(spec).await.expect("spawn worker");
@@ -186,6 +187,7 @@ async fn worker_calling_task_recovers_and_completes() {
         parent_actor: origin_plan::ActorId::new(0),
         model: None,
         mcp_servers: Vec::new(),
+        effort: None,
     };
     let handle = coord.spawn(spec).await.expect("spawn worker");
     let report = coord.await_completion(&handle).await.expect("await");
@@ -253,6 +255,7 @@ async fn worker_write_ran(gov_toml: &str, allowed: &str) -> bool {
         parent_actor: origin_plan::ActorId::new(0),
         model: None,
         mcp_servers: Vec::new(),
+        effort: None,
     };
     let handle = coord.spawn(spec).await.expect("spawn worker");
     let _ = coord.await_completion(&handle).await;

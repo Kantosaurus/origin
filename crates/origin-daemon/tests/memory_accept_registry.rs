@@ -104,6 +104,7 @@ async fn accept_persists_via_proposal_registry() {
         policy: None,
         conseca: None,
         effort: None,
+        explicit_effort: None,
         thinking_tokens: None,
         attachments: Vec::new(),
         system_suffix: None,

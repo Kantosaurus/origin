@@ -90,6 +90,10 @@ pub struct WorkerSpec {
     /// only, for the duration of its run.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerSpec>,
+    /// The parent's EXPLICIT reasoning effort (`/effort`, `/fast`, `--effort`)
+    /// as a wire token (`low`, `max`, …). `None` ⇒ the worker's own default.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 /// A follow-up task suggested by a worker on completion.

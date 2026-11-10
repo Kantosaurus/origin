@@ -3646,11 +3646,15 @@ pub struct LoopOptions {
     /// contract as `policy`: an Allow is downgraded to Deny when
     /// [`origin_conseca::check_tool`] is not `Allow`. `None` ⇒ no effect.
     pub conseca: Option<Arc<origin_conseca::SecurityPolicy>>,
-    /// Optional reasoning-effort hint for every turn of this loop. `None` (the
-    /// default) leaves each `ChatRequest.effort` as `None` ⇒ provider wire
-    /// byte-identical. Set from `PromptRequest.effort` in `handle_request`.
-    /// *Closes: claude-code `/effort`+`/fast` (the agent-loop wire).*
+    /// Reasoning effort for every turn of this loop, as resolved in
+    /// `handle_request` (explicit choice, else `ORIGIN_DEFAULT_EFFORT`, else the
+    /// Anthropic default). `None` ⇒ a turn on Anthropic still gets the
+    /// per-profile default (`High`; `Medium` for a worker); any other provider
+    /// sends no effort. *Closes: claude-code `/effort`+`/fast` (the agent-loop wire).*
     pub effort: Option<origin_provider::ReasoningEffort>,
+    /// B3: the user's EXPLICIT effort (`/effort`, `/fast`, `--effort`) only —
+    /// never a default. Handed to the sub-agents this loop's `Task` spawns.
+    pub explicit_effort: Option<origin_provider::ReasoningEffort>,
     /// Resolved ponytail intensity for this run (default `Full`). Drives both the
     /// injected `<origin-ponytail>` system block and the pre-dispatch dependency
     /// gate. Set from `PromptRequest.ponytail` (via `origin_ponytail::resolve_mode`)
@@ -3847,6 +3851,7 @@ impl Default for LoopOptions {
             policy: None,
             conseca: None,
             effort: None,
+            explicit_effort: None,
             ponytail: origin_ponytail::PonytailMode::Full,
             thinking_tokens: None,
             attachments: Vec::new(),
@@ -5405,10 +5410,14 @@ async fn run_loop_inner(
             tools: tools_schema.clone(),
             // R6: re-resolve effort against the ROUTED provider. When the session
             // resolved to None but this turn runs on Anthropic (e.g. a cross-
-            // provider router rebuild), use the main loop's default (B3: High).
-            // An explicit `/effort` (already in opts.effort) still wins.
+            // provider router rebuild), use the profile's default (B3: High;
+            // Medium for a worker). An explicit `/effort` (in opts.effort) wins.
             effort: opts.effort.or_else(|| {
-                (turn_provider.name() == "anthropic").then_some(origin_provider::ReasoningEffort::High)
+                (turn_provider.name() == "anthropic").then_some(if worker {
+                    origin_provider::ReasoningEffort::Medium
+                } else {
+                    origin_provider::ReasoningEffort::High
+                })
             }),
             thinking_tokens: opts.thinking_tokens,
             // Attach images/PDF only to the first turn's user message. On later
@@ -6649,6 +6658,9 @@ async fn run_loop_inner(
                             if input.model.is_none() {
                                 input.model = Some(session.model.clone());
                             }
+                            // B3: the user's explicit effort reaches the worker
+                            // (a default does not; the worker has its own).
+                            input.effort = opts.explicit_effort.map(|e| e.as_wire_str().to_owned());
                             // A4: a skill-masked parent may only delegate tools its
                             // mask permits, as exact names: a glob entry (`*`,
                             // `mcp__x__*`) is dropped even if the mask lists that

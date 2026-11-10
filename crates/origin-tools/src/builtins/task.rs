@@ -95,6 +95,10 @@ pub struct TaskInput {
     /// await the worker in-turn (the legacy blocking behaviour).
     #[serde(default = "default_background")]
     pub background: bool,
+    /// Set by the dispatching loop, never by the model (`serde(skip)`): the
+    /// parent's explicit effort token, copied to [`WorkerSpec::effort`].
+    #[serde(skip)]
+    pub effort: Option<String>,
 }
 
 /// Background dispatch is the default (see [`TaskInput::background`]).
@@ -231,6 +235,7 @@ fn worker_spec_from(input: TaskInput, user_mcp: &[McpServerSpec]) -> Result<Work
         parent_actor: origin_plan::ActorId::new(0),
         model: input.model,
         mcp_servers,
+        effort: input.effort,
     })
 }
 

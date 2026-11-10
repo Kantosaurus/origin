@@ -175,6 +175,7 @@ pub fn step_worker_spec(step: &WorkflowStep, catalog: &SkillCatalog) -> WorkerSp
         parent_actor: ActorId::new(0),
         model: None,
         mcp_servers: Vec::new(),
+        effort: None,
     }
 }
 

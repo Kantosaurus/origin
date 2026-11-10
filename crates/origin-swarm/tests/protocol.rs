@@ -46,6 +46,7 @@ async fn three_workers_complete_and_report() {
             parent_actor: origin_plan::ActorId::new(0),
             model: None,
             mcp_servers: Vec::new(),
+            effort: None,
         };
         handles.push(coord.spawn(spec).await.expect("spawn"));
     }

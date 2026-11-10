@@ -115,6 +115,7 @@ async fn memory_proposed_round_trip_via_stub_provider() {
             policy: None,
             conseca: None,
             effort: None,
+            explicit_effort: None,
             thinking_tokens: None,
             attachments: Vec::new(),
             system_suffix: None,

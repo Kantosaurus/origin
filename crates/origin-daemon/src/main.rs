@@ -1728,31 +1728,33 @@ fn resolve_turn_effort(
         .or_else(|| (provider_name == "anthropic").then_some(origin_provider::ReasoningEffort::High))
 }
 
+/// A best-of-N candidate's run: the orchestrator's resolved `effort`, so an
+/// explicit `/effort` reaches it.
+fn candidate_opts(effort: Option<origin_provider::ReasoningEffort>, cwd: &std::path::Path) -> LoopOptions {
+    LoopOptions {
+        max_turns: 60,
+        effort,
+        cwd: Some(cwd.to_path_buf()),
+        ..LoopOptions::default()
+    }
+}
+
 /// B3 escape hatch: `ORIGIN_DEFAULT_EFFORT`, read once per daemon process so the
 /// default never changes under a running conversation. Main loop only.
 fn env_default_effort() -> Option<origin_provider::ReasoningEffort> {
     static EFFORT: std::sync::OnceLock<Option<origin_provider::ReasoningEffort>> = std::sync::OnceLock::new();
-    *EFFORT.get_or_init(|| {
-        let raw = std::env::var("ORIGIN_DEFAULT_EFFORT").ok()?;
-        let parsed = parse_effort_name(&raw);
-        if parsed.is_none() {
-            tracing::warn!(value = %raw, "ORIGIN_DEFAULT_EFFORT: unknown effort level (ignored)");
-        }
-        parsed
-    })
+    *EFFORT.get_or_init(|| parse_default_effort(std::env::var("ORIGIN_DEFAULT_EFFORT").ok().as_deref()))
 }
 
-/// An effort name as `/effort` accepts it (its aliases included).
-fn parse_effort_name(name: &str) -> Option<origin_provider::ReasoningEffort> {
-    let name = name.trim().to_ascii_lowercase();
-    let canonical = match name.as_str() {
-        "min" => "low",
-        "mid" => "medium",
-        "maximum" | "ultra" => "max",
-        "ultra-code" => "ultracode",
-        other => other,
-    };
-    origin_provider::ReasoningEffort::from_wire_str(canonical)
+/// `ORIGIN_DEFAULT_EFFORT`'s value: a name `/effort` accepts; empty or
+/// whitespace counts as unset; anything else is ignored with a warning.
+fn parse_default_effort(raw: Option<&str>) -> Option<origin_provider::ReasoningEffort> {
+    let raw = raw.filter(|v| !v.trim().is_empty())?;
+    let parsed = origin_provider::ReasoningEffort::parse_name(raw);
+    if parsed.is_none() {
+        tracing::warn!(value = %raw, "ORIGIN_DEFAULT_EFFORT: unknown effort level (ignored)");
+    }
+    parsed
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1915,6 +1917,10 @@ async fn handle_request(
             let slot = active_account.lock().await.clone();
             origin_daemon::agent::resolve_session_account(req.account.as_deref(), &slot)
         };
+        let explicit_effort = req
+            .effort
+            .as_deref()
+            .and_then(origin_provider::ReasoningEffort::from_wire_str);
         let opts = LoopOptions {
             // No fixed turn cap on the live request loop: run until the model
             // produces a tool-free final answer. `u32::MAX` is the "infinite"
@@ -1989,17 +1995,13 @@ async fn handle_request(
             // that file is absent both are `None` ⇒ default daemon behavior is
             // byte-identical; when present they narrow (never widen) tool access
             // via the deny-only `apply_governance_overlay` in `agent.rs`.
-            effort: resolve_turn_effort(
-                req.effort
-                    .as_deref()
-                    .and_then(origin_provider::ReasoningEffort::from_wire_str),
-                env_default_effort(),
-                provider.name(),
-            ),
+            effort: resolve_turn_effort(explicit_effort, env_default_effort(), provider.name()),
             // ^ claude-code `/effort`+`/fast`: the CLI sends a canonical token;
             // an unknown token maps to `None`. With no explicit effort,
             // `ORIGIN_DEFAULT_EFFORT`, else Anthropic models default to `High`;
             // other providers stay `None` ⇒ wire byte-identical. See `resolve_turn_effort`.
+            explicit_effort,
+            // ^ B3: only the user's own choice is handed down to sub-agents.
             ponytail: origin_ponytail::resolve_mode(
                 req.ponytail
                     .as_deref()
@@ -2144,6 +2146,7 @@ async fn handle_request(
                 session.model.clone(),
                 session.id.clone(),
                 summary.gate_signals.is_some(),
+                opts.effort,
             )
             .await;
         }
@@ -2260,6 +2263,7 @@ async fn maybe_run_best_of_n(
     model: String,
     session_id: String,
     hard_tests_red: bool,
+    effort: Option<origin_provider::ReasoningEffort>,
 ) {
     use origin_daemon::bestofn_runner::{run_best_of_n, WorktreeArena};
     use origin_swarm::bestofn::DifficultySignals;
@@ -2325,16 +2329,12 @@ async fn maybe_run_best_of_n(
                 .map_err(|e| format!("candidate runtime: {e}"))?;
             let mut cand_session = Session::new(provider.name(), &model);
             let cand_opts = LoopOptions {
-                max_turns: 60,
                 cas: Some(Arc::clone(&cas)),
                 code_graph: Some(Arc::clone(&code_graph)),
                 // The gate is what makes the candidate self-verify (turn-end
                 // tests + terminal enforcement), so it MUST carry post_edit.
                 post_edit: post_edit.clone(),
-                // Match the orchestrator's effort so candidates aren't downgraded.
-                effort: resolve_turn_effort(None, env_default_effort(), provider.name()),
-                cwd: Some(wt.to_path_buf()),
-                ..LoopOptions::default()
+                ..candidate_opts(effort, wt)
             };
             let res = rt.block_on(origin_daemon::agent::run_loop(
                 &mut cand_session,
@@ -4682,7 +4682,7 @@ fn spawn_metrics_endpoint(metrics: Metrics, addr: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        choice_registry_enabled, detach_last_turn, parse_effort_name, resolve_turn_effort,
+        candidate_opts, choice_registry_enabled, detach_last_turn, parse_default_effort, resolve_turn_effort,
         resume_foreign_event, resume_session_event, turn_window, Session, SessionStore, StreamEvent,
     };
     use origin_core::types::{Block, Message, Role};
@@ -4725,19 +4725,26 @@ mod tests {
     }
 
     #[test]
-    fn default_effort_env_accepts_the_effort_command_names() {
-        for (name, want) in [
-            ("high", ReasoningEffort::High),
-            ("MID", ReasoningEffort::Medium),
-            ("min", ReasoningEffort::Low),
-            ("fast", ReasoningEffort::Fast),
-            ("ultra", ReasoningEffort::Max),
-            ("maximum", ReasoningEffort::Max),
-            ("ultra-code", ReasoningEffort::Ultracode),
-        ] {
-            assert_eq!(parse_effort_name(name), Some(want), "{name}");
-        }
-        assert_eq!(parse_effort_name("bogus"), None);
+    fn default_effort_env_parses_names_and_treats_empty_as_unset() {
+        assert_eq!(parse_default_effort(Some("ultra")), Some(ReasoningEffort::Max));
+        assert_eq!(parse_default_effort(Some(" mid ")), Some(ReasoningEffort::Medium));
+        assert_eq!(parse_default_effort(Some("bogus")), None);
+        assert_eq!(parse_default_effort(Some("")), None);
+        assert_eq!(parse_default_effort(Some("  ")), None);
+        assert_eq!(parse_default_effort(None), None);
+    }
+
+    /// B3: a best-of-N candidate runs at the orchestrator's resolved effort —
+    /// an explicit `max` stays `max`; the default stays the main default.
+    #[test]
+    fn candidates_run_at_the_orchestrators_effort() {
+        let wt = std::path::Path::new("wt");
+        assert_eq!(
+            candidate_opts(Some(ReasoningEffort::Max), wt).effort,
+            Some(ReasoningEffort::Max)
+        );
+        let default = resolve_turn_effort(None, None, "anthropic");
+        assert_eq!(candidate_opts(default, wt).effort, Some(ReasoningEffort::High));
     }
 
     #[test]

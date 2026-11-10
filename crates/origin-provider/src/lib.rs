@@ -150,6 +150,21 @@ impl ReasoningEffort {
             _ => None,
         }
     }
+
+    /// Parse an effort name as a user types it (`/effort`, `--effort`,
+    /// `ORIGIN_DEFAULT_EFFORT`): the wire tokens plus the aliases `min`→low,
+    /// `mid`→medium, `maximum`/`ultra`→max and `ultra-code`→ultracode.
+    #[must_use]
+    pub fn parse_name(s: &str) -> Option<Self> {
+        let s = s.trim().to_ascii_lowercase();
+        Self::from_wire_str(match s.as_str() {
+            "min" => "low",
+            "mid" => "medium",
+            "maximum" | "ultra" => "max",
+            "ultra-code" => "ultracode",
+            other => other,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -362,5 +377,21 @@ mod effort_tests {
         ] {
             assert_eq!(ReasoningEffort::from_wire_str(lvl.as_wire_str()), Some(lvl));
         }
+    }
+
+    #[test]
+    fn parse_name_accepts_the_effort_command_names() {
+        for (name, want) in [
+            ("high", ReasoningEffort::High),
+            (" MID ", ReasoningEffort::Medium),
+            ("min", ReasoningEffort::Low),
+            ("fast", ReasoningEffort::Fast),
+            ("ultra", ReasoningEffort::Max),
+            ("maximum", ReasoningEffort::Max),
+            ("ultra-code", ReasoningEffort::Ultracode),
+        ] {
+            assert_eq!(ReasoningEffort::parse_name(name), Some(want), "{name}");
+        }
+        assert_eq!(ReasoningEffort::parse_name("bogus"), None);
     }
 }

@@ -64,6 +64,7 @@ async fn task_tool_dispatches_worker_and_inlines_report() {
             model: None,
             mcp_servers: vec![],
             background: false,
+            effort: None,
         },
         &[],
     )
@@ -116,6 +117,7 @@ async fn task_tool_filters_disallowed_tools_into_decision_record() {
             model: None,
             mcp_servers: vec![],
             background: false,
+            effort: None,
         },
         &[],
     )

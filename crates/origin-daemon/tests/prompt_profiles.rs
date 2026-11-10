@@ -18,10 +18,12 @@ use origin_provider::{ChatRequest, ChatResponse, Provider, ProviderError, Usage}
 use origin_swarm::{Budget, Coordinator, PlanHandle, WorkerSpec};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
-/// Records every request and answers with plain text, under a chosen name.
+/// Records every request under a chosen name; answers with the scripted
+/// replies in order, then plain text.
 struct Recording {
     name: &'static str,
     requests: Mutex<Vec<ChatRequest>>,
+    script: Mutex<Vec<Message>>,
 }
 
 #[async_trait]
@@ -31,8 +33,14 @@ impl Provider for Recording {
     }
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError> {
         self.requests.lock().unwrap().push(req);
+        let mut script = self.script.lock().unwrap();
+        let assistant = if script.is_empty() {
+            Message::new(Role::Assistant).with_block(Block::text("done"))
+        } else {
+            script.remove(0)
+        };
         Ok(ChatResponse {
-            assistant: Message::new(Role::Assistant).with_block(Block::text("done")),
+            assistant,
             usage: Usage::default(),
         })
     }
@@ -42,7 +50,35 @@ fn recording(name: &'static str) -> Arc<Recording> {
     Arc::new(Recording {
         name,
         requests: Mutex::new(Vec::new()),
+        script: Mutex::new(Vec::new()),
     })
+}
+
+/// A coordinator whose workers are the daemon's real worker on `provider`.
+fn coordinator(provider: &Arc<Recording>, tmp: &tempfile::TempDir) -> Coordinator {
+    let store = Arc::new(origin_store::Store::open(tmp.path().join("origin.db")).unwrap());
+    let cas = Arc::new(
+        CasStore::open(StoreConfig {
+            root: tmp.path().join("cas"),
+            hot_capacity: 64,
+            warm_pack_target_bytes: 1 << 20,
+            cold_zstd_level: 3,
+        })
+        .unwrap(),
+    );
+    let plan_store = Arc::new(PlanStore::open(Arc::clone(&store), Arc::clone(&cas)).unwrap());
+    let plan = PlanHandle::new(Arc::new(AsyncMutex::new(Plan::default())), plan_store);
+    let active: Arc<RwLock<Arc<dyn Provider>>> =
+        Arc::new(RwLock::new(Arc::clone(provider) as Arc<dyn Provider>));
+    let mut coord = Coordinator::new(plan, format!("origin-prompt-profiles-{}", std::process::id()));
+    coord.set_default_worker(origin_daemon::swarm_worker::real_worker(
+        active,
+        cas,
+        origin_keyvault::KeyVault::in_memory(),
+        origin_planner::Plan::default(),
+        origin_daemon::config::Governance::default(),
+    ));
+    coord
 }
 
 /// A small Rust workspace for the repo map to rank.
@@ -70,28 +106,7 @@ async fn main_loop_system(opts: &LoopOptions) -> String {
 /// Run one real swarm worker against `provider`; returns its captured requests.
 async fn worker_requests(provider: Arc<Recording>) -> Vec<ChatRequest> {
     let tmp = tempfile::tempdir().unwrap();
-    let store = Arc::new(origin_store::Store::open(tmp.path().join("origin.db")).unwrap());
-    let cas = Arc::new(
-        CasStore::open(StoreConfig {
-            root: tmp.path().join("cas"),
-            hot_capacity: 64,
-            warm_pack_target_bytes: 1 << 20,
-            cold_zstd_level: 3,
-        })
-        .unwrap(),
-    );
-    let plan_store = Arc::new(PlanStore::open(Arc::clone(&store), Arc::clone(&cas)).unwrap());
-    let plan = PlanHandle::new(Arc::new(AsyncMutex::new(Plan::default())), plan_store);
-    let active: Arc<RwLock<Arc<dyn Provider>>> =
-        Arc::new(RwLock::new(Arc::clone(&provider) as Arc<dyn Provider>));
-    let mut coord = Coordinator::new(plan, format!("origin-prompt-profiles-{}", std::process::id()));
-    coord.set_default_worker(origin_daemon::swarm_worker::real_worker(
-        active,
-        Arc::clone(&cas),
-        origin_keyvault::KeyVault::in_memory(),
-        origin_planner::Plan::default(),
-        origin_daemon::config::Governance::default(),
-    ));
+    let coord = coordinator(&provider, &tmp);
     let spec = WorkerSpec {
         goal: "investigate the foo module".into(),
         allowed_tools: vec!["Read".into(), "Grep".into()],
@@ -105,6 +120,7 @@ async fn worker_requests(provider: Arc<Recording>) -> Vec<ChatRequest> {
         parent_actor: origin_plan::ActorId::new(0),
         model: None,
         mcp_servers: Vec::new(),
+        effort: None,
     };
     let handle = coord.spawn(spec).await.unwrap();
     coord.await_completion(&handle).await.unwrap();
@@ -173,6 +189,71 @@ async fn worker_defaults_to_medium_effort_on_anthropic() {
         "{}",
         body["output_config"]
     );
+}
+
+/// A parent loop on Anthropic whose model dispatches one in-turn `Task`;
+/// returns the requests its real worker sent.
+async fn worker_requests_via_task(parent: LoopOptions) -> Vec<ChatRequest> {
+    let tmp = tempfile::tempdir().unwrap();
+    let provider = recording("anthropic");
+    provider.script.lock().unwrap().push(
+        Message::new(Role::Assistant).with_block(Block::ToolUse {
+            id: "tu_1".into(),
+            name: "Task".into(),
+            input_json: serde_json::to_vec(&serde_json::json!({
+                "goal": "look around", "allowed_tools": ["Read"], "background": false
+            }))
+            .unwrap(),
+            cache_marker: None,
+        }),
+    );
+    let opts = LoopOptions {
+        coordinator: Some(Arc::new(coordinator(&provider, &tmp))),
+        ..parent
+    };
+    let mut session = Session::new("anthropic", "claude-test");
+    run_loop(&mut session, "delegate", provider.as_ref(), &AlwaysAllow, &opts)
+        .await
+        .unwrap();
+    let reqs = provider.requests.lock().unwrap().clone();
+    let worker: Vec<_> = reqs
+        .into_iter()
+        .filter(|r| r.system.contains("<origin-worker>"))
+        .collect();
+    assert!(!worker.is_empty(), "the Task must have run a worker");
+    worker
+}
+
+/// B3: a parent's EXPLICIT effort reaches its workers, up or down; a parent on
+/// the default leaves its workers on theirs (`medium`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_parent_effort_reaches_workers() {
+    use origin_provider::ReasoningEffort::{High, Low, Max, Medium};
+    for (effort, explicit, want) in [
+        (Some(Max), Some(Max), Max),
+        (Some(Low), Some(Low), Low),
+        (Some(High), None, Medium),
+    ] {
+        let parent = LoopOptions {
+            effort,
+            explicit_effort: explicit,
+            ..opts()
+        };
+        let worker = worker_requests_via_task(parent).await;
+        assert_eq!(worker[0].effort, Some(want), "parent explicit {explicit:?}");
+    }
+}
+
+/// B3: a worker turn routed to Anthropic with no effort set gets the worker
+/// default, not the main loop's.
+#[tokio::test]
+async fn worker_profile_fallback_is_medium() {
+    let opts = LoopOptions {
+        prompt_profile: PromptProfile::Worker,
+        ..opts()
+    };
+    let req = first_request(&recording("anthropic"), "claude-test", &opts).await;
+    assert_eq!(req.effort, Some(origin_provider::ReasoningEffort::Medium));
 }
 
 fn headless() -> LoopOptions {

@@ -360,8 +360,8 @@ async fn run_worker(
         // old `SectionId`→band `PrefixLedger` inheritance seam, which the live
         // wire path never consumed and which has now been removed.)
         plan: Some(plan.fork_shared_handle_bands()),
-        // B3: sub-agents default to medium effort (anthropic only).
-        effort: worker_effort(provider.name()),
+        // B3: the parent's explicit effort, else medium (anthropic only).
+        effort: worker_effort(ctx.spec.effort.as_deref(), provider.name()),
         // B5: the small fixed worker prompt, with no repo-map scan.
         prompt_profile: crate::agent::PromptProfile::Worker,
         // #3: sub-agents that EDIT get the same regression enforcement as the
@@ -557,12 +557,14 @@ pub(crate) const WORKER_PROMPT: &str = "<origin-worker>\n\
     run and their results) and what you could not do, and why.\n\
     </origin-worker>";
 
-/// Reasoning effort for a sub-agent's turns, fixed for its whole run. B3:
+/// Reasoning effort for a sub-agent's turns, fixed for its whole run (B3): the
+/// parent's explicit choice (`WorkerSpec::effort`, any provider), else
 /// anthropic ⇒ `Medium` (a delegated sub-task needs less deliberation than the
-/// orchestrator's `High`); non-anthropic providers stay `None` (wire
-/// byte-identical).
-fn worker_effort(provider_name: &str) -> Option<origin_provider::ReasoningEffort> {
-    (provider_name == "anthropic").then_some(origin_provider::ReasoningEffort::Medium)
+/// orchestrator's `High`); other providers stay `None` (wire byte-identical).
+fn worker_effort(explicit: Option<&str>, provider_name: &str) -> Option<origin_provider::ReasoningEffort> {
+    explicit
+        .and_then(origin_provider::ReasoningEffort::from_wire_str)
+        .or_else(|| (provider_name == "anthropic").then_some(origin_provider::ReasoningEffort::Medium))
 }
 
 /// Resolve the post-edit policy for a sub-agent (#3).
@@ -633,12 +635,22 @@ mod tests {
 
     #[test]
     fn sub_agents_default_to_medium_effort_on_anthropic() {
-        assert_eq!(worker_effort("anthropic"), Some(ReasoningEffort::Medium), "B3");
         assert_eq!(
-            worker_effort("openai"),
+            worker_effort(None, "anthropic"),
+            Some(ReasoningEffort::Medium),
+            "B3"
+        );
+        assert_eq!(
+            worker_effort(None, "openai"),
             None,
             "non-anthropic stays wire byte-identical"
         );
+        assert_eq!(
+            worker_effort(Some("low"), "anthropic"),
+            Some(ReasoningEffort::Low),
+            "an explicit parent choice wins, even downward"
+        );
+        assert_eq!(worker_effort(Some("max"), "openai"), Some(ReasoningEffort::Max));
     }
 
     /// Serializes the `ORIGIN_REPRO_GATE` mutations in THIS module's tests.
