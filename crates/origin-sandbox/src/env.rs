@@ -73,6 +73,13 @@ const ALLOW: &[&str] = &[
     "WAYLAND_DISPLAY",
     "XAUTHORITY",
     "XDG_RUNTIME_DIR",
+    // Unix tools: git over ssh needs the agent socket (a path, not a key);
+    // native builds read pkg-config and Apple SDK locations; TZ sets the zone.
+    "SSH_AUTH_SOCK",
+    "PKG_CONFIG_PATH",
+    "TZ",
+    "SDKROOT",
+    "DEVELOPER_DIR",
 ];
 
 /// True when `name` looks like a credential: `*_API_KEY`, `*_TOKEN`,
@@ -249,7 +256,19 @@ mod tests {
             assert!(keep(n, ""), "browser sidecars need {n}");
         }
         for n in [
+            "SSH_AUTH_SOCK",
+            "PKG_CONFIG_PATH",
+            "TZ",
+            "SDKROOT",
+            "DEVELOPER_DIR",
+        ] {
+            assert!(keep(n, ""), "Unix tools need {n}");
+        }
+        for n in [
             "GOPROXY",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
             "PIP_INDEX_URL",
             "NPM_CONFIG_REGISTRY",
             "CARGO_REGISTRY_TOKEN",
