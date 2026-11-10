@@ -125,20 +125,29 @@ pub fn allow_all_env() -> bool {
 
 impl PromptRequest {
     /// C2: the permission mode this turn runs under, and whether a client can
-    /// answer its asks. `ORIGIN_ALLOW_ALL=1` in the daemon's own environment
-    /// forces `off`; otherwise the request decides (see `permission_mode`).
+    /// answer its asks. The request decides (see `permission_mode`); only for a
+    /// request nobody can answer (headless, scheduled, ambient) does
+    /// `ORIGIN_ALLOW_ALL=1` in the daemon's own environment force `off` — an
+    /// interactive client always gets the mode it sent.
     #[must_use]
     pub fn permission(&self) -> (PermissionMode, bool) {
-        let mode = if allow_all_env() {
-            PermissionMode::Off
+        let can_ask = self.interactive || self.permission_ask;
+        if !can_ask && allow_all_env() {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "ORIGIN_ALLOW_ALL=1 in the daemon environment: non-interactive requests run in \
+                     permission mode `off` (every tool call runs without asking)"
+                );
+            });
+            return (PermissionMode::Off, false);
+        }
+        let mode = self.permission_mode.unwrap_or(if self.permission_ask {
+            PermissionMode::On
         } else {
-            self.permission_mode.unwrap_or(if self.permission_ask {
-                PermissionMode::On
-            } else {
-                PermissionMode::Workspace
-            })
-        };
-        (mode, self.interactive || self.permission_ask)
+            PermissionMode::Workspace
+        });
+        (mode, can_ask)
     }
 }
 
@@ -557,6 +566,11 @@ pub enum StreamEvent {
         /// Truncated, human-readable preview of the tool arguments (the command
         /// or path) so the user sees *what* they are approving.
         args_preview: String,
+        /// C2: `true` ⇒ the client must not offer "Always allow" (a `Task`
+        /// delegation, or an ask that needs a person every time); the daemon
+        /// ignores an `always` answer to it anyway. Omitted when `false`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_always: bool,
     },
     /// Interactive structured choice emitted by the `ask_user` builtin tool.
     /// The daemon pauses the tool and blocks on the matching
@@ -1011,6 +1025,7 @@ mod permission_wire_tests {
             id: 7,
             tool: "Bash".to_string(),
             args_preview: "rm -rf build/".to_string(),
+            no_always: true,
         };
         let json = serde_json::to_string(&ev).expect("serialize");
         assert!(
@@ -1023,10 +1038,12 @@ mod permission_wire_tests {
                 id,
                 tool,
                 args_preview,
+                no_always,
             } => {
                 assert_eq!(id, 7);
                 assert_eq!(tool, "Bash");
                 assert_eq!(args_preview, "rm -rf build/");
+                assert!(no_always, "C2: the no-always flag round-trips");
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -1232,8 +1249,28 @@ mod permission_wire_tests {
 
         std::env::set_var("ORIGIN_ALLOW_ALL", "1");
         let plain = PromptRequest::default().permission().0;
+        // Fix round 1: an interactive client keeps the mode it sent.
+        let tui = PromptRequest {
+            interactive: true,
+            permission_mode: Some(PermissionMode::Workspace),
+            ..Default::default()
+        }
+        .permission()
+        .0;
+        let legacy_on = PromptRequest {
+            permission_ask: true,
+            ..Default::default()
+        }
+        .permission()
+        .0;
         std::env::remove_var("ORIGIN_ALLOW_ALL");
-        assert_eq!(plain, PermissionMode::Off, "daemon-side env forces off");
+        assert_eq!(
+            plain,
+            PermissionMode::Off,
+            "daemon-side env forces off for headless"
+        );
+        assert_eq!(tui, PermissionMode::Workspace, "never for an interactive request");
+        assert_eq!(legacy_on, PermissionMode::On, "nor for a client that can answer");
         assert_eq!(
             PermissionMode::parse(" Workspace"),
             Some(PermissionMode::Workspace)

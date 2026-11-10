@@ -1168,10 +1168,11 @@ impl App {
     /// Always allow `<tool>` (no custom row) and stores it as the
     /// [`active_picker`](App::active_picker) with a [`PickerSource::Permission`].
     /// The option indices map back to `(allow, always)` via
-    /// [`picker_outcome_to_permission`].
-    pub fn open_permission_picker(&mut self, id: u64, tool: &str, args: &str) {
+    /// [`picker_outcome_to_permission`]. C2: `no_always` (a `Task` delegation, or
+    /// an ask that needs a person every time) drops the "Always allow" row.
+    pub fn open_permission_picker(&mut self, id: u64, tool: &str, args: &str, no_always: bool) {
         let question = crate::locale::linef("permission.ask", &[("tool", tool), ("args", args)]);
-        let options = vec![
+        let mut options = vec![
             picker::PickerOption {
                 label: "Allow once".to_string(),
                 description: None,
@@ -1180,11 +1181,13 @@ impl App {
                 label: "Deny".to_string(),
                 description: None,
             },
-            picker::PickerOption {
+        ];
+        if !no_always {
+            options.push(picker::PickerOption {
                 label: format!("Always allow {tool}"),
                 description: None,
-            },
-        ];
+            });
+        }
         let state = picker::PickerState {
             question,
             options,
@@ -4474,7 +4477,7 @@ mod tests {
     }
 
     #[test]
-    fn default_app_is_byte_identical_opt_ins_off() {
+    fn default_app_opt_ins_off_and_permissions_workspace() {
         // The opt-in TUI/config layers must all default OFF so a fresh App is
         // unchanged from before this workstream.
         let app = App::new("anthropic", "m", CompletionSources::default());
@@ -4513,7 +4516,7 @@ mod tests {
     #[test]
     fn open_permission_picker_builds_three_single_select_options() {
         let mut app = App::new("anthropic", "m", CompletionSources::default());
-        app.open_permission_picker(42, "Bash", "rm -rf build/");
+        app.open_permission_picker(42, "Bash", "rm -rf build/", false);
         let sess = app.active_picker.as_ref().expect("picker opened");
         assert!(matches!(sess.source, PickerSource::Permission { id: 42, .. }));
         assert!(!sess.state.multi, "permission picker is single-select");
@@ -4522,6 +4525,17 @@ mod tests {
         assert_eq!(sess.state.options[0].label, "Allow once");
         assert_eq!(sess.state.options[1].label, "Deny");
         assert_eq!(sess.state.options[2].label, "Always allow Bash");
+    }
+
+    /// C2: an ask flagged `no_always` (Task, or one that needs a person every
+    /// time) offers only Allow once / Deny.
+    #[test]
+    fn open_permission_picker_drops_always_when_not_offered() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.open_permission_picker(7, "Task", "1/30 gated tools", true);
+        let sess = app.active_picker.as_ref().expect("picker opened");
+        let labels: Vec<&str> = sess.state.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["Allow once", "Deny"]);
     }
 
     #[test]
@@ -4565,7 +4579,7 @@ mod tests {
     #[test]
     fn take_picker_clears_active() {
         let mut app = App::new("anthropic", "m", CompletionSources::default());
-        app.open_permission_picker(1, "Write", "a.txt");
+        app.open_permission_picker(1, "Write", "a.txt", false);
         assert!(app.has_picker());
         let taken = app.take_picker();
         assert!(taken.is_some());

@@ -20,6 +20,22 @@ pub trait Prompter: Send + Sync {
     fn can_ask(&self) -> bool {
         true
     }
+
+    /// C2: [`Prompter::ask`], saying whether the person may answer "always
+    /// allow" (`false` for a `Task` delegation or an ask that needs a person
+    /// every time). Prompters without an "always" answer ignore the flag.
+    async fn ask_offering(&self, meta: &ToolMeta, args_preview: &str, offer_always: bool) -> bool {
+        let _ = offer_always;
+        self.ask(meta, args_preview).await
+    }
+
+    /// C2: whether the person answered "always allow" for `tool` earlier in
+    /// this session. Consulted only for an ordinary ask, never for `Task` or an
+    /// ask that needs a person.
+    fn standing_allow(&self, tool: &str) -> bool {
+        let _ = tool;
+        false
+    }
 }
 
 pub struct AlwaysAllow;

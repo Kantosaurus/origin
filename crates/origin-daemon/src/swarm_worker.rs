@@ -213,8 +213,10 @@ impl Prompter for AllowList {
 
     /// C2: the allow-list is the grant the user approved through the `Task`
     /// prompt, not a person: a call that needs a person (a `NeedsApproval`
-    /// command, a write outside the workspace, a network tool after taint) is
-    /// denied. Workers have no path to the parent session's prompter.
+    /// command, a write outside the workspace or to a protected path) is
+    /// denied. Taint does not revoke the grant (the `Task` prompt was a fresh
+    /// consent for exactly these tools). Workers have no path to the parent
+    /// session's prompter.
     fn can_ask(&self) -> bool {
         false
     }
@@ -519,6 +521,8 @@ fn build_report(
         transcript_handle: [0; 32],
         usage,
         detail: (!parts.is_empty()).then(|| cap_report_text(&parts.join("\n\n"))),
+        // C2: the parent is tainted when this report reaches it, whatever the status.
+        tainted: session.tainted,
     }
 }
 
@@ -770,8 +774,8 @@ mod tests {
     }
 
     /// C2 rule 11: the allow-list grants, it is not a person, so whatever needs
-    /// a person (`NeedsApproval`, writes outside the workspace, network after
-    /// taint) is denied inside a worker even when the tool is delegated.
+    /// a person (`NeedsApproval`, writes outside the workspace or to protected
+    /// paths) is denied inside a worker even when the tool is delegated.
     #[test]
     fn allow_list_is_a_grant_not_a_person() {
         use origin_permission::prompt::Prompter as _;

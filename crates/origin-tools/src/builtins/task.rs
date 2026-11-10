@@ -124,6 +124,11 @@ pub struct TaskOutput {
     pub files_touched: Vec<String>,
     /// Goal strings of any follow-up tasks the worker suggested.
     pub follow_ups: Vec<String>,
+    /// C2: content from a network or MCP tool entered the worker's context;
+    /// the parent session becomes tainted when this output reaches it.
+    /// Omitted when `false`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tainted: bool,
     /// Short human-readable summary mentioning the goal and status, followed by
     /// the worker's report text (capped by the worker).
     pub summary: String,
@@ -302,6 +307,7 @@ fn report_to_output(report: origin_swarm::CompletionReport, goal: &str) -> TaskO
         summary,
         files_touched: report.files_touched,
         follow_ups: report.follow_ups.into_iter().map(|t| t.goal).collect(),
+        tainted: report.tainted,
     }
 }
 

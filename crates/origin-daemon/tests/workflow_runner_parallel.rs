@@ -85,6 +85,7 @@ async fn workflow_fans_out_per_layer_in_dependency_order() {
                 transcript_handle: [0; 32],
                 usage: SwarmUsage::default(),
                 detail: None,
+                tainted: false,
             })
         })
     });
@@ -182,6 +183,7 @@ async fn workflow_emits_swarm_panel_spawn_and_finish_events() {
                 transcript_handle: [0; 32],
                 usage: SwarmUsage::default(),
                 detail: None,
+                tainted: false,
             })
         })
     });

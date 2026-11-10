@@ -1275,12 +1275,10 @@ fn spawn_handler_task(
                     // streaming), so it lands here. Resolve the waiting ask in
                     // the daemon-wide registry. Unknown ids are ignored.
                     //
-                    // `always` ("remember this decision") is the CLI/picker's
-                    // concern (it persists the rule client-side); the daemon's
-                    // immediate job is only to allow/deny the in-flight tool, so
-                    // the registry resolve still keys on `allow`.
-                    let _ = always;
-                    permission_registry.resolve(id, allow);
+                    // C2: `always` ("Always allow <tool>") becomes a standing
+                    // allow for the ask's session and tool — in memory, for this
+                    // daemon's lifetime — when that ask offered it.
+                    permission_registry.resolve(id, allow, always);
                     // Ack so the client's `send_decision` drain unblocks; without
                     // it the serial keyboard loop parks and the next picker
                     // freezes. See `ack_decision`.
@@ -2108,7 +2106,11 @@ async fn handle_request(
         let prompter: &dyn Prompter = match (permission_mode, can_ask) {
             (PermissionMode::Off, _) => &always_allow,
             (_, true) => {
-                ipc_prompter = IpcPrompter::new(event_tx.clone(), Arc::clone(&permission_registry));
+                ipc_prompter = IpcPrompter::new(
+                    event_tx.clone(),
+                    Arc::clone(&permission_registry),
+                    session.id.clone(),
+                );
                 &ipc_prompter
             }
             (_, false) => &no_prompter,
@@ -2283,6 +2285,15 @@ async fn maybe_run_best_of_n(
 ) {
     use origin_daemon::bestofn_runner::{run_best_of_n, WorktreeArena};
     use origin_swarm::bestofn::DifficultySignals;
+
+    if permission_mode == PermissionMode::On {
+        tracing::warn!(
+            "best-of-N skipped: permission mode `on` asks before every edit and candidate runs \
+             cannot ask, so every candidate would produce an empty diff (use `/permissions \
+             workspace` or `off`)"
+        );
+        return;
+    }
 
     // Difficulty gate: only spend N× when the single-shot run looks hard. Today
     // the strongest no-goal signal available here is "the final harness gate

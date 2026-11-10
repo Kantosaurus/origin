@@ -74,6 +74,7 @@ async fn try_completion_polls_without_blocking_then_evicts() {
                 transcript_handle: [0; 32],
                 usage: Usage::default(),
                 detail: None,
+                tainted: false,
             })
         })
     });

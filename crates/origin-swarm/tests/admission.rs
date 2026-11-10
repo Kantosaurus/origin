@@ -396,6 +396,7 @@ fn peak_worker(
                 transcript_handle: [0; 32],
                 usage: Usage::default(),
                 detail: None,
+                tainted: false,
             })
         })
     })

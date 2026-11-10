@@ -46,6 +46,11 @@ pub struct CompletionReport {
     /// with reports written before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// C2: content from a network or MCP tool entered the worker's context
+    /// (session taint). The parent session becomes tainted when this report
+    /// reaches its context. Serde-default keeps older reports readable.
+    #[serde(default)]
+    pub tainted: bool,
 }
 
 impl CompletionReport {

@@ -100,6 +100,7 @@ fn counting_worker(spawned: &Arc<AtomicUsize>) -> WorkerFn {
                 transcript_handle: [0; 32],
                 usage: origin_swarm::Usage::default(),
                 detail: None,
+                tainted: false,
             })
         })
     })

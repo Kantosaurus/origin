@@ -492,7 +492,10 @@ async fn decide_permission(
     // (6) What the mode needs.
     let sandbox_active = origin_tools::sandbox_status() == origin_tools::SandboxStatus::Active;
     let ws = Workspace::of(opts, session);
-    let (why, person) = match workspace_need(meta, args, &ws, sandbox_active, session.tainted) {
+    // Inside a sub-agent (a grant that cannot ask) taint does not revoke what
+    // the approved `Task` grant names; it only stops standing allows here.
+    let tainted = session.tainted && prompter.can_ask();
+    let (why, person) = match workspace_need(meta, args, &ws, sandbox_active, tainted) {
         Need::Allow(why) if opts.permission_mode == PermissionMode::Workspace => {
             return decision(true, why.into());
         }
@@ -507,23 +510,39 @@ async fn decide_permission(
         }
         return decision(false, cannot_ask_reason(meta.name, &why));
     }
-    let notice;
-    let preview = if meta.name == "Bash"
+    // An "always allow" answer covers later ordinary asks for the tool in this
+    // session; never a `Task` (each delegation grants something different) and
+    // never an ask that needs a person.
+    let offer_always = !person && meta.name != "Task";
+    if offer_always && prompter.standing_allow(meta.name) {
+        return decision(true, STANDING_ALLOW.into());
+    }
+    // A person-ask leads with its reason; the no-sandbox notice follows the call.
+    let mut preview = if person {
+        format!("{why} | {args_preview}")
+    } else {
+        args_preview.to_owned()
+    };
+    if meta.name == "Bash"
         && opts.permission_mode == PermissionMode::Workspace
         && !sandbox_active
         && first_bash_ask(&session.id)
     {
-        notice = format!("{BASH_NO_SANDBOX_NOTICE} | {args_preview}");
-        notice.as_str()
-    } else {
-        args_preview
-    };
-    let allowed = prompter.ask(meta, preview).await;
+        preview = format!("{preview} | {BASH_NO_SANDBOX_NOTICE}");
+    }
+    let allowed = prompter.ask_offering(meta, &preview, offer_always).await;
+    if !allowed && !prompter.can_ask() {
+        return decision(false, cannot_ask_reason(meta.name, &why));
+    }
     decision(
         allowed,
         if allowed { USER_APPROVED } else { "user-denied" }.into(),
     )
 }
+
+/// `Decision::reason` of an Allow from a standing "always allow" answer;
+/// [`apply_cmd_guard`] still asks about a `NeedsApproval` command on it.
+const STANDING_ALLOW: &str = "always-allowed this session";
 
 /// `Decision::reason` of an Allow the prompter gave in [`decide_permission`];
 /// [`apply_cmd_guard`] relies on it to avoid asking twice about one call.
@@ -548,12 +567,15 @@ fn first_bash_ask(session_id: &str) -> bool {
         .insert(session_id.to_owned())
 }
 
-/// C2: the denial text when a call needs approval but nobody can be asked.
+/// C2: the denial text when a call needs approval but nobody can be asked. The
+/// model reads it: it says what the USER can do, and not to work around it.
 fn cannot_ask_reason(tool: &str, why: &str) -> String {
     format!(
-        "`{tool}` needs approval ({why}) but this run cannot ask anyone (headless run or \
-         sub-agent); to allow it, run with --dangerously-allow-all or ORIGIN_ALLOW_ALL=1, \
-         or add a [[permission_rules]] allow rule for `{tool}`"
+        "`{tool}` needs the user's approval ({why}), and this run cannot ask the user \
+         (headless run, sub-agent, or the client went away). Do not retry this call or try \
+         to get the same effect another way; tell the user what you could not do. The user \
+         can allow such calls by running with --dangerously-allow-all (or ORIGIN_ALLOW_ALL=1), \
+         or with a permission rule in their Origin configuration"
     )
 }
 
@@ -565,22 +587,52 @@ pub(crate) fn is_external_tool(name: &str) -> bool {
 }
 
 /// C2: whether `messages` hold a successful result of an [`is_external_tool`]
-/// call (session taint). Used per turn and on resume.
+/// call, or a sub-agent result (`Task`, `CollectTasks`) from a tainted worker
+/// (session taint). Used per turn and on resume.
 #[must_use]
 pub fn external_result_in(messages: &[Message]) -> bool {
-    let external: HashSet<&str> = messages
+    let calls: HashMap<&str, &str> = messages
         .iter()
         .flat_map(|m| &m.blocks)
         .filter_map(|b| match b {
-            Block::ToolUse { id, name, .. } if is_external_tool(name) => Some(id.as_str()),
+            Block::ToolUse { id, name, .. } => Some((id.as_str(), name.as_str())),
             _ => None,
         })
         .collect();
-    messages.iter().flat_map(|m| &m.blocks).any(|b| {
-        matches!(b, Block::ToolResult { tool_use_id, is_error: false, .. }
-            if external.contains(tool_use_id.as_str()))
+    messages.iter().flat_map(|m| &m.blocks).any(|b| match b {
+        Block::ToolResult {
+            tool_use_id,
+            is_error: false,
+            inline,
+            ..
+        } => calls.get(tool_use_id.as_str()).is_some_and(|name| {
+            is_external_tool(name)
+                || (matches!(*name, "Task" | "CollectTasks")
+                    && inline.as_deref().is_some_and(worker_result_tainted))
+        }),
+        _ => false,
     })
 }
+
+/// C2: set the session's taint and persist it (marker in the session store).
+fn mark_session_tainted(session: &mut Session, opts: &LoopOptions) {
+    if session.tainted {
+        return;
+    }
+    session.tainted = true;
+    if let Some(store) = opts.session_store.as_deref() {
+        if let Err(e) = store.mark_tainted(&session.id) {
+            tracing::warn!(error = %e, session = %session.id, "could not persist session taint");
+        }
+    }
+}
+
+/// C2: a serialized sub-agent output (`TaskOutput`, alone or in a
+/// `CollectTasks` list) says its worker was tainted.
+fn worker_result_tainted(json: &[u8]) -> bool {
+    json.windows(TAINTED_MARK.len()).any(|w| w == TAINTED_MARK)
+}
+const TAINTED_MARK: &[u8] = br#""tainted":true"#;
 
 /// C2: what `workspace` mode does with a call no rule answered.
 enum Need {
@@ -615,9 +667,7 @@ fn workspace_need(
     }
     match name {
         "Edit" | "Write" | "MultiEdit" | "ApplyPatch" => write_outside(name, args, ws)
-            .map_or(Need::Allow("workspace: edit inside the workspace"), |p| {
-                Need::Person(format!("write outside the workspace: {p}"))
-            }),
+            .map_or(Need::Allow("workspace: edit inside the workspace"), Need::Person),
         "Bash" if sandbox_active => Need::Allow("workspace: Bash under an active OS sandbox"),
         "Bash" if tainted => Need::Person(format!("Bash without an OS sandbox {AFTER_TAINT}")),
         "Bash" => Need::Ask("Bash without an OS sandbox".into()),
@@ -638,26 +688,57 @@ fn workspace_need(
 
 /// C2: the session's workspace: the run's working directory (relative tool
 /// paths resolve against it) and the resolved roots — that directory plus the
-/// session's extra roots (relative ones anchored at it).
+/// session's extra roots (relative ones anchored at it). A root that is the
+/// user's home directory or a filesystem/drive root is not a project, so it
+/// auto-allows nothing (`not_projects`).
 struct Workspace {
     cwd: std::path::PathBuf,
     roots: Vec<std::path::PathBuf>,
+    not_projects: Vec<std::path::PathBuf>,
 }
 
 impl Workspace {
     fn of(opts: &LoopOptions, session: &Session) -> Self {
         let cwd = loop_cwd(opts).unwrap_or_default();
-        let roots = std::iter::once(cwd.clone())
+        let home = dirs::home_dir().and_then(|h| origin_conseca::resolve_real(&h));
+        let (not_projects, roots) = std::iter::once(cwd.clone())
             .chain(session.roots.iter().map(|r| cwd.join(r)))
             .filter_map(|r| origin_conseca::resolve_real(&r))
-            .collect();
-        Self { cwd, roots }
+            .partition(|r| r.parent().is_none() || home.as_ref() == Some(r));
+        Self {
+            cwd,
+            roots,
+            not_projects,
+        }
     }
 }
 
-/// C2: the first target of an edit builtin that does not resolve inside a
-/// workspace root (symlinks resolved; unresolvable or missing counts as
-/// outside), or `None` when every target is inside.
+/// C2: a path whose edit is command execution or a permission change, so
+/// `workspace` mode asks a person even inside a root: any `.git` or `.origin`
+/// component (git config and hooks; Origin's governance, hooks, workflows,
+/// shadow repo), the directory holding the governance file, and `ORIGIN_HOME`.
+// ponytail: the minimum list. Other run-on-next-use files (CI workflows,
+// `package.json` scripts, Makefiles, build scripts) are ordinary project code
+// and stay auto-allowed in `workspace` mode; extend here if that changes.
+fn protected_path(resolved: &std::path::Path) -> bool {
+    let named = resolved.components().any(|c| {
+        let s = c.as_os_str();
+        s.eq_ignore_ascii_case(".git") || s.eq_ignore_ascii_case(".origin")
+    });
+    named
+        || crate::config::governance_path()
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .into_iter()
+            .chain(std::env::var_os("ORIGIN_HOME").map(std::path::PathBuf::from))
+            .filter_map(|d| origin_conseca::resolve_real(&d))
+            .any(|d| resolved.starts_with(d))
+}
+
+/// C2: why the first target of an edit builtin needs a person — it does not
+/// resolve inside a workspace root (symlinks resolved; unresolvable or missing
+/// counts as outside), its root is a home or drive root, or it is a
+/// [`protected_path`] — or `None` when every target may be edited unasked.
 fn write_outside(name: &str, args: &Value, ws: &Workspace) -> Option<String> {
     let targets: Vec<String> = if name == "ApplyPatch" {
         // Every path the patch can create, delete, update or move to.
@@ -688,11 +769,19 @@ fn write_outside(name: &str, args: &Value, ws: &Workspace) -> Option<String> {
             .collect()
     };
     if targets.is_empty() {
-        return Some("<no target path>".into());
+        return Some("write outside the workspace: <no target path>".into());
     }
-    targets.into_iter().find(|t| {
-        let resolved = origin_conseca::resolve_real(&ws.cwd.join(t));
-        !resolved.is_some_and(|p| ws.roots.iter().any(|r| p.starts_with(r)))
+    targets.into_iter().find_map(|t| {
+        let Some(p) = origin_conseca::resolve_real(&ws.cwd.join(&t)) else {
+            return Some(format!("write outside the workspace: {t}"));
+        };
+        if ws.roots.iter().any(|r| p.starts_with(r)) {
+            protected_path(&p).then(|| format!("protected path: {t}"))
+        } else if ws.not_projects.iter().any(|r| p.starts_with(r)) {
+            Some(format!("workspace root is a home or drive root: {t}"))
+        } else {
+            Some(format!("write outside the workspace: {t}"))
+        }
     })
 }
 
@@ -803,10 +892,16 @@ async fn apply_cmd_guard(
             reason: cannot_ask_reason(meta.name, &format!("cmd-guard: {reason}")),
         },
         origin_cmdparse::Risk::NeedsApproval(reason) => {
+            // Never offers "always": a standing allow does not cover this command.
             if prompter.ask(meta, args_preview).await {
                 origin_permission::Decision {
                     outcome: Outcome::Allow,
                     reason: format!("user-approved: cmd-guard: {reason}"),
+                }
+            } else if !prompter.can_ask() {
+                origin_permission::Decision {
+                    outcome: Outcome::Deny,
+                    reason: cannot_ask_reason(meta.name, &format!("cmd-guard: {reason}")),
                 }
             } else {
                 origin_permission::Decision {
@@ -816,6 +911,22 @@ async fn apply_cmd_guard(
             }
         }
         _ => decision,
+    }
+}
+
+/// C2: a `Bash` call the command guard rates `Dangerous`, denied before any
+/// permission ask so the user is never asked to approve what cannot run.
+fn cmd_guard_dangerous(tool: &str, args: &Value) -> Option<origin_permission::Decision> {
+    if tool != "Bash" || std::env::var("ORIGIN_CMD_GUARD").as_deref() == Ok("0") {
+        return None;
+    }
+    let cmd = args.get("command").and_then(Value::as_str)?;
+    match origin_cmdparse::worst(&origin_cmdparse::analyze(cmd)) {
+        origin_cmdparse::Risk::Dangerous(reason) => Some(origin_permission::Decision {
+            outcome: Outcome::Deny,
+            reason: format!("cmd-guard: dangerous bash command blocked: {reason}"),
+        }),
+        _ => None,
     }
 }
 
@@ -3378,10 +3489,10 @@ mod runtime_tools_tests {
     }
 
     /// C2: a successful MCP result taints the session (persisted in the store);
-    /// from then on the same network tool needs a person, so a grant-only
-    /// prompter can no longer run it and the denial says why.
+    /// inside a worker (a grant that cannot ask) the approved grant still runs
+    /// the tool afterwards (ruling 11 as revised in fix round 1).
     #[tokio::test]
-    async fn mcp_result_taints_the_session_and_flips_network_tools_to_a_person() {
+    async fn mcp_result_taints_the_session_but_keeps_the_worker_grant() {
         use origin_core::types::{Block, Message, Role};
         let ping = |id: &str| {
             Message::new(Role::Assistant).with_block(Block::ToolUse {
@@ -3425,11 +3536,11 @@ mod runtime_tools_tests {
                 _ => None,
             })
             .collect();
-        assert!(!results[0].0, "before taint the grant runs the tool: {results:?}");
-        assert!(results[1].0, "after taint it needs a person: {results:?}");
+        // Fix round 1 (ruling 11 revised): inside a worker, taint does not
+        // revoke what the approved grant names — the second call still runs.
         assert!(
-            results[1].1.contains("after external content") && results[1].1.contains("cannot ask"),
-            "{results:?}"
+            !results[0].0 && !results[1].0,
+            "the grant survives taint: {results:?}"
         );
         assert!(session.tainted);
         assert!(store.is_tainted(&session.id), "taint is persisted for resume");
@@ -3693,6 +3804,7 @@ mod swarm_collab_wiring_tests {
                     summary: "found 2 issues".into(),
                     files_touched: vec!["src/ipc.rs".into(), "src/wire.rs".into()],
                     follow_ups: vec!["fix the handshake".into()],
+                    tainted: false,
                 },
             },
             BgResult {
@@ -3703,6 +3815,7 @@ mod swarm_collab_wiring_tests {
                     summary: "worker vanished".into(),
                     files_touched: vec![],
                     follow_ups: vec![],
+                    tainted: false,
                 },
             },
         ];
@@ -3747,6 +3860,7 @@ mod swarm_collab_wiring_tests {
                     summary: "all good".into(),
                     files_touched: vec![],
                     follow_ups: vec![],
+                    tainted: false,
                 },
             },
             BgResult {
@@ -3757,6 +3871,7 @@ mod swarm_collab_wiring_tests {
                     summary: "could not reach the goal".into(),
                     files_touched: vec![],
                     follow_ups: vec![],
+                    tainted: false,
                 },
             },
         ];
@@ -5693,6 +5808,10 @@ async fn run_loop_inner(
                 // (their dispatch streamed "spawned" but no completion). Done
                 // before rendering the prose block; the order is immaterial.
                 emit_background_completions(opts.event_tx.as_ref(), &finished).await;
+                // C2: a tainted worker's result taints this session as it arrives.
+                if finished.iter().any(|r| r.output.tainted) {
+                    mark_session_tainted(session, opts);
+                }
                 render_background_results(&finished)
             }
             _ => String::new(),
@@ -6698,8 +6817,11 @@ async fn run_loop_inner(
                 .then(|| task_permission_preview(&args))
                 .or_else(|| cmd_guard_ask_preview(meta.name, &args, &preview));
             let ask_preview = special_preview.as_deref().unwrap_or(&preview);
-            let mut decision =
-                decide_permission(meta, &args, ask_preview, prompter, skills, opts, session).await;
+            // C2: a `Dangerous` command is denied before anyone is asked.
+            let mut decision = match cmd_guard_dangerous(meta.name, &args) {
+                Some(denied) => denied,
+                None => decide_permission(meta, &args, ask_preview, prompter, skills, opts, session).await,
+            };
 
             // Task 3 — DENY-ONLY governance overlay. After the base check yields
             // a decision, the optional policy/conseca layers may only *narrow*
@@ -7854,18 +7976,13 @@ async fn run_loop_inner(
         let mut tool_msg = Message::new(Role::Tool);
         tool_msg.blocks = tool_results;
         session.push(tool_msg);
-        // C2: session taint, set once a network tool's successful result is in
-        // the context (this turn's assistant `tool_use`s + their results) and
-        // persisted so it survives compaction and resume.
+        // C2: session taint, set once a network tool's (or a tainted worker's)
+        // successful result is in the context (this turn's assistant `tool_use`s
+        // + their results) and persisted so it survives compaction and resume.
         if !session.tainted
             && external_result_in(&session.messages[session.messages.len().saturating_sub(2)..])
         {
-            session.tainted = true;
-            if let Some(store) = opts.session_store.as_deref() {
-                if let Err(e) = store.mark_tainted(&session.id) {
-                    tracing::warn!(error = %e, session = %session.id, "could not persist session taint");
-                }
-            }
+            mark_session_tainted(session, opts);
         }
 
         // A8: denial caps, checked only now so a stop never leaves a `tool_use`
@@ -12895,22 +13012,38 @@ mod wiring_tests {
 
     // ---- C2: permission modes ----
 
-    /// Records every ask; answers `answer`; `person` = whether it can ask one.
+    /// Records every ask (and whether it offered "always"); answers `answer`;
+    /// `person` = whether it can ask one; `standing` = every tool has a
+    /// standing "always allow" answer.
     struct Rec {
         asks: std::sync::Mutex<Vec<String>>,
+        offers: std::sync::Mutex<Vec<bool>>,
         answer: bool,
         person: bool,
+        standing: bool,
     }
     impl Rec {
         fn new(answer: bool, person: bool) -> Self {
             Self {
                 asks: std::sync::Mutex::new(Vec::new()),
+                offers: std::sync::Mutex::new(Vec::new()),
                 answer,
                 person,
+                standing: false,
+            }
+        }
+        /// A person who already answered "always allow" for every tool.
+        fn standing() -> Self {
+            Self {
+                standing: true,
+                ..Self::new(true, true)
             }
         }
         fn asks(&self) -> Vec<String> {
             self.asks.lock().expect("lock").clone()
+        }
+        fn offers(&self) -> Vec<bool> {
+            self.offers.lock().expect("lock").clone()
         }
     }
     #[async_trait::async_trait]
@@ -12919,8 +13052,15 @@ mod wiring_tests {
             self.asks.lock().expect("lock").push(preview.to_owned());
             self.answer
         }
+        async fn ask_offering(&self, meta: &ToolMeta, preview: &str, offer_always: bool) -> bool {
+            self.offers.lock().expect("lock").push(offer_always);
+            self.ask(meta, preview).await
+        }
         fn can_ask(&self) -> bool {
             self.person
+        }
+        fn standing_allow(&self, _tool: &str) -> bool {
+            self.standing
         }
     }
 
@@ -13038,6 +13178,14 @@ mod wiring_tests {
         let outside = decide_c2("Write", &write(&out.path().join("x")), &human, &opts, &session).await;
         assert_eq!(outside.outcome, Outcome::Deny);
         assert_eq!(human.asks().len(), 2, "both outside writes asked the person");
+        assert!(
+            human
+                .asks()
+                .iter()
+                .all(|a| a.starts_with("write outside the workspace: ")),
+            "a person-ask leads with its reason: {:?}",
+            human.asks()
+        );
 
         let patch = serde_json::json!({"patch": format!(
             "*** Begin Patch\n*** Update File: a.rs\n*** Move to: {}\n*** End Patch\n",
@@ -13099,8 +13247,10 @@ mod wiring_tests {
         }
         let asks = human.asks();
         assert_eq!(asks.len(), 2, "Bash asks every time without a sandbox");
+        // Fix round 1: the call comes first, the notice after it.
         assert!(
-            asks[0].starts_with("note: Bash asks because no OS sandbox is active"),
+            asks[0].starts_with(&ls.to_string())
+                && asks[0].ends_with(&format!(" | {BASH_NO_SANDBOX_NOTICE}")),
             "{}",
             asks[0]
         );
@@ -13113,6 +13263,7 @@ mod wiring_tests {
         let ws = Workspace {
             cwd: std::env::temp_dir(),
             roots: Vec::new(),
+            not_projects: Vec::new(),
         };
         assert!(matches!(
             workspace_need(builtin("Bash"), &ls, &ws, true, false),
@@ -13191,45 +13342,200 @@ mod wiring_tests {
         assert_eq!(d.outcome, Outcome::Deny, "an MCP server is a grant");
     }
 
-    /// C2 rules 10-11: a standing grant (a sub-agent's allow-list — the only
-    /// "always allow" the code has) runs network tools and unsandboxed Bash
-    /// before taint; after taint they need a person, so it can no longer run
-    /// them. An explicit config allow rule still applies after taint.
+    /// C2 rule 10 (fix round 1): a standing "always allow" covers later
+    /// ordinary asks for its tool; after taint, network tools and unsandboxed
+    /// Bash need a person again despite it, while an explicit config allow rule
+    /// still applies. Inside a sub-agent the approved grant survives taint.
     #[tokio::test]
-    async fn c2_taint_flips_grants_back_to_asking_but_not_config_rules() {
-        let grant = Rec::new(true, false);
+    async fn c2_taint_overrides_standing_allows_but_not_config_rules_or_worker_grants() {
+        let standing = Rec::standing();
         let opts = LoopOptions::default();
         let mut session = Session::new("p", "m");
         let bash = serde_json::json!({"command": "ls"});
         let fetch = serde_json::json!({"url": "https://example.com"});
-        assert_eq!(
-            decide_c2("Bash", &bash, &grant, &opts, &session).await.outcome,
-            Outcome::Allow
-        );
-        assert_eq!(
-            decide_c2("WebFetch", &fetch, &grant, &opts, &session)
-                .await
-                .outcome,
-            Outcome::Allow
-        );
+        for (tool, args) in [("Bash", &bash), ("WebFetch", &fetch)] {
+            let d = decide_c2(tool, args, &standing, &opts, &session).await;
+            assert_eq!(
+                (d.outcome, d.reason.as_str()),
+                (Outcome::Allow, STANDING_ALLOW),
+                "{tool}"
+            );
+        }
+        assert!(standing.asks().is_empty(), "a standing allow is not asked");
 
         session.tainted = true;
         for (tool, args) in [("Bash", &bash), ("WebFetch", &fetch)] {
-            let d = decide_c2(tool, args, &grant, &opts, &session).await;
-            assert_eq!(d.outcome, Outcome::Deny, "{tool} after taint");
-            assert!(d.reason.contains("after external content"), "{}", d.reason);
+            let d = decide_c2(tool, args, &standing, &opts, &session).await;
+            assert_eq!(d.reason, USER_APPROVED, "{tool} after taint is asked again");
         }
+        let asks = standing.asks();
+        assert_eq!(asks.len(), 2);
+        assert!(
+            asks.iter()
+                .all(|a| a.contains("external content entered this session")),
+            "{asks:?}"
+        );
+        assert_eq!(
+            standing.offers(),
+            vec![false, false],
+            "a person-ask never offers always"
+        );
+
         let ruled = LoopOptions {
             permission_rules: Some(rules_bundle(&[("Bash", true)])),
             ..LoopOptions::default()
         };
-        let d = decide_c2("Bash", &bash, &grant, &ruled, &session).await;
+        let d = decide_c2("Bash", &bash, &standing, &ruled, &session).await;
         assert_eq!(
             d.outcome,
             Outcome::Allow,
             "a config allow rule survives taint: {}",
             d.reason
         );
+
+        // Rule 11 revised: a worker's grant is the user's per-delegation consent.
+        let grant = Rec::new(true, false);
+        for (tool, args) in [("Bash", &bash), ("WebFetch", &fetch)] {
+            let d = decide_c2(tool, args, &grant, &opts, &session).await;
+            assert_eq!(
+                d.outcome,
+                Outcome::Allow,
+                "{tool}: worker grant after taint: {}",
+                d.reason
+            );
+        }
+    }
+
+    /// C2 fix round 1: a standing allow never covers `Task` (and a Task ask
+    /// never offers "always"), never an out-of-workspace or protected write,
+    /// and never a `NeedsApproval` command — the guard still asks with its reason.
+    #[tokio::test]
+    async fn c2_standing_allow_limits() {
+        let ws = tempfile::tempdir().expect("ws");
+        let out = tempfile::tempdir().expect("out");
+        let session = Session::new("p", "m");
+        let standing = Rec::standing();
+        let task = serde_json::json!({"goal": "g", "allowed_tools": ["Edit"]});
+        let d = decide_c2("Task", &task, &standing, &LoopOptions::default(), &session).await;
+        assert_eq!(d.reason, USER_APPROVED, "Task is asked every time");
+        let on = LoopOptions {
+            cwd: Some(ws.path().to_path_buf()),
+            permission_mode: crate::protocol::PermissionMode::On,
+            ..LoopOptions::default()
+        };
+        let inside = decide_c2(
+            "Write",
+            &serde_json::json!({"file_path": "a.rs"}),
+            &standing,
+            &on,
+            &session,
+        )
+        .await;
+        assert_eq!(inside.reason, STANDING_ALLOW, "an ordinary Write ask is covered");
+        let outside = serde_json::json!({"file_path": out.path().join("x").to_string_lossy()});
+        let d = decide_c2("Write", &outside, &standing, &on, &session).await;
+        assert_eq!(d.reason, USER_APPROVED, "an outside write is asked despite it");
+        assert_eq!(
+            standing.offers(),
+            vec![false, false],
+            "Task and person-asks offer no always"
+        );
+    }
+    /// C2 fix round 1: inside a workspace root, `.git` and `.origin` paths need
+    /// a person (asked interactively, denied headless); an ordinary file does
+    /// not; a root that is the home directory auto-allows nothing.
+    #[tokio::test]
+    async fn c2_protected_paths_and_home_root_ask() {
+        let ws = tempfile::tempdir().expect("ws");
+        let opts = LoopOptions {
+            cwd: Some(ws.path().to_path_buf()),
+            ..LoopOptions::default()
+        };
+        let session = Session::new("p", "m");
+        let write = |p: &str| serde_json::json!({"file_path": p, "content": "x"});
+        for p in [
+            ".git/config",
+            ".git/hooks/pre-commit",
+            "sub/.git/config",
+            ".origin/governance.toml",
+            ".origin/hooks.json",
+        ] {
+            let human = Rec::new(true, true);
+            let d = decide_c2("Write", &write(p), &human, &opts, &session).await;
+            assert_eq!(d.reason, USER_APPROVED, "{p} is asked");
+            assert!(
+                human.asks()[0].starts_with("protected path: "),
+                "{:?}",
+                human.asks()
+            );
+            let d = decide_c2(
+                "Write",
+                &write(p),
+                &origin_permission::prompt::NoPrompter,
+                &opts,
+                &session,
+            )
+            .await;
+            assert_eq!(d.outcome, Outcome::Deny, "{p} headless");
+        }
+        let human = Rec::new(true, true);
+        let d = decide_c2("Write", &write("src/lib.rs"), &human, &opts, &session).await;
+        assert_eq!(d.outcome, Outcome::Allow);
+        assert!(human.asks().is_empty(), "an ordinary file is still auto-allowed");
+
+        let home = dirs::home_dir().expect("home dir");
+        let at_home = LoopOptions {
+            cwd: Some(home.clone()),
+            ..LoopOptions::default()
+        };
+        let target = home.join("c2-test-never-written.txt");
+        let human = Rec::new(false, true);
+        let d = decide_c2(
+            "Write",
+            &write(&target.to_string_lossy()),
+            &human,
+            &at_home,
+            &session,
+        )
+        .await;
+        assert_eq!(d.outcome, Outcome::Deny);
+        assert!(
+            human.asks()[0].contains("home or drive root"),
+            "{:?}",
+            human.asks()
+        );
+        let d = decide_c2(
+            "Write",
+            &write(&target.to_string_lossy()),
+            &origin_permission::prompt::NoPrompter,
+            &at_home,
+            &session,
+        )
+        .await;
+        assert!(d.reason.contains("cannot ask"), "{}", d.reason);
+    }
+
+    /// C2 fix round 1: a client that went away mid-ask yields the "cannot ask"
+    /// denial, not "user-denied".
+    #[tokio::test]
+    async fn c2_dead_ipc_channel_reports_cannot_ask() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let ipc = crate::ipc_prompter::IpcPrompter::new(
+            tx,
+            Arc::new(crate::ipc_prompter::PermissionRegistry::new()),
+            "s".into(),
+        );
+        let d = decide_c2(
+            "Bash",
+            &serde_json::json!({"command": "ls"}),
+            &ipc,
+            &LoopOptions::default(),
+            &Session::new("p", "m"),
+        )
+        .await;
+        assert_eq!(d.outcome, Outcome::Deny);
+        assert!(d.reason.contains("cannot ask"), "{}", d.reason);
     }
 
     /// C2 rule 11: a sub-agent runs in mode `on`, so an edit `workspace` would
@@ -13319,6 +13625,24 @@ mod wiring_tests {
             denied.reason.contains("cmd-guard") && denied.reason.contains("ORIGIN_ALLOW_ALL=1"),
             "{}",
             denied.reason
+        );
+        // Fix round 1: a standing "always allow Bash" does not cover it either;
+        // the guard asks once, showing its reason.
+        let standing = Rec::standing();
+        let base = rt.block_on(decide_c2(
+            "Bash",
+            &args,
+            &standing,
+            &LoopOptions::default(),
+            &Session::new("p", "m"),
+        ));
+        assert_eq!(base.reason, STANDING_ALLOW);
+        let guarded = rt.block_on(apply_cmd_guard(base, builtin("Bash"), &args, &preview, &standing));
+        assert_eq!(guarded.outcome, Outcome::Allow);
+        assert_eq!(
+            standing.asks(),
+            vec![preview.clone()],
+            "asked once, with the reason"
         );
         // Rule 11: inside a sub-agent, delegated `Bash` (a grant) does not
         // approve a `NeedsApproval` command.

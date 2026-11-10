@@ -2388,12 +2388,15 @@ async fn handle_prompt_turn(
             drop(a);
             handle_for_goal.mark_dirty();
         },
-        move |id, tool: &str, args: &str| {
+        move |id, tool: &str, args: &str, no_always: bool| {
             // INT-3: surface the permission ask through the interactive picker
-            // (Allow once / Deny / Always allow <tool>). The event loop routes
-            // keys through `picker::reduce` and sends the decision on a fresh
-            // connection (the turn's connection is busy streaming).
-            app_for_perm.lock().open_permission_picker(id, tool, args);
+            // (Allow once / Deny / Always allow <tool>, the last only when the
+            // daemon offers it — C2). The event loop routes keys through
+            // `picker::reduce` and sends the decision on a fresh connection (the
+            // turn's connection is busy streaming).
+            app_for_perm
+                .lock()
+                .open_permission_picker(id, tool, args, no_always);
             handle_for_perm.mark_dirty();
         },
         move |id: String,
@@ -2704,9 +2707,9 @@ async fn call_daemon(
     // EVERY Goal variant; non-Goal variants are dispatched in the match
     // below as before.
     mut on_goal: impl FnMut(&StreamEvent) + Send,
-    // Opt-in permission ask (id, tool, args_preview): surfaces the approval
+    // Permission ask (id, tool, args_preview, no_always): surfaces the approval
     // prompt; the event loop sends the decision back on a fresh connection.
-    mut on_permission_ask: impl FnMut(u64, &str, &str) + Send,
+    mut on_permission_ask: impl FnMut(u64, &str, &str, bool) + Send,
     // `ask_user` structured choice (id, question, options[(label, description?)],
     // multi_select, allow_custom): surfaces the interactive picker; the event
     // loop sends the `ChoiceDecision` back on a fresh connection.
@@ -2865,7 +2868,8 @@ async fn call_daemon(
                     id,
                     ref tool,
                     ref args_preview,
-                } => on_permission_ask(id, tool, args_preview),
+                    no_always,
+                } => on_permission_ask(id, tool, args_preview, no_always),
                 StreamEvent::ChoiceAsk {
                     id,
                     question,
@@ -3522,21 +3526,23 @@ async fn ensure_daemon_running(
     // Supervised: spawn origin-supervisor pointed at the daemon binary (it owns
     // and restarts the daemon, inheriting ORIGIN_PROVIDER/ACCOUNT below for the
     // daemon child). Direct: spawn origin-daemon itself (legacy path).
+    // ORIGIN_SOCK pins the daemon's IPC path to the one WE resolved: with
+    // per-instance paths the daemon's own default derives from its cwd — already
+    // set to this workspace below — but an explicit env keeps the pair in
+    // lock-step even when the user set ORIGIN_SOCK or the cwd canonicalizes oddly.
+    // C2: the builder also strips ORIGIN_ALLOW_ALL from the child's env.
     let mut command = if supervised {
-        let mut c = std::process::Command::new(&supervisor_path);
-        c.args(origin_cli::daemon_launch::supervisor_args(&cmd_path));
-        c
+        origin_cli::daemon_launch::daemon_command(
+            supervisor_path.as_ref(),
+            Some(cmd_path.as_ref()),
+            provider,
+            account,
+            path,
+        )
     } else {
-        std::process::Command::new(&cmd_path)
+        origin_cli::daemon_launch::daemon_command(cmd_path.as_ref(), None, provider, account, path)
     };
     command
-        .env("ORIGIN_PROVIDER", provider)
-        .env("ORIGIN_ACCOUNT", account)
-        // Pin the daemon's IPC path to the one WE resolved. With per-instance
-        // paths the daemon's own default derives from its cwd — already set to
-        // this workspace below — but an explicit env keeps the pair in lock-step
-        // even when the user set ORIGIN_SOCK or the cwd canonicalizes oddly.
-        .env("ORIGIN_SOCK", path)
         // Run the daemon IN the workspace: tools (Bash/Read/Write), the code
         // graph, and self-dev all resolve paths against the daemon's cwd, so a
         // project-A daemon must not execute in project B's directory (or in
