@@ -75,7 +75,7 @@ fn read_text(bytes: &[u8], args: &ReadArgs) -> Result<String, ToolError> {
     let det = text_fmt::detect(bytes);
     let text = text_fmt::normalise_to_lf(bytes, &det)?;
     let offset = args.offset.unwrap_or(0) as usize;
-    let limit = args.limit.unwrap_or(1000) as usize;
+    let limit = args.limit.unwrap_or(1000).max(1) as usize;
     let mut out = String::new();
     // 0-based index of the first line NOT returned: the offset to resume at.
     let mut next = offset;

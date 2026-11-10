@@ -148,6 +148,23 @@ fn overlong_line_is_truncated_at_2000_chars() {
 }
 
 #[test]
+fn zero_limit_still_advances() {
+    // `limit: 0` must not yield an empty page whose footer repeats the same offset forever.
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("a.rs");
+    fs::write(&p, "first\nsecond\nthird\n").unwrap();
+    let out = read_v2(ReadArgs {
+        file_path: p.to_string_lossy().into_owned(),
+        offset: None,
+        limit: Some(0),
+        as_: None,
+    })
+    .unwrap();
+    assert!(out.contains("     1\tfirst"), "{out}");
+    assert_eq!(footer(&out), Some((2, 1)));
+}
+
+#[test]
 fn errors_on_missing_file() {
     let err = read_v2(ReadArgs {
         file_path: "/no/such/file".into(),
