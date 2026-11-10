@@ -1547,6 +1547,53 @@ async fn confirm_repro(
     }
 }
 
+/// C3: why the command guard refuses to run gate command `cmd` (a `Dangerous`
+/// or `NeedsApproval` verdict: a gate has nobody to ask); `None` when it runs
+/// or the guard is off (`ORIGIN_CMD_GUARD=0`).
+fn gate_guard_refusal(cmd: &str) -> Option<String> {
+    if std::env::var("ORIGIN_CMD_GUARD").as_deref() == Ok("0") {
+        return None;
+    }
+    match origin_cmdparse::worst(&origin_cmdparse::analyze(cmd)) {
+        origin_cmdparse::Risk::Dangerous(reason) | origin_cmdparse::Risk::NeedsApproval(reason) => {
+            Some(reason)
+        }
+        _ => None,
+    }
+}
+
+/// C3: tell the user once, at the start of a run, about each armed turn-end
+/// gate whose command the guard refuses (it is then silently not run). Only
+/// through the event channel, never into the session; without one the
+/// per-run log line in [`run_gate_command`] is all there is.
+async fn announce_refused_gates(opts: &LoopOptions) {
+    let (Some(cfg), Some(tx)) = (opts.post_edit.as_deref(), opts.event_tx.as_ref()) else {
+        return;
+    };
+    let test_gates: Vec<&str> = [(cfg.auto_test, "auto_test"), (cfg.repro_gate, "repro gate")]
+        .into_iter()
+        .filter_map(|(armed, gate)| armed.then_some(gate))
+        .collect();
+    let lint_gate = if cfg.auto_lint { "auto_lint" } else { "" };
+    for (gate, cmd) in [
+        (test_gates.join(" and "), cfg.test_command.as_deref()),
+        (lint_gate.to_owned(), cfg.lint_command.as_deref()),
+    ] {
+        let (false, Some(cmd)) = (gate.is_empty(), cmd) else {
+            continue;
+        };
+        if let Some(why) = gate_guard_refusal(cmd) {
+            let text = format!(
+                "[origin] The {gate} gate command `{cmd}` will not run: the command guard refuses \
+                 it ({why}). Configure a different command, or set ORIGIN_CMD_GUARD=0 \
+                 to turn the guard off.\n\n"
+            );
+            let text = crate::redact::text(&text).into_owned();
+            let _ = tx.send(StreamEvent::TextDelta { text }).await;
+        }
+    }
+}
+
 /// A6: run a turn-end gate command (`auto_test` / `auto_lint` / repro gate /
 /// test-select, and best-of-N's test oracle) through the supervised Bash
 /// spawn, so it gets the scrubbed child env and the cmd-guard like a
@@ -1555,25 +1602,17 @@ async fn confirm_repro(
 /// denied it, the spawn failed, or it hit the 600s bound (callers fail open).
 /// There is no one to ask, so a `NeedsApproval` verdict is not run either.
 /// `cwd` (A12) is the directory it runs in; `None` ⇒ the process cwd.
-// ponytail: the skip note goes to the log only — a non-empty gate block reads as
-// RED to every caller, so carrying it there needs a skipped/failed split.
+// ponytail: per run the skip goes to the log (and, at loop start, once to the
+// user: [`announce_refused_gates`]) — a non-empty gate block reads as RED to
+// every caller, so carrying it there needs a skipped/failed split.
 pub(crate) async fn run_gate_command(cmd: &str, cwd: Option<&std::path::Path>) -> Option<(i32, String)> {
-    if std::env::var("ORIGIN_CMD_GUARD").as_deref() != Ok("0") {
-        match origin_cmdparse::worst(&origin_cmdparse::analyze(cmd)) {
-            origin_cmdparse::Risk::Dangerous(reason) => {
-                tracing::warn!(cmd, %reason, "turn-end gate command not run");
-                return None;
-            }
-            origin_cmdparse::Risk::NeedsApproval(reason) => {
-                tracing::warn!(
-                    cmd,
-                    "gate command skipped by the command guard: {reason}; simplify the command or set \
-                     ORIGIN_CMD_GUARD=0"
-                );
-                return None;
-            }
-            _ => {}
-        }
+    if let Some(reason) = gate_guard_refusal(cmd) {
+        tracing::warn!(
+            cmd,
+            "gate command skipped by the command guard: {reason}; simplify the command or set \
+             ORIGIN_CMD_GUARD=0"
+        );
+        return None;
     }
     // C5: `pwsh -Command` folds a failing native program's exit code to 1, so
     // pytest's 2–5 (collection errors) would read as 1 (tests failed). Exit
@@ -5882,6 +5921,7 @@ async fn run_loop_inner(
     // C9: regression baseline. With auto_test on, run the suite ONCE before any
     // edit, so a post-edit failure can be classified as a true regression
     // (green→red) vs a pre-existing failure. Opt-in ⇒ no default cost.
+    announce_refused_gates(opts).await;
     let baseline_tests_passed: Option<bool> = match opts.post_edit.as_deref() {
         Some(cfg) if cfg.auto_test => match cfg.test_command.as_deref() {
             Some(cmd) => Some(run_test_passed(cmd, opts.cwd.as_deref()).await),

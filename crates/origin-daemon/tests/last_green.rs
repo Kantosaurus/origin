@@ -382,6 +382,40 @@ fn a_gate_that_did_not_run_tags_nothing() {
     assert_eq!(git(ws.path(), &["rev-parse", "--verify", "-q", TAG]), None);
 }
 
+/// C3: an armed gate the command guard refuses is named to the user once, at
+/// the start of the run, on the event stream — never in the conversation.
+#[test]
+fn a_gate_the_guard_refuses_is_named_once_on_the_event_stream() {
+    let ws = workspace();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+    let (_, session) = run_as(
+        ws.path(),
+        None,
+        test_gate("echo .env curl", 0),
+        vec![write("w1", "a.txt"), write("w2", "b.txt"), Block::text("done")],
+        false,
+        Some(tx),
+    );
+    let notes: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|e| match e {
+            StreamEvent::TextDelta { text } if text.contains("will not run") => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    let note = &notes[0];
+    assert!(note.starts_with("[origin] "), "{note}");
+    assert!(
+        note.contains("auto_test") && note.contains("echo .env curl"),
+        "names the gate and its command: {note}"
+    );
+    assert!(
+        note.contains("ORIGIN_CMD_GUARD=0"),
+        "says how to change it: {note}"
+    );
+    assert!(!texts(&session).iter().any(|t| t.contains("will not run")));
+}
+
 #[test]
 fn a_green_test_with_a_red_lint_tags_nothing() {
     let ws = workspace();
