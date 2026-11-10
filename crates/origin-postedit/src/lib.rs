@@ -435,7 +435,7 @@ pub fn select_tests(base_command: &str, files: &[String]) -> Selection {
 fn all_shell_safe(paths: &[String]) -> bool {
     paths.iter().all(|p| {
         let rest = match p.as_bytes() {
-            [d, b':', ..] if d.is_ascii_alphabetic() => &p[2..],
+            [d, b':', ..] if cfg!(windows) && d.is_ascii_alphabetic() => &p[2..],
             _ => p.as_str(),
         };
         !rest.is_empty()
@@ -610,7 +610,11 @@ pub fn output_names_reproduction(output: &str, stem: &str, source: &str) -> bool
     }
     names.retain(|n| n.len() >= 4);
     output.lines().any(|l| {
-        let lower = l.to_ascii_lowercase();
+        // Surefire prints `Failures: 0, Errors: 0` on every class's line, passing ones too.
+        let lower = l
+            .to_ascii_lowercase()
+            .replace("failures: 0", "")
+            .replace("errors: 0", "");
         (lower.contains("fail") || lower.contains("error")) && names.iter().any(|n| l.contains(n))
     })
 }
@@ -1133,9 +1137,10 @@ mod tests {
             assert_eq!(select_tests("pytest", &f(bad)), Selection::Full, "{bad}");
         }
         assert!(narrow_to_test_files("pytest", &f("tests/test_ok-1.py")).is_some());
-        assert!(
+        assert_eq!(
             narrow_to_test_files("pytest", &f("C:/w/tests/test_a.py")).is_some(),
-            "a drive prefix is plain"
+            cfg!(windows),
+            "a drive prefix is plain on Windows only"
         );
         assert_eq!(narrow_to_test_files("pytest", &f("C:")), None);
         assert!(matches!(
@@ -1156,6 +1161,16 @@ mod tests {
             "tests/repro_slug.py .                [ 50%]\nFAILED tests/test_other.py::test_old"
         ));
         assert!(!names("PASS tests/repro_slug.test.js\nFAIL tests/other.test.js"));
+        // Surefire prints a result line for every class, passing ones included.
+        let surefire = |repro: &str| {
+            format!(
+                "Tests run: 1, Failures: {repro}, Errors: 0, Skipped: 0 - in com.x.ReproSlugTest\n\
+                 Tests run: 2, Failures: 1, Errors: 0, Skipped: 0 <<< FAILURE! - in com.x.OtherTest"
+            )
+        };
+        let class = |out: &str| output_names_reproduction(out, "ReproSlugTest", "");
+        assert!(!class(&surefire("0")), "the reproduction class passed");
+        assert!(class(&surefire("1")), "the reproduction class failed");
         // Short names are too common to count.
         assert!(!output_names_reproduction("fn ab failed", "ab", "fn ab() {}"));
     }
