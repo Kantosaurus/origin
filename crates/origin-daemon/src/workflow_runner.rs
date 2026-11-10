@@ -176,6 +176,7 @@ pub fn step_worker_spec(step: &WorkflowStep, catalog: &SkillCatalog) -> WorkerSp
         model: None,
         mcp_servers: Vec::new(),
         effort: None,
+        ponytail: None,
     }
 }
 

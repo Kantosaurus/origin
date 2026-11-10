@@ -99,6 +99,10 @@ pub struct TaskInput {
     /// parent's explicit effort token, copied to [`WorkerSpec::effort`].
     #[serde(skip)]
     pub effort: Option<String>,
+    /// Set by the dispatching loop, never by the model (`serde(skip)`): the
+    /// parent's ponytail level, copied to [`WorkerSpec::ponytail`].
+    #[serde(skip)]
+    pub ponytail: Option<String>,
 }
 
 /// Background dispatch is the default (see [`TaskInput::background`]).
@@ -236,6 +240,7 @@ fn worker_spec_from(input: TaskInput, user_mcp: &[McpServerSpec]) -> Result<Work
         model: input.model,
         mcp_servers,
         effort: input.effort,
+        ponytail: input.ponytail,
     })
 }
 

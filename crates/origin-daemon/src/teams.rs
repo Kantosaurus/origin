@@ -144,6 +144,7 @@ fn teammate_spec(task: &str) -> WorkerSpec {
         model: None,
         mcp_servers: Vec::new(),
         effort: None,
+        ponytail: None,
     }
 }
 

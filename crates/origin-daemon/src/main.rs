@@ -1728,13 +1728,15 @@ fn resolve_turn_effort(
         .or_else(|| (provider_name == "anthropic").then_some(origin_provider::ReasoningEffort::High))
 }
 
-/// A best-of-N candidate's run: the orchestrator's resolved `effort`, so an
-/// explicit `/effort` reaches it.
+/// A best-of-N candidate's run: the orchestrator's resolved `effort` (so an
+/// explicit `/effort` reaches it) and the headless prompt — nobody answers a
+/// candidate's questions.
 fn candidate_opts(effort: Option<origin_provider::ReasoningEffort>, cwd: &std::path::Path) -> LoopOptions {
     LoopOptions {
         max_turns: 60,
         effort,
         cwd: Some(cwd.to_path_buf()),
+        prompt_profile: origin_daemon::agent::PromptProfile::Headless,
         ..LoopOptions::default()
     }
 }
@@ -4745,6 +4747,15 @@ mod tests {
         );
         let default = resolve_turn_effort(None, None, "anthropic");
         assert_eq!(candidate_opts(default, wt).effort, Some(ReasoningEffort::High));
+    }
+
+    /// B5: nobody answers a candidate's questions, so it gets the headless prompt.
+    #[test]
+    fn candidates_get_the_headless_prompt() {
+        assert_eq!(
+            candidate_opts(None, std::path::Path::new("wt")).prompt_profile,
+            origin_daemon::agent::PromptProfile::Headless
+        );
     }
 
     #[test]

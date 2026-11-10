@@ -47,6 +47,7 @@ async fn three_workers_complete_and_report() {
             model: None,
             mcp_servers: Vec::new(),
             effort: None,
+            ponytail: None,
         };
         handles.push(coord.spawn(spec).await.expect("spawn"));
     }

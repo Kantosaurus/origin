@@ -4982,13 +4982,15 @@ async fn run_loop_inner(
             &style_block,
         ];
         // B5: a worker's prompt is its role/task contract plus only the rules it
-        // needs to operate its tools — no identity, directive, catalogs or map.
-        let worker_parts: [&str; 5] = [
+        // needs to operate its tools — no identity, directive, catalogs or map —
+        // and the user's ponytail ruleset when it is on (empty when off).
+        let worker_parts: [&str; 6] = [
             crate::swarm_worker::WORKER_PROMPT,
             tool_use_block,
             &result_encoding_block,
             &edit_format_block,
             &env_block,
+            &ponytail_block,
         ];
         let parts: &[&str] = if worker { &worker_parts } else { &parts };
         parts
@@ -6661,6 +6663,9 @@ async fn run_loop_inner(
                             // B3: the user's explicit effort reaches the worker
                             // (a default does not; the worker has its own).
                             input.effort = opts.explicit_effort.map(|e| e.as_wire_str().to_owned());
+                            // B5: the worker carries the ponytail ruleset exactly
+                            // when this loop does.
+                            input.ponytail = Some(opts.ponytail.as_str().to_owned());
                             // A4: a skill-masked parent may only delegate tools its
                             // mask permits, as exact names: a glob entry (`*`,
                             // `mcp__x__*`) is dropped even if the mask lists that

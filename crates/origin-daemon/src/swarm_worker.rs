@@ -364,6 +364,14 @@ async fn run_worker(
         effort: worker_effort(ctx.spec.effort.as_deref(), provider.name()),
         // B5: the small fixed worker prompt, with no repo-map scan.
         prompt_profile: crate::agent::PromptProfile::Worker,
+        // B5: the parent's ponytail level (a `Task` always sends it); other
+        // spawners resolve config/env like a fresh session.
+        ponytail: origin_ponytail::resolve_mode(
+            ctx.spec
+                .ponytail
+                .as_deref()
+                .and_then(origin_ponytail::PonytailMode::parse_level),
+        ),
         // #3: sub-agents that EDIT get the same regression enforcement as the
         // top-level loop — a worker must not report "Completed" while the test
         // suite is RED. We arm `auto_test` (turn-end run + terminal-branch

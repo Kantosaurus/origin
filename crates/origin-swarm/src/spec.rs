@@ -94,6 +94,11 @@ pub struct WorkerSpec {
     /// as a wire token (`low`, `max`, …). `None` ⇒ the worker's own default.
     #[serde(default)]
     pub effort: Option<String>,
+    /// The parent's resolved ponytail level (`off`/`lite`/`full`/`ultra`), so
+    /// the worker carries the ruleset exactly when the parent does. `None` ⇒
+    /// resolved from config/env like a fresh session.
+    #[serde(default)]
+    pub ponytail: Option<String>,
 }
 
 /// A follow-up task suggested by a worker on completion.

@@ -355,6 +355,7 @@ fn spec(goal: &str) -> WorkerSpec {
         model: None,
         mcp_servers: Vec::new(),
         effort: None,
+        ponytail: None,
     }
 }
 

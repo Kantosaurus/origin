@@ -81,6 +81,17 @@ fn coordinator(provider: &Arc<Recording>, tmp: &tempfile::TempDir) -> Coordinato
     coord
 }
 
+/// Clears the switches these tests assume unset (a developer's shell may export
+/// them) once, before any test in this binary reads them: every test calls this
+/// first, and `ORIGIN_SWARM_ALWAYS` is read once per process.
+fn clean_env() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::remove_var("ORIGIN_SWARM_ALWAYS");
+        std::env::remove_var("ORIGIN_DEFAULT_WORKFLOW");
+    });
+}
+
 /// A small Rust workspace for the repo map to rank.
 fn workspace() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -104,7 +115,7 @@ async fn main_loop_system(opts: &LoopOptions) -> String {
 }
 
 /// Run one real swarm worker against `provider`; returns its captured requests.
-async fn worker_requests(provider: Arc<Recording>) -> Vec<ChatRequest> {
+async fn worker_requests(provider: Arc<Recording>, ponytail: &str) -> Vec<ChatRequest> {
     let tmp = tempfile::tempdir().unwrap();
     let coord = coordinator(&provider, &tmp);
     let spec = WorkerSpec {
@@ -121,6 +132,7 @@ async fn worker_requests(provider: Arc<Recording>) -> Vec<ChatRequest> {
         model: None,
         mcp_servers: Vec::new(),
         effort: None,
+        ponytail: Some(ponytail.into()),
     };
     let handle = coord.spawn(spec).await.unwrap();
     coord.await_completion(&handle).await.unwrap();
@@ -148,6 +160,7 @@ fn opts() -> LoopOptions {
 /// B3: with no explicit effort the main loop sends `high` to Anthropic (was `max`).
 #[tokio::test]
 async fn main_loop_defaults_to_high_effort_on_anthropic() {
+    clean_env();
     let req = first_request(&recording("anthropic"), "claude-test", &opts()).await;
     let body = origin_provider_anthropic::encode_request_for_test(&req);
     assert_eq!(
@@ -160,6 +173,7 @@ async fn main_loop_defaults_to_high_effort_on_anthropic() {
 /// B3: an explicit top effort is sent exactly as before (`max`).
 #[tokio::test]
 async fn explicit_effort_beats_the_default() {
+    clean_env();
     let opts = LoopOptions {
         effort: Some(origin_provider::ReasoningEffort::Ultracode),
         ..opts()
@@ -172,6 +186,7 @@ async fn explicit_effort_beats_the_default() {
 /// B3: a provider with no effort default today still sends no effort at all.
 #[tokio::test]
 async fn non_anthropic_request_is_unchanged() {
+    clean_env();
     let req = first_request(&recording("openai"), "gpt-5", &opts()).await;
     assert_eq!(req.effort, None);
     let body =
@@ -182,7 +197,8 @@ async fn non_anthropic_request_is_unchanged() {
 /// B3: a swarm worker on Anthropic sends `medium`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_defaults_to_medium_effort_on_anthropic() {
-    let reqs = worker_requests(recording("anthropic")).await;
+    clean_env();
+    let reqs = worker_requests(recording("anthropic"), "off").await;
     let body = origin_provider_anthropic::encode_request_for_test(&reqs[0]);
     assert_eq!(
         body["output_config"]["effort"], "medium",
@@ -229,6 +245,7 @@ async fn worker_requests_via_task(parent: LoopOptions) -> Vec<ChatRequest> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_parent_effort_reaches_workers() {
     use origin_provider::ReasoningEffort::{High, Low, Max, Medium};
+    clean_env();
     for (effort, explicit, want) in [
         (Some(Max), Some(Max), Max),
         (Some(Low), Some(Low), Low),
@@ -244,10 +261,31 @@ async fn explicit_parent_effort_reaches_workers() {
     }
 }
 
+/// B5: a worker carries the ponytail ruleset exactly when its parent does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_inherits_the_parents_ponytail() {
+    use origin_ponytail::PonytailMode;
+    clean_env();
+    for (mode, present) in [(PonytailMode::Off, false), (PonytailMode::Full, true)] {
+        let parent = LoopOptions {
+            ponytail: mode,
+            ..opts()
+        };
+        let worker = worker_requests_via_task(parent).await;
+        assert_eq!(
+            worker[0].system.contains("<origin-ponytail"),
+            present,
+            "parent {mode:?}:\n{}",
+            worker[0].system
+        );
+    }
+}
+
 /// B3: a worker turn routed to Anthropic with no effort set gets the worker
 /// default, not the main loop's.
 #[tokio::test]
 async fn worker_profile_fallback_is_medium() {
+    clean_env();
     let opts = LoopOptions {
         prompt_profile: PromptProfile::Worker,
         ..opts()
@@ -266,6 +304,7 @@ fn headless() -> LoopOptions {
 /// B5: a headless run (`origin run`) gets no default-workflow directive.
 #[tokio::test]
 async fn headless_system_prompt_omits_the_directive() {
+    clean_env();
     let interactive = main_loop_system(&opts()).await;
     let headless = main_loop_system(&headless()).await;
     assert!(interactive.contains("DEFAULT WORKFLOW"), "{interactive}");
@@ -281,6 +320,7 @@ async fn headless_system_prompt_omits_the_directive() {
 /// `tests/swarm_always_opt_in.rs`).
 #[tokio::test]
 async fn default_directive_has_no_swarm_mandates() {
+    clean_env();
     let system = main_loop_system(&opts()).await;
     assert!(
         system.contains("ADVERSARIAL VERIFICATION IS MANDATORY"),
@@ -294,7 +334,9 @@ async fn default_directive_has_no_swarm_mandates() {
 /// sub-agent section or swarm language, and no tool it can never use.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_gets_the_fixed_prompt() {
-    let reqs = worker_requests(recording("anthropic")).await;
+    clean_env();
+    // With the ruleset on, so its text is checked against the same list.
+    let reqs = worker_requests(recording("anthropic"), "full").await;
     let system = &reqs[0].system;
     for absent in [
         "DEFAULT WORKFLOW",
@@ -302,7 +344,6 @@ async fn worker_gets_the_fixed_prompt() {
         "<repo-map>",
         "<origin-skills>",
         "<origin-workflows>",
-        "<origin-ponytail>",
         "subagent",
         "swarm",
         "Swarm",
@@ -323,6 +364,7 @@ async fn worker_gets_the_fixed_prompt() {
 /// session map; deleting the sources afterwards exposes whether one happened.
 #[tokio::test]
 async fn worker_never_computes_the_repo_map() {
+    clean_env();
     for (profile, scanned) in [(PromptProfile::Interactive, true), (PromptProfile::Worker, false)] {
         let dir = workspace();
         let provider = recording("recording");
@@ -345,6 +387,7 @@ async fn worker_never_computes_the_repo_map() {
 /// sends byte-identical system text.
 #[tokio::test]
 async fn prefix_is_stable_for_headless_and_worker_sessions() {
+    clean_env();
     for profile in [PromptProfile::Headless, PromptProfile::Worker] {
         let dir = workspace();
         let provider = recording("anthropic");
@@ -368,17 +411,23 @@ async fn prefix_is_stable_for_headless_and_worker_sessions() {
     }
 }
 
-/// Prints the system-prompt sizes the report quotes (`--nocapture`).
+/// Prints the system-prompt sizes the report quotes. Asserts nothing; run on
+/// demand: `cargo test -p origin-daemon --test prompt_profiles -- --ignored --nocapture`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement only"]
 async fn measure_system_prompt_bytes() {
+    clean_env();
     let interactive = main_loop_system(&opts()).await;
     let headless = main_loop_system(&headless()).await;
-    let worker = worker_requests(recording("anthropic")).await;
+    let worker_off = worker_requests(recording("anthropic"), "off").await;
+    let worker_full = worker_requests(recording("anthropic"), "full").await;
     eprintln!(
-        "MEASURE interactive_system_bytes={} headless_system_bytes={} worker_system_bytes={} worker_effort={:?}",
+        "MEASURE interactive_system_bytes={} headless_system_bytes={} worker_system_bytes(ponytail off)={} \
+         worker_system_bytes(ponytail full)={} worker_effort={:?}",
         interactive.len(),
         headless.len(),
-        worker[0].system.len(),
-        worker[0].effort
+        worker_off[0].system.len(),
+        worker_full[0].system.len(),
+        worker_off[0].effort
     );
 }
