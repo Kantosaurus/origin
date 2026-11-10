@@ -10134,7 +10134,8 @@ async fn dispatch_tool(
 /// workflow, load I/O, layering failure, or a swarm-layer error). C2: both
 /// arms carry whether the result taints the caller; a failed run is treated
 /// as tainted (fail closed) when any step could reach a network or MCP tool,
-/// since its error text or an earlier step may carry external content.
+/// since its error text or an earlier step may carry external content —
+/// except a layering error (a cycle), raised before any worker runs.
 async fn run_workflow_tool(
     args: &Value,
     coordinator: &origin_swarm::Coordinator,
@@ -10175,9 +10176,11 @@ async fn run_workflow_tool(
         crate::workflow_runner::run_workflow(workflow, coordinator, catalog, event_tx, effort, ponytail)
             .await
             .map_err(|e| {
-                let tainted = workflow.steps.iter().any(|s| {
-                    grants_external(&crate::workflow_runner::step_worker_spec(s, catalog).allowed_tools)
-                });
+                // A layering error (a cycle) is raised before any worker runs.
+                let tainted = !matches!(e, crate::workflow_runner::RunError::Layering(_))
+                    && workflow.steps.iter().any(|s| {
+                        grants_external(&crate::workflow_runner::step_worker_spec(s, catalog).allowed_tools)
+                    });
                 (LoopError::ToolFailure(format!("RunWorkflow: {e}")), tainted)
             })?;
     // C2: the run report's structured taint travels with its JSON.

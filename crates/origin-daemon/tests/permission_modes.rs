@@ -471,20 +471,25 @@ static ORIGIN_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(
 
 /// C2: a FAILED `RunWorkflow` taints the parent (fail closed) when a step
 /// could reach a network or MCP tool — its error, or an earlier step, may
-/// carry external content — and not when no step could.
+/// carry external content — and not when no step could, nor for a cycle in
+/// the step graph, which is refused before any worker is spawned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_run_workflow_with_network_grants_taints_the_parent() {
     use std::sync::Arc;
     let _env = ORIGIN_HOME_LOCK.lock().await;
-    for (skill_tools, want) in [("[\"WebFetch\"]", true), ("[\"Read\"]", false)] {
+    let one_step = "[[workflows]]\nname = \"wf\"\n[[workflows.steps]]\nid = 0\nskill = \"fetcher\"\nargs = \"fetch it\"\n";
+    let cycle =
+        "[[workflows]]\nname = \"wf\"\n[[workflows.steps]]\nid = 0\nskill = \"fetcher\"\ndepends_on = [1]\n\
+                 [[workflows.steps]]\nid = 1\nskill = \"fetcher\"\ndepends_on = [0]\n";
+    for (workflows, skill_tools, want) in [
+        (one_step, "[\"WebFetch\"]", true),
+        (one_step, "[\"Read\"]", false),
+        (cycle, "[\"WebFetch\"]", false),
+    ] {
         let tmp = tempfile::TempDir::new().expect("tmp");
         let home = tmp.path().join("home");
         std::fs::create_dir_all(home.join(".origin")).expect("mkdir");
-        std::fs::write(
-            home.join(".origin").join("workflows.toml"),
-            "[[workflows]]\nname = \"wf\"\n[[workflows.steps]]\nid = 0\nskill = \"fetcher\"\nargs = \"fetch it\"\n",
-        )
-        .expect("write workflows");
+        std::fs::write(home.join(".origin").join("workflows.toml"), workflows).expect("write workflows");
         let skills = tmp.path().join("skills").join("fetcher");
         std::fs::create_dir_all(&skills).expect("mkdir");
         std::fs::write(
