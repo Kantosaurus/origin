@@ -1730,13 +1730,21 @@ fn resolve_turn_effort(
 
 /// A best-of-N candidate's run: the orchestrator's resolved `effort` (so an
 /// explicit `/effort` reaches it) and the headless prompt — nobody answers a
-/// candidate's questions.
-fn candidate_opts(effort: Option<origin_provider::ReasoningEffort>, cwd: &std::path::Path) -> LoopOptions {
+/// candidate's questions. A4: the same deny-only governance the main loop runs
+/// under (`[[permission_rules]]`, policy layers, conseca).
+fn candidate_opts(
+    effort: Option<origin_provider::ReasoningEffort>,
+    cwd: &std::path::Path,
+    governance: &origin_daemon::config::Governance,
+) -> LoopOptions {
     LoopOptions {
         max_turns: 60,
         effort,
         cwd: Some(cwd.to_path_buf()),
         prompt_profile: origin_daemon::agent::PromptProfile::Headless,
+        policy: governance.policy.clone(),
+        conseca: governance.conseca.clone(),
+        permission_rules: governance.permission_rules.clone(),
         ..LoopOptions::default()
     }
 }
@@ -2164,6 +2172,7 @@ async fn handle_request(
                 opts.effort,
                 permission_mode,
                 Some(event_tx.clone()),
+                governance.clone(),
             )
             .await;
         }
@@ -2285,6 +2294,8 @@ async fn maybe_run_best_of_n(
     permission_mode: PermissionMode,
     // C5: where the one-line outcome goes (never the session).
     event_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
+    // A4: the session's deny-only governance, for every candidate.
+    governance: origin_daemon::config::Governance,
 ) {
     use origin_daemon::bestofn_runner::{run_best_of_n_reported, WorktreeArena};
     use origin_swarm::bestofn::DifficultySignals;
@@ -2365,7 +2376,7 @@ async fn maybe_run_best_of_n(
                 // tests + terminal enforcement), so it MUST carry post_edit.
                 post_edit: post_edit.clone(),
                 permission_mode,
-                ..candidate_opts(effort, wt)
+                ..candidate_opts(effort, wt, &governance)
             };
             let res = rt.block_on(origin_daemon::agent::run_loop(
                 &mut cand_session,
@@ -4772,21 +4783,76 @@ mod tests {
     #[test]
     fn candidates_run_at_the_orchestrators_effort() {
         let wt = std::path::Path::new("wt");
+        let gov = origin_daemon::config::Governance::default();
         assert_eq!(
-            candidate_opts(Some(ReasoningEffort::Max), wt).effort,
+            candidate_opts(Some(ReasoningEffort::Max), wt, &gov).effort,
             Some(ReasoningEffort::Max)
         );
         let default = resolve_turn_effort(None, None, "anthropic");
-        assert_eq!(candidate_opts(default, wt).effort, Some(ReasoningEffort::High));
+        assert_eq!(
+            candidate_opts(default, wt, &gov).effort,
+            Some(ReasoningEffort::High)
+        );
     }
 
     /// B5: nobody answers a candidate's questions, so it gets the headless prompt.
     #[test]
     fn candidates_get_the_headless_prompt() {
         assert_eq!(
-            candidate_opts(None, std::path::Path::new("wt")).prompt_profile,
+            candidate_opts(
+                None,
+                std::path::Path::new("wt"),
+                &origin_daemon::config::Governance::default()
+            )
+            .prompt_profile,
             origin_daemon::agent::PromptProfile::Headless
         );
+    }
+
+    /// A4: a best-of-N candidate runs under the session's governance: a
+    /// `[[permission_rules]]` deny for `Write` denies the candidate's `Write`,
+    /// even inside its own worktree (which `workspace` mode would allow).
+    #[tokio::test]
+    async fn a_candidate_honours_the_sessions_deny_rules() {
+        use std::sync::Arc;
+        let wt = tempfile::tempdir().expect("wt");
+        let target = wt.path().join("cand.txt");
+        let deny = vec![origin_permission::rules::Rule {
+            tool_name: "Write".into(),
+            scope: origin_daemon::config::PERMISSION_RULE_SCOPE.into(),
+            allow: false,
+        }];
+        let gov = origin_daemon::config::Governance {
+            permission_rules: Some(Arc::new(origin_daemon::config::PermissionRules {
+                bloom: origin_permission::bloom::BloomPreCheck::build(&deny),
+                rules: deny,
+            })),
+            ..Default::default()
+        };
+        let opts = origin_daemon::agent::LoopOptions {
+            streaming_disabled: true,
+            ..candidate_opts(None, wt.path(), &gov)
+        };
+        let provider = ScriptedWriteProvider {
+            calls: std::sync::Mutex::new(0),
+            target: target.clone(),
+        };
+        let mut session = Session::new("scripted-write", "m");
+        origin_daemon::agent::run_loop(
+            &mut session,
+            "write it",
+            &provider,
+            &origin_permission::prompt::NoPrompter,
+            &opts,
+        )
+        .await
+        .expect("run");
+        assert!(!target.exists(), "the deny rule bound the candidate");
+        let denied = session.messages.iter().flat_map(|m| &m.blocks).any(|b| {
+            matches!(b, Block::ToolResult { is_error: true, inline: Some(v), .. }
+                if String::from_utf8_lossy(v).contains("rule:Write"))
+        });
+        assert!(denied, "{:?}", session.messages);
     }
 
     #[test]
