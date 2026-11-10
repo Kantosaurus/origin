@@ -504,16 +504,7 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     // file is absent both handles are `None` ⇒ the deny-only overlay is inert
     // and daemon behavior is byte-identical to before this wiring landed.
     // Loaded before the swarm coordinator so sub-agents inherit it (A4).
-    let governance: Governance = {
-        let path = governance_path();
-        match load_governance(&path) {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::warn!(error = %e, path = %path.display(), "governance config load failed; running with no governance overlay");
-                Governance::default()
-            }
-        }
-    };
+    let governance: Governance = startup_governance(&governance_path())?;
     info!(
         policy = governance.policy.is_some(),
         conseca = governance.conseca.is_some(),
@@ -758,6 +749,19 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
 
 /// Spawn the idle-heartbeat consolidator if memory + consolidator are wired.
 /// Runs one bounded pass every 30s after a 30s warmup tick.
+/// A4: the governance the daemon starts with. A missing file is no
+/// governance; a file that exists but cannot be read or parsed stops the
+/// start (its organisation deny rules, conseca policy and caps must not
+/// silently vanish), with an error naming the file and the reason.
+fn startup_governance(path: &std::path::Path) -> Result<Governance> {
+    load_governance(path).map_err(|e| {
+        anyhow::anyhow!(
+            "{e}; origin-daemon does not start without the governance this file configures \
+             (fix the file, or remove it to run without governance)"
+        )
+    })
+}
+
 fn spawn_idle_consolidator(memory: Option<&MemoryWiring>) {
     let Some(m) = memory else { return };
     let Some(consolidator) = m.consolidator.as_ref() else {
@@ -4727,7 +4731,8 @@ fn spawn_metrics_endpoint(metrics: Metrics, addr: String) {
 mod tests {
     use super::{
         candidate_opts, choice_registry_enabled, detach_last_turn, parse_default_effort, resolve_turn_effort,
-        resume_foreign_event, resume_session_event, turn_window, Session, SessionStore, StreamEvent,
+        resume_foreign_event, resume_session_event, startup_governance, turn_window, Session, SessionStore,
+        StreamEvent,
     };
     use origin_core::types::{Block, Message, Role};
     use origin_provider::ReasoningEffort;
@@ -4807,6 +4812,22 @@ mod tests {
             .prompt_profile,
             origin_daemon::agent::PromptProfile::Headless
         );
+    }
+
+    /// A4 (final fix S6): a governance file that exists but cannot be parsed
+    /// stops the start with an error naming the file and the parse error; a
+    /// missing file is no governance.
+    #[test]
+    fn an_unloadable_governance_file_stops_the_start() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("governance.toml");
+        let gov = startup_governance(&path).expect("missing file starts");
+        assert!(gov.policy.is_none() && gov.conseca.is_none() && gov.permission_rules.is_none());
+        std::fs::write(&path, "this is = = not toml").expect("write");
+        let err = startup_governance(&path).expect_err("unparseable file stops the start");
+        let text = err.to_string();
+        assert!(text.contains(&path.display().to_string()), "{text}");
+        assert!(text.contains("failed to parse"), "{text}");
     }
 
     /// A4: a best-of-N candidate runs under the session's governance: a
