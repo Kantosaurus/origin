@@ -63,7 +63,8 @@ impl EditFormat {
             }
             Self::WholeFile => {
                 "emit the entire updated file contents inside a fenced code block, \
-                 preceded by the file path; do not abbreviate or elide any lines"
+                 with the file path alone on the line directly above the fence; do \
+                 not abbreviate or elide any lines"
             }
             Self::Udiff => {
                 "use unified-diff hunks: `--- a/path` and `+++ b/path` headers, then \
@@ -364,45 +365,46 @@ fn trim_trailing_newline(mut s: String) -> String {
     s
 }
 
-/// Parses a whole-file block: an optional `file:` header then fenced contents,
-/// or the raw text if no fence is present.
+/// Parses whole-file edits (C7): each is a path line (optionally ending in
+/// `:`) IMMEDIATELY followed by a closed fenced block holding the file's full
+/// contents. Anything else — prose, a fence after a sentence, an unclosed
+/// fence — is not an edit, so a plain reply never writes a file.
 fn parse_whole_file(text: &str) -> Result<Vec<Hunk>, EditFmtError> {
+    let is_fence = |l: &&str| l.trim_start().starts_with("```");
     let lines: Vec<&str> = text.lines().collect();
-    let mut file = String::new();
-    let mut content_lines: Vec<&str> = Vec::new();
-    let mut in_fence = false;
-    let mut saw_fence = false;
-    for line in &lines {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            if in_fence {
-                in_fence = false;
-            } else {
-                in_fence = true;
-                saw_fence = true;
-            }
+    let mut hunks = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if !is_fence(&lines[i]) {
+            i += 1;
             continue;
         }
-        if in_fence {
-            content_lines.push(line);
-        } else if file.is_empty() && !trimmed.is_empty() && !saw_fence {
-            file = trimmed.trim_end_matches(':').to_string();
+        let Some(close) = lines[i + 1..].iter().position(is_fence).map(|k| i + 1 + k) else {
+            break; // unclosed fence: not an edit
+        };
+        let file = i.checked_sub(1).map(|p| lines[p].trim().trim_end_matches(':'));
+        if let Some(file) = file.filter(|f| looks_like_path(f)) {
+            hunks.push(Hunk {
+                file: file.to_string(),
+                before: String::new(),
+                after: lines[i + 1..close].join("\n"),
+            });
         }
+        i = close + 1;
     }
-    let content = if saw_fence {
-        content_lines.join("\n")
-    } else {
-        // No fence: everything after an optional first header line is the body.
-        text.to_string()
-    };
-    if content.is_empty() && file.is_empty() {
-        return Err(EditFmtError::Parse("empty whole-file block".to_string()));
+    if hunks.is_empty() {
+        return Err(EditFmtError::Parse(
+            "no path line followed by a fenced block".to_string(),
+        ));
     }
-    Ok(vec![Hunk {
-        file,
-        before: String::new(),
-        after: content,
-    }])
+    Ok(hunks)
+}
+
+/// A conservative path: non-empty, ASCII letters/digits and `.` `_` `-` `/` only.
+fn looks_like_path(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
 }
 
 /// Parses a minimal unified diff into normalized hunks (one per `@@` section).
@@ -555,6 +557,47 @@ mod tests {
         assert_eq!(hunks[0].file, "config.toml");
         assert!(hunks[0].before.is_empty());
         assert_eq!(hunks[0].after, "key = \"value\"\nother = 1");
+    }
+
+    #[test]
+    fn whole_file_plain_reply_is_not_an_edit() {
+        // C7: a plain `done` from a whole-file model must never write a file.
+        assert!(parse(EditFormat::WholeFile, "done").is_err());
+        assert!(extract_all_hunks("done", "gpt-3.5-turbo").is_err());
+        assert!(parse(EditFormat::WholeFile, "src/a.rs\nno fence here\n").is_err());
+    }
+
+    #[test]
+    fn whole_file_sentence_before_fence_is_not_an_edit() {
+        let text = "Here is the updated code:\n```\nfn main() {}\n```\n";
+        assert!(parse(EditFormat::WholeFile, text).is_err());
+        // A path separated from its fence by a blank line is not an edit either.
+        assert!(parse(EditFormat::WholeFile, "src/a.rs\n\n```\nx\n```\n").is_err());
+    }
+
+    #[test]
+    fn whole_file_path_then_fence_is_one_edit() {
+        let text = "src/a.rs\n```rust\nfn a() {}\n```\n";
+        let hunks = parse(EditFormat::WholeFile, text).unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].file, "src/a.rs");
+        assert!(hunks[0].before.is_empty());
+        assert_eq!(hunks[0].after, "fn a() {}");
+    }
+
+    #[test]
+    fn whole_file_two_files_in_one_reply() {
+        let text = "Two files:\nsrc/a.rs\n```\nA\n```\nand\nsrc/b.rs\n```\nB1\nB2\n```\n";
+        let hunks = parse(EditFormat::WholeFile, text).unwrap();
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(
+            (hunks[0].file.as_str(), hunks[0].after.as_str()),
+            ("src/a.rs", "A")
+        );
+        assert_eq!(
+            (hunks[1].file.as_str(), hunks[1].after.as_str()),
+            ("src/b.rs", "B1\nB2")
+        );
     }
 
     #[test]
