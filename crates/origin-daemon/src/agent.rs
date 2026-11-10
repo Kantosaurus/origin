@@ -5621,14 +5621,16 @@ pub async fn run_loop_with_totals(
         .await;
     if let Err(e) = &result {
         // B1: the success path records these at loop end; an error exit still
-        // counts the tokens it spent (counters only).
-        record_usage_counters(
-            provider.name(),
-            &session.model,
-            totals,
-            started.elapsed().as_secs_f64() * 1_000.0,
-            opts.metrics.as_deref(),
-        );
+        // counts the tokens it spent (counters only) — none before any call.
+        if *totals != LoopTotals::default() {
+            record_usage_counters(
+                provider.name(),
+                &session.model,
+                totals,
+                started.elapsed().as_secs_f64() * 1_000.0,
+                opts.metrics.as_deref(),
+            );
+        }
         // `MaxTurns` already emitted its own `BudgetExhausted` bucket inside
         // the inner loop; every other error is a fatal, unrecovered exit ⇒
         // `Error`. The inner loop holds the model/tool split, which is not
