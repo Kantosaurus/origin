@@ -5023,6 +5023,10 @@ impl SpeculativeRegistry {
         // neither and would precompute the prose-fallback, shadowing the real
         // interactive path.
         "ask_user",
+        // `Monitor` reads the session's process supervisor; a fresh one knows
+        // no pid. (`Diagnostics`/`LspNavigate` read only the run cwd, which is
+        // `None` whenever speculation runs, so they need no entry.)
+        "Monitor",
     ];
 
     fn spawn(
@@ -12076,6 +12080,8 @@ mod dispatch_table_tests {
             ("graph_query", serde_json::json!({"kind": "communities"})),
             ("graph_path", serde_json::json!({"from": "00", "to": "00"})),
             ("graph_summarize", serde_json::json!({"community_id": 0})),
+            // A3: needs the session's process supervisor.
+            ("Monitor", serde_json::json!({"pid": 1})),
         ] {
             let meta = registry_iter().find(|m| m.name == tool).expect("registered");
             reg.spawn(format!("id-{tool}"), meta, args, None);
