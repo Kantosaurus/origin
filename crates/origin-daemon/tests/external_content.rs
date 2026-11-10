@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use origin_core::types::{Block, Message, Role};
 use origin_daemon::agent::{run_loop, scope_runtime_tools, LoopOptions};
 use origin_daemon::external_content::{
-    quarantine_model, quarantine_web_fetch, wrap_external, wrap_tool_result, QUARANTINE_ANSWER_MAX_CHARS,
-    QUARANTINE_SYSTEM,
+    missing_prompt, quarantine_model, quarantine_web_fetch, wrap_external, wrap_tool_result,
+    QUARANTINE_ANSWER_MAX_CHARS, QUARANTINE_SYSTEM,
 };
 use origin_daemon::session::Session;
 use origin_permission::prompt::AlwaysAllow;
@@ -325,6 +325,24 @@ async fn webfetch_without_a_prompt_is_bad_args() {
         assert!(is_error, "{args}: {body}");
         assert!(body.contains("missing `prompt`"), "{args}: {body}");
     }
+}
+
+/// `prompt` is demanded only where a quarantine call will run: not for a
+/// provider with no cheap model, not in raw mode.
+#[tokio::test]
+async fn missing_prompt_only_when_a_quarantine_call_will_run() {
+    let _g = ENV_LOCK.lock().await;
+    set_env(false);
+    let no_prompt = json!({ "url": "https://a.test" });
+    assert_eq!(missing_prompt("ollama", &no_prompt), None);
+    assert!(missing_prompt("anthropic", &no_prompt).is_some());
+    assert_eq!(
+        missing_prompt("anthropic", &json!({ "url": "https://a.test", "prompt": "q" })),
+        None
+    );
+    set_env(true);
+    assert_eq!(missing_prompt("anthropic", &no_prompt), None);
+    std::env::remove_var("ORIGIN_WEBFETCH_RAW");
 }
 
 /// `prompt` only feeds the quarantine call: raw mode does not demand it.

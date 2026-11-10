@@ -175,20 +175,28 @@ pub fn quarantine_model(provider_name: &str) -> Option<String> {
     })
 }
 
+/// The model a `WebFetch` quarantine call on `provider_name` will use, or
+/// `None` when no call is made: under `ORIGIN_WEBFETCH_RAW=1` or with no cheap
+/// model for the provider.
+fn quarantine_call_model(provider_name: &str) -> Option<String> {
+    if std::env::var("ORIGIN_WEBFETCH_RAW").as_deref() == Ok("1") {
+        return None;
+    }
+    quarantine_model(provider_name)
+}
+
 /// A `WebFetch` call's missing-`prompt` error, if any.
 ///
 /// `prompt` is required only when the quarantine call, its one consumer, will
-/// be made: `None` under `ORIGIN_WEBFETCH_RAW=1` or with no cheap model for
-/// `provider_name`.
+/// be made (see [`quarantine_call_model`]).
 #[must_use]
 pub fn missing_prompt(provider_name: &str, args: &Value) -> Option<String> {
-    let quarantined = std::env::var("ORIGIN_WEBFETCH_RAW").as_deref() != Ok("1")
-        && quarantine_model(provider_name).is_some();
     let blank = args
         .get("prompt")
         .and_then(Value::as_str)
         .is_none_or(|p| p.trim().is_empty());
-    (quarantined && blank).then(|| "WebFetch: missing `prompt`".to_string())
+    (blank && quarantine_call_model(provider_name).is_some())
+        .then(|| "WebFetch: missing `prompt`".to_string())
 }
 
 /// What the main loop sees of a fetched `WebFetch` page, before wrapping.
@@ -205,10 +213,7 @@ pub async fn quarantine_web_fetch(
     args: &Value,
     page: String,
 ) -> Result<String, String> {
-    if std::env::var("ORIGIN_WEBFETCH_RAW").as_deref() == Ok("1") {
-        return Ok(page);
-    }
-    let Some(model) = quarantine_model(provider.name()) else {
+    let Some(model) = quarantine_call_model(provider.name()) else {
         return Ok(page);
     };
     let prompt = args.get("prompt").and_then(Value::as_str).unwrap_or_default();
