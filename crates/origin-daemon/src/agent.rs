@@ -5937,9 +5937,11 @@ async fn run_loop_inner(
         &loop_cwd(opts).map_or_else(|| ".".to_string(), |p| p.display().to_string()),
         &tools_line,
     );
-    // B2 seam — the SESSION-STABLE system prompt. It must be byte-identical for
-    // every request of a session: Anthropic caches tools + system behind one
-    // marker, and any change re-bills the whole conversation. Ordered
+    // B2 seam — the SESSION-STABLE system prompt. Anthropic caches tools +
+    // system behind one marker, so the prefix is stable while this prompt is
+    // unchanged; a change to it (activating a skill, `/ponytail`, output
+    // style, a `/model` switch that changes the edit-format block) re-bills
+    // the message history once. Ordered
     // static-first (identity/rules → tool guidance → project-level →
     // session-level) so a block that does change (a skill activation, a
     // `/ponytail` switch) only invalidates what follows it. Content that

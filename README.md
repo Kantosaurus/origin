@@ -16,9 +16,9 @@
 </div>
 
 `origin` runs on the same shape of *model + tools + skills + hooks + permissions*
-as Claude Code, jcode, and opencode — but it treats four performance KPIs as
-**first-class CI gates** rather than afterthoughts: cold start, keystroke-to-pixel
-latency, steady RSS, and cache hit rate. It draws *attributes* from those
+as Claude Code, jcode, and opencode, with performance checked in CI: the perf-gate
+workflow fails if a read-only task takes over 80 ms; cold start, keystroke-to-pixel
+latency, steady RSS and cache hit rate are measured but not yet asserted. It draws *attributes* from those
 harnesses; every signature subsystem uses an original mechanism.
 
 It's a Cargo workspace of 40+ crates with a clean split: **`origin-daemon`** hosts

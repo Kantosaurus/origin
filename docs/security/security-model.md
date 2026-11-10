@@ -264,7 +264,7 @@ binary that deletes files).
 selection, best-of-N's oracle) go through the same analysis with nobody to ask:
 a command rated `Dangerous` or `NeedsApproval` is **not run**. Each run logs it
 (`gate command skipped by the command guard: …`), and the user is told once per
-session per gate with one `[origin]` line naming the gate, the command, the
+session for each refused gate command with one `[origin]` line naming the gate, the command, the
 guard's reason and the way out (a different command, or one the guard can
 analyse: no substitution or variable where the program name goes — for example,
 call a script file). A configured test command whose program is a substitution
@@ -404,8 +404,10 @@ sidecars this means `AGENT_BROWSER_*` configuration variables are dropped
 unless listed in `ORIGIN_ENV_PASSTHROUGH`. For them the allow-list includes
 `PLAYWRIGHT_BROWSERS_PATH`, `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY` and
 `XDG_RUNTIME_DIR`; being on the allow-list, these reach every child process,
-Bash included. `ORIGIN_ENV_PASSTHROUGH` adds names (for example
-`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, `SSH_AUTH_SOCK`, or
+Bash included. The ssh agent socket (`SSH_AUTH_SOCK`, a path, not a key) and
+`PKG_CONFIG_PATH`, `TZ`, `SDKROOT`, `DEVELOPER_DIR` are on the allow-list too.
+`ORIGIN_ENV_PASSTHROUGH` adds names (for example
+`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, or
 registry URLs such as `GOPROXY`, `PIP_INDEX_URL`, `NPM_CONFIG_REGISTRY`,
 `UV_INDEX_URL`, kept off the default list because they can embed
 `user:token@` credentials); `ORIGIN_ENV_SCRUB=0` restores full inheritance. See
@@ -660,7 +662,8 @@ this was built.
   preview is the consent for that combination), and a tainted worker result
   taints the parent session. A `RunWorkflow` whose run fails reports no taint,
   so it taints the session whenever any of its steps could reach a network or
-  MCP tool (fail closed; a workflow that could not be found or loaded does not).
+  MCP tool (fail closed; a workflow that could not be found or loaded, or whose
+  steps form a cycle, does not).
 - **Governance follows the worker.** Workers inherit the daemon's
   `governance.toml` overlays (policy layers, conseca lists, `[[permission_rules]]`
   deny rules (never allow rules), the browser action cap) (A4). Inline-MCP tools

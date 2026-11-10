@@ -15,6 +15,27 @@ release their entries belong to cannot be told from the repository (the current 
 
 Defaults that changed, each with its escape hatch:
 
+- **On Anthropic the `system` field is now an array of marked blocks** (B2), not a string. Anthropic-compatible
+  endpoints that accept only a string need `ORIGIN_SYSTEM_CACHE=0`.
+- **Old tool results are elided** once the context passes 70% of the window (A7): an elided result is gone from the
+  context and has no recall handle, so the model re-runs the tool. Escape: `ORIGIN_ELIDE_HIGH_WATER=0`.
+- **`Read` caps its output** at 100,000 bytes and 2,000 characters per line (B10); no switch, use `offset`/`limit`.
+  The public `ToolMeta.token_budget` field and `DEFAULT_TOKEN_BUDGET` were removed.
+- **`Edit` returns `{ok, diff}`** instead of a bare confirmation (B9).
+- **A sub-agent request naming an MCP server that is not in the user's configuration is refused** (A5). Escape:
+  define the server in a `~/.origin/subagents/*.md` `mcp:` list.
+- **`input_tokens` now means uncached input on the OpenAI-compatible and Gemini providers too** (B1), so token
+  budgets for goals stretch further and exported telemetry reads lower.
+- **Secret values are redacted** from tool output and stored sessions, and file tools refuse to write a redaction
+  marker (C9); no switch.
+- **The code graph builds in the background** on a session's first `graph_query` (A11). Escape:
+  `ORIGIN_CODEGRAPH_AUTOBUILD=0`.
+- **Per-turn test and lint gates** (`auto_test`, `auto_lint`, the repro gate) now run even with `ORIGIN_EDIT_CHECK=0`
+  and LSP diagnostics off (A12).
+- **Child processes no longer inherit the daemon's environment** (A6): they get an allow-list without provider keys,
+  so proxy variables (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) and version-manager variables (for example
+  `PYENV_ROOT`, `ASDF_DIR`; `NVM_DIR` is kept) no longer reach them. The ssh agent socket (`SSH_AUTH_SOCK`) is
+  passed. Escape: list names to pass through in `ORIGIN_ENV_PASSTHROUGH`, or `ORIGIN_ENV_SCRUB=0`.
 - **Permission mode** is `workspace`, not auto-allow (C2): Bash, network tools, writes outside the workspace and
   delegations that grant gated tools now ask; **headless, scheduled and ambient runs deny** what would ask. Escape:
   `/permissions off`, `origin run --dangerously-allow-all`, `ORIGIN_ALLOW_ALL=1`, or a `[[permission_rules]]` allow
@@ -47,8 +68,7 @@ Defaults that changed, each with its escape hatch:
 - **Best-of-N refuses to apply a winner** whose files have uncommitted changes in the workspace (C5); the first
   attempt's result is kept and the reason is shown. No escape hatch: applying it would fail or mix two untested
   edits.
-- Also changed by default: child processes get an allow-listed environment without provider keys (A6; escape
-  `ORIGIN_ENV_SCRUB=0`, or add names with `ORIGIN_ENV_PASSTHROUGH`); `WebFetch` refuses private and local addresses
+- Also changed by default: `WebFetch` refuses private and local addresses
   (A9; escape `ORIGIN_WEBFETCH_ALLOW_PRIVATE=1`); the per-model edit-format table picks the advertised edit tools
   (C7; escape `ORIGIN_EDITFMT=0`); commands the guard cannot classify need approval (C3; escape
   `ORIGIN_CMD_GUARD=0`).
@@ -81,7 +101,8 @@ Defaults that changed, each with its escape hatch:
   variables (`ProgramFiles`, `ProgramFiles(x86)`, `windir`, `NUMBER_OF_PROCESSORS`, `PROCESSOR_ARCHITECTURE`) and
   project-resolution variables (`PYTHONPATH`, `PYTHONHOME`, `GOFLAGS`, `GOMODCACHE`, `GOPRIVATE`, `GONOSUMDB`,
   `GONOPROXY`, `GOWORK`, `RUSTUP_TOOLCHAIN`, `RUSTFLAGS`, `CARGO_TARGET_DIR`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`,
-  `XDG_DATA_HOME`, `LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, `DOTNET_ROOT`, `NODE_PATH`), and, for the browser
+  `XDG_DATA_HOME`, `LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, `DOTNET_ROOT`, `NODE_PATH`), Unix tool variables
+  (`SSH_AUTH_SOCK`, `PKG_CONFIG_PATH`, `TZ`, `SDKROOT`, `DEVELOPER_DIR`), and, for the browser
   sidecars, `PLAYWRIGHT_BROWSERS_PATH`, `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, `XDG_RUNTIME_DIR` — being on the
   allow-list, these five reach every child process, Bash included. Turn-end gate commands run through the supervised
   spawn (command guard, PowerShell fallback when `pwsh` is absent). Add names with `ORIGIN_ENV_PASSTHROUGH`;
@@ -114,7 +135,7 @@ Defaults that changed, each with its escape hatch:
   deny rules now also bind auto-allowed tools and win over the flag. Once a network or MCP result (or a sub-agent
   result that contained one) has entered a session, network tools and unsandboxed Bash need a fresh approval each
   time; a `RunWorkflow` that fails after loading its workflow taints the session when any step could reach a network
-  or MCP tool. **Security fix:** prose edits (`ORIGIN_EDITFMT=1`, edit blocks applied from the model's reply text)
+  or MCP tool (not one whose steps form a cycle). **Security fix:** prose edits (`ORIGIN_EDITFMT=1`, edit blocks applied from the model's reply text)
   previously bypassed every permission check; each is now resolved against the run's working directory and applied
   only where a `Write` to that path would be allowed without asking (nothing in mode `on`, nothing outside the
   workspace or on protected paths; deny rules, the governance policy, read-only mode, the conseca path policy and
@@ -129,7 +150,7 @@ Defaults that changed, each with its escape hatch:
   of 4,096 extra starts, then approval is needed). A command whose program cannot be determined statically, or that
   cannot be parsed, gets a new `NeedsApproval` verdict: it goes through the permission prompt and is denied when no
   one can be asked; such an ask never offers "Always allow". Turn-end gate commands rated `Dangerous` or
-  `NeedsApproval` are not run; each run logs it, and the user is told once per session per gate with one `[origin]`
+  `NeedsApproval` are not run; each run logs it, and the user is told once per session for each refused gate command with one `[origin]`
   line naming the gate, the command, the reason and the way out. Known limits:
   `sudo -u a -g b -h host -p prompt rm -rf ~` (past the four-word window) and bash single-dash long options (`bash -norc < evil.sh`) are rated `Safe`. `ORIGIN_CMD_GUARD=0` still disables the guard.
   Note for bisecting: `origin-daemon` does not build at the six commits `3b022e6..f2f975d`.
@@ -249,8 +270,10 @@ Defaults that changed, each with its escape hatch:
 
 ### Changed
 
-- **B2**: cache-stable prompt prefix. The system prompt is ordered static-first and stays byte-identical for a
-  session. The repo map is scanned once per session and workspace. Map entries for files a prompt names, and memory
+- **B2**: cache-stable prompt prefix. The system prompt is ordered static-first; the prefix is stable while the
+  system prompt is unchanged, and a change to it (activating a skill, `/ponytail`, output style, a `/model` switch
+  that changes the edit-format block) re-bills the message history once. The repo map is scanned once per session and
+  workspace. Map entries for files a prompt names, and memory
   recall, move into that prompt's user message; they are hidden from session export, turn summaries and memory
   gardening. Anthropic requests send `system` as a block with a `cache_control` marker, so tools + system are cached
   from the first request, and keep three rolling message markers (four in total). Opt out of the marker with
@@ -344,6 +367,20 @@ Defaults that changed, each with its escape hatch:
   applied (it was made against HEAD; applying it would fail or mix both edits), and the first attempt's result is
   kept; when the winner is applied next to other uncommitted changes, the test gate is re-run once on the real tree
   and the line names those files and the re-test result. Both stay opt-in (D1, D2).
+- **C5**: best-of-N refuses a winner that touches files outside the session workspace (a workspace in a sub-directory
+  of the repository), naming them; candidates are scored from the workspace's directory in their worktree.
+- **A2**: `Monitor`, `ask_user`, `gmail` and `graph_query` results are never served from the memo, and the memo is
+  dropped after blocking sub-agents finish, when finished background sub-agents are collected, and after a prose
+  edit is applied.
+- **B1**: the governance spend cap (`max_spend_usd`) counts cache-write tokens.
+- **B8**: a finished background sub-agent's `<background-results>` report is kept in the session history instead of
+  being shown in one request only (it was lost on later turns, resume, compaction and a failed request).
+- **A3**: a streamed `Monitor` call is not pre-run speculatively (it answered "unknown pid").
+- **A1**: `Recall` of an offloaded JSON array returns its rows instead of offloading them again.
+- **A7**: any single tool result is capped at 200,000 bytes where it is captured, with a truncation note, so one
+  oversized result cannot overflow the window and break the session.
+- **B1**: runs that end in an error (turn cap, denials, stuck loop, provider or governance error) still add their
+  tokens to the usage counters, and a stopped sub-agent's report carries its real token usage.
 
 ### Documentation
 
