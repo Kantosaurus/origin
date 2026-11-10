@@ -301,7 +301,13 @@ fn scan(src: &str, sh: Shell, depth: usize, risks: &mut Vec<Risk>) {
         return;
     }
     let cs: Vec<char> = if sh == Shell::Power {
-        src.chars().map(ps_ascii).collect()
+        // PowerShell also ends a line at a lone `\r`; `\r\n` is left as it is.
+        let lone_cr_as_lf = src
+            .split("\r\n")
+            .map(|l| l.replace('\r', "\n"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        lone_cr_as_lf.chars().map(ps_ascii).collect()
     } else {
         src.chars().collect()
     };
@@ -842,7 +848,10 @@ fn check_cmd(
         } else if is_env_assignment(t) {
             assigned = Some(t);
             i += 1;
+        } else if sh == Shell::Power && i + 1 < ws.len() && ps_target_prefix(t) {
+            i += 1;
         } else if let Some((rhs, used)) = (sh == Shell::Power).then(|| ps_assignment(ws, i)).flatten() {
+            check_assignment_target(t, risks);
             // `$x = <pipeline>`: the right-hand side is a command that runs.
             if rhs.is_empty() {
                 i += used;
@@ -878,8 +887,7 @@ fn check_cmd(
         // (`[scriptblock]::Create($s).Invoke()`,
         // `$ExecutionContext.InvokeCommand.InvokeScript($s)`) runs code anyway.
         if sh == Shell::Power && !invoked {
-            let lower = cmd.text.to_ascii_lowercase();
-            if lower.contains(".invoke") || lower.contains("invoke(") {
+            if invokes_script(&cmd.text) {
                 risks.push(needs(format!(
                     "`{}` invokes a script built at run time",
                     cmd.text
@@ -942,6 +950,32 @@ fn check_cmd(
         }
         _ => {}
     }
+}
+
+/// A PowerShell method call that runs script (`.Invoke()`, `.BeginInvoke()`,
+/// `.InvokeScript(…)`).
+fn invokes_script(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains(".invoke") || lower.contains("invoke(")
+}
+
+/// An assignment target never calls a method: `$sb.Invoke('a=1')` is a call
+/// whose argument holds `=`. With a `(` left of the `=` the whole word is that
+/// call. The right-hand side is still analysed as well (fail closed).
+fn check_assignment_target(t: &str, risks: &mut Vec<Risk>) {
+    let lhs = t.split_once('=').map_or(t, |(l, _)| l);
+    if invokes_script(if lhs.contains('(') { t } else { lhs }) {
+        risks.push(needs(format!("`{t}` invokes a script built at run time")));
+    }
+}
+
+/// A spaced cast (`[int] $x = …`) or list element (`$a, $b = …`) before a
+/// PowerShell assignment target. Skipping it only lets more words be checked;
+/// a word that invokes script keeps its own check.
+fn ps_target_prefix(t: &str) -> bool {
+    ((t.starts_with('[') && t.ends_with(']')) || (t.starts_with('$') && t.ends_with(',')))
+        && !t.contains('=')
+        && !invokes_script(t)
 }
 
 /// `cmd` arguments: `cmd /c SCRIPT` (or `/k`, `/r`, even glued: `/crm`) runs
@@ -1029,7 +1063,8 @@ fn check_powershell(args: &[Word], stdin: &Stdin, depth: usize, risks: &mut Vec<
 
 /// `sh`/`bash`/… arguments: `-c SCRIPT` (also bundled: `-lc`, `-ec`) runs
 /// SCRIPT; with no script operand (or `-`, `/dev/stdin`, an `s` in an option
-/// bundle) the script is read from stdin. `-o`/`+o` take a value.
+/// bundle) the script is read from stdin. `-o`/`+o`/`--rcfile`/`--init-file`
+/// take a value.
 fn check_posix_shell(name: &str, args: &[Word], stdin: &Stdin, depth: usize, risks: &mut Vec<Risk>) {
     let bundle = |t: &str| t.starts_with('-') && !t.starts_with("--") && t.len() > 1;
     if let Some(k) = args.iter().position(|a| bundle(&a.text) && a.text.contains('c')) {
@@ -1043,11 +1078,11 @@ fn check_posix_shell(name: &str, args: &[Word], stdin: &Stdin, depth: usize, ris
         }
         return;
     }
-    // Index of the script operand; words after it are the script's arguments.
+    // Index of the script operand, skipping options that take a value.
     let mut operand = None;
     let mut k = 0;
     while let Some(t) = args.get(k).map(|a| a.text.as_str()) {
-        if matches!(t, "-o" | "+o" | "-O" | "+O") {
+        if matches!(t, "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file") {
             k += 2;
             continue;
         }
@@ -1057,8 +1092,8 @@ fn check_posix_shell(name: &str, args: &[Word], stdin: &Stdin, depth: usize, ris
         }
         k += 1;
     }
-    let options = &args[..operand.unwrap_or(args.len())];
-    if options.iter().any(|a| bundle(&a.text) && a.text.contains('s'))
+    // An `s` bundle anywhere (even after the operand) counts: fail closed.
+    if args.iter().any(|a| bundle(&a.text) && a.text.contains('s'))
         || operand.is_none_or(|k| matches!(args[k].text.as_str(), "-" | "/dev/stdin"))
     {
         shell_stdin(name, stdin, Shell::Posix, depth, risks);
@@ -1970,19 +2005,113 @@ mod tests {
         expect(Shell::Power, &ok, allowed, "Safe/Suspicious");
     }
 
+    /// An `s` bundle anywhere among a shell's arguments forces the stdin check,
+    /// even after the script operand (`bash t.sh -vs < in.txt`): an accepted
+    /// over-ask, since a value-taking option can hide where the operand is.
     #[test]
-    fn shell_options_after_the_script_operand_are_script_args() {
+    fn shell_options_after_the_script_operand_still_force_the_stdin_check() {
         expect(
             Shell::Posix,
-            &["bash t.sh -vs < in.txt"],
-            allowed,
-            "Safe/Suspicious",
+            &["bash t.sh -vs < in.txt", "bash -es foo < x.sh"],
+            needs_approval,
+            "NeedsApproval",
         );
         expect(
             Shell::Posix,
-            &["bash -es foo < x.sh"],
+            &["bash -o errexit script.sh < data.txt"],
+            allowed,
+            "Safe/Suspicious",
+        );
+    }
+
+    #[test]
+    fn value_taking_shell_options_do_not_hide_a_stdin_script() {
+        expect(
+            Shell::Posix,
+            &[
+                "bash --rcfile /dev/null -s < x.sh",
+                "bash --init-file /dev/null -s < x.sh",
+                "bash --rcfile x.sh < evil.sh",
+                "bash -o errexit < x.sh",
+                "bash -es < x.sh",
+                "sh -s -- arg < x.sh",
+                "sh < x.sh",
+            ],
             needs_approval,
             "NeedsApproval",
+        );
+        expect(
+            Shell::Posix,
+            &["bash <<'EOF'\nrm -rf ~\nEOF"],
+            dangerous,
+            "Dangerous",
+        );
+    }
+
+    #[test]
+    fn method_call_with_equals_in_its_arguments_is_not_an_assignment() {
+        expect(
+            Shell::Power,
+            &[
+                "[void]$sb.Invoke('a=1')",
+                "$sb.Invoke('a=1')",
+                "$d.DynamicInvoke(\"x=1\")",
+                "$ExecutionContext.InvokeCommand.InvokeScript('rm -r -fo ~ #=')",
+            ],
+            needs_approval,
+            "NeedsApproval",
+        );
+        expect(
+            Shell::Power,
+            &["$x=rm -r -fo ~", "$x = rm -r -fo ~", "$x += rm -r -fo ~"],
+            dangerous,
+            "Dangerous",
+        );
+        expect(Shell::Power, &["$x=iex $s"], needs_approval, "NeedsApproval");
+        let ok = [
+            "$x = 5",
+            "$x = \"a=b\"",
+            "$x = Get-ChildItem -Recurse",
+            "$env:PATH = \"x;$env:PATH\"; cargo build",
+            "$r = (Invoke-RestMethod $u).data",
+            "(Invoke-WebRequest $u).Content",
+        ];
+        expect(Shell::Power, &ok, allowed, "Safe/Suspicious");
+    }
+
+    #[test]
+    fn spaced_cast_and_multiple_assignment_run_their_right_hand_side() {
+        expect(
+            Shell::Power,
+            &["$a, $b = rm -r -fo ~", "[int] $x = rm -r -fo ~"],
+            dangerous,
+            "Dangerous",
+        );
+        expect(
+            Shell::Power,
+            &["$a, $b = 1, 2", "[int] $x = 5", "[void] $list.Add(1)"],
+            allowed,
+            "Safe/Suspicious",
+        );
+    }
+
+    #[test]
+    fn powershell_lone_carriage_return_ends_a_statement() {
+        expect(Shell::Power, &["echo hi\rrm -r -fo ~"], dangerous, "Dangerous");
+        expect(
+            Shell::Power,
+            &[
+                "$a=@'\rit's\r'@; rm -r -fo ~ #'",
+                "$a = @'\rit's\r'@; rm -r -fo ~ #'",
+            ],
+            not_allowed,
+            "NeedsApproval/Dangerous",
+        );
+        expect(
+            Shell::Power,
+            &["$m = @'\r\nit's fine\r\n'@"],
+            allowed,
+            "Safe/Suspicious",
         );
     }
 
