@@ -517,7 +517,12 @@ fn decode_response(wire: wire::WireResponse, backend: Backend) -> ChatResponse {
             blocks,
         },
         usage: Usage {
-            input_tokens: wire.usage.prompt_tokens,
+            // `prompt_tokens` includes the cached share; `Usage.input_tokens`
+            // is the uncached remainder.
+            input_tokens: wire
+                .usage
+                .prompt_tokens
+                .saturating_sub(wire.usage.prompt_tokens_details.cached_tokens),
             output_tokens: wire.usage.completion_tokens,
             cache_read_input_tokens: wire.usage.prompt_tokens_details.cached_tokens,
             cache_creation_input_tokens: 0,
@@ -572,15 +577,16 @@ mod decode_tests {
     #[test]
     fn decode_reads_cached_tokens_as_cache_reads() {
         // B1: Chat Completions reports prompt-cache reads under
-        // `usage.prompt_tokens_details.cached_tokens`.
+        // `usage.prompt_tokens_details.cached_tokens`, already included in
+        // `prompt_tokens`; `Usage.input_tokens` is the UNCACHED remainder.
         let wire = wire_from(serde_json::json!({
             "choices": [{ "message": { "role": "assistant", "content": "hi" }, "finish_reason": "stop" }],
-            "usage": { "prompt_tokens": 1200, "completion_tokens": 7,
-                       "prompt_tokens_details": { "cached_tokens": 1024 } }
+            "usage": { "prompt_tokens": 1000, "completion_tokens": 7,
+                       "prompt_tokens_details": { "cached_tokens": 600 } }
         }));
         let usage = decode_response(wire, Backend::OpenAi).usage;
-        assert_eq!(usage.input_tokens, 1200);
-        assert_eq!(usage.cache_read_input_tokens, 1024);
+        assert_eq!(usage.input_tokens, 400);
+        assert_eq!(usage.cache_read_input_tokens, 600);
         assert_eq!(usage.cache_creation_input_tokens, 0);
     }
 

@@ -366,7 +366,12 @@ fn decode_response(wire: WireResponse) -> ChatResponse {
             blocks,
         },
         usage: Usage {
-            input_tokens: wire.usage.input_tokens,
+            // Responses `input_tokens` includes the cached share;
+            // `Usage.input_tokens` is the uncached remainder.
+            input_tokens: wire
+                .usage
+                .input_tokens
+                .saturating_sub(wire.usage.input_tokens_details.cached_tokens),
             output_tokens: wire.usage.output_tokens,
             cache_read_input_tokens: wire.usage.input_tokens_details.cached_tokens,
             cache_creation_input_tokens: 0,
@@ -416,16 +421,17 @@ mod tests {
     #[test]
     fn decode_reads_input_cached_tokens_as_cache_reads() {
         // B1: the Responses API reports prompt-cache reads under
-        // `usage.input_tokens_details.cached_tokens`.
+        // `usage.input_tokens_details.cached_tokens`, included in its
+        // `input_tokens`; `Usage.input_tokens` is the UNCACHED remainder.
         let wire: WireResponse = serde_json::from_value(json!({
             "output": [],
-            "usage": { "input_tokens": 900, "output_tokens": 4,
-                       "input_tokens_details": { "cached_tokens": 512 } }
+            "usage": { "input_tokens": 1000, "output_tokens": 4,
+                       "input_tokens_details": { "cached_tokens": 600 } }
         }))
         .unwrap();
         let usage = decode_response(wire).usage;
-        assert_eq!(usage.input_tokens, 900);
-        assert_eq!(usage.cache_read_input_tokens, 512);
+        assert_eq!(usage.input_tokens, 400);
+        assert_eq!(usage.cache_read_input_tokens, 600);
     }
 
     #[test]

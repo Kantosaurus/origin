@@ -37,6 +37,14 @@ pub mod recorder_hook {
 use origin_core::types::Message;
 use thiserror::Error;
 
+/// Provider-reported token counts for one request.
+///
+/// One meaning for every provider (Anthropic's): `input_tokens` is the
+/// UNCACHED input only. Cache reads and cache writes are separate, so the full
+/// prompt size is `input_tokens + cache_read_input_tokens +
+/// cache_creation_input_tokens`. Providers whose wire count already includes
+/// cached tokens (`OpenAI`'s `prompt_tokens`, Gemini's `promptTokenCount`)
+/// subtract them when decoding.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: u32,

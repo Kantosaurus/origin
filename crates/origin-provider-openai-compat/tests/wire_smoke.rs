@@ -64,14 +64,15 @@ async fn happy_path_chat() {
 }
 
 /// B1: the trailing streamed usage frame carries prompt-cache reads under
-/// `usage.prompt_tokens_details.cached_tokens`; it must reach `Usage`.
+/// `usage.prompt_tokens_details.cached_tokens` (included in `prompt_tokens`);
+/// `Usage.input_tokens` is the uncached remainder.
 #[test]
 fn streamed_usage_frame_reads_cached_tokens() {
-    let line = br#"data: {"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":1024}}}"#;
+    let line = br#"data: {"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":600}}}"#;
     let usage = origin_provider_openai_compat::streaming::parse_chunk_for_test(line)
         .and_then(|f| f.usage)
         .expect("usage frame");
-    assert_eq!(usage.input_tokens, 1200);
+    assert_eq!(usage.input_tokens, 400);
     assert_eq!(usage.output_tokens, 9);
-    assert_eq!(usage.cache_read_input_tokens, 1024);
+    assert_eq!(usage.cache_read_input_tokens, 600);
 }

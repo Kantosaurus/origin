@@ -229,7 +229,12 @@ fn decode_response(wire: wire::WireResponse) -> ChatResponse {
         blocks,
     };
     let usage = Usage {
-        input_tokens: wire.usage_metadata.prompt_token_count,
+        // `promptTokenCount` includes the cached share; `Usage.input_tokens`
+        // is the uncached remainder.
+        input_tokens: wire
+            .usage_metadata
+            .prompt_token_count
+            .saturating_sub(wire.usage_metadata.cached_content_token_count),
         output_tokens: wire.usage_metadata.candidates_token_count,
         cache_read_input_tokens: wire.usage_metadata.cached_content_token_count,
         cache_creation_input_tokens: 0,

@@ -169,13 +169,25 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
     Ok(())
 }
 
+/// `promptTokenCount` includes the cached share; `Usage.input_tokens` is the
+/// uncached remainder. Gemini reports no cache-write count.
+const fn stream_usage(u: WireUsageMetadata) -> Usage {
+    Usage {
+        input_tokens: u.prompt_token_count.saturating_sub(u.cached_content_token_count),
+        output_tokens: u.candidates_token_count,
+        cache_read_input_tokens: u.cached_content_token_count,
+        cache_creation_input_tokens: 0,
+    }
+}
+
 fn encode_usage_meta(u: WireUsageMetadata) -> Vec<u8> {
     // 4 × u32 BE. Order: input, output, cache_read, cache_creation.
+    let u = stream_usage(u);
     let mut out = Vec::with_capacity(16);
-    out.extend_from_slice(&u.prompt_token_count.to_be_bytes());
-    out.extend_from_slice(&u.candidates_token_count.to_be_bytes());
-    out.extend_from_slice(&u.cached_content_token_count.to_be_bytes());
-    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&u.input_tokens.to_be_bytes());
+    out.extend_from_slice(&u.output_tokens.to_be_bytes());
+    out.extend_from_slice(&u.cache_read_input_tokens.to_be_bytes());
+    out.extend_from_slice(&u.cache_creation_input_tokens.to_be_bytes());
     out
 }
 
@@ -202,11 +214,6 @@ pub fn parse_chunk_for_test(line: &[u8]) -> Option<TestFrame> {
     }
     let chunk: WireStreamChunk = serde_json::from_str(payload).ok()?;
     let finished = chunk.candidates.iter().any(|c| c.finish_reason.is_some());
-    let usage = chunk.usage_metadata.map(|u| Usage {
-        input_tokens: u.prompt_token_count,
-        output_tokens: u.candidates_token_count,
-        cache_read_input_tokens: u.cached_content_token_count,
-        cache_creation_input_tokens: 0,
-    });
+    let usage = chunk.usage_metadata.map(stream_usage);
     Some(TestFrame { usage, finished })
 }

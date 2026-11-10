@@ -174,13 +174,25 @@ const fn token_soft_cap(window: u32) -> usize {
 /// turn's measured prefix tokens cross the window fraction. The measured gate
 /// catches token-dense transcripts (minified JS, base64, CJK ≈ 2 bytes/token)
 /// that the 4-bytes/token byte heuristic under-counts into an overflow 400.
+/// The prompt size of one request as the provider measured it: uncached input
+/// plus cache reads and writes (`Usage.input_tokens` is only the uncached
+/// share). With a warm prompt cache most of the prompt is a cache read.
+const fn context_tokens(u: &origin_provider::Usage) -> u32 {
+    u.input_tokens
+        .saturating_add(u.cache_read_input_tokens)
+        .saturating_add(u.cache_creation_input_tokens)
+}
+
 const fn should_compact(bytes: usize, byte_cap: usize, last_input_tokens: u32, token_cap: usize) -> bool {
     bytes > byte_cap || (last_input_tokens > 0 && last_input_tokens as usize >= token_cap)
 }
 
 #[cfg(test)]
 mod compaction_cap_tests {
-    use super::{should_compact, token_soft_cap, BYTES_PER_TOKEN, COMPACT_WINDOW_DEN, COMPACT_WINDOW_NUM};
+    use super::{
+        context_tokens, should_compact, token_soft_cap, BYTES_PER_TOKEN, COMPACT_WINDOW_DEN,
+        COMPACT_WINDOW_NUM,
+    };
     use crate::model_window::model_context_window;
 
     #[test]
@@ -197,6 +209,22 @@ mod compaction_cap_tests {
         assert!(!should_compact(10_000, 480_000, 1_000, token_cap));
         // Byte cap alone still triggers (turn-1 / no measurement).
         assert!(should_compact(500_000, 480_000, 0, token_cap));
+    }
+
+    /// B1: the measured context is the WHOLE prompt — uncached input plus
+    /// cache reads and writes. With a warm cache most of the prompt is a cache
+    /// read, so gating on the uncached share alone would almost never fire.
+    #[test]
+    fn measured_context_counts_cached_tokens() {
+        let usage = origin_provider::Usage {
+            input_tokens: 2_000,
+            output_tokens: 50,
+            cache_read_input_tokens: 110_000,
+            cache_creation_input_tokens: 8_000,
+        };
+        assert_eq!(context_tokens(&usage), 120_000);
+        let token_cap = token_soft_cap(200_000);
+        assert!(should_compact(10_000, 480_000, context_tokens(&usage), token_cap));
     }
 
     #[test]
@@ -987,10 +1015,9 @@ fn apply_path_overlay(
 /// spend-cap enforcement (Task 3b / R14).
 ///
 /// `model` selects the price row via [`origin_cost::price_for`]; the three
-/// running token totals are the loop's cumulative counters. `input_total`
-/// already folds cache reads (the provider impls add them in), so we split the
-/// cached portion back out and bill it at the cache-read rate, charging only the
-/// fresh remainder at the full input rate — matching the real billing model.
+/// running token totals are the loop's cumulative counters. `input_total` is
+/// UNCACHED input (see `origin_provider::Usage`), billed at the full input
+/// rate; cache reads are billed on top at the cache-read rate.
 ///
 /// Returns `None` when the model has no known price (unknown/local model): the
 /// caller then cannot meaningfully enforce a dollar cap and leaves the turn
@@ -1002,8 +1029,7 @@ fn estimate_spend_usd(
     cache_read_total: u64,
 ) -> Option<f64> {
     let price = origin_cost::price_for(model)?;
-    let fresh_input = input_total.saturating_sub(cache_read_total);
-    let usage = origin_cost::TokenUsage::new(fresh_input, output_total, cache_read_total, 0);
+    let usage = origin_cost::TokenUsage::new(input_total, output_total, cache_read_total, 0);
     Some(origin_cost::cost_of(&price, &usage).total())
 }
 
@@ -1085,7 +1111,7 @@ mod swarm_preview_tests {
 /// observable, so default behavior and every existing test stay byte-identical.
 #[allow(
     clippy::too_many_arguments,
-    reason = "flat per-turn measurement carrier (provider/model/4 token+call counts/latency/metrics handle); grouping them into a struct would add indirection without clarifying the single emit site"
+    reason = "flat per-turn measurement carrier (provider/model/5 token+call counts/latency/metrics handle); grouping them into a struct would add indirection without clarifying the single emit site"
 )]
 fn run_turn_end_effects(
     provider: &str,
@@ -1093,6 +1119,7 @@ fn run_turn_end_effects(
     input_tokens: u64,
     output_tokens: u64,
     cache_read_tokens: u64,
+    cache_write_tokens: u64,
     latency_ms: f64,
     tool_calls: u64,
     metrics: Option<&origin_metrics::Metrics>,
@@ -1128,6 +1155,9 @@ fn run_turn_end_effects(
         }
         if output_tokens > 0 {
             m.tokens_out_total(provider, model).inc_by(output_tokens);
+        }
+        if cache_write_tokens > 0 {
+            m.cache_write_total(provider).inc_by(cache_write_tokens);
         }
         if cache_read_tokens > 0 {
             m.cache_hit_total(provider).inc_by(cache_read_tokens);
@@ -4078,15 +4108,19 @@ async fn run_loop_inner(
     // spend against the goal's token budget.
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
-    // R1: the LAST turn's API-counted input (prefix) tokens, for the compaction
-    // measured-token gate. Set on every provider response before the end-of-turn
-    // compaction reads it; the byte path covers turn 1.
+    // R1: the LAST turn's API-counted prompt size — uncached input plus cache
+    // reads and writes ([`context_tokens`]) — for the compaction measured-token
+    // gate. Set on every provider response before the end-of-turn compaction
+    // reads it; the byte path covers turn 1.
     let mut last_input_tokens: u32;
     // R4: cumulative prompt-cache READ tokens this run_loop — fed into the
     // `origin_cache_hit_total{provider}` Prometheus counter at loop end. Zero
     // unless the provider reported cache reads (Anthropic prompt-cache); stays
     // unused when no `metrics` handle is wired.
     let mut total_cache_read_tokens: u64 = 0;
+    // B1: cumulative prompt-cache WRITE tokens, fed into
+    // `origin_cache_write_total{provider}` at loop end.
+    let mut total_cache_write_tokens: u64 = 0;
 
     // Set once any mutating tool dispatches in this run_loop. Consumed only by
     // the optional, default-off end-of-turn checkpoint (Task 1) so a clean
@@ -4862,16 +4896,18 @@ async fn run_loop_inner(
         }
 
         // Charge this turn's provider call against the cumulative counters
-        // BEFORE pushing the assistant message. Cache reads/creation are
-        // already folded into `input_tokens` by the provider impls, so we
-        // only need the two top-level fields here.
+        // BEFORE pushing the assistant message. `input_tokens` is the UNCACHED
+        // input (see `origin_provider::Usage`); cache reads and writes are
+        // counted separately.
         total_input_tokens = total_input_tokens.saturating_add(u64::from(resp.usage.input_tokens));
-        last_input_tokens = resp.usage.input_tokens;
+        last_input_tokens = context_tokens(&resp.usage);
         total_output_tokens = total_output_tokens.saturating_add(u64::from(resp.usage.output_tokens));
         // R4: accumulate prompt-cache reads for the `origin_cache_hit_total`
         // counter (fed once at loop end alongside the token totals).
         total_cache_read_tokens =
             total_cache_read_tokens.saturating_add(u64::from(resp.usage.cache_read_input_tokens));
+        total_cache_write_tokens =
+            total_cache_write_tokens.saturating_add(u64::from(resp.usage.cache_creation_input_tokens));
         // B1: one authoritative usage record per provider request (streaming
         // or not), readable from `origin run --output-format stream-json`.
         if let Some(tx) = &opts.event_tx {
@@ -5004,6 +5040,7 @@ async fn run_loop_inner(
                 total_input_tokens,
                 total_output_tokens,
                 total_cache_read_tokens,
+                total_cache_write_tokens,
                 loop_start.elapsed().as_secs_f64() * 1_000.0,
                 total_tool_calls,
                 opts.metrics.as_deref(),
@@ -10618,13 +10655,15 @@ mod wiring_tests {
     #[test]
     fn run_turn_end_effects_increments_token_counters() {
         let metrics = origin_metrics::Metrics::new();
-        // A completed loop with 1234 input / 567 output / 89 cache-read tokens.
+        // A completed loop with 1234 input / 567 output / 89 cache-read / 21
+        // cache-write tokens.
         run_turn_end_effects(
             "anthropic",
             "claude-sonnet-4-6",
             1_234,
             567,
             89,
+            21,
             42.0,
             3,
             Some(&metrics),
@@ -10646,6 +10685,10 @@ mod wiring_tests {
             (value_of("origin_cache_hit_total") - 89.0).abs() < f64::EPSILON,
             "cache_hit counter must advance to 89"
         );
+        assert!(
+            (value_of("origin_cache_write_total") - 21.0).abs() < f64::EPSILON,
+            "B1: cache_write counter must advance to 21"
+        );
     }
 
     /// R4: with no `Metrics` handle (the default everywhere, including tests),
@@ -10654,7 +10697,7 @@ mod wiring_tests {
     #[test]
     fn run_turn_end_effects_without_metrics_is_noop() {
         let metrics = origin_metrics::Metrics::new();
-        run_turn_end_effects("anthropic", "m", 100, 50, 0, 1.0, 1, None, None);
+        run_turn_end_effects("anthropic", "m", 100, 50, 0, 0, 1.0, 1, None, None);
         assert!(
             metrics.snapshot().rows.is_empty(),
             "no metrics handle ⇒ counters stay unregistered/zero"
@@ -11478,6 +11521,17 @@ mod wiring_tests {
             estimate_spend_usd("some-unknown-local-model-xyz", 1_000_000, 1_000_000, 0).is_none(),
             "unknown model ⇒ no price ⇒ unconstrained"
         );
+    }
+
+    /// B1: `Usage.input_tokens` is the UNCACHED input (Anthropic's meaning), so
+    /// cache reads are billed on top of it, not carved out of it.
+    #[test]
+    fn spend_estimate_bills_cache_reads_on_top_of_uncached_input() {
+        let price = origin_cost::price_for("claude-sonnet-4-6").expect("priced");
+        let expected =
+            origin_cost::cost_of(&price, &origin_cost::TokenUsage::new(1_000, 0, 1_000_000, 0)).total();
+        let got = estimate_spend_usd("claude-sonnet-4-6", 1_000, 0, 1_000_000).expect("priced");
+        assert!((got - expected).abs() < 1e-12, "got {got}, expected {expected}");
     }
 
     /// CONFIGURED: a spend cap is the MIN across layers, and `estimate_spend_usd`
