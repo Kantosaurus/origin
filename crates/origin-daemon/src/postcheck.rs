@@ -60,9 +60,9 @@ pub async fn check_block(paths: &BTreeSet<String>) -> Option<String> {
         let Some((prog, args)) = checker_for(p) else {
             continue;
         };
-        let run = tokio::process::Command::new(prog)
-            .args(&args)
-            .output();
+        let mut cmd = tokio::process::Command::new(prog);
+        origin_tools::scrub_env(cmd.as_std_mut()); // A6
+        let run = cmd.args(&args).output();
         match tokio::time::timeout(PER_FILE_TIMEOUT, run).await {
             Ok(Ok(out)) if !out.status.success() => {
                 let stderr = String::from_utf8_lossy(&out.stderr);

@@ -35,7 +35,9 @@ struct CmdGit;
 
 impl origin_vcs::GitRunner for CmdGit {
     fn run(&self, args: &[&str]) -> Result<String, origin_vcs::VcsError> {
-        let output = std::process::Command::new("git")
+        let mut git = std::process::Command::new("git");
+        origin_tools::scrub_env(&mut git); // A6
+        let output = git
             .args(args)
             .output()
             .map_err(|e| origin_vcs::VcsError::Git(e.to_string()))?;
@@ -1505,13 +1507,17 @@ fn dispatch_notification(n: &origin_notify::Notification, channel: &origin_notif
     match channel {
         origin_notify::Channel::Desktop => {
             let (program, cmd_args) = origin_notify::desktop_command(n);
+            // Not scrubbed (A6): a fixed OS binary, and Linux `notify-send`
+            // needs DBUS_SESSION_BUS_ADDRESS / DISPLAY, which the allow-list drops.
             let _ = std::process::Command::new(program).args(cmd_args).spawn();
         }
         origin_notify::Channel::Command { program, args } => {
             if program.is_empty() {
                 return;
             }
-            let _ = std::process::Command::new(program).args(args).spawn();
+            let mut cmd = std::process::Command::new(program);
+            origin_tools::scrub_env(&mut cmd); // A6
+            let _ = cmd.args(args).spawn();
         }
         origin_notify::Channel::Webhook { url } => {
             if url.is_empty() {
@@ -1521,7 +1527,9 @@ fn dispatch_notification(n: &origin_notify::Notification, channel: &origin_notif
             // Best-effort POST via curl; --data uses the JSON body. We do not
             // wait on the child (fire-and-forget) so a slow endpoint never
             // stalls the turn end.
-            let _ = std::process::Command::new("curl")
+            let mut curl = std::process::Command::new("curl");
+            origin_tools::scrub_env(&mut curl); // A6
+            let _ = curl
                 .arg("-fsS")
                 .arg("-X")
                 .arg("POST")
@@ -1577,7 +1585,9 @@ fn maybe_autoformat(cfg: Option<&origin_postedit::PostEditConfig>, path: &str) {
     let Some((program, flags)) = tokens.split_first() else {
         return;
     };
-    let _ = std::process::Command::new(program)
+    let mut fmt = std::process::Command::new(program);
+    origin_tools::scrub_env(&mut fmt); // A6
+    let _ = fmt
         .args(flags)
         .arg("--") // end-of-options sentinel: everything after is a positional path
         .arg(path)
@@ -1613,11 +1623,9 @@ fn run_post_edit_lint(
     }
     let tokens: Vec<&str> = lint_cmd.split_whitespace().collect();
     let (program, flags) = tokens.split_first()?;
-    let status = std::process::Command::new(program)
-        .args(flags)
-        .arg("--")
-        .arg(path)
-        .status();
+    let mut lint = std::process::Command::new(program);
+    origin_tools::scrub_env(&mut lint); // A6: repo-configurable linter gets no secrets
+    let status = lint.args(flags).arg("--").arg(path).status();
     // A lint that could not even be launched (missing binary) is treated as
     // "no failures observed" so a misconfigured linter never blocks edits.
     let failures = match status {
@@ -11454,6 +11462,52 @@ mod wiring_tests {
         assert!(
             run_post_edit_lint(&cfg2, "src/main.rs").is_none(),
             "auto_lint with no lint_command ⇒ no decision"
+        );
+    }
+
+    /// A6: the repo-configurable post-edit linter gets the allow-listed env, so
+    /// a credential in the daemon's environment never reaches it. The probe
+    /// "linter" fails iff the secret-shaped variable is visible.
+    #[test]
+    fn post_edit_lint_child_gets_scrubbed_env() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(windows)]
+        let (script, body) = (
+            dir.path().join("probe.cmd"),
+            "@if defined A6_LINT_PROBE_TOKEN exit /b 1\r\n@exit /b 0\r\n",
+        );
+        #[cfg(unix)]
+        let (script, body) = (
+            dir.path().join("probe.sh"),
+            "#!/bin/sh\n[ -z \"$A6_LINT_PROBE_TOKEN\" ]\n",
+        );
+        std::fs::write(&script, body).expect("write probe");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod probe");
+        }
+        std::env::set_var("A6_LINT_PROBE_TOKEN", "lint-secret-value");
+        // Control: with the daemon's env inherited, the probe does see it.
+        let inherited = std::process::Command::new(&script)
+            .args(["--", "src/main.rs"])
+            .status()
+            .expect("run probe");
+        let cfg = origin_postedit::PostEditConfig {
+            auto_lint: true,
+            lint_command: Some(script.to_string_lossy().into_owned()),
+            ..origin_postedit::PostEditConfig::default()
+        };
+        let decision = run_post_edit_lint(&cfg, "src/main.rs");
+        std::env::remove_var("A6_LINT_PROBE_TOKEN");
+        assert!(
+            !inherited.success(),
+            "probe must detect the variable when inherited"
+        );
+        assert_eq!(
+            decision,
+            Some(origin_postedit::RepairDecision::Stop),
+            "secret-shaped variable reached the post-edit lint child"
         );
     }
 
