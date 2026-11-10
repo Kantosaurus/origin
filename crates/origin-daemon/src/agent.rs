@@ -913,17 +913,17 @@ fn apply_governance_overlay(
 /// DENY-ONLY bash command-safety overlay (cmdparse wiring).
 ///
 /// Given a base `decision` that is already `Allow`, inspect a `Bash` tool's
-/// command string with [`origin_cmdparse::analyze`] and downgrade the `Allow`
-/// to a `Deny` when [`origin_cmdparse::worst`] classifies it as
-/// [`origin_cmdparse::Risk::Dangerous`]. Like [`apply_governance_overlay`],
-/// this can only ever turn an `Allow` into a `Deny`, never widen.
+/// command string with [`origin_cmdparse::analyze`] ([`cmd_guard_verdict`])
+/// and narrow the `Allow` by the verdict. Like [`apply_governance_overlay`],
+/// it never widens: an `Allow` stays, is re-asked, or becomes a `Deny`.
 ///
-/// Applies only to the `Bash` tool, and only acts on the curated, high-confidence
-/// `Risk::Dangerous` set (`rm -rf ~//`, pipe-to-shell `curl|sh`, fork bomb) —
-/// catastrophic, unambiguous patterns that cmdparse is tuned NOT to false-positive
-/// on. This is DEFAULT-ON; set `ORIGIN_CMD_GUARD=0` to opt out entirely. The
-/// broader `Suspicious` heuristics are never acted on here. `args` is the parsed
-/// JSON arguments; the command is read from the `command` field.
+/// Applies only to the `Bash` tool. A [`origin_cmdparse::Risk::Dangerous`]
+/// verdict (`rm -rf ~//`, pipe-to-shell `curl|sh`, fork bomb — catastrophic,
+/// unambiguous patterns cmdparse is tuned NOT to false-positive on) is denied;
+/// a `NeedsApproval` one is handled as below. This is DEFAULT-ON; set
+/// `ORIGIN_CMD_GUARD=0` to opt out entirely. The broader `Suspicious`
+/// heuristics are never acted on here. `args` is the parsed JSON arguments;
+/// the command is read from the `command` field.
 ///
 /// `Risk::NeedsApproval` (the program cannot be determined statically) needs a
 /// person (C2): an Allow a person already gave for this exact call stands (its
@@ -1596,12 +1596,13 @@ async fn announce_refused_gates(opts: &LoopOptions) {
 
 /// A6: run a turn-end gate command (`auto_test` / `auto_lint` / repro gate /
 /// test-select, and best-of-N's test oracle) through the supervised Bash
-/// spawn, so it gets the scrubbed child env and the cmd-guard like a
-/// model-issued `Bash` call. Returns
-/// `(exit_code, output)` when the command ran to exit; `None` when the guard
-/// denied it, the spawn failed, or it hit the 600s bound (callers fail open).
-/// There is no one to ask, so a `NeedsApproval` verdict is not run either.
-/// `cwd` (A12) is the directory it runs in; `None` ⇒ the process cwd.
+/// spawn, so it gets the scrubbed child env a model-issued `Bash` call gets.
+/// The parsed command guard refuses it ([`gate_guard_refusal`]) on a
+/// `Dangerous` or, since there is no one to ask, a `NeedsApproval` verdict;
+/// the dependency gate (C6) does not apply. Returns `(exit_code, output)` when
+/// the command ran to exit; `None` when the guard refused it, the spawn
+/// failed, or it hit the 600s bound (callers fail open). `cwd` (A12) is the
+/// directory it runs in; `None` ⇒ the process cwd.
 // ponytail: per run the skip goes to the log (and, at loop start, once to the
 // user: [`announce_refused_gates`]) — a non-empty gate block reads as RED to
 // every caller, so carrying it there needs a skipped/failed split.
@@ -9214,7 +9215,8 @@ async fn dispatch_tool(
     // `RepairDecision` consulted.
     post_edit: Option<&Arc<origin_postedit::PostEditConfig>>,
     // A12: the run's working directory ([`LoopOptions::cwd`]). The post-edit
-    // formatter/linter spawns and the rust-analyzer root follow it; `None` ⇒
+    // formatter/linter spawns, `ApplyPatch`'s deleted-file check and the
+    // rust-analyzer root follow it; `None` ⇒
     // the process cwd. The main-loop dispatch passes `opts.cwd`; the
     // speculative pre-dispatch passes `None`, which is correct because
     // speculation never runs for a run with its own cwd (`speculation_allowed`).
@@ -9935,8 +9937,9 @@ async fn dispatch_tool(
         }
         // ── Browser (stateful; lazy process-global router) ──
         //
-        // The router owns two long-lived Node child processes (agent-browser
-        // primary, CloakBrowser fallback). Spawning them is expensive, so we
+        // The router owns a long-lived Node child process (agent-browser), plus
+        // a second one for the CloakBrowser fallback only when
+        // `ORIGIN_STEALTH_FALLBACK=1` (D11). Spawning them is expensive, so we
         // initialize the router once per process via `OnceCell`. Concurrent
         // browser calls serialize on the Mutex — fine because the agent loop
         // is sequential within a turn, and sessions are disambiguated by the
