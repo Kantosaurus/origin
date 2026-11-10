@@ -606,19 +606,34 @@ async fn apply_cmd_guard(
 
 /// Permission-prompt preview for a `Task` delegation (A4).
 ///
-/// The prompt is shown on at most a few rows and cut, so everything a model
-/// cannot pad comes first:
-/// `<N> tools, <M> mcp | mcp: <names> | grants: <entries> | other: <entries> | goal: <goal>`.
+/// The prompt is shown on at most a few rows and cut, so the total reach comes
+/// first, where nothing can pad it away:
+/// `<G>/<T> gated tools, <D> mcp servers | mcp: <names> | grants: <entries> | other: <entries> | goal: <goal>`
+/// (`T` gated registry tools, `G` of them reached by some entry, `D` distinct servers).
 /// Each `allowed_tools` entry is classified by what it GRANTS, using the worker's
 /// own matcher (`swarm_worker::allow_entry_glob`): it is a grant if it matches a
 /// gated (not read-only) registry tool, could match an MCP tool name
 /// (`mcp__<server>__<tool>`; probe `mcp__x__y`), or does not compile (fail closed).
-/// Grants are listed in full (patterns first, then exact names, model order); the
-/// rest is capped at 3, so padding can only hide non-granting entries. Duplicates
-/// show once as ` ×k`. Every model-chosen value is escaped (`escape_debug`: no raw
-/// control chars), quoted so it can never fake a separator, and capped (names 32
-/// chars, goal 200). `<N>`/`<M>` are the raw counts.
+/// Grants are listed in full, broadest first (gated tools matched, descending;
+/// stable); the rest is capped at 3, so padding can only hide non-granting entries.
+/// Server names are listed in full. Duplicates show once as ` ×k`. Every
+/// model-chosen value is escaped (`escape_debug`: no raw control chars), quoted so
+/// it can never fake a separator, and capped (names 32 chars, goal 200).
 pub(crate) fn task_permission_preview(args: &Value) -> String {
+    /// Distinct items in first-seen order, with their repeat counts.
+    fn collapse<'a>(items: impl Iterator<Item = &'a str>) -> Vec<(&'a str, usize)> {
+        let mut out: Vec<(&str, usize)> = Vec::new();
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        for t in items {
+            if let Some(&i) = seen.get(t) {
+                out[i].1 += 1;
+            } else {
+                seen.insert(t, out.len());
+                out.push((t, 1));
+            }
+        }
+        out
+    }
     let arr = |key: &str| {
         args.get(key)
             .and_then(Value::as_array)
@@ -654,49 +669,56 @@ pub(crate) fn task_permission_preview(args: &Value) -> String {
             out
         }
     };
-    let servers: Vec<(&str, usize)> = arr("mcp_servers")
-        .iter()
-        .map(|v| (v.get("name").and_then(Value::as_str).unwrap_or("<unnamed>"), 1))
+    let servers = collapse(
+        arr("mcp_servers")
+            .iter()
+            .map(|v| v.get("name").and_then(Value::as_str).unwrap_or("<unnamed>")),
+    );
+    let gated: Vec<&str> = registry_iter()
+        .filter(|m| {
+            m.name != "Task"
+                && !(matches!(m.tier, origin_tools::Tier::AutoAllowed)
+                    && matches!(m.side_effects, SideEffects::Pure))
+        })
+        .map(|m| m.name)
         .collect();
-    // Distinct entries in first-seen order, with their repeat counts.
-    let mut tools: Vec<(&str, usize)> = Vec::new();
-    let mut seen: HashMap<&str, usize> = HashMap::new();
-    for t in arr("allowed_tools").iter().filter_map(Value::as_str) {
-        if let Some(&i) = seen.get(t) {
-            tools[i].1 += 1;
-        } else {
-            seen.insert(t, tools.len());
-            tools.push((t, 1));
-        }
-    }
-    let gated = |m: &ToolMeta| {
-        m.name != "Task"
-            && !(matches!(m.tier, origin_tools::Tier::AutoAllowed)
-                && matches!(m.side_effects, SideEffects::Pure))
-    };
-    let grants = |t: &str| {
-        let Some(m) = crate::swarm_worker::allow_entry_glob(t).map(|g| g.compile_matcher()) else {
-            return true;
-        };
+    let mut reached: HashSet<&str> = HashSet::new();
+    let (mut granted, mut other) = (Vec::new(), Vec::new());
+    for (t, k) in collapse(arr("allowed_tools").iter().filter_map(Value::as_str)) {
+        // `None` (does not compile) counts as matching everything: fail closed.
+        let m = crate::swarm_worker::allow_entry_glob(t).map(|g| g.compile_matcher());
+        let hits: Vec<&str> = gated
+            .iter()
+            .copied()
+            .filter(|n| m.as_ref().is_none_or(|m| m.is_match(n)))
+            .collect();
+        let reach = if m.is_some() { hits.len() } else { usize::MAX };
+        reached.extend(hits);
         // Every name a glob matches starts with its text before the first
         // metacharacter; if that is incompatible with `mcp__<server>__` for every
         // listed server, no tool of those servers can match.
         let prefix = t.split(['*', '?', '[', '{', '\\']).next().unwrap_or("");
-        m.is_match("mcp__x__y")
-            || registry_iter().any(|r| gated(r) && m.is_match(r.name))
+        if reach > 0
+            || m.as_ref().is_some_and(|m| m.is_match("mcp__x__y"))
             || servers.iter().any(|&(s, _)| {
                 let p = format!("mcp__{s}__");
                 p.starts_with(prefix) || prefix.starts_with(&p)
             })
-    };
-    let (mut granted, other): (Vec<_>, Vec<_>) = tools.into_iter().partition(|&(t, _)| grants(t));
-    granted.sort_by_key(|&(t, _)| registry_iter().any(|m| m.name == t)); // stable: patterns first
+        {
+            granted.push((t, k, reach));
+        } else {
+            other.push((t, k));
+        }
+    }
+    granted.sort_by_key(|&(_, _, reach)| std::cmp::Reverse(reach)); // stable: broadest first
+    let granted: Vec<(&str, usize)> = granted.into_iter().map(|(t, k, _)| (t, k)).collect();
     let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
     format!(
-        "{} tools, {} mcp | mcp: {} | grants: {} | other: {} | goal: {}",
-        arr("allowed_tools").len(),
+        "{}/{} gated tools, {} mcp servers | mcp: {} | grants: {} | other: {} | goal: {}",
+        reached.len(),
+        gated.len(),
         servers.len(),
-        list(&servers, 4),
+        list(&servers, usize::MAX),
         list(&granted, usize::MAX),
         list(&other, 3),
         shown(goal, 200)
@@ -714,12 +736,15 @@ mod task_preview_tests {
             "mcp_servers": [{"name": "github", "command": "gh-mcp"}],
         });
         let p = super::task_permission_preview(&args);
+        let t = gated_total();
         assert!(
-            p.starts_with("7 tools, 1 mcp | mcp: \"github\" | grants: "),
+            p.starts_with(&format!(
+                "4/{t} gated tools, 1 mcp servers | mcp: \"github\" | grants: "
+            )),
             "{p}"
         );
-        let head: String = p.chars().take(80).collect();
-        assert!(head.contains("\"Bash\""), "Bash must survive an 80-col cut: {p}");
+        let head: String = p.chars().take(120).collect();
+        assert!(head.contains("\"Bash\""), "Bash must survive a 120-col cut: {p}");
         let (mcp, goal) = (
             p.find("\"github\"").expect("mcp"),
             p.find("refactor").expect("goal"),
@@ -743,6 +768,66 @@ mod task_preview_tests {
             "allowed_tools": tools,
             "mcp_servers": servers,
         }))
+    }
+
+    /// `T`: gated registry tools, derived the same way the preview does.
+    fn gated_total() -> usize {
+        super::registry_iter()
+            .filter(|m| {
+                m.name != "Task"
+                    && !(matches!(m.tier, origin_tools::Tier::AutoAllowed)
+                        && matches!(m.side_effects, super::SideEffects::Pure))
+            })
+            .count()
+    }
+
+    fn docs_patterns() -> Vec<String> {
+        (1..=9)
+            .map(|n| format!("mcp__docs__get_page_{n}_summary_*"))
+            .collect()
+    }
+
+    #[test]
+    fn task_preview_star_leads_grants_even_behind_mcp_reaching_patterns() {
+        let mut tools = docs_patterns();
+        tools.push("*".into());
+        let tools: Vec<&str> = tools.iter().map(String::as_str).collect();
+        let p = preview(&tools, &["docs"]);
+        let t = gated_total();
+        assert!(
+            p.starts_with(&format!("{t}/{t} gated tools, 1 mcp servers")),
+            "{p}"
+        );
+        let at = p.find("grants: ").expect("grants") + "grants: ".len();
+        assert!(p.get(at..).unwrap_or("").starts_with("\"*\", ") && at < 80, "{p}");
+    }
+
+    #[test]
+    fn task_preview_exact_gated_name_leads_grants_behind_mcp_reaching_patterns() {
+        let mut tools = docs_patterns();
+        tools.push("Bash".into());
+        let tools: Vec<&str> = tools.iter().map(String::as_str).collect();
+        let p = preview(&tools, &["docs"]);
+        let t = gated_total();
+        assert!(p.starts_with(&format!("1/{t} gated tools, 1 mcp servers")), "{p}");
+        assert!(seg(&p, "grants").starts_with("\"Bash\", "), "{p}");
+    }
+
+    #[test]
+    fn task_preview_mcp_servers_are_collapsed_not_capped() {
+        let p = preview(&[], &["docs", "docs", "docs", "docs", "prod_db"]);
+        let t = gated_total();
+        assert!(p.starts_with(&format!("0/{t} gated tools, 2 mcp servers")), "{p}");
+        assert!(
+            p.contains("\"docs\" ×4, \"prod_db\"") && !p.contains("more"),
+            "{p}"
+        );
+        let six = ["github", "docs", "prod_db", "jira", "slack", "sentry"];
+        let p = preview(&[], &six);
+        assert!(p.starts_with(&format!("0/{t} gated tools, 6 mcp servers")), "{p}");
+        for s in six {
+            assert!(seg(&p, "mcp").contains(&format!("\"{s}\"")), "{s}: {p}");
+        }
     }
 
     #[test]
@@ -814,15 +899,18 @@ mod task_preview_tests {
             "mcp_servers": [{"name": "github"}],
         });
         let p = super::task_permission_preview(&args);
-        let head: String = p.chars().take(60).collect();
+        let head: String = p.chars().take(80).collect();
         assert!(head.contains("\"Bash\""), "Bash must lead the list: {p}");
+        let t = gated_total();
         assert!(
-            p.starts_with("2 tools, 1 mcp | mcp: \"github\" | grants: \"Bash\" | "),
+            p.starts_with(&format!(
+                "1/{t} gated tools, 1 mcp servers | mcp: \"github\" | grants: \"Bash\" | "
+            )),
             "{p}"
         );
         assert_eq!(
             outside_quotes(&p),
-            "2 tools, 1 mcp | mcp: Q | grants: Q | other: Q | goal: Q",
+            format!("1/{t} gated tools, 1 mcp servers | mcp: Q | grants: Q | other: Q | goal: Q"),
             "separators may appear only inside quoted names: {p}"
         );
     }
