@@ -56,7 +56,8 @@ fn checker_for(path: &str) -> Option<(&'static str, Vec<String>)> {
         .to_ascii_lowercase();
     match ext.as_str() {
         "py" => Some(("python", vec!["-m".into(), "py_compile".into(), path.into()])),
-        "js" | "mjs" | "cjs" | "jsx" => Some(("node", vec!["--check".into(), path.into()])),
+        // Not `.jsx`: `node --check` rejects JSX (B7).
+        "js" | "mjs" | "cjs" => Some(("node", vec!["--check".into(), path.into()])),
         _ => None,
     }
 }
@@ -328,6 +329,19 @@ mod tests {
         }
         let large = "}\n".repeat(600_000);
         assert_eq!(check_one("large.rs", &large).await, none);
+    }
+
+    /// B7: `node --check` rejects `.jsx` (JSX syntax, and node 24 refuses the
+    /// extension outright), and no JavaScript tree-sitter grammar is linked, so
+    /// `.jsx` is skipped silently — valid or broken.
+    #[tokio::test]
+    async fn jsx_is_skipped_silently() {
+        assert!(checker_for("App.jsx").is_none());
+        assert!(parse_language("App.jsx").is_none(), "no JS grammar linked");
+        let none = (String::new(), String::new());
+        let valid = "export function App() {\n  return <div className=\"app\">hi</div>;\n}\n";
+        assert_eq!(check_one("App.jsx", valid).await, none);
+        assert_eq!(check_one("Broken.jsx", "export function App() {\n").await, none);
     }
 
     /// B7: only the first five problem lines are listed, then a count.
