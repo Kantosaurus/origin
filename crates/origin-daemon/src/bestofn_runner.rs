@@ -30,6 +30,20 @@ pub struct CandidateResult {
     pub diff: String,
     /// The test-oracle verdict for the candidate's worktree.
     pub outcome: TestOutcome,
+    /// C5: the diff modified or deleted a test file that existed before the
+    /// run. The candidate was still scored, on the original tests.
+    pub tampered: bool,
+}
+
+/// C5: `diff` with line endings, trailing whitespace and `index` header lines
+/// (blob hashes, which change with the bytes) normalised away, so candidates
+/// that made the same change compare equal.
+fn normalize_diff(diff: &str) -> String {
+    diff.lines()
+        .filter(|l| !l.starts_with("index "))
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The effect surface best-of-N needs, behind a trait so the policy is testable.
@@ -66,8 +80,14 @@ pub enum BestOfNOutcome {
     /// keeps the single-shot result untouched.
     Skipped,
     /// A verified (passing, non-empty) winner was found and applied. Carries the
-    /// winning candidate index and how many candidates passed.
-    Applied { winner: usize, passed: usize },
+    /// winning candidate index, how many candidates passed, and (C5) the
+    /// candidates flagged for changing a pre-existing test — the winner's own
+    /// test changes are part of the applied diff when it is among them.
+    Applied {
+        winner: usize,
+        passed: usize,
+        tampered: Vec<usize>,
+    },
     /// N candidates ran but none was a verified winner; nothing was applied and
     /// the caller keeps the single-shot result.
     NoWinner { attempted: usize },
@@ -98,6 +118,9 @@ pub const MAX_CANDIDATES: u32 = 6;
 /// A candidate whose `run_candidate` errors is recorded as an `Unknown`,
 /// empty-diff candidate (so it can never win) and the run continues; one broken
 /// worktree never aborts the batch.
+///
+/// C5: candidates run one after another, so when the first two produce the
+/// same (normalised) non-empty diff and it passes, the rest are not run.
 pub fn run_best_of_n(
     arena: &mut dyn CandidateArena,
     n: u32,
@@ -116,9 +139,16 @@ pub fn run_best_of_n(
                 CandidateResult {
                     diff: String::new(),
                     outcome: TestOutcome::Unknown,
+                    tampered: false,
                 }
             }
         };
+        if res.tampered {
+            tracing::warn!(
+                candidate = i,
+                "best-of-N: candidate changed a pre-existing test; scored on the original"
+            );
+        }
         candidates.push(Candidate {
             index: i,
             outcome: res.outcome,
@@ -126,91 +156,49 @@ pub fn run_best_of_n(
             non_empty: !res.diff.trim().is_empty(),
         });
         results.push(res);
+        if i == 1
+            && (n as usize) > 2
+            && candidates.iter().all(|c| c.outcome.is_passed() && c.non_empty)
+            && normalize_diff(&results[0].diff) == normalize_diff(&results[1].diff)
+        {
+            tracing::info!("best-of-N: the first two candidates agree and pass; not running the rest");
+            break;
+        }
     }
 
+    let attempted = results.len();
     let passed = candidates.iter().filter(|c| c.outcome.is_passed() && c.non_empty).count();
     if !has_verified_winner(&candidates) {
-        tracing::info!(attempted = n, "best-of-N: no verified winner; keeping single-shot result");
-        return BestOfNOutcome::NoWinner { attempted: n as usize };
+        tracing::info!(
+            attempted,
+            "best-of-N: no verified winner; keeping single-shot result"
+        );
+        return BestOfNOutcome::NoWinner { attempted };
     }
     // `select_best` returns `Some` because the slice is non-empty; the winner is
     // a verified one because `has_verified_winner` held (the ordering puts a
     // passing non-empty candidate strictly above any non-passing/empty one).
     let Some(winner) = select_best(&candidates) else {
-        return BestOfNOutcome::NoWinner { attempted: n as usize };
+        return BestOfNOutcome::NoWinner { attempted };
     };
     let diff = &results[winner].diff;
     if let Err(e) = arena.apply_winner(diff) {
         tracing::warn!(winner, error = %e, "best-of-N: applying the winning diff failed; keeping single-shot result");
-        return BestOfNOutcome::NoWinner { attempted: n as usize };
+        return BestOfNOutcome::NoWinner { attempted };
     }
-    tracing::info!(winner, passed, attempted = n, "best-of-N: applied verified winner");
+    let tampered: Vec<usize> = (0..attempted).filter(|&i| results[i].tampered).collect();
+    tracing::info!(
+        winner,
+        passed,
+        attempted,
+        ?tampered,
+        "best-of-N: applied verified winner"
+    );
     BestOfNOutcome::Applied {
         winner,
         passed,
+        tampered,
     }
-}
-
-/// Async orchestration: like [`run_best_of_n`], but candidate production and
-/// winner-application are `async` closures the caller awaits inline.
-///
-/// This is the production path: each candidate runs a full async `run_loop` in
-/// its worktree, which cannot be expressed through the sync [`CandidateArena`]
-/// trait. Candidates are awaited sequentially. The
-/// *decision* logic is shared verbatim with the sync path via [`select_best`] /
-/// [`has_verified_winner`], so both are covered by the same policy tests.
-///
-/// * `run_one(i)` → the captured diff + oracle verdict for candidate `i`
-///   (`Err` ⇒ scored `Unknown`/empty, batch continues).
-/// * `apply(diff)` → apply the winning patch to the user's tree.
-pub async fn run_best_of_n_async<RunFut, ApplyFut>(
-    n: u32,
-    difficulty: DifficultySignals,
-    mut run_one: impl FnMut(usize) -> RunFut,
-    apply: impl FnOnce(String) -> ApplyFut,
-) -> BestOfNOutcome
-where
-    RunFut: std::future::Future<Output = Result<CandidateResult, String>>,
-    ApplyFut: std::future::Future<Output = Result<(), String>>,
-{
-    if n < 2 || !difficulty.is_hard() {
-        return BestOfNOutcome::Skipped;
-    }
-    let mut results: Vec<CandidateResult> = Vec::with_capacity(n as usize);
-    let mut candidates: Vec<Candidate> = Vec::with_capacity(n as usize);
-    for i in 0..n as usize {
-        let res = match run_one(i).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(candidate = i, error = %e, "best-of-N: candidate attempt failed; scoring as Unknown");
-                CandidateResult {
-                    diff: String::new(),
-                    outcome: TestOutcome::Unknown,
-                }
-            }
-        };
-        candidates.push(Candidate {
-            index: i,
-            outcome: res.outcome,
-            diff_len: res.diff.len(),
-            non_empty: !res.diff.trim().is_empty(),
-        });
-        results.push(res);
-    }
-    let passed = candidates.iter().filter(|c| c.outcome.is_passed() && c.non_empty).count();
-    if !has_verified_winner(&candidates) {
-        tracing::info!(attempted = n, "best-of-N: no verified winner; keeping single-shot result");
-        return BestOfNOutcome::NoWinner { attempted: n as usize };
-    }
-    let Some(winner) = select_best(&candidates) else {
-        return BestOfNOutcome::NoWinner { attempted: n as usize };
-    };
-    if let Err(e) = apply(results[winner].diff.clone()).await {
-        tracing::warn!(winner, error = %e, "best-of-N: applying the winning diff failed; keeping single-shot result");
-        return BestOfNOutcome::NoWinner { attempted: n as usize };
-    }
-    tracing::info!(winner, passed, attempted = n, "best-of-N: applied verified winner");
-    BestOfNOutcome::Applied { winner, passed }
 }
 
 /// The signature of the per-candidate agent runner the daemon supplies.
@@ -245,6 +233,9 @@ pub struct WorktreeArena<'a> {
     runner: Box<CandidateRunner<'a>>,
     /// Paths of worktrees created, for teardown on drop.
     created: Vec<std::path::PathBuf>,
+    /// C5: verdict + tamper flag per normalised diff already scored, so an
+    /// identical candidate shares it instead of re-running the tests.
+    scored: std::collections::HashMap<String, (TestOutcome, bool)>,
 }
 
 impl<'a> WorktreeArena<'a> {
@@ -268,7 +259,75 @@ impl<'a> WorktreeArena<'a> {
             workspace: workspace.into(),
             runner,
             created: Vec::new(),
+            scored: std::collections::HashMap::new(),
         }
+    }
+
+    /// C5: score `cmd` in the worktree `wt` on the tests that existed at the
+    /// base commit: a pre-existing test file the candidate modified or deleted
+    /// is restored, a test file it added is set aside; afterwards its own
+    /// versions are put back (its diff was captured before). Returns the
+    /// verdict and whether a pre-existing test was changed. A restore that
+    /// fails scores `Unknown`, never a pass on tampered tests.
+    // ponytail: "test file" is `origin_postedit::is_test_file`'s naming
+    // convention — a changed helper/fixture outside it (conftest.py, testdata)
+    // is not restored; a runner-reported list of collected files is the upgrade.
+    fn score_on_base_tests(
+        &self,
+        git: &dyn origin_vcs::GitRunner,
+        wt: &std::path::Path,
+        cmd: &str,
+    ) -> (TestOutcome, bool) {
+        // `-z`: NUL-separated `status, path` pairs, no path quoting;
+        // `--no-renames`: a renamed test reads as deleted + added.
+        let base = self.base_commit.as_str();
+        let listing = git
+            .run(&["diff", "--cached", "--name-status", "--no-renames", "-z", base])
+            .unwrap_or_default();
+        let fields: Vec<&str> = listing.split('\0').collect();
+        let (mut existing, mut added): (Vec<(&str, &str)>, Vec<&str>) = (Vec::new(), Vec::new());
+        for pair in fields.chunks_exact(2) {
+            if !origin_postedit::is_test_file(pair[1]) {
+                continue;
+            }
+            if pair[0] == "A" {
+                added.push(pair[1]);
+            } else {
+                existing.push((pair[0], pair[1]));
+            }
+        }
+        let tampered = !existing.is_empty();
+        let mut ok = true;
+        if tampered {
+            let mut args = vec!["restore", "--source", base, "--worktree", "--"];
+            args.extend(existing.iter().map(|&(_, p)| p));
+            ok &= git.run(&args).is_ok();
+        }
+        for p in &added {
+            ok &= std::fs::remove_file(wt.join(p)).is_ok();
+        }
+        let outcome = if ok {
+            Self::score(wt, cmd)
+        } else {
+            TestOutcome::Unknown
+        };
+        // Put the candidate's versions back: the index holds its modified and
+        // added files; a test it deleted is not in the index, so delete it again.
+        let staged: Vec<&str> = existing
+            .iter()
+            .filter(|&&(s, _)| s != "D")
+            .map(|&(_, p)| p)
+            .chain(added.iter().copied())
+            .collect();
+        if !staged.is_empty() {
+            let mut args = vec!["checkout", "--"];
+            args.extend(staged);
+            let _ = git.run(&args);
+        }
+        for &(_, p) in existing.iter().filter(|&&(s, _)| s == "D") {
+            let _ = std::fs::remove_file(wt.join(p));
+        }
+        (outcome, tampered)
     }
 
     /// Run the test command with `dir` as cwd; map the exit status to a verdict.
@@ -306,11 +365,30 @@ impl CandidateArena for WorktreeArena<'_> {
         let diff = wt_git
             .run(&["diff", "--cached", &self.base_commit])
             .unwrap_or_default();
-        let outcome = self
-            .test_command
-            .as_deref()
-            .map_or(TestOutcome::Unknown, |cmd| Self::score(&wt_path, cmd));
-        Ok(CandidateResult { diff, outcome })
+        let Some(cmd) = self.test_command.as_deref() else {
+            return Ok(CandidateResult {
+                diff,
+                outcome: TestOutcome::Unknown,
+                tampered: false,
+            });
+        };
+        // C5: an identical change was scored already ⇒ share its verdict.
+        let key = normalize_diff(&diff);
+        let (outcome, tampered) = if let Some(&hit) = self.scored.get(&key) {
+            hit
+        } else {
+            let scored = self.score_on_base_tests(&wt_git, &wt_path, cmd);
+            // A gate that did not run is not cached: the next one may run.
+            if scored.0 != TestOutcome::Unknown {
+                self.scored.insert(key, scored);
+            }
+            scored
+        };
+        Ok(CandidateResult {
+            diff,
+            outcome,
+            tampered,
+        })
     }
 
     fn apply_winner(&mut self, diff: &str) -> Result<(), String> {
@@ -321,7 +399,9 @@ impl CandidateArena for WorktreeArena<'_> {
         // patch from stdin; route it through a temp file to avoid stdin plumbing.
         let tmp = self.root.join("origin-bestofn-winner.patch");
         std::fs::write(&tmp, diff).map_err(|e| format!("write patch: {e}"))?;
-        let out = std::process::Command::new("git")
+        let mut git = std::process::Command::new("git");
+        origin_tools::scrub_env(&mut git); // A6
+        let out = git
             .args(["apply", "--whitespace=nowarn"])
             .arg(&tmp)
             .current_dir(&self.workspace)
@@ -362,6 +442,7 @@ mod tests {
         results: Vec<Result<CandidateResult, String>>,
         applied: Option<String>,
         apply_fails: bool,
+        runs: usize,
     }
     impl MockArena {
         fn new(results: Vec<Result<CandidateResult, String>>) -> Self {
@@ -369,11 +450,13 @@ mod tests {
                 results,
                 applied: None,
                 apply_fails: false,
+                runs: 0,
             }
         }
     }
     impl CandidateArena for MockArena {
         fn run_candidate(&mut self, index: usize) -> Result<CandidateResult, String> {
+            self.runs += 1;
             self.results[index].clone()
         }
         fn apply_winner(&mut self, diff: &str) -> Result<(), String> {
@@ -389,12 +472,14 @@ mod tests {
         Ok(CandidateResult {
             diff: diff.into(),
             outcome: TestOutcome::Passed,
+            tampered: false,
         })
     }
     fn fail(diff: &str) -> Result<CandidateResult, String> {
         Ok(CandidateResult {
             diff: diff.into(),
             outcome: TestOutcome::Failed,
+            tampered: false,
         })
     }
     fn hard() -> DifficultySignals {
@@ -426,7 +511,14 @@ mod tests {
         // Candidate 0 fails, candidate 1 passes ⇒ apply candidate 1's diff.
         let mut a = MockArena::new(vec![fail("bad-diff"), pass("good-diff")]);
         let out = run_best_of_n(&mut a, 2, hard());
-        assert_eq!(out, BestOfNOutcome::Applied { winner: 1, passed: 1 });
+        assert_eq!(
+            out,
+            BestOfNOutcome::Applied {
+                winner: 1,
+                passed: 1,
+                tampered: vec![]
+            }
+        );
         assert_eq!(a.applied.as_deref(), Some("good-diff"));
     }
 
@@ -438,7 +530,14 @@ mod tests {
             pass("another-long-one"),
         ]);
         let out = run_best_of_n(&mut a, 3, hard());
-        assert_eq!(out, BestOfNOutcome::Applied { winner: 1, passed: 3 });
+        assert_eq!(
+            out,
+            BestOfNOutcome::Applied {
+                winner: 1,
+                passed: 3,
+                tampered: vec![]
+            }
+        );
         assert_eq!(a.applied.as_deref(), Some("short"));
     }
 
@@ -455,7 +554,14 @@ mod tests {
         // Candidate 0 errors (worktree blew up), candidate 1 passes ⇒ 1 wins.
         let mut a = MockArena::new(vec![Err("git exploded".into()), pass("good")]);
         let out = run_best_of_n(&mut a, 2, hard());
-        assert_eq!(out, BestOfNOutcome::Applied { winner: 1, passed: 1 });
+        assert_eq!(
+            out,
+            BestOfNOutcome::Applied {
+                winner: 1,
+                passed: 1,
+                tampered: vec![]
+            }
+        );
         assert_eq!(a.applied.as_deref(), Some("good"));
     }
 
@@ -466,6 +572,52 @@ mod tests {
         let out = run_best_of_n(&mut a, 2, hard());
         assert_eq!(out, BestOfNOutcome::NoWinner { attempted: 2 });
         assert!(a.applied.is_none());
+    }
+
+    #[test]
+    fn stops_early_when_the_first_two_agree_and_pass() {
+        // Same change, CRLF vs LF and trailing whitespace ⇒ identical after
+        // normalisation; candidate 2 is never run.
+        let mut a = MockArena::new(vec![pass("+fix\n"), pass("+fix  \r\n"), pass("other")]);
+        let out = run_best_of_n(&mut a, 3, hard());
+        assert_eq!(a.runs, 2, "the third candidate is not run");
+        assert!(
+            matches!(
+                out,
+                BestOfNOutcome::Applied {
+                    winner: 0,
+                    passed: 2,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn no_early_stop_unless_both_pass_with_the_same_diff() {
+        for first_two in [
+            vec![fail("+fix"), fail("+fix")],
+            vec![
+                Ok(CandidateResult {
+                    diff: "+fix".into(),
+                    outcome: TestOutcome::Unknown,
+                    tampered: false,
+                }),
+                Ok(CandidateResult {
+                    diff: "+fix".into(),
+                    outcome: TestOutcome::Unknown,
+                    tampered: false,
+                }),
+            ],
+            vec![pass("+fix"), pass("+other")],
+        ] {
+            let mut results = first_two;
+            results.push(pass("+third"));
+            let mut a = MockArena::new(results);
+            let _ = run_best_of_n(&mut a, 3, hard());
+            assert_eq!(a.runs, 3);
+        }
     }
 
     #[test]
