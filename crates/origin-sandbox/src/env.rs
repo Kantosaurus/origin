@@ -87,7 +87,7 @@ pub fn is_secret_env_name(name: &str) -> bool {
 
 /// C9: the narrower set whose VALUES are redacted by value from tool output:
 /// `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `GITHUB_TOKEN`, `GH_TOKEN`,
-/// `ORIGIN_*KEY*`, and `AWS_SECRET_ACCESS_KEY` (case-insensitive). Unlike
+/// `ORIGIN_*_KEY`, `AWS_SECRET_ACCESS_KEY` and `PGPASSWORD` (case-insensitive). Unlike
 /// [`is_secret_env_name`] it omits the whole-vendor prefixes (`AWS_REGION`,
 /// `OPENAI_BASE_URL`, `ANTHROPIC_MODEL`…): scrubbing too much only drops a
 /// variable, but redacting too much rewrites ordinary text.
@@ -100,7 +100,9 @@ pub fn is_redactable_secret_env_name(name: &str) -> bool {
         || n == "GITHUB_TOKEN"
         || n == "GH_TOKEN"
         || n == "AWS_SECRET_ACCESS_KEY"
-        || (n.starts_with("ORIGIN_") && n.contains("KEY"))
+        || n == "PGPASSWORD"
+        // `ORIGIN_*_KEY` only: `ORIGIN_VAULT_KEYFILE` / `*_KEY_FILE` hold paths.
+        || (n.starts_with("ORIGIN_") && n.ends_with("_KEY"))
 }
 
 /// Whether a child keeps `name`, given the raw `ORIGIN_ENV_PASSTHROUGH` value.
@@ -145,11 +147,18 @@ mod tests {
             "GH_TOKEN",
             "AZURE_CLIENT_SECRET",
             "DB_PASSWORD",
+            "PGPASSWORD",
             "ORIGIN_VAULT_KEY",
+            "ORIGIN_BRAVE_KEY",
+            "ORIGIN_TAVILY_KEY",
         ] {
             assert!(is_redactable_secret_env_name(s), "{s}");
         }
         for s in [
+            // Paths / config, not secrets.
+            "ORIGIN_VAULT_KEYFILE",
+            "ORIGIN_REMOTE_CLIENT_KEY_FILE",
+            "ORIGIN_KEYVAULT",
             "AWS_REGION",
             "AWS_PROFILE",
             "AWS_ACCESS_KEY_ID",

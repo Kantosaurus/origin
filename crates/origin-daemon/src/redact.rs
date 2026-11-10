@@ -112,6 +112,12 @@ pub fn bytes(b: Vec<u8>) -> Vec<u8> {
     hit.map_or(b, String::into_bytes)
 }
 
+/// Redact an owned string; returns it unchanged (no copy) when clean.
+#[must_use]
+pub fn string(s: String) -> String {
+    owned(text(&s)).unwrap_or(s)
+}
+
 fn string_in_place(s: &mut String) {
     if let Some(r) = owned(text(s)) {
         *s = r;

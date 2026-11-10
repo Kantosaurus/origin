@@ -5290,4 +5290,124 @@ mod tests {
         );
         result.expect("a single denial must not end the turn (A8)");
     }
+
+    /// Writes a file, then claims the goal met.
+    struct WriteThenMetProvider {
+        calls: std::sync::Mutex<usize>,
+        target: std::path::PathBuf,
+    }
+    #[async_trait::async_trait]
+    impl origin_provider::Provider for WriteThenMetProvider {
+        fn name(&self) -> &'static str {
+            "write-then-met"
+        }
+        async fn chat(
+            &self,
+            _req: origin_provider::ChatRequest,
+        ) -> Result<origin_provider::ChatResponse, origin_provider::ProviderError> {
+            let n = {
+                let mut g = self.calls.lock().expect("calls lock");
+                *g += 1;
+                *g
+            };
+            let assistant = if n == 1 {
+                let input =
+                    serde_json::json!({"file_path": self.target.to_string_lossy(), "content": "x = 1\n"});
+                Message::new(Role::Assistant).with_block(Block::ToolUse {
+                    id: "tu-write-c9".into(),
+                    name: "Write".into(),
+                    input_json: serde_json::to_vec(&input).expect("encode write args"),
+                    cache_marker: None,
+                })
+            } else {
+                Message::new(Role::Assistant).with_block(Block::text(
+                    "done\n<goal-status state=\"met\"><reason>ok</reason></goal-status>",
+                ))
+            };
+            Ok(origin_provider::ChatResponse {
+                assistant,
+                usage: origin_provider::Usage::default(),
+            })
+        }
+    }
+
+    /// Records what the goal verifier is asked to judge, then says Met.
+    struct RecordingVerifier(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl origin_goal::verifier::Verifier for RecordingVerifier {
+        async fn verify(
+            &self,
+            _condition: &str,
+            last_turn: &str,
+        ) -> Result<(origin_goal::verifier::Verdict, u64, u64), origin_goal::verifier::VerifierError>
+        {
+            self.0.lock().expect("verifier lock").push(last_turn.to_string());
+            Ok((origin_goal::verifier::Verdict::Met, 0, 0))
+        }
+    }
+
+    /// C9: turn-end gate output reaches the goal verifier through
+    /// `<harness-signals>`; it must be redacted at its source.
+    #[tokio::test]
+    async fn goal_verifier_never_sees_a_raw_key_from_gate_output() {
+        use std::sync::Arc;
+        const KEY: &str = "sk-c9-goal-verifier-0123456789";
+        const MARKER: &str = "[REDACTED:C9_GOAL_API_KEY]";
+        origin_daemon::redact::install(origin_daemon::redact::Redactor::new([(
+            "C9_GOAL_API_KEY".to_string(),
+            KEY.to_string(),
+        )]));
+        // Redaction is idempotent: already-redacted text passes through unchanged.
+        assert_eq!(
+            origin_daemon::redact::text(&format!("k={MARKER}")),
+            format!("k={MARKER}")
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SessionStore::open(dir.path().join("sessions.db")).expect("open store"));
+        let mut session = Session::new("c9-goal", "test-model");
+        let provider = WriteThenMetProvider {
+            calls: std::sync::Mutex::new(0),
+            target: dir.path().join("lib.py"),
+        };
+        let verifier = RecordingVerifier(std::sync::Mutex::new(Vec::new()));
+        let active_goal = Arc::new(tokio::sync::Mutex::new(Some(origin_goal::GoalState::new(
+            "tests green".into(),
+            None,
+            None,
+        ))));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<StreamEvent>(256);
+        let opts = origin_daemon::agent::LoopOptions {
+            max_turns: 6,
+            // No terminal-branch rerun: the verifier gets the per-turn test block.
+            post_edit: Some(Arc::new(origin_postedit::PostEditConfig {
+                auto_test: true,
+                test_command: Some(format!("echo {KEY}; exit 1")),
+                max_repair_iters: 0,
+                ..origin_postedit::PostEditConfig::default()
+            })),
+            ..origin_daemon::agent::LoopOptions::default().without_streaming()
+        };
+
+        let _ = super::drive_goal_loop(
+            &mut session,
+            "write it".to_string(),
+            &provider,
+            &opts,
+            active_goal,
+            store,
+            &verifier,
+            event_tx,
+            &origin_permission::prompt::AlwaysAllow,
+        )
+        .await;
+
+        let seen = verifier.0.lock().expect("verifier lock").join("\n---\n");
+        assert!(
+            seen.contains("<harness-signals>"),
+            "verifier got the gate signals: {seen}"
+        );
+        assert!(!seen.contains(KEY), "raw key reached the goal verifier: {seen}");
+        assert!(seen.contains(MARKER), "verifier input carries the marker: {seen}");
+    }
 }

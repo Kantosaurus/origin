@@ -6360,20 +6360,26 @@ async fn run_loop_inner(
         // block is skipped and the prompt stays byte-identical.
         if lsp_diag_enabled {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            lsp_diag_block = crate::lsp_diagnostics::lsp_diagnostics_block(
-                &lsp_pool,
-                &root,
-                &lsp_edited_paths,
-                lsp_unlisted_mutation,
-            )
-            .await
-            .unwrap_or_default();
+            // C9: gate blocks carry child-process output; redact at the source
+            // so every consumer (model, goal verifier, re-localize) sees it redacted.
+            lsp_diag_block = crate::redact::string(
+                crate::lsp_diagnostics::lsp_diagnostics_block(
+                    &lsp_pool,
+                    &root,
+                    &lsp_edited_paths,
+                    lsp_unlisted_mutation,
+                )
+                .await
+                .unwrap_or_default(),
+            );
         }
         // Fast post-edit syntax gate on the same edited-path set (Python/JS).
         if compile_check_enabled && !lsp_edited_paths.is_empty() {
-            compile_check_block = crate::postcheck::check_block(&lsp_edited_paths)
-                .await
-                .unwrap_or_default();
+            compile_check_block = crate::redact::string(
+                crate::postcheck::check_block(&lsp_edited_paths)
+                    .await
+                    .unwrap_or_default(),
+            );
         }
         // Opt-in post-edit test run. Default-off (auto_test defaults false), so it
         // adds NO latency unless the user explicitly configured it — they then
@@ -6387,7 +6393,8 @@ async fn run_loop_inner(
                         // #4: narrow the suite to the edit's blast radius when
                         // test-selection is enabled; falls back to `cmd` verbatim.
                         let cmd = effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
-                        test_block = run_post_edit_test(&cmd).await.unwrap_or_default();
+                        test_block =
+                            crate::redact::string(run_post_edit_test(&cmd).await.unwrap_or_default());
                         // C9: classify a post-edit failure against the pre-edit
                         // baseline — a true regression (was green) vs failures
                         // that were already red before this change.
@@ -6412,7 +6419,8 @@ async fn run_loop_inner(
                 // per-edit lint only logged its result; surface it to the model.
                 if cfg.auto_lint {
                     if let Some(cmd) = cfg.lint_command.as_deref() {
-                        lint_block = run_post_edit_lint_block(cmd).await.unwrap_or_default();
+                        lint_block =
+                            crate::redact::string(run_post_edit_lint_block(cmd).await.unwrap_or_default());
                     }
                 }
             }
@@ -6903,7 +6911,8 @@ async fn dispatch_tool(
             return Err(LoopError::ToolFailure(format!(
                 "{}: refused — the content contains `{marker}`, a placeholder for a secret value that \
                  was redacted from your view. Writing it would replace the real value on disk. Edit \
-                 around it instead: use Edit on the surrounding lines and never rewrite the redacted value.",
+                 around it instead: use Edit on the surrounding lines and never rewrite the redacted value. \
+                 If that literal marker text is genuinely intended, ask the user to make this edit.",
                 meta.name
             )));
         }
