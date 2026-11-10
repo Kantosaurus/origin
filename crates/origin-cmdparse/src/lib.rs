@@ -843,12 +843,15 @@ fn check_cmd(
     let mut assigned = None;
     while let Some(w) = ws.get(i) {
         let t = w.text.as_str();
+        if sh == Shell::Power && !invoked && i + 1 < ws.len() && ps_target_prefix(t) {
+            // Additive only: also check the command as if this word were
+            // absent; the analysis below still runs unchanged.
+            check_cmd(&ws[i + 1..], stdin, multi, sh, depth, risks, false);
+        }
         if sh == Shell::Posix && POSIX_KEYWORDS.contains(&t) {
             i += 1;
         } else if is_env_assignment(t) {
             assigned = Some(t);
-            i += 1;
-        } else if sh == Shell::Power && i + 1 < ws.len() && ps_target_prefix(t) {
             i += 1;
         } else if let Some((rhs, used)) = (sh == Shell::Power).then(|| ps_assignment(ws, i)).flatten() {
             check_assignment_target(t, risks);
@@ -970,8 +973,8 @@ fn check_assignment_target(t: &str, risks: &mut Vec<Risk>) {
 }
 
 /// A spaced cast (`[int] $x = …`) or list element (`$a, $b = …`) before a
-/// PowerShell assignment target. Skipping it only lets more words be checked;
-/// a word that invokes script keeps its own check.
+/// PowerShell assignment target. The command is checked both with and without
+/// it, so the skip can only add risks.
 fn ps_target_prefix(t: &str) -> bool {
     ((t.starts_with('[') && t.ends_with(']')) || (t.starts_with('$') && t.ends_with(',')))
         && !t.contains('=')
@@ -1067,6 +1070,19 @@ fn check_powershell(args: &[Word], stdin: &Stdin, depth: usize, risks: &mut Vec<
 /// take a value.
 fn check_posix_shell(name: &str, args: &[Word], stdin: &Stdin, depth: usize, risks: &mut Vec<Risk>) {
     let bundle = |t: &str| t.starts_with('-') && !t.starts_with("--") && t.len() > 1;
+    // An rcfile may itself be stdin (`--rcfile /dev/stdin -i`): with stdin fed,
+    // fail closed instead of reasoning about which word is the value.
+    let fed = stdin.piped || stdin.redirects > 0;
+    let rcfile = |t: &str| {
+        ["--rcfile", "--init-file"]
+            .iter()
+            .any(|o| t == *o || t.starts_with(&format!("{o}=")))
+    };
+    if fed && args.iter().any(|a| rcfile(&a.text)) {
+        risks.push(needs(format!(
+            "`{name}` reads a startup file while its input is fed"
+        )));
+    }
     if let Some(k) = args.iter().position(|a| bundle(&a.text) && a.text.contains('c')) {
         match args.get(k + 1).map(|s| s.text.as_str()) {
             // An `xargs -I {}` placeholder: the script is whatever comes in.
@@ -1082,7 +1098,8 @@ fn check_posix_shell(name: &str, args: &[Word], stdin: &Stdin, depth: usize, ris
     let mut operand = None;
     let mut k = 0;
     while let Some(t) = args.get(k).map(|a| a.text.as_str()) {
-        if matches!(t, "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file") {
+        // The rcfile value skip only applies when stdin is not fed (above).
+        if matches!(t, "-o" | "+o" | "-O" | "+O") || (!fed && matches!(t, "--rcfile" | "--init-file")) {
             k += 2;
             continue;
         }
@@ -2087,6 +2104,60 @@ mod tests {
             dangerous,
             "Dangerous",
         );
+        expect(
+            Shell::Power,
+            &["$a, $b = 1, 2", "[int] $x = 5", "[void] $list.Add(1)"],
+            allowed,
+            "Safe/Suspicious",
+        );
+    }
+
+    #[test]
+    fn rcfile_with_fed_stdin_always_needs_approval() {
+        expect(
+            Shell::Posix,
+            &[
+                "bash --rcfile /dev/stdin -i foo < evil.sh",
+                "bash --rcfile - foo < x.sh",
+                "bash --rcfile /dev/stdin foo < x.sh",
+                "bash --rcfile=x.sh < evil.sh",
+                "bash --rcfile /dev/null -s < x.sh",
+                "bash --init-file /dev/null -s < x.sh",
+                "bash --rcfile x.sh < evil.sh",
+            ],
+            needs_approval,
+            "NeedsApproval",
+        );
+        expect(
+            Shell::Posix,
+            &["bash --rcfile my.rc script.sh"],
+            allowed,
+            "Safe/Suspicious",
+        );
+    }
+
+    #[test]
+    fn leading_word_skip_is_only_additive() {
+        let danger = [
+            "[int]$a[0] = rm -r -fo ~",
+            "[int]$a[0] += rm -r -fo ~",
+            "$a, = rm -r -fo ~",
+            "[int] $x = rm -r -fo ~",
+            "$a, $b = rm -r -fo ~",
+            "[void] rm -r -fo ~",
+            "$x, rm -r -fo ~",
+        ];
+        expect(Shell::Power, &danger, dangerous, "Dangerous");
+        let ask = [
+            "[int]$a[0] = iex $s",
+            "& [x] foo",
+            "& $f, foo",
+            ". [x] foo",
+            ". $f, foo",
+            "[string] iex $s",
+            "$a, iex $s",
+        ];
+        expect(Shell::Power, &ask, needs_approval, "NeedsApproval");
         expect(
             Shell::Power,
             &["$a, $b = 1, 2", "[int] $x = 5", "[void] $list.Add(1)"],
