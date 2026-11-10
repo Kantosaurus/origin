@@ -656,6 +656,7 @@ async fn run_mcp_worker(
         Arc::clone(&cas),
         origin_keyvault::KeyVault::in_memory(),
         origin_planner::Plan::default(),
+        origin_daemon::config::Governance::default(),
     ));
     let handle = coord
         .spawn(WorkerSpec {
