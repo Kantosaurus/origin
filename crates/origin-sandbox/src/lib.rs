@@ -27,6 +27,32 @@ pub use profile::{ProfileOrdinal, SandboxProfile};
 
 use thiserror::Error;
 
+/// Whether child processes (Bash, gate commands, hooks, MCP servers) run under
+/// OS confinement. The permission layer uses it to decide whether a command
+/// may run without asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxStatus {
+    /// A confining backend is applied, fail-closed, to every child.
+    Active,
+    /// No confining backend on this build/host: children run unconfined.
+    Unavailable,
+    /// The user opted out with `ORIGIN_SANDBOX=off`.
+    DisabledByUser,
+}
+
+/// Current [`SandboxStatus`] for this process.
+// ponytail: no backend is applied fail-closed on the shipped spawn path yet
+// (C1 items 1-3 are blocked on design decisions), so this never reports
+// `Active`; return it here once a backend refuses to spawn when it cannot confine.
+#[must_use]
+pub fn sandbox_status() -> SandboxStatus {
+    if std::env::var("ORIGIN_SANDBOX").is_ok_and(|v| v.eq_ignore_ascii_case("off")) {
+        SandboxStatus::DisabledByUser
+    } else {
+        SandboxStatus::Unavailable
+    }
+}
+
 /// Errors raised by the per-OS backends.
 #[derive(Debug, Error)]
 pub enum SandboxError {
