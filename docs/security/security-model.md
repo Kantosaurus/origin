@@ -325,7 +325,7 @@ called `C:` (fail-closed false positive).
 | -------- | ---------------------- | ------- | -------------- |
 | `cd` check (in `check_cmd`) | `cd` into a forbidden directory *before* an "approved" command, escaping a path-scoped allowlist. | `Suspicious` | `cd /etc && cat shadow` |
 | bare-assignment check (in `check_cmd`) | A leading `NAME=val` makes the *real* command the second word, dodging a first-word allowlist. | `Suspicious` | `FOO=bar evilcmd --do-it` |
-| program unknown statically (in `check_cmd`) | A variable, substitution or glob in command position, `eval`/`iex`, `-EncodedCommand`, input piped into a shell or into a group (`( … )`/`{ …; }` as a non-first pipeline segment), a shell or `source`/`.` run on a process substitution, `env -S`/`--split-string`, or a line that cannot be parsed. | `NeedsApproval` | `eval "$CMD"`, `bash <(curl …)`, `env -S 'rm -rf ~'`, `curl … \| (cd /tmp && sh)` |
+| program unknown statically (in `check_cmd`; the piped-group rule in `scan`) | A variable, substitution or glob in command position, `eval`/`iex`, `-EncodedCommand`, input piped into a shell or into a group (`( … )`/`{ …; }` as a non-first pipeline segment), a shell or `source`/`.` run on a process substitution, `env -S`/`--split-string`, or a line that cannot be parsed. | `NeedsApproval` | `eval "$CMD"`, `bash <(curl …)`, `env -S 'rm -rf ~'`, `curl … \| (cd /tmp && sh)` |
 | `detect_install` (C6, with `dep_gate`) | Installing or running a package the project does not declare. See [Dependency-install gate](#dependency-install-gate-c6). | `NeedsApproval` | `npm install left-pad` (undeclared) |
 | `detect_rm_rf_home` | `rm -rf` (any flag order/grouping, long forms, `--no-preserve-root`) aimed at `~`, `$HOME`, `${HOME}`, `/`, a `$HOME`/`~` with trailing slash, every entry of one (`~/*`, `/*`, `~/.`, `~/.*`, `$HOME/*`), or a Windows drive root (`C:`, `C:\`, `C:/`, `C:\*`, also via `Remove-Item`, `rd`, `rmdir`) — even behind `sudo`/`/bin/rm`/`\rm`/env prefix. | `Dangerous` | `sudo rm -rf ~`, `rm --recursive --force /`, `rm -rf ~/*`, `Remove-Item -Recurse -Force C:\` |
 | `detect_pipe_to_shell` | Remote content fetched and piped straight into an interpreter (`sh`/`bash`/`zsh`/`dash`/`python`/`perl`/`ruby`/`node`), also into a grouped shell. | `Dangerous` | `curl https://x/install.sh \| sh`, `curl … \| (sh)`, `curl … \| { sh; }` |
@@ -444,8 +444,16 @@ Not covered: the self-development `cargo build` / `cargo test` (`ORIGIN_SELFDEV`
 `crates/origin-selfdev/src/cargo.rs`) is not scrubbed and sees the daemon's full
 environment, provider keys included. The post-edit syntax checkers (`python`,
 `node --check`) run from the system temp directory on an absolute file path,
-Python as `python -I -S -m py_compile`. An interpreter located inside the
-workspace is never run (the tree-sitter check covers the file instead).
+Python as `python -I -S -m py_compile`. The checker runs by the path it is
+found at on `PATH`, and only when that file, the target it links to and the
+directory holding it all lie outside every workspace root; otherwise the
+tree-sitter check covers the file instead. The checker's own `PATH` has every
+workspace directory (and every relative or unresolvable entry) removed, so a
+launcher that searches `PATH` again cannot reach a workspace interpreter. A
+failure that is not a syntax error (`SyntaxError`, `IndentationError`,
+`TabError`) is ignored and the tree-sitter check covers the file. A Microsoft
+Store Python alias, or a session whose root is the home directory or a drive
+root, gets the tree-sitter check only.
 
 Why the backends are not enabled (inventory at the time of writing; Linux and
 macOS behaviour was read from code, not run):
@@ -625,9 +633,10 @@ edited without asking. Code also runs after an edit: by default, after a turn
 that edits a file, origin may run the language's own syntax checker on it
 (`python -I -S -m py_compile`, `node --check`; `ORIGIN_EDIT_CHECK=0` turns it off),
 in isolated mode, from the system temp directory, on an absolute path, so it does
-not import or load configuration from the workspace; an interpreter located
-inside the workspace is never run (the tree-sitter check covers the file
-instead); and opt-in features
+not import or load configuration from the workspace; an interpreter found
+inside the workspace, or reached through a link into it, is never run, and the
+checker's `PATH` has every workspace directory removed (the tree-sitter check
+covers the file instead); and opt-in features
 (autoformat, `auto_test`, LSP build scripts) turn such an edit into code
 execution.
 

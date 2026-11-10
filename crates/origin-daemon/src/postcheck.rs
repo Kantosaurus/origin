@@ -81,10 +81,12 @@ fn checker_for(path: &str) -> Option<(&'static str, Vec<String>)> {
     }
 }
 
-/// B7: [`checker_for`] with its program resolved on `path_var` (the `PATH`
-/// the child gets: the env scrub keeps it) to a canonical absolute path, which
-/// is what runs. `None` — no external checker; tree-sitter covers the file —
-/// when the lookup fails or the interpreter lies under a workspace root in
+/// B7: [`checker_for`] with its program resolved on `path_var` (the daemon's
+/// `PATH`) to the absolute path AS FOUND, which is what runs: launchers that
+/// pick what to run from their own file name (Volta, mise, pyenv-win's
+/// `python.bat`) keep it. `None` — no external checker; tree-sitter covers the
+/// file — when the lookup fails, the path is relative, or the file's final
+/// target or the directory holding it is not resolvably outside every root in
 /// `roots` (resolved paths): a file there may be written without an ask.
 fn checker(
     path: &str,
@@ -92,17 +94,48 @@ fn checker(
     roots: &[std::path::PathBuf],
 ) -> Option<(std::path::PathBuf, Vec<String>)> {
     let (prog, args) = checker_for(path)?;
-    let real = origin_conseca::resolve_real(&crate::subsystems::resolve_on_path(prog, path_var)?)?;
-    (!roots.iter().any(|r| real.starts_with(r))).then_some((real, args))
+    let found = crate::subsystems::resolve_on_path(prog, path_var)?;
+    let ok = found.is_absolute() && outside(&found, roots) && outside(found.parent()?, roots);
+    ok.then_some((found, args))
 }
 
-/// The checker's process: scrubbed env (A6), run from the temp directory so
-/// nothing in the workspace is on the interpreter's module path (S1).
-fn checker_command<S: AsRef<std::ffi::OsStr>>(prog: S, args: &[String]) -> tokio::process::Command {
+/// B7: `p` resolves (links followed) and lies under none of `roots`.
+fn outside(p: &std::path::Path, roots: &[std::path::PathBuf]) -> bool {
+    origin_conseca::resolve_real(p).is_some_and(|r| !roots.iter().any(|root| r.starts_with(root)))
+}
+
+/// B7: `path_var` keeping only absolute entries that resolve outside every
+/// root, so a launcher that searches `PATH` again (pyenv `system`, mise's
+/// fallback) cannot reach a workspace interpreter.
+fn workspace_free_path(path_var: &std::ffi::OsStr, roots: &[std::path::PathBuf]) -> std::ffi::OsString {
+    let kept = std::env::split_paths(path_var).filter(|d| d.is_absolute() && outside(d, roots));
+    std::env::join_paths(kept).unwrap_or_default()
+}
+
+/// The checker's process: scrubbed env (A6) with a [`workspace_free_path`],
+/// run from the temp directory so nothing in the workspace is on the
+/// interpreter's module path (S1).
+fn checker_command<S: AsRef<std::ffi::OsStr>>(
+    prog: S,
+    args: &[String],
+    roots: &[std::path::PathBuf],
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(prog);
     origin_tools::scrub_env(cmd.as_std_mut()); // A6
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    cmd.env("PATH", workspace_free_path(&path_var, roots));
     cmd.args(args).current_dir(std::env::temp_dir());
     cmd
+}
+
+/// B7: a failing checker's output names a syntax error (Python's
+/// `SyntaxError`/`IndentationError`/`TabError`; `node --check` prints
+/// `SyntaxError`). Any other failure — a launcher that ran the wrong thing —
+/// is no check at all.
+fn names_syntax_error(output: &str) -> bool {
+    ["SyntaxError", "IndentationError", "TabError"]
+        .iter()
+        .any(|w| output.contains(w))
 }
 
 /// B7: pre-edit tree-sitter problem-line count per edited path (see
@@ -140,7 +173,7 @@ pub async fn check_block(
             continue; // B8: deleted or moved away by ApplyPatch
         }
         let before = baseline.get(p).copied().unwrap_or(0);
-        match check_file(p, checker(p, &path_var, roots), before).await {
+        match check_file(p, checker(p, &path_var, roots), before, roots).await {
             Some(Finding::Failure(msg)) => failures.push(format!("{p}:\n{msg}")),
             Some(Finding::Advisory(msg)) => advisories.push(format!("{p}:\n{msg}")),
             None => {}
@@ -169,14 +202,15 @@ pub async fn check_block(
 
 /// Check one edited file: the interpreter-based `checker` when it can run,
 /// else (B7) tree-sitter, reported only when the edit raised the problem-line
-/// count above `before`.
+/// count above `before`. `roots` are filtered out of the checker's `PATH`.
 async fn check_file<S: AsRef<std::ffi::OsStr>>(
     path: &str,
     checker: Option<(S, Vec<String>)>,
     before: usize,
+    roots: &[std::path::PathBuf],
 ) -> Option<Finding> {
     if let Some((prog, args)) = checker {
-        let run = checker_command(prog, &args).output();
+        let run = checker_command(prog, &args, roots).output();
         if let Ok(Ok(out)) = tokio::time::timeout(PER_FILE_TIMEOUT, run).await {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if !interpreter_missing(out.status.code(), &stderr) {
@@ -190,10 +224,13 @@ async fn check_file<S: AsRef<std::ffi::OsStr>>(
                 } else {
                     msg.to_string()
                 };
-                return (!msg.is_empty()).then(|| Finding::Failure(truncate(&msg)));
+                if names_syntax_error(&msg) {
+                    return Some(Finding::Failure(truncate(&msg)));
+                }
             }
         }
-        // Spawn error, timeout or a stub interpreter ⇒ tree-sitter may cover it.
+        // Spawn error, timeout, a stub interpreter or a failure that is not a
+        // syntax error ⇒ tree-sitter may cover it.
     }
     let lines = parse_error_lines(path).await;
     (lines.len() > before).then(|| Finding::Advisory(advisory_text(&lines)))
@@ -327,7 +364,7 @@ mod tests {
             assert_eq!(got, prog);
             let path = args.last().expect("path");
             assert!(std::path::Path::new(path).is_absolute(), "{file}: {path}");
-            let cmd = checker_command(got, &args);
+            let cmd = checker_command(got, &args, &[]);
             assert_eq!(
                 cmd.as_std().get_current_dir(),
                 Some(std::env::temp_dir().as_path()),
@@ -368,6 +405,144 @@ mod tests {
         assert_eq!(args.last(), Some(&file));
         // Not found on PATH ⇒ no external checker.
         assert_eq!(checker(&file, std::ffi::OsStr::new(""), &[]), None);
+    }
+
+    /// A fake checker named `name` in `dir` (Windows: `name.bat` running
+    /// `win`; elsewhere an executable `sh` script running `sh`).
+    fn script(dir: &std::path::Path, name: &str, win: &str, sh: &str) -> std::path::PathBuf {
+        let p = dir.join(if cfg!(windows) {
+            format!("{name}.bat")
+        } else {
+            name.to_string()
+        });
+        let body = if cfg!(windows) {
+            win.to_string()
+        } else {
+            format!("#!/bin/sh\n{sh}\n")
+        };
+        std::fs::write(&p, body).expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        p
+    }
+
+    /// B7: the checker's `PATH` keeps only absolute directories outside every
+    /// root — no workspace directory, no relative or empty entry.
+    #[test]
+    fn the_checkers_path_has_no_workspace_directory() {
+        let ws = tempfile::tempdir().expect("tmp");
+        let root = origin_conseca::resolve_real(ws.path()).expect("resolve");
+        let inside = root.join(".venv").join("bin");
+        std::fs::create_dir_all(&inside).expect("mkdir");
+        let out = tempfile::tempdir().expect("tmp");
+        let path_var = std::env::join_paths([
+            inside,
+            std::path::PathBuf::from("rel").join("bin"),
+            std::path::PathBuf::new(),
+            out.path().to_path_buf(),
+        ])
+        .expect("PATH");
+        let roots = std::slice::from_ref(&root);
+        let kept: Vec<_> = std::env::split_paths(&workspace_free_path(&path_var, roots)).collect();
+        assert_eq!(kept, vec![out.path().to_path_buf()]);
+        // The spawned checker gets exactly that filter of the daemon's PATH.
+        let cmd = checker_command("x", &[], roots);
+        let set = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == "PATH")
+            .and_then(|(_, v)| v);
+        let daemon = std::env::var_os("PATH").unwrap_or_default();
+        assert_eq!(set, Some(workspace_free_path(&daemon, roots).as_os_str()));
+    }
+
+    /// B7: a launcher outside the workspace runs under the name it was found
+    /// by (Volta/mise shims pick what to run from it); a link whose target is
+    /// inside the workspace gives no checker.
+    #[test]
+    fn a_launcher_runs_under_its_own_name() {
+        let ws = tempfile::tempdir().expect("tmp");
+        let root = origin_conseca::resolve_real(ws.path()).expect("resolve");
+        let roots = std::slice::from_ref(&root);
+        let out = tempfile::tempdir().expect("tmp");
+        let dir = out.path().join("bin");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let launcher = script(&dir, "node", "@exit /b 0\r\n", "exit 0");
+        let path_var = std::env::join_paths([&dir]).expect("PATH");
+        let (prog, _) = checker("x.js", &path_var, roots).expect("outside every root");
+        assert_eq!(prog, launcher, "the path as found, not canonicalised");
+        assert_eq!(prog.file_name(), launcher.file_name());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let shim = script(out.path(), "volta-shim", "", "exit 0");
+            let links = out.path().join("links");
+            std::fs::create_dir_all(&links).expect("mkdir");
+            symlink(&shim, links.join("node")).expect("link");
+            let path_var = std::env::join_paths([&links]).expect("PATH");
+            let (prog, _) = checker("x.js", &path_var, roots).expect("outside every root");
+            assert_eq!(prog.file_name().and_then(|n| n.to_str()), Some("node"));
+            let inner = script(&root, "node-real", "", "exit 0");
+            let evil = out.path().join("evil");
+            std::fs::create_dir_all(&evil).expect("mkdir");
+            symlink(&inner, evil.join("node")).expect("link");
+            let path_var = std::env::join_paths([&evil]).expect("PATH");
+            assert_eq!(
+                checker("x.js", &path_var, roots),
+                None,
+                "target inside the workspace"
+            );
+        }
+    }
+
+    /// B7: a failing checker is a must-fix finding only when it names a
+    /// syntax error; any other failure (a launcher that ran the wrong thing)
+    /// falls back to tree-sitter.
+    #[tokio::test]
+    async fn only_a_failure_naming_a_syntax_error_is_a_finding() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let broken = dir.path().join("broken.py");
+        std::fs::write(&broken, "def f(:\n").expect("write");
+        let broken = broken.to_string_lossy().into_owned();
+        let wrong = script(
+            dir.path(),
+            "wrong",
+            "@echo mise ERROR no such command 1>&2\r\n@exit /b 1\r\n",
+            "echo 'mise ERROR no such command' >&2; exit 1",
+        );
+        let got = check_file(&broken, Some((&wrong, Vec::new())), 0, &[]).await;
+        assert!(
+            matches!(got, Some(Finding::Advisory(_))),
+            "tree-sitter covers: {got:?}"
+        );
+        let syntax = script(
+            dir.path(),
+            "syntax",
+            "@echo SyntaxError: invalid syntax 1>&2\r\n@exit /b 1\r\n",
+            "echo 'SyntaxError: invalid syntax' >&2; exit 1",
+        );
+        let got = check_file(&broken, Some((&syntax, Vec::new())), 0, &[]).await;
+        assert!(
+            matches!(&got, Some(Finding::Failure(m)) if m.contains("SyntaxError")),
+            "{got:?}"
+        );
+        #[cfg(windows)]
+        {
+            // pyenv-win's `python.bat` first on PATH runs by its own path
+            // (not a `\\?\` one) and exits 0: no finding, no cmd.exe error.
+            let bin = dir.path().join("bin");
+            std::fs::create_dir_all(&bin).expect("mkdir");
+            script(&bin, "python", "@exit /b 0\r\n", "");
+            let path_var = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            )))
+            .expect("PATH");
+            let c = checker(&broken, &path_var, &[]).expect("python.bat");
+            assert_eq!(check_file(&broken, Some(c), 0, &[]).await, None);
+        }
     }
 
     /// S1: an interpreter that rejects `-I` counts as missing (tree-sitter
@@ -519,13 +694,25 @@ mod tests {
         std::fs::write(&p, "fn main() {\n}\n}\n").expect("write");
         let p = p.to_string_lossy().into_owned();
         // This test binary stands in for an interpreter that runs: `--list`
-        // exits 0, an unknown flag exits non-zero with a message.
+        // exits 0; an unknown flag exits non-zero with a message that is not
+        // a syntax error, so it did not check the file (B7).
         let exe = std::env::current_exe().expect("current exe");
-        let clean = check_file(&p, Some((&exe, vec!["--list".into()])), 0).await;
+        let clean = check_file(&p, Some((&exe, vec!["--list".into()])), 0, &[]).await;
         assert_eq!(clean, None);
-        let failed = check_file(&p, Some((&exe, vec!["--no-such-flag".into()])), 0).await;
+        let syntax = script(
+            dir.path(),
+            "syntax",
+            "@echo SyntaxError: invalid syntax 1>&2\r\n@exit /b 1\r\n",
+            "echo 'SyntaxError: invalid syntax' >&2; exit 1",
+        );
+        let failed = check_file(&p, Some((&syntax, Vec::new())), 0, &[]).await;
         assert!(matches!(failed, Some(Finding::Failure(_))), "{failed:?}");
-        let missing = check_file(&p, Some(("origin-no-such-interpreter", Vec::new())), 0).await;
+        let not_a_check = check_file(&p, Some((&exe, vec!["--no-such-flag".into()])), 0, &[]).await;
+        assert!(
+            matches!(not_a_check, Some(Finding::Advisory(_))),
+            "{not_a_check:?}"
+        );
+        let missing = check_file(&p, Some(("origin-no-such-interpreter", Vec::new())), 0, &[]).await;
         assert!(matches!(missing, Some(Finding::Advisory(_))), "{missing:?}");
     }
 

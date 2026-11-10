@@ -218,9 +218,11 @@ Defaults that changed, each with its escape hatch:
 - **B7**: the post-edit syntax check no longer runs code from the workspace: Python is run as
   `python -I -S -m py_compile <absolute path>`, and both checkers (`python`, `node --check`) run from the system temp
   directory on an absolute file path. A Python that rejects `-I` counts as no interpreter (the tree-sitter check
-  covers the file). An interpreter located inside the workspace (e.g. an activated `.venv`) is never run: the
-  checker is resolved on `PATH` first and, when it lies under a workspace root or the run's directory, the
-  tree-sitter check covers the file instead; otherwise that resolved absolute path is what runs. Previously a
+  covers the file). An interpreter found inside the workspace (e.g. an activated `.venv`), or reached through a
+  link into it, is never run: the checker is resolved on `PATH` first and runs by the path it was found at only
+  when that file, its link target and its directory lie outside every workspace root (else the tree-sitter check
+  covers the file); its own `PATH` has every workspace directory removed; and a failure that is not a syntax error
+  (`SyntaxError`, `IndentationError`, `TabError`) is ignored (tree-sitter covers the file). Previously a
   `py_compile.py` written to the workspace was imported and run at turn end without an ask. `ORIGIN_EDIT_CHECK=0`
   still turns the check off.
 - **C2**: `Diagnostics` and `LspNavigate` are `RequiresPermission` (they start rust-analyzer, which runs
