@@ -38,7 +38,11 @@ pub fn system_block(mode: PonytailMode) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    format!("<origin-ponytail level=\"{}\">\n{}\n</origin-ponytail>", mode.as_str(), body.trim())
+    format!(
+        "<origin-ponytail level=\"{}\">\n{}\n</origin-ponytail>",
+        mode.as_str(),
+        body.trim()
+    )
 }
 
 #[cfg(test)]

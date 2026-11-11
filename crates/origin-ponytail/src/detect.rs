@@ -13,7 +13,10 @@ pub struct Dep {
 }
 
 fn dep(eco: Ecosystem, name: impl Into<String>) -> Dep {
-    Dep { eco, name: name.into() }
+    Dep {
+        eco,
+        name: name.into(),
+    }
 }
 
 /// Strip a version/spec suffix and surrounding quotes from a token.
@@ -43,14 +46,16 @@ pub fn bash_installs(cmd: &str) -> Vec<Dep> {
         return Vec::new();
     }
     let (eco, verb_ok, start) = match toks[0] {
-        "npm" | "yarn" | "pnpm" | "bun" => {
-            (Ecosystem::Npm, matches!(toks[1], "install" | "add" | "i"), 2)
-        }
+        "npm" | "yarn" | "pnpm" | "bun" => (Ecosystem::Npm, matches!(toks[1], "install" | "add" | "i"), 2),
         "cargo" => (Ecosystem::Cargo, toks[1] == "add", 2),
         "go" => (Ecosystem::Go, toks[1] == "get", 2),
         "gem" => (Ecosystem::RubyGems, toks[1] == "install", 2),
         "pip" | "pip3" => (Ecosystem::PyPI, toks[1] == "install", 2),
-        "uv" => (Ecosystem::PyPI, toks.get(1) == Some(&"pip") && toks.get(2) == Some(&"install"), 3),
+        "uv" => (
+            Ecosystem::PyPI,
+            toks.get(1) == Some(&"pip") && toks.get(2) == Some(&"install"),
+            3,
+        ),
         "poetry" => (Ecosystem::PyPI, toks[1] == "add", 2),
         _ => return Vec::new(),
     };
@@ -90,13 +95,20 @@ fn ecosystem_for(file: &str) -> Option<Ecosystem> {
 }
 
 fn deps_in_manifest(file: &str, content: &str) -> BTreeSet<String> {
-    let Some(eco) = ecosystem_for(file) else { return BTreeSet::new() };
+    let Some(eco) = ecosystem_for(file) else {
+        return BTreeSet::new();
+    };
     let base = file.rsplit(['/', '\\']).next().unwrap_or(file);
     let mut set = BTreeSet::new();
     match base {
         "package.json" => {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
-                for key in ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"] {
+                for key in [
+                    "dependencies",
+                    "devDependencies",
+                    "optionalDependencies",
+                    "peerDependencies",
+                ] {
                     if let Some(obj) = v.get(key).and_then(|x| x.as_object()) {
                         set.extend(obj.keys().cloned());
                     }
@@ -114,12 +126,23 @@ fn deps_in_manifest(file: &str, content: &str) -> BTreeSet<String> {
         }
         "pyproject.toml" => {
             if let Ok(v) = content.parse::<toml::Value>() {
-                if let Some(arr) = v.get("project").and_then(|p| p.get("dependencies")).and_then(|d| d.as_array()) {
+                if let Some(arr) = v
+                    .get("project")
+                    .and_then(|p| p.get("dependencies"))
+                    .and_then(|d| d.as_array())
+                {
                     for item in arr {
-                        if let Some(s) = item.as_str() { set.insert(bare_name(s)); }
+                        if let Some(s) = item.as_str() {
+                            set.insert(bare_name(s));
+                        }
                     }
                 }
-                if let Some(t) = v.get("tool").and_then(|t| t.get("poetry")).and_then(|p| p.get("dependencies")).and_then(|d| d.as_table()) {
+                if let Some(t) = v
+                    .get("tool")
+                    .and_then(|t| t.get("poetry"))
+                    .and_then(|p| p.get("dependencies"))
+                    .and_then(|d| d.as_table())
+                {
                     set.extend(t.keys().filter(|k| *k != "python").cloned());
                 }
             }
@@ -143,14 +166,20 @@ fn deps_in_lines(eco: Ecosystem, text: &str) -> Vec<Dep> {
         }
         match eco {
             Ecosystem::PyPI => {
-                if line.starts_with('-') { continue; }
+                if line.starts_with('-') {
+                    continue;
+                }
                 let name = bare_name(line);
-                if !name.is_empty() { out.push(dep(eco, name)); }
+                if !name.is_empty() {
+                    out.push(dep(eco, name));
+                }
             }
             Ecosystem::RubyGems => {
                 if let Some(rest) = line.strip_prefix("gem ") {
                     let name = bare_name(rest.trim().trim_start_matches([' ', '"', '\'']));
-                    if !name.is_empty() { out.push(dep(eco, name)); }
+                    if !name.is_empty() {
+                        out.push(dep(eco, name));
+                    }
                 }
             }
             Ecosystem::Go => {
@@ -171,17 +200,24 @@ fn deps_in_lines(eco: Ecosystem, text: &str) -> Vec<Dep> {
 /// Diff a manifest's dep set (full-content). `before == None` ⇒ all deps are added.
 #[must_use]
 pub fn manifest_deps_added(file: &str, before: Option<&str>, after: &str) -> Vec<Dep> {
-    let Some(eco) = ecosystem_for(file) else { return Vec::new() };
+    let Some(eco) = ecosystem_for(file) else {
+        return Vec::new();
+    };
     let after_set = deps_in_manifest(file, after);
     let before_set = before.map(|b| deps_in_manifest(file, b)).unwrap_or_default();
-    after_set.difference(&before_set).map(|n| dep(eco, n.clone())).collect()
+    after_set
+        .difference(&before_set)
+        .map(|n| dep(eco, n.clone()))
+        .collect()
 }
 
 /// Scan only newly-inserted text (an Edit's new_string, or `+` patch lines) for
 /// dependency declarations. Conservative line/JSON-entry patterns; fails open.
 #[must_use]
 pub fn manifest_deps_in_added_lines(file: &str, added: &str) -> Vec<Dep> {
-    let Some(eco) = ecosystem_for(file) else { return Vec::new() };
+    let Some(eco) = ecosystem_for(file) else {
+        return Vec::new();
+    };
     let base = file.rsplit(['/', '\\']).next().unwrap_or(file);
     match base {
         "requirements.txt" | "Gemfile" | "go.mod" => deps_in_lines(eco, added),
@@ -221,16 +257,24 @@ pub fn manifest_deps_in_added_lines(file: &str, added: &str) -> Vec<Dep> {
 mod tests {
     use super::*;
 
-    fn names(v: &[Dep]) -> Vec<&str> { v.iter().map(|d| d.name.as_str()).collect() }
+    fn names(v: &[Dep]) -> Vec<&str> {
+        v.iter().map(|d| d.name.as_str()).collect()
+    }
 
     #[test]
     fn bash_install_named_packages() {
         assert_eq!(names(&bash_installs("npm install lodash")), ["lodash"]);
-        assert_eq!(names(&bash_installs("yarn add lodash react")), ["lodash", "react"]);
+        assert_eq!(
+            names(&bash_installs("yarn add lodash react")),
+            ["lodash", "react"]
+        );
         assert_eq!(names(&bash_installs("pnpm add -D typescript")), ["typescript"]);
         assert_eq!(names(&bash_installs("cargo add serde@1")), ["serde"]);
         assert_eq!(names(&bash_installs("pip install requests==2.31")), ["requests"]);
-        assert_eq!(names(&bash_installs("go get github.com/pkg/errors")), ["github.com/pkg/errors"]);
+        assert_eq!(
+            names(&bash_installs("go get github.com/pkg/errors")),
+            ["github.com/pkg/errors"]
+        );
         assert_eq!(names(&bash_installs("gem install rest-client")), ["rest-client"]);
         assert_eq!(names(&bash_installs("npm i @scope/pkg")), ["@scope/pkg"]);
     }
@@ -252,18 +296,36 @@ mod tests {
     fn manifest_added_diff() {
         let before = r#"{"dependencies":{"react":"18"}}"#;
         let after = r#"{"dependencies":{"react":"18","lodash":"4"}}"#;
-        assert_eq!(names(&manifest_deps_added("package.json", Some(before), after)), ["lodash"]);
+        assert_eq!(
+            names(&manifest_deps_added("package.json", Some(before), after)),
+            ["lodash"]
+        );
     }
 
     #[test]
     fn manifest_new_file_all_added() {
         let after = "[dependencies]\nlazy_static = \"1\"\n";
-        assert_eq!(names(&manifest_deps_added("Cargo.toml", None, after)), ["lazy_static"]);
+        assert_eq!(
+            names(&manifest_deps_added("Cargo.toml", None, after)),
+            ["lazy_static"]
+        );
     }
 
     #[test]
     fn manifest_requirements_and_gemfile_lines() {
-        assert_eq!(names(&manifest_deps_in_added_lines("requirements.txt", "pytz==2024.1\n# comment\n")), ["pytz"]);
-        assert_eq!(names(&manifest_deps_in_added_lines("Gemfile", "gem \"rest-client\", \"~> 2.0\"")), ["rest-client"]);
+        assert_eq!(
+            names(&manifest_deps_in_added_lines(
+                "requirements.txt",
+                "pytz==2024.1\n# comment\n"
+            )),
+            ["pytz"]
+        );
+        assert_eq!(
+            names(&manifest_deps_in_added_lines(
+                "Gemfile",
+                "gem \"rest-client\", \"~> 2.0\""
+            )),
+            ["rest-client"]
+        );
     }
 }

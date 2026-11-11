@@ -248,7 +248,12 @@ mod compaction_cap_tests {
         let window = 200_000u32;
         let token_cap = token_soft_cap(window); // 120_000
         assert!(
-            should_compact(10_000, 480_000, u32::try_from(token_cap).unwrap_or(u32::MAX), token_cap),
+            should_compact(
+                10_000,
+                480_000,
+                u32::try_from(token_cap).unwrap_or(u32::MAX),
+                token_cap
+            ),
             "measured tokens over the window fraction must force compaction"
         );
         // Under both caps ⇒ no compaction.
@@ -355,14 +360,13 @@ async fn maybe_compact_session(
             }
         }
     }
-    if let Some(output) =
-        crate::compactor::maybe_compact_transcript_indexed(
-            &session.messages,
-            &summaries,
-            cap,
-            opts.cas.as_deref(),
-        )
-        .await
+    if let Some(output) = crate::compactor::maybe_compact_transcript_indexed(
+        &session.messages,
+        &summaries,
+        cap,
+        opts.cas.as_deref(),
+    )
+    .await
     {
         // Before collapsing the oldest turns into their summaries, snapshot each
         // one's pre-compaction body so a later `rewind` can reconstruct it
@@ -2189,9 +2193,14 @@ mod anchor_tests {
             cwd: Some(std::env::temp_dir()),
             ..LoopOptions::default()
         };
-        let turn = run_streaming_turn(&OneRead, req.clone(), &with_cwd, speculation_allowed(&with_cwd, false))
-            .await
-            .expect("turn");
+        let turn = run_streaming_turn(
+            &OneRead,
+            req.clone(),
+            &with_cwd,
+            speculation_allowed(&with_cwd, false),
+        )
+        .await
+        .expect("turn");
         assert!(
             turn.speculative.in_flight.is_empty(),
             "no pre-dispatch with a run cwd"
@@ -2211,7 +2220,8 @@ mod anchor_tests {
 /// Render a `<workspace-roots>` system-prompt block listing the additional
 /// workspace roots the agent may operate across (cline multi-root workspaces).
 /// Empty `roots` ⇒ empty string, leaving the assembled prompt byte-identical.
-fn workspace_roots_block(roots: &[std::path::PathBuf]) -> String {    if roots.is_empty() {
+fn workspace_roots_block(roots: &[std::path::PathBuf]) -> String {
+    if roots.is_empty() {
         return String::new();
     }
     let mut s = String::from(
@@ -2573,7 +2583,11 @@ mod swarm_preview_tests {
     fn long_goal_is_capped_with_an_ellipsis() {
         let goal = "x ".repeat(200);
         let out = swarm_goal_preview(&goal);
-        assert_eq!(out.chars().count(), SWARM_GOAL_PREVIEW_CHARS + 1, "cap + ellipsis");
+        assert_eq!(
+            out.chars().count(),
+            SWARM_GOAL_PREVIEW_CHARS + 1,
+            "cap + ellipsis"
+        );
         assert!(out.ends_with('\u{2026}'));
     }
 }
@@ -4440,7 +4454,10 @@ mod swarm_collab_wiring_tests {
     fn render_background_results_block_shapes() {
         use crate::bg_jobs::BgResult;
         use origin_tools::builtins::task::TaskOutput;
-        assert!(render_background_results(&[]).is_empty(), "none finished ⇒ no block");
+        assert!(
+            render_background_results(&[]).is_empty(),
+            "none finished ⇒ no block"
+        );
         let results = [
             BgResult {
                 id_hex: "00aa".into(),
@@ -4467,10 +4484,23 @@ mod swarm_collab_wiring_tests {
         ];
         let r = render_background_results(&results);
         assert!(r.starts_with("<background-results>"), "opens block: {r}");
-        assert!(r.trim_end().ends_with("</background-results>"), "closes block: {r}");
-        assert_eq!(r.matches("<background-results>").count(), 1, "one shared block: {r}");
-        assert!(r.contains("audit ipc") && r.contains("found 2 issues"), "lists completed: {r}");
-        assert!(r.contains("audit swarm") && r.contains("aborted"), "lists aborted: {r}");
+        assert!(
+            r.trim_end().ends_with("</background-results>"),
+            "closes block: {r}"
+        );
+        assert_eq!(
+            r.matches("<background-results>").count(),
+            1,
+            "one shared block: {r}"
+        );
+        assert!(
+            r.contains("audit ipc") && r.contains("found 2 issues"),
+            "lists completed: {r}"
+        );
+        assert!(
+            r.contains("audit swarm") && r.contains("aborted"),
+            "lists aborted: {r}"
+        );
         assert!(r.contains("fix the handshake"), "lists follow-ups: {r}");
         assert!(
             r.contains("files touched: src/ipc.rs, src/wire.rs\n"),
@@ -4531,7 +4561,13 @@ mod swarm_collab_wiring_tests {
         assert_eq!(events.len(), 2, "one terminal event per reaped job");
 
         match &events[0] {
-            StreamEvent::SwarmWorker { id, status, detail, tool, .. } => {
+            StreamEvent::SwarmWorker {
+                id,
+                status,
+                detail,
+                tool,
+                ..
+            } => {
                 assert_eq!(id, "00aa", "keyed by the stable spawn id");
                 assert_eq!(status, "completed", "a completed job stays completed");
                 assert!(detail.is_none(), "a clean completion carries no detail");
@@ -4540,7 +4576,9 @@ mod swarm_collab_wiring_tests {
             other => panic!("expected SwarmWorker, got {other:?}"),
         }
         match &events[1] {
-            StreamEvent::SwarmWorker { id, status, detail, .. } => {
+            StreamEvent::SwarmWorker {
+                id, status, detail, ..
+            } => {
                 assert_eq!(id, "00bb");
                 assert_eq!(status, "failed", "any non-completed terminal reads as failed");
                 assert_eq!(
@@ -6304,10 +6342,7 @@ async fn run_loop_inner(
     // loop yields control (surfacing the still-failing suite to the user/goal
     // verifier). Reuses the post-edit `max_repair_iters` budget; 0 when no gate
     // config is present (the gate is then never armed anyway).
-    let gate_repair_budget: u32 = opts
-        .post_edit
-        .as_deref()
-        .map_or(0, |c| c.max_repair_iters);
+    let gate_repair_budget: u32 = opts.post_edit.as_deref().map_or(0, |c| c.max_repair_iters);
     // C6 (`ORIGIN_DIFF_REVIEW=1`): each file's content before this run first
     // edited it (tripwires + the one end-of-run review), and whether it ran.
     let diff_review = crate::diff_review::enabled();
@@ -6880,7 +6915,11 @@ async fn run_loop_inner(
                             && resp.usage.output_tokens == 0 =>
                     {
                         let sleep_secs = (1u32 << (attempt + 1)).clamp(1, MAX_RATE_LIMIT_SLEEP_SECS);
-                        tracing::warn!(attempt, sleep_secs, "provider returned an empty response; backing off and retrying");
+                        tracing::warn!(
+                            attempt,
+                            sleep_secs,
+                            "provider returned an empty response; backing off and retrying"
+                        );
                         tokio::time::sleep(std::time::Duration::from_secs(sleep_secs.into())).await;
                         attempt += 1;
                     }
@@ -7175,13 +7214,17 @@ async fn run_loop_inner(
             // stale prior-turn `test_block`, and (b) lets the loop ENFORCE the
             // fail→pass transition without a `/goal`: on RED we synthesize a
             // continuation turn and re-enter the loop instead of returning.
-            let gate_armed = opts.post_edit.as_deref().is_some_and(origin_postedit::PostEditConfig::test_gate_armed);
+            let gate_armed = opts
+                .post_edit
+                .as_deref()
+                .is_some_and(origin_postedit::PostEditConfig::test_gate_armed);
             if gate_armed && repro_gate_repairs < gate_repair_budget {
                 if let Some(cfg) = opts.post_edit.as_deref() {
                     if let Some(cmd) = cfg.test_command.as_deref() {
                         // #4: narrow the suite to the edit's blast radius when
                         // test-selection is enabled; falls back to `cmd` verbatim.
-                        let cmd = effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
+                        let cmd =
+                            effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
                         // Run the oracle now (fresh, not the stale `test_block`).
                         let fresh = run_post_edit_test(&cmd, opts.cwd.as_deref()).await;
                         edit_unverified &= fresh.is_none();
@@ -7765,24 +7808,17 @@ async fn run_loop_inner(
             // the (uncapped) loop. A Deny becomes a recoverable tool-result error
             // the model sees and rewrites against, exactly like a dispatch failure.
             if opts.ponytail != origin_ponytail::PonytailMode::Off
-                && matches!(
-                    meta.name,
-                    "Edit" | "Write" | "MultiEdit" | "ApplyPatch" | "Bash"
-                )
+                && matches!(meta.name, "Edit" | "Write" | "MultiEdit" | "ApplyPatch" | "Bash")
             {
                 let deps = ponytail_added_deps(meta.name, &args);
                 if !deps.is_empty() {
-                    let flags = origin_ponytail::classify(
-                        &deps,
-                        opts.ponytail,
-                        &origin_ponytail::allowlist(),
-                    );
+                    let flags =
+                        origin_ponytail::classify(&deps, opts.ponytail, &origin_ponytail::allowlist());
                     // The interactive choice channel is wired iff this turn came
                     // from a human-answerable session (the same signal `ask_user`
                     // uses): BOTH an event channel and the daemon-wide choice
                     // registry are present. Absent ⇒ headless/swarm ⇒ allow + log.
-                    let interactive_choice =
-                        opts.event_tx.as_ref().zip(opts.choice_registry.as_ref());
+                    let interactive_choice = opts.event_tx.as_ref().zip(opts.choice_registry.as_ref());
                     let mut denied: Option<String> = None;
                     for f in &flags {
                         let native = match f.kind {
@@ -8078,10 +8114,8 @@ async fn run_loop_inner(
                             // background:false (or no registry / cap reached / the
                             // ORIGIN_SWARM_BG=0 global off-switch) awaits it in-turn.
                             // Captured before `input` is moved below.
-                            let bg_env_on =
-                                std::env::var("ORIGIN_SWARM_BG").map_or(true, |v| v != "0");
-                            let background =
-                                input.background && opts.background_jobs.is_some() && bg_env_on;
+                            let bg_env_on = std::env::var("ORIGIN_SWARM_BG").map_or(true, |v| v != "0");
+                            let background = input.background && opts.background_jobs.is_some() && bg_env_on;
                             // Live current-tool feed: hand the worker a progress
                             // sink (only when this connection has an event stream
                             // to relay onto). Each tool the sub-agent starts comes
@@ -9057,7 +9091,8 @@ async fn run_loop_inner(
                     if let Some(cmd) = cfg.test_command.as_deref() {
                         // #4: narrow the suite to the edit's blast radius when
                         // test-selection is enabled; falls back to `cmd` verbatim.
-                        let cmd = effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
+                        let cmd =
+                            effective_test_command(cmd, &lsp_edited_paths, opts.code_graph.as_ref()).await;
                         let ran = run_post_edit_test(&cmd, opts.cwd.as_deref()).await;
                         edit_unverified &= ran.is_none();
                         gate_ran |= ran.is_some();
@@ -9728,8 +9763,8 @@ async fn dispatch_tool(
             // `Write{force:false}` over this file is permitted (the model has
             // seen it). Only record on a successful read.
             let read_path = args.file_path.clone();
-            let out =
-                origin_tools::builtins::read::read_v2(args).map_err(|e| LoopError::ToolFailure(e.display_message()));
+            let out = origin_tools::builtins::read::read_v2(args)
+                .map_err(|e| LoopError::ToolFailure(e.display_message()));
             if out.is_ok() {
                 if let Some(guard) = write_guard {
                     guard.note_read(&read_path);
@@ -11040,12 +11075,13 @@ mod ask_user_interactive_tests {
 /// that don't name a real file, so over-inclusion is harmless.
 fn prompt_focus_paths(prompt: &str) -> Vec<String> {
     const EXTS: &[&str] = &[
-        "rs", "py", "js", "ts", "tsx", "jsx", "go", "java", "c", "cpp", "cc", "h", "hpp", "rb",
-        "php", "cs", "swift", "kt", "scala", "lua", "sh", "toml", "yaml", "yml", "json", "md",
-        "html", "css", "sql",
+        "rs", "py", "js", "ts", "tsx", "jsx", "go", "java", "c", "cpp", "cc", "h", "hpp", "rb", "php", "cs",
+        "swift", "kt", "scala", "lua", "sh", "toml", "yaml", "yml", "json", "md", "html", "css", "sql",
     ];
     prompt
-        .split(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | '(' | ')' | ',' | '<' | '>' | '[' | ']'))
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, '`' | '"' | '\'' | '(' | ')' | ',' | '<' | '>' | '[' | ']')
+        })
         .map(|t| t.trim_matches(|c: char| matches!(c, '.' | ':' | ';' | '!' | '?')))
         .filter(|t| {
             !t.is_empty()
@@ -13219,7 +13255,10 @@ mod wiring_tests {
         let marker = "*** Begin Patch\n*** Delete File: gone.py\n*** Update File: old.py\n\
                       *** Move to: new.py\n@@\n-a\n+b\n*** End Patch\n";
         assert_eq!(patch_target_paths(marker), vec!["gone.py", "new.py"]);
-        assert_eq!(patch_moves(marker), vec![("old.py".to_string(), "new.py".to_string())]);
+        assert_eq!(
+            patch_moves(marker),
+            vec![("old.py".to_string(), "new.py".to_string())]
+        );
         let unified = "--- a/dead.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n--- a/kept.rs\n+++ b/kept.rs\n";
         assert_eq!(patch_target_paths(unified), vec!["dead.rs", "kept.rs"]);
     }
@@ -14177,9 +14216,19 @@ mod wiring_tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("ORIGIN_CMD_GUARD");
         let run = tempfile::tempdir().expect("tmp");
-        std::fs::write(run.path().join("package.json"), r#"{"dependencies":{"left-pad":"1"}}"#).expect("write");
-        let args = anchor_tool_args("Bash", serde_json::json!({ "command": "npm install left-pad" }), run.path());
-        let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+        std::fs::write(
+            run.path().join("package.json"),
+            r#"{"dependencies":{"left-pad":"1"}}"#,
+        )
+        .expect("write");
+        let args = anchor_tool_args(
+            "Bash",
+            serde_json::json!({ "command": "npm install left-pad" }),
+            run.path(),
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
         let out = rt.block_on(apply_cmd_guard(
             Decision {
                 outcome: Outcome::Allow,
@@ -14191,7 +14240,12 @@ mod wiring_tests {
             &origin_permission::prompt::AlwaysDeny,
             Some(run.path()),
         ));
-        assert_eq!(out.outcome, Outcome::Allow, "declared in the run cwd: {}", out.reason);
+        assert_eq!(
+            out.outcome,
+            Outcome::Allow,
+            "declared in the run cwd: {}",
+            out.reason
+        );
     }
 
     /// C6 (final fix S4): a registry variable in the Bash call's `env`
@@ -15211,7 +15265,14 @@ mod wiring_tests {
             &Session::new("p", "m"),
         ));
         assert_eq!(base.reason, USER_APPROVED);
-        let guarded = rt.block_on(apply_cmd_guard(base, builtin("Bash"), &args, &preview, &standing, None));
+        let guarded = rt.block_on(apply_cmd_guard(
+            base,
+            builtin("Bash"),
+            &args,
+            &preview,
+            &standing,
+            None,
+        ));
         assert_eq!(guarded.outcome, Outcome::Allow);
         let asks = standing.asks();
         assert!(
@@ -15230,13 +15291,27 @@ mod wiring_tests {
             &Session::new("p", "m"),
         ));
         assert_eq!(granted.outcome, Outcome::Allow, "the grant covers Bash itself");
-        let in_worker = rt.block_on(apply_cmd_guard(granted, builtin("Bash"), &args, &preview, &grant, None));
+        let in_worker = rt.block_on(apply_cmd_guard(
+            granted,
+            builtin("Bash"),
+            &args,
+            &preview,
+            &grant,
+            None,
+        ));
         assert_eq!(in_worker.outcome, Outcome::Deny, "{}", in_worker.reason);
         let off = Decision {
             outcome: Outcome::Allow,
             reason: MODE_OFF.into(),
         };
-        let through = rt.block_on(apply_cmd_guard(off, builtin("Bash"), &args, &preview, &headless, None));
+        let through = rt.block_on(apply_cmd_guard(
+            off,
+            builtin("Bash"),
+            &args,
+            &preview,
+            &headless,
+            None,
+        ));
         assert_eq!(
             through.outcome,
             Outcome::Allow,

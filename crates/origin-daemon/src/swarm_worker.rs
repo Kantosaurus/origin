@@ -305,7 +305,10 @@ fn wire_worker_progress(opts: &mut LoopOptions, progress: origin_swarm::WorkerPr
         origin_runtime::TaskClass::Realtime,
         async move {
             while let Some(sub) = rx_sub.recv().await {
-                if crate::stream_relay::relay_to_progress(sub, &progress).await.is_err() {
+                if crate::stream_relay::relay_to_progress(sub, &progress)
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -720,10 +723,16 @@ mod tests {
         std::env::set_var("ORIGIN_REPRO_GATE", "cargo test -p somecrate");
         let cfg = worker_post_edit().expect("gate armed ⇒ Some");
         std::env::remove_var("ORIGIN_REPRO_GATE");
-        assert!(!cfg.repro_gate, "workers must NOT get the write-failing-test-first prompt");
+        assert!(
+            !cfg.repro_gate,
+            "workers must NOT get the write-failing-test-first prompt"
+        );
         assert!(cfg.auto_test, "workers DO get turn-end regression enforcement");
         assert_eq!(cfg.test_command.as_deref(), Some("cargo test -p somecrate"));
-        assert!(cfg.test_gate_armed(), "worker terminal branch will enforce RED→continue");
+        assert!(
+            cfg.test_gate_armed(),
+            "worker terminal branch will enforce RED→continue"
+        );
     }
 
     fn meta(name: &str) -> &'static ToolMeta {

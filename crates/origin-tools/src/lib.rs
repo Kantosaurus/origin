@@ -3,8 +3,8 @@
 
 pub mod array_crush;
 pub mod budget_writer;
-pub mod coerce;
 pub mod builtins;
+pub mod coerce;
 pub mod dispatch;
 pub mod error;
 pub mod macros;

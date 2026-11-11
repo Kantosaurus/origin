@@ -1004,13 +1004,7 @@ impl App {
         // Assemble the big wordmark: each row joins the six letters' row-segments
         // with a 2-column gutter, drawn verbatim so the block glyphs render as-is.
         let art: Vec<String> = (0..BANNER_ROWS)
-            .map(|r| {
-                BANNER_LETTERS
-                    .iter()
-                    .map(|l| l[r])
-                    .collect::<Vec<_>>()
-                    .join("  ")
-            })
+            .map(|r| BANNER_LETTERS.iter().map(|l| l[r]).collect::<Vec<_>>().join("  "))
             .collect();
         let art_w = art.iter().map(|s| s.chars().count()).max().unwrap_or(0);
         // Vertical breathing room so the hero sits in the upper-middle rather than
@@ -1327,10 +1321,7 @@ impl App {
             self.swarm_selected = None;
             self.swarm_view = None;
         }
-        let terminal = matches!(
-            new_status,
-            SwarmAgentStatus::Completed | SwarmAgentStatus::Failed
-        );
+        let terminal = matches!(new_status, SwarmAgentStatus::Completed | SwarmAgentStatus::Failed);
         if let Some(row) = self.swarm_agents.iter_mut().find(|r| r.id == id) {
             row.status = new_status;
             if !goal.is_empty() {
@@ -1457,7 +1448,11 @@ impl App {
             align: LineAlign::Left,
         });
         out.push(ScrollLine::verbatim(String::new(), tok.muted, 0));
-        out.push(ScrollLine::verbatim("\u{25C6} sub-agent".to_string(), tok.origin, 0));
+        out.push(ScrollLine::verbatim(
+            "\u{25C6} sub-agent".to_string(),
+            tok.origin,
+            0,
+        ));
         for line in &agent.transcript {
             match line {
                 SwarmAgentLine::Text(t) => {
@@ -1481,7 +1476,6 @@ impl App {
         }
         out
     }
-
 
     /// Set the tool a running sub-agent is using right now (live per-worker
     /// progress). A no-op for an unknown id or an already-settled agent, so a
@@ -2577,12 +2571,23 @@ fn draw_swarm_agent_block(
     // Selection cursor (Tab highlight): a `❯` in col 1 marks the agent Enter
     // would drill into. The id then renders bright instead of dim/accent.
     if selected {
-        side.put(row, 1, Cell::new('\u{276F}', pal.accent, pal.panel_bg, Attr::BOLD));
+        side.put(
+            row,
+            1,
+            Cell::new('\u{276F}', pal.accent, pal.panel_bg, Attr::BOLD),
+        );
     }
     let id_fg = if selected { pal.panel_header } else { id_fg };
     // Line 1: glyph (col 2) + short id (col 4) + elapsed clock (right).
     side.put(row, 2, Cell::new(glyph, glyph_fg, pal.panel_bg, Attr::PLAIN));
-    let short: String = a.id.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect();
+    let short: String =
+        a.id.chars()
+            .rev()
+            .take(6)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
     write_str_styled(
         side,
         row,
@@ -2602,7 +2607,14 @@ fn draw_swarm_agent_block(
         .as_secs();
     let clock = format!("{}:{:02} ", secs / 60, secs % 60);
     let clock_col = cols.saturating_sub(clamp_u16(clock.chars().count())).max(5);
-    write_str_styled(side, row, clock_col, &clock, cols.saturating_sub(clock_col), muted);
+    write_str_styled(
+        side,
+        row,
+        clock_col,
+        &clock,
+        cols.saturating_sub(clock_col),
+        muted,
+    );
     row += 1;
     if row >= rows {
         return row;
@@ -2626,10 +2638,12 @@ fn draw_swarm_agent_block(
     }
     // Line 3: current tool (running) or terminal state.
     let (col, glyph_opt, label, fg) = match a.status {
-        SwarmAgentStatus::Running => a.current_tool.as_ref().map_or(
-            (4, None, "working\u{2026}", pal.muted),
-            |tool| (6, Some('\u{25B8}'), tool.as_str(), pal.tool),
-        ),
+        SwarmAgentStatus::Running => a
+            .current_tool
+            .as_ref()
+            .map_or((4, None, "working\u{2026}", pal.muted), |tool| {
+                (6, Some('\u{25B8}'), tool.as_str(), pal.tool)
+            }),
         SwarmAgentStatus::Completed => (4, None, "completed", pal.green),
         SwarmAgentStatus::Failed => (4, None, "failed", pal.red),
     };
@@ -3355,13 +3369,19 @@ mod tests {
         app.apply_swarm_event("a1", "write tests", "spawned");
         app.apply_swarm_event("b2", "impl module", "spawned");
         assert_eq!(app.swarm_agents.len(), 2);
-        assert_eq!(app.swarm_summary().as_deref(), Some("\u{2387} 2/2 agents running"));
+        assert_eq!(
+            app.swarm_summary().as_deref(),
+            Some("\u{2387} 2/2 agents running")
+        );
 
         // One completes: the existing row flips in place (no duplicate row).
         app.apply_swarm_event("a1", "write tests", "completed");
         assert_eq!(app.swarm_agents.len(), 2, "completion updates in place");
         assert_eq!(app.swarm_agents[0].status, SwarmAgentStatus::Completed);
-        assert_eq!(app.swarm_summary().as_deref(), Some("\u{2387} 1/2 agents running"));
+        assert_eq!(
+            app.swarm_summary().as_deref(),
+            Some("\u{2387} 1/2 agents running")
+        );
 
         // The other fails: whole wave settled → summary shows the done count.
         app.apply_swarm_event("b2", "impl module", "failed");

@@ -1741,8 +1741,7 @@ async fn handle_submit(
                     .lock()
                     .ponytail_mode
                     .map_or_else(|| "full (default)".to_string(), |m| m.as_str().to_string());
-                app.lock()
-                    .add_line("system> ", &format!("ponytail mode: {cur}"));
+                app.lock().add_line("system> ", &format!("ponytail mode: {cur}"));
             }
             origin_ponytail::PonytailCmd::Usage => {
                 app.lock()
@@ -1790,7 +1789,16 @@ async fn handle_submit(
         // fallthrough below uses for a typed message).
         begin_prompt_turn(app, &prompt);
         handle.mark_dirty();
-        handle_prompt_turn(app, handle, path, model.as_str(), &prompt, session_id, interrupt_rx).await;
+        handle_prompt_turn(
+            app,
+            handle,
+            path,
+            model.as_str(),
+            &prompt,
+            session_id,
+            interrupt_rx,
+        )
+        .await;
         return;
     }
     // `/ponytail-help` / `/ponytail-gain` / `/ponytail-debt` text commands.
@@ -1816,12 +1824,10 @@ async fn handle_submit(
             app.lock().add_line("you> ", text);
             let mut out = origin_ponytail::commands::debt_report();
             // Harvest code markers too: `git grep -n "ponytail:"`.
-            if let Some(grep) = run_git(&["grep", "-n", "ponytail:"]).filter(|s| !s.trim().is_empty())
-            {
+            if let Some(grep) = run_git(&["grep", "-n", "ponytail:"]).filter(|s| !s.trim().is_empty()) {
                 let hits = origin_ponytail::commands::harvest_comments(&grep);
                 if !hits.is_empty() {
-                    let markers =
-                        format!("\n\ncode markers ({}):\n  {}", hits.len(), hits.join("\n  "));
+                    let markers = format!("\n\ncode markers ({}):\n  {}", hits.len(), hits.join("\n  "));
                     out.push_str(&markers);
                 }
             }
@@ -2837,12 +2843,9 @@ async fn call_daemon(
                     detail,
                     tool,
                 } => on_swarm(&id, &goal, &status, detail.as_deref(), tool.as_deref()),
-                StreamEvent::SwarmAgentOutput {
-                    id,
-                    part,
-                    body,
-                    ok,
-                } => on_swarm_output(&id, &part, &body, ok),
+                StreamEvent::SwarmAgentOutput { id, part, body, ok } => {
+                    on_swarm_output(&id, &part, &body, ok)
+                }
                 StreamEvent::Usage {
                     input_tokens,
                     output_tokens,
@@ -3461,12 +3464,7 @@ const STARTUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 /// — the stale daemon (and its supervisor) are killed and a fresh one is spawned
 /// on the new binary, so the update lands immediately instead of leaving the
 /// running daemon frozen at the old version.
-async fn ensure_daemon_running(
-    path: &str,
-    provider: &str,
-    account: &str,
-    force_restart: bool,
-) -> Result<()> {
+async fn ensure_daemon_running(path: &str, provider: &str, account: &str, force_restart: bool) -> Result<()> {
     let (cmd_path, sibling) = resolve_daemon_binary()?;
     // Supervised launch is the default: route the daemon through
     // origin-supervisor so the self-dev relaunch sentinel (exit 86) has a
@@ -3487,7 +3485,9 @@ async fn ensure_daemon_running(
                 // supervisor binaries; cycle the running pair so the new version
                 // takes effect this session (the self-update-completion handoff).
                 eprintln!("Update applied \u{2014} restarting the origin daemon on the new version\u{2026}");
-                tracing::info!("self-update applied this launch — restarting daemon+supervisor on the new binaries");
+                tracing::info!(
+                    "self-update applied this launch — restarting daemon+supervisor on the new binaries"
+                );
             } else {
                 tracing::info!("daemon binary is newer than running daemon — restarting");
             }
@@ -3682,7 +3682,10 @@ mod tests {
             Some(PonytailCmd::Set(PonytailMode::Ultra))
         );
         assert_eq!(parse_ponytail_command("/ponytail"), Some(PonytailCmd::Report));
-        assert_eq!(parse_ponytail_command("/ponytail bogus"), Some(PonytailCmd::Usage));
+        assert_eq!(
+            parse_ponytail_command("/ponytail bogus"),
+            Some(PonytailCmd::Usage)
+        );
         assert_eq!(parse_ponytail_command("/ponytail-review"), None);
         assert_eq!(parse_ponytail_command("/ponytail-audit"), None);
     }
@@ -3747,7 +3750,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.expect("accept decision conn");
             let _ = conn.read_frame_body().await; // consume the decision; never reply
-            // Hold the socket open so the client cannot get EOF either.
+                                                  // Hold the socket open so the client cannot get EOF either.
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         });
 
@@ -3760,11 +3763,8 @@ mod tests {
         // Outer guard sits well above `send_decision`'s internal drain bound:
         // before the fix this elapses (the drain parks forever); after the fix
         // `send_decision` returns inside its bounded drain, so this never fires.
-        let res = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            send_decision(&path, &decision),
-        )
-        .await;
+        let res =
+            tokio::time::timeout(std::time::Duration::from_secs(8), send_decision(&path, &decision)).await;
         server.abort();
         assert!(
             res.is_ok(),
@@ -3998,7 +3998,12 @@ mod tests {
     }
 
     fn checked_of(app: &origin_cli::tui::App) -> Vec<bool> {
-        app.active_picker.as_ref().expect("picker open").state.checked.clone()
+        app.active_picker
+            .as_ref()
+            .expect("picker open")
+            .state
+            .checked
+            .clone()
     }
 
     #[test]
@@ -4014,8 +4019,8 @@ mod tests {
                 ("beta".to_string(), Some("the second".to_string())),
                 ("gamma".to_string(), None),
             ],
-            true,  // multi_select
-            true,  // allow_custom
+            true, // multi_select
+            true, // allow_custom
         );
 
         // Down moves the cursor (0 -> 1).
@@ -4066,7 +4071,11 @@ mod tests {
         // Enter on the custom row enters free-text mode (does NOT resolve yet).
         assert_eq!(drive_picker_key(&mut app, KeyCode::Enter), None);
         assert!(
-            app.active_picker.as_ref().expect("still open").state.typing_custom,
+            app.active_picker
+                .as_ref()
+                .expect("still open")
+                .state
+                .typing_custom,
             "Enter on the custom row switches to free-text entry"
         );
         // Type a couple chars, then Enter resolves with the custom text.

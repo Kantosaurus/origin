@@ -7,10 +7,14 @@ const REVIEW: &str = include_str!("../assets/review.md");
 const AUDIT: &str = include_str!("../assets/audit.md");
 
 #[must_use]
-pub fn review_prompt() -> &'static str { REVIEW }
+pub fn review_prompt() -> &'static str {
+    REVIEW
+}
 
 #[must_use]
-pub fn audit_prompt() -> &'static str { AUDIT }
+pub fn audit_prompt() -> &'static str {
+    AUDIT
+}
 
 #[must_use]
 pub fn gain_text() -> &'static str {

@@ -962,7 +962,10 @@ mod permission_wire_tests {
             tool: None,
         };
         let json = serde_json::to_string(&spawn).expect("serialize");
-        assert!(json.contains("\"kind\":\"swarm_worker\""), "tagged on kind: {json}");
+        assert!(
+            json.contains("\"kind\":\"swarm_worker\""),
+            "tagged on kind: {json}"
+        );
         assert!(!json.contains("detail"), "None detail is omitted: {json}");
         assert!(!json.contains("tool"), "None tool is omitted: {json}");
         match serde_json::from_str::<StreamEvent>(&json).expect("deserialize") {

@@ -473,9 +473,15 @@ async fn run_fake_mcp(result: Result<Value, String>) -> (Scripted, Session) {
     let opts = LoopOptions::default().without_streaming();
     // Boxed: run_loop's future is large (clippy::large_futures).
     Box::pin(scope_runtime_tools(Arc::new(tools), async {
-        Box::pin(run_loop(&mut session, "get the issue", &provider, &AlwaysAllow, &opts))
-            .await
-            .unwrap();
+        Box::pin(run_loop(
+            &mut session,
+            "get the issue",
+            &provider,
+            &AlwaysAllow,
+            &opts,
+        ))
+        .await
+        .unwrap();
     }))
     .await;
     (provider, session)
@@ -637,7 +643,10 @@ async fn the_quarantine_model_sees_the_page_redacted() {
     let Block::Text { text: user, .. } = &provider.seen()[0].messages[0].blocks[0] else {
         panic!("quarantine user message is text")
     };
-    assert!(!user.contains(KEY) && user.contains("[REDACTED:ANTHROPIC_API_KEY]"), "{user}");
+    assert!(
+        !user.contains(KEY) && user.contains("[REDACTED:ANTHROPIC_API_KEY]"),
+        "{user}"
+    );
 }
 
 /// A page larger than the cheap model's window is cut to fit, not refused.

@@ -520,14 +520,23 @@ mod transient_tests {
 
     #[test]
     fn retries_429_529_and_5xx_but_not_4xx() {
-        assert!(status_is_transient(StatusCode::TOO_MANY_REQUESTS), "429 is retryable");
+        assert!(
+            status_is_transient(StatusCode::TOO_MANY_REQUESTS),
+            "429 is retryable"
+        );
         assert!(
             status_is_transient(StatusCode::from_u16(529).unwrap()),
             "529 overloaded_error is retryable (the common turn-killer)"
         );
-        assert!(status_is_transient(StatusCode::INTERNAL_SERVER_ERROR), "500 retryable");
+        assert!(
+            status_is_transient(StatusCode::INTERNAL_SERVER_ERROR),
+            "500 retryable"
+        );
         assert!(status_is_transient(StatusCode::BAD_GATEWAY), "502 retryable");
-        assert!(status_is_transient(StatusCode::SERVICE_UNAVAILABLE), "503 retryable");
+        assert!(
+            status_is_transient(StatusCode::SERVICE_UNAVAILABLE),
+            "503 retryable"
+        );
         assert!(!status_is_transient(StatusCode::BAD_REQUEST), "400 stays fatal");
         assert!(!status_is_transient(StatusCode::NOT_FOUND), "404 stays fatal");
     }

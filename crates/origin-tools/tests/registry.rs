@@ -43,7 +43,10 @@ fn task_is_permission_gated_and_hot_for_always_on_swarm() {
         Tier::RequiresPermission,
         "delegation unlocks tools for the worker, so it must pass the parent's prompter (A4)",
     );
-    assert!(meta.hot, "Task must be hot so the model can call it without ToolSearch");
+    assert!(
+        meta.hot,
+        "Task must be hot so the model can call it without ToolSearch"
+    );
 }
 
 #[test]

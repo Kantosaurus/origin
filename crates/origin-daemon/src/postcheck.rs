@@ -344,7 +344,10 @@ mod tests {
         assert!(checker_for("a.mjs").is_some(), "esm js");
         // Slow project-wide checks are NOT run per-file (fail-open).
         assert!(checker_for("a.rs").is_none(), "Rust → LSP path, not cargo check");
-        assert!(checker_for("a.ts").is_none(), "tsc is project-wide; not a fast per-file check");
+        assert!(
+            checker_for("a.ts").is_none(),
+            "tsc is project-wide; not a fast per-file check"
+        );
         assert!(checker_for("a.go").is_none(), "go vet is project-wide");
         assert!(checker_for("README.md").is_none());
         assert!(checker_for("noext").is_none());
@@ -772,7 +775,10 @@ mod tests {
         let from = dir.path().join("old.rs");
         let to = dir.path().join("new.rs");
         std::fs::write(&from, "fn a() {}\n}\n").expect("write");
-        let (from_s, to_s) = (from.to_string_lossy().into_owned(), to.to_string_lossy().into_owned());
+        let (from_s, to_s) = (
+            from.to_string_lossy().into_owned(),
+            to.to_string_lossy().into_owned(),
+        );
         let mut baseline = ParseBaseline::new();
         record_moved_baseline(&mut baseline, &from_s, &to_s).await;
         record_baseline(&mut baseline, &to_s).await;

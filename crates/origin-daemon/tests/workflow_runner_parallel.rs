@@ -223,7 +223,11 @@ async fn workflow_emits_swarm_panel_spawn_and_finish_events() {
     let completed = with_status("completed");
 
     assert_eq!(spawned.len(), 2, "one spawn event per worker; events={events:?}");
-    assert_eq!(completed.len(), 2, "one terminal event per worker; events={events:?}");
+    assert_eq!(
+        completed.len(),
+        2,
+        "one terminal event per worker; events={events:?}"
+    );
     // The SAME id spans spawn + finish so the panel updates the row in place
     // (rather than the worker showing as forever-running, which keeps the panel
     // wedged open or — when ids mismatch — never settles).

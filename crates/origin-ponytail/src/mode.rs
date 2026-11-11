@@ -63,7 +63,12 @@ mod tests {
 
     #[test]
     fn levels_round_trip() {
-        for m in [PonytailMode::Off, PonytailMode::Lite, PonytailMode::Full, PonytailMode::Ultra] {
+        for m in [
+            PonytailMode::Off,
+            PonytailMode::Lite,
+            PonytailMode::Full,
+            PonytailMode::Ultra,
+        ] {
             assert_eq!(PonytailMode::parse_level(m.as_str()), Some(m));
         }
     }
@@ -71,9 +76,18 @@ mod tests {
     #[test]
     fn command_grammar() {
         assert_eq!(parse_ponytail_command("/ponytail"), Some(PonytailCmd::Report));
-        assert_eq!(parse_ponytail_command("/ponytail ultra"), Some(PonytailCmd::Set(PonytailMode::Ultra)));
-        assert_eq!(parse_ponytail_command("/ponytail OFF"), Some(PonytailCmd::Set(PonytailMode::Off)));
-        assert_eq!(parse_ponytail_command("/ponytail bogus"), Some(PonytailCmd::Usage));
+        assert_eq!(
+            parse_ponytail_command("/ponytail ultra"),
+            Some(PonytailCmd::Set(PonytailMode::Ultra))
+        );
+        assert_eq!(
+            parse_ponytail_command("/ponytail OFF"),
+            Some(PonytailCmd::Set(PonytailMode::Off))
+        );
+        assert_eq!(
+            parse_ponytail_command("/ponytail bogus"),
+            Some(PonytailCmd::Usage)
+        );
         assert_eq!(parse_ponytail_command("/ponytailfoo"), None);
         assert_eq!(parse_ponytail_command("hello"), None);
     }

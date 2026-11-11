@@ -515,10 +515,7 @@ pub fn resolve_post_edit_with_repro_gate(
         return base;
     }
     // On. Start from the configured policy (preserve overrides) or a default.
-    let mut cfg = base
-        .as_deref()
-        .cloned()
-        .unwrap_or_default();
+    let mut cfg = base.as_deref().cloned().unwrap_or_default();
     cfg.repro_gate = true;
     // An explicit non-boolean value is a command override.
     let explicit_cmd = if raw == "1" || raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("on") {
@@ -615,7 +612,11 @@ mod tests {
         let out = resolve_post_edit_with_repro_gate(None, dir.path()).unwrap();
         std::env::remove_var("ORIGIN_REPRO_GATE");
         assert!(out.repro_gate, "=1 ⇒ repro_gate on");
-        assert_eq!(out.test_command.as_deref(), Some("cargo test"), "auto-derived from Cargo.toml");
+        assert_eq!(
+            out.test_command.as_deref(),
+            Some("cargo test"),
+            "auto-derived from Cargo.toml"
+        );
         assert!(out.test_gate_armed(), "armed: enforcement will run");
     }
 
@@ -641,7 +642,10 @@ mod tests {
         std::env::remove_var("ORIGIN_REPRO_GATE");
         assert!(out.repro_gate, "instruction still injected");
         assert!(out.test_command.is_none(), "no ecosystem ⇒ no command");
-        assert!(!out.test_gate_armed(), "no command ⇒ nothing to enforce (prompt-only)");
+        assert!(
+            !out.test_gate_armed(),
+            "no command ⇒ nothing to enforce (prompt-only)"
+        );
     }
 
     #[test]

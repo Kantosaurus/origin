@@ -10,21 +10,24 @@ fn applies_edits_in_order_atomically() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("a.rs");
     fs::write(&p, "alpha\nbeta\ngamma\n").unwrap();
-    let out = multi_edit(&MultiEditArgs {
-        file_path: p.to_string_lossy().into_owned(),
-        edits: vec![
-            EditOp {
-                old: "alpha".into(),
-                new: "A".into(),
-                replace_all: false,
-            },
-            EditOp {
-                old: "beta".into(),
-                new: "B".into(),
-                replace_all: false,
-            },
-        ],
-    }, None)
+    let out = multi_edit(
+        &MultiEditArgs {
+            file_path: p.to_string_lossy().into_owned(),
+            edits: vec![
+                EditOp {
+                    old: "alpha".into(),
+                    new: "A".into(),
+                    replace_all: false,
+                },
+                EditOp {
+                    old: "beta".into(),
+                    new: "B".into(),
+                    replace_all: false,
+                },
+            ],
+        },
+        None,
+    )
     .unwrap();
     assert_eq!(out["ok"], true);
     assert_eq!(out["applied"], 2);
@@ -36,21 +39,24 @@ fn failure_mid_sequence_does_not_partially_write() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("a.rs");
     fs::write(&p, "x\ny\nz\n").unwrap();
-    let err = multi_edit(&MultiEditArgs {
-        file_path: p.to_string_lossy().into_owned(),
-        edits: vec![
-            EditOp {
-                old: "x".into(),
-                new: "X".into(),
-                replace_all: false,
-            },
-            EditOp {
-                old: "MISSING".into(),
-                new: "?".into(),
-                replace_all: false,
-            },
-        ],
-    }, None)
+    let err = multi_edit(
+        &MultiEditArgs {
+            file_path: p.to_string_lossy().into_owned(),
+            edits: vec![
+                EditOp {
+                    old: "x".into(),
+                    new: "X".into(),
+                    replace_all: false,
+                },
+                EditOp {
+                    old: "MISSING".into(),
+                    new: "?".into(),
+                    replace_all: false,
+                },
+            ],
+        },
+        None,
+    )
     .unwrap_err();
     assert_eq!(err.reason, "no_match");
     // The no_match must be recoverable so the harness retries instead of aborting.
@@ -63,21 +69,24 @@ fn whitespace_drift_falls_back_per_edit() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("a.rs");
     fs::write(&p, "fn main() {\n    let x = 1;\n    let y = 2;\n}\n").unwrap();
-    multi_edit(&MultiEditArgs {
-        file_path: p.to_string_lossy().into_owned(),
-        edits: vec![
-            EditOp {
-                old: "\tlet x = 1;".into(), // tab instead of 4 spaces
-                new: "    let x = 10;".into(),
-                replace_all: false,
-            },
-            EditOp {
-                old: "let y = 2; ".into(), // trailing space
-                new: "    let y = 20;".into(),
-                replace_all: false,
-            },
-        ],
-    }, None)
+    multi_edit(
+        &MultiEditArgs {
+            file_path: p.to_string_lossy().into_owned(),
+            edits: vec![
+                EditOp {
+                    old: "\tlet x = 1;".into(), // tab instead of 4 spaces
+                    new: "    let x = 10;".into(),
+                    replace_all: false,
+                },
+                EditOp {
+                    old: "let y = 2; ".into(), // trailing space
+                    new: "    let y = 20;".into(),
+                    replace_all: false,
+                },
+            ],
+        },
+        None,
+    )
     .unwrap();
     assert_eq!(
         fs::read_to_string(&p).unwrap(),
@@ -90,21 +99,24 @@ fn crlf_preserved_across_multiple_edits() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("crlf.rs");
     fs::write(&p, b"a\r\nb\r\nc\r\n").unwrap();
-    multi_edit(&MultiEditArgs {
-        file_path: p.to_string_lossy().into_owned(),
-        edits: vec![
-            EditOp {
-                old: "a".into(),
-                new: "A".into(),
-                replace_all: false,
-            },
-            EditOp {
-                old: "b".into(),
-                new: "B".into(),
-                replace_all: false,
-            },
-        ],
-    }, None)
+    multi_edit(
+        &MultiEditArgs {
+            file_path: p.to_string_lossy().into_owned(),
+            edits: vec![
+                EditOp {
+                    old: "a".into(),
+                    new: "A".into(),
+                    replace_all: false,
+                },
+                EditOp {
+                    old: "b".into(),
+                    new: "B".into(),
+                    replace_all: false,
+                },
+            ],
+        },
+        None,
+    )
     .unwrap();
     assert_eq!(fs::read(&p).unwrap(), b"A\r\nB\r\nc\r\n");
 }

@@ -193,8 +193,10 @@ fn contradiction_demotes_the_older_member() {
         .expect("save");
 
     let mut idx = MemIndex::new();
-    idx.insert(memory_id_to_u64(&id_old), &unit_vec(0.0)).expect("ins");
-    idx.insert(memory_id_to_u64(&id_new), &unit_vec(0.001)).expect("ins");
+    idx.insert(memory_id_to_u64(&id_old), &unit_vec(0.0))
+        .expect("ins");
+    idx.insert(memory_id_to_u64(&id_new), &unit_vec(0.001))
+        .expect("ins");
     let index = Arc::new(RwLock::new(idx));
     let cons = Consolidator::new(Arc::clone(&store), index);
 

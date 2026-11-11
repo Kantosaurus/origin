@@ -160,7 +160,11 @@ pub async fn parse_into_ring(resp: reqwest::Response, ring: &Ring) -> Result<(),
         if finished {
             // Same `b"truncated"` marker the Anthropic / OpenAI-compat providers
             // use, so the daemon drain consumes one literal regardless of provider.
-            let payload: Vec<u8> = if truncated { b"truncated".to_vec() } else { Vec::new() };
+            let payload: Vec<u8> = if truncated {
+                b"truncated".to_vec()
+            } else {
+                Vec::new()
+            };
             ring.publish(&TokenEvent::new(TokenKind::TurnEnd, payload))
                 .map_err(|e| ProviderError::Api(e.to_string()))?;
             return Ok(());

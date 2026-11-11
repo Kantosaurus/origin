@@ -38,8 +38,15 @@ pub fn log(action: DebtAction, dep: &str, native: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let ev = DebtEvent { action, dep: dep.to_string(), native: native.to_string(), ts };
-    let Ok(line) = serde_json::to_string(&ev) else { return };
+    let ev = DebtEvent {
+        action,
+        dep: dep.to_string(),
+        native: native.to_string(),
+        ts,
+    };
+    let Ok(line) = serde_json::to_string(&ev) else {
+        return;
+    };
     let path = ledger_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);

@@ -179,7 +179,9 @@ fn review_usage_is_counted_once() {
     let provider = ScriptedProvider {
         responses: Mutex::new(vec![
             ChatResponse {
-                assistant: write(&path, "x\n").into_iter().fold(Message::new(Role::Assistant), Message::with_block),
+                assistant: write(&path, "x\n")
+                    .into_iter()
+                    .fold(Message::new(Role::Assistant), Message::with_block),
                 usage: usage(1, 10),
             },
             ChatResponse {
@@ -208,7 +210,10 @@ fn review_usage_is_counted_once() {
     assert_eq!((summary.input_tokens, summary.output_tokens), (403, 4030));
     let mut review_events = 0;
     while let Ok(ev) = rx.try_recv() {
-        if let origin_daemon::protocol::StreamEvent::RequestUsage { input_tokens: 400, .. } = ev {
+        if let origin_daemon::protocol::StreamEvent::RequestUsage {
+            input_tokens: 400, ..
+        } = ev
+        {
             review_events += 1;
         }
     }

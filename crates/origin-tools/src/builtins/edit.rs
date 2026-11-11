@@ -58,7 +58,10 @@ pub fn edit_v2(args: EditArgs, guard: Option<&WriteGuard>) -> Result<Value, Tool
             return Err(ToolError::new(
                 ErrClass::Edit,
                 "read_required",
-                format!("refusing to Edit '{}' that has not been Read this session", args.file_path),
+                format!(
+                    "refusing to Edit '{}' that has not been Read this session",
+                    args.file_path
+                ),
             )
             .recoverable(true)
             .hint("call Read on this file first, then re-Edit"));

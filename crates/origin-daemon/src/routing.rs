@@ -129,7 +129,11 @@ impl LiveRouter {
     #[must_use]
     pub fn choose_model_ref_struggling(&self, turn: u32, struggling: bool) -> Option<ModelRef> {
         self.sweep_cooldowns();
-        let phase = if turn == 1 || struggling { Phase::Plan } else { Phase::Edit };
+        let phase = if turn == 1 || struggling {
+            Phase::Plan
+        } else {
+            Phase::Edit
+        };
         self.inner.lock().ok()?.choose(phase, &self.candidates)
     }
 

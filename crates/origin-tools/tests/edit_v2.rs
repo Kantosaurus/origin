@@ -15,12 +15,15 @@ fn single_replacement_returns_hunk() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("a.rs");
     fs::write(&p, "fn foo() {}\n").unwrap();
-    let out = edit_v2(EditArgs {
-        file_path: p.to_string_lossy().into_owned(),
-        old_string: "foo".into(),
-        new_string: "bar".into(),
-        replace_all: false,
-    }, None)
+    let out = edit_v2(
+        EditArgs {
+            file_path: p.to_string_lossy().into_owned(),
+            old_string: "foo".into(),
+            new_string: "bar".into(),
+            replace_all: false,
+        },
+        None,
+    )
     .unwrap();
     assert_eq!(out["ok"], true);
     assert_eq!(out["diff"], "@@ -1 +1 @@\n-fn foo() {}\n+fn bar() {}\n");
@@ -152,12 +155,15 @@ fn ambiguous_match_without_replace_all_errors() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("a.rs");
     fs::write(&p, "foo foo foo\n").unwrap();
-    let err = edit_v2(EditArgs {
-        file_path: p.to_string_lossy().into_owned(),
-        old_string: "foo".into(),
-        new_string: "bar".into(),
-        replace_all: false,
-    }, None)
+    let err = edit_v2(
+        EditArgs {
+            file_path: p.to_string_lossy().into_owned(),
+            old_string: "foo".into(),
+            new_string: "bar".into(),
+            replace_all: false,
+        },
+        None,
+    )
     .unwrap_err();
     assert_eq!(err.class, origin_tools::ErrClass::Edit);
     assert_eq!(err.reason, "ambiguous");
@@ -168,12 +174,15 @@ fn replace_all_replaces_every_occurrence() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("a.rs");
     fs::write(&p, "foo foo foo\n").unwrap();
-    edit_v2(EditArgs {
-        file_path: p.to_string_lossy().into_owned(),
-        old_string: "foo".into(),
-        new_string: "bar".into(),
-        replace_all: true,
-    }, None)
+    edit_v2(
+        EditArgs {
+            file_path: p.to_string_lossy().into_owned(),
+            old_string: "foo".into(),
+            new_string: "bar".into(),
+            replace_all: true,
+        },
+        None,
+    )
     .unwrap();
     assert_eq!(fs::read_to_string(&p).unwrap(), "bar bar bar\n");
 }
@@ -183,12 +192,15 @@ fn no_match_errors_with_edit_no_match() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("a.rs");
     fs::write(&p, "hello\n").unwrap();
-    let err = edit_v2(EditArgs {
-        file_path: p.to_string_lossy().into_owned(),
-        old_string: "missing".into(),
-        new_string: "x".into(),
-        replace_all: false,
-    }, None)
+    let err = edit_v2(
+        EditArgs {
+            file_path: p.to_string_lossy().into_owned(),
+            old_string: "missing".into(),
+            new_string: "x".into(),
+            replace_all: false,
+        },
+        None,
+    )
     .unwrap_err();
     assert_eq!(err.reason, "no_match");
 }
@@ -236,15 +248,21 @@ fn whitespace_drift_falls_back_to_a_unique_match() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("a.rs");
     fs::write(&p, "fn main() {\n    let x = 1;\n}\n").unwrap();
-    let out = edit_v2(EditArgs {
-        file_path: p.to_string_lossy().into_owned(),
-        old_string: "\tlet x = 1; ".into(),
-        new_string: "    let x = 42;".into(),
-        replace_all: false,
-    }, None)
+    let out = edit_v2(
+        EditArgs {
+            file_path: p.to_string_lossy().into_owned(),
+            old_string: "\tlet x = 1; ".into(),
+            new_string: "    let x = 42;".into(),
+            replace_all: false,
+        },
+        None,
+    )
     .unwrap();
     assert_eq!(out["ok"], true);
-    assert_eq!(fs::read_to_string(&p).unwrap(), "fn main() {\n    let x = 42;\n}\n");
+    assert_eq!(
+        fs::read_to_string(&p).unwrap(),
+        "fn main() {\n    let x = 42;\n}\n"
+    );
 }
 
 #[test]
@@ -255,12 +273,15 @@ fn no_match_hint_names_the_whitespace_only_near_miss() {
     // Wrong indentation AND a sibling line elsewhere keeps it a near-miss, not
     // a unique fallback (there is only one candidate line, so add a decoy to
     // force the no-match path): use a needle that can't uniquely place.
-    let err = edit_v2(EditArgs {
-        file_path: p.to_string_lossy().into_owned(),
-        old_string: "let total = a+b;".into(), // operator spacing differs ⇒ genuine miss
-        new_string: "x".into(),
-        replace_all: false,
-    }, None)
+    let err = edit_v2(
+        EditArgs {
+            file_path: p.to_string_lossy().into_owned(),
+            old_string: "let total = a+b;".into(), // operator spacing differs ⇒ genuine miss
+            new_string: "x".into(),
+            replace_all: false,
+        },
+        None,
+    )
     .unwrap_err();
     assert_eq!(err.reason, "no_match");
 }

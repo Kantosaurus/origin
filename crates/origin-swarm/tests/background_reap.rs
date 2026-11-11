@@ -9,8 +9,8 @@ use std::sync::Arc;
 use origin_cas::{Store as CasStore, StoreConfig};
 use origin_plan::{ActorId, Plan, PlanStore};
 use origin_swarm::{
-    AdmissionGate, Budget, CompletionReport, Coordinator, PlanHandle, ReportStatus, Usage,
-    WorkerContext, WorkerFn, WorkerSpec,
+    AdmissionGate, Budget, CompletionReport, Coordinator, PlanHandle, ReportStatus, Usage, WorkerContext,
+    WorkerFn, WorkerSpec,
 };
 use tempfile::TempDir;
 use tokio::sync::{Mutex, Notify};

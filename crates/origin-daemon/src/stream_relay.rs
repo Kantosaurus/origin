@@ -120,7 +120,9 @@ fn flush_text_to_progress(pending: &mut String, progress: &origin_swarm::WorkerP
     if pending.is_empty() {
         return;
     }
-    let _ = progress.send(origin_swarm::WorkerProgress::AssistantText(std::mem::take(pending)));
+    let _ = progress.send(origin_swarm::WorkerProgress::AssistantText(std::mem::take(
+        pending,
+    )));
 }
 
 /// Translate a non-text `TokenEvent` into its `StreamEvent`. Returns `None` for

@@ -621,7 +621,8 @@ pub fn output_names_reproduction(output: &str, stem: &str, source: &str) -> bool
 
 /// Errors that can arise when constructing or validating a [`PostEditConfig`].
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum PostEditError {    /// An override entry carried an empty extension or empty command.
+pub enum PostEditError {
+    /// An override entry carried an empty extension or empty command.
     #[error("invalid formatter override: extension and command must be non-empty")]
     EmptyOverride,
     /// `auto_lint` was requested without any resolvable lint command.
@@ -940,9 +941,9 @@ mod tests {
     #[test]
     fn select_tests_pytest_appends_test_files_and_dirs() {
         let files = vec![
-            "pkg/mod.py".to_string(),           // non-test ⇒ contributes its dir
+            "pkg/mod.py".to_string(),            // non-test ⇒ contributes its dir
             "pkg/tests/test_mod.py".to_string(), // test ⇒ contributes the file
-            "README.md".to_string(),            // ignored (not .py)
+            "README.md".to_string(),             // ignored (not .py)
         ];
         match select_tests("pytest", &files) {
             Selection::Narrowed(cmd) => {

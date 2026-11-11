@@ -127,7 +127,10 @@ async fn task_is_permission_gated_by_the_parent_prompter() {
     run_loop(&mut session, "go", &provider, &AlwaysDeny, &opts)
         .await
         .expect("a single denial must not end the run");
-    assert!(task_denied(&session), "the Task must come back as a permission denial");
+    assert!(
+        task_denied(&session),
+        "the Task must come back as a permission denial"
+    );
     assert_eq!(
         spawned.load(Ordering::SeqCst),
         0,

@@ -311,7 +311,10 @@ fn run_best_of_n_noted(
     }
 
     let attempted = results.len();
-    let passed = candidates.iter().filter(|c| c.outcome.is_passed() && c.non_empty).count();
+    let passed = candidates
+        .iter()
+        .filter(|c| c.outcome.is_passed() && c.non_empty)
+        .count();
     let no_winner = |why: String| {
         (
             BestOfNOutcome::NoWinner { attempted },

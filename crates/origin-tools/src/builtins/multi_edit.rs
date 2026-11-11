@@ -32,7 +32,10 @@ pub fn multi_edit(args: &MultiEditArgs, guard: Option<&WriteGuard>) -> Result<Va
             return Err(ToolError::new(
                 ErrClass::Edit,
                 "read_required",
-                format!("refusing to MultiEdit '{}' that has not been Read this session", args.file_path),
+                format!(
+                    "refusing to MultiEdit '{}' that has not been Read this session",
+                    args.file_path
+                ),
             )
             .recoverable(true)
             .hint("call Read on this file first, then re-MultiEdit"));
@@ -58,7 +61,10 @@ pub fn multi_edit(args: &MultiEditArgs, guard: Option<&WriteGuard>) -> Result<Va
             return Err(ToolError::new(
                 ErrClass::Edit,
                 "noop",
-                format!("edit {} of {total}: new equals old; this edit changes nothing", i + 1),
+                format!(
+                    "edit {} of {total}: new equals old; this edit changes nothing",
+                    i + 1
+                ),
             )
             .recoverable(true)
             .hint("remove the no-op edit or target a different region"));
@@ -150,7 +156,10 @@ fn sequential_apply(mut text: String, edits: &[EditOp], total: usize) -> Result<
                 return Err(ToolError::new(
                     ErrClass::Edit,
                     "ambiguous",
-                    format!("edit {edit_no} of {total}: '{}' appears {n} times{at}; pass replace_all=true", op.old),
+                    format!(
+                        "edit {edit_no} of {total}: '{}' appears {n} times{at}; pass replace_all=true",
+                        op.old
+                    ),
                 )
                 .recoverable(true));
             }

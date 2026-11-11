@@ -80,12 +80,16 @@ pub fn resolve_mode(requested: Option<PonytailMode>) -> PonytailMode {
         return m;
     }
     let cfg = std::fs::read_to_string(config_path()).ok();
-    cfg.as_deref().and_then(default_mode_from_toml).unwrap_or(PonytailMode::Full)
+    cfg.as_deref()
+        .and_then(default_mode_from_toml)
+        .unwrap_or(PonytailMode::Full)
 }
 
 #[must_use]
 pub fn allowlist() -> BTreeSet<String> {
-    std::fs::read_to_string(config_path()).map(|c| parse_allowlist(&c)).unwrap_or_default()
+    std::fs::read_to_string(config_path())
+        .map(|c| parse_allowlist(&c))
+        .unwrap_or_default()
 }
 
 /// Append a package to the allowlist (idempotent). Best-effort; errors ignored.
@@ -100,7 +104,11 @@ pub fn remember(name: &str) {
         .ok()
         .and_then(|c| default_mode_from_toml(&c))
         .unwrap_or(PonytailMode::Full);
-    let list = set.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>().join(", ");
+    let list = set
+        .iter()
+        .map(|s| format!("{s:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let body = format!("defaultMode = {:?}\nallow = [{}]\n", existing_mode.as_str(), list);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -114,7 +122,10 @@ mod tests {
 
     #[test]
     fn requested_wins() {
-        assert_eq!(resolve_mode_with(Some(PonytailMode::Ultra), None, None), PonytailMode::Ultra);
+        assert_eq!(
+            resolve_mode_with(Some(PonytailMode::Ultra), None, None),
+            PonytailMode::Ultra
+        );
     }
 
     #[test]
@@ -125,13 +136,19 @@ mod tests {
     #[test]
     fn config_over_default_but_under_env() {
         assert_eq!(resolve_mode_with(None, Some("off"), None), PonytailMode::Off);
-        assert_eq!(resolve_mode_with(None, Some("off"), Some("ultra")), PonytailMode::Ultra);
+        assert_eq!(
+            resolve_mode_with(None, Some("off"), Some("ultra")),
+            PonytailMode::Ultra
+        );
     }
 
     #[test]
     fn falls_back_to_full() {
         assert_eq!(resolve_mode_with(None, None, None), PonytailMode::Full);
-        assert_eq!(resolve_mode_with(None, Some("garbage"), Some("garbage")), PonytailMode::Full);
+        assert_eq!(
+            resolve_mode_with(None, Some("garbage"), Some("garbage")),
+            PonytailMode::Full
+        );
     }
 
     #[test]

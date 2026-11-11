@@ -2603,7 +2603,11 @@ fn last_assistant_text(session: &Session) -> String {
 /// ran no tools or the evidence is empty.
 fn last_tool_evidence(session: &Session, cas: Option<&Store>) -> Option<String> {
     use origin_core::types::{Block, Role};
-    let msg = session.messages.iter().rev().find(|m| matches!(m.role, Role::Tool))?;
+    let msg = session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::Tool))?;
     let mut out = String::new();
     for b in &msg.blocks {
         if let Block::ToolResult { handle, inline, .. } = b {
@@ -2981,7 +2985,10 @@ async fn run_verifier_dispatch(
     // Appended at the END so the driver's tail-truncation keeps it.
     let mut last_text = match gate_signals {
         Some(sig) if !sig.is_empty() => {
-            format!("{}\n\n<harness-signals>\n{sig}\n</harness-signals>", last_assistant_text(session))
+            format!(
+                "{}\n\n<harness-signals>\n{sig}\n</harness-signals>",
+                last_assistant_text(session)
+            )
         }
         _ => last_assistant_text(session),
     };
@@ -3097,8 +3104,7 @@ async fn drive_goal_loop(
             }
         }
 
-        let summary =
-            origin_daemon::agent::run_loop(session, &next_text, provider, prompter, opts).await?;
+        let summary = origin_daemon::agent::run_loop(session, &next_text, provider, prompter, opts).await?;
         is_first_iter = false;
 
         // If no goal is active, we're done after one turn.
@@ -5426,8 +5432,7 @@ mod tests {
     #[async_trait::async_trait]
     impl origin_permission::prompt::Prompter for RecordingDenier {
         async fn ask(&self, _meta: &origin_tools::ToolMeta, _preview: &str) -> bool {
-            self.asked
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.asked.store(true, std::sync::atomic::Ordering::SeqCst);
             false
         }
     }
