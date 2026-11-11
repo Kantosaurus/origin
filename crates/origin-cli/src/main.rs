@@ -2844,7 +2844,7 @@ async fn call_daemon(
                     tool,
                 } => on_swarm(&id, &goal, &status, detail.as_deref(), tool.as_deref()),
                 StreamEvent::SwarmAgentOutput { id, part, body, ok } => {
-                    on_swarm_output(&id, &part, &body, ok)
+                    on_swarm_output(&id, &part, &body, ok);
                 }
                 StreamEvent::Usage {
                     input_tokens,
@@ -3983,14 +3983,12 @@ mod tests {
             let sess = app.active_picker.as_mut().expect("picker open");
             origin_cli::tui::picker::reduce(&mut sess.state, pkey)
         };
-        match outcome {
-            None => None, // non-terminal: state advanced, would `mark_dirty()`
-            Some(out) => {
-                let _ = app.take_picker();
-                let (sel, _custom) = origin_cli::tui::picker_outcome_to_choice(&out);
-                Some(sel)
-            }
-        }
+        // `None` is non-terminal: state advanced, would `mark_dirty()`.
+        outcome.map(|out| {
+            let _ = app.take_picker();
+            let (sel, _custom) = origin_cli::tui::picker_outcome_to_choice(&out);
+            sel
+        })
     }
 
     fn cursor_of(app: &origin_cli::tui::App) -> usize {

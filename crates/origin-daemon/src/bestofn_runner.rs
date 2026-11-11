@@ -334,8 +334,7 @@ fn run_best_of_n_noted(
     let Some(winner) = select_best(&candidates) else {
         return no_winner("no candidate could be selected".into());
     };
-    let diff = &results[winner].diff;
-    let applied = match arena.apply_winner(diff) {
+    let applied = match arena.apply_winner(&results[winner].diff) {
         Ok(extra) => extra,
         Err(e) => {
             tracing::warn!(winner, error = %e, "best-of-N: applying the winning diff failed; keeping single-shot result");

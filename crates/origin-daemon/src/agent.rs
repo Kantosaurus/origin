@@ -15312,11 +15312,7 @@ mod wiring_tests {
             &headless,
             None,
         ));
-        assert_eq!(
-            through.outcome,
-            Outcome::Allow,
-            "mode off approves without asking"
-        );
+        assert_eq!(through.outcome, Outcome::Allow, "mode off does not ask");
     }
 
     /// C2 + C6: an undeclared package install is a `NeedsApproval` verdict

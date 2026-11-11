@@ -554,10 +554,13 @@ mod transient_tests {
             cache_marker: None,
             is_error: true,
         };
-        match block_to_wire(&err, None) {
-            Some(wire::WireBlock::ToolResult { is_error, .. }) => assert!(is_error, "structured error flag"),
-            _ => panic!("expected a ToolResult wire block"),
-        }
+        assert!(
+            matches!(
+                block_to_wire(&err, None),
+                Some(wire::WireBlock::ToolResult { is_error: true, .. })
+            ),
+            "structured error flag"
+        );
 
         // A success result with non-error content stays false.
         let ok = Block::ToolResult {
@@ -567,10 +570,13 @@ mod transient_tests {
             cache_marker: None,
             is_error: false,
         };
-        match block_to_wire(&ok, None) {
-            Some(wire::WireBlock::ToolResult { is_error, .. }) => assert!(!is_error, "success stays false"),
-            _ => panic!("expected a ToolResult wire block"),
-        }
+        assert!(
+            matches!(
+                block_to_wire(&ok, None),
+                Some(wire::WireBlock::ToolResult { is_error: false, .. })
+            ),
+            "success stays false"
+        );
 
         // Safety net: an "Error:"-prefixed result whose flag was left false is
         // still surfaced as an error on the wire (false-negative guard).
@@ -581,12 +587,13 @@ mod transient_tests {
             cache_marker: None,
             is_error: false,
         };
-        match block_to_wire(&legacy, None) {
-            Some(wire::WireBlock::ToolResult { is_error, .. }) => {
-                assert!(is_error, "content fallback flags the legacy Error: convention");
-            }
-            _ => panic!("expected a ToolResult wire block"),
-        }
+        assert!(
+            matches!(
+                block_to_wire(&legacy, None),
+                Some(wire::WireBlock::ToolResult { is_error: true, .. })
+            ),
+            "content fallback flags the legacy Error: convention"
+        );
     }
 }
 

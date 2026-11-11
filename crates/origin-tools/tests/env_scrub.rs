@@ -8,7 +8,7 @@ use origin_tools::proc_supervisor::Supervisor;
 
 async fn child_sees() -> String {
     #[cfg(unix)]
-    let cmd = r#"echo "K=$ANTHROPIC_API_KEY"; echo "P=${PATH:+True}"; echo "T=$A6_PROBE_TOKEN""#;
+    let cmd = r#"echo "K=$ANTHROPIC_API_KEY"; [ -n "$PATH" ] && echo "P=True"; echo "T=$A6_PROBE_TOKEN""#;
     #[cfg(windows)]
     let cmd = "'K=' + $env:ANTHROPIC_API_KEY; 'P=' + ($env:PATH.Length -gt 0); 'T=' + $env:A6_PROBE_TOKEN";
     let args = BashArgs {
