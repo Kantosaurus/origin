@@ -95,9 +95,7 @@ pub fn closest_ws_line(text: &str, needle: &str) -> Option<usize> {
     if want.is_empty() {
         return None;
     }
-    text.lines()
-        .position(|l| collapse_ws(l) == want)
-        .map(|i| i + 1)
+    text.lines().position(|l| collapse_ws(l) == want).map(|i| i + 1)
 }
 
 /// 1-based line numbers where `needle` occurs as an exact substring (the line
@@ -217,9 +215,7 @@ fn prefix_nonblank(s: &str, prefix: &str) -> String {
 }
 
 fn strip_nonblank(s: &str, over: &str) -> String {
-    join_lines_like(s, |line| {
-        line.strip_prefix(over).unwrap_or(line).to_string()
-    })
+    join_lines_like(s, |line| line.strip_prefix(over).unwrap_or(line).to_string())
 }
 
 /// Map `f` over each line of `s`, re-joining with `\n` and preserving a

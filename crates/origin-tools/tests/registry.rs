@@ -10,7 +10,6 @@ origin_tools::origin_tool! {
     side_effects: SideEffects::Pure,
     input_schema: r#"{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
-    token_budget: origin_tools::DEFAULT_TOKEN_BUDGET,
     hot: false,
 }
 
@@ -35,23 +34,19 @@ fn tool_meta_fields_present() {
 }
 
 #[test]
-fn every_tool_has_nonzero_token_budget() {
-    for meta in origin_tools::registry_iter() {
-        assert!(meta.token_budget > 0, "tool {} has zero token_budget", meta.name);
-    }
-}
-
-#[test]
-fn task_is_autoallowed_and_hot_for_always_on_swarm() {
+fn task_is_permission_gated_and_hot_for_always_on_swarm() {
     let meta = registry_iter()
         .find(|m| m.name == "Task")
         .expect("Task must be registered");
     assert_eq!(
         meta.tier,
-        Tier::AutoAllowed,
-        "swarm delegation must not require a permission prompt",
+        Tier::RequiresPermission,
+        "delegation unlocks tools for the worker, so it must pass the parent's prompter (A4)",
     );
-    assert!(meta.hot, "Task must be hot so the model can call it without ToolSearch");
+    assert!(
+        meta.hot,
+        "Task must be hot so the model can call it without ToolSearch"
+    );
 }
 
 #[test]

@@ -9,7 +9,7 @@ downloaded onto the user's machine and are governed by their own licenses:
 | Package | Source | License |
 | --- | --- | --- |
 | `cloak-browser` | [`github:CloakHQ/CloakBrowser`](https://github.com/CloakHQ/CloakBrowser), pinned to commit `14ec2ebf5f952b3dcc8ee019965cc48cbf7ccf53` | MIT |
-| `playwright-core` | [npm](https://www.npmjs.com/package/playwright-core) (`^1.45.0`) | Apache-2.0 |
+| `playwright-core` | [npm](https://www.npmjs.com/package/playwright-core) pinned to `1.45.0` | Apache-2.0 |
 
 Both licenses (MIT and Apache-2.0) are compatible with this project's
 Apache-2.0 license.

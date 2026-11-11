@@ -9,6 +9,7 @@
 //! `ChoiceDecision{selected,custom}`.
 
 use origin_tui::grid::Attr;
+use unicode_width::UnicodeWidthChar;
 
 use super::tokens::{glyph, RenderRow, RowSpan, Tokens};
 
@@ -220,24 +221,47 @@ fn confirm_selection(state: &PickerState) -> PickerOutcome {
     }
 }
 
+/// Most rows a wrapped picker question may take.
+const QUESTION_MAX_ROWS: usize = 4;
+
 /// Lay out the picker into [`RenderRow`]s: the bold question, each option row
 /// (`▸` cursor / `□■` boxes / number hints / `muted` description), and the
 /// `✎ type your own…` row when allowed.
 ///
-/// One row per option, preceded by the bold question and followed (when
-/// `allow_custom`) by the custom row, so the total height is
-/// `1 + options.len() + allow_custom as usize`. `width` clips long descriptions.
+/// One row per option, preceded by the bold question (wrapped to `width`, at
+/// most [`QUESTION_MAX_ROWS`] rows) and followed (when `allow_custom`) by the
+/// custom row. `width` also clips long descriptions.
 #[must_use]
 pub fn layout_picker(state: &PickerState, width: u16, tok: &Tokens) -> Vec<RenderRow> {
-    let mut rows = Vec::with_capacity(state.options.len() + 2);
+    let mut rows = Vec::with_capacity(state.options.len() + QUESTION_MAX_ROWS + 1);
 
-    // Question header (bold, bright).
-    rows.push(RenderRow::one(RowSpan::new(
-        state.question.clone(),
-        tok.bright,
-        0,
-        Attr::BOLD,
-    )));
+    // Question header (bold, bright), wrapped so a long permission preview stays
+    // readable; capped (last row ends in `…`) so the options stay on screen.
+    // Wrapped by display width (wide CJK/emoji take two cells).
+    let max = usize::from(width.max(1));
+    let mut lines: Vec<String> = vec![String::new()];
+    let mut cur_w = 0;
+    for c in state.question.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if cur_w > 0 && cur_w + w > max {
+            lines.push(String::new());
+            cur_w = 0;
+        }
+        if let Some(line) = lines.last_mut() {
+            line.push(c);
+        }
+        cur_w += w;
+    }
+    if lines.len() > QUESTION_MAX_ROWS {
+        lines.truncate(QUESTION_MAX_ROWS);
+        if let Some(last) = lines.last_mut() {
+            last.pop();
+            last.push('…');
+        }
+    }
+    for line in lines {
+        rows.push(RenderRow::one(RowSpan::new(line, tok.bright, 0, Attr::BOLD)));
+    }
 
     for (i, opt) in state.options.iter().enumerate() {
         let cursored = i == state.cursor && !state.typing_custom;
@@ -591,6 +615,33 @@ mod tests {
             "question is bold"
         );
         assert_eq!(q.spans[0].text, "pick one");
+    }
+
+    #[test]
+    fn layout_long_question_wraps_and_is_capped() {
+        let tok = Tokens::default_tokens();
+        let mut s = single(2);
+        s.question = "x".repeat(25);
+        let rows = layout_picker(&s, 10, &tok);
+        // 25 chars at width 10 ⇒ 3 question rows, then 2 options.
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[2].spans[0].text, "xxxxx");
+        s.question = "y".repeat(100);
+        let rows = layout_picker(&s, 10, &tok);
+        // Capped at QUESTION_MAX_ROWS, last row marked as cut.
+        assert_eq!(rows.len(), QUESTION_MAX_ROWS + 2);
+        assert!(rows[QUESTION_MAX_ROWS - 1].spans[0].text.ends_with('…'));
+    }
+
+    #[test]
+    fn layout_question_wraps_by_display_width() {
+        let tok = Tokens::default_tokens();
+        let mut s = single(1);
+        // Six 2-cell CJK chars at width 5 ⇒ two chars (4 cells) per row, 3 rows.
+        s.question = "漢字漢字漢字".into();
+        let rows = layout_picker(&s, 5, &tok);
+        assert_eq!(rows[0].spans[0].text, "漢字");
+        assert_eq!(rows.len(), 3 + 1, "3 question rows + 1 option");
     }
 
     #[test]

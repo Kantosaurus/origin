@@ -131,24 +131,26 @@ async fn compaction_folds_and_snapshots_when_store_is_wired() {
 
     // (a) The oldest summarized turns were folded in-memory: summaries load only
     //     when the store is wired, so a fold proves the store was consulted.
+    //     Turn 0 (the task statement) is pinned, so turn 1 is the oldest fold.
+    assert_eq!(first_text(&session.messages[0]), "original turn 0");
     assert!(
-        first_text(&session.messages[0]).starts_with("[compacted turn 0]"),
-        "oldest turn should be folded into its summary, got: {:?}",
-        first_text(&session.messages[0])
+        first_text(&session.messages[1]).starts_with("[compacted turn 1]"),
+        "oldest foldable turn should be folded into its summary, got: {:?}",
+        first_text(&session.messages[1])
     );
 
     // (b) A pre-compaction snapshot was written, so rewind can reconstruct the
     //     original body. Simulate the persisted transcript going compacted, then
-    //     rewind_restoring must bring turn 0 back from its snapshot.
-    let placeholder = Message::new(Role::User).with_block(Block::text("[compacted turn 0] sum-0"));
+    //     rewind_restoring must bring turn 1 back from its snapshot.
+    let placeholder = Message::new(Role::User).with_block(Block::text("[compacted turn 1] sum-1"));
     store
-        .persist_message(SID, 0, &placeholder)
+        .persist_message(SID, 1, &placeholder)
         .expect("overwrite with compacted body");
-    assert!(first_text(&store.load_messages(SID).expect("load")[0]).starts_with("[compacted turn 0]"));
+    assert!(first_text(&store.load_messages(SID).expect("load")[1]).starts_with("[compacted turn 1]"));
     store.rewind_restoring(SID, 4).expect("rewind");
     assert_eq!(
-        first_text(&store.load_messages(SID).expect("load")[0]),
-        "original turn 0",
+        first_text(&store.load_messages(SID).expect("load")[1]),
+        "original turn 1",
         "rewind must restore the pre-compaction body from the snapshot the loop wrote"
     );
 }

@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `origin-planner` — predictive prompt-cache prefix planner.
 //!
-//! Phase 3 deliverables: `Band`, `PrefixLedger`, `CachePlanner`, `WireDecision`.
+//! Phase 3 deliverables: `Band`, `PrefixLedger`, `CachePlanner`.
 
 pub mod band;
-pub mod decision;
 pub mod ledger;
 pub mod planner;
 
 pub use band::Band;
-pub use decision::{WireDecision, INLINE_BYTE_BUDGET};
 pub use ledger::{LedgerError, PrefixLedger, SectionId, Stability};
 pub use planner::{CachePlanner, Plan, Section};

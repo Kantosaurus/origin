@@ -173,8 +173,7 @@ fn contestant_bin() -> PathBuf {
 /// (`bench/perf/tasks`); the cross-harness A/B now lives in `bench/swe`
 /// (SWE-bench Verified). Override with `ORIGIN_BENCH_TASKS`.
 fn tasks_root() -> PathBuf {
-    std::env::var_os("ORIGIN_BENCH_TASKS")
-        .map_or_else(|| PathBuf::from("bench/perf/tasks"), PathBuf::from)
+    std::env::var_os("ORIGIN_BENCH_TASKS").map_or_else(|| PathBuf::from("bench/perf/tasks"), PathBuf::from)
 }
 
 /// Aggregate one or more recorded `TaskResult` files into a ranked

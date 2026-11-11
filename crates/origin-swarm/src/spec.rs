@@ -24,7 +24,8 @@ pub struct Budget {
     pub max_input_tokens: u64,
     /// Maximum cumulative output tokens (provider-side).
     pub max_output_tokens: u64,
-    /// Maximum total tool invocations.
+    /// The worker's turn cap: the most model turns its loop runs (each turn
+    /// may make several tool calls). 0 ⇒ the worker's default.
     pub max_tool_calls: u32,
 }
 
@@ -89,6 +90,15 @@ pub struct WorkerSpec {
     /// only, for the duration of its run.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerSpec>,
+    /// The parent's EXPLICIT reasoning effort (`/effort`, `/fast`, `--effort`)
+    /// as a wire token (`low`, `max`, …). `None` ⇒ the worker's own default.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// The parent's resolved ponytail level (`off`/`lite`/`full`/`ultra`), so
+    /// the worker carries the ruleset exactly when the parent does. `None` ⇒
+    /// resolved from config/env like a fresh session.
+    #[serde(default)]
+    pub ponytail: Option<String>,
 }
 
 /// A follow-up task suggested by a worker on completion.
@@ -123,7 +133,9 @@ pub enum ReportStatus {
     GoalUnreachable,
     /// Worker hit a `Budget` cap.
     BudgetExhausted,
-    /// Worker was killed externally (coordinator cancel / sandbox abort).
+    /// Worker was stopped from outside its own decision: repeated permission
+    /// denials, a coordinator cancel / sandbox abort, or the worker was lost to
+    /// a swarm-layer error.
     Aborted,
 }
 

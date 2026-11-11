@@ -47,7 +47,9 @@ pub async fn diagnostics(args: DiagnosticsArgs, h: &dyn DiagnosticsHandle) -> Re
 crate::origin_tool! {
     name: "Diagnostics",
     description: "Return LSP diagnostics from the warm rust-analyzer for a path or the whole workspace. Severity filter: error|warning|hint|any.",
-    tier: Tier::AutoAllowed,
+    // C2: starting rust-analyzer runs `cargo metadata`, build scripts and
+    // proc-macros of the workspace, so the call is gated.
+    tier: Tier::RequiresPermission,
     urgency: Urgency::Low,
     side_effects: SideEffects::Pure,
     input_schema: r#"{

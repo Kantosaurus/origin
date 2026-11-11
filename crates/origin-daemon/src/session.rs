@@ -3,8 +3,44 @@
 //!
 //! Persistence (P1.12) wraps this with `SQLite` writes per turn.
 
-use origin_core::types::{Message, MessageId};
+use origin_core::types::{Block, Message, MessageId, Role};
 use std::path::PathBuf;
+
+/// B2: whether text block `block_idx` of a stored `role` message is context
+/// the agent loop injected.
+///
+/// That is `<origin-recall>` memories or `<repo-map-focus>` entries, not words
+/// the user typed. The loop only ever appends them to a USER message after the
+/// typed prompt (block 0), so a typed prompt or assistant text that happens to
+/// start with one of those tags is never matched. Those blocks stay in the
+/// transcript so the cached history bytes never change, but anything that
+/// shows, exports or mines user text must skip them.
+#[must_use]
+pub fn is_injected_context(role: Role, block_idx: usize, text: &str) -> bool {
+    role == Role::User
+        && block_idx >= 1
+        && (text.starts_with("<origin-recall>") || text.starts_with("<repo-map-focus>"))
+}
+
+/// `messages` with every injected-context text block removed.
+#[must_use]
+pub fn without_injected_context(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|m| Message {
+            role: m.role,
+            blocks: m
+                .blocks
+                .iter()
+                .enumerate()
+                .filter(
+                    |(i, b)| !matches!(b, Block::Text { text, .. } if is_injected_context(m.role, *i, text)),
+                )
+                .map(|(_, b)| b.clone())
+                .collect(),
+        })
+        .collect()
+}
 
 #[derive(Debug)]
 pub struct Session {
@@ -22,6 +58,12 @@ pub struct Session {
     /// checklist survives across `/goal` iterations and follow-up prompts (each a
     /// fresh `run_loop`) instead of being wiped to an empty local each time.
     pub last_todos: Option<serde_json::Value>,
+    /// C2 session taint: a successful result from a network tool (`WebFetch`,
+    /// `WebSearch`, `Browser`, `gmail`, any `mcp__*`) has entered the context.
+    /// From then on network tools, writes outside the workspace and unsandboxed
+    /// Bash always need a person to approve them. Persisted by
+    /// [`crate::session_store::SessionStore::mark_tainted`].
+    pub tainted: bool,
 }
 
 impl Session {
@@ -35,6 +77,7 @@ impl Session {
             next_proposal_id: 1,
             roots: Vec::new(),
             last_todos: None,
+            tainted: false,
         }
     }
 
@@ -52,6 +95,7 @@ impl Session {
             next_proposal_id: 1,
             roots: Vec::new(),
             last_todos: None,
+            tainted: false,
         }
     }
 

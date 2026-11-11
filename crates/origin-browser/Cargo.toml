@@ -16,12 +16,13 @@ serde_json = "1"
 reqwest = { workspace = true }
 readability = { workspace = true }
 html2md = { workspace = true }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "sync", "time", "net"] }
 thiserror = "1"
 regex = "1"
 tracing = { workspace = true }
 url = "2"
 origin-keyvault = { path = "../origin-keyvault" }
+origin-sandbox = { path = "../origin-sandbox" }
 
 [dev-dependencies]
 tempfile = "3"

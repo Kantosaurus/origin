@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Tool registry + macros + builtin tools.
 
-/// Default per-tool token budget for serialised results. Tools may override
-/// via the `token_budget:` arm of `origin_tool!`.
-pub const DEFAULT_TOKEN_BUDGET: u32 = 25_000;
-
 pub mod array_crush;
 pub mod budget_writer;
-pub mod coerce;
 pub mod builtins;
+pub mod coerce;
 pub mod dispatch;
 pub mod error;
 pub mod macros;
@@ -25,6 +21,10 @@ pub use dispatch::{Cache, CacheHit, NormalizedInput, MEMOIZATION_SKIPLIST};
 // Re-export so downstream tests + callers can construct `ToolMeta` literals
 // without taking a direct dep on `origin-sandbox` (P11.5).
 pub use origin_sandbox::{ProfileOrdinal, SandboxProfile};
+// A6: the child-env allow-list, for spawn sites outside the supervisor (MCP).
+pub use origin_sandbox::{
+    is_redactable_secret_env_name, is_secret_env_name, sandbox_status, scrub_env, SandboxStatus,
+};
 pub use registry::{registry_iter, ToolMeta};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

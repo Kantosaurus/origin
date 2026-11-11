@@ -12,6 +12,13 @@ rlimits, Windows Job Objects) are compiled in behind cargo features; on
 unsupported hosts a logging no-op backend is used. Profiles are addressed by a
 stable `u8` ordinal so dispatch never touches a string table.
 
+> **Shipped builds enable no backend feature**, so every child runs under the
+> no-op backend, unconfined. `sandbox_status()` reports that (`Unavailable`, or
+> `DisabledByUser` under `ORIGIN_SANDBOX=off`; never `Active`), and the
+> permission layer reads it. The crate also owns the child-process environment
+> allow-list (`env::scrub_env`, `ORIGIN_ENV_PASSTHROUGH`, `ORIGIN_ENV_SCRUB`).
+> Why the backends are not enabled: [security model](../security/security-model.md#status-on-shipped-builds-no-os-sandbox-is-active).
+
 ## Public API surface
 
 | Item | Kind | Summary |

@@ -20,6 +20,7 @@ fn returns_line_numbered_chunks() {
     assert!(out.contains("     1\tfirst"));
     assert!(out.contains("     2\tsecond"));
     assert!(out.contains("     3\tthird"));
+    assert_eq!(footer(&out), None, "whole file read: no footer");
 }
 
 #[test]
@@ -38,6 +39,11 @@ fn respects_offset_and_limit() {
     assert!(out.contains("    11\tline 11"));
     assert!(out.contains("    15\tline 15"));
     assert!(!out.contains("line 16"));
+    assert_eq!(
+        footer(&out),
+        Some((85, 15)),
+        "limit-cut window must name the next offset:\n{out}"
+    );
 }
 
 #[test]
@@ -55,6 +61,107 @@ fn default_limit_is_1000() {
     .unwrap();
     assert!(out.contains("\tL1000"));
     assert!(!out.contains("\tL1001"));
+}
+
+/// Parses `[N more lines — call Read with offset=K]` off the end of `out`.
+fn footer(out: &str) -> Option<(usize, u32)> {
+    let last = out.lines().last()?;
+    let rest = last.strip_prefix('[')?.strip_suffix(']')?;
+    let (n, k) = rest.split_once(" more lines \u{2014} call Read with offset=")?;
+    Some((n.parse().ok()?, k.parse().ok()?))
+}
+
+#[test]
+fn large_read_is_byte_capped_and_pages_without_loss_or_duplication() {
+    // 10,000 lines × 100 bytes = 1 MB.
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("big.txt");
+    let body: String = (1..=10_000).map(|i| format!("{i:<99}\n")).collect();
+    assert_eq!(body.len(), 1_000_000);
+    fs::write(&p, body).unwrap();
+
+    let mut seen: Vec<usize> = Vec::new();
+    let mut offset = 0u32;
+    loop {
+        let out = read_v2(ReadArgs {
+            file_path: p.to_string_lossy().into_owned(),
+            offset: Some(offset),
+            limit: Some(50_000),
+            as_: None,
+        })
+        .unwrap();
+        assert!(
+            out.len() <= 100_000,
+            "page at offset {offset} is {} bytes",
+            out.len()
+        );
+        let page: Vec<usize> = out
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .map(|(n, _)| n.trim().parse().unwrap())
+            .collect();
+        assert_eq!(
+            page.first(),
+            Some(&(offset as usize + 1)),
+            "page must start at offset+1"
+        );
+        seen.extend(&page);
+        match footer(&out) {
+            Some((more, next)) => {
+                assert_eq!(
+                    next as usize,
+                    *page.last().unwrap(),
+                    "next offset = first line not returned"
+                );
+                assert_eq!(more, 10_000 - next as usize);
+                offset = next;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(seen, (1..=10_000).collect::<Vec<_>>());
+}
+
+#[test]
+fn overlong_line_is_truncated_at_2000_chars() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("min.js");
+    fs::write(&p, format!("{}\nnext\n", "x".repeat(10_000))).unwrap();
+    let out = read_v2(ReadArgs {
+        file_path: p.to_string_lossy().into_owned(),
+        offset: None,
+        limit: None,
+        as_: None,
+    })
+    .unwrap();
+    let first = out.lines().next().unwrap();
+    assert!(
+        first.contains(&"x".repeat(2_000)) && !first.contains(&"x".repeat(2_001)),
+        "{first:.80}"
+    );
+    assert!(
+        first.contains("10000 chars"),
+        "truncation must be marked: {}",
+        &first[first.len() - 40..]
+    );
+    assert!(out.contains("     2\tnext"));
+}
+
+#[test]
+fn zero_limit_still_advances() {
+    // `limit: 0` must not yield an empty page whose footer repeats the same offset forever.
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("a.rs");
+    fs::write(&p, "first\nsecond\nthird\n").unwrap();
+    let out = read_v2(ReadArgs {
+        file_path: p.to_string_lossy().into_owned(),
+        offset: None,
+        limit: Some(0),
+        as_: None,
+    })
+    .unwrap();
+    assert!(out.contains("     1\tfirst"), "{out}");
+    assert_eq!(footer(&out), Some((2, 1)));
 }
 
 #[test]

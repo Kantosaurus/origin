@@ -680,5 +680,4 @@ crate::origin_tool! {
         "required": ["patch"]
     }"#,
     sandbox: ::origin_sandbox::SandboxProfile::WriteCwd,
-    token_budget: 4_000,
 }

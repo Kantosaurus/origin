@@ -1,10 +1,11 @@
 # CloakBrowser sidecar
 
 Node ≥18 sidecar that exposes CloakBrowser through the same stdio-JSON verb
-protocol that `agent-browser` speaks. `origin-browser`'s router spawns this
-on first use; you do not invoke it manually.
+protocol that `agent-browser` speaks. `origin-browser`'s router spawns it only
+when the stealth fallback is enabled (`ORIGIN_STEALTH_FALLBACK=1`); you do not
+invoke it manually.
 
-First-use bootstrap (origin runs this for you):
+Install its dependencies once, in this directory (origin does not run this):
 
     npm install --omit=dev
 

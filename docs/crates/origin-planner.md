@@ -8,9 +8,7 @@
 provider's prompt cache hits as often as possible. It sorts request sections into
 four stability **bands** (Frozen → Sticky → Sliding → Volatile), emits cache
 markers at every adjacent-band boundary, and tracks each section's empirical
-stability in a **prefix ledger** that promotes or demotes sections over time. A
-companion `WireDecision` rule chooses, per tool-result block, whether to inline
-its bytes or emit a compact CAS-handle reference.
+stability in a **prefix ledger** that promotes or demotes sections over time.
 
 ## Public API surface
 
@@ -25,8 +23,6 @@ its bytes or emit a compact CAS-handle reference.
 | `SectionId` | struct | Opaque `&'static str` section identifier. |
 | `Stability` | struct | `{ score, band }` running score for one section. |
 | `LedgerError` | enum | `Unknown(&'static str)`. |
-| `WireDecision` | enum | `Inline` / `Reference`; `for_block(band, byte_len)`. |
-| `INLINE_BYTE_BUDGET` | const | `2048` — inline budget for non-Frozen/Sticky bands. |
 
 ## Key types
 
@@ -36,17 +32,6 @@ pub enum Band { Frozen = 0, Sticky = 1, Sliding = 2, Volatile = 3 }
 
 pub const PROMOTE_THRESHOLD: i32 = 3;   // score ≥ ⇒ promote toward Frozen
 pub const DEMOTE_THRESHOLD: i32 = -2;   // score ≤ ⇒ demote toward Volatile
-
-pub enum WireDecision { Inline, Reference }
-impl WireDecision {
-    pub const fn for_block(band: Band, byte_len: usize) -> Self {
-        match band {
-            Band::Frozen | Band::Sticky => Self::Inline,            // always inline; amortized
-            Band::Sliding | Band::Volatile =>
-                if byte_len <= INLINE_BYTE_BUDGET { Self::Inline } else { Self::Reference },
-        }
-    }
-}
 ```
 
 ## How it works
@@ -74,12 +59,10 @@ churny ones drift out.
 daemon's tool-result dispatch (writer) and the provider's wire-encoder (reader)
 hold separate `Plan` clones that **share** the same interior-mutable state: a
 write on one side is immediately visible to the other without an explicit
-channel. The wire-encoder then calls `WireDecision::for_block` per tool-result:
-Frozen/Sticky always inline (their bytes amortize across many cache-hitting
-turns), Sliding/Volatile inline only when `byte_len ≤ INLINE_BYTE_BUDGET` (2048),
-otherwise emitting a `<result handle:… — N bytes>` reference the model can
-inflate via `Recall`. Competing stacks re-serialize full tool-result bytes every
-turn; the per-handle band map is the novel demotion mechanism.
+channel. The band map does not change what the model sees: the wire-encoder
+inlines every tool result verbatim (A1 removed the old `WireDecision` rule, which
+swapped >2,048-byte Sliding/Volatile results for a `<result handle:…>` stub the
+model could not resolve).
 
 ## Dependencies & features
 
@@ -100,8 +83,7 @@ features.
 `proptest` drives randomized hit/miss sequences to verify promotion/demotion
 monotonicity and that the ledger never moves a section past `Frozen`/`Volatile`.
 Inline unit tests cover `Band::promoted`/`demoted` boundaries, marker placement
-at band edges, `Plan` clone-shares-state equality, and every `WireDecision::for_block`
-arm around the `INLINE_BYTE_BUDGET` threshold.
+at band edges, and `Plan` clone-shares-state equality.
 
 ## See also
 

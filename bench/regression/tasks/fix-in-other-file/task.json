@@ -1,0 +1,7 @@
+{
+  "id": "fix-in-other-file",
+  "repo": { "fixture": "repo" },
+  "prompt": "test_slug.py fails: slugify in slug.py turns 'Héllo, World!' into 'héllo,-world!' instead of 'hello-world'. Find the root cause and fix it so the whole test suite passes.",
+  "verify": { "cmd": ["{python}", "-m", "unittest", "-q"], "expect_exit": 0, "restore": ["test_slug.py"] },
+  "timeout_s": 900
+}

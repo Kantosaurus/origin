@@ -7,7 +7,6 @@
 
 #[test]
 fn ponytail_block_present_for_full_absent_for_off() {
-    assert!(origin_ponytail::system_block(origin_ponytail::PonytailMode::Full)
-        .contains("origin-ponytail"));
+    assert!(origin_ponytail::system_block(origin_ponytail::PonytailMode::Full).contains("origin-ponytail"));
     assert!(origin_ponytail::system_block(origin_ponytail::PonytailMode::Off).is_empty());
 }

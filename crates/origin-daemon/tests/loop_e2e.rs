@@ -303,3 +303,334 @@ async fn dispatch_registers_pure_tool_handle_as_sticky_in_shared_plan() {
         "Read (SideEffects::Pure) must map to Band::Sticky in the encoder's plan view"
     );
 }
+
+/// A12: a run given its own working directory (a best-of-N candidate's
+/// worktree) resolves the model's relative paths there, for `Write` and for
+/// `ApplyPatch`, without the process cwd ever pointing at it.
+#[tokio::test]
+async fn relative_tool_paths_resolve_against_loop_cwd() {
+    let ws = tempdir().expect("tempdir");
+    let name = format!("a12-{}.txt", ulid::Ulid::new());
+    let patched = format!("a12-patch-{}.txt", ulid::Ulid::new());
+    let write = Block::ToolUse {
+        id: "tu_w".into(),
+        name: "Write".into(),
+        input_json: serde_json::to_vec(&serde_json::json!({"file_path": name, "content": "hi\n"}))
+            .expect("json"),
+        cache_marker: None,
+    };
+    let patch = format!("*** Begin Patch\n*** Add File: {patched}\n+patched\n*** End Patch\n");
+    let apply = Block::ToolUse {
+        id: "tu_p".into(),
+        name: "ApplyPatch".into(),
+        input_json: serde_json::to_vec(&serde_json::json!({ "patch": patch })).expect("json"),
+        cache_marker: None,
+    };
+    let provider = ScriptedProvider::new(vec![
+        ChatResponse {
+            assistant: Message::new(Role::Assistant).with_block(write).with_block(apply),
+            usage: Usage::default(),
+        },
+        ChatResponse {
+            assistant: Message::new(Role::Assistant).with_block(Block::text("done")),
+            usage: Usage::default(),
+        },
+    ]);
+    let opts = LoopOptions {
+        cwd: Some(ws.path().to_path_buf()),
+        ..LoopOptions::default().without_streaming()
+    };
+    let mut session = Session::new("test", "claude-opus-4-7");
+    run_loop(&mut session, "write files", &provider, &AlwaysAllow, &opts)
+        .await
+        .expect("loop ok");
+
+    let here = std::env::current_dir().expect("cwd");
+    let stray = [here.join(&name), here.join(&patched)];
+    let leaked: Vec<_> = stray.iter().filter(|p| p.exists()).collect();
+    for p in &leaked {
+        let _ = std::fs::remove_file(p);
+    }
+    assert!(
+        leaked.is_empty(),
+        "written relative to the process cwd: {leaked:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join(&name)).ok().as_deref(),
+        Some("hi\n")
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join(&patched)).ok().as_deref(),
+        Some("patched\n")
+    );
+}
+
+/// A12: with `ORIGIN_CHECKPOINTS=1`, a run with its own working directory
+/// snapshots THAT tree into ITS shadow history (`<cwd>/.origin/shadow.git`),
+/// not the daemon's process cwd — the user's real checkout.
+#[tokio::test]
+async fn checkpoints_follow_the_loop_cwd() {
+    let ws = tempdir().expect("tempdir");
+    let shadow = ws.path().join(".origin").join("shadow.git");
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&shadow)
+            .args(args)
+            .current_dir(ws.path())
+            .output()
+            .expect("spawn git");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    // Initialised the way `origin checkpoint` (origin-cli vcs.rs) does it.
+    let ws_s = ws.path().to_string_lossy().into_owned();
+    std::fs::create_dir_all(ws.path().join(".origin")).expect("mkdir");
+    git(&["--work-tree", &ws_s, "init", "-q"]);
+    git(&["config", "core.worktree", &ws_s]);
+    git(&["config", "user.name", "t"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    let write = Block::ToolUse {
+        id: "tu_w".into(),
+        name: "Write".into(),
+        input_json: serde_json::to_vec(&serde_json::json!({"file_path": "snap.txt", "content": "x\n"}))
+            .expect("json"),
+        cache_marker: None,
+    };
+    let provider = ScriptedProvider::new(vec![
+        ChatResponse {
+            assistant: Message::new(Role::Assistant).with_block(write),
+            usage: Usage::default(),
+        },
+        ChatResponse {
+            assistant: Message::new(Role::Assistant).with_block(Block::text("done")),
+            usage: Usage::default(),
+        },
+    ]);
+    let opts = LoopOptions {
+        cwd: Some(ws.path().to_path_buf()),
+        ..LoopOptions::default().without_streaming()
+    };
+    let mut session = Session::new("test", "claude-opus-4-7");
+    std::env::set_var("ORIGIN_CHECKPOINTS", "1");
+    let res = run_loop(&mut session, "write", &provider, &AlwaysAllow, &opts).await;
+    std::env::remove_var("ORIGIN_CHECKPOINTS");
+    res.expect("loop ok");
+    let snapshot = git(&["show", "--name-only", "--format=", "HEAD"]);
+    assert!(
+        snapshot.lines().any(|l| l == "snap.txt"),
+        "the run's own shadow history holds a snapshot of the run's tree: {snapshot:?}"
+    );
+}
+
+/// A11: one fresh session whose model calls `graph_query` once, then stops.
+async fn run_graph_query_session(opts: &LoopOptions, roots: Vec<std::path::PathBuf>) {
+    let query = Block::ToolUse {
+        id: "tu_q".into(),
+        name: "graph_query".into(),
+        input_json: serde_json::to_vec(&serde_json::json!({"kind": "by_name", "args": {"name": "add"}}))
+            .expect("json"),
+        cache_marker: None,
+    };
+    let provider = ScriptedProvider::new(vec![
+        ChatResponse {
+            assistant: Message::new(Role::Assistant).with_block(query),
+            usage: Usage::default(),
+        },
+        ChatResponse {
+            assistant: Message::new(Role::Assistant).with_block(Block::text("done")),
+            usage: Usage::default(),
+        },
+    ]);
+    let mut session = Session::new("test", "claude-opus-4-7");
+    session.roots = roots;
+    run_loop(&mut session, "find add", &provider, &AlwaysAllow, opts)
+        .await
+        .expect("loop ok");
+}
+
+/// A11: whether `file` has graph nodes within `wait`.
+async fn indexed_within(
+    graph: &tokio::sync::Mutex<origin_codegraph::index::CodeGraphIndex>,
+    file: &str,
+    wait: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if !graph.lock().await.nodes_in_file(file).expect("query").is_empty() {
+            return true;
+        }
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// A11: the first `graph_query` of a session builds the code graph over the
+/// session's workspace roots in the background (no `graph_rebuild` call) —
+/// except for a run with its own cwd (a best-of-N candidate: its throwaway
+/// worktree must not land in the shared, persistent graph) and when
+/// `ORIGIN_CODEGRAPH_AUTOBUILD=0`.
+#[tokio::test]
+async fn first_graph_query_builds_the_code_graph_in_the_background() {
+    let ws = tempdir().expect("tempdir");
+    let src = ws.path().join("calc.py");
+    std::fs::write(&src, "def add(a, b):\n    return a + b\n").expect("write");
+    let file = src.display().to_string();
+    let db = tempdir().expect("tempdir");
+    let cas = Store::open(StoreConfig {
+        root: db.path().join("cas"),
+        hot_capacity: 32,
+        warm_pack_target_bytes: 1024 * 1024,
+        cold_zstd_level: 3,
+    })
+    .expect("cas");
+    let sql = origin_store::Store::open(db.path().join("origin.db")).expect("sql");
+    let graph = Arc::new(tokio::sync::Mutex::new(
+        origin_codegraph::index::CodeGraphIndex::new(cas, sql),
+    ));
+    let short = std::time::Duration::from_millis(1500);
+
+    // A run with a cwd override never auto-builds.
+    let candidate = LoopOptions {
+        code_graph: Some(Arc::clone(&graph)),
+        cwd: Some(ws.path().to_path_buf()),
+        ..LoopOptions::default().without_streaming()
+    };
+    run_graph_query_session(&candidate, vec![ws.path().to_path_buf()]).await;
+    assert!(
+        !indexed_within(&graph, &file, short).await,
+        "cwd override must not build"
+    );
+
+    let opts = LoopOptions {
+        code_graph: Some(Arc::clone(&graph)),
+        ..LoopOptions::default().without_streaming()
+    };
+    // The escape hatch disables it.
+    std::env::set_var("ORIGIN_CODEGRAPH_AUTOBUILD", "0");
+    run_graph_query_session(&opts, vec![ws.path().to_path_buf()]).await;
+    std::env::remove_var("ORIGIN_CODEGRAPH_AUTOBUILD");
+    assert!(
+        !indexed_within(&graph, &file, short).await,
+        "ORIGIN_CODEGRAPH_AUTOBUILD=0 must not build"
+    );
+
+    // Default: the first graph_query indexes the session's roots.
+    run_graph_query_session(&opts, vec![ws.path().to_path_buf()]).await;
+    assert!(
+        indexed_within(&graph, &file, std::time::Duration::from_secs(10)).await,
+        "code graph never indexed {file}"
+    );
+}
+
+/// A1 regression: a fresh >2 KiB result from a Mutating tool (Bash) must reach
+/// the model verbatim on the very next request. Drives the production wiring
+/// end to end — real `run_loop`, real Bash, CAS, the shared `Plan` the daemon
+/// gives both sides, and the real `Anthropic` wire encoder against a mock
+/// `/v1/messages` — and asserts on the bytes actually sent.
+#[tokio::test]
+async fn large_bash_result_reaches_anthropic_verbatim_on_next_request() {
+    use origin_provider_anthropic::Anthropic;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let cap = Arc::clone(&bodies);
+    // `seq`/`1..1000` print ~4-5 KB, well over the old 2,048-byte inline budget.
+    let command = if cfg!(windows) { "1..1000" } else { "seq 1 1000" };
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: serde_json::Value = req.body_json().expect("json");
+            let after_tool = body["messages"]
+                .as_array()
+                .and_then(|m| m.last())
+                .is_some_and(|m| m["content"][0]["type"] == "tool_result");
+            cap.lock().expect("lock").push(body);
+            let content = if after_tool {
+                serde_json::json!([{"type": "text", "text": "done"}])
+            } else {
+                serde_json::json!([{"type": "tool_use", "id": "tu_bash", "name": "Bash",
+                                    "input": {"command": command, "timeout": 30}}])
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": content,
+                "usage": {"input_tokens": 1, "output_tokens": 1,
+                          "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().expect("tempdir");
+    let store = Arc::new(
+        Store::open(StoreConfig {
+            root: dir.path().to_path_buf(),
+            hot_capacity: 32,
+            warm_pack_target_bytes: 1024 * 1024,
+            cold_zstd_level: 3,
+        })
+        .expect("store"),
+    );
+    // Production wiring (main.rs): one Plan shared by the provider and the loop.
+    let plan = origin_planner::Plan::default();
+    let provider = Anthropic::with_endpoint(server.uri(), "test", "claude-opus-4-7")
+        .with_cas(Arc::clone(&store))
+        .with_plan(plan.clone());
+    let mut session = Session::new("test", "claude-opus-4-7");
+    let opts = LoopOptions {
+        max_turns: 5,
+        cas: Some(Arc::clone(&store)),
+        relay_tx: None,
+        streaming_disabled: true,
+        plan: Some(plan),
+        ..LoopOptions::default()
+    };
+    run_loop(&mut session, "print some numbers", &provider, &AlwaysAllow, &opts)
+        .await
+        .expect("loop");
+
+    // The full result body the loop stored for this Bash call.
+    let handle = session
+        .messages
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .find_map(|b| match b {
+            Block::ToolResult { handle: Some(h), .. } => Some(*h),
+            _ => None,
+        })
+        .expect("Bash result stored as a CAS handle");
+    let stored = store
+        .get(Hash::from_bytes(handle))
+        .expect("get")
+        .expect("present");
+    assert!(
+        stored.len() > 2048,
+        "fixture must exceed 2,048 bytes, got {}",
+        stored.len()
+    );
+
+    // The first request after the tool call must carry that body verbatim.
+    let next = bodies
+        .lock()
+        .expect("lock")
+        .get(1)
+        .cloned()
+        .expect("a follow-up request after the Bash call");
+    let sent = next["messages"]
+        .as_array()
+        .and_then(|m| m.last())
+        .map(|m| m["content"][0]["content"].clone())
+        .expect("tool_result content");
+    let sent = sent.as_str().expect("content str");
+    assert!(
+        sent.as_bytes() == stored.as_slice(),
+        "Bash result ({} bytes) must be sent verbatim; got {} bytes: {:.120}",
+        stored.len(),
+        sent.len(),
+        sent
+    );
+}

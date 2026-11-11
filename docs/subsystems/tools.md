@@ -83,8 +83,6 @@ pub struct ToolMeta {
     pub input_schema: &'static str,
     /// Per-tool sandbox profile applied to child processes this tool spawns.
     pub sandbox_profile: SandboxProfile,
-    /// Approximate token budget for this tool's serialised result (default 25k).
-    pub token_budget: u32,
     /// "Hot" tools have their full schema embedded in the system prompt.
     /// "Deferred" tools advertise only {name, description}; their schemas
     /// are fetched on demand via `ToolSearch`.
@@ -118,14 +116,12 @@ pub enum SideEffects { Pure, Mutating }
 - **`SandboxProfile`** (re-exported from `origin-sandbox`) is the per-tool
   confinement applied to any child process the tool spawns.
 
-`DEFAULT_TOKEN_BUDGET` is `25_000` (`lib.rs`).
-
 ### The registration macro
 
 Tools register their metadata with the `origin_tool!` macro
-(`crates/origin-tools/src/macros.rs`). It is a declarative macro with four
-arms, from "everything specified" down to "defaults for sandbox, token_budget,
-and hot". The fullest form:
+(`crates/origin-tools/src/macros.rs`). It is a declarative macro with three
+arms, from "everything specified" down to "defaults for sandbox and hot". The
+fullest form:
 
 ```rust
 #[macro_export]
@@ -138,7 +134,6 @@ macro_rules! origin_tool {
         side_effects: $sfx:expr,
         input_schema: $schema:expr,
         sandbox: $sandbox:expr,
-        token_budget: $budget:expr,
         hot: $hot:expr
         $(,)?
     ) => {
@@ -151,18 +146,15 @@ macro_rules! origin_tool {
                 side_effects: $sfx,
                 input_schema: $schema,
                 sandbox_profile: $sandbox,
-                token_budget: $budget,
                 hot: $hot,
             }
         }
     };
-    // … shorter arms default `sandbox: SandboxProfile::Inherit`,
-    //    `token_budget: DEFAULT_TOKEN_BUDGET`, and `hot: true`.
+    // … shorter arms default `sandbox: SandboxProfile::Inherit` and `hot: true`.
 }
 ```
 
 The shorter arms apply, in order: default `hot: true`; default
-`token_budget: DEFAULT_TOKEN_BUDGET`; default
 `sandbox_profile: SandboxProfile::Inherit`. So a minimal registration only needs
 `name`, `description`, `tier`, `urgency`, `side_effects`, and `input_schema` —
 everything else defaults. A representative real registration, the `Read` tool
@@ -248,23 +240,23 @@ each module's registration.
 
 | Tool | Purpose | Tier | Side-effects | Sandbox | Hot | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| `Read` | Line-numbered file read; `as: text\|image\|pdf` | AutoAllowed | Pure | `ReadFs` | yes | Refuses symlinks; default limit 1000 lines, max 50000; images report dims, PDFs extract text (`read.rs`). |
+| `Read` | Line-numbered file read; `as: text\|image\|pdf` | AutoAllowed | Pure | `ReadFs` | yes | Refuses symlinks; default limit 1000 lines, max 50000; output capped at 100,000 bytes and 2,000 chars per line, with a `[N more lines — call Read with offset=<next>]` footer; images report dims, PDFs extract text (`read.rs`). |
 | `Write` | Create/overwrite a UTF-8 file (atomic) | RequiresPermission | Mutating | `WriteCwd` | yes | Refuses to clobber an unread existing file unless `force` (`write.rs`). |
-| `Edit` | Find-and-replace a unique string in a file | RequiresPermission | Mutating | `WriteCwd` | yes | CRLF-safe; `replace_all` for multi-match (`edit.rs`). |
+| `Edit` | Find-and-replace a unique string in a file | RequiresPermission | Mutating | `WriteCwd` | yes | CRLF-safe; `replace_all` for multi-match; returns `{ok, diff}`, a 3-line-context unified diff (`edit.rs`). |
 | `MultiEdit` | Apply a sequence of edits to one file atomically | RequiresPermission | Mutating | `WriteCwd` | yes | Single read + single write per call (`multi_edit.rs`). |
 | `ApplyPatch` | Apply a unified-diff or codex/opencode marker-envelope patch across files | RequiresPermission | Mutating | `WriteCwd` | yes | Add/Delete/Update/Move directives; validates all ops before any write (`apply_patch.rs`). |
 | `Bash` | Execute a shell command; foreground or `run_in_background` | RequiresPermission | Mutating | `Shell` | yes | Timeout default 120s / max 600s; stdout capped to ~96 KiB head+tail; backed by `proc_supervisor` (`bash.rs`). |
 | `Monitor` | Tail output of a background `Bash` process by `pid` | AutoAllowed | Pure | `Inherit` | yes | Byte-offset ring buffer; `since_byte` to resume (`monitor.rs`). |
 | `Grep` | Recursive regex search + `agentgrep:` DSL | AutoAllowed | Pure | `Inherit` | yes | Modes `files_with_matches`/`content`/`count`; `agentgrep:outline:<path>` and `agentgrep:refs:<symbol>` (`grep_tool.rs`). |
 | `Glob` | Find files matching a glob, mtime-sorted, gitignore-aware | AutoAllowed | Pure | `Inherit` | yes | (`glob_tool.rs`). |
-| `LspNavigate` | Semantic nav: definition/references/incoming/outgoing calls | AutoAllowed | Pure | `Inherit` | **no** | Backed by the warm LSP fleet (`lsp_nav.rs`). |
-| `Diagnostics` | LSP diagnostics for a path or workspace | AutoAllowed | Pure | `Inherit` | yes | Severity filter error/warning/hint/any (`diagnostics.rs`). |
-| `WebFetch` | GET a URL, return reader-mode markdown; multi-URL batching | RequiresPermission | Pure | `Inherit` | **no** | Pure-Rust readability path (`web_fetch.rs`). |
+| `LspNavigate` | Semantic nav: definition/references/incoming/outgoing calls | RequiresPermission | Pure | `Inherit` | **no** | Backed by the warm LSP fleet (`lsp_nav.rs`). |
+| `Diagnostics` | LSP diagnostics for a path or workspace | RequiresPermission | Pure | `Inherit` | yes | Severity filter error/warning/hint/any (`diagnostics.rs`). |
+| `WebFetch` | GET one or more URLs and answer `prompt` about them (required whenever the quarantine call runs; the description names `prompt` and `url`/`urls` as required); the page is read by a tool-less quarantine model and only its answer is returned, wrapped in `<external>` (`ORIGIN_WEBFETCH_RAW=1` returns the wrapped page instead) | RequiresPermission | Pure | `Inherit` | **no** | Pure-Rust readability path (`web_fetch.rs`); quarantine in `origin-daemon/src/external_content.rs` (C4). |
 | `WebSearch` | Tavily web search | RequiresPermission | Pure | `Inherit` | **no** | Requires `TAVILY_API_KEY` / vault key (`web_search.rs`). |
-| `Browser` | Stateful dual-backend browser (agent-browser + Cloak fallback) | RequiresPermission | Mutating | `Inherit` | **no** | (`browser.rs`). |
+| `Browser` | Stateful browser (agent-browser; Cloak fallback only with `ORIGIN_STEALTH_FALLBACK=1`) | RequiresPermission | Mutating | `Inherit` | **no** | (`browser.rs`). |
 | `Recall` | Inflate a CAS handle into the response; optional region slice | AutoAllowed | Pure | `Inherit` | **yes** | Hot on purpose: SchemaCrush offloads behind a `recall` handle (`recall.rs`). |
 | `ToolSearch` | Fetch full schemas for deferred tools | AutoAllowed | Pure | `Inherit` | yes | `select:Name,Name` or keyword rank (`tool_search.rs`). |
-| `Task` | Dispatch a sub-agent (swarm worker) | AutoAllowed | Mutating | `Inherit` | **yes** | No prompt; child confined to `allowed_tools` (`task.rs`). |
+| `Task` | Dispatch a sub-agent (swarm worker) | RequiresPermission | Mutating | `Inherit` | **yes** | Asks with a `<G>/<T> gated tools, <D> mcp servers` preview; in mode `workspace` a read-only delegation runs without an ask (A4, C2); child confined to `allowed_tools` (`task.rs`). |
 | `ask` | Free-text question routed to code-graph / memory | AutoAllowed | Pure | `Inherit` | **no** | No LLM in the router (`ask.rs`). |
 | `ask_user` | Structured single/multi-select question to the human | AutoAllowed | Pure | `Inherit` | **no** | High urgency; `allow_custom` free-text (`ask_user.rs`). |
 | `AuthorWorkflow` | Author a runnable workflow from an NL goal | RequiresPermission | Mutating | `Inherit` | **no** | Persists to the user's workflows file (`author_workflow.rs`). |
@@ -332,15 +324,16 @@ pub async fn check(meta: &ToolMeta, args_preview: &str, prompter: &dyn Prompter)
 }
 ```
 
-- **`AutoAllowed`** tools (`Read`, `Grep`, `Glob`, `Diagnostics`, `LspNavigate`,
-  `Recall`, `ToolSearch`, `Task`, the `graph_*`/`mem_search`/`ask` read paths)
-  bypass the prompter entirely. Notably `Task` is `AutoAllowed` *despite* being
-  `Mutating`: spawning a swarm worker never prompts, because the child is
-  confined to the `allowed_tools` allow-list the parent grants and any
-  governance/conseca deny overlay still applies (`task.rs` comment).
+- **`AutoAllowed`** tools (`Read`, `Grep`, `Glob`,
+  `Recall`, `ToolSearch`, `CollectTasks`, the `graph_*`/`mem_search`/`ask` read
+  paths) bypass the prompter entirely.
 - **`RequiresPermission`** tools ask the user. This covers every file mutator,
   `Bash`, `WebFetch`/`WebSearch`/`Browser`, `mem_save`/`mem_forget`,
-  `graph_rebuild`, `gmail`, and the workflow authors.
+  `graph_rebuild`, `gmail`, `Task`, the workflow authors, and `Diagnostics`/
+  `LspNavigate` (starting a language server runs project code: rust-analyzer
+  runs `cargo metadata`, build scripts and proc-macros). `Task` asks with a
+  `<G>/<T> gated tools, <D> mcp servers` preview; in mode `workspace` a
+  read-only delegation runs without an ask (A4, C2).
 
 A second entry point, `check_with_rules`, consults a bloom-filter pre-check plus
 a user-configured wildcard rule list *before* the tier check, keyed on
@@ -518,7 +511,13 @@ markers (`<<<<<<<`, a ```` ``` ```` fence, an `@@` hunk header), and
 `extract_all_hunks(text, model)` auto-detects, falling back to the model's best
 format. `apply` replaces the unique occurrence of `before` with `after`,
 returning `EditFmtError::NoMatch` / `EditFmtError::Ambiguous` exactly like the
-`Edit` tool. Whole-file hunks have an empty `before` and replace wholesale.
+`Edit` tool. Whole-file hunks have an empty `before` and replace wholesale; a
+whole-file edit is only recognised as a path line standing alone (relative, no
+`..`, containing a `/` or a file name with an extension that has a letter)
+directly above a closed fenced block. The daemon applies prose edits only with
+`ORIGIN_EDITFMT=1`, and only where a `Write` to the resolved path would be
+allowed without asking (see the
+[security model](../security/security-model.md#permission-modes-workspace--on--off)).
 
 ### Post-edit lint/test/format policy (`origin-postedit`)
 
@@ -681,15 +680,19 @@ pub use visual::VisualCapture;
 ### Dual-backend router (agent-browser primary, CloakBrowser fallback)
 
 `router.rs` policy: try **`agent-browser`** first; if the classifier flags the
-response as bot-detected, replay the *same* verb against **`CloakBrowser`** and
-emit that instead. After two consecutive Cloak fallbacks in a session, mark the
-session **sticky** so future verbs skip primary entirely:
+response as bot-detected **and the stealth fallback is enabled**
+(`ORIGIN_STEALTH_FALLBACK=1`, opt-in since D11), replay the *same* verb against
+**`CloakBrowser`** and emit that instead. After two consecutive Cloak fallbacks
+in a session, mark the session **sticky** so future verbs skip primary entirely.
+Without the opt-in the Cloak sidecar is never spawned and a bot-detected
+response is returned as is:
 
 ```rust
 match classify(&primary) {
     Verdict::Clean => { st.cloak_streak = 0; Ok(primary) }
     Verdict::BotDetected(_reason) => {
-        let cloak_resp = self.cloak.send(verb).await?;
+        let Some(cloak) = self.cloak.as_mut() else { return Ok(primary) };
+        let cloak_resp = cloak.send(verb).await?;
         if cloak_resp.ok {
             st.cloak_streak = st.cloak_streak.saturating_add(1);
             if st.cloak_streak >= 2 { st.sticky = true; }
@@ -705,7 +708,7 @@ client for the `agent-browser` CLI (`agent-browser --stdio`, or
 stdio-JSON. `Verb` covers `Open`/`Click`/`Fill`/`Extract`/`Snapshot`/
 `Screenshot`/`Close`, each carrying a `session`. `CloakClient` (`cloak.rs`) is the
 matching stealth backend — same verb protocol, an anti-detection browser used
-only on fallback.
+only on fallback, and only when `ORIGIN_STEALTH_FALLBACK=1`.
 
 ### Bot detection
 
@@ -732,6 +735,18 @@ original host — a cross-host 3xx is **stopped**, so an allow-listed page can't
 bounce the fetch to an internal service or cloud metadata endpoint. The
 `WebFetch` tool batches multiple URLs (`urls` array, up to 20) and sections the
 output under `## <url>` headers.
+
+The page never reaches the main loop directly (C4): the tool's required
+`prompt` is answered by a tool-less call to a cheap model of the active provider
+(on Anthropic, the sidecar summariser's `ORIGIN_SIDECAR_MODEL`, default Haiku),
+with the page wrapped as data, and only that answer (at most 8,000 characters)
+is returned. A failed quarantine call is a tool error, never the raw page. With
+no resolvable cheap model (non-Anthropic providers) or `ORIGIN_WEBFETCH_RAW=1`,
+the page itself is returned. Either way the result — like every `WebSearch`,
+`Browser`, `gmail` and `mcp__*` result — arrives as
+`<external source="…" url="…">…</external>`, with marker lookalikes inside the
+content escaped; the system prompt states that such text is data, not
+instructions.
 
 ### WebSearch via Tavily
 
@@ -956,8 +971,6 @@ A checklist for adding a builtin tool to `origin-tools`:
      in lock-step with the args struct.
    - `sandbox`: `ReadFs` for read-only file tools, `WriteCwd` for mutators,
      `Shell` for exec, `Network` for outbound HTTPS, else `Inherit`.
-   - `token_budget`: usually `DEFAULT_TOKEN_BUDGET` (25k); raise/lower for chatty
-     tools and self-cap output in the tool body.
    - `hot`: `true` only for tools the model needs in the base loop; default cold
      tools to `false` so they cost just `{name, description}` until `ToolSearch`.
 4. **Wire dispatch** in the daemon: map `ToolMeta.name` to the behaviour function

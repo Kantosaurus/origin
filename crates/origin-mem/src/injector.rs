@@ -215,7 +215,10 @@ mod tests {
     fn boosted_but_irrelevant_memory_is_excluded() {
         // High re-ranked score driven purely by a recency/priority boost, but a
         // near-zero raw similarity ⇒ not actually relevant ⇒ excluded.
-        assert!(!passes_inclusion(0.9, 0.05), "boost must not smuggle in a stale, irrelevant memory");
+        assert!(
+            !passes_inclusion(0.9, 0.05),
+            "boost must not smuggle in a stale, irrelevant memory"
+        );
         // Genuinely relevant ⇒ included.
         assert!(passes_inclusion(0.9, 0.8));
         // Below the score floor ⇒ excluded regardless of similarity.

@@ -150,7 +150,6 @@ crate::origin_tool! {
     side_effects: crate::SideEffects::Pure,
     input_schema: r#"{"type":"object","required":["question","options"],"properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"object","required":["label"],"properties":{"label":{"type":"string"},"description":{"type":"string"}}}},"multi_select":{"type":"boolean"},"allow_custom":{"type":"boolean"}}}"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
-    token_budget: crate::DEFAULT_TOKEN_BUDGET,
     hot: false,
 }
 

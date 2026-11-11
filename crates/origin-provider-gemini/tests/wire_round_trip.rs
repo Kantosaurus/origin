@@ -48,7 +48,9 @@ async fn calls_gemini_generate_content_endpoint() {
     let resp = provider.chat(req).await.expect("gemini chat should succeed");
 
     assert_eq!(resp.assistant.role, Role::Assistant);
-    assert_eq!(resp.usage.input_tokens, 5);
+    // `promptTokenCount` includes the cached share; `Usage.input_tokens` is
+    // the uncached remainder (5 - 1).
+    assert_eq!(resp.usage.input_tokens, 4);
     assert_eq!(resp.usage.output_tokens, 2);
     assert_eq!(resp.usage.cache_read_input_tokens, 1);
 

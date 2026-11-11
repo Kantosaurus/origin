@@ -354,6 +354,8 @@ fn spec(goal: &str) -> WorkerSpec {
         parent_actor: ActorId::new(0),
         model: None,
         mcp_servers: Vec::new(),
+        effort: None,
+        ponytail: None,
     }
 }
 
@@ -394,6 +396,7 @@ fn peak_worker(
                 transcript_handle: [0; 32],
                 usage: Usage::default(),
                 detail: None,
+                tainted: false,
             })
         })
     })

@@ -37,6 +37,14 @@ pub mod recorder_hook {
 use origin_core::types::Message;
 use thiserror::Error;
 
+/// Provider-reported token counts for one request.
+///
+/// One meaning for every provider (Anthropic's): `input_tokens` is the
+/// UNCACHED input only. Cache reads and cache writes are separate, so the full
+/// prompt size is `input_tokens + cache_read_input_tokens +
+/// cache_creation_input_tokens`. Providers whose wire count already includes
+/// cached tokens (`OpenAI`'s `prompt_tokens`, Gemini's `promptTokenCount`)
+/// subtract them when decoding.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: u32,
@@ -75,8 +83,8 @@ pub enum ReasoningEffort {
     /// `Ultracode`: the deepest tier — maximum reasoning *plus* always-on
     /// multi-agent swarm orchestration. On the provider wire it is the highest
     /// valid reasoning level (Anthropic `max`); the swarm-orchestration half is
-    /// realised by the always-on `Task` surface, not the wire. This is the
-    /// default effort for Anthropic models.
+    /// realised by the `Task` surface, not the wire. Opt-in; the Anthropic
+    /// default is [`Self::High`] (sub-agents [`Self::Medium`]).
     Ultracode,
 }
 
@@ -141,6 +149,21 @@ impl ReasoningEffort {
             "ultracode" => Some(Self::Ultracode),
             _ => None,
         }
+    }
+
+    /// Parse an effort name as a user types it (`/effort`, `--effort`,
+    /// `ORIGIN_DEFAULT_EFFORT`): the wire tokens plus the aliases `min`→low,
+    /// `mid`→medium, `maximum`/`ultra`→max and `ultra-code`→ultracode.
+    #[must_use]
+    pub fn parse_name(s: &str) -> Option<Self> {
+        let s = s.trim().to_ascii_lowercase();
+        Self::from_wire_str(match s.as_str() {
+            "min" => "low",
+            "mid" => "medium",
+            "maximum" | "ultra" => "max",
+            "ultra-code" => "ultracode",
+            other => other,
+        })
     }
 }
 
@@ -212,8 +235,8 @@ pub const CAS_MISS_PLACEHOLDER: &str =
 /// Each provider's wire encoder only understands inline content, so a provider
 /// must inflate handles back into bytes before encoding — otherwise the model
 /// receives empty tool results on every follow-up turn and the agentic loop
-/// silently breaks. The Anthropic provider does this with extra Plan-aware
-/// `Reference` downgrading; every other provider can use this plain helper.
+/// silently breaks. Every provider, Anthropic included, uses this helper, so a
+/// fresh tool result always reaches the model verbatim.
 ///
 /// Returns a cloned message vector with handles resolved. A handle present with
 /// no CAS configured is still a hard error (a misconfiguration). A CAS *miss*,
@@ -354,5 +377,21 @@ mod effort_tests {
         ] {
             assert_eq!(ReasoningEffort::from_wire_str(lvl.as_wire_str()), Some(lvl));
         }
+    }
+
+    #[test]
+    fn parse_name_accepts_the_effort_command_names() {
+        for (name, want) in [
+            ("high", ReasoningEffort::High),
+            (" MID ", ReasoningEffort::Medium),
+            ("min", ReasoningEffort::Low),
+            ("fast", ReasoningEffort::Fast),
+            ("ultra", ReasoningEffort::Max),
+            ("maximum", ReasoningEffort::Max),
+            ("ultra-code", ReasoningEffort::Ultracode),
+        ] {
+            assert_eq!(ReasoningEffort::parse_name(name), Some(want), "{name}");
+        }
+        assert_eq!(ReasoningEffort::parse_name("bogus"), None);
     }
 }

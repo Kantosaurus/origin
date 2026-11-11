@@ -36,6 +36,12 @@ desktop.ini
 .env.*
 !.env.example
 
+# Regression-benchmark scratch results (bench/regression/baselines/ stays tracked)
+/bench/regression/out/
+
+# Python bytecode (e.g. `py_compile` of the bench scripts)
+__pycache__/
+
 # Logs / temp
 *.log
 *.tmp

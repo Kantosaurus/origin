@@ -160,6 +160,261 @@ pub fn repo_map_block(roots: &[std::path::PathBuf], focus: &[String]) -> Option<
     Some(out)
 }
 
+/// B2: the session's unfocused `<repo-map>` block, scanned once per
+/// (session id, roots).
+///
+/// Reused byte-for-byte afterwards, so edits made during the session never
+/// change the cached system prefix. Keyed on the roots too: they are reset
+/// from each prompt request and a client may reuse a session id in another
+/// workspace. Empty when nothing ranks; an empty scan is not cached, so a
+/// session started in an empty directory gets a map once files exist. A new
+/// session (or a daemon restart) rescans.
+#[must_use]
+pub fn session_repo_map_block(session_id: &str, roots: &[std::path::PathBuf]) -> String {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+    type Key = (String, Vec<String>);
+    // ponytail: process-wide and never evicted (one ≤1k-token string per
+    // session id + roots); evict on session removal if a daemon ever hosts thousands.
+    static MAPS: OnceLock<Mutex<HashMap<Key, String>>> = OnceLock::new();
+    let maps = MAPS.get_or_init(Mutex::default);
+    let key: Key = (session_id.to_string(), roots_key(roots));
+    if let Some(map) = maps.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
+        return map.clone();
+    }
+    // Scan outside the lock; if two prompts race, the first insert wins.
+    let map = repo_map_block(roots, &[]).unwrap_or_default();
+    if map.is_empty() {
+        return map;
+    }
+    maps.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(key)
+        .or_insert(map)
+        .clone()
+}
+
+/// B6: toolchains and package managers probed on `PATH`, in the order listed.
+const PROBED_TOOLS: [&str; 26] = [
+    "python", "python3", "node", "npm", "pnpm", "yarn", "bun", "deno", "cargo", "rustc", "go", "java", "mvn",
+    "gradle", "dotnet", "ruby", "php", "gcc", "clang", "make", "cmake", "git", "docker", "uv", "pip",
+    "pytest",
+];
+
+/// B6: budget for the `PATH` probe. A healthy listing takes ~50 ms; a dead
+/// network entry must not stall the first prompt.
+const TOOL_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// B6: `Tools on PATH: python, node, …` for the [`PROBED_TOOLS`] that resolve
+/// on `path` (a `PATH`-style list), or empty when none do.
+///
+/// A pure lookup — nothing is spawned. Windows honours `PATHEXT`
+/// (case-insensitively). Each tool is decided at its FIRST match the shell
+/// would run, in `PATH` order (within one directory, the earliest `PATHEXT`
+/// extension); on Unix a file without the execute bit is skipped, as the
+/// shell skips it. A zero-length first match
+/// means "not found": the Microsoft Store "App Execution Alias" stubs for
+/// `python`/`python3` are not an interpreter. Lists each `PATH` directory once
+/// rather than `which`-ing every tool: that is ~26 × dirs × `PATHEXT` stats,
+/// hundreds of milliseconds on Windows.
+#[must_use]
+pub fn tools_on_path_line(path: &std::ffi::OsStr) -> String {
+    let exts = path_exts();
+    // `Some(real)` once a tool's first match is seen.
+    let mut decided: [Option<bool>; PROBED_TOOLS.len()] = [None; PROBED_TOOLS.len()];
+    for dir in std::env::split_paths(path) {
+        if decided.iter().all(Option::is_some) {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        // This directory's best match per tool: (PATHEXT index, path).
+        let mut first: [Option<(usize, std::path::PathBuf)>; PROBED_TOOLS.len()] = Default::default();
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let name = if cfg!(windows) {
+                name.to_ascii_lowercase()
+            } else {
+                name.to_string()
+            };
+            for (i, tool) in PROBED_TOOLS.iter().enumerate() {
+                let Some(x) = name
+                    .strip_prefix(tool)
+                    .and_then(|rest| exts.iter().position(|ext| ext == rest))
+                else {
+                    continue;
+                };
+                if decided[i].is_none()
+                    && first[i].as_ref().is_none_or(|(best, _)| x < *best)
+                    && shell_candidate(&entry.path())
+                {
+                    first[i] = Some((x, entry.path()));
+                }
+            }
+        }
+        for (slot, hit) in decided.iter_mut().zip(first) {
+            if let Some((_, p)) = hit {
+                *slot = Some(is_real_executable(&p));
+            }
+        }
+    }
+    let found: Vec<&str> = PROBED_TOOLS
+        .iter()
+        .zip(decided)
+        .filter_map(|(tool, d)| (d == Some(true)).then_some(*tool))
+        .collect();
+    if found.is_empty() {
+        String::new()
+    } else {
+        format!("Tools on PATH: {}", found.join(", "))
+    }
+}
+
+/// The extensions a bare program name may take: Windows' `PATHEXT`
+/// (lower-cased), or just the name itself elsewhere.
+fn path_exts() -> Vec<String> {
+    if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    } else {
+        vec![String::new()]
+    }
+}
+
+/// B7: the file the shell would run for `name` on `path` (a `PATH`-style list).
+///
+/// The same rules as [`tools_on_path_line`]: the first match in
+/// `PATH` order (within one directory, the earliest `PATHEXT` extension),
+/// directories and, on Unix, files without the execute bit skipped. `None`
+/// when nothing matches or the first match is a zero-length Store stub.
+#[must_use]
+pub fn resolve_on_path(name: &str, path: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+    let exts = path_exts();
+    std::env::split_paths(path)
+        .flat_map(|dir| exts.iter().map(move |ext| dir.join(format!("{name}{ext}"))))
+        .find(|p| std::fs::symlink_metadata(p).is_ok_and(|m| !m.is_dir()) && shell_candidate(p))
+        .filter(|p| is_real_executable(p))
+}
+
+/// B6: whether the shell would try to run `p`. On Unix it skips anything but
+/// a regular file (links followed: a symlink to a directory is skipped) with
+/// the execute bit and keeps searching `PATH`; on Windows a `PATHEXT` name
+/// match is run, even a zero-length Store stub.
+#[cfg_attr(not(unix), allow(clippy::missing_const_for_fn))] // const only off Unix
+fn shell_candidate(p: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = p;
+        true
+    }
+}
+
+/// B6: a non-empty regular file (links followed).
+fn is_real_executable(p: &std::path::Path) -> bool {
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 0)
+}
+
+/// B6: the daemon's [`tools_on_path_line`], probed once per PROCESS.
+///
+/// The daemon's `PATH` never changes, so one value serves every session and
+/// sits byte-for-byte in each cached system prefix. Empty when
+/// `ORIGIN_TOOL_PROBE=0` (read once) or the probe failed or timed out.
+pub async fn tools_line() -> String {
+    static LINE: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+    LINE.get_or_init(|| async {
+        if matches!(std::env::var("ORIGIN_TOOL_PROBE").as_deref(), Ok("0")) {
+            return String::new();
+        }
+        probe_tools_line(std::env::var_os("PATH")).await
+    })
+    .await
+    .clone()
+}
+
+/// B6: [`tools_on_path_line`] off the async runtime under
+/// [`TOOL_PROBE_BUDGET`]; empty (logged at debug) on timeout or error.
+async fn probe_tools_line(path: Option<std::ffi::OsString>) -> String {
+    let probe = tokio::task::spawn_blocking(move || path.map(|p| tools_on_path_line(&p)).unwrap_or_default());
+    match tokio::time::timeout(TOOL_PROBE_BUDGET, probe).await {
+        Ok(Ok(line)) => line,
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "PATH tool probe failed (ignored)");
+            String::new()
+        }
+        Err(_) => {
+            tracing::debug!("PATH tool probe timed out (ignored)");
+            String::new()
+        }
+    }
+}
+
+/// The roots as one workspace identity: sorted, de-duplicated and lexically
+/// normalised (trailing separators dropped; on Windows `\`→`/` and
+/// case-folded, as its paths compare case-insensitively). Purely lexical — no
+/// filesystem access per prompt — so `C:\x`, `c:/x/` and a re-ordered list all
+/// name the same session map.
+fn roots_key(roots: &[std::path::PathBuf]) -> Vec<String> {
+    let mut key: Vec<String> = roots
+        .iter()
+        .map(|r| {
+            let s = r.to_string_lossy();
+            let mut s = if cfg!(windows) {
+                s.replace('\\', "/").to_lowercase()
+            } else {
+                s.into_owned()
+            };
+            let kept = s.trim_end_matches('/').len();
+            if kept > 0 {
+                s.truncate(kept); // the filesystem root itself keeps its "/"
+            }
+            s
+        })
+        .collect();
+    key.sort();
+    key.dedup();
+    key
+}
+
+/// B2: the `<repo-map-focus>` block for the paths a prompt names.
+///
+/// Holds the focused-map entries `session_map` lacks — new files, or files
+/// whose symbols changed. Goes in that prompt's user message, never the system
+/// prompt. Empty when the prompt names no path or the focused map adds nothing.
+#[must_use]
+pub fn repo_map_focus_block(session_map: &str, roots: &[std::path::PathBuf], focus: &[String]) -> String {
+    if focus.is_empty() {
+        return String::new();
+    }
+    let Some(focused) = repo_map_block(roots, focus) else {
+        return String::new();
+    };
+    let fresh: Vec<&str> = focused
+        .lines()
+        .filter(|l| l.starts_with("- ") && !session_map.lines().any(|s| s == *l))
+        .collect();
+    if fresh.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<repo-map-focus>\nFiles relevant to this prompt, beyond the session <repo-map>:\n{}\n</repo-map-focus>",
+        fresh.join("\n")
+    )
+}
+
 /// Render a `<repo-map>` block with one labelled section per workspace root.
 ///
 /// Each root is ranked INDEPENDENTLY via [`origin_repomap::build_map_per_root`]
@@ -329,6 +584,157 @@ fn push_identifier(out: &mut Vec<String>, cur: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rust_workspace(file: &str, body: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(file), body).expect("write");
+        dir
+    }
+
+    /// Writes a fake executable `name` into `dir`: `len` bytes, execute bit set on Unix.
+    fn fake_exe(dir: &std::path::Path, name: &str, len: usize) {
+        let p = dir.join(name);
+        std::fs::write(&p, vec![b'x'; len]).expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+    }
+
+    /// B6: only real (non-empty, executable) hits on the given PATH are listed,
+    /// in the probe order, on one line.
+    #[test]
+    fn tools_line_lists_found_tools_in_probe_order() {
+        let a = tempfile::tempdir().expect("tempdir");
+        let b = tempfile::tempdir().expect("tempdir");
+        let (exe, cmd) = if cfg!(windows) { (".exe", ".CMD") } else { ("", "") };
+        fake_exe(a.path(), &format!("git{exe}"), 4);
+        fake_exe(a.path(), &format!("npm{cmd}"), 4);
+        fake_exe(b.path(), &format!("python{exe}"), 4);
+        // A zero-length stub (the Windows Store python alias) is not a tool.
+        fake_exe(a.path(), &format!("python3{exe}"), 0);
+        fake_exe(a.path(), "not-a-tool", 4);
+        // Not executable: no `PATHEXT` extension on Windows, no execute bit on Unix.
+        let node = if cfg!(windows) { "node.txt" } else { "node" };
+        std::fs::write(a.path().join(node), "x").expect("write");
+        let path = std::env::join_paths([a.path(), b.path()]).expect("join");
+        assert_eq!(tools_on_path_line(&path), "Tools on PATH: python, npm, git");
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(tools_on_path_line(empty.path().as_os_str()), "");
+    }
+
+    /// B6: a tool is decided at its first match in PATH order — a zero-length
+    /// stub ahead of a real binary is what the shell runs, so "not found".
+    #[test]
+    fn tools_line_decides_each_tool_at_its_first_path_match() {
+        let stub_first = tempfile::tempdir().expect("tempdir");
+        let real_later = tempfile::tempdir().expect("tempdir");
+        let exe = if cfg!(windows) { ".exe" } else { "" };
+        fake_exe(stub_first.path(), &format!("python{exe}"), 0);
+        fake_exe(real_later.path(), &format!("python{exe}"), 4);
+        fake_exe(stub_first.path(), &format!("go{exe}"), 4);
+        fake_exe(real_later.path(), &format!("go{exe}"), 0);
+        let path = std::env::join_paths([stub_first.path(), real_later.path()]).expect("join");
+        assert_eq!(tools_on_path_line(&path), "Tools on PATH: go");
+        // Within one directory the earliest PATHEXT extension wins.
+        if cfg!(windows) {
+            let d = tempfile::tempdir().expect("tempdir");
+            fake_exe(d.path(), "node.com", 0);
+            fake_exe(d.path(), "node.exe", 4);
+            assert_eq!(tools_on_path_line(d.path().as_os_str()), "");
+        }
+        // Unix: a file without the execute bit is skipped, as the shell skips
+        // it, so a later executable in PATH counts.
+        #[cfg(unix)]
+        {
+            let no_x = tempfile::tempdir().expect("tempdir");
+            let x = tempfile::tempdir().expect("tempdir");
+            std::fs::write(no_x.path().join("node"), "x").expect("write");
+            fake_exe(x.path(), "node", 4);
+            let path = std::env::join_paths([no_x.path(), x.path()]).expect("join");
+            assert_eq!(tools_on_path_line(&path), "Tools on PATH: node");
+        }
+    }
+
+    /// B6: a symlink to a DIRECTORY named like a tool is not a candidate (the
+    /// shell cannot run it), so a later real binary in PATH counts.
+    #[cfg(unix)]
+    #[test]
+    fn tools_line_skips_a_symlink_to_a_directory() {
+        let linked = tempfile::tempdir().expect("tempdir");
+        let target = tempfile::tempdir().expect("tempdir");
+        let real = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(target.path(), linked.path().join("python")).expect("symlink");
+        fake_exe(real.path(), "python", 4);
+        let path = std::env::join_paths([linked.path(), real.path()]).expect("join");
+        assert_eq!(tools_on_path_line(&path), "Tools on PATH: python");
+    }
+
+    /// B6: the probe runs off the runtime on the injected PATH; no PATH, no line.
+    #[tokio::test]
+    async fn probe_tools_line_uses_the_given_path() {
+        let a = tempfile::tempdir().expect("tempdir");
+        fake_exe(a.path(), if cfg!(windows) { "git.exe" } else { "git" }, 4);
+        let line = probe_tools_line(Some(a.path().as_os_str().to_owned())).await;
+        assert_eq!(line, "Tools on PATH: git");
+        assert_eq!(probe_tools_line(None).await, "");
+    }
+
+    /// B2: the session map is keyed on (session id, roots). A reused or resumed
+    /// id pointed at another workspace gets that workspace's map; the same id
+    /// and roots get the identical bytes back.
+    #[test]
+    fn session_repo_map_is_keyed_on_id_and_roots() {
+        let a = rust_workspace("alpha.rs", "pub fn alpha_fn() {}\n");
+        let b = rust_workspace("beta.rs", "pub fn beta_fn() {}\n");
+        let roots_a = vec![a.path().to_path_buf()];
+        let roots_b = vec![b.path().to_path_buf()];
+        let id = "b2-3-session";
+        let first = session_repo_map_block(id, &roots_a);
+        assert!(first.contains("alpha.rs"), "{first}");
+        let other = session_repo_map_block(id, &roots_b);
+        assert!(
+            other.contains("beta.rs") && !other.contains("alpha.rs"),
+            "{other}"
+        );
+        // Edit A: the cached bytes for (id, A) must not change.
+        std::fs::write(a.path().join("gamma.rs"), "pub fn gamma_fn() {}\n").expect("write");
+        assert_eq!(session_repo_map_block(id, &roots_a), first);
+    }
+
+    /// The same workspace spelled differently (order, trailing separator, and
+    /// on Windows case/separators) is the same cache entry — no rescan, so the
+    /// map bytes (and the cached prefix) survive a client re-spelling roots.
+    #[test]
+    fn session_repo_map_key_ignores_root_order_and_spelling() {
+        let a = rust_workspace("alpha.rs", "pub fn alpha_fn() {}\n");
+        let b = rust_workspace("beta.rs", "pub fn beta_fn() {}\n");
+        let id = "b2-spelling";
+        let first = session_repo_map_block(id, &[a.path().to_path_buf(), b.path().to_path_buf()]);
+        assert!(first.contains("alpha.rs") && first.contains("beta.rs"), "{first}");
+        // A fresh scan would now differ; the cached entry must be returned.
+        std::fs::write(a.path().join("gamma.rs"), "pub fn gamma_fn() {}\n").expect("write");
+        let mut a_spelled = format!("{}{}", a.path().display(), std::path::MAIN_SEPARATOR);
+        if cfg!(windows) {
+            a_spelled = a_spelled.to_uppercase();
+        }
+        let respelled = [b.path().to_path_buf(), std::path::PathBuf::from(a_spelled)];
+        assert_eq!(session_repo_map_block(id, &respelled), first);
+        // Genuinely different roots are a different entry.
+        assert_ne!(session_repo_map_block(id, &[b.path().to_path_buf()]), first);
+    }
+
+    /// An empty first scan (a session started in an empty directory) is not
+    /// cached, so the map appears once source files exist.
+    #[test]
+    fn empty_session_repo_map_is_not_cached() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = vec![dir.path().to_path_buf()];
+        assert_eq!(session_repo_map_block("b2-empty", &roots), "");
+        std::fs::write(dir.path().join("late.rs"), "pub fn late_fn() {}\n").expect("write");
+        assert!(session_repo_map_block("b2-empty", &roots).contains("late.rs"));
+    }
 
     #[test]
     fn group_paths_by_language_detects_per_file_and_skips_unknown() {

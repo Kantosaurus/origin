@@ -30,8 +30,8 @@ pub enum ReasoningEffort {
     High,
     /// Maximum effort; deepest deliberation.
     Max,
-    /// `Ultracode`: the deepest tier — maximum reasoning plus always-on
-    /// multi-agent swarm orchestration. The default effort for Anthropic models.
+    /// `Ultracode`: the deepest tier — maximum reasoning (Anthropic `max` on the
+    /// wire). Opt-in; with no `/effort` the daemon defaults Anthropic to `high`.
     Ultracode,
 }
 
@@ -52,18 +52,18 @@ impl ReasoningEffort {
 
     /// Parse a single effort level token (case-insensitive). Accepts the
     /// canonical names plus a few aliases (`min`→`low`, `mid`→`medium`,
-    /// `ultra`/`maximum`→`max`).
+    /// `ultra`/`maximum`→`max`); see [`origin_provider::ReasoningEffort::parse_name`].
     #[must_use]
     pub fn parse_level(token: &str) -> Option<Self> {
-        match token.trim().to_ascii_lowercase().as_str() {
-            "fast" => Some(Self::Fast),
-            "low" | "min" => Some(Self::Low),
-            "medium" | "mid" => Some(Self::Medium),
-            "high" => Some(Self::High),
-            "max" | "maximum" | "ultra" => Some(Self::Max),
-            "ultracode" | "ultra-code" => Some(Self::Ultracode),
-            _ => None,
-        }
+        use origin_provider::ReasoningEffort as P;
+        Some(match P::parse_name(token)? {
+            P::Fast => Self::Fast,
+            P::Low => Self::Low,
+            P::Medium => Self::Medium,
+            P::High => Self::High,
+            P::Max => Self::Max,
+            P::Ultracode => Self::Ultracode,
+        })
     }
 }
 

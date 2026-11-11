@@ -22,16 +22,16 @@ Ranked by **accuracy-per-dollar uplift ÷ implementation effort**:
 | # | Proposal | Acc | Tokens | Cost | Effort | Status |
 |---|----------|:---:|:------:|:----:|:------:|:------:|
 | 1 | **Reproduction-test gate** (generate failing test → confirm RED → require GREEN before "done") | ★★★ | ~ | ↓ (kills wasted retries) | M | ✅ **shipped** (`ORIGIN_REPRO_GATE`) |
-| 2 | **Uncertainty-gated model cascade** (cheap model drives; escalate only when stuck) | ★★ | ~ | ↓↓↓ | M | ◑ partial (`choose_model_ref_struggling`; opt-in `ORIGIN_ROUTER`) |
-| 3 | **Regression-test selection before final answer** (run the touched-area tests, feed failures back) | ★★★ | ↑ small | ↓ (fewer bad patches) | S–M | ✅ **shipped** (`ORIGIN_TEST_SELECT`) |
+| 2 | **Uncertainty-gated model cascade** (cheap model drives; escalate only when stuck) | ★★ | ~ | ↓↓↓ | M | ✗ **not in the main conversation** (D4, §10); opt-in `ORIGIN_ROUTER` stays; route through sub-agents instead |
+| 3 | **Regression-test selection before final answer** (run the touched-area tests, feed failures back) | ★★★ | ↑ small | ↓ (fewer bad patches) | S–M | ✅ **shipped** (`ORIGIN_TEST_SELECT`; graph edges are file-local, so callers in other files are not selected) |
 | 4 | **Localize-then-edit retrieval band** (repo-map + codegraph "suspect set" injected before the agent reads files) | ★★ | ↓↓ | ↓ | S | ◑ partial (repomap `focus` on by default) |
 | 5 | **Best-of-N with execution-grounded selection** (only when a test oracle exists) | ★★★ | ↑↑ | ↑ but bounded | M | ✅ **shipped** (`ORIGIN_BESTOFN=N`) |
-| 6 | **Sub-agent return-contract compression** (force structured `CompletionReport`, drop raw transcript) | ★ | ↓↓ | ↓ | S | ☐ |
-| 7 | **Adaptive thinking-budget by phase/uncertainty** | ★ | ↓ | ↓ | S | ☐ |
+| 6 | **Sub-agent return-contract compression** (force structured `CompletionReport`, drop raw transcript) | ★ | ↓↓ | ↓ | S | ◑ partial (B8: files touched, status, report capped at 8,000 chars) |
+| 7 | **Adaptive thinking-budget by phase/uncertainty** | ★ | ↓ | ↓ | S | ✗ **not built** (D4, §10): effort is fixed per conversation (B3) |
 | 8 | **"Anchored" file reads / edit-anchored re-reads** (never re-emit a whole file the model already saw) | ~ | ↓↓ | ↓ | S | ◑ partial (`ORIGIN_AGENTGREP_TRUNCATE` for Grep) |
-| 9 | **Semantic + exact prompt-prefix cache across sessions** (warm the cache from a sibling session) | ~ | ↓ | ↓↓ | M | ☐ |
-| 10 | **Speculative *next-tool* prefetch** (extend the existing speculative path to chains) | ↑ latency | ~ | ~ | M | ☐ |
-| 11 | **Token-budgeted, model-tuned system prompt** (trim the always-on directive; make it conditional) | ~ | ↓ | ↓ | S | ☐ |
+| 9 | **Semantic + exact prompt-prefix cache across sessions** (warm the cache from a sibling session) | ~ | ↓ | ↓↓ | M | ⏸ parked (D10, §10) |
+| 10 | **Speculative *next-tool* prefetch** (extend the existing speculative path to chains) | ↑ latency | ~ | ~ | M | ⏸ parked (D10, §10) |
+| 11 | **Token-budgeted, model-tuned system prompt** (trim the always-on directive; make it conditional) | ~ | ↓ | ↓ | S | ◑ partial (B5/D3: no directive headless, fixed worker prompt, mandates opt-in) |
 | 12 | **Diagnostic-driven repair loop already exists in `postedit` — wire it into the main loop** | ★★ | ↑ small | ↓ | S | ✅ **shipped** (`auto_lint`/`auto_test` + terminal enforcement) |
 
 > **Implementation status (workspace 0.9.13+).** Proposals **1, 3, 5, 12** — the
@@ -552,7 +552,7 @@ and `LoopSummary.gate_signals` was computed and dropped. The fix makes the gate
 |-----|--------|---------|
 | `ORIGIN_REPRO_GATE=1` | Arm the reproduction/regression gate on the current run: inject the `<repro-gate>` contract, run the test command at turn-end, and **refuse to return a tool-free "done" while tests are RED** — even with no `/goal`. Auto-derives a `test_command` from the repo's ecosystem markers. | off |
 | `ORIGIN_REPRO_GATE=<command>` | As above, but use `<command>` verbatim as the test oracle (escape hatch for non-standard runners). | — |
-| `ORIGIN_TEST_SELECT=1` | Regression-test **selection**: narrow the gate's test command to `{edited ∪ code-graph reverse-deps}` (pytest/go) instead of the whole suite. Falls back to the full command whenever narrowing could drop coverage. | off |
+| `ORIGIN_TEST_SELECT=1` | Regression-test **selection**: narrow the gate's test command to `{edited ∪ code-graph reverse-deps}` (pytest/go) instead of the whole suite. Falls back to the full command whenever narrowing could drop coverage. Code-graph edges are file-local, so the reverse-deps never reach callers in other files (pinned by `test_selection_does_not_follow_cross_file_callers`). | off |
 | `ORIGIN_BESTOFN=N` (N≥2, capped at 6) | For a **hard** instance (gate still RED), run N candidate attempts in isolated `git worktree` lanes, score each against the test oracle, and apply the verified winner's diff. Requires an armed oracle (`ORIGIN_REPRO_GATE`). | off |
 
 `[post_edit]` in `governance.toml` also gained a `repro_gate` key (previously the
@@ -582,9 +582,9 @@ unreachable).
 - **Best-of-N:** pure policy in `origin_swarm::bestofn`
   (`select_best`/`has_verified_winner`/`DifficultySignals`, fully unit-tested);
   orchestration in `origin_daemon::bestofn_runner` (`WorktreeArena` +
-  `run_best_of_n`), invoked from `main::maybe_run_best_of_n`. The batch runs on a
-  blocking thread and serializes on a process-wide cwd lock (candidates edit
-  cwd-relative paths, so each runs with cwd pointed at its worktree).
+  `run_best_of_n`), invoked from `main::maybe_run_best_of_n`. Each candidate runs
+  with its own working directory (`LoopOptions::cwd`, its worktree) instead of
+  changing the daemon's process-wide cwd (A12).
 
 ### 9.3 A/B protocol (unchanged from §6, restated per feature)
 
@@ -607,3 +607,71 @@ that **SWE-bench hides the `FAIL_TO_PASS`/`PASS_TO_PASS` tests**, so the
 auto-derived whole-suite command (e.g. `pytest`) is what the gate runs; it
 verifies the model's *own* reproduction test and any repo tests it can see, not
 the hidden grader.
+
+---
+
+## 10. 2026-11 evidence review (D1–D10)
+
+*Dated 2026-11. Records which proposals stay opt-in or are deliberately not
+built, after the harness-improvements work (CHANGELOG `[Unreleased]`). Sources
+are the ones the plan's research report cites; "report inference" marks a point
+the report reasons to rather than measures.*
+
+| # | Decision | Evidence | State in code |
+|---|---|---|---|
+| D1 | The reproduction gate (#1) **stays opt-in**. | Generated reproduction tests were neutral-to-negative for a strong model: 74 → 71, 71, 73 of 100 ([SWE-Doctor](https://arxiv.org/abs/2607.00990)). | `ORIGIN_REPRO_GATE` unset/`0`/`false`/`off` ⇒ no change (`config::resolve_post_edit_with_repro_gate`); `[post_edit] repro_gate` defaults to `false`. C5 hardened the gate itself. |
+| D2 | Best-of-N (#5) **stays opt-in**, for high-stakes runs. | About +5 pp at N=3 on 2025 models with cost linear in N ([Trae Agent](https://arxiv.org/abs/2507.23370)); Augment dropped ensembling over cost ([Augment](https://www.augmentcode.com/blog/1-open-source-agent-on-swe-bench-verified-by-combining-claude-3-7-and-o1)). | `bestofn_runner::configured_n`: unset, `0`, `1` or non-numeric ⇒ off. |
+| D4 | **No per-turn model routing or per-turn effort changes in the main conversation.** Route work to other models through sub-agents (B8) and fix effort per conversation (B3). #2 and #7 are marked accordingly in §0. | Prompt caches are per model, so a mid-session switch re-reads everything uncached ([Claude Code lessons](https://claude.dev/blog/lessons-from-building-claude-code-prompt-caching-is-everything/)); effort changes invalidate the cache on most models ([Claude Code](https://code.claude.com/docs/en/prompt-caching)). | `ORIGIN_ROUTER` unset ⇒ `Router::from_env` returns `None` (routing off). The existing opt-in strategies are kept, not extended. |
+| D5 | **No further recall machinery and no embedding-ranked compaction** (§4.4). Plain age-based elision instead (A1, A7). | Recoverable elision averaged −0.36 pp and went unused in 36 of 64 settings ([2609.20804](https://arxiv.org/html/2609.20804v1)). | A7 elides old tool results to one-line placeholders past 70% of the window. |
+| D6 | **No embeddings code index**, and `SkillEmbedder` stays unwired. The README claim of embedding-indexed skill injection was corrected (A10). Revisit only for very large repositories. | +12.5% is first-party with a proprietary embedder; the online gain was +0.3% overall and +2.6% at 1,000+ files ([Cursor](https://cursor.com/blog/semsearch)). | The system prompt lists every skill by name and description; a skill's body is injected only after `/<name>`. |
+| D7 | **No `/init`-style generated instruction file.** If a loader is ever added: short, human-written, in the per-project cache layer, treated as untrusted. | LLM-generated files −0.5 and −2 pp at ~20% more cost; human-written +2.4 pp at p=0.21 ([2602.11988](https://arxiv.org/abs/2602.11988)); instruction files are an injection and persistence vector ([CSA](https://labs.cloudsecurityalliance.org/research/csa-research-note-ai-coding-agent-ci-prompt-injection-202608/)). | Not present. |
+| D8 | **No blanket "write secure code" prompt line.** C6 (dependency gate, opt-in diff review) instead. | Functional correctness 53.6% → 45.5% for +1.6 pp secure ([BaxBench](https://arxiv.org/html/2502.11844)); security hints were ineffective ([SusVibes](https://arxiv.org/html/2512.03262v2)). | Not present. |
+| D9 | **No forced LSP navigation, think tool, fast-apply model, or new hard loop-breakers.** Nudges stay soft (B11 is one message) and LSP stays optional (C10 is opt-in). | Forced LSP 100% → 89% ([RuntimeWire](https://runtimewire.com/article/agentconnect-coding-agents-grep-lsp-tool-harness)); think-tool data is early 2025 ([Anthropic](https://www.anthropic.com/engineering/claude-think-tool)); fast-apply figures are vendor-only ([Morph](https://morphllm.com/blog/fast-apply-fast-agents)); a bundled loop breaker regressed 5.6–6.7 pp ([Meta-Harness](https://arxiv.org/abs/2603.28052)). | The existing stuck detector (hard stop at 5 repeats) is unchanged. |
+| D10 | **Park #9 (cross-session cache warming) and #10 (speculative next-tool prefetch)** until A3 and B2 are measured. | Report inference: #10 extends the speculative path that had the A3 permission gap, and #9 warms a prefix B2 had to stabilise first. Same-prefix siblings need only a few seconds' stagger ([Claude Code](https://code.claude.com/docs/en/prompt-caching)). | A3 and B2 have landed but are **not measured**: the B4 regression benchmark exists with no committed baseline. |
+
+D3 (swarm and verifier mandates opt-in, `ORIGIN_SWARM_ALWAYS=1`) and D11 (the
+stealth-browser fallback opt-in, `ORIGIN_STEALTH_FALLBACK=1`, and
+`playwright-core` pinned to `1.45.0`) were code changes; see the CHANGELOG.
+
+### What an OS sandbox would take
+
+No OS sandbox is active on any shipped build (`origin_sandbox::sandbox_status()`
+reports `unavailable` everywhere); see the
+[security model](../security/security-model.md#status-on-shipped-builds-no-os-sandbox-is-active)
+for the per-backend inventory. Enabling one needs these decisions, and a Linux
+and a macOS machine to test them on (none of this could be run on the Windows
+host the work was done on):
+
+1. **Carve-outs on Linux.** Landlock is allow-only and inherits down the tree, so
+   it cannot keep `.git/hooks`, `AGENTS.md` or `.origin/` read-only inside a
+   writable workspace (`git commit` needs create rights in `.git`). Choose:
+   bubblewrap / a mount namespace with read-only binds (needs unprivileged user
+   namespaces, which some distributions restrict), accepting that Linux does not
+   enforce the carve-outs, or forbidding file creation at the workspace root.
+2. **Reading secrets.** Denying `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh` and
+   Origin's credentials on Linux means inverting today's "read only system dirs"
+   policy into an enumerated "read everything except", and deciding which files
+   under `~/.origin/` count as credentials.
+3. **Fail-closed semantics.** Landlock needs kernel 5.13+ and the backend asks for
+   ABI 4 (6.7). Hard requirement refuses every command on older kernels, many
+   containers and WSL; best-effort degrades silently. Pick a minimum ABI and how
+   partial enforcement is reported.
+4. **Resource caps.** Keep, raise or drop the 60 CPU-second / 1 GiB address-space
+   caps, which kill ordinary builds and node/JVM runs today.
+5. **Network.** A network-off default breaks most MCP servers and some hooks;
+   per-server opt-in or an MCP exemption.
+6. **Which directory is the workspace.** The backends use the daemon's cwd; the
+   session's workspace root must be passed to the supervisor, the hook shell
+   pool and the MCP stdio transport (the Bash `cwd` argument is model-chosen and
+   must not be the confinement root).
+7. **macOS.** SBPL can express the policy, but the backend must stop replacing
+   the `Command` (which discards the env scrub, cwd and stdio), use a curated
+   allow-list instead of a bare `(deny default)`, handle `/private/tmp` and
+   `$TMPDIR`, and escape paths.
+8. **Reporting.** How to tell "failed because of the sandbox" from an ordinary
+   failure (EPERM/EACCES outside the write set, `socket` EPERM), and returning a
+   refused spawn as an `is_error` result.
+
+Windows has no confining backend to enable: `backend_windows.rs` sets only
+`CREATE_SUSPENDED` and its Job Object attach is never called. Until a backend
+reports `active`, permission mode `workspace` asks before every Bash command.

@@ -16,9 +16,7 @@ pub fn run_one(bin: &Path, task: &Task) -> anyhow::Result<TaskResult> {
     // internally tagged on `kind` (snake_case). Token usage rides on
     // `{"kind":"usage",...}`; each tool start is a `{"kind":"tool_activity",...}`.
     // The prompt is a POSITIONAL arg (there is no `--prompt` flag).
-    let out = Command::new(bin)
-        .args(["run", "--json", &task.prompt])
-        .output()?;
+    let out = Command::new(bin).args(["run", "--json", &task.prompt]).output()?;
     let wall = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let mut input_tokens: u64 = 0;
@@ -30,10 +28,14 @@ pub fn run_one(bin: &Path, task: &Task) -> anyhow::Result<TaskResult> {
             match v.get("kind").and_then(|x| x.as_str()) {
                 Some("usage") => {
                     input_tokens = input_tokens.saturating_add(
-                        v.get("input_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                        v.get("input_tokens")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
                     );
                     output_tokens = output_tokens.saturating_add(
-                        v.get("output_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                        v.get("output_tokens")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
                     );
                 }
                 Some("tool_activity") => tool_calls = tool_calls.saturating_add(1),

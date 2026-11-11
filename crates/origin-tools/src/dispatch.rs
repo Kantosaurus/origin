@@ -13,9 +13,21 @@
 use blake3::Hash as Blake3Hash;
 use std::collections::HashMap;
 
-/// Tool names that never memoize. Side-effect-free guarantees do not extend
-/// to tools that write to the filesystem or shell out.
-pub const MEMOIZATION_SKIPLIST: &[&str] = &["Bash", "Edit", "Write"];
+/// Tool names that never memoize.
+///
+/// Side-effect-free guarantees do not extend to tools that write to the
+/// filesystem or shell out, nor to tools whose answer changes over time for
+/// the same input (a live process, the user, an inbox, a code graph still
+/// being built).
+pub const MEMOIZATION_SKIPLIST: &[&str] = &[
+    "Bash",
+    "Edit",
+    "Write",
+    "Monitor",
+    "ask_user",
+    "gmail",
+    "graph_query",
+];
 
 /// 32-byte content hash of `(tool_name, raw_input_bytes)`. The hash function
 /// is blake3, matching the rest of `origin` (`origin-cas::Hash`).
@@ -65,6 +77,12 @@ impl Cache {
     #[must_use]
     pub fn lookup(&self, key: &NormalizedInput) -> Option<&CacheHit> {
         self.table.get(key)
+    }
+
+    /// Drop every memoized result. Called before any mutating tool runs, since
+    /// it may change files a cached `Read`/`Grep`/`Glob` result describes.
+    pub fn clear(&mut self) {
+        self.table.clear();
     }
 
     /// Record a result. `turn` is the conversation turn number for the

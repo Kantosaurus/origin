@@ -18,7 +18,7 @@
 //! Secure defaults: a closed event channel or a dropped decision sender denies,
 //! so a vanished client can never silently auto-approve.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
@@ -34,11 +34,22 @@ use crate::protocol::StreamEvent;
 /// Shared (`Arc`) across every connection handler so a decision arriving on one
 /// connection can resolve an ask emitted on another. Ids are globally unique
 /// within the daemon's lifetime.
+/// C2: the `(session id, tool)` an "always allow" answer to an ask covers.
+type AlwaysKey = (String, String);
+/// An in-flight ask: its decision sender and the key an lways answer covers.
+type Pending = (oneshot::Sender<bool>, Option<AlwaysKey>);
+
 #[derive(Debug, Default)]
 pub struct PermissionRegistry {
-    pending: Mutex<HashMap<u64, oneshot::Sender<bool>>>,
+    /// Each in-flight ask: its decision sender and, when the person may answer
+    /// "always allow", the `(session id, tool)` that answer covers (C2).
+    pending: Mutex<HashMap<u64, Pending>>,
     /// Monotonic correlation-id source. Starts at 1 so `0` is never valid.
     next_id: AtomicU64,
+    /// C2: tools the person answered "always allow" for, per session id.
+    // ponytail: in memory only (lost on daemon restart) and never evicted;
+    // persist or key on session lifetime if that ever matters.
+    standing: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 impl PermissionRegistry {
@@ -48,15 +59,26 @@ impl PermissionRegistry {
         Self {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            standing: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Reserve a correlation id and a receiver for its decision.
-    fn register(&self) -> (u64, oneshot::Receiver<bool>) {
+    /// Reserve a correlation id and a receiver for its decision. `always_key`
+    /// is the `(session id, tool)` an "always allow" answer may cover.
+    fn register(&self, always_key: Option<AlwaysKey>) -> (u64, oneshot::Receiver<bool>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().insert(id, tx);
+        self.pending.lock().insert(id, (tx, always_key));
         (id, rx)
+    }
+
+    /// C2: whether `tool` has a standing "always allow" in `session_id`.
+    #[must_use]
+    pub fn is_standing(&self, session_id: &str, tool: &str) -> bool {
+        self.standing
+            .lock()
+            .get(session_id)
+            .is_some_and(|tools| tools.contains(tool))
     }
 
     /// Drop a reservation whose ask could not be emitted.
@@ -72,10 +94,15 @@ impl PermissionRegistry {
 
     /// Deliver a client decision, correlated by `id`. Unknown ids (a stray or
     /// late decision, or one whose `ask` already gave up) are ignored, so a
-    /// misbehaving client can never panic the daemon.
-    pub fn resolve(&self, id: u64, allow: bool) {
-        let sender = self.pending.lock().remove(&id);
-        if let Some(tx) = sender {
+    /// misbehaving client can never panic the daemon. C2: `allow && always`
+    /// records a standing allow for the ask's session and tool, but only for an
+    /// ask that offered "always" (never a `Task` or an ask that needs a person).
+    pub fn resolve(&self, id: u64, allow: bool, always: bool) {
+        let entry = self.pending.lock().remove(&id);
+        if let Some((tx, always_key)) = entry {
+            if let (true, true, Some((session, tool))) = (allow, always, always_key) {
+                self.standing.lock().entry(session).or_default().insert(tool);
+            }
             // The receiver may have been dropped (turn ended); ignore the error.
             let _ = tx.send(allow);
         }
@@ -172,22 +199,35 @@ pub struct IpcPrompter {
     event_tx: mpsc::Sender<StreamEvent>,
     /// Shared decision table.
     registry: std::sync::Arc<PermissionRegistry>,
+    /// C2: the session whose standing "always allow" answers this prompter uses.
+    session_id: String,
+    /// C2: set once the client is gone (channel closed, decision dropped); from
+    /// then on [`Prompter::can_ask`] is `false`, so denials say nobody can be asked.
+    gone: std::sync::atomic::AtomicBool,
 }
 
 impl IpcPrompter {
-    /// Create a prompter that emits asks over `event_tx` and parks on `registry`.
+    /// Create a prompter that emits asks over `event_tx`, parks on `registry`
+    /// and keeps "always allow" answers for `session_id`.
     #[must_use]
     pub const fn new(
         event_tx: mpsc::Sender<StreamEvent>,
         registry: std::sync::Arc<PermissionRegistry>,
+        session_id: String,
     ) -> Self {
-        Self { event_tx, registry }
+        Self {
+            event_tx,
+            registry,
+            session_id,
+            gone: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     /// Core ask by tool name + preview (the trait's [`ToolMeta`]-free seam, so
     /// the round-trip is unit-testable without constructing a full `ToolMeta`).
-    async fn ask_named(&self, tool: &str, args_preview: &str) -> bool {
-        let (id, rx) = self.registry.register();
+    async fn ask_named(&self, tool: &str, args_preview: &str, offer_always: bool) -> bool {
+        let always_key = offer_always.then(|| (self.session_id.clone(), tool.to_string()));
+        let (id, rx) = self.registry.register(always_key);
         let _guard = PermissionCancelGuard {
             reg: &self.registry,
             id,
@@ -196,20 +236,37 @@ impl IpcPrompter {
             id,
             tool: tool.to_string(),
             args_preview: args_preview.to_string(),
+            no_always: !offer_always,
         };
         if self.event_tx.send(ask).await.is_err() {
             // Client/relay gone ⇒ cannot ask ⇒ secure default deny (guard cleans up).
+            self.gone.store(true, Ordering::Relaxed);
             return false;
         }
         // Block until the client answers; a dropped sender resolves to deny.
-        rx.await.unwrap_or(false)
+        rx.await.unwrap_or_else(|_| {
+            self.gone.store(true, Ordering::Relaxed);
+            false
+        })
     }
 }
 
 #[async_trait]
 impl Prompter for IpcPrompter {
     async fn ask(&self, meta: &ToolMeta, args_preview: &str) -> bool {
-        self.ask_named(meta.name, args_preview).await
+        self.ask_named(meta.name, args_preview, false).await
+    }
+
+    async fn ask_offering(&self, meta: &ToolMeta, args_preview: &str, offer_always: bool) -> bool {
+        self.ask_named(meta.name, args_preview, offer_always).await
+    }
+
+    fn can_ask(&self) -> bool {
+        !self.gone.load(Ordering::Relaxed)
+    }
+
+    fn standing_allow(&self, tool: &str) -> bool {
+        self.registry.is_standing(&self.session_id, tool)
     }
 }
 
@@ -281,6 +338,7 @@ mod tests {
                 id,
                 tool: t,
                 args_preview,
+                ..
             } => {
                 assert_eq!(t, tool);
                 assert_eq!(args_preview, preview);
@@ -294,10 +352,10 @@ mod tests {
     async fn resolve_true_allows_the_waiting_ask() {
         let (tx, mut rx) = mpsc::channel(4);
         let registry = Arc::new(PermissionRegistry::new());
-        let prompter = IpcPrompter::new(tx, Arc::clone(&registry));
-        let handle = tokio::spawn(async move { prompter.ask_named("Bash", "rm -rf x").await });
+        let prompter = IpcPrompter::new(tx, Arc::clone(&registry), "s".into());
+        let handle = tokio::spawn(async move { prompter.ask_named("Bash", "rm -rf x", false).await });
         let id = expect_ask(rx.recv().await.expect("ask emitted"), "Bash", "rm -rf x");
-        registry.resolve(id, true);
+        registry.resolve(id, true, false);
         assert!(handle.await.expect("task joins"), "allow decision returns true");
     }
 
@@ -305,10 +363,10 @@ mod tests {
     async fn resolve_false_denies_the_waiting_ask() {
         let (tx, mut rx) = mpsc::channel(4);
         let registry = Arc::new(PermissionRegistry::new());
-        let prompter = IpcPrompter::new(tx, Arc::clone(&registry));
-        let handle = tokio::spawn(async move { prompter.ask_named("Write", "/etc/passwd").await });
+        let prompter = IpcPrompter::new(tx, Arc::clone(&registry), "s".into());
+        let handle = tokio::spawn(async move { prompter.ask_named("Write", "/etc/passwd", false).await });
         let id = expect_ask(rx.recv().await.expect("ask emitted"), "Write", "/etc/passwd");
-        registry.resolve(id, false);
+        registry.resolve(id, false, false);
         assert!(!handle.await.expect("task joins"), "deny decision returns false");
     }
 
@@ -318,12 +376,12 @@ mod tests {
         // connection path), not the prompter that emitted the ask.
         let (tx, mut rx) = mpsc::channel(4);
         let registry = Arc::new(PermissionRegistry::new());
-        let prompter = IpcPrompter::new(tx, Arc::clone(&registry));
-        let handle = tokio::spawn(async move { prompter.ask_named("Edit", "src/x.rs").await });
+        let prompter = IpcPrompter::new(tx, Arc::clone(&registry), "s".into());
+        let handle = tokio::spawn(async move { prompter.ask_named("Edit", "src/x.rs", false).await });
         let id = expect_ask(rx.recv().await.expect("ask emitted"), "Edit", "src/x.rs");
         // A *different* holder of the Arc resolves it.
         let other = Arc::clone(&registry);
-        other.resolve(id, true);
+        other.resolve(id, true, false);
         assert!(handle.await.expect("task joins"));
     }
 
@@ -332,17 +390,52 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         drop(rx); // no client listening
         let registry = Arc::new(PermissionRegistry::new());
-        let prompter = IpcPrompter::new(tx, registry);
+        let prompter = IpcPrompter::new(tx, registry, "s".into());
         assert!(
-            !prompter.ask_named("Bash", "x").await,
+            !prompter.ask_named("Bash", "x", false).await,
             "a vanished client must deny, never silently allow"
         );
+    }
+
+    /// C2 (fix 8): a vanished client makes the prompter report it cannot ask,
+    /// so the denial says nobody could be asked rather than "user-denied".
+    #[tokio::test]
+    async fn closed_channel_turns_can_ask_off() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let prompter = IpcPrompter::new(tx, Arc::new(PermissionRegistry::new()), "s".into());
+        assert!(prompter.can_ask());
+        assert!(!prompter.ask_named("Bash", "x", true).await);
+        assert!(!prompter.can_ask());
+    }
+
+    /// C2 (fix 3): "always allow" sticks for the ask's session and tool only
+    /// when the ask offered it; the ask carries `no_always` otherwise.
+    #[tokio::test]
+    async fn always_answer_sticks_only_when_offered() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let registry = Arc::new(PermissionRegistry::new());
+        let prompter = Arc::new(IpcPrompter::new(tx, Arc::clone(&registry), "s1".into()));
+        for (offer, tool) in [(false, "Task"), (true, "Bash")] {
+            let p = Arc::clone(&prompter);
+            let handle = tokio::spawn(async move { p.ask_named(tool, "x", offer).await });
+            let (id, no_always) = match rx.recv().await.expect("ask emitted") {
+                StreamEvent::PermissionAsk { id, no_always, .. } => (id, no_always),
+                other => panic!("expected PermissionAsk, got {other:?}"),
+            };
+            assert_eq!(no_always, !offer, "{tool}");
+            registry.resolve(id, true, true);
+            assert!(handle.await.expect("joins"));
+        }
+        assert!(!prompter.standing_allow("Task"), "an unoffered always is ignored");
+        assert!(prompter.standing_allow("Bash"));
+        assert!(!registry.is_standing("other-session", "Bash"), "per session");
     }
 
     #[test]
     fn resolve_unknown_id_is_noop() {
         let registry = PermissionRegistry::new();
-        registry.resolve(999, true); // must not panic
+        registry.resolve(999, true, false); // must not panic
     }
 
     #[tokio::test]
@@ -351,9 +444,9 @@ mod tests {
         // on `rx`) must not leak the registry reservation for the daemon's life.
         let (tx, mut rx) = mpsc::channel(4);
         let registry = Arc::new(PermissionRegistry::new());
-        let prompter = IpcPrompter::new(tx, Arc::clone(&registry));
+        let prompter = IpcPrompter::new(tx, Arc::clone(&registry), "s".into());
         {
-            let fut = prompter.ask_named("Bash", "x");
+            let fut = prompter.ask_named("Bash", "x", false);
             tokio::pin!(fut);
             // Poll the ask far enough to register + emit, then DROP it (the rx
             // branch wins, the never-resolved `fut` is dropped at scope end).

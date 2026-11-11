@@ -39,6 +39,8 @@ fn spec(goal: &str) -> WorkerSpec {
         parent_actor: ActorId::new(0),
         model: None,
         mcp_servers: Vec::new(),
+        effort: None,
+        ponytail: None,
     }
 }
 
@@ -82,6 +84,7 @@ async fn spawned_workers_run_concurrently_not_serially() {
                 transcript_handle: [0; 32],
                 usage: Usage::default(),
                 detail: None,
+                tainted: false,
             })
         })
     });

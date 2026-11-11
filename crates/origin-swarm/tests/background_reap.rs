@@ -9,8 +9,8 @@ use std::sync::Arc;
 use origin_cas::{Store as CasStore, StoreConfig};
 use origin_plan::{ActorId, Plan, PlanStore};
 use origin_swarm::{
-    AdmissionGate, Budget, CompletionReport, Coordinator, PlanHandle, ReportStatus, Usage,
-    WorkerContext, WorkerFn, WorkerSpec,
+    AdmissionGate, Budget, CompletionReport, Coordinator, PlanHandle, ReportStatus, Usage, WorkerContext,
+    WorkerFn, WorkerSpec,
 };
 use tempfile::TempDir;
 use tokio::sync::{Mutex, Notify};
@@ -39,6 +39,8 @@ fn spec(goal: &str) -> WorkerSpec {
         parent_actor: ActorId::new(0),
         model: None,
         mcp_servers: Vec::new(),
+        effort: None,
+        ponytail: None,
     }
 }
 
@@ -72,6 +74,7 @@ async fn try_completion_polls_without_blocking_then_evicts() {
                 transcript_handle: [0; 32],
                 usage: Usage::default(),
                 detail: None,
+                tainted: false,
             })
         })
     });
