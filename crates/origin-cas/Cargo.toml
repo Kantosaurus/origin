@@ -29,7 +29,7 @@ zstd = "0.13"
 
 [dev-dependencies]
 hex = "0.4"
-proptest = { version = "=1.4.0", default-features = false, features = ["std"] }
+proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
 tempfile = "3"
 
 [features]
