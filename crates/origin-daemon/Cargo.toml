@@ -89,7 +89,7 @@ origin-gmail            = { path = "../origin-gmail" }
 origin-workflowgen      = { path = "../origin-workflowgen" }
 origin-ponytail         = { path = "../origin-ponytail" }
 ctrlc                   = "3"
-dirs                    = "5"
+dirs                    = "6"
 which                   = "8"
 globset.workspace       = true
 reqwest                 = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "rustls-tls-native-roots"] }

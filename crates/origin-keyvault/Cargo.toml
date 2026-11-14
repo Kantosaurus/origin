@@ -39,7 +39,7 @@ chrono = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 secret-service = { version = "4", features = ["rt-tokio-crypto-rust"] }
 age = "0.11"
-dirs = "5"
+dirs = "6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Upper bound on 3.7.0 keeps the dep MSRV-compatible: 3.7+ requires the
