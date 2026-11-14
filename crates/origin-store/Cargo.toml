@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 rusqlite = { version = "0.31", features = ["bundled", "blob"] }
-refinery = { version = "0.8", features = ["rusqlite"] }
+refinery = { version = "0.9", features = ["rusqlite"] }
 thiserror = "1"
 tracing = "0.1"
 
