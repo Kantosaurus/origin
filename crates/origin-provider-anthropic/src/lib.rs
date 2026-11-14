@@ -205,9 +205,12 @@ impl Anthropic {
     /// Propagates [`ProviderError`] from CAS handle expansion, or
     /// [`ProviderError::Api`] if the typed body fails to serialize.
     fn build_chat_body(&self, req: &ChatRequest) -> Result<serde_json::Value, ProviderError> {
-        let expanded = expand_messages_for_wire(&req.messages, self.cas.as_ref(), self.plan.as_ref())?;
+        // A1: every tool-result handle is inlined verbatim (no size-based
+        // `<result handle:…>` stub the model cannot resolve). Replacing OLD
+        // results with placeholders is a transcript-level step upstream of
+        // the provider, so it applies to every provider alike.
+        let expanded = origin_provider::inflate_tool_result_handles(&req.messages, self.cas.as_ref())?;
         let plan = self.plan.as_ref();
-        let wire_messages = build_wire_messages(&expanded, plan);
         let wire_tools = req
             .tools
             .iter()
@@ -226,6 +229,8 @@ impl Anthropic {
         } else {
             req.system.clone()
         };
+        let system = wire_system(&system_text);
+        let wire_messages = build_wire_messages(&expanded, plan, message_marker_budget(system.as_ref()));
 
         let body = wire::WireRequest {
             model: &req.model,
@@ -233,11 +238,7 @@ impl Anthropic {
             // (Anthropic requires `max_tokens` > `budget_tokens`); otherwise
             // unchanged at `DEFAULT_MAX_TOKENS` ⇒ byte-identical default.
             max_tokens: resolve_max_tokens(req.thinking_tokens),
-            system: if system_text.is_empty() {
-                None
-            } else {
-                Some(system_text.as_str())
-            },
+            system,
             messages: wire_messages,
             tools: wire_tools,
             metadata: self.oauth_metadata.as_ref().map(|m| wire::WireMetadata {
@@ -321,9 +322,8 @@ impl Provider for Anthropic {
 
     #[allow(clippy::too_many_lines)] // cohesive streaming method: body build + status handling + optional cassette record/replay tap
     async fn chat_stream(&self, req: ChatRequest, ring: &origin_stream::Ring) -> Result<(), ProviderError> {
-        let expanded = expand_messages_for_wire(&req.messages, self.cas.as_ref(), self.plan.as_ref())?;
+        let expanded = origin_provider::inflate_tool_result_handles(&req.messages, self.cas.as_ref())?;
         let plan = self.plan.as_ref();
-        let wire_messages = build_wire_messages(&expanded, plan);
         let wire_tools = req
             .tools
             .iter()
@@ -342,6 +342,8 @@ impl Provider for Anthropic {
         } else {
             req.system.clone()
         };
+        let system = wire_system(&system_text);
+        let wire_messages = build_wire_messages(&expanded, plan, message_marker_budget(system.as_ref()));
 
         let mut body_json = serde_json::json!({
             "model": req.model,
@@ -349,11 +351,7 @@ impl Provider for Anthropic {
             // (Anthropic requires `max_tokens` > `budget_tokens`); otherwise
             // unchanged at `DEFAULT_MAX_TOKENS` ⇒ byte-identical default.
             "max_tokens": resolve_max_tokens(req.thinking_tokens),
-            "system": if system_text.is_empty() {
-                serde_json::Value::Null
-            } else {
-                serde_json::Value::String(system_text)
-            },
+            "system": system,
             "messages": wire_messages,
             "tools": wire_tools,
             "stream": true,
@@ -522,14 +520,23 @@ mod transient_tests {
 
     #[test]
     fn retries_429_529_and_5xx_but_not_4xx() {
-        assert!(status_is_transient(StatusCode::TOO_MANY_REQUESTS), "429 is retryable");
+        assert!(
+            status_is_transient(StatusCode::TOO_MANY_REQUESTS),
+            "429 is retryable"
+        );
         assert!(
             status_is_transient(StatusCode::from_u16(529).unwrap()),
             "529 overloaded_error is retryable (the common turn-killer)"
         );
-        assert!(status_is_transient(StatusCode::INTERNAL_SERVER_ERROR), "500 retryable");
+        assert!(
+            status_is_transient(StatusCode::INTERNAL_SERVER_ERROR),
+            "500 retryable"
+        );
         assert!(status_is_transient(StatusCode::BAD_GATEWAY), "502 retryable");
-        assert!(status_is_transient(StatusCode::SERVICE_UNAVAILABLE), "503 retryable");
+        assert!(
+            status_is_transient(StatusCode::SERVICE_UNAVAILABLE),
+            "503 retryable"
+        );
         assert!(!status_is_transient(StatusCode::BAD_REQUEST), "400 stays fatal");
         assert!(!status_is_transient(StatusCode::NOT_FOUND), "404 stays fatal");
     }
@@ -547,10 +554,13 @@ mod transient_tests {
             cache_marker: None,
             is_error: true,
         };
-        match block_to_wire(&err, None) {
-            Some(wire::WireBlock::ToolResult { is_error, .. }) => assert!(is_error, "structured error flag"),
-            _ => panic!("expected a ToolResult wire block"),
-        }
+        assert!(
+            matches!(
+                block_to_wire(&err, None),
+                Some(wire::WireBlock::ToolResult { is_error: true, .. })
+            ),
+            "structured error flag"
+        );
 
         // A success result with non-error content stays false.
         let ok = Block::ToolResult {
@@ -560,10 +570,13 @@ mod transient_tests {
             cache_marker: None,
             is_error: false,
         };
-        match block_to_wire(&ok, None) {
-            Some(wire::WireBlock::ToolResult { is_error, .. }) => assert!(!is_error, "success stays false"),
-            _ => panic!("expected a ToolResult wire block"),
-        }
+        assert!(
+            matches!(
+                block_to_wire(&ok, None),
+                Some(wire::WireBlock::ToolResult { is_error: false, .. })
+            ),
+            "success stays false"
+        );
 
         // Safety net: an "Error:"-prefixed result whose flag was left false is
         // still surfaced as an error on the wire (false-negative guard).
@@ -574,22 +587,69 @@ mod transient_tests {
             cache_marker: None,
             is_error: false,
         };
-        match block_to_wire(&legacy, None) {
-            Some(wire::WireBlock::ToolResult { is_error, .. }) => {
-                assert!(is_error, "content fallback flags the legacy Error: convention");
-            }
-            _ => panic!("expected a ToolResult wire block"),
-        }
+        assert!(
+            matches!(
+                block_to_wire(&legacy, None),
+                Some(wire::WireBlock::ToolResult { is_error: true, .. })
+            ),
+            "content fallback flags the legacy Error: convention"
+        );
     }
 }
 
 /// Anthropic's Messages API rejects any request carrying more than this many
 /// blocks with `cache_control` (`invalid_request_error: "A maximum of 4 blocks
 /// with cache_control may be provided."`). The ceiling spans the WHOLE request
-/// (tools + system + messages); in this encoder `system` is a plain string and
-/// `WireTool` carries no marker, so every marker lives on a message block and
-/// this is the only place the budget is spent.
+/// (tools + system + messages). `WireTool` carries no marker; a non-empty
+/// `system` carries exactly one ([`wire_system`]), and the messages get the
+/// rest ([`message_marker_budget`]).
 const WIRE_MAX_CACHE_MARKERS: usize = 4;
+
+/// B2: encode `system` as a one-block array whose block carries a
+/// `cache_control` marker, so the tools + system prefix is written to the
+/// cache from a session's very first request (which has no tool-result marker
+/// yet). The daemon keeps that text session-stable, so later requests read it.
+/// Under `ORIGIN_CACHE_TTL_1H=1` it takes the 1h TTL: it is the earliest
+/// breakpoint, and a longer-TTL breakpoint must not follow a shorter one.
+/// Escape hatch: `ORIGIN_SYSTEM_CACHE=0` sends the pre-B2 plain string with no
+/// marker, for Anthropic-compatible endpoints that reject the array form.
+fn wire_system(text: &str) -> Option<wire::WireSystem<'_>> {
+    if text.is_empty() {
+        return None;
+    }
+    if !system_cache_enabled() {
+        return Some(wire::WireSystem::Text(text));
+    }
+    Some(wire::WireSystem::Blocks(vec![wire::WireBlock::Text {
+        text,
+        cache_control: Some(if ttl_1h_enabled() {
+            wire::WireCacheControl::ephemeral_1h()
+        } else {
+            wire::WireCacheControl::ephemeral()
+        }),
+    }]))
+}
+
+/// Whether the `system` prompt is sent as a marked (cached) block.
+///
+/// The ONE answer both this encoder and the daemon's rolling-marker planner
+/// use, so together they never exceed Anthropic's four breakpoints: 1 system +
+/// 3 message markers by default, 0 + 4 under `ORIGIN_SYSTEM_CACHE=0`. Read per
+/// call (one env lookup) so it can be flipped without a restart.
+#[must_use]
+pub fn system_cache_enabled() -> bool {
+    std::env::var("ORIGIN_SYSTEM_CACHE").as_deref() != Ok("0")
+}
+
+/// How many `cache_control` markers the messages may carry: the request-wide
+/// ceiling minus the one a marked (block-form) `system` spends. Takes the
+/// encoded `system` so the two can never disagree.
+const fn message_marker_budget(system: Option<&wire::WireSystem<'_>>) -> usize {
+    match system {
+        Some(wire::WireSystem::Blocks(_)) => WIRE_MAX_CACHE_MARKERS - 1,
+        Some(wire::WireSystem::Text(_)) | None => WIRE_MAX_CACHE_MARKERS,
+    }
+}
 
 /// Block indices within message `m` (at `msg_idx`) that any emission path would
 /// flag with `cache_control`, BEFORE the per-request ceiling is applied. Three
@@ -638,7 +698,11 @@ fn marker_block_indices(m: &Message, plan: Option<&Plan>, msg_idx: usize) -> Vec
 /// was dropped by `strip_orphan_tool_results`). Without this clamp such a drift
 /// is fatal: the API 400s the entire turn with `"A maximum of 4 blocks with
 /// cache_control may be provided. Found 5."`.
-fn build_wire_messages<'a>(messages: &'a [Message], plan: Option<&Plan>) -> Vec<wire::WireMessage<'a>> {
+fn build_wire_messages<'a>(
+    messages: &'a [Message],
+    plan: Option<&Plan>,
+    max_markers: usize,
+) -> Vec<wire::WireMessage<'a>> {
     // Pass 1: collect every (msg_idx, block_idx) any path would mark, in
     // document order (ascending msg_idx, then block_idx).
     let selected: Vec<(usize, usize)> = messages
@@ -654,21 +718,17 @@ fn build_wire_messages<'a>(messages: &'a [Message], plan: Option<&Plan>) -> Vec<
     // Clamp to the ceiling, keeping the LATEST markers: Anthropic's prompt cache
     // hits on prefix-extension, so a newer marker amortizes across more
     // subsequent turns than an older one. Since `selected` is in document order,
-    // the last `WIRE_MAX_CACHE_MARKERS` entries are the latest.
-    if selected.len() > WIRE_MAX_CACHE_MARKERS {
+    // the last `max_markers` entries are the latest.
+    if selected.len() > max_markers {
         tracing::warn!(
             selected = selected.len(),
-            kept = WIRE_MAX_CACHE_MARKERS,
+            kept = max_markers,
             "cache_control marker selection exceeded Anthropic's per-request ceiling; \
              keeping the latest and dropping the earliest to avoid a 400"
         );
     }
-    let keep: std::collections::HashSet<(usize, usize)> = selected
-        .iter()
-        .rev()
-        .take(WIRE_MAX_CACHE_MARKERS)
-        .copied()
-        .collect();
+    let keep: std::collections::HashSet<(usize, usize)> =
+        selected.iter().rev().take(max_markers).copied().collect();
 
     // Pass 2: serialize, emitting `cache_control` only on the kept positions.
     // Drop any message whose content serialized to empty — e.g. a thinking-only
@@ -791,109 +851,6 @@ fn block_to_wire(b: &Block, cache_control: Option<wire::WireCacheControl>) -> Op
         // Do not re-send thinking blocks; Anthropic ignores them on inbound.
         Block::Thinking { .. } => None,
     }
-}
-
-/// Re-inflate any `ToolResult` blocks that carry a CAS `handle` (but no
-/// inline bytes) by fetching the payload from the attached store.
-///
-/// When a `plan` is provided, consults `WireDecision` to decide whether to
-/// inline the bytes or emit a short `<result handle:… — N bytes>` reference.
-///
-/// Blocks with inline bytes (or unrelated kinds) are passed through unchanged.
-///
-/// # Errors
-/// Returns `ProviderError::Api` if a handle is encountered without a CAS, or if
-/// the CAS lookup itself errors. A CAS *miss* degrades to an inline
-/// `CAS_MISS_PLACEHOLDER` (payload lost in a restart) rather than failing.
-fn expand_messages_for_wire(
-    messages: &[Message],
-    cas: Option<&std::sync::Arc<origin_cas::Store>>,
-    plan: Option<&origin_planner::Plan>,
-) -> Result<Vec<Message>, ProviderError> {
-    let mut out = Vec::with_capacity(messages.len());
-    for m in messages {
-        let mut blocks = Vec::with_capacity(m.blocks.len());
-        for b in &m.blocks {
-            if let Block::ToolResult {
-                tool_use_id,
-                handle: Some(h),
-                inline: None,
-                cache_marker,
-                is_error,
-            } = b
-            {
-                let store = cas.ok_or_else(|| {
-                    ProviderError::Api("ToolResult handle present but no CAS configured".into())
-                })?;
-                let bytes = store
-                    .get(origin_cas::Hash::from_bytes(*h))
-                    .map_err(|e| ProviderError::Api(format!("cas get: {e}")))?
-                    .unwrap_or_else(|| {
-                        // Degrade rather than fail the turn: the payload was lost
-                        // in a daemon restart (Hot tier not flushed). Inline a
-                        // placeholder so the tool_use/tool_result pairing holds.
-                        tracing::warn!(
-                            "cas miss for tool result handle; substituting placeholder \
-                             (cached output lost across a daemon restart)"
-                        );
-                        origin_provider::CAS_MISS_PLACEHOLDER.as_bytes().to_vec()
-                    });
-
-                // N4.3: consult the per-handle band index in `O(1)`. The
-                // planner populates this via `Plan::register_handle` as
-                // it threads sections through the compactor; callers that
-                // have not registered a particular handle fall through to
-                // the safe floor (`Band::Volatile`), which preserves the
-                // pre-N4.3 behavior of aggressive inlining.
-                //
-                // This is the novel angle that beats openclaude/jcode/
-                // opencode on tokens: they re-serialize every tool result
-                // unconditionally, while we can demote long-lived handles
-                // to a short `<result handle:… — N bytes>` reference.
-                let band = plan
-                    .and_then(|p| p.band_for_handle(h))
-                    .unwrap_or(origin_planner::Band::Volatile);
-
-                match origin_planner::WireDecision::for_block(band, bytes.len()) {
-                    origin_planner::WireDecision::Inline => {
-                        blocks.push(Block::ToolResult {
-                            tool_use_id: tool_use_id.clone(),
-                            handle: None,
-                            inline: Some(bytes),
-                            cache_marker: *cache_marker,
-                            is_error: *is_error,
-                        });
-                    }
-                    origin_planner::WireDecision::Reference => {
-                        let preview =
-                            format!("<result handle:{} \u{2014} {} bytes>", short_hex(h), bytes.len());
-                        blocks.push(Block::ToolResult {
-                            tool_use_id: tool_use_id.clone(),
-                            handle: None,
-                            inline: Some(preview.into_bytes()),
-                            cache_marker: *cache_marker,
-                            is_error: *is_error,
-                        });
-                    }
-                }
-            } else {
-                blocks.push(b.clone());
-            }
-        }
-        out.push(Message { role: m.role, blocks });
-    }
-    // Defense-in-depth at the API boundary: drop any `tool_result` whose
-    // `tool_use` is missing from the preceding message. The Messages API rejects
-    // such an orphan with a hard `400 ... unexpected tool_use_id found in
-    // tool_result blocks`, taking down the whole turn over one malformed entry
-    // deep in the history (e.g. a stranded tail spliced on after a reused session
-    // id, or a compaction hole). Stripping it here keeps a corrupted transcript
-    // recoverable instead of fatal; a well-formed transcript is unchanged.
-    // Two-sided pairing repair at the wire choke: drop orphaned tool_results
-    // AND a trailing orphan tool_use (the latter previously fixed only on the
-    // daemon's interrupt path, leaving resume/corruption/migration to 400).
-    let out = origin_core::types::strip_orphan_tool_results(out);
-    Ok(origin_core::types::strip_trailing_orphan_tool_use(out))
 }
 
 fn load_oauth_metadata(session_id: &str) -> wire::WireMetadata {
@@ -1071,14 +1028,6 @@ mod cassette {
     }
 }
 
-fn short_hex(h: &[u8; 32]) -> String {
-    origin_cas::Hash::from_bytes(*h)
-        .to_string()
-        .chars()
-        .take(8)
-        .collect()
-}
-
 /// Test-only: build the JSON body that `Provider::chat` would POST to
 /// `/v1/messages`, without any plan, CAS expansion, or network I/O.
 ///
@@ -1113,9 +1062,10 @@ fn encode_request_body_for_test(req: &ChatRequest, plan: Option<&Plan>) -> serde
     // Mirror the production encode pipeline (expand CAS handles + strip orphan
     // tool_results) so tests observe the exact message list the wire encoder
     // places cache markers on — including any index shift from a dropped turn.
-    let expanded = expand_messages_for_wire(&req.messages, None, plan)
+    let expanded = origin_provider::inflate_tool_result_handles(&req.messages, None)
         .expect("test requests carry no CAS handles, so expansion cannot fail");
-    let wire_messages = build_wire_messages(&expanded, plan);
+    let system = wire_system(&req.system);
+    let wire_messages = build_wire_messages(&expanded, plan, message_marker_budget(system.as_ref()));
     let wire_tools = req
         .tools
         .iter()
@@ -1128,11 +1078,7 @@ fn encode_request_body_for_test(req: &ChatRequest, plan: Option<&Plan>) -> serde
     let body = wire::WireRequest {
         model: &req.model,
         max_tokens: resolve_max_tokens(req.thinking_tokens),
-        system: if req.system.is_empty() {
-            None
-        } else {
-            Some(req.system.as_str())
-        },
+        system,
         messages: wire_messages,
         tools: wire_tools,
         metadata: None,

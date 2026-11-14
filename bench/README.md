@@ -1,10 +1,13 @@
 # `bench/` — origin benchmarking
 
-Two independent things live here:
+Three independent things live here:
 
 - **`swe/` — SWE-bench Verified A/B** (Path B): the *publishable* cross-harness
   benchmark that proves origin is better (or not) on **correctness + tokens + $ +
   wall-clock**, on the **same model**, against other agentic coding harnesses.
+- **`regression/` — origin vs. earlier origin**: 20–50 tasks from origin's own
+  past failures, 3–5 trials each, reporting pass@1, pass^k, tokens and $ at a
+  pinned model and effort. See [`regression/README.md`](regression/README.md).
 - **`perf/` — internal latency gate**: origin's own cold-start / read-only latency
   probes, asserted in CI by `.github/workflows/perf-gate.yml`. Not an A/B; kept
   separate from the publishable benchmark.
@@ -120,6 +123,27 @@ bench/swe/
   by `--ids` across machines for scale.
 - Lead your published claim with the **efficiency win** (tokens/$/latency at equal
   solve rate); only claim a higher solve rate if the CIs separate.
+- `adapters/origin.sh` sets `ORIGIN_ALLOW_ALL=1` for `origin run` (auto-approve
+  every tool headless). Run it only inside a disposable container or VM.
+
+---
+
+## `regression/` — origin's regression benchmark
+
+Full protocol, task-file schema and results format:
+[`regression/README.md`](regression/README.md). To produce and commit the first
+baseline, inside a disposable container (the runner auto-approves every tool):
+
+```bash
+python bench/regression/run.py --model claude-opus-4-8 --effort high --dry-run
+export ANTHROPIC_API_KEY=...  BENCH_KILL_DAEMON=1
+python bench/regression/run.py --model claude-opus-4-8 --effort high --trials 3 \
+    --out bench/regression/baselines/<date>-<model>-<effort>.json
+git add bench/regression/baselines/   # with the task set it was run on
+```
+
+Compare later runs only at the same model, effort, trials, task set and container
+limits. A single-run difference under 2–3 points is noise.
 
 ---
 

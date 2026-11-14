@@ -182,5 +182,4 @@ fn lsp_navigate_tool_is_registered_and_deferred() {
         .expect("LspNavigate must be registered");
     // Deferred (hot:false) so it stays out of the pinned hot-11 set.
     assert!(!meta.hot, "LspNavigate should be a deferred tool");
-    assert!(meta.token_budget > 0);
 }

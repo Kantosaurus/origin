@@ -199,12 +199,15 @@ loop, so the wrapper never double-emits).
    `runtime_tool_schemas()`.
 4. **Per-session memoization cache** `origin_tools::Cache::new()` (agent.rs:2936)
    — identical `(tool_name, input_bytes)` pairs in this run avoid re-execution.
-5. **Prompt-recall** — if an `Injector` is wired, embed the prompt once and reuse
-   the resulting `<context>` block across all turns (agent.rs:2942).
+5. **Prompt-recall** — if an `Injector` is wired, embed the prompt once. Since
+   B2 the recalled memories (and repo-map entries for files the prompt names)
+   go into that prompt's **user message**, not the system prompt; they are
+   hidden from session export, turn summaries and memory gardening.
 6. **Assemble the static system-prompt blocks** — skill catalog, active-skill
-   bodies, workflows, recall, output style, workspace roots, edit-format,
-   subagents, result-encoding (agent.rs:2954–3238). These are joined once and
-   reused as `recalled_system` so Anthropic prompt-cache breakpoints stay warm.
+   bodies, workflows, output style, workspace roots, edit-format, subagents,
+   result-encoding. These are ordered static-first, joined once, and kept
+   byte-identical for the session so the cached tools + system prefix stays
+   warm (see [Prompt cost and verification switches](#prompt-cost-and-verification-switches)).
 7. Initialize cumulative counters: `total_input_tokens`, `total_output_tokens`,
    `total_cache_read_tokens`, `total_tool_calls`, plus the pain-bucket clocks
    `loop_start`, `tool_time_ms`, `first_tool_ms`, `first_token_ms`
@@ -253,7 +256,7 @@ return Err(LoopError::MaxTurns(opts.max_turns));                  // agent.rs:47
 | `Err(MaxTurns)` | agent.rs:4755 | loop ran `max_turns` turns and never settled on a tool-free answer |
 | `Err(GovernanceDenied)` | agent.rs:3384 / :3404 | policy denied the turn's model, or cumulative spend exceeded the cap |
 | `Err(RateLimitExhausted)` | agent.rs:3639 | every `MAX_PROVIDER_RETRIES` retry returned `RateLimit` |
-| `Err(Provider/Denied/UnknownTool/ToolFailure/BadArgs)` | dispatch path | a tool call failed permission, was unknown, errored, or had malformed args |
+| `Err(Provider/Denied/UnknownTool/ToolFailure/BadArgs)` | dispatch path | a tool call was unknown, errored, or had malformed args. A **denied** call no longer ends the run (A8): the model gets an `is_error` result naming the tier and rule, and the run stops with "tool denied" only after 3 consecutive (per assistant turn) or 20 total denials |
 
 `LoopSummary` (agent.rs:2396) carries `assistant_text`, `turns`,
 `input_tokens`, `output_tokens` — the latter two so the goal driver can charge
@@ -549,7 +552,7 @@ the `BudgetExhausted` cap reason wins over a tentative `Met`.
 ```text
 loop {
     goal_cap_clear(...)            // top-of-iteration cap_check; Bug #7 first-iter handling
-    summary = run_loop(session, next_text, provider, &AlwaysAllow, opts)   // main.rs:2714
+    summary = run_loop(session, next_text, provider, prompter, opts)   // the mode's prompter (C2): AlwaysAllow in mode off, IPC when a client can answer, else NoPrompter
     if goal slot is now None  -> return Ok(summary)
     decision = run_verifier_dispatch(...)   // parse_tag, record_iteration, drive_decision off-lock
     checkpoint(session)            // persist a goal-aware ResumeToken
@@ -782,6 +785,114 @@ daemon-wide fan-out for `OpEnvelope`s that IPC clients subscribe to as
 swarm-spawning call sites; nothing in the hot loop publishes to it today.
 
 ---
+
+## Prompt cost and verification switches
+
+What the harness-improvements work changed in the loop's defaults, and how to
+read and switch it. Every variable is in the
+[environment reference](../reference/environment-variables.md).
+
+### Prompt caching (B2) and what stays stable
+
+- The system prompt is ordered static-first and stays **byte-identical for a
+  session**: the repo map is scanned once per session and workspace (opt out
+  with `ORIGIN_REPOMAP=0`), and per-prompt material (repo-map entries for files
+  the prompt names, recalled memories) goes into that prompt's user message,
+  secret-redacted (C9). The tool list is decided once per session at its first prompt (C7).
+- On Anthropic, `system` is sent as one block with its own `cache_control`
+  marker, so tools + system are cached from a session's first request; three
+  rolling message markers make four in total (Anthropic's ceiling).
+  `ORIGIN_SYSTEM_CACHE=0` restores the plain-string `system` and four message
+  markers for endpoints that reject the array form. Neither the OAuth billing
+  header path nor `ORIGIN_CACHE_TTL_1H=1` was checked against the live API.
+- Things that still change the prefix mid-session: toggling `ORIGIN_EDITFMT=1`
+  (its guidance block is read per turn), and a model or effort switch. Per-turn
+  model routing (`ORIGIN_ROUTER`) stays opt-in for that reason (D4).
+
+### Reading the token counters (B1)
+
+- `origin run --output-format stream-json` emits one `request_usage` event per
+  model request (`input_tokens`, `output_tokens`, `cache_read_input_tokens`,
+  `cache_creation_input_tokens`) — sum these, not the raw `usage` events
+  (Anthropic splits one request over two `usage` events) — and one
+  `prompt_prefix` event per session (`system_bytes`, `tools_bytes`,
+  `approx_tokens` = bytes / 4, not a tokenizer count).
+- `input_tokens` means **uncached** input for every provider; the
+  OpenAI-compatible and Gemini decoders subtract cached tokens. The context size
+  the compaction gate uses is input + cache read + cache write.
+- Prometheus: `origin_cache_hit_total{provider}` counts cache-read tokens and
+  `origin_cache_write_total{provider}` cache-write tokens.
+- Not counted: the C4 `WebFetch` quarantine call's tokens (neither in the
+  counters nor in the spend cap). An errored run (`MaxTurns`, provider error,
+  denial cap) does not fold its totals into the Prometheus counters.
+
+### Lean prompts and default effort (B3, B5, D3)
+
+- Headless runs (`origin run`, self-dispatch) omit the default-workflow
+  directive (`ORIGIN_DEFAULT_WORKFLOW=on` keeps it); swarm workers get a small
+  fixed prompt and no repo map. The "swarm is always on" and
+  "separate verifier `Task` for every non-trivial change" mandates are opt-in
+  (`ORIGIN_SWARM_ALWAYS=1`); the directive still asks for parallel `Task`
+  dispatch in two of its steps.
+- System-prompt bytes as measured when this landed (scripted provider, a
+  two-file Rust workspace, no skill catalog): interactive 11,257 → 10,499;
+  headless 11,257 → 6,797; swarm worker 14,136 → 6,334 (2,282 with the
+  ponytail ruleset off; the 14,136 baseline included that ruleset at its
+  default level). Later changes add an external-content line to worker prompts.
+- Reasoning effort with no `/effort`, `/fast` or `--effort`: `high` for the main
+  loop and `medium` for sub-agents on Anthropic (was `max` for both); other
+  providers send none. An explicit parent effort is handed down to workers
+  (`Task` workers and the step workers of an in-session `RunWorkflow`, which
+  also get the parent's ponytail level) and to best-of-N candidates. `ORIGIN_DEFAULT_EFFORT=max` restores the old main-loop
+  default. Whether `high` versus `max` changes task success was **not
+  measured**.
+
+### Tool list (C7)
+
+`ORIGIN_TOOL_PROFILE=lean` advertises only `Read`, `Edit`, `MultiEdit`,
+`ApplyPatch`, `Write`, `Bash`, `Grep`, `Glob`, `Recall`, `TodoWrite` (MCP and
+runtime tools unaffected): 5,510 versus 14,708 tool-definition bytes (10 versus
+32 tools) when measured. Static prompt text still names some tools `lean` hides.
+`ORIGIN_EDITFMT` decides the edit tools: by default the per-model table removes
+`Edit`/`MultiEdit`/`ApplyPatch` for models it maps to whole-file (`gpt-3.5*`,
+`*turbo-instruct`); `0`/`off`/`false` or another format name keeps the full
+list, `whole-file` removes them for every model. Exactly `1` also applies edit
+blocks the model writes in its reply text; such prose edits obey the permission
+mode like a `Write` (see the
+[security model](../security/security-model.md#permission-modes-workspace--on--off)).
+
+### Environment line and post-edit checks (B6, B7, B11, C10)
+
+- **Toolchain line (B6).** `<origin-env>` carries one `Tools on PATH: …` line —
+  a PATH lookup (no process spawned) done once per daemon process with a 2 s
+  budget; a zero-length or non-executable first match (such as the Windows
+  Store `python` alias) counts as absent, and on Unix a symlink to a directory
+  is ignored. `ORIGIN_TOOL_PROBE=0` omits it.
+- **Tree-sitter advisory (B7).** The post-edit syntax gate also parses edited
+  files with tree-sitter for the grammars `origin-codegraph` links (Python only
+  when no real interpreter ran). It reports only parse errors an edit **added**,
+  as a separate `<syntax-advisory>` ("may be a parser limitation"), never as a
+  must-fix; files over 1 MB, `.tsx` and `.h` are skipped. `.jsx` files get no
+  check from this gate (`node --check` rejects JSX, and no JavaScript grammar is
+  linked). The pinned grammars
+  lag current languages: a characterisation test in `origin-codegraph` records
+  that the pinned Rust grammar flags `use<>` precise capturing, `&raw const` and
+  `gen {}` as errors (the TypeScript samples it checks parse clean).
+  `ORIGIN_EDIT_CHECK=0` disables the whole gate.
+- **Pre-completion check (B11).** With `ORIGIN_PRECOMPLETE_CHECK=1`, a run that
+  edited files and ran nothing since the last edit gets one message asking it to
+  verify the change or say why it cannot. End-of-run effects (counters,
+  notification, hooks) run once per run.
+- **LSP diagnostics (C10).** With `ORIGIN_LSP_DIAGNOSTICS=1`, language servers
+  stay warm across a prompt's turns, but are restarted after any turn with a
+  shell or unlisted mutation and at each new prompt — which includes every
+  `/goal` iteration. In a session where most turns run a shell command, a
+  slow-starting server (rust-analyzer, Java servers) may never return
+  diagnostics; the model gets "timed out" / "still starting" notes instead.
+  Best-of-N candidates get no diagnostics. No real language server was run when
+  this was built. The per-turn test and lint gates (`auto_test`, repro gate,
+  `auto_lint`) run whether or not the syntax gate and LSP diagnostics are on
+  (A12).
 
 ## Diagrams
 

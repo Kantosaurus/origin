@@ -5,6 +5,8 @@
 //! summaries where the router's snapshot/ref protocol would be overkill.
 
 use std::fmt::Write as _;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -13,6 +15,9 @@ pub struct FetchOptions {
     pub timeout: Duration,
     pub max_bytes: usize,
     pub user_agent: String,
+    /// Permit loopback/private/link-local targets (see [`is_non_public_ip`]).
+    /// Defaults to `ORIGIN_WEBFETCH_ALLOW_PRIVATE=1`, for local dev servers.
+    pub allow_private: bool,
 }
 
 impl Default for FetchOptions {
@@ -21,7 +26,63 @@ impl Default for FetchOptions {
             timeout: Duration::from_secs(30),
             max_bytes: 10 * 1024 * 1024,
             user_agent: concat!("origin/", env!("CARGO_PKG_VERSION")).into(),
+            allow_private: std::env::var("ORIGIN_WEBFETCH_ALLOW_PRIVATE").is_ok_and(|v| v == "1"),
         }
+    }
+}
+
+/// Whether `WebFetch` must refuse to contact `ip`.
+///
+/// Refused: loopback, link-local (incl. the 169.254.169.254 cloud-metadata
+/// endpoint), private, unique-local (`fc00::/7`) and unspecified (`0.0.0.0/8`,
+/// `::`), including IPv4 wrapped in IPv4-mapped IPv6.
+#[must_use]
+pub fn is_non_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.octets()[0] == 0,
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or_else(
+            || {
+                let head = v6.segments()[0];
+                // fc00::/7 unique-local, fe80::/10 link-local (std helpers exceed the MSRV).
+                v6.is_loopback() || v6.is_unspecified() || head & 0xfe00 == 0xfc00 || head & 0xffc0 == 0xfe80
+            },
+            |v4| is_non_public_ip(IpAddr::V4(v4)),
+        ),
+    }
+}
+
+/// Refusal reason when `url`'s host is a literal non-public IP. Literal IPs are
+/// dialled without DNS, so [`PublicOnlyResolver`] never sees them; hostnames
+/// are vetted there instead, after resolution.
+fn literal_host_refusal(url: &url::Url) -> Option<String> {
+    let ip = match url.host()? {
+        url::Host::Ipv4(v4) => IpAddr::V4(v4),
+        url::Host::Ipv6(v6) => IpAddr::V6(v6),
+        url::Host::Domain(_) => return None,
+    };
+    is_non_public_ip(ip)
+        .then(|| format!("{ip} is not a public address (set ORIGIN_WEBFETCH_ALLOW_PRIVATE=1 to allow)"))
+}
+
+/// DNS resolver that fails the lookup when ANY resolved address is non-public,
+/// so a hostname cannot point the fetch at an internal service. Installed on
+/// the client, it runs for every connection, including each redirect hop.
+struct PublicOnlyResolver;
+
+impl reqwest::dns::Resolve for PublicOnlyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            if let Some(bad) = addrs.iter().find(|a| is_non_public_ip(a.ip())) {
+                return Err(format!(
+                    "{host} resolves to non-public address {} (set ORIGIN_WEBFETCH_ALLOW_PRIVATE=1 to allow)",
+                    bad.ip()
+                )
+                .into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
     }
 }
 
@@ -42,15 +103,30 @@ pub enum FetchError {
     Readability(String),
     #[error("url parse: {0}")]
     Url(#[from] url::ParseError),
+    #[error("refused: {0}")]
+    Blocked(String),
 }
 
 /// Fetch `url` and return reader-mode markdown.
 ///
 /// # Errors
 /// Returns [`FetchError`] for HTTP failure, oversized body, or readability
-/// failure.
+/// failure; [`FetchError::Blocked`] (or an HTTP error, for a hostname that
+/// resolves to one) for a non-public target unless `opts.allow_private`.
 pub async fn fetch(url: &str, opts: FetchOptions) -> Result<FetchResult, FetchError> {
-    let client = reqwest::Client::builder()
+    let guard = !opts.allow_private;
+    if guard {
+        if let Some(why) = literal_host_refusal(&url::Url::parse(url)?) {
+            return Err(FetchError::Blocked(why));
+        }
+    }
+    let mut builder = reqwest::Client::builder();
+    if guard {
+        // Every dial goes through the vetting resolver. A proxy would resolve
+        // the target itself, unvetted, so proxies are bypassed while guarded.
+        builder = builder.dns_resolver(Arc::new(PublicOnlyResolver)).no_proxy();
+    }
+    let client = builder
         .timeout(opts.timeout)
         .user_agent(&opts.user_agent)
         // Only follow redirects that stay on the original request's host. The
@@ -59,11 +135,13 @@ pub async fn fetch(url: &str, opts: FetchOptions) -> Result<FetchResult, FetchEr
         // arbitrary host (an internal service, a cloud metadata endpoint, an
         // exfil sink), escaping the allow-list. Cross-host redirects are
         // stopped rather than followed.
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             let origin_host = attempt.previous().first().and_then(|u| u.host_str());
             let next_host = attempt.url().host_str();
             if attempt.previous().len() > 10 {
                 attempt.error("too many redirects")
+            } else if let Some(why) = guard.then(|| literal_host_refusal(attempt.url())).flatten() {
+                attempt.error(why)
             } else if origin_host.is_none() || origin_host == next_host {
                 attempt.follow()
             } else {
@@ -197,6 +275,42 @@ mod tests {
         UrlOutcome {
             url: url.into(),
             result: Ok(md.into()),
+        }
+    }
+
+    #[test]
+    fn non_public_addresses_are_classified() {
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "::1",
+            "::",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(is_non_public_ip(ip.parse().expect("ip")), "{ip} must be blocked");
+        }
+        for ip in ["93.184.216.34", "8.8.8.8", "2606:4700:4700::1111"] {
+            assert!(!is_non_public_ip(ip.parse().expect("ip")), "{ip} is public");
+        }
+    }
+
+    /// A9b: literal non-public hosts are refused before any connection.
+    #[tokio::test]
+    async fn literal_non_public_hosts_are_refused() {
+        let opts = FetchOptions {
+            allow_private: false,
+            ..FetchOptions::default()
+        };
+        for url in ["http://127.0.0.1/", "http://169.254.169.254/", "http://[::1]/"] {
+            let res = fetch(url, opts.clone()).await;
+            assert!(matches!(res, Err(FetchError::Blocked(_))), "{url}: {res:?}");
         }
     }
 

@@ -881,12 +881,13 @@ mod tests {
             goal: "build the thing".into(),
             status: ReportStatus::Completed,
             plan_updates: Vec::new(),
-            files_touched: vec![[0u8; 32]],
+            files_touched: vec!["src/lib.rs".into()],
             decisions: Vec::new(),
             follow_ups: Vec::new(),
             transcript_handle: [0u8; 32],
             usage: Usage::default(),
             detail: None,
+            tainted: false,
         };
         let summary = report_summary(&report);
         assert!(summary.contains("Completed"));

@@ -54,7 +54,9 @@ impl CloakClient {
     // same shape; the body uses no await today but the trait pair is async.
     #[allow(clippy::unused_async)]
     pub async fn spawn_with_command(prog: &str, args: &[&str]) -> Result<Self, ClientError> {
-        let mut child = Command::new(prog)
+        let mut cmd = Command::new(prog);
+        origin_sandbox::scrub_env(cmd.as_std_mut()); // A6
+        let mut child = cmd
             .args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

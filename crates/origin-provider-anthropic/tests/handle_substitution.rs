@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use origin_cas::{Store, StoreConfig};
 use origin_core::types::{Block, Message, Role};
-use origin_planner::{Band, CachePlanner, PrefixLedger, Section, SectionId};
+use origin_planner::{Band, Plan};
 use origin_provider::Provider;
 use origin_provider_anthropic::Anthropic;
 use serde_json::Value;
@@ -10,10 +10,14 @@ use tempfile::tempdir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// A1: CAS-handle tool results are inlined verbatim whatever their size or
+/// registered band. A >2,048-byte `Volatile` (Mutating-tool) body used to be
+/// swapped for an unresolvable `<result handle:XXXXXXXX — N bytes>` stub;
+/// small bodies were always inlined and must stay byte-identical.
 #[tokio::test]
-async fn large_tool_result_emitted_as_reference_when_volatile() {
+async fn tool_result_handles_inlined_verbatim_regardless_of_size_or_band() {
     let server = MockServer::start().await;
-    let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<Value>));
+    let captured = Arc::new(std::sync::Mutex::new(None::<Value>));
     let cap = captured.clone();
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -40,47 +44,45 @@ async fn large_tool_result_emitted_as_reference_when_volatile() {
         .expect("open"),
     );
 
-    let big = vec![b'.'; 8_000];
-    let h = store.put(&big).expect("put");
-
-    let ledger = PrefixLedger::new();
-    let planner = CachePlanner::new(&ledger);
-    let plan = planner.plan(&[Section::new(
-        SectionId::new("turn-1"),
-        Band::Volatile,
-        0..big.len(),
-    )]);
+    let small = vec![b's'; 2_048]; // at the old inline budget
+    let big = vec![b'.'; 8_000]; // well over it
+    let h_small = store.put(&small).expect("put");
+    let h_big = store.put(&big).expect("put");
+    // Register both as `Volatile` exactly as the daemon does for Mutating tools.
+    let plan = Plan::default();
+    plan.register_handle(*h_small.as_bytes(), Band::Volatile);
+    plan.register_handle(*h_big.as_bytes(), Band::Volatile);
 
     let client = Anthropic::with_endpoint(server.uri(), "test", "claude-3-5-haiku-20241022")
         .with_cas(store.clone())
         .with_plan(plan);
 
-    let msg = Message {
-        role: Role::Tool,
-        blocks: vec![Block::ToolResult {
-            tool_use_id: "id1".into(),
-            handle: Some(*h.as_bytes()),
-            inline: None,
-            cache_marker: None,
-            is_error: false,
-        }],
+    let tool_use = |id: &str| Block::ToolUse {
+        id: id.into(),
+        name: "Bash".into(),
+        input_json: b"{}".to_vec(),
+        cache_marker: None,
     };
-    // Precede the tool result with its matching assistant tool_use so the
-    // transcript satisfies the API pairing invariant — the wire encoder now
-    // defensively strips orphaned tool_results.
-    let tool_use = Message {
-        role: Role::Assistant,
-        blocks: vec![Block::ToolUse {
-            id: "id1".into(),
-            name: "Read".into(),
-            input_json: b"{}".to_vec(),
-            cache_marker: None,
-        }],
+    let tool_result = |id: &str, h: &origin_cas::Hash| Block::ToolResult {
+        tool_use_id: id.into(),
+        handle: Some(*h.as_bytes()),
+        inline: None,
+        cache_marker: None,
+        is_error: false,
     };
     let _ = client
         .chat(origin_provider::ChatRequest {
             system: String::new(),
-            messages: vec![tool_use, msg],
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    blocks: vec![tool_use("small"), tool_use("big")],
+                },
+                Message {
+                    role: Role::Tool,
+                    blocks: vec![tool_result("small", &h_small), tool_result("big", &h_big)],
+                },
+            ],
             model: "claude-3-5-haiku-20241022".into(),
             tools: vec![],
             effort: None,
@@ -91,214 +93,22 @@ async fn large_tool_result_emitted_as_reference_when_volatile() {
         .expect("ok");
 
     let body = captured.lock().expect("lock").clone().expect("captured");
-    let content = body["messages"][1]["content"][0]["content"]
-        .as_str()
-        .expect("content str");
-    assert!(
-        content.starts_with("<result handle:") && content.contains("8000 bytes"),
-        "expected reference, got: {content}"
-    );
-}
-
-/// N4.3: when a handle is registered as `Band::Sticky`, the wire encoder
-/// must inline the body even though it exceeds `INLINE_BYTE_BUDGET`,
-/// because Frozen/Sticky bytes hit prompt cache and amortize across
-/// turns. Demonstrates that `Plan::band_for_handle` flips behavior away
-/// from the default Volatile floor.
-#[tokio::test]
-async fn large_tool_result_inlined_when_handle_registered_sticky() {
-    let server = MockServer::start().await;
-    let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<Value>));
-    let cap = captured.clone();
-    Mock::given(method("POST"))
-        .and(path("/v1/messages"))
-        .respond_with(move |req: &wiremock::Request| {
-            *cap.lock().expect("lock") = Some(req.body_json().expect("json"));
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{"type": "text", "text": "ok"}],
-                "usage": {"input_tokens": 1, "output_tokens": 1,
-                          "cache_read_input_tokens": 0,
-                          "cache_creation_input_tokens": 0}
-            }))
-        })
-        .mount(&server)
-        .await;
-
-    let dir = tempdir().expect("tempdir");
-    let store = Arc::new(
-        Store::open(StoreConfig {
-            root: dir.path().to_path_buf(),
-            hot_capacity: 64,
-            warm_pack_target_bytes: 64 * 1024,
-            cold_zstd_level: 3,
-        })
-        .expect("open"),
-    );
-
-    // 8 KiB body — clearly over `INLINE_BYTE_BUDGET` (2 KiB).
-    let big = vec![b'x'; 8_000];
-    let h = store.put(&big).expect("put");
-
-    let ledger = PrefixLedger::new();
-    let planner = CachePlanner::new(&ledger);
-    let plan = planner.plan(&[Section::new(
-        SectionId::new("memories"),
-        Band::Sticky,
-        0..big.len(),
-    )]);
-    // N4.3 registration: park the handle in Sticky → always inline.
-    plan.register_handle(*h.as_bytes(), Band::Sticky);
-    assert_eq!(plan.band_for_handle(h.as_bytes()), Some(Band::Sticky));
-
-    let client = Anthropic::with_endpoint(server.uri(), "test", "claude-3-5-haiku-20241022")
-        .with_cas(store.clone())
-        .with_plan(plan);
-
-    let msg = Message {
-        role: Role::Tool,
-        blocks: vec![Block::ToolResult {
-            tool_use_id: "id1".into(),
-            handle: Some(*h.as_bytes()),
-            inline: None,
-            cache_marker: None,
-            is_error: false,
-        }],
+    let content = |i: usize| {
+        body["messages"][1]["content"][i]["content"]
+            .as_str()
+            .expect("content str")
+            .to_owned()
     };
-    // Precede the tool result with its matching assistant tool_use so the
-    // transcript satisfies the API pairing invariant — the wire encoder now
-    // defensively strips orphaned tool_results.
-    let tool_use = Message {
-        role: Role::Assistant,
-        blocks: vec![Block::ToolUse {
-            id: "id1".into(),
-            name: "Read".into(),
-            input_json: b"{}".to_vec(),
-            cache_marker: None,
-        }],
-    };
-    let _ = client
-        .chat(origin_provider::ChatRequest {
-            system: String::new(),
-            messages: vec![tool_use, msg],
-            model: "claude-3-5-haiku-20241022".into(),
-            tools: vec![],
-            effort: None,
-            thinking_tokens: None,
-            attachments: Vec::new(),
-        })
-        .await
-        .expect("ok");
-
-    let body = captured.lock().expect("lock").clone().expect("captured");
-    let content = body["messages"][1]["content"][0]["content"]
-        .as_str()
-        .expect("content str");
-    assert!(
-        !content.starts_with("<result handle:"),
-        "expected inline (not reference) when band=Sticky, got: {content}"
-    );
     assert_eq!(
-        content.len(),
-        8_000,
-        "expected full 8000 bytes inlined when band=Sticky, got len={}",
-        content.len()
+        content(0).as_bytes(),
+        small.as_slice(),
+        "small result sent verbatim"
     );
-}
-
-/// N4.3 inverse direction: a handle explicitly registered as `Band::Sliding`
-/// with a large body must still produce a `<result handle:…>` reference.
-/// This protects against regressions where a future refactor breaks the
-/// `band_for_handle` lookup and silently falls back to Volatile (which
-/// would happen to give the same answer for this size). The two-test
-/// matrix (Sticky-inline above, Sliding-reference here) pins down both
-/// branches of the `WireDecision::for_block` switch.
-#[tokio::test]
-async fn large_tool_result_referenced_when_handle_registered_sliding() {
-    let server = MockServer::start().await;
-    let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<Value>));
-    let cap = captured.clone();
-    Mock::given(method("POST"))
-        .and(path("/v1/messages"))
-        .respond_with(move |req: &wiremock::Request| {
-            *cap.lock().expect("lock") = Some(req.body_json().expect("json"));
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{"type": "text", "text": "ok"}],
-                "usage": {"input_tokens": 1, "output_tokens": 1,
-                          "cache_read_input_tokens": 0,
-                          "cache_creation_input_tokens": 0}
-            }))
-        })
-        .mount(&server)
-        .await;
-
-    let dir = tempdir().expect("tempdir");
-    let store = Arc::new(
-        Store::open(StoreConfig {
-            root: dir.path().to_path_buf(),
-            hot_capacity: 64,
-            warm_pack_target_bytes: 64 * 1024,
-            cold_zstd_level: 3,
-        })
-        .expect("open"),
-    );
-
-    let big = vec![b'q'; 8_000];
-    let h = store.put(&big).expect("put");
-
-    let ledger = PrefixLedger::new();
-    let planner = CachePlanner::new(&ledger);
-    let plan = planner.plan(&[Section::new(
-        SectionId::new("history"),
-        Band::Sliding,
-        0..big.len(),
-    )]);
-    plan.register_handle(*h.as_bytes(), Band::Sliding);
-
-    let client = Anthropic::with_endpoint(server.uri(), "test", "claude-3-5-haiku-20241022")
-        .with_cas(store.clone())
-        .with_plan(plan);
-
-    let msg = Message {
-        role: Role::Tool,
-        blocks: vec![Block::ToolResult {
-            tool_use_id: "id1".into(),
-            handle: Some(*h.as_bytes()),
-            inline: None,
-            cache_marker: None,
-            is_error: false,
-        }],
-    };
-    // Precede the tool result with its matching assistant tool_use so the
-    // transcript satisfies the API pairing invariant — the wire encoder now
-    // defensively strips orphaned tool_results.
-    let tool_use = Message {
-        role: Role::Assistant,
-        blocks: vec![Block::ToolUse {
-            id: "id1".into(),
-            name: "Read".into(),
-            input_json: b"{}".to_vec(),
-            cache_marker: None,
-        }],
-    };
-    let _ = client
-        .chat(origin_provider::ChatRequest {
-            system: String::new(),
-            messages: vec![tool_use, msg],
-            model: "claude-3-5-haiku-20241022".into(),
-            tools: vec![],
-            effort: None,
-            thinking_tokens: None,
-            attachments: Vec::new(),
-        })
-        .await
-        .expect("ok");
-
-    let body = captured.lock().expect("lock").clone().expect("captured");
-    let content = body["messages"][1]["content"][0]["content"]
-        .as_str()
-        .expect("content str");
+    let sent_big = content(1);
     assert!(
-        content.starts_with("<result handle:") && content.contains("8000 bytes"),
-        "expected reference when band=Sliding+large, got: {content}"
+        sent_big.as_bytes() == big.as_slice(),
+        "large result must be sent verbatim, got {} bytes: {:.80}",
+        sent_big.len(),
+        sent_big
     );
 }

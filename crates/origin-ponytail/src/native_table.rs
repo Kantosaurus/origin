@@ -26,23 +26,60 @@ const fn r(rung: u8, native: &'static str, note: &'static str) -> NativeReplacem
 }
 
 const NPM: &[(&str, NativeReplacement)] = &[
-    ("query-string", r(3, "new URLSearchParams(location.search)", "0 deps")),
+    (
+        "query-string",
+        r(3, "new URLSearchParams(location.search)", "0 deps"),
+    ),
     ("qs", r(3, "new URLSearchParams(...)", "0 deps")),
     ("lodash.clonedeep", r(3, "structuredClone(obj)", "native")),
     ("lodash.groupby", r(3, "Object.groupBy(arr, fn)", "native")),
-    ("lodash", r(3, "native Array/Object methods (groupBy, structuredClone, …)", "drop the umbrella dep")),
-    ("moment", r(3, "Intl.DateTimeFormat / Temporal", "native i18n dates")),
-    ("date-fns", r(3, "Intl.DateTimeFormat / Intl.RelativeTimeFormat", "native")),
+    (
+        "lodash",
+        r(
+            3,
+            "native Array/Object methods (groupBy, structuredClone, …)",
+            "drop the umbrella dep",
+        ),
+    ),
+    (
+        "moment",
+        r(3, "Intl.DateTimeFormat / Temporal", "native i18n dates"),
+    ),
+    (
+        "date-fns",
+        r(3, "Intl.DateTimeFormat / Intl.RelativeTimeFormat", "native"),
+    ),
     ("numeral", r(3, "new Intl.NumberFormat(...)", "native")),
-    ("accounting", r(3, "new Intl.NumberFormat(..., {style:'currency'})", "native")),
-    ("clipboard.js", r(3, "navigator.clipboard.writeText(text)", "native")),
+    (
+        "accounting",
+        r(3, "new Intl.NumberFormat(..., {style:'currency'})", "native"),
+    ),
+    (
+        "clipboard.js",
+        r(3, "navigator.clipboard.writeText(text)", "native"),
+    ),
     ("uuid", r(3, "crypto.randomUUID()", "native, v4")),
-    ("uuid-validate", r(3, "/^[0-9a-f]{8}-...$/i.test(id)", "1-line regex")),
+    (
+        "uuid-validate",
+        r(3, "/^[0-9a-f]{8}-...$/i.test(id)", "1-line regex"),
+    ),
     ("left-pad", r(2, "String.prototype.padStart(n, '0')", "stdlib")),
-    ("is-online", r(3, "navigator.onLine + online/offline events", "native")),
-    ("mkdirp", r(2, "fs.mkdirSync(path, { recursive: true })", "stdlib")),
-    ("make-dir", r(2, "fs.mkdirSync(path, { recursive: true })", "stdlib")),
-    ("rimraf", r(2, "fs.rmSync(path, { recursive: true, force: true })", "stdlib")),
+    (
+        "is-online",
+        r(3, "navigator.onLine + online/offline events", "native"),
+    ),
+    (
+        "mkdirp",
+        r(2, "fs.mkdirSync(path, { recursive: true })", "stdlib"),
+    ),
+    (
+        "make-dir",
+        r(2, "fs.mkdirSync(path, { recursive: true })", "stdlib"),
+    ),
+    (
+        "rimraf",
+        r(2, "fs.rmSync(path, { recursive: true, force: true })", "stdlib"),
+    ),
     ("slash", r(2, "path.posix / path.normalize()", "stdlib")),
     ("is-stream", r(2, "val instanceof stream.Readable", "stdlib")),
     ("object-assign", r(2, "Object.assign() / spread", "stdlib")),
@@ -50,8 +87,18 @@ const NPM: &[(&str, NativeReplacement)] = &[
     ("array-flatten", r(2, "arr.flat(Infinity)", "stdlib")),
     ("flat", r(2, "arr.flat(depth)", "stdlib")),
     ("path-exists", r(2, "fs.existsSync(path)", "stdlib")),
-    ("load-json-file", r(2, "JSON.parse(fs.readFileSync(path, 'utf8'))", "stdlib")),
-    ("write-json-file", r(2, "fs.writeFileSync(path, JSON.stringify(obj, null, 2))", "stdlib")),
+    (
+        "load-json-file",
+        r(2, "JSON.parse(fs.readFileSync(path, 'utf8'))", "stdlib"),
+    ),
+    (
+        "write-json-file",
+        r(
+            2,
+            "fs.writeFileSync(path, JSON.stringify(obj, null, 2))",
+            "stdlib",
+        ),
+    ),
     ("pkg-dir", r(2, "path.resolve(__dirname, '..')", "stdlib")),
 ];
 
@@ -62,10 +109,20 @@ const PYPI: &[(&str, NativeReplacement)] = &[
     ("six", r(2, "(drop it — Python 2 is gone)", "stdlib")),
     ("pathlib2", r(2, "pathlib.Path", "stdlib 3.4+")),
     ("enum34", r(2, "enum.Enum", "stdlib 3.4+")),
-    ("typing_extensions", r(2, "builtin generics + from __future__ import annotations", "stdlib")),
+    (
+        "typing_extensions",
+        r(
+            2,
+            "builtin generics + from __future__ import annotations",
+            "stdlib",
+        ),
+    ),
     ("simplejson", r(2, "json", "stdlib")),
     ("mergedeep", r(2, "dict | other_dict", "stdlib 3.9+")),
-    ("more-itertools", r(2, "itertools (chain, islice, groupby, product)", "stdlib")),
+    (
+        "more-itertools",
+        r(2, "itertools (chain, islice, groupby, product)", "stdlib"),
+    ),
     ("toolz", r(2, "functools (lru_cache, partial, reduce)", "stdlib")),
     ("tabulate", r(2, "pprint.pprint()", "stdlib, debug only")),
 ];
@@ -73,16 +130,31 @@ const PYPI: &[(&str, NativeReplacement)] = &[
 const CARGO: &[(&str, NativeReplacement)] = &[
     ("lazy_static", r(2, "std::sync::LazyLock", "stdlib 1.80")),
     ("once_cell", r(2, "std::sync::OnceLock / LazyLock", "stdlib")),
-    ("num_cpus", r(2, "std::thread::available_parallelism()", "stdlib 1.59")),
-    ("maplit", r(2, "HashMap::from([...]) / BTreeMap::from", "stdlib 1.56")),
-    ("failure", r(2, "std::error::Error (+ thiserror/anyhow)", "stdlib")),
+    (
+        "num_cpus",
+        r(2, "std::thread::available_parallelism()", "stdlib 1.59"),
+    ),
+    (
+        "maplit",
+        r(2, "HashMap::from([...]) / BTreeMap::from", "stdlib 1.56"),
+    ),
+    (
+        "failure",
+        r(2, "std::error::Error (+ thiserror/anyhow)", "stdlib"),
+    ),
     ("error-chain", r(2, "std::error::Error", "stdlib")),
 ];
 
 const GO: &[(&str, NativeReplacement)] = &[
-    ("github.com/pkg/errors", r(2, "errors + fmt.Errorf(\"%w\")", "stdlib 1.13")),
+    (
+        "github.com/pkg/errors",
+        r(2, "errors + fmt.Errorf(\"%w\")", "stdlib 1.13"),
+    ),
     ("github.com/sirupsen/logrus", r(2, "log/slog", "stdlib 1.21")),
-    ("github.com/gorilla/mux", r(3, "net/http.ServeMux (method+wildcard)", "stdlib 1.22")),
+    (
+        "github.com/gorilla/mux",
+        r(3, "net/http.ServeMux (method+wildcard)", "stdlib 1.22"),
+    ),
     ("golang.org/x/exp/slices", r(2, "slices", "stdlib 1.21")),
     ("golang.org/x/exp/maps", r(2, "maps", "stdlib 1.21")),
 ];
@@ -114,12 +186,21 @@ mod tests {
 
     #[test]
     fn known_replacements_hit() {
-        assert_eq!(lookup(Ecosystem::Npm, "lodash.groupby").unwrap().native, "Object.groupBy(arr, fn)");
-        assert_eq!(lookup(Ecosystem::PyPI, "pytz").unwrap().native, "zoneinfo.ZoneInfo");
+        assert_eq!(
+            lookup(Ecosystem::Npm, "lodash.groupby").unwrap().native,
+            "Object.groupBy(arr, fn)"
+        );
+        assert_eq!(
+            lookup(Ecosystem::PyPI, "pytz").unwrap().native,
+            "zoneinfo.ZoneInfo"
+        );
         assert_eq!(lookup(Ecosystem::Cargo, "lazy_static").unwrap().rung, 2);
         // hyphen/underscore normalization for cargo
         assert!(lookup(Ecosystem::Cargo, "lazy-static").is_some());
-        assert_eq!(lookup(Ecosystem::Go, "github.com/pkg/errors").unwrap().native, "errors + fmt.Errorf(\"%w\")");
+        assert_eq!(
+            lookup(Ecosystem::Go, "github.com/pkg/errors").unwrap().native,
+            "errors + fmt.Errorf(\"%w\")"
+        );
     }
 
     #[test]

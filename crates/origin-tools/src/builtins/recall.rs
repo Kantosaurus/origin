@@ -127,7 +127,6 @@ crate::origin_tool! {
         "required": ["handle"]
     }"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
-    token_budget: crate::DEFAULT_TOKEN_BUDGET,
     // Hot (advertised in the base tool set) so the model can inflate a CAS
     // handle in one step. SchemaCrush's lossy tier offloads tail rows behind a
     // `recall` handle; if `Recall` were deferred the model would have to discover

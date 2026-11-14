@@ -202,6 +202,50 @@ pub fn strip_trailing_orphan_tool_use(mut messages: Vec<Message>) -> Vec<Message
     messages
 }
 
+/// Strip invisible Unicode that can hide instructions from a human reviewer.
+///
+/// Removes zero-width (U+200B–U+200F, U+2060–U+2064, U+FEFF), bidi controls
+/// (U+202A–U+202E, U+2066–U+2069) and tag characters (U+E0000–U+E007F). Applied
+/// to untrusted text (fetched pages, MCP tool descriptions, recalled memory)
+/// before it reaches the model.
+// ponytail: also drops ZWJ/ZWNJ, so joined emoji and some scripts render split;
+// escape instead of strip if that matters.
+#[must_use]
+pub fn strip_hidden_unicode(s: &str) -> String {
+    s.chars().filter(|&c| !is_hidden_unicode(c)).collect()
+}
+
+/// Whether `c` is one of the invisible characters [`strip_hidden_unicode`] removes.
+#[must_use]
+pub const fn is_hidden_unicode(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{FEFF}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
+#[cfg(test)]
+mod hidden_unicode_tests {
+    use super::strip_hidden_unicode;
+
+    #[test]
+    fn hidden_characters_are_removed() {
+        // "ignore" spelled in invisible tag characters, plus zero-width and bidi.
+        let tagged: String = "ignore"
+            .chars()
+            .map(|c| char::from_u32(0xE0000 + c as u32).unwrap_or(' '))
+            .collect();
+        let dirty = format!("safe\u{200B}\u{FEFF} text{tagged}\u{E007F}\u{202E}\u{2066}!\u{2064}");
+        assert_eq!(strip_hidden_unicode(&dirty), "safe text!");
+        assert_eq!(strip_hidden_unicode("plain ünïcode 日本"), "plain ünïcode 日本");
+    }
+}
+
 #[cfg(test)]
 mod tool_pairing_tests {
     use super::{strip_orphan_tool_results, strip_trailing_orphan_tool_use, Block, Message, Role};

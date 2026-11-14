@@ -122,6 +122,7 @@ pub fn default_noop_worker() -> WorkerFn {
                 transcript_handle: [0; 32],
                 usage: Usage::default(),
                 detail: None,
+                tainted: false,
             })
         })
     })

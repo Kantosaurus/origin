@@ -162,6 +162,8 @@ def main() -> int:
                         m.get("model", ""), m.get("input_tokens", 0), m.get("output_tokens", 0),
                         m.get("cache_read", 0), m.get("cache_creation", 0)), 6),
                     "empty_patch": not patch.strip(),
+                    # origin.sh: "request_usage", or "usage" when an old binary forced the fallback
+                    "token_source": m.get("token_source", ""),
                 }) + "\n")
                 pf.flush()
                 mf.flush()

@@ -19,7 +19,8 @@ pipeline and `gen_ai.*` semantic-convention instruments.
 | `Metrics::new()` / `default()` | fn | Build a registry with all `origin_*` families pre-declared. |
 | `Metrics::tool_call_total(provider, tool, result)` | fn → `IntCounter` | `origin_tool_call_total` handle (allowlisted labels). |
 | `Metrics::tokens_in_total` / `tokens_out_total(provider, model)` | fn → `IntCounter` | Token counters (`model` interned, not allowlisted). |
-| `Metrics::cache_hit_total(provider)` | fn → `IntCounter` | Prompt-cache hit counter. |
+| `Metrics::cache_hit_total(provider)` | fn → `IntCounter` | Prompt-cache hit counter (cache-read tokens). |
+| `Metrics::cache_write_total(provider)` | fn → `IntCounter` | Prompt-cache write counter (cache-write tokens). |
 | `Metrics::sandbox_violation_total(profile, kind)` | fn → `IntCounter` | Sandbox-denial counter. |
 | `Metrics::encode_text()` | fn → `Result<String, MetricsError>` | Prometheus text exposition (fast path). |
 | `Metrics::snapshot()` | fn → `Snapshot` | In-process rows for the TUI `?metrics` panel. |

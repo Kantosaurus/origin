@@ -123,6 +123,7 @@ impl BackgroundJobs {
                 summary: format!("background worker for {:?} aborted: {e}", job.goal),
                 files_touched: Vec::new(),
                 follow_ups: Vec::new(),
+                tainted: false,
             });
             coord.evict(&job.handle).await;
             reaped.push(job.id_hex.clone());

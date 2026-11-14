@@ -317,16 +317,19 @@ pub fn governance_path() -> PathBuf {
 ///
 /// # Errors
 ///
-/// Returns [`GovernanceError`] when the file exists but cannot be read, is not
-/// valid TOML/schema, or carries an invalid `max_spend_usd`.
+/// Returns [`GovernanceError`] when the file exists (or its existence cannot
+/// be checked) but cannot be read, is not valid TOML/schema, or carries an
+/// invalid `max_spend_usd`.
 pub fn load_governance(path: &Path) -> Result<Governance, GovernanceError> {
-    if !path.exists() {
-        return Ok(Governance::default());
-    }
-    let raw = std::fs::read_to_string(path).map_err(|source| GovernanceError::Read {
+    let read_err = |source| GovernanceError::Read {
         path: path.to_path_buf(),
         source,
-    })?;
+    };
+    // A4: a file whose existence cannot be checked is not "missing".
+    if !path.try_exists().map_err(read_err)? {
+        return Ok(Governance::default());
+    }
+    let raw = std::fs::read_to_string(path).map_err(read_err)?;
     let cfg: GovernanceConfig = toml::from_str(&raw).map_err(|source| GovernanceError::Parse {
         path: path.to_path_buf(),
         source: Box::new(source),
@@ -361,21 +364,40 @@ fn governance_from_config(cfg: GovernanceConfig, path: &Path) -> Result<Governan
     // Build the permission-rule bundle once at load time (rules + bloom). An
     // empty `[[permission_rules]]` ⇒ `None` ⇒ dispatch never consults the rule
     // path, byte-identical to before this wiring.
-    let permission_rules = if cfg.permission_rules.is_empty() {
-        None
-    } else {
-        let rules: Vec<Rule> = cfg
-            .permission_rules
-            .into_iter()
-            .map(|r| Rule {
+    // C2: only scope `*` is looked up, so a rule with another scope must not be
+    // silently inert in the unsafe direction: a deny applies everywhere, an
+    // allow is dropped. Tool names match case-insensitively at lookup.
+    let rules: Vec<Rule> = cfg
+        .permission_rules
+        .into_iter()
+        .filter_map(|r| {
+            if r.scope != PERMISSION_RULE_SCOPE {
+                let what = if r.allow {
+                    "this allow rule is ignored"
+                } else {
+                    "this deny rule applies everywhere"
+                };
+                tracing::warn!(
+                    tool = %r.tool,
+                    path = %path.display(),
+                    "permission rule: scope '{}' is not supported; {what}",
+                    r.scope
+                );
+                if r.allow {
+                    return None;
+                }
+            }
+            Some(Rule {
                 tool_name: r.tool,
-                scope: r.scope,
+                scope: PERMISSION_RULE_SCOPE.to_owned(),
                 allow: r.allow,
             })
-            .collect();
+        })
+        .collect();
+    let permission_rules = (!rules.is_empty()).then(|| {
         let bloom = BloomPreCheck::build(&rules);
-        Some(Arc::new(PermissionRules { rules, bloom }))
-    };
+        Arc::new(PermissionRules { rules, bloom })
+    });
     // `[post_edit]`: map the config-surface struct onto the crate's
     // `PostEditConfig`. Absent ⇒ `None` ⇒ the post-edit path uses only the
     // builtin formatter table, byte-identical to before this wiring.
@@ -493,10 +515,7 @@ pub fn resolve_post_edit_with_repro_gate(
         return base;
     }
     // On. Start from the configured policy (preserve overrides) or a default.
-    let mut cfg = base
-        .as_deref()
-        .cloned()
-        .unwrap_or_default();
+    let mut cfg = base.as_deref().cloned().unwrap_or_default();
     cfg.repro_gate = true;
     // An explicit non-boolean value is a command override.
     let explicit_cmd = if raw == "1" || raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("on") {
@@ -593,7 +612,11 @@ mod tests {
         let out = resolve_post_edit_with_repro_gate(None, dir.path()).unwrap();
         std::env::remove_var("ORIGIN_REPRO_GATE");
         assert!(out.repro_gate, "=1 ⇒ repro_gate on");
-        assert_eq!(out.test_command.as_deref(), Some("cargo test"), "auto-derived from Cargo.toml");
+        assert_eq!(
+            out.test_command.as_deref(),
+            Some("cargo test"),
+            "auto-derived from Cargo.toml"
+        );
         assert!(out.test_gate_armed(), "armed: enforcement will run");
     }
 
@@ -619,7 +642,10 @@ mod tests {
         std::env::remove_var("ORIGIN_REPRO_GATE");
         assert!(out.repro_gate, "instruction still injected");
         assert!(out.test_command.is_none(), "no ecosystem ⇒ no command");
-        assert!(!out.test_gate_armed(), "no command ⇒ nothing to enforce (prompt-only)");
+        assert!(
+            !out.test_gate_armed(),
+            "no command ⇒ nothing to enforce (prompt-only)"
+        );
     }
 
     #[test]
@@ -736,6 +762,14 @@ mod tests {
         .unwrap();
         let err = load_governance(&path).unwrap_err();
         assert!(matches!(err, GovernanceError::InvalidSpend { value, .. } if value == -1.0));
+    }
+
+    /// A4: a path whose existence cannot be checked is a load failure, not
+    /// "missing" (= no governance). A NUL byte fails the check on every OS.
+    #[test]
+    fn an_uninspectable_path_is_a_read_error() {
+        let err = load_governance(Path::new("governance\0.toml")).unwrap_err();
+        assert!(matches!(err, GovernanceError::Read { .. }), "{err}");
     }
 
     #[test]

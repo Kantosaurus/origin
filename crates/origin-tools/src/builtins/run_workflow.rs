@@ -32,7 +32,6 @@ crate::origin_tool! {
     side_effects: SideEffects::Mutating,
     input_schema: RUN_WORKFLOW_INPUT_SCHEMA,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
-    token_budget: crate::DEFAULT_TOKEN_BUDGET,
     hot: false,
 }
 

@@ -80,6 +80,12 @@ async fn garbage_frame_between_good_frames_is_skipped_not_fatal() {
     }
     prov_handle.await.expect("prov task");
 
-    assert_eq!(text, "hello world", "both good frames' content must survive a skipped garbage frame");
-    assert!(saw_turn_end, "the turn must still reach TurnEnd after a skipped frame");
+    assert_eq!(
+        text, "hello world",
+        "both good frames' content must survive a skipped garbage frame"
+    );
+    assert!(
+        saw_turn_end,
+        "the turn must still reach TurnEnd after a skipped frame"
+    );
 }

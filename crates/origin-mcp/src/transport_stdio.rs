@@ -25,7 +25,10 @@ impl StdioTransport {
     /// # Errors
     /// Returns [`TransportError::Io`] on spawn or pipe-take failure.
     pub fn spawn(program: &str, args: &[String]) -> Result<Self, TransportError> {
-        let mut child = Command::new(program)
+        let mut cmd = Command::new(program);
+        // A6: allow-listed env only (add names via `ORIGIN_ENV_PASSTHROUGH`).
+        origin_tools::scrub_env(cmd.as_std_mut());
+        let mut child = cmd
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

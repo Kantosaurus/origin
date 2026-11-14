@@ -523,11 +523,11 @@ pub struct App {
     /// notification fires on successful turn completion via `origin-notify`.
     /// Default `false` ⇒ no spawn ⇒ byte-identical.
     pub notify_desktop: bool,
-    /// Opt-in interactive tool-permission prompting. When `true`, each
-    /// `PromptRequest` carries `permission_ask`, so the daemon asks before
-    /// running `RequiresPermission` tools. Default `false` ⇒ the daemon stays on
-    /// auto-allow ⇒ byte-identical. Toggled by the `/permissions` command.
-    pub permission_ask: bool,
+    /// C2: the permission mode each `PromptRequest` carries. Default
+    /// `Workspace` (edits inside the workspace run, Bash/network/outside writes
+    /// ask); `On` asks for every gated tool, `Off` runs everything. Set by the
+    /// `/permissions workspace|on|off` command, for this TUI session only.
+    pub permission_mode: origin_daemon::protocol::PermissionMode,
     /// The pending permission ask, if the daemon is currently waiting on the
     /// user. `Some` ⇒ the next `y`/`n` (or `Esc`) answers it; rendered above the
     /// input card. `None` in the common case.
@@ -717,7 +717,7 @@ impl App {
             vim_active: false,
             theme: Theme::Default,
             notify_desktop: false,
-            permission_ask: false,
+            permission_mode: origin_daemon::protocol::PermissionMode::Workspace,
             pending_permission: None,
             active_picker: None,
             running_tool_row: None,
@@ -854,15 +854,12 @@ impl App {
         Some(u8::try_from(pct.min(100)).unwrap_or(100))
     }
 
-    /// Apply a `/permissions [on|off]` toggle, returning the new state. No
-    /// argument flips the current state; `on`/`off` set it explicitly.
-    pub fn set_permission_ask(&mut self, arg: &str) -> bool {
-        self.permission_ask = match arg.trim() {
-            "on" => true,
-            "off" => false,
-            _ => !self.permission_ask,
-        };
-        self.permission_ask
+    /// Apply `/permissions [workspace|on|off]` (C2). A known mode is set; no or
+    /// an unknown argument leaves the mode unchanged and returns `None`.
+    pub fn set_permission_mode(&mut self, arg: &str) -> Option<origin_daemon::protocol::PermissionMode> {
+        let mode = origin_daemon::protocol::PermissionMode::parse(arg)?;
+        self.permission_mode = mode;
+        Some(mode)
     }
 
     /// Apply a `/mouse [on|off]` toggle, returning the new capture state. No
@@ -1007,13 +1004,7 @@ impl App {
         // Assemble the big wordmark: each row joins the six letters' row-segments
         // with a 2-column gutter, drawn verbatim so the block glyphs render as-is.
         let art: Vec<String> = (0..BANNER_ROWS)
-            .map(|r| {
-                BANNER_LETTERS
-                    .iter()
-                    .map(|l| l[r])
-                    .collect::<Vec<_>>()
-                    .join("  ")
-            })
+            .map(|r| BANNER_LETTERS.iter().map(|l| l[r]).collect::<Vec<_>>().join("  "))
             .collect();
         let art_w = art.iter().map(|s| s.chars().count()).max().unwrap_or(0);
         // Vertical breathing room so the hero sits in the upper-middle rather than
@@ -1171,10 +1162,11 @@ impl App {
     /// Always allow `<tool>` (no custom row) and stores it as the
     /// [`active_picker`](App::active_picker) with a [`PickerSource::Permission`].
     /// The option indices map back to `(allow, always)` via
-    /// [`picker_outcome_to_permission`].
-    pub fn open_permission_picker(&mut self, id: u64, tool: &str, args: &str) {
+    /// [`picker_outcome_to_permission`]. C2: `no_always` (a `Task` delegation, or
+    /// an ask that needs a person every time) drops the "Always allow" row.
+    pub fn open_permission_picker(&mut self, id: u64, tool: &str, args: &str, no_always: bool) {
         let question = crate::locale::linef("permission.ask", &[("tool", tool), ("args", args)]);
-        let options = vec![
+        let mut options = vec![
             picker::PickerOption {
                 label: "Allow once".to_string(),
                 description: None,
@@ -1183,11 +1175,13 @@ impl App {
                 label: "Deny".to_string(),
                 description: None,
             },
-            picker::PickerOption {
+        ];
+        if !no_always {
+            options.push(picker::PickerOption {
                 label: format!("Always allow {tool}"),
                 description: None,
-            },
-        ];
+            });
+        }
         let state = picker::PickerState {
             question,
             options,
@@ -1327,10 +1321,7 @@ impl App {
             self.swarm_selected = None;
             self.swarm_view = None;
         }
-        let terminal = matches!(
-            new_status,
-            SwarmAgentStatus::Completed | SwarmAgentStatus::Failed
-        );
+        let terminal = matches!(new_status, SwarmAgentStatus::Completed | SwarmAgentStatus::Failed);
         if let Some(row) = self.swarm_agents.iter_mut().find(|r| r.id == id) {
             row.status = new_status;
             if !goal.is_empty() {
@@ -1457,7 +1448,11 @@ impl App {
             align: LineAlign::Left,
         });
         out.push(ScrollLine::verbatim(String::new(), tok.muted, 0));
-        out.push(ScrollLine::verbatim("\u{25C6} sub-agent".to_string(), tok.origin, 0));
+        out.push(ScrollLine::verbatim(
+            "\u{25C6} sub-agent".to_string(),
+            tok.origin,
+            0,
+        ));
         for line in &agent.transcript {
             match line {
                 SwarmAgentLine::Text(t) => {
@@ -1481,7 +1476,6 @@ impl App {
         }
         out
     }
-
 
     /// Set the tool a running sub-agent is using right now (live per-worker
     /// progress). A no-op for an unknown id or an already-settled agent, so a
@@ -2577,12 +2571,23 @@ fn draw_swarm_agent_block(
     // Selection cursor (Tab highlight): a `❯` in col 1 marks the agent Enter
     // would drill into. The id then renders bright instead of dim/accent.
     if selected {
-        side.put(row, 1, Cell::new('\u{276F}', pal.accent, pal.panel_bg, Attr::BOLD));
+        side.put(
+            row,
+            1,
+            Cell::new('\u{276F}', pal.accent, pal.panel_bg, Attr::BOLD),
+        );
     }
     let id_fg = if selected { pal.panel_header } else { id_fg };
     // Line 1: glyph (col 2) + short id (col 4) + elapsed clock (right).
     side.put(row, 2, Cell::new(glyph, glyph_fg, pal.panel_bg, Attr::PLAIN));
-    let short: String = a.id.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect();
+    let short: String =
+        a.id.chars()
+            .rev()
+            .take(6)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
     write_str_styled(
         side,
         row,
@@ -2602,7 +2607,14 @@ fn draw_swarm_agent_block(
         .as_secs();
     let clock = format!("{}:{:02} ", secs / 60, secs % 60);
     let clock_col = cols.saturating_sub(clamp_u16(clock.chars().count())).max(5);
-    write_str_styled(side, row, clock_col, &clock, cols.saturating_sub(clock_col), muted);
+    write_str_styled(
+        side,
+        row,
+        clock_col,
+        &clock,
+        cols.saturating_sub(clock_col),
+        muted,
+    );
     row += 1;
     if row >= rows {
         return row;
@@ -2626,10 +2638,12 @@ fn draw_swarm_agent_block(
     }
     // Line 3: current tool (running) or terminal state.
     let (col, glyph_opt, label, fg) = match a.status {
-        SwarmAgentStatus::Running => a.current_tool.as_ref().map_or(
-            (4, None, "working\u{2026}", pal.muted),
-            |tool| (6, Some('\u{25B8}'), tool.as_str(), pal.tool),
-        ),
+        SwarmAgentStatus::Running => a
+            .current_tool
+            .as_ref()
+            .map_or((4, None, "working\u{2026}", pal.muted), |tool| {
+                (6, Some('\u{25B8}'), tool.as_str(), pal.tool)
+            }),
         SwarmAgentStatus::Completed => (4, None, "completed", pal.green),
         SwarmAgentStatus::Failed => (4, None, "failed", pal.red),
     };
@@ -3355,13 +3369,19 @@ mod tests {
         app.apply_swarm_event("a1", "write tests", "spawned");
         app.apply_swarm_event("b2", "impl module", "spawned");
         assert_eq!(app.swarm_agents.len(), 2);
-        assert_eq!(app.swarm_summary().as_deref(), Some("\u{2387} 2/2 agents running"));
+        assert_eq!(
+            app.swarm_summary().as_deref(),
+            Some("\u{2387} 2/2 agents running")
+        );
 
         // One completes: the existing row flips in place (no duplicate row).
         app.apply_swarm_event("a1", "write tests", "completed");
         assert_eq!(app.swarm_agents.len(), 2, "completion updates in place");
         assert_eq!(app.swarm_agents[0].status, SwarmAgentStatus::Completed);
-        assert_eq!(app.swarm_summary().as_deref(), Some("\u{2387} 1/2 agents running"));
+        assert_eq!(
+            app.swarm_summary().as_deref(),
+            Some("\u{2387} 1/2 agents running")
+        );
 
         // The other fails: whole wave settled → summary shows the done count.
         app.apply_swarm_event("b2", "impl module", "failed");
@@ -4477,7 +4497,7 @@ mod tests {
     }
 
     #[test]
-    fn default_app_is_byte_identical_opt_ins_off() {
+    fn default_app_opt_ins_off_and_permissions_workspace() {
         // The opt-in TUI/config layers must all default OFF so a fresh App is
         // unchanged from before this workstream.
         let app = App::new("anthropic", "m", CompletionSources::default());
@@ -4485,7 +4505,11 @@ mod tests {
         assert!(!app.vim_active);
         assert_eq!(app.vim_mode, VimMode::Insert);
         assert!(!app.notify_desktop);
-        assert!(!app.permission_ask, "permission prompting defaults off");
+        assert_eq!(
+            app.permission_mode,
+            origin_daemon::protocol::PermissionMode::Workspace,
+            "C2: the TUI defaults to workspace mode, not auto-allow"
+        );
         assert!(app.pending_permission.is_none());
         assert!(app.active_picker.is_none(), "no picker open by default");
         assert_eq!(app.palette(), theme::palette(Theme::Default));
@@ -4512,7 +4536,7 @@ mod tests {
     #[test]
     fn open_permission_picker_builds_three_single_select_options() {
         let mut app = App::new("anthropic", "m", CompletionSources::default());
-        app.open_permission_picker(42, "Bash", "rm -rf build/");
+        app.open_permission_picker(42, "Bash", "rm -rf build/", false);
         let sess = app.active_picker.as_ref().expect("picker opened");
         assert!(matches!(sess.source, PickerSource::Permission { id: 42, .. }));
         assert!(!sess.state.multi, "permission picker is single-select");
@@ -4521,6 +4545,17 @@ mod tests {
         assert_eq!(sess.state.options[0].label, "Allow once");
         assert_eq!(sess.state.options[1].label, "Deny");
         assert_eq!(sess.state.options[2].label, "Always allow Bash");
+    }
+
+    /// C2: an ask flagged `no_always` (Task, or one that needs a person every
+    /// time) offers only Allow once / Deny.
+    #[test]
+    fn open_permission_picker_drops_always_when_not_offered() {
+        let mut app = App::new("anthropic", "m", CompletionSources::default());
+        app.open_permission_picker(7, "Task", "1/30 gated tools", true);
+        let sess = app.active_picker.as_ref().expect("picker opened");
+        let labels: Vec<&str> = sess.state.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["Allow once", "Deny"]);
     }
 
     #[test]
@@ -4564,7 +4599,7 @@ mod tests {
     #[test]
     fn take_picker_clears_active() {
         let mut app = App::new("anthropic", "m", CompletionSources::default());
-        app.open_permission_picker(1, "Write", "a.txt");
+        app.open_permission_picker(1, "Write", "a.txt", false);
         assert!(app.has_picker());
         let taken = app.take_picker();
         assert!(taken.is_some());
@@ -4572,14 +4607,27 @@ mod tests {
     }
 
     #[test]
-    fn set_permission_ask_toggles_and_sets() {
+    fn set_permission_mode_sets_known_modes_only() {
+        use origin_daemon::protocol::PermissionMode;
         let mut app = App::new("anthropic", "m", CompletionSources::default());
-        assert!(!app.permission_ask, "default off");
-        assert!(app.set_permission_ask(""), "no arg flips on");
-        assert!(app.permission_ask);
-        assert!(!app.set_permission_ask(""), "no arg flips back off");
-        assert!(app.set_permission_ask("on"), "explicit on");
-        assert!(!app.set_permission_ask("off"), "explicit off");
+        assert_eq!(
+            app.permission_mode,
+            PermissionMode::Workspace,
+            "default workspace"
+        );
+        assert_eq!(app.set_permission_mode("on"), Some(PermissionMode::On));
+        assert_eq!(app.set_permission_mode("off"), Some(PermissionMode::Off));
+        assert_eq!(app.set_permission_mode(""), None, "no arg leaves the mode");
+        assert_eq!(
+            app.set_permission_mode("bogus"),
+            None,
+            "unknown arg leaves the mode"
+        );
+        assert_eq!(app.permission_mode, PermissionMode::Off);
+        assert_eq!(
+            app.set_permission_mode("workspace"),
+            Some(PermissionMode::Workspace)
+        );
     }
 
     #[test]

@@ -198,7 +198,9 @@ impl ProcessGitRunner {
 
 impl GitRunner for ProcessGitRunner {
     fn run(&self, args: &[&str]) -> Result<String, VcsError> {
-        let output = std::process::Command::new("git")
+        let mut git = std::process::Command::new("git");
+        origin_tools::scrub_env(&mut git); // A6
+        let output = git
             .args(args)
             .current_dir(&self.workspace_dir)
             .output()

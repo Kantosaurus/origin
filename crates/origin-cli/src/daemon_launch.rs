@@ -59,9 +59,50 @@ pub fn supervisor_args(daemon_path: &OsStr) -> Vec<OsString> {
     vec![OsString::from("--daemon-path"), daemon_path.to_os_string()]
 }
 
+/// The spawn command for the daemon (`supervisor` launches it through
+/// `origin-supervisor`, which `program` then names) with the provider, account
+/// and IPC path it must use.
+///
+/// C2: `ORIGIN_ALLOW_ALL` is removed from the child's environment. A CLI
+/// started with it sends permission mode `off` with its own requests; left in
+/// the environment of a daemon that outlives the CLI, it would also apply to
+/// later sessions that never asked for it.
+#[must_use]
+pub fn daemon_command(
+    program: &OsStr,
+    supervised_daemon: Option<&OsStr>,
+    provider: &str,
+    account: &str,
+    sock: &str,
+) -> std::process::Command {
+    let mut c = std::process::Command::new(program);
+    if let Some(daemon) = supervised_daemon {
+        c.args(supervisor_args(daemon));
+    }
+    c.env("ORIGIN_PROVIDER", provider)
+        .env("ORIGIN_ACCOUNT", account)
+        // Pin the daemon's IPC path to the one the CLI resolved.
+        .env("ORIGIN_SOCK", sock)
+        .env_remove("ORIGIN_ALLOW_ALL");
+    c
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C2: the spawned daemon (or supervisor) never inherits `ORIGIN_ALLOW_ALL`.
+    #[test]
+    fn daemon_command_removes_allow_all_from_the_child_env() {
+        for supervised in [None, Some(OsStr::new("origin-daemon"))] {
+            let c = daemon_command(OsStr::new("origin-x"), supervised, "anthropic", "default", "sock");
+            let allow_all = c.get_envs().find(|(k, _)| *k == OsStr::new("ORIGIN_ALLOW_ALL"));
+            assert_eq!(allow_all, Some((OsStr::new("ORIGIN_ALLOW_ALL"), None)), "removed");
+            assert!(c
+                .get_envs()
+                .any(|(k, v)| k == OsStr::new("ORIGIN_SOCK") && v == Some(OsStr::new("sock"))));
+        }
+    }
 
     #[test]
     fn supervised_is_the_default() {

@@ -93,14 +93,15 @@ pub async fn bash_v2(args: BashArgs, sup: &Supervisor) -> Result<Value, ToolErro
             // does not outlive the tool call, then return.
             kill_guard.disarm();
             sup.kill(pid);
-            return Ok(json!({"status": "timed_out", "exit_code": -1, "failed": true, "stdout": cap_stdout(acc)}));
+            return Ok(
+                json!({"status": "timed_out", "exit_code": -1, "failed": true, "stdout": cap_stdout(acc)}),
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
-/// Byte budget for returned stdout (~24k tokens at ~4 bytes/token, just under
-/// the tool's declared `token_budget` of 25k). A chatty command (a build log,
+/// Byte budget for returned stdout (~24k tokens at ~4 bytes/token). A chatty command (a build log,
 /// `find /`, a stack dump) would otherwise flood the model's context with its
 /// entire output every turn it stays in history.
 const STDOUT_BYTE_BUDGET: usize = 96_000;
@@ -200,5 +201,4 @@ crate::origin_tool! {
         "required": ["command"]
     }"#,
     sandbox: ::origin_sandbox::SandboxProfile::Shell,
-    token_budget: 25_000,
 }

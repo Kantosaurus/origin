@@ -92,6 +92,7 @@ pub struct Metrics {
     tokens_in: IntCounterVec,
     tokens_out: IntCounterVec,
     cache_hit: IntCounterVec,
+    cache_write: IntCounterVec,
     sandbox_violation: IntCounterVec,
     /// Static HELP/TYPE blocks emitted before the rows. Order matches the
     /// upstream encoder (registration order).
@@ -129,6 +130,14 @@ impl Metrics {
             &["provider"],
         )
         .expect("metric opts");
+        let cache_write = IntCounterVec::new(
+            Opts::new(
+                "origin_cache_write_total",
+                "prompt-cache writes (tokens written to the cache)",
+            ),
+            &["provider"],
+        )
+        .expect("metric opts");
         let sandbox_violation = IntCounterVec::new(
             Opts::new(
                 "origin_sandbox_violation_total",
@@ -142,6 +151,7 @@ impl Metrics {
             &tokens_in,
             &tokens_out,
             &cache_hit,
+            &cache_write,
             &sandbox_violation,
         ] {
             registry
@@ -151,12 +161,16 @@ impl Metrics {
         // Pre-render the HELP/TYPE block once per family. Order here matches
         // declaration order so the encoded body matches `TextEncoder`'s
         // output byte-for-byte (modulo trailing-newline conventions).
-        let mut headers: Vec<FamilyHeader> = Vec::with_capacity(5);
+        let mut headers: Vec<FamilyHeader> = Vec::with_capacity(6);
         for (family, help) in [
             ("origin_tool_call_total", "total tool invocations"),
             ("origin_tokens_in_total", "input tokens billed"),
             ("origin_tokens_out_total", "output tokens billed"),
             ("origin_cache_hit_total", "prompt-cache reads served from cache"),
+            (
+                "origin_cache_write_total",
+                "prompt-cache writes (tokens written to the cache)",
+            ),
             (
                 "origin_sandbox_violation_total",
                 "kernel-enforced sandbox denials",
@@ -173,6 +187,7 @@ impl Metrics {
             tokens_in,
             tokens_out,
             cache_hit,
+            cache_write,
             sandbox_violation,
             headers: Arc::new(headers),
             fast: Arc::new(Mutex::new(FastIndex::default())),
@@ -286,6 +301,15 @@ impl Metrics {
         let p = keys::canonical_provider(provider);
         let c = self.cache_hit.with_label_values(&[p]);
         self.register_fast("origin_cache_hit_total", &[("provider", p)], &c);
+        c
+    }
+
+    /// Counter handle for `origin_cache_write_total{provider}`.
+    #[must_use]
+    pub fn cache_write_total(&self, provider: &str) -> IntCounter {
+        let p = keys::canonical_provider(provider);
+        let c = self.cache_write.with_label_values(&[p]);
+        self.register_fast("origin_cache_write_total", &[("provider", p)], &c);
         c
     }
 

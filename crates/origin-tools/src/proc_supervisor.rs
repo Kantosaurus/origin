@@ -202,6 +202,8 @@ impl Supervisor {
         if let Some(cwd) = &opts.cwd {
             cmd.current_dir(cwd);
         }
+        // A6: allow-listed env only; the caller's explicit `opts.env` still applies.
+        origin_sandbox::scrub_env(cmd.as_std_mut());
         for (k, v) in &opts.env {
             cmd.env(k, v);
         }
@@ -234,6 +236,7 @@ impl Supervisor {
             if let Some(cwd) = &opts.cwd {
                 fallback.current_dir(cwd);
             }
+            origin_sandbox::scrub_env(fallback.as_std_mut());
             for (k, v) in &opts.env {
                 fallback.env(k, v);
             }

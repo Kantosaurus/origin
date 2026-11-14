@@ -89,11 +89,20 @@ async fn garbage_frame_between_good_frames_is_skipped_not_fatal() {
     let r = ring.clone();
     let prov = tokio::spawn(async move {
         // The turn must complete successfully despite the garbage frame.
-        provider.chat_stream(make_req(), &r).await.expect("stream must not abort on bad frame");
+        provider
+            .chat_stream(make_req(), &r)
+            .await
+            .expect("stream must not abort on bad frame");
     });
     let (text, saw_turn_end) = drain(&mut sub).await;
     prov.await.expect("prov task");
 
-    assert_eq!(text, "Hi!", "both good frames' content must survive a skipped garbage frame");
-    assert!(saw_turn_end, "the turn must still reach TurnEnd after a skipped frame");
+    assert_eq!(
+        text, "Hi!",
+        "both good frames' content must survive a skipped garbage frame"
+    );
+    assert!(
+        saw_turn_end,
+        "the turn must still reach TurnEnd after a skipped frame"
+    );
 }

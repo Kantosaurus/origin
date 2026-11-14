@@ -33,7 +33,6 @@ crate::origin_tool! {
         "required":["todos"]
     }"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
-    token_budget: crate::DEFAULT_TOKEN_BUDGET,
     hot: true,
 }
 
@@ -50,7 +49,10 @@ pub fn render_block(todos: &serde_json::Value) -> Option<String> {
     }
     let mut lines = Vec::with_capacity(arr.len());
     for item in arr {
-        let content = item.get("content").and_then(serde_json::Value::as_str).unwrap_or("");
+        let content = item
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
         if content.is_empty() {
             continue;
         }
@@ -93,6 +95,9 @@ mod tests {
     fn empty_or_malformed_yields_none() {
         assert!(render_block(&json!([])).is_none());
         assert!(render_block(&json!("nope")).is_none());
-        assert!(render_block(&json!([{"status":"pending"}])).is_none(), "no content ⇒ skipped");
+        assert!(
+            render_block(&json!([{"status":"pending"}])).is_none(),
+            "no content ⇒ skipped"
+        );
     }
 }

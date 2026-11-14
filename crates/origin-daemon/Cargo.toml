@@ -112,6 +112,9 @@ hex         = "0.4"
 parking_lot = "0.12"
 rand        = "0.8"
 toml        = "0.8"
+# C6: diff-review tripwires and run diff (both already in the workspace).
+regex       = "1"
+similar     = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -127,6 +130,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "origin-daemon"
 path = "src/main.rs"
+
+# Own `main`: the test binary doubles as the fake language server (run when it
+# is launched under the name `rust-analyzer`), so it needs no real server.
+[[test]]
+name = "lsp_diagnostics_turns"
+harness = false
 
 [[bench]]
 name = "phase2_ram_soak"

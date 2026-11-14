@@ -54,7 +54,7 @@ pub fn parse_urls(args: &Value) -> Vec<String> {
 /// Returns `Err` only when `urls` is empty (nothing to fetch). Individual
 /// fetch failures are folded into the returned markdown, not propagated.
 pub async fn web_fetch_many(urls: &[String]) -> Result<String, String> {
-    match urls {
+    let md = match urls {
         [] => Err("WebFetch: no URL provided".to_owned()),
         // Exactly one URL: preserve the legacy bare-markdown shape, including
         // surfacing the fetch error to the caller (no per-URL section wrap).
@@ -63,7 +63,9 @@ pub async fn web_fetch_many(urls: &[String]) -> Result<String, String> {
             let (outcomes, truncated) = fetch_many(urls, &FetchOptions::default()).await;
             Ok(render_combined_markdown(&outcomes, truncated))
         }
-    }
+    };
+    // Fetched page text is untrusted: drop hidden Unicode before the model sees it.
+    md.map(|md| origin_core::types::strip_hidden_unicode(&md))
 }
 
 /// Parse `WebFetch` arguments (`url` and/or `urls`) and fetch accordingly.
@@ -80,13 +82,12 @@ pub async fn web_fetch_args(args: &Value) -> Result<String, String> {
 
 crate::origin_tool! {
     name: "WebFetch",
-    description: "Fetch one or more URLs and return reader-mode markdown. Pass a single `url` string, or a `urls` array (up to 20) to fetch several at once; multi-URL output is sectioned under `## <url>` headers.",
+    description: "Fetch one or more URLs and answer `prompt` about their content. Required: `prompt` (what to find out from the page) and `url` or `urls`. Pass a single `url` string, or a `urls` array (up to 20) to fetch several at once. Where available, the page is read by a separate tool-less model and only its answer is returned; the result is wrapped in an <external> marker.",
     tier: Tier::RequiresPermission,
     urgency: Urgency::Low,
     side_effects: SideEffects::Pure,
-    input_schema: r#"{"type":"object","properties":{"url":{"type":"string","description":"A single URL to fetch."},"urls":{"type":"array","items":{"type":"string"},"maxItems":20,"description":"Up to 20 URLs to fetch in one call; takes precedence over `url` when present."}}}"#,
+    input_schema: r#"{"type":"object","properties":{"url":{"type":"string","description":"A single URL to fetch."},"urls":{"type":"array","items":{"type":"string"},"maxItems":20,"description":"Up to 20 URLs to fetch in one call; takes precedence over `url` when present."},"prompt":{"type":"string","description":"What you want to know from the page(s); answered from the fetched content."}},"required":["prompt"]}"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
-    token_budget: crate::DEFAULT_TOKEN_BUDGET,
     hot: false,
 }
 
@@ -126,6 +127,20 @@ mod tests {
         assert_eq!(
             urls,
             vec!["https://a.test".to_owned(), "https://b.test".to_owned()]
+        );
+    }
+
+    #[test]
+    fn description_names_the_required_arguments() {
+        // C4: a deferred tool's model sees only the description, not the schema.
+        let meta = crate::registry_iter()
+            .find(|m| m.name == "WebFetch")
+            .expect("WebFetch registered");
+        assert!(
+            meta.description
+                .contains("Required: `prompt` (what to find out from the page) and `url` or `urls`."),
+            "{}",
+            meta.description
         );
     }
 

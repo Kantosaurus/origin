@@ -136,7 +136,7 @@ origin sessions ls
 origin import opencode --from ~/.config/opencode --apply
 ```
 
-Imported **skills** then participate in `origin`'s embedding-indexed injection
+Imported **skills** then appear in `origin`'s skill catalog and can be activated
 just like native ones — see [Authoring skills](authoring-skills.md). Imported
 **sessions** show up in `origin sessions ls` and can be resumed with
 `origin sessions resume <id>`.

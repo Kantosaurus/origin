@@ -20,9 +20,9 @@ run.
   Markdown body — that carry (a) model-facing instructions injected verbatim
   into the per-turn system prompt and (b) an `allowed-tools` mask that *narrows*
   the permission surface. Every body is content-addressed by a blake3
-  `SkillHash` and embedded into the same HNSW vector index the memory subsystem
-  uses, so the *right* skills surface lazily per turn with zero session-start
-  scan cost.
+  `SkillHash`. The system prompt lists every skill by name and description
+  (`<origin-skills>`); a skill's body is injected only once it is activated
+  (`/<name>`).
 - **Hooks** (`origin-hooks`) are long-lived NUL-framed shell responders bound to
   typed lifecycle events (`PreTool`, `PostTool`, `SessionStart`, …). A
   pre-spawned `ShellPool` amortizes dispatch to one `write_all` + one
@@ -35,9 +35,9 @@ run.
   `workflow_progress.rs`) or fans it out as a dependency-layered parallel DAG of
   swarm workers (`workflow_runner.rs`, the `RunWorkflow` tool).
 
-The README's "embedding-indexed lazy injection" tagline is this subsystem: the
-catalog is loaded once, embedded once, and queried per turn so only the
-top-K relevant skill bodies materialize into the cache's `Sticky` band.
+An embedding-indexed, top-K-per-turn skill injection is designed (see
+[below](#embedding-indexed-lazy-injection)) but **not wired**: nothing in the
+daemon constructs `SkillEmbedder`, and the README no longer claims it (A10, D6).
 
 ---
 
@@ -257,9 +257,18 @@ upstream superpowers project and are the building blocks the default workflow an
 
 ## Embedding-indexed lazy injection
 
+> **Not wired (design only).** `SkillEmbedder` exists in
+> `crates/origin-skills/src/embed.rs` and is unit-tested, but no daemon or CLI
+> code constructs it, and no per-turn skill query runs. What runs today: the
+> system prompt carries the whole catalog as one line per skill (name and
+> description, `*` marking active skills), and an activated skill's full body is
+> injected under `<origin-active-skills>`. The 2026-11 evidence review (D6, in the
+> [design doc](../design/harness-efficiency-and-accuracy-proposals.md)) decided
+> not to wire it. The rest of this section describes the unwired design.
+
 The naïve approach — dump every skill description into every system prompt — is
 quadratic in catalog size and burns cache budget on skills that don't apply. The
-README's "embedding-indexed lazy injection" is the alternative.
+embedding-indexed design below is the alternative.
 
 ### `SkillEmbedder` — upsert into the shared HNSW index
 
@@ -370,6 +379,9 @@ The semantics matter and are carefully chosen:
 - **`Some(set)`** ⇒ the *intersection* of every restricting skill's list. Two
   active skills only allow what they *both* allow — narrowing is monotonic:
   activating another restricting skill can only ever shrink the surface.
+  (Not so in `RunWorkflow`: there a step's skill `allowed-tools`, or the default
+  `Read, Grep, Glob, Edit, Write`, is what the step's worker is *granted*; the
+  `RunWorkflow` ask shows the total reach of its steps.)
 - **`Some(empty set)`** ⇒ no tool is allowed (a genuine deny-all if two skills'
   lists are disjoint).
 
@@ -637,7 +649,7 @@ for the `RunWorkflow` tool / `origin workflow run`:
 ### The baked-in default workflow
 
 `crates/origin-daemon/src/default_workflow.rs` prepends a **default workflow
-directive** to every system prompt so the model self-orchestrates without the
+directive** to interactive system prompts so the model self-orchestrates without the
 user invoking each skill by name. Trivial requests (single facts, one-line edits)
 bypass it. The flow:
 
@@ -652,20 +664,27 @@ bypass it. The flow:
    each running **`/test-driven-development`** (RED → GREEN) then
    **`/verification-before-completion`** (paste fresh evidence).
 
-Two cross-cutting mandates the directive enforces: **ADVERSARIAL VERIFICATION IS
-MANDATORY** (try to *refute* the work; for non-trivial changes dispatch a
-separate verifier subagent) and **SWARM IS ALWAYS ON** (reach for parallel `Task`
+The directive enforces **ADVERSARIAL VERIFICATION IS MANDATORY** (try to
+*refute* the work). Two stronger mandates are opt-in with `ORIGIN_SWARM_ALWAYS=1`
+(read once per daemon process): dispatch a separate verifier `Task` for every
+non-trivial change, and **SWARM IS ALWAYS ON** (reach for parallel `Task`
 delegation by default). The directive maps directly onto the embedded skills
 (`goal`, `brainstorming`, `writing-plans`, `dispatching-parallel-agents`,
-`test-driven-development`, `verification-before-completion`) and is disabled
-globally with `ORIGIN_DEFAULT_WORKFLOW=off` (`directive()` returns `""`, which the
-caller concatenates unconditionally so the prompt stays byte-identical when off).
+`test-driven-development`, `verification-before-completion`). Headless runs
+(`origin run`, self-dispatch) omit it and swarm workers get their own small fixed
+prompt; `ORIGIN_DEFAULT_WORKFLOW=off` disables it everywhere and `=on` forces it
+into headless runs too (`directive()` returns `""` when omitted, which the caller
+concatenates unconditionally).
 
 ---
 
 ## Diagrams
 
 ### Skill injection flow (load → embed → per-turn materialization)
+
+> The embed and per-turn materialization steps are the **unwired design** (see
+> [Embedding-indexed lazy injection](#embedding-indexed-lazy-injection)); today
+> the catalog is listed in full and bodies are injected on activation.
 
 ```mermaid
 flowchart TD

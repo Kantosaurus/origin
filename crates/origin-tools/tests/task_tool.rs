@@ -51,6 +51,7 @@ async fn task_tool_dispatches_worker_and_inlines_report() {
                 transcript_handle: [0; 32],
                 usage: Usage::default(),
                 detail: None,
+                tainted: false,
             })
         })
     }));
@@ -64,7 +65,10 @@ async fn task_tool_dispatches_worker_and_inlines_report() {
             model: None,
             mcp_servers: vec![],
             background: false,
+            effort: None,
+            ponytail: None,
         },
+        &[],
     )
     .await
     .expect("task ok");
@@ -102,6 +106,7 @@ async fn task_tool_filters_disallowed_tools_into_decision_record() {
                 transcript_handle: [0; 32],
                 usage: Usage::default(),
                 detail: None,
+                tainted: false,
             })
         })
     }));
@@ -115,7 +120,10 @@ async fn task_tool_filters_disallowed_tools_into_decision_record() {
             model: None,
             mcp_servers: vec![],
             background: false,
+            effort: None,
+            ponytail: None,
         },
+        &[],
     )
     .await
     .expect("task ok");

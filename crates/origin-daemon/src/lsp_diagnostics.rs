@@ -5,23 +5,30 @@
 //! This is the daemon-side complement to the `origin lsp ls`/`ensure` CLI and
 //! the [`origin_lspfleet`] registry: after a turn that **mutated** files, the
 //! agent loop hands the distinct edited paths here. For each path we resolve its
-//! language server from the registry, spawn it through [`origin_lsp_client`],
-//! `did_open` the edited file, collect `textDocument/publishDiagnostics` under a
-//! short timeout, then drop the client (which reaps the server). The collected
-//! diagnostics are rendered into a compact `<lsp-diagnostics>` block that the
-//! agent loop appends to the *next* turn's system prompt so the model sees the
-//! compiler/linter feedback its edit produced.
+//! language server from the registry, get it from the session's
+//! [`LspPool`] (spawned on first use, then kept warm across turns),
+//! re-sync the edited file (`didOpen` → wait for that version's
+//! `textDocument/publishDiagnostics` under a short timeout → `didClose`). The
+//! collected diagnostics are rendered into a compact `<lsp-diagnostics>` block
+//! that the agent loop appends to the *next* turn's system prompt so the model
+//! sees the compiler/linter feedback its edit produced. A timeout is reported
+//! in the block (with the file's previous result, marked as possibly stale)
+//! rather than as an empty result. Every edited file is reported to the live
+//! servers as changed; after a turn whose mutations cannot be listed (`Bash`,
+//! MCP tools) and at the start of each prompt the pool is recycled, so no
+//! server analyses a stale copy of a file it was not told about. The pool
+//! lives as long as the connection (session); dropping it kills the servers.
 //!
 //! Everything here is best-effort and **gated behind `ORIGIN_LSP_DIAGNOSTICS=1`**
 //! (default off ⇒ the agent loop's per-turn system prompt is byte-identical).
-//! Any spawn / timeout / parse failure is swallowed — a flaky language server
-//! must never fail the turn that produced the edit.
+//! No failure propagates — a flaky language server must never fail the turn
+//! that produced the edit.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
-use origin_lsp_client::{Diagnostic, LspClient};
+use origin_lsp_client::{Diagnostic, LspError, LspPool, Probe};
 
 /// Per-file diagnostics-collection timeout. Kept short: language servers that
 /// publish quickly return well before this (the probe returns as soon as the
@@ -31,8 +38,8 @@ use origin_lsp_client::{Diagnostic, LspClient};
 const PER_FILE_TIMEOUT: Duration = Duration::from_millis(2500);
 
 /// Upper bound on how many distinct edited files we probe in a single turn.
-/// Spawning one short-lived server per file is the dominant cost; capping it
-/// keeps a turn that rewrote dozens of files from stalling on diagnostics.
+/// Waiting on the server is the dominant cost; capping it keeps a turn that
+/// rewrote dozens of files from stalling on diagnostics.
 const MAX_FILES_PER_TURN: usize = 8;
 
 /// Maximum number of diagnostic lines rendered into the block, across all files.
@@ -94,13 +101,14 @@ fn collapse_ws(s: &str) -> String {
 /// `path:line:col severity message` line, then the lines are sorted lexically
 /// and exact duplicates removed, so the same set always produces the same text
 /// (and a server that re-publishes an identical diagnostic collapses to one
-/// line). Returns `None` for an empty input (a clean edit surfaces no block —
-/// keeping the next turn's prompt unchanged). Output is capped at
+/// line). `notes` (timeouts, staleness, server failures) follow as `- note:`
+/// lines. Returns `None` when both are empty (a clean edit surfaces no block —
+/// keeping the next turn's prompt unchanged). Diagnostic output is capped at
 /// [`MAX_DIAG_LINES`] lines with an overflow summary.
 #[must_use]
-pub fn format_diagnostics_block(diags: &[Diagnostic]) -> Option<String> {
+pub fn format_diagnostics_block(diags: &[Diagnostic], notes: &[String]) -> Option<String> {
     use std::fmt::Write as _;
-    if diags.is_empty() {
+    if diags.is_empty() && notes.is_empty() {
         return None;
     }
     // Dedup the diagnostics themselves (by their rendered line) so a server that
@@ -110,9 +118,6 @@ pub fn format_diagnostics_block(diags: &[Diagnostic]) -> Option<String> {
     let mut deduped: Vec<Diagnostic> = diags.to_vec();
     deduped.sort_by_cached_key(render_one);
     deduped.dedup_by_key(|d| render_one(d));
-    if deduped.is_empty() {
-        return None;
-    }
     let (errors, warnings) = count_severities(&deduped);
     let rendered: Vec<String> = deduped.iter().map(render_one).collect();
     let mut out = String::from(
@@ -120,7 +125,11 @@ pub fn format_diagnostics_block(diags: &[Diagnostic]) -> Option<String> {
          Language-server diagnostics for the files you just edited. Fix any \
          `error` before continuing; `warning`/`info`/`hint` are advisory.\n",
     );
-    let _ = writeln!(out, "summary: {errors} error(s), {warnings} warning(s)");
+    // No summary for a notes-only block: "0 error(s)" would read as a clean
+    // result when the server simply did not answer.
+    if !deduped.is_empty() {
+        let _ = writeln!(out, "summary: {errors} error(s), {warnings} warning(s)");
+    }
     let shown = rendered.len().min(MAX_DIAG_LINES);
     for line in rendered.iter().take(shown) {
         out.push_str("- ");
@@ -129,6 +138,9 @@ pub fn format_diagnostics_block(diags: &[Diagnostic]) -> Option<String> {
     }
     if rendered.len() > shown {
         let _ = writeln!(out, "… and {} more", rendered.len() - shown);
+    }
+    for note in notes {
+        let _ = writeln!(out, "- note: {note}");
     }
     out.push_str("</lsp-diagnostics>");
     Some(out)
@@ -214,65 +226,94 @@ fn ensure_binary(program: &str, server: &origin_lspfleet::LspServer) -> bool {
 
 /// Run a registry install command through the platform shell. The command
 /// string originates from the builtin [`origin_lspfleet`] registry, never from
-/// model/user input.
+/// model/user input. The installer (and any package postinstall script it runs)
+/// gets the allow-listed environment (A6), never the daemon's provider keys.
 fn run_install(install_cmd: &str) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(windows)]
-    {
-        std::process::Command::new("cmd")
-            .arg("/C")
-            .arg(install_cmd)
-            .status()
-    }
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C");
+        c
+    };
     #[cfg(not(windows))]
-    {
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(install_cmd)
-            .status()
-    }
+    let mut cmd = {
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c");
+        c
+    };
+    origin_tools::scrub_env(&mut cmd);
+    cmd.arg(install_cmd).status()
 }
 
-/// Probe one edited file: resolve its server, ensure the binary, spawn it, open
-/// the file, and collect diagnostics for it under [`PER_FILE_TIMEOUT`].
+/// Probe one edited file through the session's pooled server for its language,
+/// waiting at most [`PER_FILE_TIMEOUT`].
 ///
-/// Returns the diagnostics the server reported for `path` (possibly empty), or
-/// an empty vec for every best-effort skip (no server, missing binary, unreadable
-/// file, spawn/handshake failure). Never panics, never propagates an error.
-async fn probe_file(workspace_root: &Path, path: &Path) -> Vec<Diagnostic> {
+/// Returns the diagnostics to show for `path` plus an optional note (timeout,
+/// staleness, server failure). Skips silently (empty, no note) when no server
+/// is registered for the file, its binary is unavailable, or the file is
+/// unreadable. Never panics, never propagates an error.
+async fn probe_file(pool: &LspPool, workspace_root: &Path, path: &Path) -> (Vec<Diagnostic>, Option<String>) {
     let Some(resolved) = resolve_launch(path) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     if !ensure_binary(resolved.program, resolved.server) {
         tracing::debug!(
             program = resolved.program,
             "LSP server binary unavailable; skipping diagnostics"
         );
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
-    let program = resolved.program;
-    match LspClient::diagnose_file(
-        program,
-        &resolved.args,
-        workspace_root,
-        path,
-        resolved.language_id,
-        &text,
-        PER_FILE_TIMEOUT,
-    )
-    .await
-    {
-        Ok((_client, diags)) => {
-            // `_client` is bound (not discarded with `_`) so the server stays
-            // alive through the full collection window above; it is reaped here
-            // when it drops at the end of this scope (kill_on_drop).
-            diags
-        }
+    let probe = pool
+        .diagnose(
+            resolved.program,
+            &resolved.args,
+            workspace_root,
+            path,
+            resolved.language_id,
+            &text,
+            PER_FILE_TIMEOUT,
+        )
+        .await;
+    probe_outcome(path, probe)
+}
+
+/// Turn a pooled probe result into the diagnostics to show plus an optional
+/// note, so a timeout or failure is reported instead of reading as "clean".
+fn probe_outcome(path: &Path, probe: Result<Probe, LspError>) -> (Vec<Diagnostic>, Option<String>) {
+    let p = path.display();
+    match probe {
+        Ok(Probe::Fresh(diags)) => (diags, None),
+        Ok(Probe::MaybeStale(diags)) => (
+            diags,
+            Some(format!(
+                "{p}: diagnostics may be stale (the server did not say which edit they \
+                 answer, and the previous check of this file timed out)"
+            )),
+        ),
+        Ok(Probe::TimedOut { starting: true, .. }) => (
+            Vec::new(),
+            Some(format!(
+                "{p}: diagnostics timed out after {PER_FILE_TIMEOUT:?}; the language server \
+                 is still starting"
+            )),
+        ),
+        Ok(Probe::TimedOut { previous, .. }) if previous.is_empty() => (
+            Vec::new(),
+            Some(format!("{p}: diagnostics timed out after {PER_FILE_TIMEOUT:?}")),
+        ),
+        Ok(Probe::TimedOut { previous, .. }) => (
+            previous,
+            Some(format!(
+                "{p}: diagnostics timed out after {PER_FILE_TIMEOUT:?}; showing the previous \
+                 result for this file, diagnostics may be stale"
+            )),
+        ),
         Err(e) => {
-            tracing::debug!(program, error = %e, "LSP diagnostics probe failed (ignored)");
-            Vec::new()
+            tracing::debug!(error = %e, "LSP diagnostics probe failed");
+            (Vec::new(), Some(format!("{p}: diagnostics unavailable ({e})")))
         }
     }
 }
@@ -280,35 +321,58 @@ async fn probe_file(workspace_root: &Path, path: &Path) -> Vec<Diagnostic> {
 /// Build the `<lsp-diagnostics>` block for a turn's distinct edited files.
 ///
 /// No-op (returns `None`) unless [`enabled`]. Probes up to [`MAX_FILES_PER_TURN`]
-/// distinct paths (sorted for determinism), aggregates every server's reported
-/// diagnostics, and formats them via [`format_diagnostics_block`]. A clean edit
-/// (no diagnostics) and an unresolvable/unusable server set both yield `None`,
-/// so the next turn's prompt stays unchanged. Best-effort throughout.
+/// distinct paths (sorted for determinism) through `pool`, aggregates every
+/// server's reported diagnostics and notes, and formats them via
+/// [`format_diagnostics_block`]. A clean edit (no diagnostics, no notes) and an
+/// unresolvable/unavailable server set both yield `None`, so the next turn's
+/// prompt stays unchanged. Best-effort throughout.
 ///
-/// `workspace_root` is the directory the servers `initialize` against (the
-/// session cwd). `edited` is the set of file paths the turn mutated.
+/// `pool` holds the session's live servers. `workspace_root` is the directory
+/// a server `initialize`s against when first spawned (the session cwd).
+/// `edited` is the set of file paths the turn mutated; every one of them (not
+/// just the probed ones) is reported to the live servers as changed.
+/// `unlisted_mutation` is true when the turn also ran a mutating tool that
+/// does not report which files it changed (`Bash`, MCP tools, …): the pool is
+/// then recycled so no server analyses a stale copy of those files.
 #[allow(clippy::module_name_repetitions)] // `lsp_diagnostics_block` is the documented entry point callers expect.
-pub async fn lsp_diagnostics_block(workspace_root: &Path, edited: &BTreeSet<String>) -> Option<String> {
-    if !enabled() || edited.is_empty() {
+pub async fn lsp_diagnostics_block(
+    pool: &LspPool,
+    workspace_root: &Path,
+    edited: &BTreeSet<String>,
+    unlisted_mutation: bool,
+) -> Option<String> {
+    if !enabled() {
         return None;
     }
-    let mut all: Vec<Diagnostic> = Vec::new();
-    for path_str in edited.iter().take(MAX_FILES_PER_TURN) {
-        let path = Path::new(path_str);
-        let mut diags = probe_file(workspace_root, path).await;
-        all.append(&mut diags);
+    if unlisted_mutation {
+        // ponytail: a cold server start after every shell-mutation turn (slow
+        // for rust-analyzer/jdtls); upgrade path is a workspace file watcher or
+        // an mtime snapshot diff, reported via `notify_changed` instead.
+        pool.recycle().await;
     }
-    format_diagnostics_block(&all)
+    if edited.is_empty() {
+        return None;
+    }
+    let changed: Vec<&Path> = edited.iter().map(Path::new).collect();
+    pool.notify_changed(&changed).await;
+    let mut all: Vec<Diagnostic> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    for path_str in edited.iter().take(MAX_FILES_PER_TURN) {
+        let (mut diags, note) = probe_file(pool, workspace_root, Path::new(path_str)).await;
+        all.append(&mut diags);
+        notes.extend(note);
+    }
+    format_diagnostics_block(&all, &notes)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{
-        collapse_ws, count_severities, enabled, format_diagnostics_block, render_one, resolve_launch,
-        severity_label,
+        collapse_ws, count_severities, enabled, format_diagnostics_block, probe_outcome, render_one,
+        resolve_launch, severity_label,
     };
-    use origin_lsp_client::Diagnostic;
+    use origin_lsp_client::{Diagnostic, Probe};
     use std::path::{Path, PathBuf};
 
     fn diag(file: &str, line: u32, col: u32, severity: u8, message: &str, code: Option<&str>) -> Diagnostic {
@@ -341,9 +405,30 @@ mod tests {
         if std::env::var_os("ORIGIN_LSP_DIAGNOSTICS").is_none() {
             let mut edited = std::collections::BTreeSet::new();
             edited.insert("main.rs".to_string());
-            let block = super::lsp_diagnostics_block(Path::new("."), &edited).await;
+            let pool = origin_lsp_client::LspPool::default();
+            let block = super::lsp_diagnostics_block(&pool, Path::new("."), &edited, true).await;
             assert!(block.is_none(), "disabled gate must yield no block");
         }
+    }
+
+    /// A6: the `ORIGIN_LSP_AUTO` installer (and any package postinstall script
+    /// it runs) gets the allow-listed environment, not the daemon's secrets.
+    #[test]
+    fn install_command_does_not_see_daemon_secrets() {
+        // Secret-shaped and unique to this test, so setting it disturbs no other test.
+        std::env::set_var("A6_INSTALL_PROBE_TOKEN", "sk-install-secret");
+        let out = std::env::temp_dir().join(format!("a6-install-probe-{}.txt", std::process::id()));
+        #[cfg(windows)]
+        let cmd = format!("echo %A6_INSTALL_PROBE_TOKEN%>{}", out.display());
+        #[cfg(not(windows))]
+        let cmd = format!("echo \"$A6_INSTALL_PROBE_TOKEN\" > '{}'", out.display());
+        assert!(super::run_install(&cmd).unwrap().success());
+        let seen = std::fs::read_to_string(&out).unwrap();
+        let _ = std::fs::remove_file(&out);
+        assert!(
+            !seen.contains("sk-install-secret"),
+            "secret leaked to installer: {seen:?}"
+        );
     }
 
     #[test]
@@ -383,7 +468,81 @@ mod tests {
 
     #[test]
     fn format_block_none_when_empty() {
-        assert!(format_diagnostics_block(&[]).is_none());
+        assert!(format_diagnostics_block(&[], &[]).is_none());
+    }
+
+    #[test]
+    fn timeout_is_reported_not_returned_as_clean() {
+        let (diags, note) = probe_outcome(
+            Path::new("a.rs"),
+            Ok(Probe::TimedOut {
+                previous: Vec::new(),
+                starting: false,
+            }),
+        );
+        assert!(diags.is_empty());
+        let block = format_diagnostics_block(&diags, &Vec::from_iter(note)).unwrap();
+        assert!(
+            block.contains("- note: a.rs: diagnostics timed out after 2.5s"),
+            "{block}"
+        );
+        assert!(
+            !block.contains("summary:"),
+            "a timeout must not read as 0 errors: {block}"
+        );
+    }
+
+    #[test]
+    fn timeout_with_previous_result_is_marked_stale() {
+        let (diags, note) = probe_outcome(
+            Path::new("a.rs"),
+            Ok(Probe::TimedOut {
+                previous: vec![diag("a.rs", 0, 0, 1, "old error", None)],
+                starting: false,
+            }),
+        );
+        let block = format_diagnostics_block(&diags, &Vec::from_iter(note)).unwrap();
+        assert!(block.contains("a.rs:1:1 error old error"), "{block}");
+        assert!(block.contains("diagnostics may be stale"), "{block}");
+    }
+
+    #[test]
+    fn starting_server_and_untagged_publish_get_their_own_notes() {
+        let (diags, note) = probe_outcome(
+            Path::new("a.rs"),
+            Ok(Probe::TimedOut {
+                previous: Vec::new(),
+                starting: true,
+            }),
+        );
+        assert!(diags.is_empty());
+        assert_eq!(
+            note.as_deref(),
+            Some("a.rs: diagnostics timed out after 2.5s; the language server is still starting")
+        );
+        let (diags, note) = probe_outcome(
+            Path::new("a.rs"),
+            Ok(Probe::MaybeStale(vec![diag("a.rs", 0, 0, 1, "e", None)])),
+        );
+        assert_eq!(diags.len(), 1);
+        assert!(note.unwrap().contains("a.rs: diagnostics may be stale"));
+    }
+
+    #[test]
+    fn fresh_result_has_no_note_and_failure_does() {
+        let (diags, note) = probe_outcome(
+            Path::new("a.rs"),
+            Ok(Probe::Fresh(vec![diag("a.rs", 0, 0, 1, "e", None)])),
+        );
+        assert_eq!((diags.len(), note), (1, None));
+        let (_, note) = probe_outcome(
+            Path::new("a.rs"),
+            Err(origin_lsp_client::LspError::Spawn("boom".into())),
+        );
+        assert_eq!(
+            note.as_deref(),
+            Some("a.rs: diagnostics unavailable (spawn: boom)")
+        );
     }
 
     #[test]
@@ -393,7 +552,7 @@ mod tests {
             diag("a.rs", 9, 4, 1, "boom", Some("E0308")),
             diag("a.rs", 9, 4, 1, "boom", Some("E0308")), // exact dup
         ];
-        let block = format_diagnostics_block(&diags).unwrap();
+        let block = format_diagnostics_block(&diags, &[]).unwrap();
         assert!(block.starts_with("<lsp-diagnostics>"));
         assert!(block.ends_with("</lsp-diagnostics>"));
         assert!(block.contains("summary: 1 error(s), 1 warning(s)"));
@@ -423,7 +582,7 @@ mod tests {
                 )
             })
             .collect();
-        let block = format_diagnostics_block(&diags).unwrap();
+        let block = format_diagnostics_block(&diags, &[]).unwrap();
         assert!(block.contains("… and 5 more"));
     }
 

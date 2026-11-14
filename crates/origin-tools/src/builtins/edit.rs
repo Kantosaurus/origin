@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `Edit` v2 — find-and-replace with CRLF safety, hunk return, `replace_all`.
+//! `Edit` v2 — find-and-replace with CRLF safety, unified-diff return, `replace_all`.
 
-use crate::builtins::editmatch;
 use crate::builtins::write::WriteGuard;
+use crate::builtins::{editmatch, read};
 use crate::error::{ErrClass, ToolError};
 use crate::text_fmt;
 use crate::{SideEffects, Tier, Urgency};
 use serde_json::{json, Value};
+use std::fmt::Write as _;
 
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Clone)]
@@ -57,7 +58,10 @@ pub fn edit_v2(args: EditArgs, guard: Option<&WriteGuard>) -> Result<Value, Tool
             return Err(ToolError::new(
                 ErrClass::Edit,
                 "read_required",
-                format!("refusing to Edit '{}' that has not been Read this session", args.file_path),
+                format!(
+                    "refusing to Edit '{}' that has not been Read this session",
+                    args.file_path
+                ),
             )
             .recoverable(true)
             .hint("call Read on this file first, then re-Edit"));
@@ -112,13 +116,44 @@ pub fn edit_v2(args: EditArgs, guard: Option<&WriteGuard>) -> Result<Value, Tool
         }
     };
 
-    let hunk = build_hunk(&text, &args.old_string, &args.new_string);
+    let diff = capped_diff(&text, &updated);
     let new_bytes = text_fmt::denormalise(&updated, &det);
     atomic_write(&args.file_path, &new_bytes)?;
-    Ok(json!({
-        "ok": true,
-        "hunks": [hunk],
-    }))
+    Ok(json!({ "ok": true, "diff": diff }))
+}
+
+/// Byte cap on the returned `diff`, truncation marker included.
+const MAX_DIFF_BYTES: usize = 20_000;
+
+/// 3-line-context unified diff of `before` → `after`, computed under a 500 ms
+/// deadline (past it `similar` returns a coarser but still correct diff). Each
+/// line is cut like a `Read` row; past [`MAX_DIFF_BYTES`] the rest is replaced
+/// by a one-line `[diff truncated — N more lines; …]` marker.
+fn capped_diff(before: &str, after: &str) -> String {
+    let full = similar::TextDiff::configure()
+        .timeout(std::time::Duration::from_millis(500))
+        .diff_lines(before, after)
+        .unified_diff()
+        .context_radius(3)
+        .to_string();
+    let mut out = String::new();
+    let mut rows = full.split_inclusive('\n');
+    while let Some(row) = rows.next() {
+        let body = row.strip_suffix('\n').unwrap_or(row);
+        let line = read::cap_line(body);
+        // 128 bytes stay free for the marker.
+        if out.len() + line.len() + 1 > MAX_DIFF_BYTES - 128 {
+            let more = 1 + rows.count();
+            let _ = writeln!(
+                out,
+                "[diff truncated \u{2014} {more} more lines; Read the file to see the result]"
+            );
+            break;
+        }
+        out.push_str(&line);
+        out.push_str(&row[body.len()..]);
+    }
+    out
 }
 
 /// The `edit.no_match` error, enriched with the closest whitespace-only
@@ -131,15 +166,6 @@ fn gutter_or_no_match(text: &str, old: &str, path: &str) -> ToolError {
     ToolError::new(ErrClass::Edit, "no_match", msg)
         .recoverable(true)
         .hint("widen the needle or add surrounding context")
-}
-
-fn build_hunk(before: &str, old: &str, new: &str) -> Value {
-    let line = before
-        .lines()
-        .enumerate()
-        .find(|(_, l)| l.contains(old))
-        .map_or(0, |(i, _)| i + 1);
-    json!({ "before": old, "after": new, "line": line })
 }
 
 fn atomic_write(path: &str, bytes: &[u8]) -> Result<(), ToolError> {
@@ -177,5 +203,4 @@ crate::origin_tool! {
         "required": ["file_path", "old_string", "new_string"]
     }"#,
     sandbox: ::origin_sandbox::SandboxProfile::WriteCwd,
-    token_budget: 4_000,
 }

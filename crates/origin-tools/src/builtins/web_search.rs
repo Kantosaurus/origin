@@ -20,6 +20,5 @@ crate::origin_tool! {
     side_effects: SideEffects::Pure,
     input_schema: r#"{"type":"object","required":["query"],"properties":{"query":{"type":"string"},"count":{"type":"integer","minimum":1,"maximum":20}}}"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
-    token_budget: crate::DEFAULT_TOKEN_BUDGET,
     hot: false,
 }

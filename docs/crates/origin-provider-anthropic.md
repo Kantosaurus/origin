@@ -64,16 +64,21 @@ consumes the byte stream and publishes deltas into the `Ring`.
 on a block via three paths: planner `marker_indices` on message 0, an in-band
 `cache_marker` on any block, or a dynamic per-turn marker on the last emitting
 block. A `Frozen` boundary can opt into the 1-hour TTL via `ORIGIN_CACHE_TTL_1H=1`.
-A warning fires past Anthropic's 4-marker-per-request ceiling.
+`system` is sent as a one-block array carrying its own marker (1-hour TTL under the
+same flag), so the tools + system prefix is cached from a session's first request;
+that marker counts against Anthropic's 4-marker-per-request ceiling, leaving the
+messages three. `ORIGIN_SYSTEM_CACHE=0` restores the plain-string `system` with no
+marker (and four message markers) for Anthropic-compatible endpoints that reject the
+array form. Markers past the ceiling are dropped (earliest first) with a warning.
 
 **Thinking.** `thinking_tokens` enables extended thinking; models tagged
 `-4-6`/`-4-7`/`-4-8` use `{"type":"adaptive"}` (manual `budget_tokens` 400s on
 4.7+), older models use `{"type":"enabled","budget_tokens":n}`, and `max_tokens`
 is bumped above the budget.
 
-**Tool results / CAS.** `expand_messages_for_wire` resolves CAS handles, consults
-the `Plan`'s per-handle band to decide inline-vs-`<result handle:… — N bytes>`
-reference, and strips orphan `tool_result` blocks before the API rejects them.
+**Tool results / CAS.** `origin_provider::inflate_tool_result_handles` (shared
+with every provider) inlines each CAS handle's full body verbatim and strips orphan
+`tool_result` blocks before the API rejects them.
 
 **Cassette tap.** `ORIGIN_CASSETTE=record:<path>|replay:<path>` records/replays
 both `chat` JSON and `chat_stream` SSE bodies (secret-scrubbed, save-gated).

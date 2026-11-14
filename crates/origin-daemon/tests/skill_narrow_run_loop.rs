@@ -40,8 +40,9 @@ impl Provider for ScriptedProvider {
 
 #[tokio::test]
 async fn skill_narrowing_denies_tool_in_run_loop() {
-    // Skill stack only permits `Read`. The scripted assistant tries to call
-    // `Bash`, which is outside the mask → run_loop must return Denied.
+    // Skill stack only permits `Read`. The scripted assistant keeps calling
+    // `Bash`, which is outside the mask → each call is denied, and the third
+    // consecutive denial (A8) makes run_loop return Denied.
     let mut skills = SkillRegistry::new();
     skills.activate(SkillFrontmatter {
         name: "read-only".into(),
@@ -49,17 +50,20 @@ async fn skill_narrowing_denies_tool_in_run_loop() {
         allowed_tools: vec!["Read".into()],
     });
 
-    let tool_use = Block::ToolUse {
-        id: "tu_1".into(),
-        name: "Bash".into(),
-        input_json: serde_json::to_vec(&serde_json::json!({"command": "echo hi"})).expect("json"),
-        cache_marker: None,
-    };
-    let provider = ScriptedProvider {
-        responses: Mutex::new(vec![ChatResponse {
-            assistant: Message::new(Role::Assistant).with_block(tool_use),
+    let responses = (1..=3)
+        .map(|i| ChatResponse {
+            assistant: Message::new(Role::Assistant).with_block(Block::ToolUse {
+                id: format!("tu_{i}"),
+                name: "Bash".into(),
+                input_json: serde_json::to_vec(&serde_json::json!({"command": format!("echo {i}")}))
+                    .expect("json"),
+                cache_marker: None,
+            }),
             usage: Usage::default(),
-        }]),
+        })
+        .collect();
+    let provider = ScriptedProvider {
+        responses: Mutex::new(responses),
     };
 
     let mut session = Session::new("skill-narrow", "scripted-model");

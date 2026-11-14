@@ -18,7 +18,9 @@ use origin_daemon::memory_wiring::MemoryWiring;
 use origin_daemon::pairing::{Pairing, RedeemResult};
 use origin_daemon::plan_bus::PlanBus;
 use origin_daemon::proposal_registry::ProposalRegistry;
-use origin_daemon::protocol::{ClientMessage, MemoryAction, PromptReply, PromptRequest, StreamEvent};
+use origin_daemon::protocol::{
+    ClientMessage, MemoryAction, PermissionMode, PromptReply, PromptRequest, StreamEvent,
+};
 use origin_daemon::provider_factory::{ProviderFactory, ProviderId};
 use origin_daemon::runtime_launch::{self, ShutdownSignal};
 use origin_daemon::session::Session;
@@ -403,10 +405,22 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
         "initial provider ready"
     );
     let active: ActiveProvider = Arc::new(RwLock::new(initial_provider));
+    // C9: build the by-value secret redactor once, before any tool can run, and
+    // after the initial provider build so an OAuth token refreshed at startup is
+    // the one collected.
+    origin_daemon::redact::install(
+        origin_daemon::redact::collect(&vault, factory.catalog(), &initial_account).await,
+    );
 
     let db_path = env::var("ORIGIN_DB").unwrap_or_else(|_| default_db_path());
     let session_store = Arc::new(SessionStore::open(&db_path)?);
     info!(db = %db_path, "session store ready");
+    // C9: opt-in session retention. ORIGIN_SESSION_RETENTION_DAYS = N > 0 prunes
+    // sessions idle for N days; unset / 0 / unparsable keeps everything.
+    let retention_days = session_retention_days(env::var("ORIGIN_SESSION_RETENTION_DAYS").ok().as_deref());
+    if let Err(e) = session_store.prune_older_than(retention_days) {
+        warn!(error = %e, "session retention prune failed");
+    }
 
     // Code-graph subsystem (P7.8 Subsystem A). Opens its own CAS root and
     // SQL connection so the index never contends with the session store or
@@ -485,6 +499,18 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
         warn!("memory subsystem disabled (store init failed)");
     }
 
+    // Optional governance config (5-tier policy engine + per-prompt ConSeca
+    // security policy). Loaded once at startup from `governance.toml`. When the
+    // file is absent both handles are `None` ⇒ the deny-only overlay is inert
+    // and daemon behavior is byte-identical to before this wiring landed.
+    // Loaded before the swarm coordinator so sub-agents inherit it (A4).
+    let governance: Governance = startup_governance(&governance_path())?;
+    info!(
+        policy = governance.policy.is_some(),
+        conseca = governance.conseca.is_some(),
+        "governance config loaded at startup"
+    );
+
     // Swarm coordinator (P9.6). We open a dedicated SqlStore for the plan op-log
     // so the plan tables are isolated from the session-store connection.
     // `PlanStore::open` is currently infallible (returns `Ok(Self)` always) so
@@ -541,6 +567,7 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
             // wire-encoder); each sub-agent forks a session-isolated view that
             // shares the content-addressed handle bands (prefix-cache inheritance).
             wire_plan.clone(),
+            governance.clone(),
         ));
         Arc::new(coord)
     };
@@ -588,26 +615,6 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
     info!(
         workflow_count = workflows_catalog.workflows.len(),
         "workflows catalog loaded at startup"
-    );
-
-    // Optional governance config (5-tier policy engine + per-prompt ConSeca
-    // security policy). Loaded once at startup from `governance.toml`. When the
-    // file is absent both handles are `None` ⇒ the deny-only overlay is inert
-    // and daemon behavior is byte-identical to before this wiring landed.
-    let governance: Governance = {
-        let path = governance_path();
-        match load_governance(&path) {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::warn!(error = %e, path = %path.display(), "governance config load failed; running with no governance overlay");
-                Governance::default()
-            }
-        }
-    };
-    info!(
-        policy = governance.policy.is_some(),
-        conseca = governance.conseca.is_some(),
-        "governance config loaded at startup"
     );
 
     spawn_idle_consolidator(memory.as_ref());
@@ -738,6 +745,19 @@ async fn daemon_setup(state: Arc<std::sync::Mutex<DaemonState>>) -> Result<()> {
             path.clone(),
         );
     }
+}
+
+/// A4: the governance the daemon starts with. A missing file is no
+/// governance; a file that exists but cannot be read or parsed stops the
+/// start (its organisation deny rules, conseca policy and caps must not
+/// silently vanish), with an error naming the file and the reason.
+fn startup_governance(path: &std::path::Path) -> Result<Governance> {
+    load_governance(path).map_err(|e| {
+        anyhow::anyhow!(
+            "{e}; origin-daemon does not start without the governance this file configures \
+             (fix the file, or remove it to run without governance)"
+        )
+    })
 }
 
 /// Spawn the idle-heartbeat consolidator if memory + consolidator are wired.
@@ -914,6 +934,12 @@ fn spawn_handler_task(
         // `Write{force:false}` over a seen file is permitted. Uses interior
         // mutability, so a single `Arc<WriteGuard>` records reads across calls.
         let write_guard = Arc::new(origin_tools::builtins::write::WriteGuard::default());
+        // C10: per-connection (per-session) language servers for the opt-in
+        // post-edit diagnostics, kept warm across a prompt's turns (recycled
+        // when files may have changed unseen). Empty unless
+        // `ORIGIN_LSP_DIAGNOSTICS=1`; dropped (servers killed) when the
+        // connection ends.
+        let lsp_pool = Arc::new(origin_lsp_client::LspPool::default());
 
         loop {
             // Step 1: drain any pushed-back message left by the goal driver
@@ -1001,6 +1027,7 @@ fn spawn_handler_task(
                         Arc::clone(&write_guard),
                         Arc::clone(&metrics),
                         verifier,
+                        Arc::clone(&lsp_pool),
                         req,
                     )
                     .await;
@@ -1252,12 +1279,10 @@ fn spawn_handler_task(
                     // streaming), so it lands here. Resolve the waiting ask in
                     // the daemon-wide registry. Unknown ids are ignored.
                     //
-                    // `always` ("remember this decision") is the CLI/picker's
-                    // concern (it persists the rule client-side); the daemon's
-                    // immediate job is only to allow/deny the in-flight tool, so
-                    // the registry resolve still keys on `allow`.
-                    let _ = always;
-                    permission_registry.resolve(id, allow);
+                    // C2: `always` ("Always allow <tool>") becomes a standing
+                    // allow for the ask's session and tool — in memory, for this
+                    // daemon's lifetime — when that ask offered it.
+                    permission_registry.resolve(id, allow, always);
                     // Ack so the client's `send_decision` drain unblocks; without
                     // it the serial keyboard loop parks and the next picker
                     // freezes. See `ack_decision`.
@@ -1693,18 +1718,57 @@ const fn choice_registry_enabled(interactive: bool, permission_ask: bool) -> boo
 
 /// Resolve the effective reasoning effort for a turn.
 ///
-/// An explicit per-request effort (the CLI's `/effort` / `/fast`) always wins.
-/// When the client sent no effort, Anthropic models default to
-/// [`ReasoningEffort::Ultracode`] — maximum reasoning plus the always-on swarm
-/// surface — so Claude models run at full depth out of the box. Every other
-/// provider stays unset (`None`), which leaves its wire byte-identical.
+/// An explicit per-request effort (the CLI's `/effort` / `/fast` / `--effort`)
+/// always wins, then `ORIGIN_DEFAULT_EFFORT` (`env_default`). With neither,
+/// Anthropic models default to [`ReasoningEffort::High`] (B3; was `max`). Every
+/// other provider stays unset (`None`), which leaves its wire byte-identical.
 fn resolve_turn_effort(
     requested: Option<origin_provider::ReasoningEffort>,
+    env_default: Option<origin_provider::ReasoningEffort>,
     provider_name: &str,
 ) -> Option<origin_provider::ReasoningEffort> {
-    requested.or_else(|| {
-        (provider_name == "anthropic").then_some(origin_provider::ReasoningEffort::Ultracode)
-    })
+    requested
+        .or(env_default)
+        .or_else(|| (provider_name == "anthropic").then_some(origin_provider::ReasoningEffort::High))
+}
+
+/// A best-of-N candidate's run: the orchestrator's resolved `effort` (so an
+/// explicit `/effort` reaches it) and the headless prompt — nobody answers a
+/// candidate's questions. A4: the same deny-only governance the main loop runs
+/// under (`[[permission_rules]]`, policy layers, conseca).
+fn candidate_opts(
+    effort: Option<origin_provider::ReasoningEffort>,
+    cwd: &std::path::Path,
+    governance: &origin_daemon::config::Governance,
+) -> LoopOptions {
+    LoopOptions {
+        max_turns: 60,
+        effort,
+        cwd: Some(cwd.to_path_buf()),
+        prompt_profile: origin_daemon::agent::PromptProfile::Headless,
+        policy: governance.policy.clone(),
+        conseca: governance.conseca.clone(),
+        permission_rules: governance.permission_rules.clone(),
+        ..LoopOptions::default()
+    }
+}
+
+/// B3 escape hatch: `ORIGIN_DEFAULT_EFFORT`, read once per daemon process so the
+/// default never changes under a running conversation. Main loop only.
+fn env_default_effort() -> Option<origin_provider::ReasoningEffort> {
+    static EFFORT: std::sync::OnceLock<Option<origin_provider::ReasoningEffort>> = std::sync::OnceLock::new();
+    *EFFORT.get_or_init(|| parse_default_effort(std::env::var("ORIGIN_DEFAULT_EFFORT").ok().as_deref()))
+}
+
+/// `ORIGIN_DEFAULT_EFFORT`'s value: a name `/effort` accepts; empty or
+/// whitespace counts as unset; anything else is ignored with a warning.
+fn parse_default_effort(raw: Option<&str>) -> Option<origin_provider::ReasoningEffort> {
+    let raw = raw.filter(|v| !v.trim().is_empty())?;
+    let parsed = origin_provider::ReasoningEffort::parse_name(raw);
+    if parsed.is_none() {
+        tracing::warn!(value = %raw, "ORIGIN_DEFAULT_EFFORT: unknown effort level (ignored)");
+    }
+    parsed
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1746,6 +1810,8 @@ async fn handle_request(
     // the counters that back `/metrics`, `origin usage`, and the `?metrics` panel.
     metrics: Arc<Metrics>,
     verifier: Arc<dyn origin_goal::verifier::Verifier>,
+    // C10: per-connection pool of live language servers for post-edit diagnostics.
+    lsp_pool: Arc<origin_lsp_client::LspPool>,
     req: PromptRequest,
 ) -> PromptOutcome {
     let mut session = if let Some(sid) = &req.session_id {
@@ -1797,6 +1863,11 @@ async fn handle_request(
     if !req.roots.is_empty() {
         session.roots = req.roots.iter().map(std::path::PathBuf::from).collect();
     }
+    // C2: session taint survives reloads, compaction and resume (marker file);
+    // a history that already holds an external result counts too.
+    session.tainted =
+        session_store.is_tainted(&session.id) || origin_daemon::agent::external_result_in(&session.messages);
+    let (permission_mode, can_ask) = req.permission();
     // Bug #8: stash the session id so a later `/goal` activation on this
     // connection can checkpoint without waiting for the first iteration
     // to complete.
@@ -1865,6 +1936,10 @@ async fn handle_request(
             let slot = active_account.lock().await.clone();
             origin_daemon::agent::resolve_session_account(req.account.as_deref(), &slot)
         };
+        let explicit_effort = req
+            .effort
+            .as_deref()
+            .and_then(origin_provider::ReasoningEffort::from_wire_str);
         let opts = LoopOptions {
             // No fixed turn cap on the live request loop: run until the model
             // produces a tool-free final answer. `u32::MAX` is the "infinite"
@@ -1927,8 +2002,7 @@ async fn handle_request(
             // ^ shared with the Anthropic provider's wire-encoder via the
             // `Arc<RwLock<…>>` inside `Plan`. The dispatch loop registers
             // every produced CAS handle (Sticky for Pure tools, Volatile
-            // for Mutating) so the encoder can downgrade `Inline` to
-            // `Reference` on subsequent turns.
+            // for Mutating); the encoder still inlines every result (A1).
             goal: Arc::clone(&active_goal),
             // ^ per-connection goal slot. When `Some(Active|Verifying)` the
             // `run_loop` body renders an `<origin-goal>` block on each turn;
@@ -1940,16 +2014,13 @@ async fn handle_request(
             // that file is absent both are `None` ⇒ default daemon behavior is
             // byte-identical; when present they narrow (never widen) tool access
             // via the deny-only `apply_governance_overlay` in `agent.rs`.
-            effort: resolve_turn_effort(
-                req.effort
-                    .as_deref()
-                    .and_then(origin_provider::ReasoningEffort::from_wire_str),
-                provider.name(),
-            ),
+            effort: resolve_turn_effort(explicit_effort, env_default_effort(), provider.name()),
             // ^ claude-code `/effort`+`/fast`: the CLI sends a canonical token;
-            // an unknown token maps to `None`. With no explicit effort, Anthropic
-            // models default to `Ultracode` (max reasoning); other providers stay
-            // `None` ⇒ wire byte-identical. See `resolve_turn_effort`.
+            // an unknown token maps to `None`. With no explicit effort,
+            // `ORIGIN_DEFAULT_EFFORT`, else Anthropic models default to `High`;
+            // other providers stay `None` ⇒ wire byte-identical. See `resolve_turn_effort`.
+            explicit_effort,
+            // ^ B3: only the user's own choice is handed down to sub-agents.
             ponytail: origin_ponytail::resolve_mode(
                 req.ponytail
                     .as_deref()
@@ -2021,19 +2092,40 @@ async fn handle_request(
             // hours) and dispatched over the configured channel. Absent ⇒ `None`
             // ⇒ unconditional desktop toast under `ORIGIN_NOTIFY=1`,
             // byte-identical to before.
+            lsp_pool: Some(lsp_pool),
+            // ^ C10: the connection's language servers.
+            cwd: None,
+            // ^ A12: the live turn uses the process cwd; only best-of-N
+            // candidates run in their own worktree.
+            touches: None, // B8: only swarm workers report their touches
+            prompt_profile: if req.interactive {
+                origin_daemon::agent::PromptProfile::Interactive
+            } else {
+                origin_daemon::agent::PromptProfile::Headless
+            },
+            // ^ B5: `interactive` is false for headless `origin run` and the
+            // daemon's self-dispatch; those omit the default-workflow directive.
+            permission_mode,
+            // ^ C2: `workspace` by default; see `PromptRequest::permission`.
         };
-        // Opt-in interactive prompting: when the turn requested it, route
-        // RequiresPermission tools through the IPC prompter (asks the client and
-        // blocks on the daemon-wide registry). Default (off) keeps `AlwaysAllow`,
-        // so tool execution is byte-identical. Both owners are locals so the
-        // `&dyn Prompter` borrow outlives the `drive_goal_loop` await.
+        // C2: mode `off` allows; otherwise asks go through the IPC prompter when
+        // a client can answer (the TUI; it blocks on the daemon-wide registry)
+        // and are denied when none can (headless, scheduled). The owners are
+        // locals so the `&dyn Prompter` borrow outlives the `drive_goal_loop` await.
         let always_allow = AlwaysAllow;
+        let no_prompter = origin_permission::prompt::NoPrompter;
         let ipc_prompter;
-        let prompter: &dyn Prompter = if req.permission_ask {
-            ipc_prompter = IpcPrompter::new(event_tx.clone(), Arc::clone(&permission_registry));
-            &ipc_prompter
-        } else {
-            &always_allow
+        let prompter: &dyn Prompter = match (permission_mode, can_ask) {
+            (PermissionMode::Off, _) => &always_allow,
+            (_, true) => {
+                ipc_prompter = IpcPrompter::new(
+                    event_tx.clone(),
+                    Arc::clone(&permission_registry),
+                    session.id.clone(),
+                );
+                &ipc_prompter
+            }
+            (_, false) => &no_prompter,
         };
         // Mid-turn interrupt: race the turn future against `poll_for_interrupt`,
         // the SOLE interrupt reader during the turn (`drive_goal_loop`'s own
@@ -2081,6 +2173,10 @@ async fn handle_request(
                 session.model.clone(),
                 session.id.clone(),
                 summary.gate_signals.is_some(),
+                opts.effort,
+                permission_mode,
+                Some(event_tx.clone()),
+                governance.clone(),
             )
             .await;
         }
@@ -2136,12 +2232,14 @@ async fn handle_request(
             PromptOutcome::Succeeded
         }
         TurnEnd::Normal(Err(e)) => {
-            let message = format!("loop error: {e}");
+            // C9: a provider error body could echo a credential.
+            let message = origin_daemon::redact::text(&format!("loop error: {e}")).into_owned();
             let _ = conn
                 .lock()
                 .await
                 .write_frame(FrameKind::ErrorFrame, message.as_bytes())
                 .await;
+            persist_failed_turn(session_store.as_ref(), Some(&cas), &mut session);
             PromptOutcome::Failed { message }
         }
         // Ctrl+C / mid-turn follow-up: the turn was aborted. Write a TERMINAL
@@ -2180,11 +2278,9 @@ async fn handle_request(
 /// [`origin_daemon::bestofn_runner::run_best_of_n`] policy.
 ///
 /// The whole batch runs on a blocking thread ([`tokio::task::spawn_blocking`]):
-/// the [`WorktreeArena`] changes the *process* cwd into each worktree (the tool
-/// builtins edit cwd-relative paths), which it serializes with a process-wide
-/// lock, and each candidate drives the async agent loop via a dedicated
-/// current-thread runtime. This keeps cwd correct for the entire
-/// run→capture→score sequence and never blocks the main async worker.
+/// each candidate drives the async agent loop via a dedicated current-thread
+/// runtime, with its worktree as the run's working directory (A12), so it
+/// never blocks the main async worker or moves the process cwd.
 #[allow(clippy::too_many_arguments)]
 async fn maybe_run_best_of_n(
     n: u32,
@@ -2197,9 +2293,25 @@ async fn maybe_run_best_of_n(
     model: String,
     session_id: String,
     hard_tests_red: bool,
+    effort: Option<origin_provider::ReasoningEffort>,
+    // C2: candidates run under the request's mode with nobody to ask.
+    permission_mode: PermissionMode,
+    // C5: where the one-line outcome goes (never the session).
+    event_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
+    // A4: the session's deny-only governance, for every candidate.
+    governance: origin_daemon::config::Governance,
 ) {
-    use origin_daemon::bestofn_runner::{run_best_of_n, WorktreeArena};
+    use origin_daemon::bestofn_runner::{run_best_of_n_reported, WorktreeArena};
     use origin_swarm::bestofn::DifficultySignals;
+
+    if permission_mode == PermissionMode::On {
+        tracing::warn!(
+            "best-of-N skipped: permission mode `on` asks before every edit and candidate runs \
+             cannot ask, so every candidate would produce an empty diff (use `/permissions \
+             workspace` or `off`)"
+        );
+        return;
+    }
 
     // Difficulty gate: only spend N× when the single-shot run looks hard. Today
     // the strongest no-goal signal available here is "the final harness gate
@@ -2228,7 +2340,7 @@ async fn maybe_run_best_of_n(
     let workspace = selfdev_workspace_root();
     let goal_text = user_text.to_string();
 
-    // Everything below is blocking (git worktree, chdir, subprocess tests, plus
+    // Everything below is blocking (git worktree, subprocess tests, plus
     // a nested current-thread runtime per candidate), so it runs off the async
     // worker on a blocking thread. Values captured must be owned/`Send`.
     let join = tokio::task::spawn_blocking(move || {
@@ -2245,32 +2357,30 @@ async fn maybe_run_best_of_n(
         let _ = std::fs::create_dir_all(&scratch);
 
         // Per-candidate runner: fresh session + fresh run_loop on the ORIGINAL
-        // prompt. cwd is already the worktree (the arena set it under the
-        // process-wide lock right before calling us), so edits land there. We
-        // drive the async loop with a dedicated current-thread runtime.
+        // prompt, with the worktree as the run's working directory (A12: passed
+        // in `LoopOptions::cwd`, never set process-wide), so edits land there.
+        // We drive the async loop with a dedicated current-thread runtime.
         //
         // A candidate is an ISOLATED, SILENT attempt: it gets only the handles a
         // fresh run genuinely needs (the test gate, CAS, code graph) — no event/
         // relay channels, no goal slot, no metrics — so it never emits to the
         // user's stream or mutates shared per-connection state. This deliberately
         // builds a MINIMAL `LoopOptions` rather than cloning the live one.
-        let prompter = AlwaysAllow;
-        let runner = move |_idx: usize, _wt: &std::path::Path| -> Result<(), String> {
+        let prompter = origin_permission::prompt::NoPrompter;
+        let runner = move |_idx: usize, wt: &std::path::Path| -> Result<(), String> {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| format!("candidate runtime: {e}"))?;
             let mut cand_session = Session::new(provider.name(), &model);
             let cand_opts = LoopOptions {
-                max_turns: 60,
                 cas: Some(Arc::clone(&cas)),
                 code_graph: Some(Arc::clone(&code_graph)),
                 // The gate is what makes the candidate self-verify (turn-end
                 // tests + terminal enforcement), so it MUST carry post_edit.
                 post_edit: post_edit.clone(),
-                // Match the orchestrator's effort so candidates aren't downgraded.
-                effort: resolve_turn_effort(None, provider.name()),
-                ..LoopOptions::default()
+                permission_mode,
+                ..candidate_opts(effort, wt, &governance)
             };
             let res = rt.block_on(origin_daemon::agent::run_loop(
                 &mut cand_session,
@@ -2296,7 +2406,7 @@ async fn maybe_run_best_of_n(
             Some(test_command),
             Box::new(runner),
         );
-        let outcome = run_best_of_n(&mut arena, n, difficulty);
+        let outcome = run_best_of_n_reported(&mut arena, n, difficulty, event_tx.as_ref());
         tracing::info!(?outcome, "best-of-N finished");
     });
     if let Err(e) = join.await {
@@ -2493,7 +2603,11 @@ fn last_assistant_text(session: &Session) -> String {
 /// ran no tools or the evidence is empty.
 fn last_tool_evidence(session: &Session, cas: Option<&Store>) -> Option<String> {
     use origin_core::types::{Block, Role};
-    let msg = session.messages.iter().rev().find(|m| matches!(m.role, Role::Tool))?;
+    let msg = session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::Tool))?;
     let mut out = String::new();
     for b in &msg.blocks {
         if let Block::ToolResult { handle, inline, .. } = b {
@@ -2871,7 +2985,10 @@ async fn run_verifier_dispatch(
     // Appended at the END so the driver's tail-truncation keeps it.
     let mut last_text = match gate_signals {
         Some(sig) if !sig.is_empty() => {
-            format!("{}\n\n<harness-signals>\n{sig}\n</harness-signals>", last_assistant_text(session))
+            format!(
+                "{}\n\n<harness-signals>\n{sig}\n</harness-signals>",
+                last_assistant_text(session)
+            )
         }
         _ => last_assistant_text(session),
     };
@@ -2987,8 +3104,7 @@ async fn drive_goal_loop(
             }
         }
 
-        let summary =
-            origin_daemon::agent::run_loop(session, &next_text, provider, prompter, opts).await?;
+        let summary = origin_daemon::agent::run_loop(session, &next_text, provider, prompter, opts).await?;
         is_first_iter = false;
 
         // If no goal is active, we're done after one turn.
@@ -3451,8 +3567,11 @@ fn export_session_event(session_store: &SessionStore, session_id: &str, format: 
             .to_string();
             let mut text = String::new();
             let mut tools = Vec::new();
-            for b in &m.blocks {
+            for (i, b) in m.blocks.iter().enumerate() {
                 match b {
+                    // B2: injected recall / repo-map context is not the user's words.
+                    Block::Text { text: t, .. }
+                        if origin_daemon::session::is_injected_context(m.role, i, t) => {}
                     Block::Text { text: t, .. } => {
                         if !text.is_empty() {
                             text.push('\n');
@@ -4194,7 +4313,9 @@ async fn handle_run_workflow(
     // swarm panel. Live per-worker panel events are wired on the agent-loop
     // `RunWorkflow` tool path; add a connection bridge here only if a future
     // `workflow run` UI needs the live readout.
-    let ev = match origin_daemon::workflow_runner::run_workflow(wf, coordinator, skill_catalog, None).await {
+    // No parent loop: each step's worker resolves its own effort and ponytail.
+    let run = origin_daemon::workflow_runner::run_workflow(wf, coordinator, skill_catalog, None, None, None);
+    let ev = match run.await {
         Ok(report) => StreamEvent::WorkflowRunComplete {
             name: report.name,
             layers: u32::try_from(report.layers).unwrap_or(u32::MAX),
@@ -4317,6 +4438,25 @@ fn persist(session_store: &SessionStore, cas: Option<&Arc<Store>>, session: &Ses
     }
 }
 
+/// C9: `ORIGIN_SESSION_RETENTION_DAYS` → days to keep; `0` = keep forever.
+/// Unset, `0`, or anything that is not a whole number of days (`off`, `-1`)
+/// keeps everything (an unparsable value warns once): pruning is opt-in.
+fn session_retention_days(raw: Option<&str>) -> u64 {
+    let Some(v) = raw else { return 0 };
+    v.trim().parse::<u64>().unwrap_or_else(|_| {
+        warn!(value = %v, "ORIGIN_SESSION_RETENTION_DAYS is not a whole number of days; keeping all sessions");
+        0
+    })
+}
+
+/// A7: persist what a FAILED request already completed. The loop can error
+/// between an assistant `tool_use` and its `tool_result` (e.g. the stuck-loop
+/// halt), so the orphaned tail is dropped first, exactly as on interrupt.
+fn persist_failed_turn(session_store: &SessionStore, cas: Option<&Arc<Store>>, session: &mut Session) {
+    drop_orphan_tool_use_tail(&mut session.messages);
+    persist(session_store, cas, session);
+}
+
 /// Resolve the `last_turn` to stamp on a detach / goal-activation checkpoint
 /// token (#17).
 ///
@@ -4366,16 +4506,25 @@ fn submit_summarize_jobs(sidecar: &Sidecar, session_store: &Arc<SessionStore>, s
         // tool results before the next user turn), not the entire transcript.
         // Sending the whole transcript made every turn's summary collapse to the
         // latest-turn text, which compaction then baked into the *oldest* turns.
-        let (start, end) = turn_window(messages, i);
         let session_id = session.id.clone();
         let deliverer = SessionStoreSummaryDeliverer(Arc::clone(session_store));
         let _ = sidecar.submit(SidecarJob::Summarize {
             session_id,
             turn_index,
-            transcript: messages[start..end].to_vec(),
+            transcript: summary_transcript(messages, i),
             deliver_to: Box::new(deliverer),
         });
     }
+}
+
+/// The messages a turn's summary is built from: its [`turn_window`], minus
+/// B2's injected per-prompt context (recalled memories, repo-map entries).
+fn summary_transcript(
+    messages: &[origin_core::types::Message],
+    assistant_idx: usize,
+) -> Vec<origin_core::types::Message> {
+    let (start, end) = turn_window(messages, assistant_idx);
+    origin_daemon::session::without_injected_context(&messages[start..end])
 }
 
 /// The message-index window `[start, end)` covering the conversation turn whose
@@ -4587,35 +4736,156 @@ fn spawn_metrics_endpoint(metrics: Metrics, addr: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        choice_registry_enabled, detach_last_turn, resolve_turn_effort, resume_foreign_event,
-        resume_session_event, turn_window, Session, SessionStore, StreamEvent,
+        candidate_opts, choice_registry_enabled, detach_last_turn, parse_default_effort, resolve_turn_effort,
+        resume_foreign_event, resume_session_event, startup_governance, turn_window, Session, SessionStore,
+        StreamEvent,
     };
     use origin_core::types::{Block, Message, Role};
     use origin_provider::ReasoningEffort;
     use origin_resume_token::ResumeToken;
 
     #[test]
-    fn anthropic_defaults_to_ultracode_when_no_effort_requested() {
+    fn anthropic_defaults_to_high_when_no_effort_requested() {
         assert_eq!(
-            resolve_turn_effort(None, "anthropic"),
-            Some(ReasoningEffort::Ultracode),
-            "Anthropic models default to ultracode (max reasoning + always-on swarm)",
+            resolve_turn_effort(None, None, "anthropic"),
+            Some(ReasoningEffort::High),
+            "B3: the main loop defaults to high, not max",
         );
     }
 
     #[test]
-    fn explicit_effort_always_wins_over_the_anthropic_default() {
+    fn explicit_effort_always_wins_over_env_and_default() {
         assert_eq!(
-            resolve_turn_effort(Some(ReasoningEffort::Low), "anthropic"),
-            Some(ReasoningEffort::Low),
-            "a user-set /effort must never be overridden by the default",
+            resolve_turn_effort(
+                Some(ReasoningEffort::Ultracode),
+                Some(ReasoningEffort::Low),
+                "anthropic"
+            ),
+            Some(ReasoningEffort::Ultracode),
+            "a user-set /effort must never be overridden",
         );
+    }
+
+    #[test]
+    fn env_default_effort_beats_the_built_in_default() {
+        assert_eq!(
+            resolve_turn_effort(None, Some(ReasoningEffort::Max), "anthropic"),
+            Some(ReasoningEffort::Max)
+        );
+        assert_eq!(
+            resolve_turn_effort(None, Some(ReasoningEffort::Low), "openai"),
+            Some(ReasoningEffort::Low),
+            "an explicit env choice applies on any provider"
+        );
+    }
+
+    #[test]
+    fn default_effort_env_parses_names_and_treats_empty_as_unset() {
+        assert_eq!(parse_default_effort(Some("ultra")), Some(ReasoningEffort::Max));
+        assert_eq!(parse_default_effort(Some(" mid ")), Some(ReasoningEffort::Medium));
+        assert_eq!(parse_default_effort(Some("bogus")), None);
+        assert_eq!(parse_default_effort(Some("")), None);
+        assert_eq!(parse_default_effort(Some("  ")), None);
+        assert_eq!(parse_default_effort(None), None);
+    }
+
+    /// B3: a best-of-N candidate runs at the orchestrator's resolved effort —
+    /// an explicit `max` stays `max`; the default stays the main default.
+    #[test]
+    fn candidates_run_at_the_orchestrators_effort() {
+        let wt = std::path::Path::new("wt");
+        let gov = origin_daemon::config::Governance::default();
+        assert_eq!(
+            candidate_opts(Some(ReasoningEffort::Max), wt, &gov).effort,
+            Some(ReasoningEffort::Max)
+        );
+        let default = resolve_turn_effort(None, None, "anthropic");
+        assert_eq!(
+            candidate_opts(default, wt, &gov).effort,
+            Some(ReasoningEffort::High)
+        );
+    }
+
+    /// B5: nobody answers a candidate's questions, so it gets the headless prompt.
+    #[test]
+    fn candidates_get_the_headless_prompt() {
+        assert_eq!(
+            candidate_opts(
+                None,
+                std::path::Path::new("wt"),
+                &origin_daemon::config::Governance::default()
+            )
+            .prompt_profile,
+            origin_daemon::agent::PromptProfile::Headless
+        );
+    }
+
+    /// A4 (final fix S6): a governance file that exists but cannot be parsed
+    /// stops the start with an error naming the file and the parse error; a
+    /// missing file is no governance.
+    #[test]
+    fn an_unloadable_governance_file_stops_the_start() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("governance.toml");
+        let gov = startup_governance(&path).expect("missing file starts");
+        assert!(gov.policy.is_none() && gov.conseca.is_none() && gov.permission_rules.is_none());
+        std::fs::write(&path, "this is = = not toml").expect("write");
+        let err = startup_governance(&path).expect_err("unparseable file stops the start");
+        let text = err.to_string();
+        assert!(text.contains(&path.display().to_string()), "{text}");
+        assert!(text.contains("failed to parse"), "{text}");
+    }
+
+    /// A4: a best-of-N candidate runs under the session's governance: a
+    /// `[[permission_rules]]` deny for `Write` denies the candidate's `Write`,
+    /// even inside its own worktree (which `workspace` mode would allow).
+    #[tokio::test]
+    async fn a_candidate_honours_the_sessions_deny_rules() {
+        use std::sync::Arc;
+        let wt = tempfile::tempdir().expect("wt");
+        let target = wt.path().join("cand.txt");
+        let deny = vec![origin_permission::rules::Rule {
+            tool_name: "Write".into(),
+            scope: origin_daemon::config::PERMISSION_RULE_SCOPE.into(),
+            allow: false,
+        }];
+        let gov = origin_daemon::config::Governance {
+            permission_rules: Some(Arc::new(origin_daemon::config::PermissionRules {
+                bloom: origin_permission::bloom::BloomPreCheck::build(&deny),
+                rules: deny,
+            })),
+            ..Default::default()
+        };
+        let opts = origin_daemon::agent::LoopOptions {
+            streaming_disabled: true,
+            ..candidate_opts(None, wt.path(), &gov)
+        };
+        let provider = ScriptedWriteProvider {
+            calls: std::sync::Mutex::new(0),
+            target: target.clone(),
+        };
+        let mut session = Session::new("scripted-write", "m");
+        origin_daemon::agent::run_loop(
+            &mut session,
+            "write it",
+            &provider,
+            &origin_permission::prompt::NoPrompter,
+            &opts,
+        )
+        .await
+        .expect("run");
+        assert!(!target.exists(), "the deny rule bound the candidate");
+        let denied = session.messages.iter().flat_map(|m| &m.blocks).any(|b| {
+            matches!(b, Block::ToolResult { is_error: true, inline: Some(v), .. }
+                if String::from_utf8_lossy(v).contains("rule:Write"))
+        });
+        assert!(denied, "{:?}", session.messages);
     }
 
     #[test]
     fn non_anthropic_providers_stay_unset_for_a_byte_identical_wire() {
-        assert_eq!(resolve_turn_effort(None, "openai"), None);
-        assert_eq!(resolve_turn_effort(None, "gemini"), None);
+        assert_eq!(resolve_turn_effort(None, None, "openai"), None);
+        assert_eq!(resolve_turn_effort(None, None, "gemini"), None);
     }
 
     #[test]
@@ -4678,6 +4948,40 @@ mod tests {
         assert_eq!(balanced.len(), before, "a balanced transcript is left intact");
     }
 
+    /// C9: pruning is opt-in — only a positive whole number of days prunes.
+    #[test]
+    fn session_retention_is_opt_in() {
+        use super::session_retention_days as days;
+        assert_eq!(days(None), 0, "unset keeps everything");
+        for keep in ["0", "off", "never", "-1", "", "3.5"] {
+            assert_eq!(days(Some(keep)), 0, "{keep:?} keeps everything");
+        }
+        assert_eq!(days(Some(" 45 ")), 45);
+    }
+
+    #[test]
+    fn failed_turn_is_persisted_without_its_orphan_tool_use() {
+        // A7: the loop-error arm used to return without persisting, losing every
+        // turn the failed request had already completed.
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = SessionStore::open(dir.path().join("s.db")).expect("open store");
+        let mut session = Session::new_with_id("sess-err".into(), "m".into());
+        session.messages = vec![
+            msg(Role::User, "do it"),
+            tool_use_msg(),
+            msg(Role::Tool, "result"),
+            tool_use_msg(), // the loop errored before this tool_use got a result
+        ];
+        super::persist_failed_turn(&store, None, &mut session);
+        let saved = store.load_messages("sess-err").expect("load");
+        assert_eq!(
+            saved.len(),
+            3,
+            "completed turns persisted, orphan tool_use dropped"
+        );
+        assert_eq!(saved, session.messages);
+    }
+
     #[test]
     fn turn_window_isolates_each_turn() {
         // user0, asst1, tool2, user3, asst4, tool5
@@ -4697,6 +5001,68 @@ mod tests {
         // Crucially the two windows are disjoint — distinct turns get distinct
         // slices, so their summaries cannot collapse to the same text.
         assert_ne!(turn_window(&msgs, 1), turn_window(&msgs, 4));
+    }
+
+    /// A stored prompt message carrying B2's injected per-prompt context.
+    fn prompt_with_injected_context() -> Message {
+        Message::new(Role::User)
+            .with_block(Block::text("fix the build"))
+            .with_block(Block::text(
+                "<origin-recall>\nprivate memory from another project\n</origin-recall>\n\n\
+                 <repo-map-focus>\n- src/a.rs: alpha\n</repo-map-focus>",
+            ))
+    }
+
+    /// B2: session export shows only what the user typed, never the recalled
+    /// memories / repo-map entries stored alongside it.
+    #[test]
+    #[allow(clippy::panic)] // asserts the StreamEvent variant via a panicking else-arm
+    fn export_skips_injected_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(dir.path().join("sessions.db")).expect("open store");
+        let mut s = Session::new("test", "m");
+        s.push(prompt_with_injected_context());
+        s.push(Message::new(Role::Assistant).with_block(Block::text("done")));
+        // Text the user TYPED (block 0) and assistant text are kept even when
+        // they happen to start with an injected-context tag.
+        s.push(msg(Role::User, "<origin-recall> pasted debug output"));
+        s.push(msg(Role::Assistant, "<repo-map-focus> echoed by the model"));
+        store.persist_session(&s).expect("persist");
+        store
+            .persist_transcript(&s.id, &s.messages)
+            .expect("persist transcript");
+        for format in ["markdown", "json"] {
+            let StreamEvent::SessionExport { content } = super::export_session_event(&store, &s.id, format)
+            else {
+                panic!("expected an export");
+            };
+            // The assistant turn proves the transcript (not just the title) was exported.
+            assert!(content.contains("done"), "{content}");
+            assert!(content.contains("fix the build"), "{content}");
+            assert!(!content.contains("private memory"), "{format}: {content}");
+            assert!(!content.contains("src/a.rs"), "{format}: {content}");
+            assert!(content.contains("pasted debug output"), "{format}: {content}");
+            assert!(content.contains("echoed by the model"), "{format}: {content}");
+        }
+    }
+
+    /// B2: a turn's summary transcript leaves out the injected context.
+    #[test]
+    fn summary_transcript_skips_injected_context() {
+        let msgs = vec![prompt_with_injected_context(), msg(Role::Assistant, "done")];
+        let transcript = super::summary_transcript(&msgs, 1);
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[0].blocks.len(), 1, "only the typed prompt remains");
+        assert!(matches!(&transcript[0].blocks[0], Block::Text { text, .. } if text == "fix the build"));
+
+        // A typed prompt (block 0) or assistant text starting with a tag stays.
+        let typed = vec![
+            msg(Role::User, "<origin-recall> pasted debug output"),
+            msg(Role::Assistant, "<repo-map-focus> echoed"),
+        ];
+        let transcript = super::summary_transcript(&typed, 1);
+        assert_eq!(transcript[0].blocks.len(), 1, "typed prompt kept");
+        assert_eq!(transcript[1].blocks.len(), 1, "assistant text kept");
     }
 
     #[test]
@@ -5066,8 +5432,7 @@ mod tests {
     #[async_trait::async_trait]
     impl origin_permission::prompt::Prompter for RecordingDenier {
         async fn ask(&self, _meta: &origin_tools::ToolMeta, _preview: &str) -> bool {
-            self.asked
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.asked.store(true, std::sync::atomic::Ordering::SeqCst);
             false
         }
     }
@@ -5131,15 +5496,132 @@ mod tests {
             asked.load(Ordering::SeqCst),
             "the prompter passed to drive_goal_loop must govern the regular turn"
         );
-        // A denied Write must never touch disk, and must surface as an error.
+        // A denied Write must never touch disk. A8: a single denial goes back to
+        // the model as an error result and the turn continues to "done".
         assert!(
             !target.exists(),
             "a denied Write must NOT execute (file was created ⇒ tool auto-ran)"
         );
-        let err = result.expect_err("a denied tool must surface as a loop error, not Ok");
-        assert!(
-            format!("{err}").to_lowercase().contains("deni"),
-            "expected a denial error, got: {err}"
+        result.expect("a single denial must not end the turn (A8)");
+    }
+
+    /// Writes a file, then claims the goal met.
+    struct WriteThenMetProvider {
+        calls: std::sync::Mutex<usize>,
+        target: std::path::PathBuf,
+    }
+    #[async_trait::async_trait]
+    impl origin_provider::Provider for WriteThenMetProvider {
+        fn name(&self) -> &'static str {
+            "write-then-met"
+        }
+        async fn chat(
+            &self,
+            _req: origin_provider::ChatRequest,
+        ) -> Result<origin_provider::ChatResponse, origin_provider::ProviderError> {
+            let n = {
+                let mut g = self.calls.lock().expect("calls lock");
+                *g += 1;
+                *g
+            };
+            let assistant = if n == 1 {
+                let input =
+                    serde_json::json!({"file_path": self.target.to_string_lossy(), "content": "x = 1\n"});
+                Message::new(Role::Assistant).with_block(Block::ToolUse {
+                    id: "tu-write-c9".into(),
+                    name: "Write".into(),
+                    input_json: serde_json::to_vec(&input).expect("encode write args"),
+                    cache_marker: None,
+                })
+            } else {
+                Message::new(Role::Assistant).with_block(Block::text(
+                    "done\n<goal-status state=\"met\"><reason>ok</reason></goal-status>",
+                ))
+            };
+            Ok(origin_provider::ChatResponse {
+                assistant,
+                usage: origin_provider::Usage::default(),
+            })
+        }
+    }
+
+    /// Records what the goal verifier is asked to judge, then says Met.
+    struct RecordingVerifier(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl origin_goal::verifier::Verifier for RecordingVerifier {
+        async fn verify(
+            &self,
+            _condition: &str,
+            last_turn: &str,
+        ) -> Result<(origin_goal::verifier::Verdict, u64, u64), origin_goal::verifier::VerifierError>
+        {
+            self.0.lock().expect("verifier lock").push(last_turn.to_string());
+            Ok((origin_goal::verifier::Verdict::Met, 0, 0))
+        }
+    }
+
+    /// C9: turn-end gate output reaches the goal verifier through
+    /// `<harness-signals>`; it must be redacted at its source.
+    #[tokio::test]
+    async fn goal_verifier_never_sees_a_raw_key_from_gate_output() {
+        use std::sync::Arc;
+        const KEY: &str = "sk-c9-goal-verifier-0123456789";
+        const MARKER: &str = "[REDACTED:C9_GOAL_API_KEY]";
+        origin_daemon::redact::install(origin_daemon::redact::Redactor::new([(
+            "C9_GOAL_API_KEY".to_string(),
+            KEY.to_string(),
+        )]));
+        // Redaction is idempotent: already-redacted text passes through unchanged.
+        assert_eq!(
+            origin_daemon::redact::text(&format!("k={MARKER}")),
+            format!("k={MARKER}")
         );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SessionStore::open(dir.path().join("sessions.db")).expect("open store"));
+        let mut session = Session::new("c9-goal", "test-model");
+        let provider = WriteThenMetProvider {
+            calls: std::sync::Mutex::new(0),
+            target: dir.path().join("lib.py"),
+        };
+        let verifier = RecordingVerifier(std::sync::Mutex::new(Vec::new()));
+        let active_goal = Arc::new(tokio::sync::Mutex::new(Some(origin_goal::GoalState::new(
+            "tests green".into(),
+            None,
+            None,
+        ))));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<StreamEvent>(256);
+        let opts = origin_daemon::agent::LoopOptions {
+            max_turns: 6,
+            // No terminal-branch rerun: the verifier gets the per-turn test block.
+            post_edit: Some(Arc::new(origin_postedit::PostEditConfig {
+                auto_test: true,
+                test_command: Some(format!("echo {KEY}; exit 1")),
+                max_repair_iters: 0,
+                ..origin_postedit::PostEditConfig::default()
+            })),
+            ..origin_daemon::agent::LoopOptions::default().without_streaming()
+        };
+
+        let _ = super::drive_goal_loop(
+            &mut session,
+            "write it".to_string(),
+            &provider,
+            &opts,
+            active_goal,
+            store,
+            &verifier,
+            event_tx,
+            &origin_permission::prompt::AlwaysAllow,
+        )
+        .await;
+
+        let seen = verifier.0.lock().expect("verifier lock").join("\n---\n");
+        assert!(
+            seen.contains("<harness-signals>"),
+            "verifier got the gate signals: {seen}"
+        );
+        assert!(!seen.contains(KEY), "raw key reached the goal verifier: {seen}");
+        assert!(seen.contains(MARKER), "verifier input carries the marker: {seen}");
     }
 }

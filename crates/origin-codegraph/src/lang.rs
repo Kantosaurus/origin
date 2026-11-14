@@ -127,8 +127,71 @@ impl Language {
             .map_err(|_| LangError::SetLanguage(self))?;
         parser.parse(source, None).ok_or(LangError::Empty)
     }
+
+    /// 1-based line numbers of the tree-sitter `ERROR` / `MISSING` nodes in
+    /// `source`, in document order, one entry per line. An `ERROR` node is
+    /// reported once, not again for errors nested inside it.
+    ///
+    /// # Errors
+    /// As [`Language::parse`].
+    pub fn syntax_error_lines(self, source: &[u8]) -> Result<Vec<usize>, LangError> {
+        let tree = self.parse(source)?;
+        let mut lines: Vec<usize> = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.is_error() || node.is_missing() {
+                lines.push(node.start_position().row + 1);
+            } else if node.has_error() {
+                stack.extend((0..node.child_count()).rev().filter_map(|i| node.child(i)));
+            }
+        }
+        lines.dedup();
+        Ok(lines)
+    }
 }
 
 /// Thin re-export so downstream modules can construct a parser without
 /// pulling tree-sitter into their imports.
 pub type Parser = tree_sitter::Parser;
+
+#[cfg(test)]
+mod tests {
+    use super::Language;
+
+    /// Valid modern syntax the pinned grammars may predate, with the problem
+    /// lines `syntax_error_lines` reports for it TODAY. These pin the grammar
+    /// lag so it stays visible; a grammar bump may flip them (then update).
+    const MODERN: &[(Language, &str, &[usize])] = &[
+        // Flagged by tree-sitter-rust 0.21.2: precise capturing, raw borrows, gen blocks.
+        (Language::Rust, "fn f() -> impl Sized + use<> {}\n", &[1]),
+        (
+            Language::Rust,
+            "fn f() { let x = 1; let p = &raw const x; }\n",
+            &[1],
+        ),
+        (Language::Rust, "#[unsafe(no_mangle)] fn g() {}\n", &[]),
+        (Language::Rust, "fn f() { let it = gen { yield 1; }; }\n", &[1]),
+        (Language::TypeScript, "using r = open();\n", &[]),
+        (
+            Language::TypeScript,
+            "async function f() { await using r = open(); }\n",
+            &[],
+        ),
+        (
+            Language::TypeScript,
+            "const c = { a: 1 } satisfies Record<string, number>;\n",
+            &[],
+        ),
+        (Language::TypeScript, "class C { @dec m() {} }\n", &[]),
+    ];
+
+    #[test]
+    fn modern_syntax_parse_errors_are_pinned() {
+        let got: Vec<(&str, Vec<usize>)> = MODERN
+            .iter()
+            .map(|(lang, src, _)| (*src, lang.syntax_error_lines(src.as_bytes()).expect("parse")))
+            .collect();
+        let want: Vec<(&str, Vec<usize>)> = MODERN.iter().map(|(_, src, l)| (*src, l.to_vec())).collect();
+        assert_eq!(got, want);
+    }
+}

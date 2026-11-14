@@ -184,9 +184,10 @@ underlying `prometheus::Registry` never sees a new family after construction:
 | `origin_tokens_in_total` | `provider`, `model` | Input tokens billed. |
 | `origin_tokens_out_total` | `provider`, `model` | Output tokens billed. |
 | `origin_cache_hit_total` | `provider` | Prompt-cache reads served from cache. |
+| `origin_cache_write_total` | `provider` | Prompt-cache writes (tokens written to the cache). |
 | `origin_sandbox_violation_total` | `profile`, `kind` | Kernel-enforced sandbox denials. |
 
-All five are `IntCounterVec` (monotonic counters). The accessors
+All six are `IntCounterVec` (monotonic counters). The accessors
 (`tool_call_total`, `tokens_in_total`, …, `lib.rs:245`+) return the upstream
 `prometheus::IntCounter` so a caller increments it directly.
 
@@ -217,7 +218,7 @@ fixed product:
 
 - `origin_tool_call_total`: `(7+1) providers × (18+1) tools × 3 results` =
   **456** series at most.
-- `origin_cache_hit_total`: `(7+1)` = **8** series at most.
+- `origin_cache_hit_total`, `origin_cache_write_total`: `(7+1)` = **8** series each at most.
 
 > **Cardinality bound found:** the `provider`/`tool`/`result` keyspace is capped
 > at **7 providers + 18 tools + 3 results** (each plus one `_other_` bucket),

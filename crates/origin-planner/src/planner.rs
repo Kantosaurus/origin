@@ -16,8 +16,7 @@ pub struct Section {
     pub id: SectionId,
     /// The band this section belongs to.
     pub band: Band,
-    /// Byte range inside the section's original block (informational; used by
-    /// `WireDecision` in P3.6 to pick inline vs reference).
+    /// Byte range inside the section's original block (informational).
     pub bytes: Range<usize>,
 }
 
@@ -43,19 +42,10 @@ pub struct Plan {
     ordered: Vec<Section>,
     markers: Vec<usize>,
     /// N4.3 handle→band index. Populated by `register_handle` after the
-    /// planner emits the section order; consulted by the message-to-wire
-    /// encoder in `O(1)` per CAS handle to decide `Inline` vs `Reference`.
+    /// planner emits the section order. The wire encoder no longer reads it
+    /// (A1: every tool result is inlined verbatim, whatever its band).
     ///
-    /// Wrapped in `Arc<RwLock<…>>` so the daemon's tool-result dispatch path
-    /// (writer) and the provider's wire-encoder (reader) can share the same
-    /// map through their respective `Plan` clones — exposing interior
-    /// mutability through `&self` on `register_handle` keeps the public API
-    /// ergonomic for both call sites.
-    ///
-    /// Competitor stacks (openclaude/jcode/opencode) re-serialize full
-    /// tool-result bytes every turn unconditionally — they have no
-    /// per-handle band assignment, so they cannot demote long-lived
-    /// handles to reference form. This map is the novel mechanism.
+    /// Wrapped in `Arc<RwLock<…>>` so every `Plan` clone shares the same map.
     handle_bands: Arc<RwLock<HashMap<[u8; 32], Band>>>,
     /// Dynamic per-message cache breakpoints populated by the agent loop
     /// each turn. Each index is a position in the session's message list;
@@ -106,11 +96,6 @@ impl Plan {
     }
 
     /// Register a CAS handle with the band it lives in for this turn.
-    ///
-    /// Subsequent serialization passes (e.g. the Anthropic provider's
-    /// `expand_messages_for_wire`) consult `band_for_handle` to skip
-    /// inlining for handles parked in a non-Volatile band whose body
-    /// exceeds `INLINE_BYTE_BUDGET`.
     ///
     /// Idempotent: re-registering the same handle overwrites its band.
     /// Takes `&self` (not `&mut self`) so the daemon's per-turn dispatch

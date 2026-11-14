@@ -16,15 +16,14 @@ crushing, and the child-process supervisor behind `Bash`.
 
 | Item | Kind | Summary |
 | --- | --- | --- |
-| `origin_tool!` | macro | Submits a `ToolMeta` into the `inventory` registry; arms cover optional `sandbox`, `token_budget`, and `hot`. |
-| `ToolMeta` | struct | Per-tool metadata: `name`, `description`, `tier`, `urgency`, `side_effects`, `input_schema`, `sandbox_profile`, `token_budget`, `hot`. |
+| `origin_tool!` | macro | Submits a `ToolMeta` into the `inventory` registry; arms cover optional `sandbox` and `hot`. |
+| `ToolMeta` | struct | Per-tool metadata: `name`, `description`, `tier`, `urgency`, `side_effects`, `input_schema`, `sandbox_profile`, `hot`. |
 | `registry_iter` | fn | Walks all registered `ToolMeta` at runtime. |
 | `Tier` / `Urgency` / `SideEffects` | enum | `AutoAllowed`/`RequiresPermission`; `Low`/`Medium`/`High`; `Pure`/`Mutating`. |
 | `DynTool` | trait | Runtime tool object (`meta()` + async `invoke`) for tools with no inventory entry — MCP-discovered tools live here. |
 | `Cache` / `NormalizedInput` / `CacheHit` | struct | Per-session `(tool, input)` memoization; `MEMOIZATION_SKIPLIST`. |
 | `ToolError` / `ErrClass` | enum | Structured tool errors. |
 | `SandboxProfile` / `ProfileOrdinal` | re-export | From `origin-sandbox`, so callers build `ToolMeta` without a direct dep. |
-| `DEFAULT_TOKEN_BUDGET` | const | `25_000` advisory token cap per serialised result. |
 
 Builtin modules (each registers one or more tools): `apply_patch`, `ask`,
 `ask_user`, `author_workflow`, `bash`, `browser`, `diagnostics`, `edit`,
@@ -45,7 +44,6 @@ pub struct ToolMeta {
     pub side_effects: SideEffects,
     pub input_schema: &'static str,
     pub sandbox_profile: SandboxProfile,
-    pub token_budget: u32,
     /// "Hot" tools embed their full schema in the system prompt; "deferred"
     /// tools advertise only {name, description} and are fetched via ToolSearch.
     pub hot: bool,

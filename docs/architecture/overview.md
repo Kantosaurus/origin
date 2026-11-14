@@ -31,7 +31,7 @@ Every turn the daemon assembles a request from five composable surfaces, each ow
 
 - **Model** — a provider behind a uniform `Provider` trait, resolved from a catalog (`origin-provider*`).
 - **Tools** — a registry of builtin and MCP tools (`origin-tools`, `origin-mcp`).
-- **Skills** — embedding-indexed, lazily materialized top-K per turn (`origin-skills`, `origin-mem`).
+- **Skills** — a one-line-per-skill catalog in the system prompt; a skill's body is injected once it is activated (`origin-skills`).
 - **Hooks** — typed lifecycle events dispatched through a pre-spawned shell pool (`origin-hooks`).
 - **Permissions** — a tier-based gate with a pluggable prompter, hardened against command-line bypasses (`origin-permission`, `origin-cmdparse`, `origin-conseca`, `origin-policy`).
 
@@ -196,12 +196,12 @@ The following walkthrough traces a single interactive turn from keystroke to ren
 3. **IPC frame** — the request is encoded as a length-prefixed `FrameKind::Request` frame (`MAGIC = "ORON"`, 64 MiB body cap) and written over the local socket / named pipe (or QUIC+mTLS for a remote daemon). (`origin-ipc`)
 4. **Accept + dispatch** — the daemon's accept loop returns a `SharedConnection`; `spawn_handler_task` spawns a per-connection handler in `TaskClass::Critical`. The handler reads the frame body and decodes a `ClientMessage` (with a legacy `PromptRequest` fallback). (`origin-daemon`)
 5. **Session bind** — the handler snapshots the active `Provider` (so a concurrent `/account` switch can't yank it mid-flight), builds a per-prompt Haiku-backed goal verifier, and rehydrates / creates the session transcript from the SQLite session store. (`origin-daemon`, `origin-store`)
-6. **Context assembly** — skills are materialized top-K, memory is recalled, code-graph context is fetched, and the prompt-cache prefix planner annotates blocks with `CacheBoundary` bands. (`origin-skills`, `origin-mem`, `origin-codegraph`, `origin-planner`)
+6. **Context assembly** — the skill catalog and active skills' bodies are added, memory is recalled, code-graph context is fetched, and the prompt-cache prefix planner annotates blocks with `CacheBoundary` bands. (`origin-skills`, `origin-mem`, `origin-codegraph`, `origin-planner`)
 7. **Agent loop** — the daemon enters its loop: send the assembled `Message` history to the provider. (`origin-daemon::agent`)
 8. **Provider call** — the active `Provider` issues a streaming HTTP/2 request (rustls-only TLS), running in `TaskClass::Critical`. (`origin-provider*`)
 9. **Streamed tokens** — server-sent deltas are parsed, written into an `origin-stream` ring buffer, and relayed back to the connection as `FrameKind::Event` frames (`stream_relay::relay_to_connection`, `TaskClass::Realtime`). The TUI renders them via the cell-grid widget. (`origin-stream`, `origin-tui`)
 10. **Tool calls** — when the model emits a `Block::ToolUse`, the daemon dispatches it through the tool registry. (`origin-tools`)
-11. **Permission gate** — before any side effect, the call passes the tier-based permission engine; a Bash command is additionally analyzed by `origin-cmdparse` for bypass classes, and the optional per-prompt ConSeca / governance overlay can deny it. A blocking ask is resolved via the daemon-wide `PermissionRegistry` / `ChoiceRegistry` (so a decision arriving on a fresh connection can resolve an ask emitted on the busy one). A skill that omits `Bash` literally cannot shell out; sandboxing (landlock+seccomp / sandbox-exec / AppContainer) confines what does run. (`origin-permission`, `origin-cmdparse`, `origin-conseca`, `origin-policy`, `origin-sandbox`)
+11. **Permission gate** — before any side effect, the call passes the tier-based permission engine; a Bash command is additionally analyzed by `origin-cmdparse` for bypass classes, and the optional per-prompt ConSeca / governance overlay can deny it. A blocking ask is resolved via the daemon-wide `PermissionRegistry` / `ChoiceRegistry` (so a decision arriving on a fresh connection can resolve an ask emitted on the busy one). A skill that omits `Bash` literally cannot shell out. `origin-sandbox` has per-OS backends, but none is enabled on shipped builds, so what does run is not OS-confined; children get an allow-listed environment. (`origin-permission`, `origin-cmdparse`, `origin-conseca`, `origin-policy`, `origin-sandbox`)
 12. **CAS offload** — the tool result is written to CAS; large outputs become a `Block::ToolResult { handle: Some([u8; 32]), .. }` referencing the content hash, small ones stay `inline`. The freshly-produced handle is registered into the shared cache-band `Plan`. (`origin-cas`, `origin-planner`)
 13. **Loop or finish** — the tool result is appended to the transcript and the loop iterates (back to step 7) until the model stops emitting tool calls; the turn's blocks are persisted as archived SQLite blobs. (`origin-daemon`, `origin-store`)
 14. **Completion** — a final `StreamEvent` closes the turn; the CLI reconstructs the assistant text from the streamed deltas and the connection closes. (`origin-cli`)
@@ -231,7 +231,7 @@ sequenceDiagram
         opt model emits ToolUse
             D->>G: check tier + cmdparse + governance
             G-->>D: allow / deny / ask
-            D->>D: execute tool (sandboxed)
+            D->>D: execute tool (no OS sandbox; allow-listed child env)
             D->>C: write result bytes -> [u8;32] handle
             C-->>D: ToolResult{handle} appended to transcript
         end
@@ -407,7 +407,7 @@ CI runs `cargo clippy -D warnings` with `pedantic`/`nursery` enabled and `unwrap
 
 ### `Secret<T>` redaction
 
-`origin-keyvault` provides `Secret<T: Zeroize>` — a guard wrapper that **zeroizes on drop** and **redacts in `Debug`** (its `fmt::Debug` writes the literal `Secret<redacted>`). Provider credentials live only in the daemon's `KeyVault`, which fronts OS-native credential stores with an age-encrypted fallback and an audit ring that records `(provider, account, action, timestamp)` tuples — **never the secret bytes** — to a rotating JSONL log. A CI lint additionally rejects raw secret bytes flowing through `tracing`.
+`origin-keyvault` provides `Secret<T: Zeroize>` — a guard wrapper that **zeroizes on drop** and **redacts in `Debug`** (its `fmt::Debug` writes the literal `Secret<redacted>`). Provider credentials live only in the daemon's `KeyVault`, which fronts OS-native credential stores with an age-encrypted fallback and an audit ring that records `(provider, account, action, timestamp)` tuples — **never the secret bytes** — to a rotating JSONL log. `cargo run -p xtask -- lint-secrets` flags `Debug` structs with secret-named fields that are not `Secret<…>`/`#[redact]`; it is not run in CI and currently reports 11 violations (secret-named string fields in `Debug` structs, all older than the `[Unreleased]` changes).
 
 ### Deterministic replay
 

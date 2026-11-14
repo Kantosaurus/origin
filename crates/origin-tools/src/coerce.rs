@@ -103,10 +103,7 @@ fn strip_trailing_commas(s: &str) -> String {
         }
         if c == ',' {
             // Look ahead past whitespace for a closer.
-            let next = chars[i + 1..]
-                .iter()
-                .find(|&&n| !n.is_whitespace())
-                .copied();
+            let next = chars[i + 1..].iter().find(|&&n| !n.is_whitespace()).copied();
             if matches!(next, Some('}' | ']')) {
                 continue; // drop this comma
             }

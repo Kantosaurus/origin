@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-use origin_sandbox::{ProfileOrdinal, SandboxProfile};
+use origin_sandbox::{sandbox_status, ProfileOrdinal, SandboxProfile, SandboxStatus};
 
 #[test]
 fn ordinals_are_stable() {
@@ -22,4 +22,19 @@ fn round_trips_from_ordinal() {
         assert_eq!(p.ordinal().0, raw);
     }
     assert!(SandboxProfile::from_ordinal(ProfileOrdinal(255)).is_none());
+}
+
+/// C1 item 4: the status the permission layer queries. No backend is applied on
+/// the shipped spawn path yet, so the honest answer is `Unavailable`, and
+/// `ORIGIN_SANDBOX=off` reports the explicit opt-out. One test fn: it mutates
+/// the process environment.
+#[test]
+fn sandbox_status_reports_unavailable_or_user_opt_out() {
+    std::env::remove_var("ORIGIN_SANDBOX");
+    assert_eq!(sandbox_status(), SandboxStatus::Unavailable);
+    std::env::set_var("ORIGIN_SANDBOX", "OFF");
+    assert_eq!(sandbox_status(), SandboxStatus::DisabledByUser);
+    std::env::set_var("ORIGIN_SANDBOX", "on");
+    assert_eq!(sandbox_status(), SandboxStatus::Unavailable);
+    std::env::remove_var("ORIGIN_SANDBOX");
 }

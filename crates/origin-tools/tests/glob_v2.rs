@@ -53,6 +53,24 @@ fn respects_gitignore() {
     }
 }
 
+/// `walk_files` stops walking once `limit` files are kept: `keep` is consulted
+/// exactly `limit` times when every file qualifies, so the cost on a large tree
+/// is bounded by the limit, not the tree size.
+#[test]
+fn walk_files_stops_at_the_limit() {
+    let d = tempdir().unwrap();
+    for i in 0..10 {
+        fs::write(d.path().join(format!("f{i}.rs")), "").unwrap();
+    }
+    let mut asked = 0;
+    let found = origin_tools::builtins::glob_tool::walk_files(d.path(), 3, |_| {
+        asked += 1;
+        true
+    });
+    assert_eq!(found.len(), 3);
+    assert_eq!(asked, 3, "the walk must stop at the limit");
+}
+
 #[test]
 fn head_limit_caps_output() {
     let d = tempdir().unwrap();

@@ -16,7 +16,7 @@
 
 use anyhow::{anyhow, Result};
 use jsonschema::JSONSchema;
-use origin_daemon::protocol::{ClientMessage, PromptRequest, StreamEvent};
+use origin_daemon::protocol::{ClientMessage, PermissionMode, PromptRequest, StreamEvent};
 use origin_ipc::frame::{encode, FrameKind};
 use origin_ipc::transport::Connector;
 use serde_json::{json, Value};
@@ -59,6 +59,16 @@ pub struct RunArgs {
     pub json_schema: Option<String>,
     /// Extra workspace roots (cline multi-root).
     pub roots: Vec<String>,
+    /// C2: `--dangerously-allow-all` / `ORIGIN_ALLOW_ALL=1`, read here and sent
+    /// in the request (the daemon may already be running without the variable).
+    pub allow_all: bool,
+}
+
+/// C2: the permission mode a headless turn sends: `off` with the allow-all
+/// flag, else none (the daemon's `workspace`, where nobody can answer an ask,
+/// so a call that needs approval comes back to the model as a denial).
+fn headless_permission_mode(allow_all: bool) -> Option<PermissionMode> {
+    allow_all.then_some(PermissionMode::Off)
 }
 
 /// The resolved stdout contract.
@@ -140,6 +150,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         output_format,
         json_schema,
         roots,
+        allow_all,
     } = args;
     let fmt = OutputFormat::resolve(json, output_format.as_deref())?;
     let raw_model =
@@ -186,6 +197,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
             attachments,
             roots,
             &schema_path,
+            allow_all,
         )
         .await;
     }
@@ -207,6 +219,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         read_only: false,
         roots,
         permission_ask: false,
+        permission_mode: headless_permission_mode(allow_all),
         // Headless is non-interactive: no human to answer an `ask_user` picker.
         interactive: false,
         // Headless is one-shot and never switches accounts mid-session, so the
@@ -237,6 +250,7 @@ async fn run_structured(
     attachments: Vec<origin_multimodal::ContentBlock>,
     roots: Vec<String>,
     schema_path: &str,
+    allow_all: bool,
 ) -> Result<()> {
     let schema_src = std::fs::read_to_string(schema_path)
         .map_err(|e| anyhow!("read --json-schema `{schema_path}`: {e}"))?;
@@ -267,6 +281,7 @@ async fn run_structured(
             read_only: false,
             roots: roots.clone(),
             permission_ask: false,
+            permission_mode: headless_permission_mode(allow_all),
             interactive: false,
             account: None,
             ponytail: None,
@@ -359,6 +374,7 @@ pub async fn one_shot_text(model: &str, user_text: String) -> Result<String> {
         read_only: true,
         roots: Vec::new(),
         permission_ask: false,
+        permission_mode: None,
         interactive: false,
         account: None,
         ponytail: None,
@@ -469,6 +485,15 @@ mod tests {
             OutputFormat::Json
         ));
         assert!(OutputFormat::resolve(false, Some("bogus")).is_err());
+    }
+
+    /// C2: without the allow-all flag a headless turn sends no mode (the daemon
+    /// lands on `workspace` with nobody to ask); with it, `off` rides the request.
+    #[test]
+    fn headless_mode_is_off_only_with_the_allow_all_flag() {
+        use origin_daemon::protocol::PermissionMode;
+        assert_eq!(super::headless_permission_mode(false), None);
+        assert_eq!(super::headless_permission_mode(true), Some(PermissionMode::Off));
     }
 
     #[test]

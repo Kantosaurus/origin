@@ -2,9 +2,11 @@
 //! Primary/fallback browser router.
 //!
 //! Policy: try `agent-browser` first. If the classifier flags the response as
-//! bot-detected, replay the same verb against `CloakBrowser` and emit that
-//! response instead. After two consecutive Cloak fallbacks in a session, mark
-//! the session sticky so future verbs skip primary entirely.
+//! bot-detected and the stealth fallback is enabled (`ORIGIN_STEALTH_FALLBACK=1`,
+//! D11), replay the same verb against `CloakBrowser` and emit that response
+//! instead. After two consecutive Cloak fallbacks in a session, mark the session
+//! sticky so future verbs skip primary entirely. Without the opt-in the Cloak
+//! sidecar is never spawned and a bot-detected response is returned as is.
 
 use crate::agent_browser::AgentBrowserClient;
 use crate::cloak::CloakClient;
@@ -30,17 +32,26 @@ struct SessionState {
     sticky: bool,
 }
 
+/// D11: whether the stealth (`CloakBrowser`) fallback is enabled. Opt-in:
+/// only `ORIGIN_STEALTH_FALLBACK=1` turns it on.
+#[must_use]
+pub fn stealth_fallback_enabled() -> bool {
+    std::env::var("ORIGIN_STEALTH_FALLBACK").as_deref() == Ok("1")
+}
+
 // public router type; `Browser` prefix is the documented API surface and
 // pairs with `BrowserClient`s the consumer constructs above.
 #[allow(clippy::module_name_repetitions)]
 pub struct BrowserRouter {
     primary: AgentBrowserClient,
-    cloak: CloakClient,
+    /// `None` unless the stealth fallback is enabled (D11).
+    cloak: Option<CloakClient>,
     state: HashMap<String, SessionState>,
 }
 
 impl BrowserRouter {
-    /// Production constructor: spawn real CLIs.
+    /// Production constructor: spawn real CLIs. The Cloak sidecar is spawned
+    /// only when [`stealth_fallback_enabled`].
     ///
     /// # Errors
     /// Forwards spawn errors from either backend.
@@ -48,9 +59,15 @@ impl BrowserRouter {
         let primary = AgentBrowserClient::spawn()
             .await
             .map_err(|e| RouterError::Primary(e.to_string()))?;
-        let cloak = CloakClient::spawn()
-            .await
-            .map_err(|e| RouterError::Fallback(e.to_string()))?;
+        let cloak = if stealth_fallback_enabled() {
+            Some(
+                CloakClient::spawn()
+                    .await
+                    .map_err(|e| RouterError::Fallback(e.to_string()))?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             primary,
             cloak,
@@ -58,22 +75,30 @@ impl BrowserRouter {
         })
     }
 
-    /// Test constructor: spawn both backends with explicit commands.
+    /// Test constructor: spawn the backends with explicit commands; `cloak:
+    /// None` runs without the stealth fallback.
     ///
     /// # Errors
     /// Forwards spawn errors from either backend.
     pub async fn with_commands(
         primary: (&str, Vec<String>),
-        cloak: (&str, Vec<String>),
+        cloak: Option<(&str, Vec<String>)>,
     ) -> Result<Self, RouterError> {
         let p_args: Vec<&str> = primary.1.iter().map(String::as_str).collect();
-        let c_args: Vec<&str> = cloak.1.iter().map(String::as_str).collect();
         let primary = AgentBrowserClient::spawn_with_command(primary.0, &p_args)
             .await
             .map_err(|e| RouterError::Primary(e.to_string()))?;
-        let cloak = CloakClient::spawn_with_command(cloak.0, &c_args)
-            .await
-            .map_err(|e| RouterError::Fallback(e.to_string()))?;
+        let cloak = match cloak {
+            Some((cmd, args)) => {
+                let c_args: Vec<&str> = args.iter().map(String::as_str).collect();
+                Some(
+                    CloakClient::spawn_with_command(cmd, &c_args)
+                        .await
+                        .map_err(|e| RouterError::Fallback(e.to_string()))?,
+                )
+            }
+            None => None,
+        };
         Ok(Self {
             primary,
             cloak,
@@ -95,9 +120,9 @@ impl BrowserRouter {
         let session = session_of(verb).to_string();
         let st = self.state.entry(session.clone()).or_default();
 
-        if st.sticky {
-            return self
-                .cloak
+        // `sticky` is only ever set when a Cloak client exists.
+        if let (true, Some(cloak)) = (st.sticky, self.cloak.as_mut()) {
+            return cloak
                 .send(verb)
                 .await
                 .map_err(|e| RouterError::Fallback(e.to_string()));
@@ -114,8 +139,10 @@ impl BrowserRouter {
                 Ok(primary)
             }
             Verdict::BotDetected(_reason) => {
-                let cloak_resp = self
-                    .cloak
+                let Some(cloak) = self.cloak.as_mut() else {
+                    return Ok(primary);
+                };
+                let cloak_resp = cloak
                     .send(verb)
                     .await
                     .map_err(|e| RouterError::Fallback(e.to_string()))?;
@@ -140,5 +167,20 @@ fn session_of(v: &Verb) -> &str {
         | Verb::Snapshot { session }
         | Verb::Screenshot { session, .. }
         | Verb::Close { session } => session,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn stealth_fallback_is_opt_in() {
+        // Only test in this crate's lib that touches the variable.
+        std::env::remove_var("ORIGIN_STEALTH_FALLBACK");
+        assert!(!super::stealth_fallback_enabled(), "unset ⇒ off");
+        std::env::set_var("ORIGIN_STEALTH_FALLBACK", "true");
+        assert!(!super::stealth_fallback_enabled(), "only `1` enables it");
+        std::env::set_var("ORIGIN_STEALTH_FALLBACK", "1");
+        assert!(super::stealth_fallback_enabled());
+        std::env::remove_var("ORIGIN_STEALTH_FALLBACK");
     }
 }

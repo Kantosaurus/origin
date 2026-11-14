@@ -38,7 +38,7 @@ use crate::workflows::{Workflow, WorkflowStep};
 const DEFAULT_STEP_TOOLS: &[&str] = &["Read", "Grep", "Glob", "Edit", "Write"];
 
 /// Per-step worker budget. Generous wall/token ceilings (a step is a full
-/// sub-agent turn) with the same tool-call cap the `Task` default uses.
+/// sub-agent turn) with a 32-turn cap (below the `Task` default of 50).
 const STEP_BUDGET: Budget = Budget::new(
     /* max_wall_ms */ 300_000, /* max_input_tokens */ 1_000_000,
     /* max_output_tokens */ 256_000, /* max_tool_calls */ 32,
@@ -79,6 +79,10 @@ pub struct RunReport {
     pub layers: usize,
     /// Per-step outcomes, in execution order (layer-major, then step order).
     pub steps: Vec<StepReport>,
+    /// C2: some step's worker was tainted (network/MCP content entered its
+    /// context); the calling session becomes tainted too. Omitted when `false`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tainted: bool,
 }
 
 /// Map a daemon [`Workflow`]'s steps into dependency layers of **positions**
@@ -175,6 +179,8 @@ pub fn step_worker_spec(step: &WorkflowStep, catalog: &SkillCatalog) -> WorkerSp
         parent_actor: ActorId::new(0),
         model: None,
         mcp_servers: Vec::new(),
+        effort: None,
+        ponytail: None,
     }
 }
 
@@ -196,6 +202,10 @@ pub fn step_worker_spec(step: &WorkflowStep, catalog: &SkillCatalog) -> WorkerSp
 /// `"failed"` because the TUI only treats `"completed"`/`"failed"` as terminal —
 /// any other token reads as still-running and would wedge the panel's row open.
 ///
+/// B3/B5: `effort` and `ponytail` are what a parent loop hands its workers
+/// (its explicit `/effort`, its ponytail level), as `Task` does; `None` (no
+/// parent loop, e.g. the `/workflow` command) lets each worker resolve its own.
+///
 /// # Errors
 /// - [`RunError::Layering`] if the workflow's dependency graph is invalid.
 /// - [`RunError::Swarm`] if a worker spawn or await fails at the swarm layer.
@@ -204,9 +214,12 @@ pub async fn run_workflow(
     coordinator: &Coordinator,
     catalog: &SkillCatalog,
     event_tx: Option<&Sender<StreamEvent>>,
+    effort: Option<&str>,
+    ponytail: Option<&str>,
 ) -> Result<RunReport, RunError> {
     let layers = compute_layers(workflow)?;
     let mut steps_out: Vec<StepReport> = Vec::with_capacity(workflow.steps.len());
+    let mut tainted = false;
 
     for (layer_idx, layer) in layers.iter().enumerate() {
         // Spawn EVERY step in this layer before awaiting any of them — this is
@@ -215,7 +228,11 @@ pub async fn run_workflow(
         let mut handles = Vec::with_capacity(layer.len());
         for &pos in layer {
             let step = &workflow.steps[pos];
-            let spec = step_worker_spec(step, catalog);
+            let spec = WorkerSpec {
+                effort: effort.map(str::to_owned),
+                ponytail: ponytail.map(str::to_owned),
+                ..step_worker_spec(step, catalog)
+            };
             let goal_preview = swarm_goal_preview(&spec.goal);
             let handle = coordinator.spawn(spec).await?;
             if let Some(tx) = event_tx {
@@ -235,6 +252,7 @@ pub async fn run_workflow(
         for (pos, handle, goal_preview) in handles {
             match coordinator.await_completion(&handle).await {
                 Ok(report) => {
+                    tainted |= report.tainted;
                     if let Some(tx) = event_tx {
                         // Only `Completed` is a panel "success"; every other
                         // terminal state shows as a failed row.
@@ -285,6 +303,7 @@ pub async fn run_workflow(
         name: workflow.name.clone(),
         layers: layers.len(),
         steps: steps_out,
+        tainted,
     })
 }
 

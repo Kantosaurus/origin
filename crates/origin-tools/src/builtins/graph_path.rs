@@ -34,6 +34,5 @@ crate::origin_tool! {
         "required": ["from", "to"]
     }"#,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
-    token_budget: crate::DEFAULT_TOKEN_BUDGET,
     hot: false,
 }

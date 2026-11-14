@@ -1,0 +1,7 @@
+{
+  "id": "two-file-flag",
+  "repo": { "fixture": "repo" },
+  "prompt": "Add a keyword argument `reverse=False` to `top_words` in counter.py: when true it returns the n LEAST common words, least common first (ties stay alphabetical). Expose it as a `--reverse` option on the wordcount command line (wordcount.py). Behaviour without the option must not change. The tests are in test_wordcount.py.",
+  "verify": { "cmd": ["{python}", "-m", "unittest", "-q"], "expect_exit": 0, "restore": ["test_wordcount.py"] },
+  "timeout_s": 900
+}

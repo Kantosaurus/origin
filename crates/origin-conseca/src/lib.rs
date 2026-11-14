@@ -96,54 +96,197 @@ pub fn check_tool(p: &SecurityPolicy, tool: &str) -> Decision {
     Decision::Deny(format!("tool '{tool}' is not on the allow list"))
 }
 
-/// Normalizes a filesystem path for prefix comparison.
-///
-/// Backslashes are converted to forward slashes so that Windows and POSIX
-/// paths compare identically against policy prefixes.
-fn normalize_path(path: &str) -> String {
-    path.replace('\\', "/")
+/// Lexically canonicalizes a filesystem path into its components for the
+/// current platform (see [`components_with`]).
+// ponytail: lexical only — NOT handled: symlinks, Windows 8.3 short names
+// (`PROGRA~1`), non-ASCII case folding on Windows, and macOS's case-insensitive
+// default volume (rules compare case-sensitively there). Upgrade path:
+// `fs::canonicalize` of the longest existing ancestor, then re-append the rest.
+fn path_components(path: &str) -> Option<Vec<String>> {
+    components_with(path, cfg!(windows), &|| {
+        std::env::current_dir()
+            .ok()
+            .map(|d| d.to_string_lossy().into_owned())
+    })
 }
 
-/// Returns `true` when `path` lies under `prefix` on a path-segment boundary.
+/// Pure core of [`path_components`]; `windows` selects the path rules.
 ///
-/// A bare prefix equal to the path matches, and a prefix followed by a `/`
-/// separator matches, but a prefix that is merely a textual head of a longer
-/// segment (for example `/etc` vs `/etchosts`) does not.
-fn path_under(path: &str, prefix: &str) -> bool {
-    let prefix = prefix.trim_end_matches('/');
-    if prefix.is_empty() {
-        return true;
+/// Relative paths are anchored at `cwd()` (where the tools resolve them), and
+/// empty, `.` and `..` segments are resolved; `..` never climbs above the root.
+/// On POSIX a backslash and an `x:` segment are ordinary file-name characters.
+/// Windows rules are in [`windows_components`]. `None` = unresolvable.
+fn components_with(path: &str, windows: bool, cwd: &dyn Fn() -> Option<String>) -> Option<Vec<String>> {
+    if windows {
+        return windows_components(path, cwd);
     }
-    if path == prefix {
-        return true;
+    if !path.starts_with('/') {
+        return components_with(&format!("{}/{path}", cwd()?), false, &|| None);
     }
-    path.strip_prefix(prefix)
-        .is_some_and(|rest| rest.starts_with('/'))
+    let mut out: Vec<String> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            _ => out.push(seg.to_owned()),
+        }
+    }
+    Some(out)
+}
+
+/// Windows rules for [`components_with`].
+///
+/// `\` is a separator and components are ASCII-lower-cased. The root is a drive
+/// (`x:` then a separator or nothing) or a UNC `//server` + `share` (kept as
+/// `"//server"` so it never equals a drive path); `..` cannot pop either root.
+/// `\\?\UNC\` maps to UNC; after `\\?\` or `\\.\` only a drive root is
+/// accepted. A root-relative `\dir` lands on the cwd's root. Unresolvable
+/// (fail closed): device/volume namespaces, `\??\`, drive-relative `C:dir`,
+/// `.`/`..` under `\\?\` or `\\.\` (not normalised by Win32), a component ending
+/// in `.` or a space (Win32 strips those) or containing `:` (alternate data
+/// streams), and a UNC path without server and share.
+fn windows_components(path: &str, cwd: &dyn Fn() -> Option<String>) -> Option<Vec<String>> {
+    let has = |p: &str, pre: &str| p.get(..pre.len()).is_some_and(|h| h.eq_ignore_ascii_case(pre));
+    let is_drive_root = |p: &[u8]| {
+        p.len() >= 2 && p[0].is_ascii_alphabetic() && p[1] == b':' && p.get(2).is_none_or(|&c| c == b'/')
+    };
+    let mut path = path.replace('\\', "/");
+    if has(&path, "/??/") {
+        return None; // NT object-manager prefix
+    }
+    let verbatim = has(&path, "//?/") || has(&path, "//./");
+    if has(&path, "//?/UNC/") {
+        path = format!("//{}", &path[8..]);
+    } else if verbatim {
+        path.drain(..4);
+        if !is_drive_root(path.as_bytes()) {
+            return None; // GLOBALROOT, Volume{..}, \\.\UNC, devices
+        }
+    }
+    let (mut out, rest) = if let Some(unc) = path.strip_prefix("//") {
+        let mut parts = unc.splitn(3, '/');
+        let server = parts.next().filter(|s| !s.is_empty())?;
+        let share = parts.next().filter(|s| !s.is_empty())?;
+        (
+            vec![format!("//{server}"), share.to_owned()],
+            parts.next().unwrap_or("").to_owned(),
+        )
+    } else if is_drive_root(path.as_bytes()) {
+        (vec![path[..2].to_owned()], path[2..].to_owned())
+    } else if path.as_bytes().get(1) == Some(&b':') {
+        return None; // drive-relative `C:dir`
+    } else if path.starts_with('/') {
+        let root = windows_components(&cwd()?, &|| None)?;
+        let floor = if root.first()?.starts_with("//") { 2 } else { 1 };
+        (root.get(..floor)?.to_vec(), path)
+    } else {
+        return windows_components(&format!("{}/{path}", cwd()?), &|| None);
+    };
+    for root in &mut out {
+        if root.trim_start_matches('/').ends_with(['.', ' ']) {
+            return None; // `\\srv.\share`, `\\srv\share.`
+        }
+        *root = root.to_ascii_lowercase();
+    }
+    let floor = out.len();
+    for seg in rest.split('/') {
+        match seg {
+            "." | ".." if verbatim => return None,
+            "" | "." => {}
+            ".." => {
+                if out.len() > floor {
+                    out.pop();
+                }
+            }
+            _ if seg.ends_with(['.', ' ']) || seg.contains(':') => return None,
+            _ => out.push(seg.to_ascii_lowercase()),
+        }
+    }
+    Some(out)
+}
+
+/// C2: the real location of the absolute `path`, symlinks (and Windows
+/// junctions) resolved.
+///
+/// The OS canonicalises the longest existing ancestor and
+/// the not-yet-existing rest is re-appended, `.`/`..` resolved lexically (a name
+/// that does not exist cannot be a link). `None` = unresolvable, which callers
+/// treat as "outside": a relative path, a spelling [`path_components`] rejects
+/// (Win32-rewritten names, devices, `:` streams), an existing entry that cannot
+/// be canonicalised (a dangling link would let a write land anywhere), or `..`
+/// above the root.
+#[must_use]
+pub fn resolve_real(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    path_components(path.to_str()?)?;
+    if !path.is_absolute() {
+        return None;
+    }
+    let comps: Vec<Component<'_>> = path.components().collect();
+    for i in (1..=comps.len()).rev() {
+        let Ok(mut base) = std::fs::canonicalize(comps[..i].iter().collect::<std::path::PathBuf>()) else {
+            continue;
+        };
+        for c in &comps[i..] {
+            match c {
+                Component::Normal(name) => {
+                    base.push(name);
+                    if std::fs::symlink_metadata(&base).is_ok() {
+                        return None; // exists, yet canonicalize failed on it
+                    }
+                }
+                Component::ParentDir if base.pop() => {}
+                Component::CurDir => {}
+                _ => return None,
+            }
+        }
+        return Some(base);
+    }
+    None
 }
 
 /// Checks whether a filesystem path may be accessed under the policy.
 ///
-/// Paths are normalized (backslashes to forward slashes) before matching.
-/// Deny prefixes win. When the allow-list is empty any non-denied path is
-/// permitted; when it is non-empty the path must fall under an allow prefix.
+/// Both the path and the policy prefixes are lexically canonicalized with
+/// [`path_components`] (symlinks and 8.3 short names are not resolved) and
+/// compared component by component, so
+/// `/work/project-evil` is not under `/work/project`. Deny prefixes win. When
+/// the allow-list is empty any non-denied path is permitted; when it is
+/// non-empty the path must fall under an allow prefix. Anything that cannot be
+/// resolved fails closed (path denied, deny prefix treated as matching).
 #[must_use]
 pub fn check_path(p: &SecurityPolicy, path: &str) -> Decision {
-    let normalized = normalize_path(path);
-    if let Some(deny) = p
-        .deny_paths
-        .iter()
-        .find(|d| path_under(&normalized, &normalize_path(d)))
-    {
+    let Some(components) = path_components(path) else {
+        return Decision::Deny(format!("path '{path}' cannot be resolved"));
+    };
+    let under = |prefix: &str| path_components(prefix).map(|pre| components.starts_with(&pre));
+    if let Some(deny) = p.deny_paths.iter().find(|d| under(d).unwrap_or(true)) {
         return Decision::Deny(format!("path '{path}' is under denied prefix '{deny}'"));
     }
-    if p.allow_paths.is_empty()
-        || p.allow_paths
-            .iter()
-            .any(|a| path_under(&normalized, &normalize_path(a)))
-    {
+    if p.allow_paths.is_empty() || p.allow_paths.iter().any(|a| under(a).unwrap_or(false)) {
         return Decision::Allow;
     }
     Decision::Deny(format!("path '{path}' is not under any allowed prefix"))
+}
+
+/// Checks a recursive search (`Grep`/`Glob`) rooted at `root`.
+///
+/// Like [`check_path`] on the root, and additionally denied when any deny
+/// prefix lies inside the tree, since the walk would read it. An unresolvable
+/// deny prefix counts as inside (fail closed).
+#[must_use]
+pub fn check_tree(p: &SecurityPolicy, root: &str) -> Decision {
+    let decision = check_path(p, root);
+    let (Decision::Allow, Some(root_c)) = (&decision, path_components(root)) else {
+        return decision;
+    };
+    let inside = |d: &String| path_components(d).is_none_or(|dc| dc.starts_with(&root_c));
+    if let Some(deny) = p.deny_paths.iter().find(|d| inside(d)) {
+        return Decision::Deny(format!("search root '{root}' contains denied path '{deny}'"));
+    }
+    Decision::Allow
 }
 
 /// Extracts the lowercase host from a URL or bare host string.
@@ -324,6 +467,7 @@ mod tests {
         assert!(matches!(check_path(&p, "/repository/x"), Decision::Deny(_)));
     }
 
+    #[cfg(windows)] // on POSIX `\` is a file-name character, not a separator
     #[test]
     fn path_backslash_normalized() {
         let p = SecurityPolicy {
@@ -331,6 +475,212 @@ mod tests {
             ..SecurityPolicy::default()
         };
         assert_eq!(check_path(&p, r"C:\work\file.txt"), Decision::Allow);
+    }
+
+    #[test]
+    fn path_dot_segments_resolved_before_matching() {
+        let p = SecurityPolicy {
+            allow_paths: vec!["/work/project".to_owned()],
+            deny_paths: vec!["/work/project/secrets".to_owned()],
+            ..SecurityPolicy::default()
+        };
+        // `..` cannot climb out of an allow root into a sibling.
+        assert!(matches!(
+            check_path(&p, "/work/project/../project-evil/x"),
+            Decision::Deny(_)
+        ));
+        // `.`/`..`/doubled separators cannot dodge a deny prefix.
+        assert!(matches!(
+            check_path(&p, "/work/project/src/../secrets/./key.pem"),
+            Decision::Deny(_)
+        ));
+        assert!(matches!(
+            check_path(&p, "/work/project//secrets/key.pem"),
+            Decision::Deny(_)
+        ));
+        assert_eq!(check_path(&p, "/work/project/a/../b"), Decision::Allow);
+    }
+
+    fn comps(path: &str, windows: bool, cwd: &str) -> Option<Vec<String>> {
+        let cwd = cwd.to_owned();
+        components_with(path, windows, &move || Some(cwd.clone()))
+    }
+
+    fn owned(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// POSIX: `s:` is an ordinary directory name, so `s:/../secrets/key` is
+    /// `<cwd>/secrets/key`, and a backslash is part of a file name, not a
+    /// separator.
+    #[test]
+    fn posix_has_no_drive_letters_or_backslash_separators() {
+        assert_eq!(
+            comps("s:/../secrets/key", false, "/work/project"),
+            Some(owned(&["work", "project", "secrets", "key"]))
+        );
+        assert_eq!(
+            comps(r"/work/project/a\../../secrets", false, "/"),
+            Some(owned(&["work", "project", "secrets"]))
+        );
+    }
+
+    /// Windows: case, `\\?\` and `\\.\` prefixes, and root-relative paths all
+    /// resolve to the same components as the plain drive path; a drive-relative
+    /// `C:foo` cannot be resolved.
+    #[test]
+    fn windows_spellings_canonicalize_alike() {
+        let deny = comps("C:/Users/u/.ssh", true, "C:/w").expect("deny resolves");
+        for p in [
+            r"c:\users\u\.ssh\id_rsa",
+            r"\\?\C:\Users\u\.ssh\id_rsa",
+            r"\\.\C:\Users\u\.ssh\id_rsa",
+            r"\Users\u\.ssh\id_rsa",
+            r"C:\Users\u\x\..\.ssh\id_rsa",
+        ] {
+            let got = comps(p, true, "C:/w").expect("path resolves");
+            assert!(got.starts_with(&deny), "{p} => {got:?} must be under {deny:?}");
+        }
+        assert_eq!(
+            comps(r"\\?\UNC\server\share\f", true, "C:/w"),
+            comps(r"\\server\share\f", true, "C:/w")
+        );
+        assert_eq!(
+            comps("C:foo", true, "C:/w"),
+            None,
+            "drive-relative is unresolvable"
+        );
+        assert_eq!(
+            comps("C:/..", true, "C:/w"),
+            Some(owned(&["c:"])),
+            "`..` stops at the drive"
+        );
+    }
+
+    /// N1: after `\\?\`/`\\.\` only a drive root is accepted; device and
+    /// volume namespaces (and `\\.\UNC`) are unresolvable, never cwd-relative.
+    #[test]
+    fn windows_device_namespaces_are_unresolvable() {
+        for p in [
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\x",
+            r"\\.\UNC\h\s\x",
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\x",
+        ] {
+            assert_eq!(comps(p, true, "C:/w"), None, "{p}");
+        }
+    }
+
+    /// N2/N3: server + share is a UNC root that `..` cannot pop, a UNC path
+    /// never equals a drive path, and a root-relative path on a UNC cwd lands
+    /// on that share.
+    #[test]
+    fn unc_root_is_a_floor() {
+        let deny = comps("//srv/share/hr", true, "C:/w").expect("deny resolves");
+        let got = comps(r"\\srv\share\..\..\hr\x", true, "C:/w").expect("resolves");
+        assert!(got.starts_with(&deny), "{got:?} must be under {deny:?}");
+        let allow = comps("C:/work/project", true, "C:/w").expect("allow resolves");
+        let evil = comps(r"\\evil\s\..\..\c:\work\project\f", true, "C:/w");
+        assert!(evil.as_ref().is_none_or(|e| !e.starts_with(&allow)), "{evil:?}");
+        assert_ne!(comps(r"\\c:\x\f", true, "C:/w"), comps(r"c:\x\f", true, "C:/w"));
+        assert_eq!(comps(r"\\srv", true, "C:/w"), None, "UNC needs server and share");
+        assert_eq!(
+            comps(r"\Users\u\.ssh\k", true, r"\\srv\share\d"),
+            Some(owned(&["//srv", "share", "users", "u", ".ssh", "k"]))
+        );
+    }
+
+    /// Spellings Win32 rewrites behind our back are unresolvable (fail closed).
+    #[test]
+    fn windows_rewritten_spellings_are_unresolvable() {
+        for p in [
+            r"\\?\C:\Users\..\x",                         // (i) `..` under `\\?\`
+            r"\\.\C:\..\C:\Users\u\.ssh\id_rsa",          // (i) `..` under `\\.\`
+            r"\??\C:\Users\u\.ssh\id_rsa",                // (ii) NT prefix
+            r"C:\Users\u\.ssh.\id_rsa",                   // (iii) trailing dot
+            r"C:\Users\u\.ssh \id_rsa",                   // (iii) trailing space
+            r"C:\Users\u\f::$DATA",                       // (iv) ADS
+            r"C:\Users\u\.ssh::$INDEX_ALLOCATION\id_rsa", // (iv) ADS
+        ] {
+            assert_eq!(comps(p, true, "C:/w"), None, "{p}");
+        }
+        for p in [
+            r"C:\work\project\src\main.rs",
+            "C:/work/project/a.b/c d/e",
+            r"\\srv\share\dir\f.txt",
+        ] {
+            assert!(comps(p, true, "C:/w").is_some(), "{p} must resolve");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_device_path_cannot_ride_the_cwd_allow_rule() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let p = SecurityPolicy {
+            allow_paths: vec![cwd.to_string_lossy().into_owned()],
+            ..SecurityPolicy::default()
+        };
+        let read = r"\\?\GLOBALROOT\Device\HarddiskVolume3\Users\u\.ssh\id_rsa";
+        assert!(matches!(check_path(&p, read), Decision::Deny(_)));
+        let deny = SecurityPolicy {
+            deny_paths: vec!["//srv/share/hr".to_owned()],
+            ..SecurityPolicy::default()
+        };
+        assert!(matches!(
+            check_path(&deny, r"\\srv\share\..\..\hr\x"),
+            Decision::Deny(_)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_deny_list_resists_case_and_verbatim_prefixes() {
+        let p = SecurityPolicy {
+            deny_paths: vec!["C:/Users/u/.ssh".to_owned()],
+            ..SecurityPolicy::default()
+        };
+        for path in [
+            r"c:\users\u\.ssh\id_rsa",
+            r"\\?\C:\Users\u\.ssh\id_rsa",
+            r"\\.\C:\Users\u\.ssh\id_rsa",
+        ] {
+            assert!(matches!(check_path(&p, path), Decision::Deny(_)), "{path}");
+        }
+    }
+
+    /// A recursive search is denied when a deny prefix lies inside its root.
+    #[test]
+    fn tree_search_denied_when_it_contains_a_deny_prefix() {
+        let p = SecurityPolicy {
+            allow_paths: vec!["/work/project".to_owned()],
+            deny_paths: vec!["/work/project/secrets".to_owned(), "/home/u/.ssh".to_owned()],
+            ..SecurityPolicy::default()
+        };
+        assert!(matches!(check_tree(&p, "/work/project"), Decision::Deny(_)));
+        assert!(matches!(
+            check_tree(&p, "/work/project/secrets/x"),
+            Decision::Deny(_)
+        ));
+        assert_eq!(check_tree(&p, "/work/project/src"), Decision::Allow);
+        let open = SecurityPolicy {
+            deny_paths: vec!["/home/u/.ssh".to_owned()],
+            ..SecurityPolicy::default()
+        };
+        assert!(matches!(check_tree(&open, "/home/u"), Decision::Deny(_)));
+        assert!(matches!(check_tree(&open, "/"), Decision::Deny(_)));
+        assert_eq!(check_tree(&open, "/home/u/src"), Decision::Allow);
+    }
+
+    #[test]
+    fn relative_path_is_anchored_at_cwd() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let p = SecurityPolicy {
+            deny_paths: vec![cwd.to_string_lossy().into_owned()],
+            ..SecurityPolicy::default()
+        };
+        // A relative path lands under the process cwd, which is denied.
+        assert!(matches!(check_path(&p, "src/lib.rs"), Decision::Deny(_)));
+        assert!(matches!(check_path(&p, "."), Decision::Deny(_)));
     }
 
     #[test]

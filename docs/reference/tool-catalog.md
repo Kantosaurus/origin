@@ -24,7 +24,6 @@ Every builtin carries this metadata (`crates/origin-tools/src/registry.rs`):
 | `side_effects` | `SideEffects` | `Pure` (read-only) or `Mutating`. |
 | `input_schema` | `&str` | JSON Schema string for the arguments. |
 | `sandbox_profile` | `SandboxProfile` | Confinement applied to child processes (see below). |
-| `token_budget` | `u32` | Advisory result-size cap (default `25_000`). |
 | `hot` | `bool` | `true` ⇒ full schema in the system prompt; `false` ⇒ deferred behind `ToolSearch`. |
 
 ### Permission tiers (`Tier`)
@@ -43,7 +42,10 @@ Every builtin carries this metadata (`crates/origin-tools/src/registry.rs`):
 | `WriteCwd` | Writes confined to the workspace / current working tree. |
 | `Shell` | Full shell exec profile (network + write), most permissive. |
 
-See [`../crates/origin-sandbox.md`](../crates/origin-sandbox.md) and
+These are the levels the profiles are written to enforce; no OS backend is
+enabled on shipped builds, so none is enforced today and children run
+unconfined with an allow-listed environment. See
+[`../crates/origin-sandbox.md`](../crates/origin-sandbox.md) and
 [`../security/security-model.md`](../security/security-model.md).
 
 ---
@@ -78,8 +80,8 @@ description}` and are inflated via `ToolSearch`.
 
 | Tool | Purpose | Tier | Sandbox | Key params |
 |------|---------|------|---------|-----------|
-| `LspNavigate` | Semantic navigation via the warm LSP: `definition`, `references`, `incoming_calls`, `outgoing_calls`. | AutoAllowed | `Inherit` | `op`, `path`, `line`, `col` |
-| `Diagnostics` | LSP diagnostics from warm rust-analyzer; severity filter. | AutoAllowed | `Inherit` | `path`, `severity` |
+| `LspNavigate` | Semantic navigation via the warm LSP: `definition`, `references`, `incoming_calls`, `outgoing_calls`. | RequiresPermission | `Inherit` | `op`, `path`, `line`, `col` |
+| `Diagnostics` | LSP diagnostics from warm rust-analyzer; severity filter. | RequiresPermission | `Inherit` | `path`, `severity` |
 
 ### Code graph
 
@@ -105,9 +107,9 @@ description}` and are inflated via `ToolSearch`.
 
 | Tool | Purpose | Tier | Sandbox | Key params |
 |------|---------|------|---------|-----------|
-| `WebFetch` | Fetch one or more URLs and return reader-mode markdown (single `url` or `urls[]` up to 20). | RequiresPermission | `Inherit` | `url`, `urls[]` |
+| `WebFetch` | Fetch one or more URLs (single `url` or `urls[]` up to 20) and answer `prompt` about them through a tool-less cheap model; only the answer is returned. | RequiresPermission | `Inherit` | `url`, `urls[]`, `prompt` (required when the quarantine call runs: not under `ORIGIN_WEBFETCH_RAW=1` or with no cheap model) |
 | `WebSearch` | Search the web via Tavily (`TAVILY_API_KEY` or vault). | RequiresPermission | `Inherit` | `query`, `count` |
-| `Browser` | Stateful browser with agent-detection fallback to CloakBrowser. | RequiresPermission | `Inherit` | verb + verb args |
+| `Browser` | Stateful browser (agent-browser backend). CloakBrowser fallback on bot detection only with `ORIGIN_STEALTH_FALLBACK=1`. | RequiresPermission | `Inherit` | verb + verb args |
 
 ### Mail
 
@@ -119,7 +121,7 @@ description}` and are inflated via `ToolSearch`.
 
 | Tool | Purpose | Tier | Sandbox | Key params |
 |------|---------|------|---------|-----------|
-| `Task` | Dispatch a concurrent sub-agent (swarm worker) confined to `allowed_tools`; returns a `CompletionReport`. | AutoAllowed | `Inherit` | `goal`, `allowed_tools[]`, `budget`, `model`, `mcp_servers[]` |
+| `Task` | Dispatch a concurrent sub-agent (swarm worker) confined to `allowed_tools`; returns a `CompletionReport`. Asks with a `<G>/<T> gated tools, <D> mcp servers` preview; in mode `workspace` a read-only delegation runs without an ask (A4, C2). | RequiresPermission | `Inherit` | `goal`, `allowed_tools[]`, `budget`, `model`, `mcp_servers[]` |
 | `AuthorWorkflow` | Author a runnable workflow from an NL `goal`; persists TOML to the user's workflows file. | RequiresPermission | `Inherit` | `goal`, `name` |
 | `RunWorkflow` | Run a named workflow; groups steps into dependency layers and fans out one sub-agent per step. | RequiresPermission | `Inherit` | `name` |
 
@@ -162,8 +164,8 @@ dispatched through the same permission/sandbox path as builtins. See
 Large results are content-addressed: a tool may return a **CAS handle** that the
 model inflates with `Recall`. Array-heavy JSON is compacted by `SchemaCrush`
 (`array_crush`), and the dispatch layer memoizes pure-tool results (see
-`MEMOIZATION_SKIPLIST` in `dispatch.rs`). The `token_budget` field is advisory
-metadata only — live bounds come from each builtin's own `head_limit` plus
+`MEMOIZATION_SKIPLIST` in `dispatch.rs`). Live bounds come from each builtin's
+own caps (`head_limit`, `Read`'s 100,000-byte page, `Bash`'s stdout budget) plus
 `SchemaCrush` and the dispatch result cache.
 
 ---

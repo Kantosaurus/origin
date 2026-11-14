@@ -69,6 +69,8 @@ struct WireStreamUsage {
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: crate::wire::PromptTokensDetails,
 }
 
 #[derive(Deserialize)]
@@ -199,14 +201,26 @@ pub async fn parse_into_ring(
     Ok(())
 }
 
+/// `prompt_tokens` includes the cached share; `Usage.input_tokens` is the
+/// uncached remainder. `OpenAI` reports no cache-write count.
+const fn stream_usage(u: WireStreamUsage) -> Usage {
+    let cached = u.prompt_tokens_details.cached_tokens;
+    Usage {
+        input_tokens: u.prompt_tokens.saturating_sub(cached),
+        output_tokens: u.completion_tokens,
+        cache_read_input_tokens: cached,
+        cache_creation_input_tokens: 0,
+    }
+}
+
 fn encode_usage(u: WireStreamUsage) -> Vec<u8> {
-    // 4 × u32 BE. Order: input, output, cache_read, cache_creation. OpenAI
-    // does not report cache token counts on Chat Completions streams.
+    // 4 × u32 BE. Order: input, output, cache_read, cache_creation.
+    let u = stream_usage(u);
     let mut out = Vec::with_capacity(16);
-    out.extend_from_slice(&u.prompt_tokens.to_be_bytes());
-    out.extend_from_slice(&u.completion_tokens.to_be_bytes());
-    out.extend_from_slice(&0u32.to_be_bytes());
-    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&u.input_tokens.to_be_bytes());
+    out.extend_from_slice(&u.output_tokens.to_be_bytes());
+    out.extend_from_slice(&u.cache_read_input_tokens.to_be_bytes());
+    out.extend_from_slice(&u.cache_creation_input_tokens.to_be_bytes());
     out
 }
 
@@ -240,12 +254,7 @@ pub fn parse_chunk_for_test(line: &[u8]) -> Option<TestFrame> {
         .iter()
         .find_map(|c| c.delta.tool_calls.as_ref())
         .and_then(|tcs| tcs.iter().find_map(|tc| tc.index));
-    let usage = chunk.usage.map(|u| Usage {
-        input_tokens: u.prompt_tokens,
-        output_tokens: u.completion_tokens,
-        cache_read_input_tokens: 0,
-        cache_creation_input_tokens: 0,
-    });
+    let usage = chunk.usage.map(stream_usage);
     Some(TestFrame { index, usage })
 }
 

@@ -172,6 +172,16 @@ fn global_defs() -> &'static [SubagentDef] {
         .as_slice()
 }
 
+/// Every inline-MCP server defined in user-scope config (the `mcp:` lists of
+/// `~/.origin/subagents/*.md`) — the only servers a `Task` worker may start (A5).
+#[must_use]
+pub fn user_mcp_servers() -> Vec<origin_swarm::McpServerSpec> {
+    global_defs()
+        .iter()
+        .flat_map(|d| d.mcp_servers.iter().cloned())
+        .collect()
+}
+
 /// Render the `<origin-subagents>` block from the `.md`-loaded subagents PLUS
 /// the built-in `browser` subagent when `allow_domains` is non-empty
 /// (browser-security C).

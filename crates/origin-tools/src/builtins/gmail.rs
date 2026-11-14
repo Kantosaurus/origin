@@ -29,7 +29,6 @@ crate::origin_tool! {
     side_effects: SideEffects::Pure,
     input_schema: GMAIL_INPUT_SCHEMA,
     sandbox: ::origin_sandbox::SandboxProfile::Inherit,
-    token_budget: crate::DEFAULT_TOKEN_BUDGET,
     hot: false,
 }
 

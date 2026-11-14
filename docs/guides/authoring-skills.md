@@ -6,12 +6,12 @@ sessions. `origin` ships **19 embedded skills** (the "superpowers" set —
 test-driven-development, systematic-debugging, writing-plans, and more), and you
 can add your own under `~/.origin/skills/`.
 
-Crucially, skills are **not** all loaded into every conversation. They are
-indexed into an embedding graph and only the top-matching ones are injected per
-turn — so you can install hundreds of skills with no session-start scan cost and
-no token bloat.
+Skill **bodies** are not loaded into every conversation: the system prompt
+lists every installed skill by name and `description` (one line each), and a
+skill's full body is injected only once it is activated (`/<name>`). Each
+installed skill therefore costs one catalog line in every prompt.
 
-> For the subsystem internals (the HNSW index, materialization, the loader), see
+> For the subsystem internals (the loader, activation, the unwired embedding design), see
 > the [skills subsystem reference](../subsystems/skills.md). This guide is the
 > task-oriented "how do I write one" companion.
 
@@ -116,8 +116,9 @@ the *exact* set of tools a skill is permitted to use. The narrowing is
 **enforced**, not advisory:
 
 > A skill that omits `Bash` from its `allowed-tools` **cannot shell out** — even
-> if the model tries. The sandbox (landlock + seccomp + namespaces on Linux,
-> `sandbox-exec` on macOS, AppContainer on Windows) is wired to the tool grant.
+> if the model tries: the permission layer denies the call (`skill-narrowed`)
+> before it runs. This is a tool-level mask, not OS confinement: no OS sandbox
+> is active on shipped builds, so a granted `Bash` runs unconfined.
 
 Practical guidance:
 
@@ -133,18 +134,18 @@ Practical guidance:
 
 ---
 
-## Embedding-indexed injection
+## How a skill reaches the model
 
-You don't choose which skills load — `origin` does, per turn, by relevance:
+1. Every installed skill appears in the system prompt's `<origin-skills>` catalog
+   as one line: its `name` and `description` (a leading `*` marks an active one).
+2. A skill is activated with `/<name>`; only then is its full
+   body injected, and its `allowed-tools` mask takes effect.
 
-1. Each installed skill's frontmatter is embedded and indexed into an HNSW
-   (approximate nearest-neighbor) graph at load time.
-2. On each turn, `origin` materializes the **top-K** skills whose `description`
-   best matches the current context, and injects only those into the prompt.
-3. Hundreds of installed skills therefore cost **zero** session-start scan time
-   and don't bloat the context window.
+(An embedding index that would pick the top-K skills per turn exists in
+`origin-skills` but is not wired into the daemon.)
 
-This is why the `description` field matters so much: it's the query target.
+This is why the `description` field matters so much: it's what the model reads
+to decide whether a skill applies.
 Write it as **triggering conditions only** ("Use when…"), in the third person,
 packed with the words a model would search for (error messages, symptoms,
 synonyms, tool names). **Do not** summarize the skill's workflow in the

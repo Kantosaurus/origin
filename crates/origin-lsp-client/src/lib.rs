@@ -3,14 +3,16 @@
 //!
 //! Implements the subset needed by `Diagnostics` and code navigation:
 //! `initialize`, `initialized`, `textDocument/didOpen`, `textDocument/didChange`,
-//! listening for `textDocument/publishDiagnostics`, and request/response
-//! round-trips (`textDocument/definition`, `textDocument/references`,
-//! `callHierarchy/*`) correlated by JSON-RPC `id`.
+//! `textDocument/didClose`, listening for `textDocument/publishDiagnostics`, and
+//! request/response round-trips (`textDocument/definition`,
+//! `textDocument/references`, `callHierarchy/*`) correlated by JSON-RPC `id`.
+//! [`LspPool`] keeps servers alive across diagnostics calls.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +25,10 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 /// Map of outstanding JSON-RPC request ids to the oneshot that delivers their
 /// response frame. Shared between [`LspClient`] and its [`reader_loop`].
 pub(crate) type PendingMap = Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>;
+
+/// Latest published diagnostics per file, with the document `version` the
+/// server tagged that publish with (`None` when it did not say).
+type DiagMap = Arc<RwLock<HashMap<PathBuf, (Option<i64>, Vec<Diagnostic>)>>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LspError {
@@ -69,14 +75,17 @@ pub struct CallHierarchyItem {
 
 pub struct LspClient {
     /// Holds the child process alive for the lifetime of the client.
-    _child: Child,
+    child: Child,
     stdin: Arc<Mutex<ChildStdin>>,
-    diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>>,
+    diags: DiagMap,
     /// Outstanding request-id → response-oneshot correlation table.
     pending: PendingMap,
     /// Monotonic request id allocator. Id `0` is reserved for the `initialize`
     /// handshake, so request ids start at `1`.
     next_id: AtomicI64,
+    /// Monotonic document version allocator shared by every document, so each
+    /// `didOpen`/`didChange` carries a version newer than any sent before.
+    next_version: AtomicI32,
 }
 
 impl LspClient {
@@ -104,6 +113,9 @@ impl LspClient {
         workspace_root: &Path,
     ) -> Result<Self, LspError> {
         let mut cmd = Command::new(binary);
+        // A6: the server gets the allow-listed environment (PATH, CARGO_HOME,
+        // RUSTUP_HOME, … stay), never the daemon's provider keys.
+        origin_sandbox::scrub_env(cmd.as_std_mut());
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -123,7 +135,7 @@ impl LspClient {
             .ok_or_else(|| LspError::Spawn("no stdout".into()))?;
 
         let stdin = Arc::new(Mutex::new(stdin));
-        let diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let diags: DiagMap = Arc::new(RwLock::new(HashMap::new()));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
 
         // Reader loop.
@@ -143,7 +155,11 @@ impl LspClient {
             "params": {
                 "processId": std::process::id(),
                 "rootUri": root_uri,
-                "capabilities": {}
+                // We send `workspace/didChangeWatchedFiles` for files we know
+                // changed (see `LspPool::notify_changed`); no dynamic watchers.
+                "capabilities": {
+                    "workspace": { "didChangeWatchedFiles": { "dynamicRegistration": false } }
+                }
             }
         });
         write_frame(stdin.clone(), &init).await?;
@@ -152,20 +168,23 @@ impl LspClient {
         write_frame(stdin.clone(), &initd).await?;
 
         Ok(Self {
-            _child: child,
+            child,
             stdin,
             diags,
             pending,
             next_id: AtomicI64::new(1),
+            next_version: AtomicI32::new(1),
         })
     }
 
-    /// Notify the server about a file the client has open.
+    /// Notify the server about a file the client has open. Returns the
+    /// document version sent.
     ///
     /// # Errors
     /// Returns `LspError::Io` if the write fails.
-    pub async fn did_open(&self, path: &Path, language_id: &str, text: &str) -> Result<(), LspError> {
+    pub async fn did_open(&self, path: &Path, language_id: &str, text: &str) -> Result<i32, LspError> {
         let uri = format!("file://{}", path.display().to_string().replace('\\', "/"));
+        let version = self.next_version.fetch_add(1, Ordering::Relaxed);
         let msg = json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didOpen",
@@ -173,12 +192,66 @@ impl LspClient {
                 "textDocument": {
                     "uri": uri,
                     "languageId": language_id,
-                    "version": 1,
+                    "version": version,
                     "text": text,
                 }
             }
         });
+        write_frame(self.stdin.clone(), &msg).await?;
+        Ok(version)
+    }
+
+    /// Tell the server the client closed `path`; the server then reads the
+    /// file from disk instead of the copy sent with `did_open`.
+    async fn did_close(&self, path: &Path) -> Result<(), LspError> {
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didClose",
+            "params": { "textDocument": { "uri": path_to_uri(path) } }
+        });
         write_frame(self.stdin.clone(), &msg).await
+    }
+
+    /// `true` once the server process has exited (crashed or quit).
+    fn has_exited(&mut self) -> bool {
+        !matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// `true` if the server answers a request within `timeout`. LSP requires
+    /// servers to reject `$/` requests they do not know with `MethodNotFound`,
+    /// so any reply proves the server's main loop is alive.
+    async fn ping(&self, timeout: Duration) -> bool {
+        match self.request("$/origin/ping", Value::Null, timeout).await {
+            Ok(_) => true,
+            Err(LspError::Protocol(m)) => m.starts_with("server error"),
+            Err(_) => false,
+        }
+    }
+
+    /// Poll until the server publishes diagnostics for `path` tagged with
+    /// `version` (or untagged), for at most `timeout`. Returns the diagnostics
+    /// and whether the publish was untagged; `None` on timeout.
+    async fn wait_for(
+        &self,
+        path: &Path,
+        version: i32,
+        timeout: Duration,
+    ) -> Option<(Vec<Diagnostic>, bool)> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let published = self.diags.read().await.get(path).cloned();
+            // A publish tagged with another version is a late answer to an
+            // earlier call: returning it would report stale diagnostics.
+            if let Some((v, diags)) = published {
+                if v.is_none_or(|v| v == i64::from(version)) {
+                    return Some((diags, v.is_none()));
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Notify the server that a file changed (full sync).
@@ -191,7 +264,7 @@ impl LspClient {
             "jsonrpc": "2.0",
             "method": "textDocument/didChange",
             "params": {
-                "textDocument": { "uri": uri, "version": 2 },
+                "textDocument": { "uri": uri, "version": self.next_version.fetch_add(1, Ordering::Relaxed) },
                 "contentChanges": [ { "text": text } ]
             }
         });
@@ -202,8 +275,8 @@ impl LspClient {
     pub async fn diagnostics(&self, path: Option<&Path>) -> Vec<Diagnostic> {
         let g = self.diags.read().await;
         path.map_or_else(
-            || g.values().flatten().cloned().collect(),
-            |p| g.get(p).cloned().unwrap_or_default(),
+            || g.values().flat_map(|(_, d)| d).cloned().collect(),
+            |p| g.get(p).map(|(_, d)| d.clone()).unwrap_or_default(),
         )
     }
 
@@ -388,62 +461,226 @@ impl LspClient {
         let result = self.request(method, json!({ "item": item }), timeout).await?;
         Ok(parse_call_hierarchy_items(&result, key))
     }
+}
 
-    /// One-shot diagnostics probe for a single file.
+/// How long a server that missed the diagnostics deadline gets to answer a
+/// liveness ping before it is treated as hung and dropped.
+const PING_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long after spawn a server that has never answered counts as still
+/// starting (indexing, loading the workspace) rather than hung, so a slow
+/// starter is kept warming up instead of being killed on every call.
+const STARTUP_GRACE: Duration = Duration::from_secs(60);
+
+/// Consecutive startup failures (spawn error, or exit/eviction before it ever
+/// answered) after which a program is not spawned again by this pool.
+const MAX_STARTUP_FAILURES: u32 = 3;
+
+/// Outcome of [`LspPool::diagnose`].
+#[derive(Debug)]
+pub enum Probe {
+    /// The server published diagnostics for exactly the text just sent.
+    Fresh(Vec<Diagnostic>),
+    /// A publish arrived, but without a document version while the previous
+    /// call for this file had timed out: it may answer that earlier edit.
+    MaybeStale(Vec<Diagnostic>),
+    /// Nothing was published within the deadline. `previous` is the last
+    /// result the server reported for this file before this call (it may be
+    /// stale; empty when there was none). `starting` is true when the server
+    /// has not answered anything yet and is kept because it is still starting.
+    TimedOut {
+        previous: Vec<Diagnostic>,
+        starting: bool,
+    },
+}
+
+/// One pooled server.
+struct Server {
+    client: LspClient,
+    spawned: std::time::Instant,
+    /// Has published or answered a request at least once.
+    ready: bool,
+    /// Files whose last probe timed out: an untagged publish for them may be
+    /// that probe's late answer.
+    timed_out: std::collections::HashSet<PathBuf>,
+}
+
+#[derive(Default)]
+struct PoolState {
+    servers: HashMap<String, Server>,
+    startup_failures: HashMap<String, u32>,
+}
+
+impl PoolState {
+    /// Drop (kill) `program`'s server. One that never answered counts as a
+    /// startup failure.
+    fn evict(&mut self, program: &str) {
+        if self.servers.remove(program).is_some_and(|s| !s.ready) {
+            *self.startup_failures.entry(program.to_owned()).or_default() += 1;
+        }
+    }
+}
+
+/// Language servers kept alive across diagnostics calls, one per launch program.
+///
+/// A server stays warm instead of being spawned per call. One that exited is
+/// respawned on the next call; one that misses a deadline AND a liveness ping
+/// is dropped (killed), unless it is still within its startup grace. Dropping
+/// the pool kills every server (`kill_on_drop`).
+#[derive(Default)]
+pub struct LspPool {
+    state: Mutex<PoolState>,
+}
+
+impl LspPool {
+    /// Tell every live server that `paths` changed on disk
+    /// (`workspace/didChangeWatchedFiles`, type Changed), so a server does not
+    /// keep analysing other files from a copy older than the agent's edits. A
+    /// server whose input does not accept the write in time is dropped.
+    pub async fn notify_changed(&self, paths: &[&Path]) {
+        let changes: Vec<Value> = paths
+            .iter()
+            .map(|p| json!({ "uri": path_to_uri(p), "type": 2 }))
+            .collect();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWatchedFiles",
+            "params": { "changes": changes }
+        });
+        let mut state = self.state.lock().await;
+        let mut dead = Vec::new();
+        for (program, s) in &state.servers {
+            let sent = tokio::time::timeout(PING_TIMEOUT, write_frame(s.client.stdin.clone(), &msg)).await;
+            if !matches!(sent, Ok(Ok(()))) {
+                dead.push(program.clone());
+            }
+        }
+        for program in dead {
+            state.evict(&program);
+        }
+    }
+
+    /// Drop (kill) every server; the next probe spawns a fresh one that reads
+    /// the whole workspace from disk. Use when files changed in ways that
+    /// cannot be reported path by path. Startup-failure counts are kept.
+    pub async fn recycle(&self) {
+        self.state.lock().await.servers.clear();
+    }
+
+    /// Diagnose `path`, whose current contents are `text`, with the pooled
+    /// server launched as `program args` (spawned on first use).
     ///
-    /// Spawns `program` (with launch `args` such as `--stdio`) against
-    /// `workspace_root`, opens `path` (`did_open` with `language_id` + `text`),
-    /// then polls for `textDocument/publishDiagnostics` until either the server
-    /// has reported diagnostics for `path` or `timeout` elapses, whichever comes
-    /// first. The spawned server is reaped when the returned client is dropped
-    /// (`kill_on_drop`), so the caller need only drop the [`LspClient`] this
-    /// returns (or let it fall out of scope).
-    ///
-    /// Returns the diagnostics observed for `path` (possibly empty) and the live
-    /// [`LspClient`] so the caller controls teardown timing. This is the routine
-    /// the daemon's autonomous post-edit feedback uses: spawn → open → bounded
-    /// wait → drop.
-    ///
-    /// The poll loop sleeps in short slices so a server that publishes quickly
-    /// returns well before `timeout`; a server that never publishes simply hits
-    /// the deadline and returns whatever (if anything) it had reported.
+    /// Each call re-syncs the document — `didOpen` with a new version, wait up
+    /// to `timeout` for that version's publish, `didClose` — so the server
+    /// never keeps a stale in-memory copy of it between calls.
     ///
     /// # Errors
-    /// `LspError::Spawn` if the binary cannot be started; `Protocol`/`Io` if the
-    /// initialize handshake or the `did_open` write fails.
-    pub async fn diagnose_file(
+    /// `LspError::Spawn` / `Protocol` / `Io` if the server cannot be started
+    /// (or has failed to start [`MAX_STARTUP_FAILURES`] times in a row, after
+    /// which it is no longer spawned), `Io` if the `didOpen` write fails (the
+    /// server is dropped and respawned next call).
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub async fn diagnose(
+        &self,
         program: &str,
         args: &[&str],
         workspace_root: &Path,
         path: &Path,
         language_id: &str,
         text: &str,
-        timeout: std::time::Duration,
-    ) -> Result<(Self, Vec<Diagnostic>), LspError> {
-        let client = Self::spawn_with_args(program, args, workspace_root).await?;
-        client.did_open(path, language_id, text).await?;
-        // Poll in short slices: many servers publish within a few hundred ms of
-        // `did_open`, so we return as soon as `path` has any reported entry
-        // rather than always waiting the full `timeout`. A server that reports
-        // an empty diagnostic set never inserts the key here, so a clean file
-        // costs the full deadline — acceptable for a best-effort probe.
-        let deadline = std::time::Instant::now() + timeout;
-        let slice = std::time::Duration::from_millis(100);
-        loop {
-            let ready = {
-                let g = client.diags.read().await;
-                g.get(path).cloned()
-            };
-            if let Some(diags) = ready {
-                return Ok((client, diags));
-            }
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(slice).await;
+        timeout: Duration,
+    ) -> Result<Probe, LspError> {
+        let mut guard = self.state.lock().await;
+        let state = &mut *guard;
+        if state
+            .servers
+            .get_mut(program)
+            .is_some_and(|s| s.client.has_exited())
+        {
+            state.evict(program);
         }
-        let diags = client.diagnostics(Some(path)).await;
-        Ok((client, diags))
+        let failures = state.startup_failures.get(program).copied().unwrap_or(0);
+        let server = match state.servers.entry(program.to_owned()) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(_) if failures >= MAX_STARTUP_FAILURES => {
+                return Err(LspError::Spawn(format!(
+                    "{program} failed to start {failures} times in a row; not restarting it this session"
+                )));
+            }
+            Entry::Vacant(e) => match LspClient::spawn_with_args(program, args, workspace_root).await {
+                Ok(client) => e.insert(Server {
+                    client,
+                    spawned: std::time::Instant::now(),
+                    ready: false,
+                    timed_out: std::collections::HashSet::new(),
+                }),
+                Err(err) => {
+                    *state.startup_failures.entry(program.to_owned()).or_default() += 1;
+                    return Err(err);
+                }
+            },
+        };
+        let previous = server
+            .client
+            .diags
+            .write()
+            .await
+            .remove(path)
+            .map(|(_, d)| d)
+            .unwrap_or_default();
+        let late_answer_possible = server.timed_out.remove(path);
+        // Every write is bounded: a server that stopped reading its input would
+        // otherwise block it forever once the pipe buffer is full.
+        let version =
+            match tokio::time::timeout(timeout, server.client.did_open(path, language_id, text)).await {
+                Ok(Ok(version)) => version,
+                Ok(Err(e)) => {
+                    state.evict(program);
+                    return Err(e);
+                }
+                Err(_) => {
+                    state.evict(program);
+                    return Ok(Probe::TimedOut {
+                        previous,
+                        starting: false,
+                    });
+                }
+            };
+        let published = server.client.wait_for(path, version, timeout).await;
+        // On a miss, slow or hung? A live server answers the ping and is kept;
+        // a hung or dead one is killed and respawned on the next call instead
+        // of costing every call a timeout.
+        let answered = tokio::time::timeout(PING_TIMEOUT, async {
+            server.client.did_close(path).await.is_ok()
+                && (published.is_some() || server.client.ping(PING_TIMEOUT).await)
+        })
+        .await
+        .unwrap_or(false);
+        if answered || published.is_some() {
+            server.ready = true;
+            state.startup_failures.remove(program);
+        }
+        // Never answered yet, but young and alive: still starting, keep it.
+        let starting =
+            !server.ready && server.spawned.elapsed() < STARTUP_GRACE && !server.client.has_exited();
+        let Some((diags, untagged)) = published else {
+            if answered || starting {
+                server.timed_out.insert(path.to_path_buf());
+            } else {
+                state.evict(program);
+            }
+            drop(guard);
+            return Ok(Probe::TimedOut { previous, starting });
+        };
+        if !answered {
+            state.evict(program);
+        }
+        drop(guard);
+        Ok(if untagged && late_answer_possible {
+            Probe::MaybeStale(diags)
+        } else {
+            Probe::Fresh(diags)
+        })
     }
 }
 
@@ -469,11 +706,7 @@ async fn write_frame(stdin: Arc<Mutex<ChildStdin>>, msg: &Value) -> Result<(), L
 /// update `diags`; correlated responses (frames carrying an integer `id` plus a
 /// `result`/`error`) are routed to the matching oneshot in `pending`. Server→
 /// client request frames (method + id, no result) are ignored without error.
-async fn reader_loop(
-    stdout: ChildStdout,
-    diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>>,
-    pending: PendingMap,
-) {
+async fn reader_loop(stdout: ChildStdout, diags: DiagMap, pending: PendingMap) {
     // Cap the server-declared body size so a malformed/hostile language
     // server cannot drive an unbounded `vec![0u8; len]` allocation (OOM).
     const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -658,7 +891,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-async fn handle_diagnostics(v: &Value, diags: &Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>>) {
+async fn handle_diagnostics(v: &Value, diags: &DiagMap) {
     let Some(params) = v.get("params") else { return };
     let Some(uri) = params.get("uri").and_then(Value::as_str) else {
         return;
@@ -696,7 +929,8 @@ async fn handle_diagnostics(v: &Value, diags: &Arc<RwLock<HashMap<PathBuf, Vec<D
             });
         }
     }
-    diags.write().await.insert(path, out);
+    let version = params.get("version").and_then(Value::as_i64);
+    diags.write().await.insert(path, (version, out));
 }
 
 #[cfg(test)]
@@ -704,7 +938,7 @@ async fn handle_diagnostics(v: &Value, diags: &Arc<RwLock<HashMap<PathBuf, Vec<D
 mod tests {
     use super::{
         dispatch_response, file_uri_to_path, handle_diagnostics, parse_call_hierarchy_items, parse_locations,
-        percent_decode, Diagnostic, Location, PendingMap,
+        percent_decode, DiagMap, Location, PendingMap,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -735,7 +969,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_diagnostics_parses_publish_payload() {
-        let diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let diags: DiagMap = Arc::new(RwLock::new(HashMap::new()));
         let payload = json!({
             "method": "textDocument/publishDiagnostics",
             "params": {
@@ -756,7 +990,8 @@ mod tests {
             .await
             .get(&PathBuf::from("/tmp/a.rs"))
             .cloned()
-            .unwrap();
+            .unwrap()
+            .1;
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].line, 9);
         assert_eq!(got[0].col, 4);
@@ -767,7 +1002,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_diagnostics_defaults_missing_fields() {
-        let diags: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let diags: DiagMap = Arc::new(RwLock::new(HashMap::new()));
         // No severity, no code, no range → severity defaults to 2 (warning),
         // line/col default to 0, and the key is still inserted (empty-but-present).
         let payload = json!({
@@ -780,7 +1015,8 @@ mod tests {
             .await
             .get(&PathBuf::from("/tmp/b.rs"))
             .cloned()
-            .unwrap();
+            .unwrap()
+            .1;
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].severity, 2);
         assert_eq!(got[0].line, 0);

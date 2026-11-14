@@ -63,7 +63,8 @@ impl EditFormat {
             }
             Self::WholeFile => {
                 "emit the entire updated file contents inside a fenced code block, \
-                 preceded by the file path; do not abbreviate or elide any lines"
+                 with the file path alone on the line directly above the fence; do \
+                 not abbreviate or elide any lines"
             }
             Self::Udiff => {
                 "use unified-diff hunks: `--- a/path` and `+++ b/path` headers, then \
@@ -171,6 +172,35 @@ pub fn best_format_for(model: &str) -> EditFormat {
         return EditFormat::WholeFile;
     }
     EditFormat::SearchReplace
+}
+
+/// C7: the edit format a session's edit tools are advertised for.
+///
+/// `editfmt_env` is the value of `ORIGIN_EDITFMT`; a [`forced_format`] wins
+/// over the table. Unset, `1` or an unrecognised value ⇒ [`best_format_for`]
+/// `model`.
+#[must_use]
+pub fn session_format(model: &str, editfmt_env: Option<&str>) -> EditFormat {
+    editfmt_env
+        .and_then(forced_format)
+        .unwrap_or_else(|| best_format_for(model))
+}
+
+/// C7: the format an `ORIGIN_EDITFMT` value forces, if any.
+///
+/// Matched ASCII-case-insensitively: `0`/`off`/`false` bypass the table ([`EditFormat::SearchReplace`], the full
+/// edit-tool set); a format name (`search-replace`, `diff-fenced`,
+/// `whole-file`, `udiff`) forces that format. `None` for `1` (use the table)
+/// and for anything unrecognised.
+#[must_use]
+pub fn forced_format(value: &str) -> Option<EditFormat> {
+    match value.to_ascii_lowercase().as_str() {
+        "0" | "off" | "false" | "search-replace" => Some(EditFormat::SearchReplace),
+        "diff-fenced" => Some(EditFormat::DiffFenced),
+        "whole-file" => Some(EditFormat::WholeFile),
+        "udiff" => Some(EditFormat::Udiff),
+        _ => None,
+    }
 }
 
 /// Builds an `<origin-edit-format>` system-prompt block tuned to `model`.
@@ -335,45 +365,58 @@ fn trim_trailing_newline(mut s: String) -> String {
     s
 }
 
-/// Parses a whole-file block: an optional `file:` header then fenced contents,
-/// or the raw text if no fence is present.
+/// Parses whole-file edits (C7): each is a path line ([`looks_like_path`],
+/// alone on its line) IMMEDIATELY followed by a closed fenced block holding the file's full
+/// contents. Anything else — prose, a fence after a sentence, an unclosed
+/// fence — is not an edit, so a plain reply never writes a file.
 fn parse_whole_file(text: &str) -> Result<Vec<Hunk>, EditFmtError> {
+    let is_fence = |l: &&str| l.trim_start().starts_with("```");
     let lines: Vec<&str> = text.lines().collect();
-    let mut file = String::new();
-    let mut content_lines: Vec<&str> = Vec::new();
-    let mut in_fence = false;
-    let mut saw_fence = false;
-    for line in &lines {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            if in_fence {
-                in_fence = false;
-            } else {
-                in_fence = true;
-                saw_fence = true;
-            }
+    let mut hunks = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if !is_fence(&lines[i]) {
+            i += 1;
             continue;
         }
-        if in_fence {
-            content_lines.push(line);
-        } else if file.is_empty() && !trimmed.is_empty() && !saw_fence {
-            file = trimmed.trim_end_matches(':').to_string();
+        let Some(close) = lines[i + 1..].iter().position(is_fence).map(|k| i + 1 + k) else {
+            break; // unclosed fence: not an edit
+        };
+        let file = i.checked_sub(1).map(|p| lines[p].trim());
+        if let Some(file) = file.filter(|f| looks_like_path(f)) {
+            hunks.push(Hunk {
+                file: file.to_string(),
+                before: String::new(),
+                after: lines[i + 1..close].join("\n"),
+            });
         }
+        i = close + 1;
     }
-    let content = if saw_fence {
-        content_lines.join("\n")
-    } else {
-        // No fence: everything after an optional first header line is the body.
-        text.to_string()
-    };
-    if content.is_empty() && file.is_empty() {
-        return Err(EditFmtError::Parse("empty whole-file block".to_string()));
+    if hunks.is_empty() {
+        return Err(EditFmtError::Parse(
+            "no path line followed by a fenced block".to_string(),
+        ));
     }
-    Ok(vec![Hunk {
-        file,
-        before: String::new(),
-        after: content,
-    }])
+    Ok(hunks)
+}
+
+/// A conservative relative path: ASCII letters/digits and `.` `_` `-` `/`
+/// only; a `/`, or a file name with a stem and an extension holding a letter
+/// (so `Example`, `Done.`, `v1.2.3` are not paths, `a.rs` is); not absolute
+/// and no `..` component. Containment is the applier's job; this is defence
+/// in depth.
+fn looks_like_path(s: &str) -> bool {
+    let named = s.contains('/')
+        || s.rsplit_once('.').is_some_and(|(stem, ext)| {
+            !stem.is_empty()
+                && ext.chars().any(|c| c.is_ascii_alphabetic())
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        });
+    named
+        && !s.starts_with('/')
+        && !s.split('/').any(|c| c == "..")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
 }
 
 /// Parses a minimal unified diff into normalized hunks (one per `@@` section).
@@ -529,6 +572,78 @@ mod tests {
     }
 
     #[test]
+    fn whole_file_plain_reply_is_not_an_edit() {
+        // C7: a plain `done` from a whole-file model must never write a file.
+        assert!(parse(EditFormat::WholeFile, "done").is_err());
+        assert!(extract_all_hunks("done", "gpt-3.5-turbo").is_err());
+        assert!(parse(EditFormat::WholeFile, "src/a.rs\nno fence here\n").is_err());
+    }
+
+    #[test]
+    fn whole_file_sentence_before_fence_is_not_an_edit() {
+        let text = "Here is the updated code:\n```\nfn main() {}\n```\n";
+        assert!(parse(EditFormat::WholeFile, text).is_err());
+        // A path separated from its fence by a blank line is not an edit either.
+        assert!(parse(EditFormat::WholeFile, "src/a.rs\n\n```\nx\n```\n").is_err());
+    }
+
+    #[test]
+    fn whole_file_snippet_introducers_and_escaping_paths_are_not_edits() {
+        for text in [
+            "Example:\n```\nlet x = 1;\n```\n",
+            "Run:\n```\ncargo test\n```\n",
+            "Usage\n```\nfoo --bar\n```\n",
+            "src/a.rs:\n```\nx\n```\n",
+            "../x.rs\n```\nx\n```\n",
+            "src/../../x.rs\n```\nx\n```\n",
+            "/etc/x.conf\n```\nx\n```\n",
+            "C:/x.rs\n```\nx\n```\n",
+        ] {
+            assert!(parse(EditFormat::WholeFile, text).is_err(), "{text}");
+        }
+        let hunks = parse(EditFormat::WholeFile, "README.md\n```\n# hi\n```\n").unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].file, "README.md");
+    }
+
+    #[test]
+    fn whole_file_path_needs_a_slash_or_a_lettered_extension() {
+        for word in ["Done.", "v1.2.3", "..."] {
+            let text = format!("{word}\n```\nx\n```\n");
+            assert!(parse(EditFormat::WholeFile, &text).is_err(), "{word}");
+        }
+        for path in ["README.md", "Cargo.toml", "src/a"] {
+            let hunks = parse(EditFormat::WholeFile, &format!("{path}\n```\nx\n```\n")).unwrap();
+            assert_eq!(hunks[0].file, path);
+        }
+    }
+
+    #[test]
+    fn whole_file_path_then_fence_is_one_edit() {
+        let text = "src/a.rs\n```rust\nfn a() {}\n```\n";
+        let hunks = parse(EditFormat::WholeFile, text).unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].file, "src/a.rs");
+        assert!(hunks[0].before.is_empty());
+        assert_eq!(hunks[0].after, "fn a() {}");
+    }
+
+    #[test]
+    fn whole_file_two_files_in_one_reply() {
+        let text = "Two files:\nsrc/a.rs\n```\nA\n```\nand\nsrc/b.rs\n```\nB1\nB2\n```\n";
+        let hunks = parse(EditFormat::WholeFile, text).unwrap();
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(
+            (hunks[0].file.as_str(), hunks[0].after.as_str()),
+            ("src/a.rs", "A")
+        );
+        assert_eq!(
+            (hunks[1].file.as_str(), hunks[1].after.as_str()),
+            ("src/b.rs", "B1\nB2")
+        );
+    }
+
+    #[test]
     fn parses_small_udiff() {
         let text = "--- a/src/lib.rs\n\
                     +++ b/src/lib.rs\n\
@@ -580,6 +695,57 @@ mod tests {
     fn best_format_for_unknown_defaults() {
         assert_eq!(best_format_for("some-random-model"), EditFormat::SearchReplace);
         assert_eq!(best_format_for(""), EditFormat::SearchReplace);
+    }
+
+    #[test]
+    fn session_format_uses_the_table_unless_the_env_overrides_it() {
+        // Exact id, a dated/suffixed form of it (prefix match), and an unknown id.
+        assert_eq!(session_format("gpt-3.5-turbo", None), EditFormat::WholeFile);
+        assert_eq!(session_format("gpt-3.5-turbo-0125", None), EditFormat::WholeFile);
+        assert_eq!(session_format("claude-opus-4", None), EditFormat::SearchReplace);
+        assert_eq!(
+            session_format("some-random-model", None),
+            EditFormat::SearchReplace
+        );
+        // `1` (today's opt-in) and junk keep the table.
+        assert_eq!(session_format("gpt-3.5-turbo", Some("1")), EditFormat::WholeFile);
+        assert_eq!(
+            session_format("gpt-3.5-turbo", Some("junk")),
+            EditFormat::WholeFile
+        );
+        // `0` bypasses the table; a format name forces that format.
+        assert_eq!(
+            session_format("gpt-3.5-turbo", Some("0")),
+            EditFormat::SearchReplace
+        );
+        assert_eq!(
+            session_format("claude-opus-4", Some("whole-file")),
+            EditFormat::WholeFile
+        );
+        assert_eq!(session_format("claude-opus-4", Some("udiff")), EditFormat::Udiff);
+        // Case-insensitive; `off`/`false` mean `0`; garbage is not an override.
+        assert_eq!(
+            session_format("claude-opus-4", Some("Whole-File")),
+            EditFormat::WholeFile
+        );
+        for off in ["off", "OFF", "false"] {
+            assert_eq!(
+                session_format("gpt-3.5-turbo", Some(off)),
+                EditFormat::SearchReplace
+            );
+        }
+        assert_eq!(forced_format("garbage"), None);
+        assert_eq!(forced_format("1"), None);
+        // The table only narrows on an exact prefix: provider-namespaced or
+        // region-prefixed ids keep the full edit-tool list.
+        assert_eq!(
+            session_format("openai/gpt-3.5-turbo", None),
+            EditFormat::SearchReplace
+        );
+        assert_eq!(
+            session_format("us.anthropic.claude-sonnet-4-5-20250929-v1:0", None),
+            EditFormat::SearchReplace
+        );
     }
 
     #[test]

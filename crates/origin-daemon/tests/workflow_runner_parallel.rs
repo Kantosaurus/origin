@@ -85,6 +85,7 @@ async fn workflow_fans_out_per_layer_in_dependency_order() {
                 transcript_handle: [0; 32],
                 usage: SwarmUsage::default(),
                 detail: None,
+                tainted: false,
             })
         })
     });
@@ -110,7 +111,7 @@ async fn workflow_fans_out_per_layer_in_dependency_order() {
         ],
     };
 
-    let report = run_workflow(&wf, &coord, &catalog, None)
+    let report = run_workflow(&wf, &coord, &catalog, None, None, None)
         .await
         .expect("run_workflow");
 
@@ -182,6 +183,7 @@ async fn workflow_emits_swarm_panel_spawn_and_finish_events() {
                 transcript_handle: [0; 32],
                 usage: SwarmUsage::default(),
                 detail: None,
+                tainted: false,
             })
         })
     });
@@ -198,7 +200,7 @@ async fn workflow_emits_swarm_panel_spawn_and_finish_events() {
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
-    let report = run_workflow(&wf, &coord, &catalog, Some(&tx))
+    let report = run_workflow(&wf, &coord, &catalog, Some(&tx), None, None)
         .await
         .expect("run_workflow");
     drop(tx); // close the channel so the drain below terminates.
@@ -221,7 +223,11 @@ async fn workflow_emits_swarm_panel_spawn_and_finish_events() {
     let completed = with_status("completed");
 
     assert_eq!(spawned.len(), 2, "one spawn event per worker; events={events:?}");
-    assert_eq!(completed.len(), 2, "one terminal event per worker; events={events:?}");
+    assert_eq!(
+        completed.len(),
+        2,
+        "one terminal event per worker; events={events:?}"
+    );
     // The SAME id spans spawn + finish so the panel updates the row in place
     // (rather than the worker showing as forever-running, which keeps the panel
     // wedged open or — when ids mismatch — never settles).

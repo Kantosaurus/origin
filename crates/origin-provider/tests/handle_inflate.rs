@@ -89,8 +89,11 @@ fn cas_hit_inflates_the_stored_payload() {
     let payload = b"the real tool output";
     let h = cas.put(payload).expect("put");
 
-    let out =
-        inflate_tool_result_handles(&[assistant_tool_use("t1"), tool_result(*h.as_bytes())], Some(&cas)).expect("ok");
+    let out = inflate_tool_result_handles(
+        &[assistant_tool_use("t1"), tool_result(*h.as_bytes())],
+        Some(&cas),
+    )
+    .expect("ok");
 
     let block = &out[1].blocks[0];
     assert!(

@@ -132,10 +132,7 @@ pub const REVERSE_DEP_FILE_CAP: usize = 64;
 ///
 /// # Errors
 /// Propagates index / `SQLite` errors from the underlying lookups.
-pub fn reverse_dep_files(
-    idx: &CodeGraphIndex,
-    edited_files: &[String],
-) -> Result<Vec<String>, QueryError> {
+pub fn reverse_dep_files(idx: &CodeGraphIndex, edited_files: &[String]) -> Result<Vec<String>, QueryError> {
     let mut files: HashSet<String> = HashSet::new();
     for f in edited_files {
         // A change is its own dependency (in-file tests, same-file callers).
@@ -157,7 +154,8 @@ pub fn reverse_dep_files(
     Ok(out)
 }
 
-fn neighbors(idx: &CodeGraphIndex, start: EntityId, depth: usize) -> Result<QueryResult, QueryError> {    let mut seen: HashSet<[u8; 32]> = HashSet::new();
+fn neighbors(idx: &CodeGraphIndex, start: EntityId, depth: usize) -> Result<QueryResult, QueryError> {
+    let mut seen: HashSet<[u8; 32]> = HashSet::new();
     let mut queue: VecDeque<(EntityId, usize)> = VecDeque::new();
     let mut out: Vec<NodeRow> = Vec::new();
     seen.insert(start.0);

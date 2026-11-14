@@ -200,6 +200,7 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
             output_format,
             json_schema,
             root,
+            dangerously_allow_all,
         } => {
             // Run-level `--thinking-tokens` wins; otherwise inherit the startup
             // seed. `0` is a hard error (matches the global flag's contract).
@@ -222,6 +223,7 @@ async fn dispatch_subcommand(cmd: Cmd) -> Option<Result<()>> {
                 output_format,
                 json_schema,
                 roots: root,
+                allow_all: dangerously_allow_all || origin_daemon::protocol::allow_all_env(),
             })
             .await
         }
@@ -1739,8 +1741,7 @@ async fn handle_submit(
                     .lock()
                     .ponytail_mode
                     .map_or_else(|| "full (default)".to_string(), |m| m.as_str().to_string());
-                app.lock()
-                    .add_line("system> ", &format!("ponytail mode: {cur}"));
+                app.lock().add_line("system> ", &format!("ponytail mode: {cur}"));
             }
             origin_ponytail::PonytailCmd::Usage => {
                 app.lock()
@@ -1788,7 +1789,16 @@ async fn handle_submit(
         // fallthrough below uses for a typed message).
         begin_prompt_turn(app, &prompt);
         handle.mark_dirty();
-        handle_prompt_turn(app, handle, path, model.as_str(), &prompt, session_id, interrupt_rx).await;
+        handle_prompt_turn(
+            app,
+            handle,
+            path,
+            model.as_str(),
+            &prompt,
+            session_id,
+            interrupt_rx,
+        )
+        .await;
         return;
     }
     // `/ponytail-help` / `/ponytail-gain` / `/ponytail-debt` text commands.
@@ -1814,12 +1824,10 @@ async fn handle_submit(
             app.lock().add_line("you> ", text);
             let mut out = origin_ponytail::commands::debt_report();
             // Harvest code markers too: `git grep -n "ponytail:"`.
-            if let Some(grep) = run_git(&["grep", "-n", "ponytail:"]).filter(|s| !s.trim().is_empty())
-            {
+            if let Some(grep) = run_git(&["grep", "-n", "ponytail:"]).filter(|s| !s.trim().is_empty()) {
                 let hits = origin_ponytail::commands::harvest_comments(&grep);
                 if !hits.is_empty() {
-                    let markers =
-                        format!("\n\ncode markers ({}):\n  {}", hits.len(), hits.join("\n  "));
+                    let markers = format!("\n\ncode markers ({}):\n  {}", hits.len(), hits.join("\n  "));
                     out.push_str(&markers);
                 }
             }
@@ -2004,24 +2012,35 @@ async fn handle_submit(
         handle.mark_dirty();
         return;
     }
-    // `/permissions [on|off]` toggles opt-in interactive tool prompting. When
-    // ON, the daemon asks before running RequiresPermission tools (Bash/Write/
-    // Edit/…) and the user answers each with y/n. Default OFF keeps the historic
-    // auto-allow behaviour (byte-identical wire + tool execution).
+    // `/permissions [workspace|on|off]` (C2) sets which tool calls ask first.
+    // `workspace` (default): edits inside the workspace run, Bash, network tools
+    // and writes outside ask. `on`: every gated tool asks. `off`: all run.
     if let Some(arg) = text
         .trim()
         .strip_prefix("/permissions")
         .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
         .map(str::trim)
     {
+        use origin_daemon::protocol::PermissionMode;
         app.lock().add_line("you> ", text);
-        let now_on = app.lock().set_permission_ask(arg);
-        let msg = if now_on {
-            "permission prompts ON \u{2014} approve Bash/Write/Edit before they run (y/n); /permissions off to disable"
-        } else {
-            "permission prompts OFF \u{2014} tools auto-run (default)"
+        let set = app.lock().set_permission_mode(arg);
+        let mode = app.lock().permission_mode;
+        let what = match mode {
+            PermissionMode::Workspace => {
+                "permissions: workspace (default) \u{2014} edits inside the workspace run; Bash, network \
+                 tools and writes outside the workspace ask first"
+            }
+            PermissionMode::On => "permissions: on \u{2014} every permission-gated tool asks first",
+            PermissionMode::Off => {
+                "permissions: off \u{2014} tools run without asking (deny rules still apply)"
+            }
         };
-        app.lock().add_line("system> ", msg);
+        let msg = if set.is_none() && !arg.is_empty() {
+            format!("unknown mode `{arg}` (use workspace, on or off); {what}")
+        } else {
+            what.to_string()
+        };
+        app.lock().add_line("system> ", &msg);
         handle.mark_dirty();
         return;
     }
@@ -2342,8 +2361,8 @@ async fn handle_prompt_turn(
     let attachments = std::mem::take(&mut app.lock().pending_attachments);
     // Session-wide multi-root list (from the startup `--root` flags).
     let roots = app.lock().workspace_roots.clone();
-    // Opt-in interactive permission prompting (`/permissions on`).
-    let permission_ask = app.lock().permission_ask;
+    // C2: the session's permission mode (`/permissions`).
+    let permission_mode = app.lock().permission_mode;
     // Opt-in per-turn cost line (`ORIGIN_TURN_COST=1`): snapshot the cumulative
     // USD before the turn so we can render its delta afterward. Default-off: when
     // the env var is unset we never read this value and emit no extra line, so the
@@ -2361,7 +2380,7 @@ async fn handle_prompt_turn(
         read_only,
         attachments,
         roots,
-        permission_ask,
+        permission_mode,
         interrupt_rx,
         move |ev: &StreamEvent| {
             // Bug #4: route Goal* events through the dedicated renderer so
@@ -2375,12 +2394,15 @@ async fn handle_prompt_turn(
             drop(a);
             handle_for_goal.mark_dirty();
         },
-        move |id, tool: &str, args: &str| {
+        move |id, tool: &str, args: &str, no_always: bool| {
             // INT-3: surface the permission ask through the interactive picker
-            // (Allow once / Deny / Always allow <tool>). The event loop routes
-            // keys through `picker::reduce` and sends the decision on a fresh
-            // connection (the turn's connection is busy streaming).
-            app_for_perm.lock().open_permission_picker(id, tool, args);
+            // (Allow once / Deny / Always allow <tool>, the last only when the
+            // daemon offers it — C2). The event loop routes keys through
+            // `picker::reduce` and sends the decision on a fresh connection (the
+            // turn's connection is busy streaming).
+            app_for_perm
+                .lock()
+                .open_permission_picker(id, tool, args, no_always);
             handle_for_perm.mark_dirty();
         },
         move |id: String,
@@ -2678,10 +2700,8 @@ async fn call_daemon(
     attachments: Vec<origin_multimodal::ContentBlock>,
     // Session-wide extra workspace roots (`--root`); empty ⇒ single-root.
     roots: Vec<String>,
-    // Opt-in interactive permission prompting (`/permissions on`); false ⇒ the
-    // daemon stays on auto-allow, so the request and tool execution are
-    // byte-identical.
-    permission_ask: bool,
+    // C2: the session's permission mode (`/permissions`, default workspace).
+    permission_mode: origin_daemon::protocol::PermissionMode,
     // Bug #5: one-shot channel surfacing user Ctrl+C while a Prompt is in
     // flight. When a tick lands we write `ClientMessage::Interrupt` to
     // the same connection serving the prompt — the daemon's
@@ -2693,9 +2713,9 @@ async fn call_daemon(
     // EVERY Goal variant; non-Goal variants are dispatched in the match
     // below as before.
     mut on_goal: impl FnMut(&StreamEvent) + Send,
-    // Opt-in permission ask (id, tool, args_preview): surfaces the approval
+    // Permission ask (id, tool, args_preview, no_always): surfaces the approval
     // prompt; the event loop sends the decision back on a fresh connection.
-    mut on_permission_ask: impl FnMut(u64, &str, &str) + Send,
+    mut on_permission_ask: impl FnMut(u64, &str, &str, bool) + Send,
     // `ask_user` structured choice (id, question, options[(label, description?)],
     // multi_select, allow_custom): surfaces the interactive picker; the event
     // loop sends the `ChoiceDecision` back on a fresh connection.
@@ -2730,7 +2750,9 @@ async fn call_daemon(
         attachments,
         read_only,
         roots,
-        permission_ask,
+        // `permission_ask` keeps `on` working against an older daemon.
+        permission_ask: permission_mode == origin_daemon::protocol::PermissionMode::On,
+        permission_mode: Some(permission_mode),
         // The interactive TUI always wires the choice picker (this `call_daemon`
         // path sets up `on_choice_ask`), so the model's `ask_user` questions
         // surface a picker regardless of whether `/permissions` is on.
@@ -2821,12 +2843,9 @@ async fn call_daemon(
                     detail,
                     tool,
                 } => on_swarm(&id, &goal, &status, detail.as_deref(), tool.as_deref()),
-                StreamEvent::SwarmAgentOutput {
-                    id,
-                    part,
-                    body,
-                    ok,
-                } => on_swarm_output(&id, &part, &body, ok),
+                StreamEvent::SwarmAgentOutput { id, part, body, ok } => {
+                    on_swarm_output(&id, &part, &body, ok);
+                }
                 StreamEvent::Usage {
                     input_tokens,
                     output_tokens,
@@ -2852,7 +2871,8 @@ async fn call_daemon(
                     id,
                     ref tool,
                     ref args_preview,
-                } => on_permission_ask(id, tool, args_preview),
+                    no_always,
+                } => on_permission_ask(id, tool, args_preview, no_always),
                 StreamEvent::ChoiceAsk {
                     id,
                     question,
@@ -3444,12 +3464,7 @@ const STARTUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 /// — the stale daemon (and its supervisor) are killed and a fresh one is spawned
 /// on the new binary, so the update lands immediately instead of leaving the
 /// running daemon frozen at the old version.
-async fn ensure_daemon_running(
-    path: &str,
-    provider: &str,
-    account: &str,
-    force_restart: bool,
-) -> Result<()> {
+async fn ensure_daemon_running(path: &str, provider: &str, account: &str, force_restart: bool) -> Result<()> {
     let (cmd_path, sibling) = resolve_daemon_binary()?;
     // Supervised launch is the default: route the daemon through
     // origin-supervisor so the self-dev relaunch sentinel (exit 86) has a
@@ -3470,7 +3485,9 @@ async fn ensure_daemon_running(
                 // supervisor binaries; cycle the running pair so the new version
                 // takes effect this session (the self-update-completion handoff).
                 eprintln!("Update applied \u{2014} restarting the origin daemon on the new version\u{2026}");
-                tracing::info!("self-update applied this launch — restarting daemon+supervisor on the new binaries");
+                tracing::info!(
+                    "self-update applied this launch — restarting daemon+supervisor on the new binaries"
+                );
             } else {
                 tracing::info!("daemon binary is newer than running daemon — restarting");
             }
@@ -3509,21 +3526,23 @@ async fn ensure_daemon_running(
     // Supervised: spawn origin-supervisor pointed at the daemon binary (it owns
     // and restarts the daemon, inheriting ORIGIN_PROVIDER/ACCOUNT below for the
     // daemon child). Direct: spawn origin-daemon itself (legacy path).
+    // ORIGIN_SOCK pins the daemon's IPC path to the one WE resolved: with
+    // per-instance paths the daemon's own default derives from its cwd — already
+    // set to this workspace below — but an explicit env keeps the pair in
+    // lock-step even when the user set ORIGIN_SOCK or the cwd canonicalizes oddly.
+    // C2: the builder also strips ORIGIN_ALLOW_ALL from the child's env.
     let mut command = if supervised {
-        let mut c = std::process::Command::new(&supervisor_path);
-        c.args(origin_cli::daemon_launch::supervisor_args(&cmd_path));
-        c
+        origin_cli::daemon_launch::daemon_command(
+            supervisor_path.as_ref(),
+            Some(cmd_path.as_ref()),
+            provider,
+            account,
+            path,
+        )
     } else {
-        std::process::Command::new(&cmd_path)
+        origin_cli::daemon_launch::daemon_command(cmd_path.as_ref(), None, provider, account, path)
     };
     command
-        .env("ORIGIN_PROVIDER", provider)
-        .env("ORIGIN_ACCOUNT", account)
-        // Pin the daemon's IPC path to the one WE resolved. With per-instance
-        // paths the daemon's own default derives from its cwd — already set to
-        // this workspace below — but an explicit env keeps the pair in lock-step
-        // even when the user set ORIGIN_SOCK or the cwd canonicalizes oddly.
-        .env("ORIGIN_SOCK", path)
         // Run the daemon IN the workspace: tools (Bash/Read/Write), the code
         // graph, and self-dev all resolve paths against the daemon's cwd, so a
         // project-A daemon must not execute in project B's directory (or in
@@ -3663,7 +3682,10 @@ mod tests {
             Some(PonytailCmd::Set(PonytailMode::Ultra))
         );
         assert_eq!(parse_ponytail_command("/ponytail"), Some(PonytailCmd::Report));
-        assert_eq!(parse_ponytail_command("/ponytail bogus"), Some(PonytailCmd::Usage));
+        assert_eq!(
+            parse_ponytail_command("/ponytail bogus"),
+            Some(PonytailCmd::Usage)
+        );
         assert_eq!(parse_ponytail_command("/ponytail-review"), None);
         assert_eq!(parse_ponytail_command("/ponytail-audit"), None);
     }
@@ -3728,7 +3750,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.expect("accept decision conn");
             let _ = conn.read_frame_body().await; // consume the decision; never reply
-            // Hold the socket open so the client cannot get EOF either.
+                                                  // Hold the socket open so the client cannot get EOF either.
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         });
 
@@ -3741,11 +3763,8 @@ mod tests {
         // Outer guard sits well above `send_decision`'s internal drain bound:
         // before the fix this elapses (the drain parks forever); after the fix
         // `send_decision` returns inside its bounded drain, so this never fires.
-        let res = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            send_decision(&path, &decision),
-        )
-        .await;
+        let res =
+            tokio::time::timeout(std::time::Duration::from_secs(8), send_decision(&path, &decision)).await;
         server.abort();
         assert!(
             res.is_ok(),
@@ -3964,14 +3983,12 @@ mod tests {
             let sess = app.active_picker.as_mut().expect("picker open");
             origin_cli::tui::picker::reduce(&mut sess.state, pkey)
         };
-        match outcome {
-            None => None, // non-terminal: state advanced, would `mark_dirty()`
-            Some(out) => {
-                let _ = app.take_picker();
-                let (sel, _custom) = origin_cli::tui::picker_outcome_to_choice(&out);
-                Some(sel)
-            }
-        }
+        // `None` is non-terminal: state advanced, would `mark_dirty()`.
+        outcome.map(|out| {
+            let _ = app.take_picker();
+            let (sel, _custom) = origin_cli::tui::picker_outcome_to_choice(&out);
+            sel
+        })
     }
 
     fn cursor_of(app: &origin_cli::tui::App) -> usize {
@@ -3979,7 +3996,12 @@ mod tests {
     }
 
     fn checked_of(app: &origin_cli::tui::App) -> Vec<bool> {
-        app.active_picker.as_ref().expect("picker open").state.checked.clone()
+        app.active_picker
+            .as_ref()
+            .expect("picker open")
+            .state
+            .checked
+            .clone()
     }
 
     #[test]
@@ -3995,8 +4017,8 @@ mod tests {
                 ("beta".to_string(), Some("the second".to_string())),
                 ("gamma".to_string(), None),
             ],
-            true,  // multi_select
-            true,  // allow_custom
+            true, // multi_select
+            true, // allow_custom
         );
 
         // Down moves the cursor (0 -> 1).
@@ -4047,7 +4069,11 @@ mod tests {
         // Enter on the custom row enters free-text mode (does NOT resolve yet).
         assert_eq!(drive_picker_key(&mut app, KeyCode::Enter), None);
         assert!(
-            app.active_picker.as_ref().expect("still open").state.typing_custom,
+            app.active_picker
+                .as_ref()
+                .expect("still open")
+                .state
+                .typing_custom,
             "Enter on the custom row switches to free-text entry"
         );
         // Type a couple chars, then Enter resolves with the custom text.

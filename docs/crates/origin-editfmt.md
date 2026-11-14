@@ -48,7 +48,12 @@ pub struct Hunk {
 (`parse_search_replace`, `parse_whole_file`, `parse_udiff`) and normalizes the
 result into `Hunk`s. `apply` replaces the *unique* occurrence of `before` with
 `after`, returning `NoMatch` if it is absent or `Ambiguous` if it occurs more
-than once (whole-file hunks with empty `before` replace wholesale). The model
+than once (whole-file hunks with empty `before` replace wholesale).
+`parse_whole_file` takes a hunk only from a path line standing alone (ASCII
+letters/digits and `. _ - /`; relative, no `..`; containing a `/` or a file
+name with an extension that has a letter) directly followed by a closed fenced
+block; anything else is skipped, and a reply with no such pair is a parse
+error, not an edit. The model
 matrix is prefix-based and case-insensitive: Claude/Anthropic/sonnet/opus/haiku
 → `SearchReplace`; `gpt-4`/`o1`/`o3` → `Udiff`; `deepseek` → `DiffFenced`;
 `gpt-3.5`/`turbo-instruct` → `WholeFile`; unknown → `SearchReplace`.

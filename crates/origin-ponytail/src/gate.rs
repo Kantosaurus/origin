@@ -49,10 +49,14 @@ pub fn classify(deps: &[Dep], mode: PonytailMode, allow: &BTreeSet<String>) -> V
     deps.iter()
         .filter(|d| !allow.contains(&d.name.to_ascii_lowercase()))
         .filter_map(|d| match lookup(d.eco, &d.name) {
-            Some(repl) => Some(Flagged { dep: d.clone(), kind: FlagKind::Replaceable(repl) }),
-            None if mode == PonytailMode::Ultra => {
-                Some(Flagged { dep: d.clone(), kind: FlagKind::Unjustified })
-            }
+            Some(repl) => Some(Flagged {
+                dep: d.clone(),
+                kind: FlagKind::Replaceable(repl),
+            }),
+            None if mode == PonytailMode::Ultra => Some(Flagged {
+                dep: d.clone(),
+                kind: FlagKind::Unjustified,
+            }),
             None => None,
         })
         .collect()
@@ -66,8 +70,14 @@ mod tests {
 
     fn deps() -> Vec<Dep> {
         vec![
-            Dep { eco: Ecosystem::Npm, name: "lodash".into() }, // replaceable
-            Dep { eco: Ecosystem::Npm, name: "react".into() },  // no replacement
+            Dep {
+                eco: Ecosystem::Npm,
+                name: "lodash".into(),
+            }, // replaceable
+            Dep {
+                eco: Ecosystem::Npm,
+                name: "react".into(),
+            }, // no replacement
         ]
     }
 
@@ -93,7 +103,9 @@ mod tests {
     fn ultra_flags_every_new_dep() {
         let f = classify(&deps(), PonytailMode::Ultra, &BTreeSet::new());
         assert_eq!(f.len(), 2);
-        assert!(f.iter().any(|x| x.dep.name == "react" && matches!(x.kind, FlagKind::Unjustified)));
+        assert!(f
+            .iter()
+            .any(|x| x.dep.name == "react" && matches!(x.kind, FlagKind::Unjustified)));
     }
 
     #[test]

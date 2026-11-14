@@ -117,7 +117,10 @@ mod tests {
         // Chocolatey: nuspec + tools subtree preserved; NU5035 (licenseUrl) gone.
         let nuspec = fs::read_to_string(out.join("chocolatey/origin.nuspec")).expect("read nuspec");
         assert!(nuspec.contains("<version>1.0.0</version>"));
-        assert!(!nuspec.contains("<licenseUrl>"), "licenseUrl element triggers NU5035");
+        assert!(
+            !nuspec.contains("<licenseUrl>"),
+            "licenseUrl element triggers NU5035"
+        );
         let choco_install =
             fs::read_to_string(out.join("chocolatey/tools/chocolateyinstall.ps1")).expect("read install");
         assert!(choco_install.contains("feedfad0")); // SHA256_WIN_X64

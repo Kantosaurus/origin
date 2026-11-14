@@ -115,7 +115,9 @@ hard error — exactly as CI does on the `check` job (Ubuntu/macOS/Windows).
 
 ### xtask source lints
 
-Two project-specific lints ship as `xtask` subcommands and are enforced in CI:
+Two project-specific lints ship as `xtask` subcommands. No CI workflow runs
+them, and `lint-secrets` currently reports 11 violations (secret-named string
+fields in `Debug` structs, all older than the `[Unreleased]` changes):
 
 ```sh
 cargo run -p xtask -- lint-spawn      # ban raw tokio::spawn outside spawn_in
