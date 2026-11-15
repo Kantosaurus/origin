@@ -234,7 +234,11 @@ pub fn resolve_real(path: &std::path::Path) -> Option<std::path::PathBuf> {
                 Component::Normal(name) => {
                     base.push(name);
                     if std::fs::symlink_metadata(&base).is_ok() {
-                        return None; // exists, yet canonicalize failed on it
+                        // Exists: either `..` led back out of a missing detour
+                        // onto a real entry (resolve it, it may be a link), or
+                        // canonicalize already failed on it (dangling link):
+                        // that fails again here and stays unresolvable.
+                        base = std::fs::canonicalize(&base).ok()?;
                     }
                 }
                 Component::ParentDir if base.pop() => {}
@@ -755,6 +759,32 @@ mod tests {
         assert!(prompt.contains("summarize the README"));
         // Must instruct the model to ignore injected instructions.
         assert!(prompt.contains("untrusted"));
+    }
+
+    /// A missing detour (`missing/..`) must not hide an existing target: the
+    /// resolver lands on it and resolves it like any other existing entry.
+    #[test]
+    fn resolve_real_resolves_existing_target_after_missing_detour() {
+        let dir = std::env::temp_dir().join(format!("conseca-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("target"), "x").unwrap();
+        let real = std::fs::canonicalize(dir.join("target")).unwrap();
+        let detour = |name: &str| dir.join("missing").join("..").join(name);
+
+        assert_eq!(resolve_real(&detour("target")), Some(real.clone()));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real, dir.join("link")).unwrap();
+            assert_eq!(resolve_real(&detour("link")), Some(real), "link is followed");
+            std::os::unix::fs::symlink(dir.join("gone"), dir.join("dangling")).unwrap();
+            assert_eq!(
+                resolve_real(&detour("dangling")),
+                None,
+                "dangling link fails closed"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

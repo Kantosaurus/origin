@@ -3375,7 +3375,7 @@ fn kill_pid(pid: u32) {
 }
 
 /// Ask a process to terminate *gracefully* so it runs its cooperative shutdown
-/// (which flushes the CAS Hot tier + checkpoints SQLite) before exiting.
+/// (which flushes the CAS Hot tier + checkpoints `SQLite`) before exiting.
 ///
 /// unix: SIGTERM — the daemon's `ctrlc` handler catches it. Windows: a
 /// `CREATE_NO_WINDOW` daemon has no console to receive a CTRL event, so there is
