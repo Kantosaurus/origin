@@ -120,7 +120,7 @@ similar     = { workspace = true }
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 sysinfo  = "0.30"
-proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
+proptest = { version = "=1.12.0", default-features = false, features = ["std"] }
 wiremock = "0.6"
 
 [lib]
